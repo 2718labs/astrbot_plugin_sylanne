@@ -1,3 +1,2 @@
-aiohttp>=3.9
-portalocker>=2.10
-pywin32>=312; sys_platform == "win32"
+# Sylanne 3 has no third-party Python runtime dependencies.
+# The AstrBot host supplies its SDK; CI pins AstrBot 4.28.1 only for host verification.

@@ -1,6 +1,0 @@
-{
-  "widget_type": "status_card",
-  "title": "Sylanne Embodiment",
-  "endpoint": "/api/widget-state",
-  "refresh_interval": 10
-}

@@ -4,7 +4,7 @@
 
 ## 工程原则
 
-项目采用最小充分工程原则：实现需求所需的最小闭环，用与风险相称的测试证明行为，不把“可以更完整”当成扩大范围的理由。
+3.0 的产品目标是完整的重型角色系统，见 [总体设计](docs/architecture/embodiment-3-system.md)。按明确的模块合同分阶段交付可运行闭环，用与风险相称的测试证明行为；不能把当前验证切片当成最终能力上限。
 
 - 优先处理历史或数据丢失、插件崩溃、无回复、权限或隐私边界错误、安装失败和主要流程回归。
 - 界面细节、低概率且无稳定复现的边缘问题、纯理论风险和无直接收益的重构默认不阻塞交付。
@@ -29,26 +29,27 @@
 ## 开发环境
 
 1. Fork 并克隆仓库。
-2. 使用 Python 3.10-3.13。
-3. 将插件目录放入 AstrBot 的 `data/plugins/`，或通过 AstrBot WebUI 安装本地 ZIP。
+2. 使用 Python 3.11 或更新版本并安装 Rust 工具链；当前本地验证为 Python 3.13.14 和 AstrBot 4.28.1。
+3. 先编译 `rewrite/native`，再将仓库根目录作为插件放入隔离 AstrBot 的 `data/plugins/`。当前没有已验收的发布 ZIP，旧核心与旧界面已退役。
 4. AstrBot 会安装 `requirements.txt` 中的插件依赖；不要把 `astrbot` 本身加入依赖。
 
 ## 代码与测试
 
-- AstrBot API 只从 `astrbot.api.*` 导入。
+- 插件运行代码的 AstrBot API 只从 `astrbot.api.*` 导入；固定 SDK 的验收测试可检查其注册表。
 - 持久化数据只写 AstrBot 提供的插件数据目录。
 - 异步路径不得使用阻塞网络请求或未受控后台任务。
-- 修改行为时补充最小回归测试，并运行受影响的旧测试。
+- 修改行为时补充必要回归测试，并运行受影响的新运行时测试；不保留依赖旧核心的测试作为假兼容层。
 - 代码检查使用 Ruff；不要在同一仓库混入 Black、Flake8 或 isort。
 - 注释说明约束和原因，不复述代码，也不把软件行为描述成生物学或医学结论。
 
 常用命令：
 
 ```powershell
-python -m pytest tests/path_to_affected_test.py -q
-python -m pytest
-python -m ruff check .
-python -m compileall -q main.py sylanne_alpha
+python rewrite/tools/verify.py
+# 使用隔离安装了 astrbot==4.28.1 的解释器：
+python rewrite/tools/verify_host.py
+python -m ruff check main.py rewrite
+python -m compileall -q main.py rewrite/sylanne3
 ```
 
 ## Pull Request

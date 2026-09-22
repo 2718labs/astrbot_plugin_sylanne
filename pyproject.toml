@@ -1,32 +1,17 @@
 [tool.ruff]
-target-version = "py310"
-# 团队规范 §10 默认 88，但本仓存量按 120 写、ruff format 会重排 200 个文件，
-# 故保 120 避免整库重排（line-length 属 [团队约定] 可调）。88 重排留独立专项 PR。
+target-version = "py311"
 line-length = 120
+src = [".", "rewrite"]
 
 [tool.ruff.lint]
-# 致命问题（语法 E9 / 比较 F63 / 语法 F7 / 未定义 F82）
-# + ASYNC（团队规范 §10：对 bot 最高价值，抓 async 处理器里的阻塞调用 / 未 await）。
 select = ["E9", "F63", "F7", "F82", "ASYNC"]
-ignore = []
-
-[tool.ruff.lint.per-file-ignores]
-# vendored 第三方 SDK：mirror 上游 sylanne_core，不由本仓 lint（改它=偏离上游）。
-# 例：_sharing.py 的 ASYNC240（async 里 Path().resolve()）是上游代码的事，我们不改 vendored。
-"sylanne_alpha/_engine/*" = ["ALL"]
 
 [tool.ruff.format]
-# 排版用上面的 line-length=120。注：全库现有 200 文件未按 ruff format 排版，
-# 故 CI 暂不强制 `ruff format --check`；整库重排留独立专项 PR。
-
-[tool.pyright]
-typeCheckingMode = "basic"     # 团队规范 §10：对齐 AstrBot 上游、摩擦最低
-pythonVersion = "3.10"         # 本仓下限（metadata.yaml min_python 3.10）
-reportMissingImports = false   # SDK 部分类型缺失，避免噪声
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
 
 [tool.commitizen]
-# 团队规范 §9：英文 Conventional Commits + SemVer。version 单一源走 scm（git tag），
-# 不硬编码版本号（避免与 metadata.yaml 漂移）；cz bump 经 version_files 同步写回 metadata.yaml。
 name = "cz_conventional_commits"
 version_provider = "scm"
 tag_format = "Embodiment-$version"

@@ -2,255 +2,69 @@ name: CI
 
 on:
   push:
-    branches: [main, "Sylanne-*"]
-    tags: ["v*"]
+    branches: [main, codex/embodiment-3-rewrite]
   pull_request:
-    branches: [main]
+    branches: [main, codex/embodiment-3-rewrite]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  lint:
-    name: Lint & Type Check
-    runs-on: ubuntu-latest
+  core-native:
+    name: Core/native (${{ matrix.os }}, Python 3.13)
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
 
-      - name: Install dependencies
+      - name: Select stable Rust toolchain
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyright ruff
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
 
-      - name: Syntax check (all .py files)
-        run: |
-          python -c "
-          import ast, sys, pathlib
-          errors = []
-          for f in pathlib.Path('.').rglob('*.py'):
-              try:
-                  ast.parse(f.read_text(encoding='utf-8'), filename=str(f))
-              except SyntaxError as e:
-                  errors.append(f'  {f}:{e.lineno}: {e.msg}')
-          if errors:
-              print('Syntax errors found:')
-              print('\n'.join(errors))
-              sys.exit(1)
-          print(f'All {len(list(pathlib.Path(\".\").rglob(\"*.py\")))} files OK')
-          "
+      - name: Install lint tooling
+        run: python -m pip install ruff
 
-      - name: Check for merge conflict markers
-        run: |
-          if grep -rn '<<<<<<< \|======= \|>>>>>>> ' --include='*.py' --include='*.html' --include='*.yaml' .; then
-            echo "::error::Merge conflict markers found in source files"
-            exit 1
-          fi
-          echo "No conflict markers found"
+      - name: Ruff
+        run: ruff check main.py rewrite
 
-      - name: Ruff lint
-        # select 单一真相在 pyproject.toml（含 ASYNC）；此处不再覆盖 --select。
-        run: ruff check . --no-fix
+      - name: Verify Python core and native kernel
+        run: python rewrite/tools/verify.py
 
-      - name: Pyright type check (sylanne_alpha)
-        continue-on-error: true
-        run: pyright --pythonversion ${{ matrix.python-version }} --level warning sylanne_alpha/
-
-      - name: Pyright type check (main.py, informational)
-        continue-on-error: true
-        run: pyright --pythonversion ${{ matrix.python-version }} --level error main.py
-
-  import-test:
-    name: Import & Smoke Test
-    runs-on: ubuntu-latest
+  astrbot-sdk:
+    name: AstrBot 4.28.1 SDK (${{ matrix.os }}, Python 3.13)
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.13"]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
 
-      - name: Install runtime deps
-        run: pip install -r requirements.txt
-
-      - name: Import main module
+      - name: Select stable Rust toolchain
         run: |
-          python -c "
-          import sys, importlib.util
-          spec = importlib.util.spec_from_file_location('main', 'main.py')
-          mod = importlib.util.module_from_spec(spec)
-          sys.modules['main'] = mod
-          spec.loader.exec_module(mod)
-          print('main.py imported OK')
-          "
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
-      - name: Import all sylanne_alpha submodules
+      - name: Build native kernel for host tests
+        run: cargo build --release --manifest-path rewrite/native/Cargo.toml
+
+      - name: Install pinned AstrBot SDK
         run: |
-          python -c "
-          import sys, importlib, pathlib
-          sys.path.insert(0, '.')
-          failed = []
-          for f in sorted(pathlib.Path('sylanne_alpha').glob('*.py')):
-              mod_name = f'sylanne_alpha.{f.stem}'
-              if f.stem == '__init__':
-                  mod_name = 'sylanne_alpha'
-              try:
-                  importlib.import_module(mod_name)
-              except Exception as e:
-                  failed.append(f'  {mod_name}: {type(e).__name__}: {e}')
-          if failed:
-              print('Import failures:')
-              print('\n'.join(failed))
-              sys.exit(1)
-          print(f'All submodules imported OK')
-          "
+          python -m pip install --upgrade pip
+          python -m pip install "AstrBot==4.28.1"
 
-      - name: Slots consistency check
-        run: |
-          python -c "
-          import sys
-          sys.path.insert(0, '.')
-          from sylanne_alpha import AlphaKernel, AlphaBodyState
-
-          # Verify slotted dataclasses can be instantiated (共振场 kernel)
-          kernel = AlphaKernel(session_key='ci-test')
-          assert kernel.session_key == 'ci-test'
-          assert hasattr(kernel, 'body'), 'kernel missing body'
-          assert hasattr(kernel, 'computation'), 'kernel missing computation'
-          print('Slots consistency OK')
-          "
-
-      - name: Kernel boot/tick smoke test
-        run: |
-          python -c "
-          import sys, time
-          sys.path.insert(0, '.')
-          from sylanne_alpha import AlphaKernel, AlphaKernelEvent
-
-          kernel = AlphaKernel.boot(session_key='ci-smoke')
-          event = AlphaKernelEvent(
-              text='hello',
-              confidence=0.8,
-              flags=['safe', 'request'],
-              now=time.time(),
-          )
-          result = kernel.tick(event)
-          assert 'surface' in result, f'tick() missing surface key: {list(result.keys())}'
-          assert 'decision' in result['surface']
-          assert 'guard' in result['surface']
-
-          # Verify snapshot/restore roundtrip
-          snap = kernel.snapshot()
-          restored = AlphaKernel.restore(snap)
-          assert restored.session_key == 'ci-smoke'
-          assert restored.turns == kernel.turns
-          print(f'Kernel smoke test OK (turns={kernel.turns})')
-          "
-
-  test:
-    name: Unit Tests
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.13"]
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install deps
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio numpy jieba
-
-      - name: Run pytest
-        run: pytest tests/ -v --no-header -p no:cacheprovider
-        env:
-          PYTHONPATH: .
-
-  package:
-    name: Package & Verify
-    runs-on: ubuntu-latest
-    needs: [lint, import-test, test]
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Resolve package channel
-        id: package-channel
-        run: |
-          CHANNEL=$(python -c "from pathlib import Path; from scripts.package_plugin import _metadata_channel_for_version, _read_metadata_version; print(_metadata_channel_for_version(_read_metadata_version(Path('metadata.yaml').read_bytes())))")
-          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
-
-      - name: Build plugin zip
-        run: python scripts/package_plugin.py --channel "${{ steps.package-channel.outputs.channel }}" --output dist/plugin.zip
-
-      - name: Verify zip contents
-        run: |
-          python -c "
-          import zipfile, sys
-          required = [
-              'astrbot_plugin_sylanne/main.py',
-              'astrbot_plugin_sylanne/metadata.yaml',
-              'astrbot_plugin_sylanne/__init__.py',
-              'astrbot_plugin_sylanne/README.md',
-              'astrbot_plugin_sylanne/sylanne_alpha/__init__.py',
-              'astrbot_plugin_sylanne/sylanne_alpha/host.py',
-              'astrbot_plugin_sylanne/sylanne_alpha/_engine/sylanne_core/__init__.py',
-          ]
-          with zipfile.ZipFile('dist/plugin.zip') as zf:
-              names = zf.namelist()
-              missing = [r for r in required if r not in names]
-              if missing:
-                  print('Missing files in zip:')
-                  for m in missing:
-                      print(f'  {m}')
-                  sys.exit(1)
-              # Check no .pyc or __pycache__
-              bad = [n for n in names if '.pyc' in n or '__pycache__' in n]
-              if bad:
-                  print('Unwanted files in zip:')
-                  for b in bad:
-                      print(f'  {b}')
-                  sys.exit(1)
-              py_count = len([n for n in names if n.endswith('.py')])
-              print(f'Zip OK: {len(names)} files ({py_count} .py)')
-          "
-
-      - name: Import from extracted zip
-        run: |
-          mkdir -p /tmp/verify && cd /tmp/verify
-          unzip -q $GITHUB_WORKSPACE/dist/plugin.zip
-          pip install -r $GITHUB_WORKSPACE/requirements.txt
-          python -c "
-          import sys
-          sys.path.insert(0, '/tmp/verify/astrbot_plugin_sylanne')
-          import importlib.util
-          spec = importlib.util.spec_from_file_location(
-              'main', '/tmp/verify/astrbot_plugin_sylanne/main.py'
-          )
-          mod = importlib.util.module_from_spec(spec)
-          sys.modules['main'] = mod
-          spec.loader.exec_module(mod)
-          print('Extracted zip import OK')
-          "
-
-      - name: Upload artifact
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v7
-        with:
-          name: plugin-zip
-          path: dist/plugin.zip
+      - name: Verify AstrBot host adapter
+        run: python rewrite/tools/verify_host.py

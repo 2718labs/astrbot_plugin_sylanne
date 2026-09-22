@@ -1,11 +1,17 @@
 {
-  "include": ["sylanne_alpha/**/*.py"],
-  "exclude": ["**/tests/**", "docs/**", "scripts/**"],
+  "include": [
+    "main.py",
+    "rewrite/sylanne3",
+    "rewrite/tests",
+    "rewrite/host_tests",
+    "rewrite/tools"
+  ],
+  "exclude": [
+    "rewrite/artifacts",
+    "rewrite/native/target"
+  ],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
   "reportMissingImports": "none",
-  "reportMissingModuleSource": "none",
-  "reportOptionalMemberAccess": "warning",
-  "reportAttributeAccessIssue": "warning",
-  "reportGeneralClassIssues": "none",
-  "pythonVersion": "3.10",
-  "typeCheckingMode": "basic"
+  "reportMissingModuleSource": "none"
 }

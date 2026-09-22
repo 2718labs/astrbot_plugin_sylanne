@@ -1,25 +1,15 @@
 name: astrbot_plugin_sylanne
-display_name: Sylanne
-desc: "面向 AstrBot 的长期记忆、关系状态建模与即时聊天插件，提供情感状态计算、认知编排、生活模拟、主动消息及 WebUI 观测能力；高风险可选功能默认关闭。"
-short_desc: "Embodiment-2.5.1 — Sylanne 长期记忆、关系状态建模与即时聊天"
-version: "2.5.1"
+display_name: Sylanne 3 Development Adapter
+desc: "显式 /sylanne3 命令的隔离开发适配器，默认关闭。"
+short_desc: "Sylanne 3 隔离开发入口"
+version: "3.0.0-dev.1"
 author: 2718-labs
 license: AGPL-3.0-or-later
-repo: "https://github.com/Ayleovelle/astrbot_plugin_sylanne"
+repo: "https://github.com/2718labs/astrbot_plugin_sylanne"
 support_platforms: []
-astrbot_version: ">=4.26,<5.0.0"
-tested_astrbot_version: "4.26.7"
-
-# Item 111: 插件市场元数据规范 v2
+astrbot_version: ">=4.28.1,<5.0.0"
+tested_astrbot_version: "4.28.1"
 compatibility_matrix:
-  min_python: "3.10"
-  max_python: "3.13"
-  tested_platforms: ["linux", "windows"]
-resource_budget:
-  memory_mb: 100
-  cpu_percent: 5
-  disk_mb: 50
-personality_impact:
-  modifies_personality: true
-  modifies_memory: true
-  modifies_proactive: true
+  min_python: "3.11"
+  tested_python: ["3.13"]
+  tested_platforms: ["windows"]
