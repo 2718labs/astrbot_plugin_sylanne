@@ -115,6 +115,12 @@ pub(crate) struct JointVerificationEnvelope {
     pub(crate) energy_before: Interval,
     pub(crate) energy_after: Interval,
     pub(crate) energy_difference: Interval,
+    pub(crate) gradient_displacement: Interval,
+    pub(crate) dissipation: Interval,
+    pub(crate) drive_work: Interval,
+    pub(crate) residual_work: Interval,
+    pub(crate) gradient_identity_defect: Interval,
+    pub(crate) energy_balance_defect: Interval,
     pub(crate) operator_bounds: OperatorBounds,
 }
 
@@ -234,6 +240,22 @@ pub(crate) fn verify_joint_step(
     let energy_before = energy(input.k, input.a, input.alpha, &x, &ax)?;
     let energy_after = energy(input.k, input.a, input.alpha, &y, &ay)?;
     let energy_difference = finite_interval(energy_after.sub(energy_before)?)?;
+    let mut displacement = Vec::with_capacity(n);
+    for index in 0..n {
+        displacement.push(finite_interval(y[index].sub(x[index])?)?);
+    }
+    let gradient_displacement = interval_dot(&gradient, &displacement)?;
+    let dissipation =
+        finite_interval(Interval::point(-input.h)?.mul(interval_dot(&gradient, &rg)?)?)?;
+    let drive_work = finite_interval(step.mul(interval_dot(&gradient, &drive)?)?)?;
+    let residual_work = interval_dot(&gradient, &residual_components)?;
+    let gradient_identity_defect = finite_interval(energy_difference.sub(gradient_displacement)?)?;
+    let energy_balance_defect = finite_interval(
+        energy_difference
+            .sub(dissipation)?
+            .sub(drive_work)?
+            .sub(residual_work)?,
+    )?;
 
     Ok(JointVerificationEnvelope {
         gradient,
@@ -242,6 +264,12 @@ pub(crate) fn verify_joint_step(
         energy_before,
         energy_after,
         energy_difference,
+        gradient_displacement,
+        dissipation,
+        drive_work,
+        residual_work,
+        gradient_identity_defect,
+        energy_balance_defect,
         operator_bounds: OperatorBounds {
             k_coercivity_lower,
             r_coercivity_lower,
@@ -250,6 +278,51 @@ pub(crate) fn verify_joint_step(
             j_row_abs_upper,
             a_row_abs_upper,
         },
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LinearReadout {
+    pub(crate) point: Interval,
+    pub(crate) enclosure: Interval,
+    /// -1: strictly below; 0: threshold may be crossed; 1: strictly above.
+    pub(crate) threshold_relation: i32,
+}
+
+/// An arithmetic enclosure for c^T y and an externally supplied state error.
+/// The caller's error provenance is not authenticated by this function.
+pub(crate) fn linear_readout(
+    y: &[f64],
+    c: &[f64],
+    error_upper: f64,
+    threshold: f64,
+) -> Result<LinearReadout, VerifierError> {
+    if y.is_empty() || y.len() != c.len() || y.len() > MAX_VERIFIED_N {
+        return Err(VerifierError::InvalidDimension);
+    }
+    validate_state(y)?;
+    validate_state(c)?;
+    if !error_upper.is_finite() || error_upper < 0.0 {
+        return Err(VerifierError::InvalidInheritedError);
+    }
+    if !threshold.is_finite() {
+        return Err(VerifierError::InvalidState);
+    }
+    let point = interval_dot(&point_vector(c)?, &point_vector(y)?)?;
+    let radius =
+        finite_interval(interval_l2_norm(&point_vector(c)?)?.mul(Interval::point(error_upper)?)?)?;
+    let enclosure = finite_interval(point.add(Interval::new(-radius.upper(), radius.upper())?)?)?;
+    let threshold_relation = if enclosure.upper() < threshold {
+        -1
+    } else if enclosure.lower() > threshold {
+        1
+    } else {
+        0
+    };
+    Ok(LinearReadout {
+        point,
+        enclosure,
+        threshold_relation,
     })
 }
 
@@ -559,6 +632,17 @@ fn interval_l2_norm(values: &[Interval]) -> Result<Interval, VerifierError> {
     finite_interval(sum.sqrt()?)
 }
 
+fn interval_dot(lhs: &[Interval], rhs: &[Interval]) -> Result<Interval, VerifierError> {
+    if lhs.len() != rhs.len() {
+        return Err(VerifierError::InvalidDimension);
+    }
+    let mut sum = Interval::point(0.0)?;
+    for (left, right) in lhs.iter().zip(rhs) {
+        sum = finite_interval(sum.add(left.mul(*right)?)?)?;
+    }
+    Ok(sum)
+}
+
 fn finite_interval(value: Interval) -> Result<Interval, VerifierError> {
     if value.lower().is_finite() && value.upper().is_finite() {
         Ok(value)
@@ -580,6 +664,45 @@ mod tests {
 
     fn scalar_matrix<'a>(value: &'a [f64]) -> SparseMatrix<'a> {
         SparseMatrix::new(1, 1, &[0, 1], &[0], value)
+    }
+
+    #[test]
+    fn energy_ledger_and_readout_enclose_scalar_balance_and_crossing() {
+        let k = [2.0];
+        let r = [1.0];
+        let input = JointVerificationInput {
+            k: scalar_matrix(&k),
+            r: scalar_matrix(&r),
+            j: SparseMatrix::new(1, 1, &[0, 0], &[], &[]),
+            a: SparseMatrix::new(0, 1, &[0], &[], &[]),
+            alpha: &[],
+            x: &[0.4],
+            y: &[0.35],
+            h: 0.1,
+            drive: &[0.0],
+        };
+        let envelope = verify_joint_step(&input).unwrap();
+        contains(
+            envelope.energy_difference,
+            0.35_f64.powi(2) - 0.4_f64.powi(2),
+        );
+        contains(envelope.gradient_displacement, 0.75 * -0.05);
+        contains(envelope.dissipation, -0.1 * 0.75 * 0.75);
+        contains(envelope.drive_work, 0.0);
+        contains(envelope.residual_work, 0.75 * 0.025);
+        contains(envelope.gradient_identity_defect, 0.0);
+        contains(envelope.energy_balance_defect, 0.0);
+        let readout = linear_readout(&[0.35], &[2.0], 0.1, 0.7).unwrap();
+        contains(readout.point, 0.7);
+        contains(readout.enclosure, 0.5);
+        contains(readout.enclosure, 0.9);
+        assert_eq!(readout.threshold_relation, 0);
+        assert_eq!(
+            linear_readout(&[0.35], &[2.0], 0.0, 1.0)
+                .unwrap()
+                .threshold_relation,
+            -1
+        );
     }
 
     #[test]

@@ -14,8 +14,20 @@ from .loader import (
     NativePlatformError,
     load_production_native,
 )
+from .arithmetic_report import (
+    ArithmeticReport,
+    ArithmeticReportLibrary,
+    RawArithmeticReport,
+    ReportInput,
+    parse_arithmetic_report,
+)
 
 __all__ = [
+    "ArithmeticReport",
+    "ArithmeticReportLibrary",
+    "RawArithmeticReport",
+    "ReportInput",
+    "parse_arithmetic_report",
     "ABI2CSR",
     "ABI2NativeLibrary",
     "ABI2ResultError",

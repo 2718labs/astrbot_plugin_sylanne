@@ -4,6 +4,7 @@ use std::slice;
 
 // Arithmetic foundation only; ABI2 certificates stay disabled until the
 // independent nonlinear verifier and strict-build evidence are complete.
+mod arithmetic_report;
 #[allow(dead_code)]
 mod interval;
 #[allow(dead_code)]
