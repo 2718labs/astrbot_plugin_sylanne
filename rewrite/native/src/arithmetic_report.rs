@@ -1,10 +1,10 @@
-//! Version 1 mathematical-input arithmetic report. This is not an ABI2 step
-//! certificate or product receipt. The caller owns all input buffers for the
+//! Version 1 mathematical-input arithmetic reports. These are not ABI2 step
+//! certificates or product receipts. The caller owns all input buffers for the
 //! entire synchronous call and must not mutate them or overlap the output.
 use crate::interval::Interval;
 use crate::interval_verifier::{
-    linear_readout, verify_joint_error_bounds, verify_joint_step, JointVerificationInput,
-    SparseMatrix,
+    linear_readout, verify_fixed_trajectory, verify_joint_error_bounds, verify_joint_step,
+    JointVerificationInput, SparseMatrix,
 };
 use sha2::{Digest, Sha256};
 use std::{mem, ptr, slice};
@@ -12,6 +12,7 @@ use std::{mem, ptr, slice};
 const VERSION: u32 = 1;
 const MAX_N: usize = 64;
 const MAX_NNZ: usize = 4_096;
+const MAX_TRAJECTORY_STEPS: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -82,6 +83,39 @@ pub struct ArithmeticReport {
     readout_point: ReportInterval,
     readout_enclosure: ReportInterval,
     threshold_relation: i32,
+}
+
+/// One mathematical step of the received fixed CSR block. The first x is the
+/// mathematical initial condition; the native verifier checks all later x/y
+/// links and derives every inherited error itself.
+#[repr(C)]
+pub struct TrajectoryMathStep {
+    struct_size: u32,
+    version: u32,
+    n: u32,
+    k: ReportCsr,
+    r: ReportCsr,
+    j: ReportCsr,
+    a: ReportCsr,
+    alpha: *const f64,
+    x: *const f64,
+    y: *const f64,
+    drive: *const f64,
+    h: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TrajectoryMathReport {
+    struct_size: u32,
+    version: u32,
+    status: i32, // 0 mathematical success; -1 layout/input; -2 numerical rejection
+    product_certificate_flags: u32, // always zero: external source and graph closure unverified
+    steps_verified: u32,
+    input_sha256: [u8; 32],
+    final_time_error: ReportInterval,
+    max_endpoint_error: ReportInterval,
+    max_reconstruction_defect: ReportInterval,
 }
 
 #[no_mangle]
@@ -291,4 +325,199 @@ pub unsafe extern "C" fn sylanne3_arithmetic_report_v1(
     report.status = 0;
     ptr::write(output, report);
     0
+}
+
+/// Recheck a bounded fixed-model mathematical trajectory with no caller-supplied
+/// inherited error. This report binds the checked bytes but does not establish
+/// the initial state's external origin or whole-graph closure.
+///
+/// # Safety
+/// The step array and all referenced buffers must remain live, aligned and
+/// immutable through the call. Output must be exclusive and non-overlapping.
+#[no_mangle]
+pub unsafe extern "C" fn sylanne3_v2_trajectory_math_report_v1(
+    steps: *const TrajectoryMathStep,
+    step_count: u32,
+    output: *mut TrajectoryMathReport,
+    output_size: u32,
+) -> i32 {
+    if !aligned(output) || output_size as usize != mem::size_of::<TrajectoryMathReport>() {
+        return -1;
+    }
+    let mut report = TrajectoryMathReport {
+        struct_size: mem::size_of::<TrajectoryMathReport>() as u32,
+        version: VERSION,
+        status: -1,
+        ..TrajectoryMathReport::default()
+    };
+    ptr::write(output, report);
+    if !aligned(steps) || !(1..=MAX_TRAJECTORY_STEPS).contains(&(step_count as usize)) {
+        return -1;
+    }
+    let raw_steps = slice::from_raw_parts(steps, step_count as usize);
+    let mut numerical_steps = Vec::with_capacity(raw_steps.len());
+    for raw in raw_steps {
+        let n = raw.n as usize;
+        if raw.struct_size as usize != mem::size_of::<TrajectoryMathStep>()
+            || raw.version != VERSION
+            || !(1..=MAX_N).contains(&n)
+            || raw.a.rows as usize > MAX_N
+        {
+            return -1;
+        }
+        let (Some(k), Some(r), Some(j), Some(a)) = (
+            matrix(raw.k, n, n),
+            matrix(raw.r, n, n),
+            matrix(raw.j, n, n),
+            matrix(raw.a, raw.a.rows as usize, n),
+        ) else {
+            return -1;
+        };
+        let (Some(alpha), Some(x), Some(y), Some(drive)) = (
+            vector(raw.alpha, raw.a.rows as usize),
+            vector(raw.x, n),
+            vector(raw.y, n),
+            vector(raw.drive, n),
+        ) else {
+            return -1;
+        };
+        numerical_steps.push(JointVerificationInput {
+            k,
+            r,
+            j,
+            a,
+            alpha,
+            x,
+            y,
+            h: raw.h,
+            drive,
+        });
+    }
+    let Ok(verified) = verify_fixed_trajectory(&numerical_steps) else {
+        report.status = -2;
+        ptr::write(output, report);
+        return -2;
+    };
+    let max_endpoint = verified
+        .steps
+        .iter()
+        .map(|step| step.endpoint_error.upper())
+        .fold(0.0_f64, f64::max);
+    let max_defect = verified
+        .steps
+        .iter()
+        .map(|step| step.reconstruction_defect.upper())
+        .fold(0.0_f64, f64::max);
+    report.steps_verified = step_count;
+    report.input_sha256 = verified.input_sha256;
+    report.final_time_error = verified.final_time_error.into();
+    report.max_endpoint_error = ReportInterval {
+        lower: 0.0,
+        upper: max_endpoint,
+    };
+    report.max_reconstruction_defect = ReportInterval {
+        lower: 0.0,
+        upper: max_defect,
+    };
+    report.status = 0;
+    ptr::write(output, report);
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffi_trajectory_derives_history_and_rejects_forged_link() {
+        let offsets = [0, 1];
+        let indices = [0];
+        let values = [1.0];
+        let empty_offsets = [0, 0];
+        let empty_a_offsets = [0];
+        let positive = ReportCsr {
+            rows: 1,
+            cols: 1,
+            nnz: 1,
+            offsets: offsets.as_ptr(),
+            indices: indices.as_ptr(),
+            values: values.as_ptr(),
+        };
+        let empty = ReportCsr {
+            rows: 1,
+            cols: 1,
+            nnz: 0,
+            offsets: empty_offsets.as_ptr(),
+            indices: ptr::null(),
+            values: ptr::null(),
+        };
+        let no_nonlinear = ReportCsr {
+            rows: 0,
+            cols: 1,
+            nnz: 0,
+            offsets: empty_a_offsets.as_ptr(),
+            indices: ptr::null(),
+            values: ptr::null(),
+        };
+        let x0 = [1.0];
+        let y0 = [0.9];
+        let x1 = [0.9];
+        let y1 = [0.82];
+        let changed_y1 = [0.83];
+        let drive = [0.0];
+        let step = |x: &[f64; 1], y: &[f64; 1]| TrajectoryMathStep {
+            struct_size: mem::size_of::<TrajectoryMathStep>() as u32,
+            version: VERSION,
+            n: 1,
+            k: positive,
+            r: positive,
+            j: empty,
+            a: no_nonlinear,
+            alpha: ptr::null(),
+            x: x.as_ptr(),
+            y: y.as_ptr(),
+            drive: drive.as_ptr(),
+            h: 0.1,
+        };
+        let mut steps = [step(&x0, &y0), step(&x1, &y1)];
+        let mut report = TrajectoryMathReport::default();
+        let size = mem::size_of::<TrajectoryMathReport>() as u32;
+        assert_eq!(
+            unsafe { sylanne3_v2_trajectory_math_report_v1(steps.as_ptr(), 2, &mut report, size) },
+            0
+        );
+        assert_eq!(report.product_certificate_flags, 0);
+        assert_eq!(report.steps_verified, 2);
+        assert!(report.final_time_error.upper >= (0.82 - (-0.2_f64).exp()).abs());
+        assert!(report.max_endpoint_error.upper > 0.0);
+        let mut reset_report = TrajectoryMathReport::default();
+        assert_eq!(
+            unsafe {
+                sylanne3_v2_trajectory_math_report_v1(
+                    steps.as_ptr().add(1),
+                    1,
+                    &mut reset_report,
+                    size,
+                )
+            },
+            0
+        );
+        assert!(report.final_time_error.upper > reset_report.final_time_error.upper);
+        let original_hash = report.input_sha256;
+        steps[1].y = changed_y1.as_ptr();
+        assert_eq!(
+            unsafe { sylanne3_v2_trajectory_math_report_v1(steps.as_ptr(), 2, &mut report, size) },
+            0
+        );
+        assert_ne!(report.input_sha256, original_hash);
+
+        steps[1].x = x0.as_ptr();
+        assert_eq!(
+            unsafe { sylanne3_v2_trajectory_math_report_v1(steps.as_ptr(), 2, &mut report, size) },
+            -2
+        );
+        assert_eq!(report.product_certificate_flags, 0);
+        assert_eq!(report.steps_verified, 0);
+        assert_eq!(report.input_sha256, [0; 32]);
+    }
 }
