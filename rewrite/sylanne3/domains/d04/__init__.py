@@ -25,6 +25,7 @@ from .affect import (
     SelfUnderstanding,
     UnresolvedMechanism,
 )
+from .encoding_baseline import CommittedRef, EncodingBaseline
 
 __all__ = (
     "AdvanceRequirements",
@@ -50,4 +51,6 @@ __all__ = (
     "SemanticDriveRule",
     "SelfUnderstanding",
     "UnresolvedMechanism",
+    "CommittedRef",
+    "EncodingBaseline",
 )

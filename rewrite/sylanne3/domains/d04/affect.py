@@ -18,6 +18,7 @@ from ...runtime_contracts import (
     RUNTIME_SCHEMA,
     schema_hash,
 )
+from .encoding_baseline import EncodingBaseline, decode_encoding_baseline
 
 
 def _nonempty(value: object, label: str) -> str:
@@ -723,6 +724,7 @@ class AffectProvider:
             "d04.regulation_attempt.v1",
             "d04.regulation_observation.v1",
             "d04.recollection_experience.v1",
+            "d04.encoding_baseline.v1",
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
@@ -734,6 +736,7 @@ class AffectProvider:
             ("d04.regulation_attempt.v1", ("activity",), "state", _decode_regulation_attempt),
             ("d04.regulation_observation.v1", ("activity",), "state", _decode_regulation_observation),
             ("d04.recollection_experience.v1", ("activity",), "source", _decode_recollection_experience),
+            ("d04.encoding_baseline.v1", ("event",), "source", decode_encoding_baseline),
         )
         return tuple(
             TypeSpec(
@@ -741,7 +744,7 @@ class AffectProvider:
                 owner_kinds=owner_kinds,
                 storage_role=storage_role,
                 validator=validator,
-                immutable=name == "d04.recollection_experience.v1",
+                immutable=name in {"d04.recollection_experience.v1", "d04.encoding_baseline.v1"},
                 writer_domain="d04",
                 schema_hash=schema_hash({"type": name, "version": 1, "writer_domain": "d04"}),
             )
@@ -1311,6 +1314,44 @@ class AffectProvider:
                 or decoded.activity_id != proposal.envelope.identity.activity_id
             ):
                 raise ValueError("recollection experience identity differs from its activity write")
+            if isinstance(decoded, EncodingBaseline):
+                if not isinstance(snapshot, GraphSnapshot):
+                    raise ValueError("encoding baseline requires a committed graph snapshot")
+                source = AtomKey.from_token(decoded.source_refs[0])
+                if (write.key.name != decoded.baseline_id
+                        or write.key.owner.kind != "event"
+                        or (write.key.owner.bot, write.key.owner.persona)
+                        != (source.owner.bot, source.owner.persona)):
+                    raise ValueError("encoding baseline identity differs from its graph write")
+                if not set(decoded.source_refs) <= set(proposal.envelope.source_qualification.source_refs):
+                    raise ValueError("encoding baseline sources exceed source qualification")
+                guarded = {item.key: item for item in proposal.envelope.version_guard.read_versions}
+                historical = {item.key: item for item in proposal.dependencies.historical_provenance}
+                if (len(guarded) != len(proposal.envelope.version_guard.read_versions)
+                        or len(historical) != len(proposal.dependencies.historical_provenance)):
+                    raise ValueError("encoding baseline read proofs must not repeat keys")
+                if guarded.get(write.key) != GraphVersion(write.key, 0):
+                    raise ValueError("encoding baseline requires a revision-0 write guard")
+                refs = tuple(AtomKey.from_token(token) for token in (
+                    *decoded.source_refs, decoded.perspective_ref,
+                    *(item.ref for item in decoded.then_feeling_versions),
+                    *(item.ref for item in decoded.interpretation_versions),
+                ))
+                versions = {
+                    AtomKey.from_token(item.ref): item.revision
+                    for item in (*decoded.then_feeling_versions, *decoded.interpretation_versions)
+                }
+                if not set(refs) <= set(write.dependencies):
+                    raise ValueError("encoding baseline graph dependencies omit referenced atoms")
+                for key in refs:
+                    proof = guarded.get(key)
+                    if (proof is None or proof.revision < 1
+                            or (key in versions and proof.revision != versions[key])
+                            or historical.get(key) != proof):
+                        raise ValueError("encoding baseline references lack committed guarded provenance")
+                decoded.verify_committed_refs(snapshot)
+                if any(snapshot.get(key).revision != guarded[key].revision for key in refs):
+                    raise ValueError("encoding baseline graph snapshot differs from guarded revisions")
             decoded_writes.append(decoded)
         if proposal.typed_writes:
             scheme = snapshot if isinstance(snapshot, AffectScheme) else (
