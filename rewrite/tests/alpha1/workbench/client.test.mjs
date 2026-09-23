@@ -10,7 +10,7 @@ test("client posts to the AstrBot plugin extension route with host cookie and CS
   const api = new WorkbenchApi({ fetchImpl: async (url, init) => {
     requested.push({ url, init });
     return { ok: true, json: async () => init.method === "GET"
-      ? { status: "ready", csrf_token: "server-issued" }
+      ? { status: "ready", dashboard_session: "authenticated", owner_session: "unlocked", csrf_token: "server-issued" }
       : { status: "unavailable", problem: { code: "provider_unavailable" } } };
   } });
   await api.command(ACTIONS.openWorkspace, { scope: "role-1", purpose: "workbench_view", input: { client_protocol: D12_SCHEMA_VERSION } });
@@ -38,25 +38,25 @@ test("installation status uses the host session without opening Owner session", 
 
 test("client displays a D12 problem from an HTTP error", async () => {
   const api = new WorkbenchApi({ fetchImpl: async (_url, init) => init.method === "GET"
-    ? { ok: true, json: async () => ({ status: "ready", csrf_token: "server-issued" }) }
+    ? { ok: true, json: async () => ({ status: "ready", dashboard_session: "authenticated", owner_session: "unlocked", csrf_token: "server-issued" }) }
     : { ok: false, status: 403, json: async () => ({ status: "unauthorized", problem: { code: "csrf_denied", message: "防跨站校验未通过。", retryable: false } }) } });
   await assert.rejects(api.command(ACTIONS.openWorkspace, { scope: "role-1", purpose: "workbench_view" }),
     (error) => error instanceof WorkbenchApiError && error.status === 403 && error.code === "csrf_denied" && error.message === "防跨站校验未通过。");
   assert.equal(api.hasSession, false);
 });
 
-test("unpaired session prevents POST and can be retried after pairing", async () => {
+test("locked Owner session prevents POST and can be retried after login", async () => {
   let paired = false;
   const requests = [];
   const api = new WorkbenchApi({ fetchImpl: async (_url, init) => {
     requests.push(init.method);
     if (init.method === "GET") return paired
-      ? { ok: true, json: async () => ({ status: "ready", csrf_token: "fresh" }) }
-      : { ok: false, status: 401, json: async () => ({ status: "unauthorized", problem: { code: "session_unbound", message: "工作台会话未建立。" } }) };
+      ? { ok: true, json: async () => ({ status: "ready", dashboard_session: "authenticated", owner_session: "unlocked", csrf_token: "fresh" }) }
+      : { ok: false, status: 401, json: async () => ({ status: "unauthorized", problem: { code: "owner_session_locked", message: "Owner 会话未解锁。" } }) };
     assert.equal(init.headers["x-csrf-token"], "fresh");
     return { ok: true, json: async () => ({ status: "ready", projection: {} }) };
   } });
-  await assert.rejects(api.command(ACTIONS.openWorkspace, { scope: "role-1" }), (error) => error.code === "session_unbound");
+  await assert.rejects(api.command(ACTIONS.openWorkspace, { scope: "role-1" }), (error) => error.code === "owner_session_locked");
   assert.deepEqual(requests, ["GET"]);
   paired = true;
   await api.command(ACTIONS.openWorkspace, { scope: "role-1" });
@@ -66,7 +66,7 @@ test("unpaired session prevents POST and can be retried after pairing", async ()
 test("expired CSRF clears in-memory token and the next attempt gets a new one", async () => {
   let issues = 0;
   const api = new WorkbenchApi({ fetchImpl: async (_url, init) => {
-    if (init.method === "GET") return { ok: true, json: async () => ({ status: "ready", csrf_token: `token-${++issues}` }) };
+    if (init.method === "GET") return { ok: true, json: async () => ({ status: "ready", dashboard_session: "authenticated", owner_session: "unlocked", csrf_token: `token-${++issues}` }) };
     if (issues === 1) return { ok: false, status: 403, json: async () => ({ status: "unauthorized", problem: { code: "csrf_denied" } }) };
     assert.equal(init.headers["x-csrf-token"], "token-2");
     return { ok: true, json: async () => ({ status: "ready", projection: {} }) };
@@ -75,6 +75,13 @@ test("expired CSRF clears in-memory token and the next attempt gets a new one", 
   assert.equal(api.hasSession, false);
   await api.command(ACTIONS.openWorkspace, { scope: "role-1" });
   assert.equal(issues, 2);
+});
+
+test("a legacy ready response without independent Owner proof stays locked", async () => {
+  const api = new WorkbenchApi({ fetchImpl: async () => ({ ok: true, status: 200,
+    json: async () => ({ status: "ready", csrf_token: "old-dashboard-only" }) }) });
+  await assert.rejects(api.openSession(), (error) => error.code === "invalid_session");
+  assert.equal(api.hasSession, false);
 });
 
 test("D12 command request declares contract, scoped action, and an operation id", () => {

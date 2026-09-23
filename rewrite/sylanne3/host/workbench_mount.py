@@ -119,13 +119,13 @@ class WorkbenchHostMount:
                 return json_response(
                     _unavailable("authority_unavailable"), status_code=503, headers=headers,
                 )
-            # The transport verifies a bound dashboard cookie, exact Origin,
-            # per-session CSRF and server-issued scope grants before D12 runs.
+            # The transport rechecks the independent Sylanne Owner session,
+            # exact Origin, CSRF and server-issued scope grants before D12 runs.
             result = await transport.command(request)
             status_code = result.pop("http_status", None)
             if status_code is None:
                 code = (result.get("problem") or {}).get("code")
-                status_code = {"session_unbound": 401, "invalid_request": 400,
+                status_code = {"owner_session_locked": 401, "invalid_request": 400,
                                "invalid_provider_response": 502}.get(code)
                 if status_code is None:
                     status_code = {"unauthorized": 403, "unavailable": 503}.get(
@@ -181,7 +181,7 @@ class WorkbenchHostMount:
             PLUGIN_ROUTE_PREFIX, static, ["GET"], "Sylanne W11 authenticated workbench",
         )
         context.register_web_api(
-            SESSION_ROUTE, session, ["GET"], "Sylanne D12 paired Owner session",
+            SESSION_ROUTE, session, ["GET"], "Sylanne current Owner session",
         )
         context.register_web_api(
             STATUS_ROUTE, status, ["GET"], "Sylanne installation stage",

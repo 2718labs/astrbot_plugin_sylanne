@@ -1,8 +1,8 @@
 """AstrBot Web API adapter for the D12 command service.
 
-The adapter deliberately receives its authority only from the authenticated
-AstrBot request context and a W09 session resolver.  JSON fields never create
-an actor, role, capability, or CSRF exemption.
+The Dashboard login opens the page. Owner commands additionally require a
+current Sylanne Owner session, checked by a trusted resolver on every request.
+JSON fields never create an actor, role, capability, or CSRF exemption.
 """
 from __future__ import annotations
 
@@ -26,11 +26,11 @@ PLUGIN_ROUTE_PREFIX = "/astrbot_plugin_sylanne/workbench"
 COMMAND_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/commands"
 SESSION_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/session"
 ASSET_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/<path:asset>"
-ASTRBOT_DASHBOARD_JWT_COOKIE = "astrbot_dashboard_jwt"
+SYLANNE_OWNER_SESSION_COOKIE = "sylanne_owner_session"
 
 
 class SessionResolver(Protocol):
-    """Resolve a W09-issued session from the host-authenticated username."""
+    """Recheck an independent Owner bearer session for this Dashboard user."""
 
     def resolve(self, *, username: str, session_hint: str | None
                 ) -> AuthenticatedSession | None | Awaitable[AuthenticatedSession | None]: ...
@@ -38,7 +38,7 @@ class SessionResolver(Protocol):
 
 @dataclass(frozen=True)
 class VerifiedOwnerPairing:
-    """One current, independently verified Owner binding for a dashboard login."""
+    """One current Owner session with its independently verified guard."""
 
     session: AuthenticatedSession
     principal: OwnerPrincipalV1
@@ -46,27 +46,32 @@ class VerifiedOwnerPairing:
 
 
 class CurrentOwnerPairingPort(Protocol):
-    """Trusted installation port; query pairing and Authority guard on every request."""
+    """Trusted installation port; recheck the revocable Authority session."""
 
-    def resolve_current_pairing(self, *, username: str, dashboard_jwt_digest: str
+    def resolve_current_owner_session(self, *, username: str, owner_session_token: str
                                 ) -> VerifiedOwnerPairing | None | Awaitable[VerifiedOwnerPairing | None]: ...
 
 
 class CurrentOwnerDashboardSessions:
-    """Bind AstrBot's authenticated host identity to a fresh external Owner."""
+    """Keep the historic constructor name while requiring an Owner session.
+
+    Older Dashboard-JWT pairing ports stay locked. This allows an existing
+    runtime composition to start safely until its Authority session port is
+    installed.
+    """
 
     def __init__(self, pairing: CurrentOwnerPairingPort) -> None:
-        if not callable(getattr(pairing, "resolve_current_pairing", None)):
-            raise TypeError("a trusted current Owner pairing port is required")
-        self._pairing = pairing
+        self._pairing = pairing if callable(
+            getattr(pairing, "resolve_current_owner_session", None)) else None
 
     async def resolve(self, *, username: str,
                       session_hint: str | None) -> AuthenticatedSession | None:
         if (not isinstance(username, str) or not username
-                or not isinstance(session_hint, str) or not session_hint):
+                or not isinstance(session_hint, str) or not session_hint
+                or self._pairing is None):
             return None
-        paired = self._pairing.resolve_current_pairing(
-            username=username, dashboard_jwt_digest=session_hint)
+        paired = self._pairing.resolve_current_owner_session(
+            username=username, owner_session_token=session_hint)
         if inspect.isawaitable(paired):
             paired = await paired
         if not isinstance(paired, VerifiedOwnerPairing):
@@ -106,36 +111,6 @@ class PluginRequest(Protocol):
 class WorkbenchHandler(Protocol):
     def handle(self, payload: object, *, session: AuthenticatedSession | None,
                context: RequestContext) -> ApiResponse | Awaitable[ApiResponse]: ...
-
-
-class BoundDashboardSessions:
-    """W09-owned store binding a validated AstrBot dashboard JWT to a session.
-
-    ``bind_authenticated_dashboard_session`` may only be called by code that
-    has already passed AstrBot's dashboard authentication. The raw JWT is never
-    retained: lookup uses a domain-separated digest and requires the same host
-    cookie on every command. No entry means fail closed.
-    """
-
-    def __init__(self) -> None:
-        self._entries: dict[tuple[str, str], AuthenticatedSession] = {}
-
-    def bind_authenticated_dashboard_session(self, *, username: str, dashboard_jwt: str,
-                                             session: AuthenticatedSession) -> None:
-        if not isinstance(username, str) or not username or not isinstance(dashboard_jwt, str) or not dashboard_jwt:
-            raise ValueError("trusted dashboard identity and JWT are required")
-        if session.host_username not in (None, username) or (
-                session.host_username is None and session.actor_id != username):
-            raise ValueError("session host identity must match the authenticated username")
-        self._entries[(username, _credential_digest(dashboard_jwt))] = session
-
-    def revoke(self, *, username: str, dashboard_jwt: str) -> None:
-        self._entries.pop((username, _credential_digest(dashboard_jwt)), None)
-
-    def resolve(self, *, username: str, session_hint: str | None) -> AuthenticatedSession | None:
-        if not isinstance(session_hint, str) or not session_hint:
-            return None
-        return self._entries.get((username, session_hint))
 
 
 class BoundCsrfTokens:
@@ -195,7 +170,7 @@ class WorkbenchHttpTransport:
         if not isinstance(request.username, str) or not request.username:
             return self._error("unauthorized", "host_session_missing", "AstrBot 未提供已认证会话。", 401)
         if session is None:
-            return self._error("unauthorized", "session_unbound", "工作台会话未建立。", 401)
+            return self._error("unauthorized", "owner_session_locked", "Sylanne Owner 会话未解锁或已失效。", 401)
         if not self._origin_allowed(request):
             return self._error("unauthorized", "origin_denied", "请求来源未获允许。", 403)
         token = request.headers.get("x-csrf-token")
@@ -231,30 +206,30 @@ class WorkbenchHttpTransport:
         if not isinstance(request.username, str) or not request.username:
             return self._error("unauthorized", "host_session_missing", "AstrBot 未提供已认证会话。", 401)
         if session is None:
-            return self._error("unauthorized", "session_unbound", "工作台会话未建立。", 401)
+            return self._error("unauthorized", "owner_session_locked", "Sylanne Owner 会话未解锁或已失效。", 401)
         if not self._session_origin_allowed(request):
             return self._error("unauthorized", "origin_denied", "请求来源未获允许。", 403)
         issue = getattr(self._csrf, "issue", None)
         if not callable(issue):
             return self._error("unavailable", "csrf_unavailable", "防跨站令牌不可用。", 503)
-        return {"status": "ready", "csrf_token": issue(session=session)}
+        return {"status": "ready", "dashboard_session": "authenticated",
+                "owner_session": "unlocked", "csrf_token": issue(session=session)}
 
     async def _bound_session(self, request: PluginRequest) -> AuthenticatedSession | None:
-        # Only the dashboard's authenticated username plus its own cookie can
-        # select a W09-issued session. Neither JSON nor a request header can.
+        # AstrBot authenticates username, while Sylanne's own bearer cookie
+        # identifies the revocable Owner session. JSON/headers cannot supply it.
         username = request.username
         if not isinstance(username, str) or not username:
             return None
-        host_cookie = request.cookies.get(ASTRBOT_DASHBOARD_JWT_COOKIE)
-        if not isinstance(host_cookie, str) or not host_cookie:
+        owner_cookie = request.cookies.get(SYLANNE_OWNER_SESSION_COOKIE)
+        if not isinstance(owner_cookie, str) or not owner_cookie:
             return None
         session = self._sessions.resolve(
-            username=username, session_hint=_credential_digest(host_cookie))
+            username=username, session_hint=owner_cookie)
         if inspect.isawaitable(session):
             session = await session
         return session if isinstance(session, AuthenticatedSession) and (
-            session.host_username == username or (
-                session.host_username is None and session.actor_id == username)) else None
+            session.host_username == username and session.actor_id and session.session_id) else None
 
     def _origin_allowed(self, request: PluginRequest) -> bool:
         origin = request.headers.get("origin")
@@ -300,7 +275,7 @@ class WorkbenchHttpTransport:
             status_code = result.pop("http_status", None)
             if status_code is None:
                 code = (result.get("problem") or {}).get("code")
-                status_code = {"session_unbound": 401, "invalid_request": 400,
+                status_code = {"owner_session_locked": 401, "invalid_request": 400,
                                "invalid_provider_response": 502}.get(code)
                 if status_code is None:
                     status_code = {"unauthorized": 403, "unavailable": 503}.get(result.get("status"), 200)
@@ -309,10 +284,9 @@ class WorkbenchHttpTransport:
         async def serve_asset(asset: str):
             if not isinstance(request.username, str) or not request.username:
                 return error_response("unauthorized", "host_session_missing", "AstrBot 未提供已认证会话。", 401)
-            if await self._bound_session(request) is None:
-                return error_response("unauthorized", "session_unbound", "工作台会话未建立。", 401)
-            # Fetching images/scripts cannot supply a CSRF header. The host
-            # session is required; any supplied Origin must match our origin.
+            # Static assets contain no Owner projection. A Dashboard login can
+            # load the page while its independent Owner session is locked.
+            # Any supplied Origin must still match our origin.
             if request.headers.get("origin") is not None and not self._origin_allowed(request):
                 return error_response("unauthorized", "origin_denied", "请求来源未获允许。", 403)
             path = self.asset_path(asset)

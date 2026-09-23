@@ -1,7 +1,7 @@
 export const VIEW_STATES = Object.freeze(["loading", "empty", "unauthorized", "stale", "partial", "unavailable", "ready"]);
 
 export function initialState() {
-  return { role: null, roleEpoch: 0, view: "setup", projection: null, status: "unavailable", problem: { code: "service_unavailable", message: "尚未核验工作台连接。" }, receipt: null, sessionReady: false };
+  return { role: null, roleEpoch: 0, view: "setup", projection: null, status: "unavailable", problem: { code: "service_unavailable", message: "尚未核验工作台连接。" }, receipt: null, dashboardAuthenticated: true, sessionReady: false };
 }
 
 export function switchRole(state, role) {
@@ -16,6 +16,6 @@ export function applyResponse(state, response) {
 }
 
 export function applyProblem(state, problem) {
-  const status = ["unauthorized", "host_session_missing", "session_unbound", "csrf_denied", "origin_denied"].includes(problem?.code) ? "unauthorized" : "unavailable";
+  const status = ["unauthorized", "host_session_missing", "owner_session_locked", "csrf_denied", "origin_denied"].includes(problem?.code) ? "unauthorized" : "unavailable";
   return { ...state, status, projection: null, problem, receipt: null };
 }

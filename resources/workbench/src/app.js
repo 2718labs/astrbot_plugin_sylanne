@@ -28,6 +28,7 @@ function escapeHtml(value) {
 }
 
 function statusCopy(status, problem) {
+  if (problem?.code === "owner_session_locked") return ["Owner 尚未解锁", "AstrBot 控制台已登录。Sylanne Owner 会话尚未建立或已失效；角色内容和操作保持锁定。"];
   const map = {
     loading: ["正在核验", "正在向服务重新请求权限过滤的投影。"],
     empty: ["暂无内容", "服务已确认这个视图为空；这不表示其他领域也为空。"],
@@ -42,7 +43,7 @@ function statusCopy(status, problem) {
 }
 
 function formMarkup(page) {
-  if (page[0] === "setup") return `<p class="setup-hint">输入已有且获授权的角色范围 ID 后，可向服务端核验连接。当前版本没有可用的角色创建、场景绑定或会话配对入口。</p>`;
+  if (page[0] === "setup") return `<p class="setup-hint">AstrBot 控制台登录只允许打开工作台。Sylanne Owner 还需独立登录，服务端签发可撤销会话后才能读取角色内容。当前工作台尚未接通 Owner 登录入口；接通后请刷新解锁状态。输入角色 ID 不会创建角色或解锁会话。</p>`;
   if (page[0] === "creation") return `<label>方案草稿（JSON 对象，可编辑）<textarea name="draft_json" placeholder='{"fields":{},"field_sources":{}}'></textarea></label><label>已有方案草稿引用（与 JSON 二选一）<input name="draft_ref" placeholder="由已授权草稿提供" /></label><label>已编译候选引用<input name="compiled_scheme_ref" placeholder="采用前由服务签发" /></label><label>操作<select name="mode"><option value="compile">编译候选</option><option value="activate">采用方案</option></select></label>`;
   if (["relations", "memory"].includes(page[0])) return `<label>纠错类型<select name="correction_kind"><option value="source_correction">来源更正</option><option value="interpretation_challenge">解释质疑</option><option value="administrative_edit">创作调整</option></select></label><label>新说明<textarea name="statement" required></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" /></label>`;
   if (["cognition", "action", "expression"].includes(page[0])) return `<label>对象引用<input name="object_ref" required /></label><label>控制请求<input name="control" placeholder="只提交领域可解释的控制请求" /></label>`;
@@ -81,12 +82,13 @@ function setupMarkup() {
     : (installationProblem?.message ?? "正在读取宿主安装状态");
   const steps = [
     ["插件安装与运行", stage, reason],
-    ["宿主与工作台会话", state.sessionReady ? "已核验" : "未核验", state.sessionReady ? "服务端已签发当前会话令牌；角色能力仍以实际目录为准。" : "请登录宿主并完成 Owner 配对，然后重新核验连接。"],
+    ["AstrBot 控制台", state.dashboardAuthenticated ? "已登录" : "登录失效", state.dashboardAuthenticated ? "已认证，可打开工作台和查看安装状态。" : "请重新登录 AstrBot 控制台。"],
+    ["Sylanne Owner", state.sessionReady ? "已解锁" : "锁定", state.sessionReady ? "服务端已复核当前可撤销 Owner 会话；每次命令还会重新复核。" : "需由服务端 Owner 登录入口完成身份认证并签发会话；当前入口尚未接通。"],
     ["角色初始化", "未核验", "当前能力目录不包含角色初始化回执；填写角色 ID 不会创建角色。"],
     ["场景绑定", "未核验", "当前没有绑定成功回执；私聊或群聊不可据此视为已接通。"],
     ["验证对话", "未核验", "尚无真实对话和投递收据；不会自动向聊天场景发消息。"]
   ];
-  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${escapeHtml(detail)}</p></li>`).join("")}</ol><p class="setup-next">${state.role ? "可刷新能力目录；创建与绑定入口需服务端完成后才会开放。" : "先从宿主取得已授权的角色范围；当前浏览器不能自行签发角色。"}</p><button class="quiet" data-command="retry-status">刷新安装状态</button><button class="quiet" data-command="retry-session">重新核验工作台会话</button></div>`;
+  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${escapeHtml(detail)}</p></li>`).join("")}</ol><p class="setup-next">${state.sessionReady ? (state.role ? "可刷新能力目录；创建与绑定入口需服务端完成后才会开放。" : "填写已授权的角色范围后，可读取能力目录。") : "Owner 登录入口需先在服务端接通；当前不能读取角色内容或提交操作。"}</p><button class="quiet" data-command="retry-status">刷新安装状态</button><button class="quiet" data-command="retry-session">重新核验 Owner 会话</button></div>`;
 }
 
 function render() {
@@ -95,28 +97,28 @@ function render() {
     ? ["工作台会话已核验", "角色初始化、场景绑定与验证对话仍需各自的真实回执。"]
     : statusCopy(state.status, state.problem);
   const sessionVerified = state.sessionReady;
-  const body = state.view === "setup" ? setupMarkup() : state.projection
+  const body = state.view === "setup" ? setupMarkup() : sessionVerified && state.projection
     ? `<pre class="projection" aria-label="服务返回的权限过滤投影">${escapeHtml(JSON.stringify(state.projection, null, 2))}</pre>`
-    : `<section class="empty-state" aria-live="polite"><div class="empty-mark" aria-hidden="true">◇</div><h2>${statusTitle}</h2><p>${statusDetail}</p><button class="primary" data-command="refresh" ${state.role ? "" : "disabled"}>重新请求投影</button></section>`;
+    : `<section class="empty-state" aria-live="polite"><div class="empty-mark" aria-hidden="true">◇</div><h2>${sessionVerified ? statusTitle : "Owner 尚未解锁"}</h2><p>${sessionVerified ? statusDetail : "Sylanne Owner 会话尚未核验。请先完成服务端登录，再刷新解锁状态。"}</p><button class="primary" data-command="refresh" ${state.role && sessionVerified ? "" : "disabled"}>重新请求投影</button></section>`;
   app.innerHTML = `
     <div class="shell">
       <header class="topbar">
         <button class="menu-button" data-command="menu" aria-expanded="false" aria-controls="sidebar">菜单</button>
         <label class="role-picker">当前角色 <input id="role-input" value="${escapeHtml(state.role ?? "")}" placeholder="输入角色范围 ID" autocomplete="off" /></label>
         <button class="quiet" data-command="switch-role">切换角色</button>
-        <p class="session-status ${sessionVerified ? "verified" : ""}" role="status"><span aria-hidden="true">●</span> ${sessionVerified ? "当前请求已通过服务端核验" : "工作台会话尚未核验"}</p>
+        <p class="session-status ${sessionVerified ? "verified" : ""}" role="status"><span aria-hidden="true">●</span> AstrBot ${state.dashboardAuthenticated ? "已登录" : "登录失效"} · Sylanne Owner ${sessionVerified ? "已解锁" : "锁定"}</p>
       </header>
       <aside id="sidebar" class="sidebar" aria-label="工作台导航">
         <div class="brand">Sylanne <span>角色工作台</span></div>
         <nav>${pages.map(([id, label]) => `<button class="nav-item ${id === state.view ? "selected" : ""}" data-view="${id}" aria-current="${id === state.view ? "page" : "false"}">${label}</button>`).join("")}</nav>
-        <p class="sidebar-note">浏览器不保存私密原文。撤权或切换角色时立即清空当前投影。</p>
+        <p class="sidebar-note">浏览器不保存私密原文。会话复核失败或切换角色时清空当前投影。</p>
       </aside>
       <main id="workspace" tabindex="-1">
-        <div class="title-row"><div><h1>${page[1]}</h1><p>${page[2]}</p></div><button class="quiet" data-command="open-workspace">刷新能力目录</button></div>
+        <div class="title-row"><div><h1>${page[1]}</h1><p>${page[2]}</p></div><button class="quiet" data-command="open-workspace" ${sessionVerified ? "" : "disabled"}>刷新能力目录</button></div>
         <div class="state-banner state-${state.status}" role="status"><strong>${statusTitle}</strong><span>${statusDetail}</span></div>
         <div class="workspace-grid"><section class="projection-panel">${body}</section>
           <aside class="inspector" aria-label="操作面板"><h2>操作</h2><p>操作由服务端能力、当前作用域和版本核验。页面不会直接改图或调用平台发送。</p>
-          <form id="page-form">${formMarkup(page)}<button type="button" class="primary" data-command="page-action" ${state.role && state.status !== "loading" ? "" : "disabled"}>${page[0] === "setup" ? "核验当前连接" : page[3] === "read" ? "读取当前视图" : "提交给服务端"}</button></form>
+          <form id="page-form">${formMarkup(page)}<button type="button" class="primary" data-command="page-action" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>${page[0] === "setup" ? "核验当前连接" : page[3] === "read" ? "读取当前视图" : "提交给服务端"}</button></form>
           <dl><dt>操作收据</dt><dd>${escapeHtml(state.receipt?.operation_id ?? "尚无")}</dd><dt>状态</dt><dd>${escapeHtml(state.receipt?.phase ?? statusTitle)}</dd></dl></aside>
         </div>
       </main>
@@ -137,6 +139,7 @@ async function loadView() {
   } catch (error) {
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
   render();
@@ -189,6 +192,7 @@ async function commandAction(action, input, purpose = "workbench_user_action") {
   } catch (error) {
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
   render();
@@ -208,6 +212,7 @@ async function verifySession(refreshRole = false) {
   try {
     await api.openSession();
     state.sessionReady = true;
+    state.dashboardAuthenticated = true;
     if (refreshRole && state.role) return loadView();
     if (!state.role) {
       state.status = "unavailable";
@@ -215,6 +220,7 @@ async function verifySession(refreshRole = false) {
     }
   } catch (error) {
     state.sessionReady = false;
+    if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
   render();
@@ -227,6 +233,7 @@ async function verifyInstallationStatus() {
   } catch (error) {
     installation = null;
     installationProblem = normalizeError(error);
+    if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
   }
   render();
 }

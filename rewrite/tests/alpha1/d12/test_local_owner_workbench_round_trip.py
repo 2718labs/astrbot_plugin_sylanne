@@ -1,4 +1,4 @@
-"""A paired dashboard command reaches the real graph through a separate Authority DB."""
+"""An independently checked Owner session reaches the real graph."""
 
 from dataclasses import replace
 import json
@@ -17,8 +17,8 @@ from sylanne3.host.workbench_mount import WorkbenchHostMount
 from sylanne3.runtime_context import RuntimeContext
 from sylanne3.runtime_contracts import canonical_digest
 from sylanne3.workbench_api.http_transport import (
-    ASTRBOT_DASHBOARD_JWT_COOKIE, COMMAND_ROUTE, SESSION_ROUTE,
-    VerifiedOwnerPairing, _credential_digest,
+    SYLANNE_OWNER_SESSION_COOKIE, COMMAND_ROUTE, SESSION_ROUTE,
+    VerifiedOwnerPairing,
 )
 from sylanne3.workbench_api.onboarding import TrustedCreateCharacter
 from sylanne3.workbench_api.service import AuthenticatedSession
@@ -36,7 +36,8 @@ class _Request:
     def __init__(self, body=b"", *, token=None, session=False):
         self.username = "dashboard-admin"
         self.content_type = "application/json"
-        self.cookies = {ASTRBOT_DASHBOARD_JWT_COOKIE: "dashboard-jwt"}
+        self.cookies = {"astrbot_dashboard_jwt": "dashboard-jwt",
+                        SYLANNE_OWNER_SESSION_COOKIE: "owner-token"}
         self.headers = ({"referer": "https://dashboard.local/workbench"}
                         if session else {"origin": "https://dashboard.local",
                                          "x-csrf-token": token})
@@ -128,9 +129,9 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         class Pairing:
             current = True
 
-            def resolve_current_pairing(self, *, username, dashboard_jwt_digest):
+            def resolve_current_owner_session(self, *, username, owner_session_token):
                 if (not self.current or username != "dashboard-admin"
-                        or dashboard_jwt_digest != _credential_digest("dashboard-jwt")):
+                        or owner_session_token != "owner-token"):
                     return None
                 anchor = service.current_anchor(
                     credential=owner_case.WORKER, subject=owner_case.SUBJECT)

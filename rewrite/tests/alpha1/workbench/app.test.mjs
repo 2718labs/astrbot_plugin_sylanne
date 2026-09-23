@@ -25,11 +25,14 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [] } = 
         const body = statusResponses[statusRequests++] ?? { schema_version: "sylanne.install-status.v1", runtime_stage: "limited", reason_code: "runtime_unavailable" };
         return { ok: true, status: 200, json: async () => body };
       }
-      const body = sessionResponses[sessionRequests++] ?? { status: "ready", csrf_token: "issued" };
+      const body = sessionResponses[sessionRequests++] ?? { status: "ready", dashboard_session: "authenticated", owner_session: "unlocked", csrf_token: "issued" };
       return { ok: body.status === "ready", status: body.status === "ready" ? 200 : 401, json: async () => body };
     }
     return new Promise((resolve) => {
-      requests.push({ payload: JSON.parse(init.body), resolve: (body) => resolve({ ok: true, json: async () => body }) });
+      requests.push({ payload: JSON.parse(init.body), resolve: (body) => resolve({
+        ok: body.status !== "unauthorized", status: body.status === "unauthorized" ? 401 : 200,
+        json: async () => body
+      }) });
     });
   };
   await import(`../../../../webui-src/src/app.js?test=${Date.now()}-${Math.random()}`);
@@ -71,31 +74,33 @@ test("an older same-role view response cannot replace the selected page", async 
   } finally { ui.restore(); }
 });
 
-test("unpaired startup exposes recovery and retry verifies a new session", async () => {
+test("locked startup distinguishes Dashboard login from Owner unlock", async () => {
   const ui = await mountWorkbench({ sessionResponses: [
-    { status: "unauthorized", problem: { code: "session_unbound", message: "工作台会话未建立。" } },
-    { status: "ready", csrf_token: "paired" }
+    { status: "unauthorized", problem: { code: "owner_session_locked", message: "Sylanne Owner 会话未解锁。" } },
+    { status: "ready", dashboard_session: "authenticated", owner_session: "unlocked", csrf_token: "paired" }
   ] });
   try {
     await new Promise((resolve) => setImmediate(resolve));
-    assert.match(ui.app.innerHTML, /工作台会话未建立/);
-    assert.match(ui.app.innerHTML, /重新核验工作台会话/);
+    assert.match(ui.app.innerHTML, /AstrBot 控制台.*已登录/s);
+    assert.match(ui.app.innerHTML, /Sylanne Owner.*锁定/s);
+    assert.match(ui.app.innerHTML, /重新核验 Owner 会话/);
+    assert.doesNotMatch(ui.app.innerHTML, /aria-label="服务返回的权限过滤投影"/);
     await ui.clickCommand("retry-session");
     assert.equal(ui.sessionRequests, 2);
-    assert.match(ui.app.innerHTML, /宿主与工作台会话.*已核验/s);
-    assert.doesNotMatch(ui.app.innerHTML, /工作台会话未建立/);
+    assert.match(ui.app.innerHTML, /Sylanne Owner.*已解锁/s);
+    assert.doesNotMatch(ui.app.innerHTML, /Owner 尚未解锁/);
   } finally { ui.restore(); }
 });
 
 test("unpaired setup shows authenticated installation stage without role content", async () => {
   const ui = await mountWorkbench({
     statusResponses: [{ schema_version: "sylanne.install-status.v1", runtime_stage: "enrollment_required", reason_code: "authority_profile" }],
-    sessionResponses: [{ status: "unauthorized", problem: { code: "session_unbound" } }]
+    sessionResponses: [{ status: "unauthorized", problem: { code: "owner_session_locked" } }]
   });
   try {
     await new Promise((resolve) => setImmediate(resolve));
     assert.match(ui.app.innerHTML, /插件安装与运行.*需要登记.*需要管理员登记 Authority/s);
-    assert.match(ui.app.innerHTML, /工作台会话尚未核验/);
+    assert.match(ui.app.innerHTML, /Sylanne Owner.*锁定/s);
     assert.equal(ui.requests.length, 0);
     assert.doesNotMatch(ui.app.innerHTML, /aria-label="服务返回的权限过滤投影"/);
   } finally { ui.restore(); }
@@ -142,6 +147,30 @@ test("a command response from the previous role cannot alter projection or recei
   } finally { ui.restore(); }
 });
 
+test("revoked Owner session clears private projection and relocks the page", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("role-a");
+    const initial = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { private: "must-clear" } });
+    await initial;
+    const view = ui.clickView("overview");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: { private: "must-clear" } });
+    await view;
+    assert.match(ui.app.innerHTML, /must-clear/);
+
+    const revoked = ui.clickCommand("open-workspace");
+    await ui.nextRequest(2);
+    ui.requests[2].resolve({ status: "unauthorized", problem: { code: "owner_session_locked" } });
+    await revoked;
+    assert.doesNotMatch(ui.app.innerHTML, /must-clear/);
+    assert.match(ui.app.innerHTML, /Sylanne Owner.*锁定/s);
+    assert.doesNotMatch(ui.app.innerHTML, /aria-label="服务返回的权限过滤投影"/);
+  } finally { ui.restore(); }
+});
+
 test("refresh retains the current projection while requesting its replacement", async () => {
   const ui = await mountWorkbench();
   try {
@@ -177,7 +206,7 @@ test("start page requests only the authenticated capability catalogue and never 
     assert.equal(ui.requests[0].payload.action, "open_workspace");
     ui.requests[0].resolve({ status: "ready", projection: { views: [{ view_type: "overview", status: "available" }] } });
     await requested;
-    assert.match(ui.app.innerHTML, /宿主与工作台会话.*已核验/s);
+    assert.match(ui.app.innerHTML, /Sylanne Owner.*已解锁/s);
     assert.match(ui.app.innerHTML, /角色初始化.*未核验/s);
     assert.match(ui.app.innerHTML, /场景绑定.*未核验/s);
   } finally { ui.restore(); }

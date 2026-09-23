@@ -68,7 +68,8 @@ export class WorkbenchApi {
       this.clearSession();
       throw this.#responseError(response, body, "工作台会话尚未建立。请先登录并完成 Owner 配对，然后重试。");
     }
-    if (body?.status !== "ready" || typeof body.csrf_token !== "string" || !body.csrf_token) {
+    if (body?.status !== "ready" || body.dashboard_session !== "authenticated" ||
+        body.owner_session !== "unlocked" || typeof body.csrf_token !== "string" || !body.csrf_token) {
       this.clearSession();
       throw new WorkbenchApiError("工作台会话响应无效。请重新核验连接。", { code: "invalid_session", retryable: true });
     }
