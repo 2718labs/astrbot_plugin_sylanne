@@ -42,14 +42,14 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
               patch("sylanne3.host.v2_installation.AuthorityClient", return_value=client),
               patch("sylanne3.host.v2_installation.V2FencePort") as port_type):
             assembled = await assemble_v2_installation(
-                "installed", package_root=Path("G:/package"), data_dir=Path("G:/data"),
+                "installed", package_root=Path.cwd() / "package", data_dir=Path.cwd() / "data",
                 available_cpu_features=frozenset({"avx2"}),
             )
             self.assertIs(assembled.installation_grant, grant)
             self.assertIs(assembled.installation_policy, policy)
             self.assertEqual(assembled.d11_signing_key, b"k" * 32)
-            self.assertEqual(assembled.package_root, Path("G:/package"))
-            self.assertEqual(assembled.data_dir, Path("G:/data"))
+            self.assertEqual(assembled.package_root, Path.cwd() / "package")
+            self.assertEqual(assembled.data_dir, Path.cwd() / "data")
             self.assertEqual(assembled.available_cpu_features, frozenset({"avx2"}))
             port_type.assert_not_called()
             await asyncio.to_thread(assembled.fence_port_factory)
@@ -92,6 +92,6 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
               patch("sylanne3.host.v2_installation.AuthorityClient", return_value=client)):
             with self.assertRaisesRegex(RuntimeError, "differs from administrator"):
                 await assemble_v2_installation(
-                    "installed", package_root=Path("G:/package"), data_dir=Path("G:/data"),
+                    "installed", package_root=Path.cwd() / "package", data_dir=Path.cwd() / "data",
                 )
             transport.close.assert_awaited_once()
