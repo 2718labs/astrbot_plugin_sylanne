@@ -9,10 +9,14 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .domain_registry import DomainRegistry, discover_domain_registry
-from .graph_coordinator import GraphCoordinator, IngressClockSample, IngressIssuancePolicy
+from .graph_coordinator import (
+    FirstIngressOutcomeUnknown, GraphCoordinator, IngressClockSample,
+    IngressIssuancePolicy,
+)
 from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
+from .host.v2_ingress_adapter import ingress_host_facts
 from .host.installed_package import verify_installed_package
 from .host.v2_installation import V2InstallationAssembly
 from .host.v2_fence_port import V2FenceOutcomeUnknown
@@ -107,6 +111,9 @@ class RuntimeContext:
         self._coordinator: GraphCoordinator | None = None
         self._worker: GraphWorker | None = None
         self._v2_provision: Callable | None = None
+        self._v2_ingress: Callable | None = None
+        self._v2_missing_ingress_policies: tuple[str, ...] = ()
+        self._v2_namespace_provisioned = False
         self._ingress_handler: Callable[
             [HostIngressEnvelope, GraphCoordinator], Awaitable[IngressReceipt]
         ] | None = None
@@ -174,9 +181,10 @@ class RuntimeContext:
                 )
 
             provision = None
+            ingress = None
 
             def make_coordinator(store, port):
-                nonlocal provision
+                nonlocal provision, ingress
                 if port.installation_grant != installation_grant:
                     raise RuntimeError("v2 port installation grant changed")
                 bootstrap = object()
@@ -197,6 +205,12 @@ class RuntimeContext:
                 provision = lambda graph, operation_id: graph.provision_namespace_v2(
                     bootstrap, policy, operation_id=operation_id,
                 )
+                if installation.ingress_clock is not None and installation.ingress_encoding is not None:
+                    def ingress(graph, host):
+                        return graph.commit_first_ingress_v2(
+                            bootstrap, host, policy,
+                            installation.ingress_clock, installation.ingress_encoding,
+                        )
                 return coordinator
 
             try:
@@ -210,6 +224,13 @@ class RuntimeContext:
                 )
                 return self.health
             self._v2_provision = provision
+            self._v2_ingress = ingress
+            self._v2_missing_ingress_policies = tuple(
+                name for name, configured in (
+                    ("ingress_clock", installation.ingress_clock),
+                    ("ingress_encoding", installation.ingress_encoding),
+                ) if configured is None
+            )
             self.health = RuntimeHealth(
                 "limited", ("namespace_activation",),
                 "v2 graph worker started; namespace admission is pending",
@@ -222,9 +243,15 @@ class RuntimeContext:
             if self._worker is None or self._v2_provision is None:
                 raise RuntimeError("v2 graph worker is unavailable")
             receipt = await self._worker.call(self._v2_provision, operation_id)
+            self._v2_namespace_provisioned = True
+            missing = ["dispatch"]
+            if self._v2_ingress is None:
+                missing.insert(0, "product_ingress")
+            detail = "installed namespace provisioned; dispatch remains pending"
+            if self._v2_missing_ingress_policies:
+                detail += "; ingress requires " + ", ".join(self._v2_missing_ingress_policies)
             self.health = RuntimeHealth(
-                "limited", ("product_ingress", "dispatch"),
-                "installed namespace provisioned; product ingress and dispatch are pending",
+                "limited", tuple(missing), detail,
             )
             return receipt
 
@@ -352,6 +379,22 @@ class RuntimeContext:
     async def handle_ingress(self, envelope: HostIngressEnvelope) -> IngressReceipt:
         if not isinstance(envelope, HostIngressEnvelope):
             raise TypeError("envelope must be HostIngressEnvelope")
+        if self._worker is not None:
+            if not self._v2_namespace_provisioned or self._v2_ingress is None:
+                return IngressReceipt("unavailable")
+            try:
+                receipt = await self._worker.call(self._v2_ingress, ingress_host_facts(envelope))
+            except FirstIngressOutcomeUnknown as exc:
+                return IngressReceipt("deferred", exc.operation_id)
+            if receipt.status == "committed":
+                return IngressReceipt("accepted", receipt.operation_id)
+            if receipt.status == "duplicate":
+                return IngressReceipt("duplicate", receipt.operation_id)
+            if receipt.status == "pending_confirmation":
+                return IngressReceipt("deferred", receipt.operation_id)
+            if receipt.status == "rejected":
+                return IngressReceipt("rejected")
+            return IngressReceipt("unavailable")
         if self.health.status != "ready" or self._coordinator is None or self._ingress_handler is None:
             return IngressReceipt("unavailable")
         receipt = await self._ingress_handler(envelope, self._coordinator)
@@ -366,6 +409,9 @@ class RuntimeContext:
             self.health = RuntimeHealth("draining")
             worker, self._worker = self._worker, None
             self._v2_provision = None
+            self._v2_ingress = None
+            self._v2_missing_ingress_policies = ()
+            self._v2_namespace_provisioned = False
             store, self._store = self._store, None
             self._coordinator = None
             self._ingress_handler = None
