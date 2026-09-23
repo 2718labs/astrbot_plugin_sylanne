@@ -22,7 +22,7 @@ from .v2_fence_service import AuthorityV2FenceService
 from .v2_fence_store import AuthorityV2FenceStore
 from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
-from .v2_owner_proof import AuthorityV2OwnerProofStore
+from .v2_owner_proof import AuthorityV2OwnerProofStore, OwnerProofAcceptanceV1
 from ..runtime_contracts import NamespaceId
 
 
@@ -40,6 +40,8 @@ def compose_local_owner_authority(
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
     owner_proofs: AuthorityV2OwnerProofStore | None = None,
+    current_claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1,
+                                        OwnerProofAcceptanceV1], bool] | None = None,
 ) -> AuthorityRpcServer:
     """Build the independent local Authority endpoint from trusted install config.
 
@@ -60,18 +62,21 @@ def compose_local_owner_authority(
             or not callable(publisher_manifest_verifier)):
         raise AuthorityUnavailable("trusted Authority callbacks are required")
     if owner_proofs is None:
-        if not callable(claimant_verifier):
+        if not callable(claimant_verifier) or current_claimant_verifier is not None:
             raise AuthorityUnavailable("trusted Owner claimant verifier is required")
         verified_claimant = claimant_verifier
     else:
         if (type(owner_proofs) is not AuthorityV2OwnerProofStore
-                or owner_proofs._core is not core or claimant_verifier is not None):
+                or owner_proofs._core is not core or claimant_verifier is not None
+                or not callable(current_claimant_verifier)):
             raise AuthorityUnavailable("Owner proof must be the sole claimant verifier")
 
         def verified_claimant(credential: object,
                              operation: OwnerAuthorizationOperationV1) -> bool:
-            return owner_proofs.get_accepted_for_operation(
-                transport_credential=credential, operation=operation) is not None
+            accepted = owner_proofs.get_accepted_for_operation(
+                transport_credential=credential, operation=operation)
+            return (accepted is not None
+                    and current_claimant_verifier(credential, operation, accepted) is True)
     if not installations_v2 or not namespace_bindings_v2:
         raise AuthorityUnavailable("installed peer and namespace bindings are required")
     if set(namespace_bindings_v2.values()) != set(services):

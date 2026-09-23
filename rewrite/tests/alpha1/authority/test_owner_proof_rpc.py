@@ -137,12 +137,16 @@ def test_owner_proof_real_mtls_rpc_replay_and_binding(tmp_path):
             and request.dashboard_origin == "http://localhost:6185"),
         create=True)
     original_server, tickets = compose()
+    current_login = [True]
     server = compose_local_owner_authority(
         core=core, v2_fences=original_server._v2_fences,
         graph_db_path=tmp_path / "business.db",
         utc_clock=lambda: datetime.now(timezone.utc),
         first_claim_verifier=tickets._first_claim_verifier,
         claimant_verifier=None, owner_proofs=store,
+        current_claimant_verifier=lambda credential, op, accepted: (
+            current_login[0] and credential == peer and op == operation
+            and accepted.challenge.request == proof_request),
         administrator_authorizer=original_server._administrator_authorizer,
         publisher_manifest_verifier=original_server._publisher_manifest_verifier,
         installations_v2=original_server._installations_v2,
@@ -193,6 +197,9 @@ def test_owner_proof_real_mtls_rpc_replay_and_binding(tmp_path):
                     request, handshake, namespace=AUTH_NS,
                     operation=operation) == acceptance
                 assert claimant(peer, operation) is True
+                current_login[0] = False
+                assert claimant(peer, operation) is False
+                current_login[0] = True
                 with pytest.raises(RuntimeError):
                     await transport.v2_accept_owner_proof(
                         request, handshake, namespace=AUTH_NS,
