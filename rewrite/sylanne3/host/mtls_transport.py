@@ -34,6 +34,10 @@ from ..authority_service.v2_owner_proof import (
     OwnerProofChallengeV1, OwnerProofRequestV1,
     from_wire as proof_from_wire, to_wire as proof_to_wire,
 )
+from ..authority_service.v2_owner_session import (
+    OwnerSessionLoginChallengeV1, OwnerSessionLoginRequestV1,
+    from_wire as session_from_wire, to_wire as session_to_wire,
+)
 from ..authority_service.v2_execution_bridge import HandoffStartV2
 from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
@@ -999,6 +1003,109 @@ class MtlsAuthorityTransport:
             raise RuntimeError("Authority Owner proof binding differs")
         return acceptance
 
+    @staticmethod
+    def _owner_session_response(response: dict[str, object],
+                                handshake: AuthorityHandshake, field: str) -> object:
+        if (type(response) is not dict
+                or set(response) != {field, "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("Authority Owner session response is invalid")
+        return response[field]
+
+    async def v2_begin_owner_session(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, login_request: OwnerSessionLoginRequestV1,
+    ) -> OwnerSessionLoginChallengeV1:
+        if type(login_request) is not OwnerSessionLoginRequestV1:
+            raise TypeError("Owner session login request is required")
+        response = await self._content_rpc(
+            request, handshake, "begin_owner_session_v1",
+            {"namespace": namespace, "request": session_to_wire(login_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        raw = self._owner_session_response(response, handshake, "challenge")
+        try:
+            challenge = session_from_wire(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Authority Owner session challenge is invalid") from exc
+        if (type(challenge) is not OwnerSessionLoginChallengeV1
+                or session_to_wire(challenge) != raw
+                or challenge.request != login_request
+                or login_request.authority_id != handshake.installation_authority_id
+                or login_request.authority_namespace != namespace):
+            raise RuntimeError("Authority Owner session challenge binding differs")
+        return challenge
+
+    async def v2_accept_owner_session(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, challenge: OwnerSessionLoginChallengeV1, signature: bytes,
+    ) -> str:
+        if (type(challenge) is not OwnerSessionLoginChallengeV1
+                or type(signature) is not bytes or len(signature) != 64):
+            raise TypeError("Owner login challenge and Ed25519 signature are required")
+        response = await self._content_rpc(
+            request, handshake, "accept_owner_session_v1",
+            {"namespace": namespace, "challenge": session_to_wire(challenge),
+             "signature": signature.hex()}, protocol=AUTHORITY_V2_PROTOCOL)
+        token = self._owner_session_response(response, handshake, "token")
+        if (type(token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None
+                or challenge.request.authority_id != handshake.installation_authority_id
+                or challenge.request.authority_namespace != namespace):
+            raise RuntimeError("Authority Owner session token binding differs")
+        return token
+
+    async def _v2_owner_session_action(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        method: str, *, namespace: str, login_request: OwnerSessionLoginRequestV1,
+        token: str,
+    ) -> bool:
+        if type(login_request) is not OwnerSessionLoginRequestV1:
+            raise TypeError("Owner session login request is required")
+        if type(token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None:
+            raise ValueError("Owner session token is invalid")
+        if (login_request.authority_id != handshake.installation_authority_id
+                or login_request.authority_namespace != namespace):
+            raise RuntimeError("Owner session request binding differs")
+        response = await self._content_rpc(
+            request, handshake, method,
+            {"namespace": namespace, "request": session_to_wire(login_request),
+             "token": token}, protocol=AUTHORITY_V2_PROTOCOL)
+        field = "current" if method == "current_owner_session_v1" else "revoked"
+        if self._owner_session_response(response, handshake, field) is not True:
+            raise RuntimeError("Authority Owner session response is invalid")
+        return True
+
+    async def v2_current_owner_session(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, login_request: OwnerSessionLoginRequestV1, token: str,
+    ) -> bool:
+        return await self._v2_owner_session_action(
+            request, handshake, "current_owner_session_v1",
+            namespace=namespace, login_request=login_request, token=token)
+
+    async def v2_logout_owner_session(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, login_request: OwnerSessionLoginRequestV1, token: str,
+    ) -> None:
+        await self._v2_owner_session_action(
+            request, handshake, "logout_owner_session_v1",
+            namespace=namespace, login_request=login_request, token=token)
+
+    async def v2_revoke_all_owner_sessions(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, login_request: OwnerSessionLoginRequestV1, token: str,
+    ) -> None:
+        await self._v2_owner_session_action(
+            request, handshake, "revoke_all_owner_sessions_v1",
+            namespace=namespace, login_request=login_request, token=token)
+
+    async def v2_revoke_owner_session_key(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, login_request: OwnerSessionLoginRequestV1, token: str,
+    ) -> None:
+        await self._v2_owner_session_action(
+            request, handshake, "revoke_owner_session_key_v1",
+            namespace=namespace, login_request=login_request, token=token)
+
     async def v2_register_owner_ticket(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, ticket: OwnerClaimTicketV1,
@@ -1014,15 +1121,36 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority owner ticket response is invalid")
         return result
 
+    @staticmethod
+    def _owner_issue_session_fields(
+        handshake: AuthorityHandshake, namespace: str,
+        owner_session_token: str | None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None,
+    ) -> dict[str, object]:
+        if owner_session_token is None and owner_session_request is None:
+            return {}
+        if (type(owner_session_token) is not str
+                or re.fullmatch(r"[A-Za-z0-9_-]{43}", owner_session_token) is None
+                or type(owner_session_request) is not OwnerSessionLoginRequestV1
+                or owner_session_request.authority_id != handshake.installation_authority_id
+                or owner_session_request.authority_namespace != namespace):
+            raise RuntimeError("Owner issue session binding differs")
+        return {"owner_session_token": owner_session_token,
+                "owner_session_request": session_to_wire(owner_session_request)}
+
     async def v2_reserve_owner_issue(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, operation: OwnerAuthorizationOperationV1,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
     ) -> OwnerAuthorizationReceiptV1:
         if type(operation) is not OwnerAuthorizationOperationV1:
             raise TypeError("owner issue operation is required")
         response = await self._content_rpc(
             request, handshake, "reserve_owner_issue",
-            {"namespace": namespace, "operation": owner_to_wire(operation)},
+            {"namespace": namespace, "operation": owner_to_wire(operation),
+             **self._owner_issue_session_fields(
+                 handshake, namespace, owner_session_token, owner_session_request)},
             protocol=AUTHORITY_V2_PROTOCOL)
         result = self._owner_result(
             response, handshake, "receipt", OwnerAuthorizationReceiptV1)
@@ -1035,6 +1163,8 @@ class MtlsAuthorityTransport:
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, operation: OwnerAuthorizationOperationV1,
         proof: OwnerGraphCommitProofV1,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
     ) -> OwnerAuthorizationReceiptV1:
         if (type(operation) is not OwnerAuthorizationOperationV1
                 or type(proof) is not OwnerGraphCommitProofV1):
@@ -1042,7 +1172,10 @@ class MtlsAuthorityTransport:
         response = await self._content_rpc(
             request, handshake, "finalize_owner_issue",
             {"namespace": namespace, "operation": owner_to_wire(operation),
-             "proof": owner_to_wire(proof)}, protocol=AUTHORITY_V2_PROTOCOL)
+             "proof": owner_to_wire(proof),
+             **self._owner_issue_session_fields(
+                 handshake, namespace, owner_session_token, owner_session_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
         result = self._owner_result(
             response, handshake, "receipt", OwnerAuthorizationReceiptV1)
         if (result.operation != operation or result.phase != "committed"
@@ -1087,10 +1220,14 @@ class MtlsAuthorityTransport:
     async def v2_get_pending_owner_issue(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, operation_id: str,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
     ) -> OwnerAuthorizationReceiptV1 | None:
         response = await self._content_rpc(
             request, handshake, "get_pending_owner_issue",
-            {"namespace": namespace, "operation_id": operation_id},
+            {"namespace": namespace, "operation_id": operation_id,
+             **self._owner_issue_session_fields(
+                 handshake, namespace, owner_session_token, owner_session_request)},
             protocol=AUTHORITY_V2_PROTOCOL)
         if (set(response) != {"receipt", "channel_binding_sha256"}
                 or response["channel_binding_sha256"] != handshake.channel_binding_sha256):

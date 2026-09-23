@@ -23,6 +23,7 @@ from .v2_fence_store import AuthorityV2FenceStore
 from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 from .v2_owner_proof import AuthorityV2OwnerProofStore, OwnerProofAcceptanceV1
+from .v2_owner_session import AuthorityV2OwnerSessionStore
 from ..runtime_contracts import NamespaceId
 
 
@@ -42,6 +43,7 @@ def compose_local_owner_authority(
     owner_proofs: AuthorityV2OwnerProofStore | None = None,
     current_claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1,
                                         OwnerProofAcceptanceV1], bool] | None = None,
+    owner_sessions: AuthorityV2OwnerSessionStore | None = None,
 ) -> AuthorityRpcServer:
     """Build the independent local Authority endpoint from trusted install config.
 
@@ -61,7 +63,19 @@ def compose_local_owner_authority(
             or not callable(administrator_authorizer)
             or not callable(publisher_manifest_verifier)):
         raise AuthorityUnavailable("trusted Authority callbacks are required")
-    if owner_proofs is None:
+    if (owner_sessions is not None
+            and (type(owner_sessions) is not AuthorityV2OwnerSessionStore
+                 or owner_sessions._core is not core)):
+        raise AuthorityUnavailable("Owner sessions require this Authority core")
+    if owner_sessions is not None:
+        if (owner_proofs is not None and (
+                type(owner_proofs) is not AuthorityV2OwnerProofStore
+                or owner_proofs._core is not core)):
+            raise AuthorityUnavailable("Owner proof store requires this Authority core")
+        if claimant_verifier is not None or current_claimant_verifier is not None:
+            raise AuthorityUnavailable("Owner session is the sole current claimant verifier")
+        verified_claimant = None
+    elif owner_proofs is None:
         if not callable(claimant_verifier) or current_claimant_verifier is not None:
             raise AuthorityUnavailable("trusted Owner claimant verifier is required")
         verified_claimant = claimant_verifier
@@ -116,11 +130,13 @@ def compose_local_owner_authority(
         first_claim_verifier=first_claim_verifier,
         claimant_verifier=verified_claimant,
         graph_commit_verifier=graph_verifier,
+        owner_sessions=owner_sessions,
         create=create_owner_schema,
     )
     return AuthorityRpcServer(
         core, v2_fences=services, v2_owner_tickets=owner_tickets,
         v2_owner_proofs=owner_proofs,
+        v2_owner_sessions=owner_sessions,
         administrator_authorizer=administrator_authorizer,
         publisher_manifest_verifier=publisher_manifest_verifier,
         installations_v2=installations_v2,

@@ -22,6 +22,7 @@ from .v2_owner_contract import (
     canonical_bytes, canonical_digest,
     decode_bytes,
 )
+from .v2_owner_session import AuthorityV2OwnerSessionStore, OwnerSessionLoginRequestV1
 from ..graph_coordinator import namespace_ref
 
 
@@ -86,6 +87,7 @@ class AuthorityV2OwnerTicketStore:
                  claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1], bool] | None = None,
                  graph_commit_verifier: Callable[[OwnerAuthorizationOperationV1,
                                                  OwnerGraphCommitProofV1], bool] | None = None,
+                 owner_sessions: AuthorityV2OwnerSessionStore | None = None,
                  create: bool = False) -> None:
         if type(core) is not AuthorityServiceCore:
             raise TypeError("owner tickets require the independent Authority core")
@@ -94,6 +96,11 @@ class AuthorityV2OwnerTicketStore:
         self._first_claim_verifier = first_claim_verifier
         self._claimant_verifier = claimant_verifier
         self._graph_commit_verifier = graph_commit_verifier
+        if owner_sessions is not None and (
+                type(owner_sessions) is not AuthorityV2OwnerSessionStore
+                or owner_sessions._core is not core):
+            raise TypeError("Owner sessions must use the same Authority core")
+        self._owner_sessions = owner_sessions
         with core._tx() as db:
             self._require_mode(db)
             present = self._present(db)
@@ -327,6 +334,27 @@ class AuthorityV2OwnerTicketStore:
         if accepted is not True:
             raise AuthorityUnavailable("owner claim verification denied")
 
+    def _require_owner_session(
+        self, db: sqlite3.Connection, authority_namespace: str,
+        operation: OwnerAuthorizationOperationV1 | None,
+        session_token: str | None, session_request: OwnerSessionLoginRequestV1 | None,
+    ) -> None:
+        sessions = self._owner_sessions
+        if sessions is None:
+            if session_token is not None or session_request is not None:
+                raise AuthorityUnavailable("Owner session service is unavailable")
+            return
+        if (session_token is None or type(session_request) is not OwnerSessionLoginRequestV1
+                or session_request.authority_namespace != authority_namespace
+                or session_request.audience != "sylanne-owner-console"
+                or (operation is not None and (
+                    session_request.authority_id != operation.authority_id
+                    or session_request.installation_id != operation.installation_id
+                    or session_request.principal != operation.principal
+                    or authority_namespace != namespace_ref(operation.namespace)))):
+            raise AuthorityUnavailable("Owner session differs from issue operation")
+        sessions.require_current_in_tx(db, token=session_token, request=session_request)
+
     def register_ticket(self, *, credential: object, authority_namespace: str,
                         ticket: OwnerClaimTicketV1) -> OwnerClaimTicketV1:
         """Register exactly one original creation binding; never infer owner."""
@@ -383,19 +411,24 @@ class AuthorityV2OwnerTicketStore:
         return ticket
 
     def reserve_issue(self, *, credential: object, authority_namespace: str,
-                      operation: OwnerAuthorizationOperationV1) -> OwnerAuthorizationReceiptV1:
+                      operation: OwnerAuthorizationOperationV1,
+                      session_token: str | None = None,
+                      session_request: OwnerSessionLoginRequestV1 | None = None,
+                      ) -> OwnerAuthorizationReceiptV1:
         """Consume a registered ticket once and retain an inert pending issue."""
         identifier(authority_namespace, "authority_namespace")
         if type(operation) is not OwnerAuthorizationOperationV1 or operation.action != "issue":
             raise TypeError("first owner issue operation is required")
         self._core._require(credential, "owner_claim", authority_namespace)
-        # This callback must authenticate the full stable principal and proof
-        # of the independently paired challenge; no dashboard role is enough.
-        self._verified(self._claimant_verifier, credential, operation)
+        if self._owner_sessions is None:
+            # Historical proof mode authenticates a paired claimant externally.
+            self._verified(self._claimant_verifier, credential, operation)
         ticket = operation.ticket
         assert ticket is not None
         with self._core._tx() as db:
             self._require_mode(db)
+            self._require_owner_session(db, authority_namespace, operation,
+                                        session_token, session_request)
             self._bound_namespace(db, ticket, authority_namespace)
             prior = self._checked_pending(db, authority_namespace, operation.operation_id)
             if prior is not None:
@@ -410,6 +443,8 @@ class AuthorityV2OwnerTicketStore:
             raise AuthorityUnavailable("owner claim ticket has expired")
         with self._core._tx() as db:
             self._require_mode(db)
+            self._require_owner_session(db, authority_namespace, operation,
+                                        session_token, session_request)
             self._bound_namespace(db, ticket, authority_namespace)
             prior = self._checked_pending(db, authority_namespace, operation.operation_id)
             if prior is not None:
@@ -453,7 +488,9 @@ class AuthorityV2OwnerTicketStore:
             return receipt
 
     def get_pending(self, *, credential: object, authority_namespace: str,
-                    operation_id: str) -> OwnerAuthorizationReceiptV1 | None:
+                    operation_id: str, session_token: str | None = None,
+                    session_request: OwnerSessionLoginRequestV1 | None = None,
+                    ) -> OwnerAuthorizationReceiptV1 | None:
         """Query the original pending receipt after restart; never mint access."""
         identifier(authority_namespace, "authority_namespace")
         identifier(operation_id, "operation_id")
@@ -461,10 +498,14 @@ class AuthorityV2OwnerTicketStore:
         with self._core._tx() as db:
             self._require_mode(db)
             pending = self._checked_pending(db, authority_namespace, operation_id)
+            self._require_owner_session(db, authority_namespace,
+                                        pending[0] if pending is not None else None,
+                                        session_token, session_request)
         if pending is None:
             return None
         operation, receipt = pending
-        self._verified(self._claimant_verifier, credential, operation)
+        if self._owner_sessions is None:
+            self._verified(self._claimant_verifier, credential, operation)
         return receipt
 
     def get_pending_for_graph_write(
@@ -535,7 +576,10 @@ class AuthorityV2OwnerTicketStore:
 
     def finalize_issue(self, *, credential: object, authority_namespace: str,
                        operation: OwnerAuthorizationOperationV1,
-                       proof: OwnerGraphCommitProofV1) -> OwnerAuthorizationReceiptV1:
+                       proof: OwnerGraphCommitProofV1,
+                       session_token: str | None = None,
+                       session_request: OwnerSessionLoginRequestV1 | None = None,
+                       ) -> OwnerAuthorizationReceiptV1:
         """Record one graph-verified issue after an exact durable pending claim."""
         identifier(authority_namespace, "authority_namespace")
         if type(operation) is not OwnerAuthorizationOperationV1 or operation.action != "issue":
@@ -543,7 +587,8 @@ class AuthorityV2OwnerTicketStore:
         if type(proof) is not OwnerGraphCommitProofV1:
             raise TypeError("canonical graph commit proof is required")
         self._core._require(credential, "owner_claim", authority_namespace)
-        self._verified(self._claimant_verifier, credential, operation)
+        if self._owner_sessions is None:
+            self._verified(self._claimant_verifier, credential, operation)
         if not callable(self._graph_commit_verifier):
             raise AuthorityUnavailable("trusted graph commit verifier is unavailable")
         if (namespace_ref(operation.namespace) != authority_namespace
@@ -556,6 +601,8 @@ class AuthorityV2OwnerTicketStore:
             raise AuthorityUnavailable("owner graph proof differs from pending issue")
         with self._core._tx() as db:
             self._require_mode(db)
+            self._require_owner_session(db, authority_namespace, operation,
+                                        session_token, session_request)
             pending = self._checked_pending(db, authority_namespace,
                                             operation.operation_id)
             if pending is None or pending[0] != operation:
@@ -583,6 +630,8 @@ class AuthorityV2OwnerTicketStore:
             proof.grant_revision, proof.graph_access_epoch)
         with self._core._tx() as db:
             self._require_mode(db)
+            self._require_owner_session(db, authority_namespace, operation,
+                                        session_token, session_request)
             ticket = operation.ticket
             assert ticket is not None
             self._bound_namespace(db, ticket, authority_namespace)

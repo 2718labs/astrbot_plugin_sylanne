@@ -41,6 +41,11 @@ from .v2_owner_proof import (
     OwnerProofChallengeV1, OwnerProofRequestV1,
     from_wire as proof_from_wire, to_wire as proof_to_wire,
 )
+from .v2_owner_session import (
+    AuthorityV2OwnerSessionStore, OwnerSessionLoginChallengeV1,
+    OwnerSessionLoginRequestV1, from_wire as session_from_wire,
+    to_wire as session_to_wire,
+)
 from ..graph_coordinator import namespace_ref
 
 
@@ -159,6 +164,7 @@ class AuthorityRpcServer:
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
         v2_owner_tickets: AuthorityV2OwnerTicketStore | None = None,
         v2_owner_proofs: AuthorityV2OwnerProofStore | None = None,
+        v2_owner_sessions: AuthorityV2OwnerSessionStore | None = None,
         v2_final_handoff_authorizers: Mapping[str, Callable] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
@@ -198,6 +204,11 @@ class AuthorityRpcServer:
                      or v2_owner_proofs._core is not core)):
             raise TypeError("v2 Owner proofs must use the same Authority core")
         self._v2_owner_proofs = v2_owner_proofs
+        if (v2_owner_sessions is not None
+                and (type(v2_owner_sessions) is not AuthorityV2OwnerSessionStore
+                     or v2_owner_sessions._core is not core)):
+            raise TypeError("v2 Owner sessions must use the same Authority core")
+        self._v2_owner_sessions = v2_owner_sessions
         handoff_authorizers = dict(v2_final_handoff_authorizers or {})
         if any(namespace not in services or not callable(callback)
                for namespace, callback in handoff_authorizers.items()):
@@ -441,6 +452,29 @@ class AuthorityRpcServer:
             raise AuthorityUnavailable("namespace unavailable")
         return self._v2_service(namespace)
 
+    def _owner_session_kwargs(self, command: dict[str, object], namespace: str,
+                              installation_id: str) -> dict[str, object]:
+        fields = {"owner_session_token", "owner_session_request"}
+        present = set(command) & fields
+        if not present:
+            return {}
+        if present != fields:
+            raise AuthorityUnavailable("Owner session fields must be paired")
+        token = command["owner_session_token"]
+        if (type(token) is not str or len(token) != 43
+                or any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+                       for ch in token)):
+            raise AuthorityUnavailable("Owner session token encoding differs")
+        raw = command["owner_session_request"]
+        request = session_from_wire(raw)
+        if (type(request) is not OwnerSessionLoginRequestV1
+                or session_to_wire(request) != raw
+                or request.authority_id != self._authority_id()
+                or request.authority_namespace != namespace
+                or request.installation_id != installation_id):
+            raise AuthorityUnavailable("Owner session request identity differs")
+        return {"session_token": token, "session_request": request}
+
     @staticmethod
     def _dispatch_footprint(value: object) -> RecoveryConstraintFootprint:
         if type(value) is not dict:
@@ -471,6 +505,59 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method in {"begin_owner_session_v1", "accept_owner_session_v1",
+                          "current_owner_session_v1", "logout_owner_session_v1",
+                          "revoke_all_owner_sessions_v1", "revoke_owner_session_key_v1"}:
+                namespace = identifier(command.get("namespace"), "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                sessions = self._v2_owner_sessions
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                if sessions is None or installed is None:
+                    raise AuthorityUnavailable("Owner session service is unavailable")
+                required = ({"namespace", "request"} if method == "begin_owner_session_v1"
+                            else {"namespace", "challenge", "signature"}
+                            if method == "accept_owner_session_v1"
+                            else {"namespace", "request", "token"})
+                if set(command) != required:
+                    raise AuthorityUnavailable("Owner session command fields differ")
+                field = "challenge" if method == "accept_owner_session_v1" else "request"
+                raw = command[field]
+                decoded = session_from_wire(raw)
+                expected = (OwnerSessionLoginChallengeV1 if field == "challenge"
+                            else OwnerSessionLoginRequestV1)
+                if type(decoded) is not expected or session_to_wire(decoded) != raw:
+                    raise AuthorityUnavailable("Owner session command is not canonical")
+                request = decoded.request if type(decoded) is OwnerSessionLoginChallengeV1 else decoded
+                if (request.authority_id != self._authority_id()
+                        or request.authority_namespace != namespace
+                        or request.installation_id != installed.installation_id):
+                    raise AuthorityUnavailable("Owner session installation identity differs")
+                if method == "begin_owner_session_v1":
+                    challenge = sessions.begin_login(
+                        transport_credential=credential, request=request)
+                    return {"challenge": session_to_wire(challenge)}
+                if method == "accept_owner_session_v1":
+                    signature = self._owner_proof_signature(command["signature"])
+                    token = sessions.accept_login(
+                        transport_credential=credential, challenge=decoded,
+                        signature=signature)
+                    return {"token": token}
+                token = command["token"]
+                if method == "current_owner_session_v1":
+                    sessions.require_current(
+                        transport_credential=credential, token=token, request=request)
+                    return {"current": True}
+                if method == "logout_owner_session_v1":
+                    sessions.logout(
+                        transport_credential=credential, token=token, request=request)
+                elif method == "revoke_all_owner_sessions_v1":
+                    sessions.revoke_all(
+                        transport_credential=credential, token=token, request=request)
+                else:
+                    sessions.revoke_credential(
+                        transport_credential=credential, token=token, request=request)
+                return {"revoked": True}
             if method in {"register_owner_credential_v1", "begin_owner_proof_v1",
                           "accept_owner_proof_v1", "get_owner_proof_v1"}:
                 namespace = identifier(command.get("namespace"), "namespace")
@@ -598,7 +685,10 @@ class AuthorityRpcServer:
                             else {"namespace", "operation", "proof"}
                             if method == "finalize_owner_issue"
                             else {"namespace", "operation"})
-                if set(command) != expected:
+                session_fields = {"owner_session_token", "owner_session_request"}
+                if set(command) != expected and not (
+                        method != "register_owner_ticket"
+                        and set(command) == expected | session_fields):
                     raise AuthorityUnavailable("owner command is invalid")
                 field = "ticket" if method == "register_owner_ticket" else "operation"
                 raw = command[field]
@@ -622,9 +712,11 @@ class AuthorityRpcServer:
                         ticket=value)
                     return {"ticket": owner_to_wire(ticket)}
                 if method == "reserve_owner_issue":
+                    session_kwargs = self._owner_session_kwargs(
+                        command, namespace, installed.installation_id)
                     receipt = tickets.reserve_issue(
                         credential=credential, authority_namespace=namespace,
-                        operation=value)
+                        operation=value, **session_kwargs)
                     return {"receipt": owner_to_wire(receipt)}
                 raw_proof = command["proof"]
                 proof = owner_from_wire(raw_proof)
@@ -635,7 +727,9 @@ class AuthorityRpcServer:
                 # graph verifier and rechecks the Authority snapshot before CAS.
                 receipt = tickets.finalize_issue(
                     credential=credential, authority_namespace=namespace,
-                    operation=value, proof=proof)
+                    operation=value, proof=proof,
+                    **self._owner_session_kwargs(
+                        command, namespace, installed.installation_id))
                 return {"receipt": owner_to_wire(receipt)}
             if method == "get_pending_owner_issue_for_graph_write" and set(command) == {
                     "namespace", "operation_id", "permit"}:
@@ -660,17 +754,25 @@ class AuthorityRpcServer:
                     operation_id=operation_id, installation_id=installed.installation_id,
                     subject=subject, permit=permit)
                 return {"receipt": None if receipt is None else owner_to_wire(receipt)}
-            if method == "get_pending_owner_issue" and set(command) == {
-                    "namespace", "operation_id"}:
+            if method == "get_pending_owner_issue" and (
+                    set(command) == {"namespace", "operation_id"}
+                    or set(command) == {"namespace", "operation_id",
+                                        "owner_session_token", "owner_session_request"}):
                 namespace = identifier(command["namespace"], "namespace")
                 operation_id = identifier(command["operation_id"], "operation_id")
                 self._bound_v2_service(
                     credential, profile_id, manifest_digest, namespace)
                 if self._v2_owner_tickets is None:
                     raise AuthorityUnavailable("owner ticket service is unavailable")
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                if installed is None:
+                    raise AuthorityUnavailable("installation is unavailable")
                 receipt = self._v2_owner_tickets.get_pending(
                     credential=credential, authority_namespace=namespace,
-                    operation_id=operation_id)
+                    operation_id=operation_id,
+                    **self._owner_session_kwargs(
+                        command, namespace, installed.installation_id))
                 if receipt is not None and (
                     type(receipt) is not OwnerAuthorizationReceiptV1
                     or receipt.phase != "pending"

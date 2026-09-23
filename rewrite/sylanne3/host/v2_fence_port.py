@@ -25,6 +25,9 @@ from ..authority_service.v2_owner_proof import (
     OwnerCredentialRegistrationV1, OwnerProofAcceptanceV1,
     OwnerProofChallengeV1, OwnerProofRequestV1,
 )
+from ..authority_service.v2_owner_session import (
+    OwnerSessionLoginChallengeV1, OwnerSessionLoginRequestV1,
+)
 from ..authority_service.v2_execution_bridge import HandoffStartV2
 from ..graph_coordinator import namespace_ref
 from ..runtime.restore_anchor import RestoreAnchor
@@ -345,6 +348,97 @@ class V2FencePort:
                 or (not pairing and value.installation_id != grant.installation_id)):
             raise RuntimeError("v2 owner identity mismatch")
 
+    def _owner_session_identity(self, namespace: NamespaceId,
+                                authority_namespace: str,
+                                request: OwnerSessionLoginRequestV1) -> None:
+        _, grant = self._identity()
+        if (type(namespace) is not NamespaceId
+                or namespace_ref(namespace) != authority_namespace
+                or type(request) is not OwnerSessionLoginRequestV1
+                or request.authority_id != grant.authority_id
+                or request.authority_namespace != authority_namespace
+                or request.installation_id != grant.installation_id):
+            raise RuntimeError("v2 Owner session identity mismatch")
+
+    def begin_owner_session(self, *, namespace: NamespaceId,
+                            authority_namespace: str,
+                            request: OwnerSessionLoginRequestV1,
+                            ) -> OwnerSessionLoginChallengeV1:
+        return self._submit(self._with_session_repair(lambda: self._begin_owner_session(
+            namespace, authority_namespace, request)))
+
+    async def _begin_owner_session(self, namespace: NamespaceId,
+                                   authority_namespace: str,
+                                   request: OwnerSessionLoginRequestV1,
+                                   ) -> OwnerSessionLoginChallengeV1:
+        await self._mapped(namespace, authority_namespace)
+        self._owner_session_identity(namespace, authority_namespace, request)
+        handshake, _ = self._identity()
+        return await self._transport.v2_begin_owner_session(
+            self._request, handshake, namespace=authority_namespace,
+            login_request=request)
+
+    def accept_owner_session(self, *, namespace: NamespaceId,
+                             authority_namespace: str,
+                             challenge: OwnerSessionLoginChallengeV1,
+                             signature: bytes) -> str:
+        return self._submit(self._accept_owner_session(
+            namespace, authority_namespace, challenge, signature))
+
+    async def _accept_owner_session(self, namespace: NamespaceId,
+                                    authority_namespace: str,
+                                    challenge: OwnerSessionLoginChallengeV1,
+                                    signature: bytes) -> str:
+        await self._mapped(namespace, authority_namespace)
+        if type(challenge) is not OwnerSessionLoginChallengeV1:
+            raise TypeError("Owner login challenge is required")
+        self._owner_session_identity(namespace, authority_namespace, challenge.request)
+        handshake, _ = self._identity()
+        return await self._transport.v2_accept_owner_session(
+            self._request, handshake, namespace=authority_namespace,
+            challenge=challenge, signature=signature)
+
+    def current_owner_session(self, *, namespace: NamespaceId,
+                              authority_namespace: str,
+                              request: OwnerSessionLoginRequestV1, token: str) -> bool:
+        return self._submit(self._with_session_repair(lambda: self._owner_session_action(
+            "current", namespace, authority_namespace, request, token)))
+
+    def logout_owner_session(self, *, namespace: NamespaceId,
+                             authority_namespace: str,
+                             request: OwnerSessionLoginRequestV1, token: str) -> None:
+        self._submit(self._owner_session_action(
+            "logout", namespace, authority_namespace, request, token))
+
+    def revoke_all_owner_sessions(self, *, namespace: NamespaceId,
+                                  authority_namespace: str,
+                                  request: OwnerSessionLoginRequestV1, token: str) -> None:
+        self._submit(self._owner_session_action(
+            "revoke_all", namespace, authority_namespace, request, token))
+
+    def revoke_owner_session_key(self, *, namespace: NamespaceId,
+                                 authority_namespace: str,
+                                 request: OwnerSessionLoginRequestV1, token: str) -> None:
+        self._submit(self._owner_session_action(
+            "revoke_key", namespace, authority_namespace, request, token))
+
+    async def _owner_session_action(self, action: str, namespace: NamespaceId,
+                                    authority_namespace: str,
+                                    request: OwnerSessionLoginRequestV1,
+                                    token: str) -> bool | None:
+        await self._mapped(namespace, authority_namespace)
+        self._owner_session_identity(namespace, authority_namespace, request)
+        handshake, _ = self._identity()
+        method = {
+            "current": self._transport.v2_current_owner_session,
+            "logout": self._transport.v2_logout_owner_session,
+            "revoke_all": self._transport.v2_revoke_all_owner_sessions,
+            "revoke_key": self._transport.v2_revoke_owner_session_key,
+        }[action]
+        return await method(
+            self._request, handshake, namespace=authority_namespace,
+            login_request=request, token=token)
+
     def register_owner_credential(self, *, namespace: NamespaceId,
                                   authority_namespace: str,
                                   registration: OwnerCredentialRegistrationV1,
@@ -455,22 +549,31 @@ class V2FencePort:
     def reserve_owner_issue(self, *, namespace: NamespaceId,
                             authority_namespace: str,
                             operation: OwnerAuthorizationOperationV1,
+                            owner_session_token: str | None = None,
+                            owner_session_request: OwnerSessionLoginRequestV1 | None = None,
     ) -> OwnerAuthorizationReceiptV1:
         return self._submit(self._with_session_repair(
-            lambda: self._reserve_owner_issue(namespace, authority_namespace, operation)))
+            lambda: self._reserve_owner_issue(
+                namespace, authority_namespace, operation,
+                owner_session_token, owner_session_request)))
 
     async def _reserve_owner_issue(self, namespace: NamespaceId,
                                    authority_namespace: str,
                                    operation: OwnerAuthorizationOperationV1,
+                                   owner_session_token: str | None,
+                                   owner_session_request: OwnerSessionLoginRequestV1 | None,
     ) -> OwnerAuthorizationReceiptV1:
         if type(operation) is not OwnerAuthorizationOperationV1:
             raise TypeError("owner issue operation is required")
         await self._mapped(namespace, authority_namespace)
         self._owner_identity(namespace, authority_namespace, operation)
+        if owner_session_request is not None:
+            self._owner_session_identity(namespace, authority_namespace, owner_session_request)
         handshake, _ = self._identity()
         result = await self._transport.v2_reserve_owner_issue(
             self._request, handshake, namespace=authority_namespace,
-            operation=operation)
+            operation=operation, owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
         if result.operation != operation or result.phase != "pending":
             raise RuntimeError("v2 owner pending response differs")
         return result
@@ -479,21 +582,28 @@ class V2FencePort:
                              authority_namespace: str,
                              operation: OwnerAuthorizationOperationV1,
                              proof: OwnerGraphCommitProofV1,
+                             owner_session_token: str | None = None,
+                             owner_session_request: OwnerSessionLoginRequestV1 | None = None,
     ) -> OwnerAuthorizationReceiptV1:
         return self._submit(self._with_session_repair(
             lambda: self._finalize_owner_issue(
-                namespace, authority_namespace, operation, proof)))
+                namespace, authority_namespace, operation, proof,
+                owner_session_token, owner_session_request)))
 
     async def _finalize_owner_issue(self, namespace: NamespaceId,
                                     authority_namespace: str,
                                     operation: OwnerAuthorizationOperationV1,
                                     proof: OwnerGraphCommitProofV1,
+                                    owner_session_token: str | None,
+                                    owner_session_request: OwnerSessionLoginRequestV1 | None,
     ) -> OwnerAuthorizationReceiptV1:
         if (type(operation) is not OwnerAuthorizationOperationV1
                 or type(proof) is not OwnerGraphCommitProofV1):
             raise TypeError("owner issue operation and graph proof are required")
         await self._mapped(namespace, authority_namespace)
         self._owner_identity(namespace, authority_namespace, operation)
+        if owner_session_request is not None:
+            self._owner_session_identity(namespace, authority_namespace, owner_session_request)
         if (proof.namespace != namespace
                 or proof.operation_id != operation.operation_id
                 or proof.request_digest != operation.request_digest):
@@ -501,7 +611,9 @@ class V2FencePort:
         handshake, _ = self._identity()
         result = await self._transport.v2_finalize_owner_issue(
             self._request, handshake, namespace=authority_namespace,
-            operation=operation, proof=proof)
+            operation=operation, proof=proof,
+            owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
         if result.operation != operation or result.phase != "committed":
             raise RuntimeError("v2 owner commit response differs")
         return result
@@ -539,20 +651,30 @@ class V2FencePort:
 
     def get_pending_owner_issue(self, *, namespace: NamespaceId,
                                 authority_namespace: str,
-                                operation_id: str) -> OwnerAuthorizationReceiptV1 | None:
+                                operation_id: str,
+                                owner_session_token: str | None = None,
+                                owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+                                ) -> OwnerAuthorizationReceiptV1 | None:
         """Read a pending owner issue as this installation's real mTLS peer."""
         return self._submit(self._with_session_repair(lambda: self._get_pending_owner_issue(
-            namespace, authority_namespace, operation_id)))
+            namespace, authority_namespace, operation_id,
+            owner_session_token, owner_session_request)))
 
     async def _get_pending_owner_issue(self, namespace: NamespaceId,
                                        authority_namespace: str,
-                                       operation_id: str) -> OwnerAuthorizationReceiptV1 | None:
+                                       operation_id: str,
+                                       owner_session_token: str | None,
+                                       owner_session_request: OwnerSessionLoginRequestV1 | None,
+                                       ) -> OwnerAuthorizationReceiptV1 | None:
         identifier(operation_id, "operation_id")
         await self._mapped(namespace, authority_namespace)
+        if owner_session_request is not None:
+            self._owner_session_identity(namespace, authority_namespace, owner_session_request)
         handshake, grant = self._identity()
         receipt = await self._transport.v2_get_pending_owner_issue(
             self._request, handshake, namespace=authority_namespace,
-            operation_id=operation_id)
+            operation_id=operation_id, owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
         if receipt is not None and (
             type(receipt) is not OwnerAuthorizationReceiptV1
             or receipt.phase != "pending"

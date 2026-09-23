@@ -139,6 +139,50 @@ class OwnerSessionLoginChallengeV1:
         return b"Sylanne3 Owner session login v1\n" + _canonical(self)
 
 
+def to_wire(value: OwnerSessionLoginRequestV1 | OwnerSessionLoginChallengeV1) -> dict[str, object]:
+    if type(value) is OwnerSessionLoginRequestV1:
+        return {"kind": "owner_session_login_request_v1", **asdict(value)}
+    if type(value) is OwnerSessionLoginChallengeV1:
+        return {"kind": "owner_session_login_challenge_v1", "schema": SCHEMA,
+                "request": to_wire(value.request), "nonce": value.nonce,
+                "principal_epoch": value.principal_epoch, "boot_id": value.boot_id,
+                "issued_at_utc": value.issued_at_utc,
+                "expires_at_utc": value.expires_at_utc}
+    raise TypeError("Owner session request or challenge is required")
+
+
+def from_wire(raw: object) -> OwnerSessionLoginRequestV1 | OwnerSessionLoginChallengeV1:
+    if type(raw) is not dict:
+        raise TypeError("Owner session wire object is required")
+    kind = raw.get("kind")
+    if kind == "owner_session_login_request_v1":
+        fields = set(OwnerSessionLoginRequestV1.__dataclass_fields__) | {"kind"}
+        if set(raw) != fields or type(raw.get("principal")) is not dict:
+            raise ValueError("Owner session request fields differ")
+        principal_fields = set(OwnerPrincipalV1.__dataclass_fields__)
+        if set(raw["principal"]) != principal_fields:
+            raise ValueError("Owner principal fields differ")
+        parts = {key: value for key, value in raw.items() if key != "kind"}
+        parts["principal"] = OwnerPrincipalV1(**parts["principal"])
+        value = OwnerSessionLoginRequestV1(**parts)
+    elif kind == "owner_session_login_challenge_v1":
+        fields = set(OwnerSessionLoginChallengeV1.__dataclass_fields__) | {"kind"}
+        if set(raw) != fields:
+            raise ValueError("Owner session challenge fields differ")
+        request = from_wire(raw["request"])
+        if type(request) is not OwnerSessionLoginRequestV1:
+            raise ValueError("Owner session challenge request differs")
+        value = OwnerSessionLoginChallengeV1(
+            request, raw["nonce"], raw["principal_epoch"], raw["boot_id"],
+            raw["issued_at_utc"], raw["expires_at_utc"], raw["schema"],
+        )
+    else:
+        raise ValueError("unknown Owner session wire kind")
+    if to_wire(value) != raw:
+        raise ValueError("Owner session wire object is not canonical")
+    return value
+
+
 class AuthorityV2OwnerSessionStore:
     """One-use key login and revocable bearer sessions in independent Authority SQLite."""
 
@@ -353,5 +397,5 @@ class AuthorityV2OwnerSessionStore:
 
 __all__ = (
     "AuthorityV2OwnerSessionStore", "OwnerSessionLoginChallengeV1",
-    "OwnerSessionLoginRequestV1",
+    "OwnerSessionLoginRequestV1", "from_wire", "to_wire",
 )
