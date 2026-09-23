@@ -163,7 +163,8 @@ def test_windows_dacl_policy_inspects_pinned_handles(tmp_path: Path) -> None:
         # The developer fixture cannot satisfy the administrator DACL policy.
         # This also exercises GetSecurityInfo on pinned Win32 handles.
         with patch.dict(sys.modules, {"sylanne3.host": _host_package}):
-            with pytest.raises(PermissionError, match="owner|non-admin write"):
+            with pytest.raises(PermissionError,
+                               match="owner|non-admin write|bypass private-key DACL"):
                 authority_profile._check_windows_handles(profile_dir, handles)
 
 

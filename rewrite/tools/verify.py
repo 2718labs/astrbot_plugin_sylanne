@@ -135,7 +135,9 @@ def main() -> int:
             results.append({"name": "python_unittest", "status": "SKIPPED", "passed": False})
             results.append({"name": "python_compileall", "status": "SKIPPED", "passed": False})
         else:
-            results.append(run_command("python_unittest", [sys.executable, "-m", "unittest", "discover", "-s", "rewrite/tests", "-p", "test_*.py", "-v"], root.parent, env, log, 180))
+            core_tests = [path.relative_to(root.parent).as_posix()
+                          for path in sorted((root / "tests").glob("test_*.py"))]
+            results.append(run_command("python_unittest", [sys.executable, "-m", "unittest", "-v", *core_tests], root.parent, env, log, 180))
             started = time.time()
             compiled = compileall.compile_dir(str(root / "sylanne3"), quiet=1, force=False)
             for entry_point in (root.parent / "main.py", root.parent / "__init__.py", root / "__init__.py"):
@@ -154,6 +156,16 @@ def main() -> int:
                "log": str(log_path), "static_boundary_check": True}
     receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"status": receipt["status"], "receipt": str(receipt_path), "log": str(log_path)}, ensure_ascii=False))
+    if receipt["status"] != "PASS":
+        for result in results:
+            if result.get("passed") or result.get("status") == "SKIPPED":
+                continue
+            print(f"verify failed: {result['name']} (exit_code={result.get('exit_code')})", file=sys.stderr)
+            for stream in ("stdout", "stderr"):
+                if result.get(stream):
+                    print(result[stream], file=sys.stderr)
+            if result["name"] == "ast_boundary":
+                print(json.dumps(result["violations"], ensure_ascii=False), file=sys.stderr)
     return 0 if receipt["status"] == "PASS" else 1
 
 

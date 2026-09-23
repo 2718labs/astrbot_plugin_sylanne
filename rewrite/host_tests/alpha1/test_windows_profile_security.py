@@ -39,7 +39,8 @@ def test_default_developer_temp_profile_is_rejected(tmp_path: Path) -> None:
     profile.mkdir()
     for name in security_gate._MATERIAL:
         (profile / name).write_bytes(b"fixture")
-    with pytest.raises(PermissionError, match="Authority profile"):
+    with pytest.raises(PermissionError,
+                       match="Authority profile|bypass private-key DACL"):
         security_gate._verify_tree(profile)
 
 

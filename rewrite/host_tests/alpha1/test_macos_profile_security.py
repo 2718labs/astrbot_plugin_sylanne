@@ -33,13 +33,18 @@ class _Function:
         return self.result(*args) if callable(self.result) else self.result
 
 
-def _libc(entry_result: int, *, acl=123, valid=0, entry_errno=errno.EINVAL):
+def _libc(entry_result: int, *, acl=123, acl_errno=0, valid=0,
+          entry_errno=errno.EINVAL):
+    def get_acl(*_args):
+        ctypes.set_errno(acl_errno)
+        return acl
+
     def get_entry(*_args):
         ctypes.set_errno(entry_errno if entry_result == -1 else 0)
         return entry_result
 
     return SimpleNamespace(
-        acl_get_fd_np=_Function(acl),
+        acl_get_fd_np=_Function(get_acl),
         acl_get_entry=_Function(get_entry),
         acl_valid_fd_np=_Function(valid),
         acl_free=_Function(0),
@@ -56,6 +61,22 @@ def test_extended_acl_entry_is_rejected() -> None:
 def test_acl_query_failure_is_rejected() -> None:
     with patch.object(security.platform, "system", return_value="Darwin"), \
          patch.object(security.ctypes, "CDLL", return_value=_libc(-1, acl=0)):
+        with pytest.raises(security.MacOSProfileSecurityUnavailable,
+                           match="ACL query failed"):
+            security.reject_extended_acl(4)
+
+
+def test_missing_extended_acl_is_allowed() -> None:
+    with patch.object(security.platform, "system", return_value="Darwin"), \
+         patch.object(security.ctypes, "CDLL",
+                      return_value=_libc(-1, acl=0, acl_errno=errno.ENOENT)):
+        security.reject_extended_acl(4)
+
+
+def test_acl_query_io_error_is_rejected() -> None:
+    with patch.object(security.platform, "system", return_value="Darwin"), \
+         patch.object(security.ctypes, "CDLL",
+                      return_value=_libc(-1, acl=0, acl_errno=errno.EIO)):
         with pytest.raises(security.MacOSProfileSecurityUnavailable,
                            match="ACL query failed"):
             security.reject_extended_acl(4)

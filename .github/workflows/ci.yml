@@ -89,6 +89,15 @@ jobs:
       - name: Verify Python core and native kernel
         run: python rewrite/tools/verify.py
 
+      - name: Upload core verification failure receipt
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-verification-${{ matrix.os }}
+          path: rewrite/artifacts/verification-*
+          if-no-files-found: warn
+          retention-days: 3
+
   astrbot-sdk:
     name: AstrBot 4.28.1 SDK (${{ matrix.os }}, Python 3.13)
     runs-on: ${{ matrix.os }}

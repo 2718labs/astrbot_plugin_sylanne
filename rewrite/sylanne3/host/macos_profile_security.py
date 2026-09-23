@@ -45,6 +45,10 @@ def reject_extended_acl(fd: int) -> None:
     ctypes.set_errno(0)
     acl = get_acl(fd, _ACL_TYPE_EXTENDED)
     if not acl:
+        # Darwin returns NULL/ENOENT when the opened object has no ACL.
+        # Every other query failure leaves its ACL state unverified.
+        if ctypes.get_errno() == errno.ENOENT:
+            return
         raise MacOSProfileSecurityUnavailable("macOS ACL query failed")
     try:
         if valid_acl(fd, _ACL_TYPE_EXTENDED, acl) != 0:
