@@ -362,6 +362,9 @@ class ContentFencePortV2(Protocol):
     this protocol structurally does not authenticate or activate a runtime.
     """
 
+    def current_anchor(self, *, namespace: NamespaceId,
+                       authority_namespace: str) -> RestoreAnchor: ...
+
     def begin_fence(self, *, namespace: NamespaceId, authority_namespace: str,
                     holder: str, generation: int, operation: str, operation_id: str,
                     expected_anchor: RestoreAnchor,

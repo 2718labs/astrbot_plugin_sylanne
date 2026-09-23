@@ -20,7 +20,8 @@ from .graph_store import GraphStore, ProductionGraphStore
 from .graph_types import AtomKey, GraphCandidate, GraphSnapshot, GraphAtom, GraphVersion, NamespaceEpoch
 from .memory_types import access_key, source_key
 from .runtime_contracts import (
-    AuthorityContext, CommitReceipt, DomainBundle, NamespaceId, canonical_digest,
+    AuthorityContext, CommitReceipt, ContentFencePortV2, DomainBundle, FenceScope,
+    NamespaceId, canonical_digest,
 )
 from .runtime.restore_anchor import (
     ExecutionJournalPort, SnapshotRequirements, validate_restore,
@@ -296,6 +297,7 @@ class GraphCoordinator:
                  restore_authority=None,
                  execution_journal_port: ExecutionJournalPort | None = None,
                  snapshot_requirements=None, holder=None, content_fence=None,
+                 content_fence_v2: ContentFencePortV2 | None = None,
                  closure_verifier=None, d02_issuer=None, d11_issuer=None,
                  ingress_policy=None, ingress_clock=None):
         if not isinstance(store, GraphStore):
@@ -303,13 +305,14 @@ class GraphCoordinator:
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
             raise TypeError("bootstrap must be an opaque host object")
         if isinstance(store, ProductionGraphStore):
-            if (deletion_journal is None or migration_authority is None
-                    or restore_authority is None
-                    or not callable(getattr(execution_journal_port, "verify_current_chain", None))
-                    or not callable(snapshot_requirements) or not holder
-                    or not callable(content_fence)
-                    or not callable(getattr(d02_issuer, "authorize_resources", None))
-                    or not callable(getattr(d11_issuer, "admit_runtime", None))):
+            v2 = content_fence_v2 is not None
+            if (not holder or (v2 and not isinstance(content_fence_v2, ContentFencePortV2))
+                    or (not v2 and (deletion_journal is None
+                        or migration_authority is None or restore_authority is None
+                        or not callable(getattr(execution_journal_port, "verify_current_chain", None))
+                        or not callable(snapshot_requirements) or not callable(content_fence)
+                        or not callable(getattr(d02_issuer, "authorize_resources", None))
+                        or not callable(getattr(d11_issuer, "admit_runtime", None))))):
                 raise UnavailableGuard("production recovery and activation authority required")
         self.__store = store
         self.__bootstrap = bootstrap
@@ -320,6 +323,7 @@ class GraphCoordinator:
         self.__snapshot_requirements = snapshot_requirements
         self.__holder = holder
         self.__content_fence = content_fence
+        self.__content_fence_v2 = content_fence_v2
         self.__closure_verifier = closure_verifier
         self.__d02_issuer = d02_issuer
         self.__d11_issuer = d11_issuer
@@ -344,10 +348,84 @@ class GraphCoordinator:
                        operation: str):
         if not isinstance(self.__store, ProductionGraphStore):
             return nullcontext()
+        if self.__content_fence_v2 is not None:
+            raise UnavailableGuard("v2 graph write path is not admitted")
         if self.__content_fence is None:
             raise UnavailableGuard("content authority fence unavailable")
         return self.__content_fence(namespace_ref(namespace), self.__holder,
                                     generation, operation)
+
+    @staticmethod
+    def _anchor_matches(requirements, anchor) -> bool:
+        return (requirements.authority_id == anchor.authority_id
+                and requirements.authority_namespace == anchor.namespace
+                and requirements.activation_generation == anchor.activation_generation
+                and requirements.deletion_journal_id == anchor.deletion_journal_id
+                and requirements.deletion_seq == anchor.deletion_seq
+                and requirements.deletion_digest == anchor.deletion_digest
+                and requirements.execution_journal_id == anchor.execution_journal_id
+                and requirements.execution_seq == anchor.execution_seq
+                and requirements.execution_digest == anchor.execution_digest
+                and requirements.revocation_epoch == anchor.revocation_epoch)
+
+    def _v2_graph_stamp(self, namespace: NamespaceId):
+        """Read both business stamps while the GraphStore lock is held."""
+        store = self.__store
+        metadata = store.graph_recovery_metadata(
+            namespace, _capability=self.__graph_capability)
+        if metadata is None:
+            raise UnavailableGuard("v2 graph recovery metadata is absent")
+        epoch = GraphStore.graph_epoch(
+            store, *namespace.as_tuple, _capability=self.__graph_capability)
+        return metadata, epoch
+
+    def _read_v2(self, authority: AuthorityContext, reader):
+        """Keep every Authority RPC outside the business graph lock."""
+        store = self.__store
+        namespace = authority.namespace
+        port = self.__content_fence_v2
+        try:
+            with store._lock:
+                metadata, epoch = self._v2_graph_stamp(namespace)
+            target = metadata.requirements
+            if target.namespace != namespace or target.activation_generation != authority.activation_generation:
+                raise UnavailableGuard("v2 graph recovery identity or generation differs")
+            anchor = port.current_anchor(
+                namespace=namespace, authority_namespace=target.authority_namespace)
+            if not self._anchor_matches(target, anchor):
+                raise UnavailableGuard("v2 graph recovery anchor differs")
+            operation_id = "graph-read-" + secrets.token_hex(16)
+            permit = port.begin_fence(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                holder=self.__holder, generation=authority.activation_generation,
+                operation="read", operation_id=operation_id, expected_anchor=anchor)
+            scope = FenceScope(namespace, target.authority_namespace,
+                               authority.activation_generation, "read", operation_id,
+                               permit, anchor, epoch, metadata.graph_revision)
+            try:
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("v2 read permit changed")
+                with store._lock:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise UnavailableGuard("v2 graph recovery stamp changed")
+                    result = reader()
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("v2 read permit changed")
+                with store._lock:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise UnavailableGuard("v2 graph recovery stamp changed")
+                return result
+            finally:
+                port.finish_fence(
+                    scope, request_id="finish:" + operation_id,
+                    request_digest="sha256:" + canonical_digest({
+                        "operation_id": operation_id, "permit_token": permit.token,
+                        "action": "finish_read",
+                    }))
+        except UnavailableGuard:
+            raise
+        except Exception as exc:
+            raise UnavailableGuard("v2 content authority is unavailable") from exc
 
     def _admit_content(self, namespace: NamespaceId, generation: int,
                        operation: str, refs: tuple[str, ...] = ()) -> None:
@@ -433,6 +511,8 @@ class GraphCoordinator:
         if not isinstance(self.__store, ProductionGraphStore):
             yield
             return
+        if self.__content_fence_v2 is not None:
+            raise UnavailableGuard("v2 graph write path is not admitted")
         try:
             proof = self.__migration_authority.current(namespace_ref(namespace))
         except Exception as exc:
@@ -1205,6 +1285,9 @@ class GraphCoordinator:
         domains = frozenset(self.__store._registry.spec(key.type_name).writer_domain
                             for key in keys)
         self._authorize(lease, authority, domains)
+        if isinstance(self.__store, ProductionGraphStore) and self.__content_fence_v2 is not None:
+            return self._read_v2(authority, lambda: GraphStore.graph_snapshot(
+                self.__store, keys, _capability=self.__graph_capability))
         with self._content_fence(authority.namespace, authority.activation_generation, "read"):
             store = self.__store
             with store._lock:
@@ -1224,6 +1307,10 @@ class GraphCoordinator:
         domains = frozenset(self.__store._registry.spec(name).writer_domain
                             for name in type_names)
         self._authorize(lease, authority, domains)
+        if isinstance(self.__store, ProductionGraphStore) and self.__content_fence_v2 is not None:
+            return self._read_v2(authority, lambda: GraphStore.graph_query(
+                self.__store, *authority.namespace.as_tuple, type_names=type_names,
+                owner_kind=owner_kind, _capability=self.__graph_capability, **filters))
         with self._content_fence(authority.namespace, authority.activation_generation, "read"):
             store = self.__store
             with store._lock:
@@ -1241,19 +1328,23 @@ class GraphCoordinator:
         if not isinstance(authority, AuthorityContext) or not operation_id:
             raise ValueError("valid authority and operation ID are required")
         self._authorize(lease, authority, frozenset())
+        if isinstance(self.__store, ProductionGraphStore) and self.__content_fence_v2 is not None:
+            return self._read_v2(authority, lambda: self._get_operation_fenced(
+                authority, operation_id, v2=True))
         with self._content_fence(authority.namespace, authority.activation_generation, "read"):
             return self._get_operation_fenced(authority, operation_id)
 
     def _get_operation_fenced(self, authority: AuthorityContext,
-                              operation_id: str) -> CommitReceipt | None:
+                              operation_id: str, *, v2: bool = False) -> CommitReceipt | None:
         namespace = authority.namespace
         store = self.__store
         with store._lock:
             store._ensure_open()
-            self._admit_content(namespace, authority.activation_generation, "read")
-            if self._version(store._db, namespace, "activation", "current") != str(
-                    authority.activation_generation):
-                raise StaleRead("activation generation changed")
+            if not v2:
+                self._admit_content(namespace, authority.activation_generation, "read")
+                if self._version(store._db, namespace, "activation", "current") != str(
+                        authority.activation_generation):
+                    raise StaleRead("activation generation changed")
             row = store._db.execute(
                 "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
                 "FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
