@@ -15,6 +15,9 @@ from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.event_message_type import EventMessageTypeFilter
 from astrbot.core.star.star_handler import star_handlers_registry
 
+from rewrite.sylanne3.host.ingress import HostIngressEnvelope, SourceLineage
+from rewrite.sylanne3.runtime_contracts import NamespaceId
+
 ROOT = Path(os.environ.get("SYLANNE3_PLUGIN_ROOT", Path(__file__).resolve().parents[2])).resolve()
 MODULE = "data.plugins.sylanne3_acceptance.main"
 
@@ -90,10 +93,22 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_ready_ingress_claims_only_accepted_runtime_receipts(self):
         runtime = types.SimpleNamespace(handle_ingress=AsyncMock())
         self.plugin._runtime = runtime
+        self.plugin._enabled = True
         self.plugin.runtime_health = self.module.RuntimeHealth("ready")
         event = ControlledEvent()
         with patch.object(self.module, "build_astrbot_ingress", new_callable=AsyncMock) as build:
-            build.return_value = object()
+            build.return_value = HostIngressEnvelope(
+                namespace=NamespaceId("bot", "persona"),
+                platform_ref="platform",
+                conversation_ref="conversation",
+                sender_ref="sender",
+                message_id="message",
+                text="hello",
+                occurred_at=None,
+                learned_at=1.0,
+                visibility="private",
+                lineage=SourceLineage("a" * 64, "reported", "astrbot_test", "external_report", "reported_claim"),
+            )
             runtime.handle_ingress.return_value = types.SimpleNamespace(status="accepted")
             await self.plugin.ingress(event)
             self.assertTrue(event.stopped)
