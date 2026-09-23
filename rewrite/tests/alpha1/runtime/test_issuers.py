@@ -9,6 +9,7 @@ from sylanne3.runtime.d11_types import runtime_job_key, runtime_outbox_key
 from sylanne3.runtime.issuers import (
     BudgetLeaseGrant,
     D02ResourceIssuer,
+    D11BudgetGrantIssuer,
     D11BudgetJobIssuer,
     IssuerAuthorityDenied,
     ResourceOutcome,
@@ -111,6 +112,23 @@ class ProductionIssuerTests(unittest.TestCase):
     def issue_authorities(self, *, quote=None, grant=None):
         self.d02.issue_quote(self.db, quote or self.quote())
         self.d11.issue_budget_grant(self.db, grant or self.grant())
+
+    def test_grant_issuer_signs_without_d02_and_rejects_tampering(self):
+        issuer = D11BudgetGrantIssuer(b"k" * 32)
+        grant = self.grant()
+        signature = issuer.issue_budget_grant(self.db, grant)
+        self.assertEqual(issuer.current_budget_grant(self.db, "parent"), grant)
+        self.assertEqual(signature, self.db.execute(
+            "SELECT signature FROM runtime_budget_grants WHERE lease_id='parent'"
+        ).fetchone()[0])
+        with self.assertRaises(IssuerAuthorityDenied):
+            D11BudgetGrantIssuer(b"x" * 32).current_budget_grant(self.db, "parent")
+        self.db.execute(
+            "UPDATE runtime_budget_grants SET grant_json=replace(grant_json, '1000', '999') "
+            "WHERE lease_id='parent'"
+        )
+        with self.assertRaises(IssuerAuthorityDenied):
+            issuer.current_budget_grant(self.db, "parent")
 
     def test_missing_or_tampered_quote_fails_closed(self):
         with self.assertRaises(IssuerAuthorityDenied):

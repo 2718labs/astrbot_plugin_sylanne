@@ -638,7 +638,7 @@ class GraphCoordinator:
         """
         from .installation_policy import AdminInstallationPolicy
         from .runtime.issuers import (
-            BudgetLeaseGrant, D11BudgetJobIssuer,
+            BudgetLeaseGrant, D11BudgetGrantIssuer, D11BudgetJobIssuer,
             install_schema as install_issuer_schema,
         )
         from .runtime_contracts import (
@@ -652,7 +652,7 @@ class GraphCoordinator:
         port = self.__content_fence_v2
         if (not isinstance(store, ProductionGraphStore) or port is None
                 or not callable(getattr(port, "provision_namespace", None))
-                or type(self.__d11_issuer) is not D11BudgetJobIssuer):
+                or type(self.__d11_issuer) not in (D11BudgetGrantIssuer, D11BudgetJobIssuer)):
             raise UnavailableGuard("production v2 provisioning authorities are unavailable")
         if type(policy) is not AdminInstallationPolicy:
             raise TypeError("verified administrator installation policy is required")

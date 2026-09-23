@@ -14,7 +14,9 @@ from sylanne3.graph_store import ProductionGraphStore
 from sylanne3.graph_types import AtomKey, Owner, TypeRegistry
 from sylanne3.installation_policy import AdminInstallationPolicy
 from sylanne3.runtime.budget import BudgetLease, get_budget_lease
-from sylanne3.runtime.issuers import BudgetLeaseGrant, build_runtime_issuers
+from sylanne3.runtime.issuers import (
+    BudgetLeaseGrant, D11BudgetGrantIssuer, build_runtime_issuers,
+)
 from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime_contracts import (
     InstallationGrantV2, NamespaceBootstrapV2, NamespaceId,
@@ -135,6 +137,27 @@ def row_counts(store):
             "graph_recovery_metadata_v2", "graph_guard_versions",
             "runtime_budget_leases", "runtime_budget_operations",
             "runtime_budget_grants", "graph_namespace_provisioning_v2")}
+
+
+def test_genesis_uses_d11_grant_capability_without_d02(tmp_path):
+    store = ProductionGraphStore(tmp_path / "business.db", TypeRegistry())
+    authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
+    try:
+        port = AuthorityPort(store, authority_db)
+        issuer = D11BudgetGrantIssuer(b"K" * 32)
+        bootstrap = object()
+        coordinator = GraphCoordinator(
+            store, bootstrap, holder="administrator", content_fence_v2=port,
+            d11_issuer=issuer)
+        policy = policy_for(store)
+        receipt = coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+        assert issuer.current_budget_grant(store._db, receipt.root_lease_id) == policy.root_grant
+        assert coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona") == receipt
+    finally:
+        store.close()
+        authority_db.close()
 
 
 def test_success_stages_recovery_guards_real_budget_and_reconcilable_receipt(system):

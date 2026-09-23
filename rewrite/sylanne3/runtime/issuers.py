@@ -431,19 +431,11 @@ class D02ResourceIssuer:
         return True
 
 
-class D11BudgetJobIssuer:
-    """Issues typed GraphCoordinator admissions from signed D02 and D11 state."""
+class D11BudgetGrantIssuer:
+    """Signs and verifies durable D11 lease grants without D02 authority."""
 
-    def __init__(self, d02_issuer: D02ResourceIssuer, signing_key: bytes):
-        if not isinstance(d02_issuer, D02ResourceIssuer):
-            raise TypeError("d02_issuer must be D02ResourceIssuer")
-        self._d02 = d02_issuer
+    def __init__(self, signing_key: bytes):
         self._signer = _Signer(signing_key)
-
-    @property
-    def resource_issuer(self) -> D02ResourceIssuer:
-        """Return the D02 authority this budget issuer actually verifies."""
-        return self._d02
 
     def issue_budget_grant(self, db, grant: BudgetLeaseGrant) -> str:
         if not isinstance(grant, BudgetLeaseGrant):
@@ -480,6 +472,21 @@ class D11BudgetJobIssuer:
     def current_budget_grant(self, db, lease_id: str) -> BudgetLeaseGrant:
         """Verify and return the active signed grant in this business transaction."""
         return self._load_grant(db, lease_id)
+
+
+class D11BudgetJobIssuer(D11BudgetGrantIssuer):
+    """Issues typed GraphCoordinator admissions from signed D02 and D11 state."""
+
+    def __init__(self, d02_issuer: D02ResourceIssuer, signing_key: bytes):
+        if not isinstance(d02_issuer, D02ResourceIssuer):
+            raise TypeError("d02_issuer must be D02ResourceIssuer")
+        super().__init__(signing_key)
+        self._d02 = d02_issuer
+
+    @property
+    def resource_issuer(self) -> D02ResourceIssuer:
+        """Return the D02 authority this budget issuer actually verifies."""
+        return self._d02
 
     def _admission_state(self, envelope: CommandEnvelope, db):
         quote = self._d02.qualified_quote(envelope, db)
@@ -608,7 +615,7 @@ def build_runtime_issuers(signing_key: bytes, *,
 
 
 __all__ = [
-    "BudgetLeaseGrant", "D02ResourceIssuer", "D11BudgetJobIssuer",
+    "BudgetLeaseGrant", "D02ResourceIssuer", "D11BudgetGrantIssuer", "D11BudgetJobIssuer",
     "IssuerAuthorityDenied", "ResourceOutcome", "ResourceQuote",
     "build_runtime_issuers", "install_schema",
 ]
