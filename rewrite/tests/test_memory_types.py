@@ -192,7 +192,8 @@ class MemoryGraphTypeTests(unittest.TestCase):
         register_memory_types(registry)
         specs = {spec.name: spec for spec in registry.specs}
         self.assertEqual(set(specs), {
-            "memory.source", "memory.access", "memory.interpretation"
+            "memory.source", "memory.access", "memory.interpretation",
+            "memory.episode.v1", "memory.subjective_trace.v1",
         })
         self.assertEqual(
             (specs["memory.source"].owner_kinds,
@@ -204,6 +205,10 @@ class MemoryGraphTypeTests(unittest.TestCase):
             self.assertEqual(specs[name].owner_kinds, ("event",))
             self.assertEqual(specs[name].storage_role, "state")
             self.assertFalse(specs[name].immutable)
+        for name in ("memory.episode.v1", "memory.subjective_trace.v1"):
+            self.assertEqual(specs[name].owner_kinds, ("event",))
+            self.assertEqual(specs[name].storage_role, "source")
+            self.assertTrue(specs[name].immutable)
 
         source = SourceRecord(**source_value()).to_dict()
         interpretation = InterpretationRecord(**interpretation_value()).to_dict()
