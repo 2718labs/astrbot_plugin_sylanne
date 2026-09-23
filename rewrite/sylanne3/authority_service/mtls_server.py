@@ -13,7 +13,7 @@ import time
 from typing import Callable
 
 from ..runtime.restore_anchor import RestoreAnchor
-from ..runtime_contracts import InstallationGrantV2
+from ..runtime_contracts import InstallationGrantV2, NamespaceBootstrapV2, NamespaceId
 from .core import AuthorityServiceCore
 from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, ContentPermit, identifier
 from .v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire
@@ -122,6 +122,7 @@ class AuthorityRpcServer:
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
+        namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
     ) -> None:
         if not isinstance(core, AuthorityServiceCore):
             raise TypeError("AuthorityServiceCore is required")
@@ -153,6 +154,14 @@ class AuthorityRpcServer:
                for key, value in installed.items()):
             raise TypeError("administrator v2 installations are invalid")
         self._installations_v2 = installed
+        bindings = dict(namespace_bindings_v2 or {})
+        if any(type(key) is not tuple or len(key) != 3
+               or (key[0], key[1]) not in installed
+               or type(key[2]) is not NamespaceId
+               or type(namespace) is not str or namespace not in services
+               for key, namespace in bindings.items()):
+            raise TypeError("administrator v2 namespace bindings are invalid")
+        self._namespace_bindings_v2 = bindings
         self._sessions: dict[str, tuple[float, str, str]] = {}
 
     @staticmethod
@@ -433,6 +442,32 @@ class AuthorityRpcServer:
                 service_capability_version=installed.service_capability_version,
                 channel_binding_sha256=binding,
             ))
+        if method == "namespace_bootstrap":
+            if (wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict
+                    or set(command) != {"namespace"}
+                    or type(command["namespace"]) is not dict
+                    or set(command["namespace"]) != {"bot_id", "persona_id"}):
+                raise RuntimeError("authority unavailable")
+            installed = self._installations_v2.get((peer, wire.profile_id))
+            if installed is None or installed.manifest_digest != wire.manifest_sha256:
+                raise RuntimeError("authority unavailable")
+            try:
+                namespace_id = NamespaceId(**command["namespace"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("authority unavailable") from exc
+            namespace = self._namespace_bindings_v2.get((peer, wire.profile_id, namespace_id))
+            if namespace is None:
+                raise RuntimeError("authority unavailable")
+            result = self._v2_service(namespace).namespace_bootstrap(
+                credential=credential, subject="mtls:sha256:" + peer,
+                namespace_id=namespace_id,
+            )
+            if (type(result) is not NamespaceBootstrapV2
+                    or result.authority_id != self._authority_id()
+                    or result.namespace != namespace_id
+                    or result.authority_namespace != namespace):
+                raise RuntimeError("authority unavailable")
+            return {**asdict(result), "channel_binding_sha256": binding}
         if method == "capability_grant":
             if command is not None:
                 raise RuntimeError("authority unavailable")

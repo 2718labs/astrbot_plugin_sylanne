@@ -45,6 +45,7 @@ from sylanne3.host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTrans
 if not hasattr(_host_package, "__file__"):
     sys.modules.pop("sylanne3.host", None)
 from sylanne3.runtime.deletion import DeletionJournal
+from sylanne3.runtime_contracts import NamespaceId, NamespaceRuntimeState
 
 
 class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
@@ -325,6 +326,10 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                             AdministratorInstallationV2(
                                 "installation-a", "host:one", "publisher-policy-a",
                                 "capabilities-v2", "a" * 64),
+                    },
+                    namespace_bindings_v2={
+                        (peers["client"].certificate_sha256, "first",
+                         NamespaceId("bot-a", "persona-a")): "ns:role",
                     })
                 listener = await server.start(
                     "127.0.0.1", 0,
@@ -359,6 +364,20 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(installation.manifest_digest, "a" * 64)
                 self.assertEqual(installation.channel_binding_sha256,
                                  first_handshake.channel_binding_sha256)
+                bootstrap = await first.v2_namespace_bootstrap(
+                    first_request, first_handshake, NamespaceId("bot-a", "persona-a"))
+                self.assertEqual(bootstrap.state, NamespaceRuntimeState.ACTIVE)
+                self.assertEqual(bootstrap.namespace, NamespaceId("bot-a", "persona-a"))
+                self.assertEqual(bootstrap.authority_namespace, "ns:role")
+                self.assertEqual(bootstrap.anchor.authority_id, server._authority_id())
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await first.v2_namespace_bootstrap(
+                        first_request, first_handshake, NamespaceId("bot-a", "persona-b"))
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await first._content_rpc(
+                        first_request, first_handshake, "namespace_bootstrap",
+                        {"namespace": {"bot_id": "bot-a", "persona_id": "persona-a"},
+                         "authority_namespace": "ns:role"}, protocol=AUTHORITY_V2_PROTOCOL)
                 anchor = await first.v2_current_anchor(
                     first_request, first_handshake, "ns:role")
                 permit = await first.v2_begin_read_fence(
@@ -374,6 +393,9 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                     second_request, protocol=AUTHORITY_V2_PROTOCOL)
                 with self.assertRaisesRegex(RuntimeError, "unavailable"):
                     await second.installation_grant_v2(second_request, second_handshake)
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await second.v2_namespace_bootstrap(
+                        second_request, second_handshake, NamespaceId("bot-a", "persona-a"))
                 with self.assertRaisesRegex(RuntimeError, "unavailable"):
                     await second.v2_validate_fence(
                         second_request, second_handshake, permit)

@@ -27,7 +27,9 @@ from sylanne3.host.mtls_transport import (
 if not hasattr(_host_package, "__file__"):
     sys.modules.pop("sylanne3.host", None)
 from sylanne3.runtime.restore_anchor import RestoreAnchor
-from sylanne3.runtime_contracts import InstallationGrantV2
+from sylanne3.runtime_contracts import (
+    InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
+)
 
 
 class ContentTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -196,3 +198,37 @@ class ContentTransportTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "handshake channel"):
             await self.transport.installation_grant_v2(self.request, self.handshake)
+
+    async def test_namespace_bootstrap_parses_exact_observation_and_rejects_forgery(self):
+        namespace = NamespaceId("bot-a", "persona-a")
+        observed = NamespaceBootstrapV2(
+            "authority-1", namespace, "ns:role", "holder-a", 1, "active",
+            NamespaceRuntimeState.ACTIVE, self.anchor, (),
+        )
+        response = {
+            **asdict(observed), "state": "active", "blocking_reasons": [],
+            "channel_binding_sha256": self.handshake.channel_binding_sha256,
+        }
+        calls = []
+
+        async def rpc(request, handshake, method, command, *, protocol):
+            calls.append((method, command, protocol))
+            return response
+
+        self.transport._content_rpc = rpc
+        self.assertEqual(await self.transport.v2_namespace_bootstrap(
+            self.request, self.handshake, namespace), observed)
+        self.assertEqual(calls, [(
+            "namespace_bootstrap", {"namespace": asdict(namespace)}, SCHEMA)])
+        original = response
+        for response in (
+            {**original, "extra": "permit"},
+            {**original, "namespace": {"bot_id": "bot-a", "persona_id": "persona-b"}},
+            {**original, "authority_id": "other-authority"},
+            {**original, "state": "unknown"},
+            {**original, "anchor": {**original["anchor"], "proof": ""}},
+            {**original, "anchor": {**original["anchor"], "extra": True}},
+        ):
+            with self.assertRaises(RuntimeError):
+                await self.transport.v2_namespace_bootstrap(
+                    self.request, self.handshake, namespace)

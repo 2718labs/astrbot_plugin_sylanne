@@ -23,7 +23,9 @@ from ..authority_service.v2_contract import (
 )
 from ..runtime.activation import ActivationProof
 from ..runtime.restore_anchor import RestoreAnchor
-from ..runtime_contracts import InstallationGrantV2
+from ..runtime_contracts import (
+    InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
+)
 from .authority_client import (
     AUTHORITY_PROTOCOL,
     AuthorityCapabilityGrant,
@@ -384,6 +386,52 @@ class MtlsAuthorityTransport:
                 or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
             raise RuntimeError("authority v2 installation grant binding is invalid")
         return grant
+
+    async def v2_namespace_bootstrap(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        namespace: NamespaceId,
+    ) -> NamespaceBootstrapV2:
+        """Observe one mapped namespace; the result grants no content access."""
+        if not handshake.valid_pairing() or type(namespace) is not NamespaceId:
+            raise RuntimeError("authority v2 namespace request is invalid")
+        response = await self._content_rpc(
+            request, handshake, "namespace_bootstrap",
+            {"namespace": asdict(namespace)}, protocol=AUTHORITY_V2_PROTOCOL,
+        )
+        if set(response) != set(NamespaceBootstrapV2.__dataclass_fields__) | {
+            "channel_binding_sha256"
+        }:
+            raise RuntimeError("authority v2 namespace response is invalid")
+        namespace_wire = response["namespace"]
+        anchor_wire = response["anchor"]
+        if (type(namespace_wire) is not dict
+                or set(namespace_wire) != set(NamespaceId.__dataclass_fields__)
+                or (anchor_wire is not None and type(anchor_wire) is not dict)
+                or type(response["state"]) is not str
+                or type(response["blocking_reasons"]) is not list):
+            raise RuntimeError("authority v2 namespace response is invalid")
+        try:
+            observed = NamespaceBootstrapV2(
+                authority_id=response["authority_id"],
+                namespace=NamespaceId(**namespace_wire),
+                authority_namespace=response["authority_namespace"],
+                holder=response["holder"], generation=response["generation"],
+                phase=response["phase"],
+                state=NamespaceRuntimeState(response["state"]),
+                anchor=(None if anchor_wire is None else self._restore_anchor_response(
+                    {**anchor_wire, "channel_binding_sha256":
+                     response["channel_binding_sha256"]}, "v2 namespace anchor")),
+                blocking_reasons=tuple(response["blocking_reasons"]),
+                schema=response["schema"],
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise RuntimeError("authority v2 namespace response is invalid") from exc
+        profile = self.profile_for(request.profile_id)
+        if (observed.namespace != namespace
+                or observed.authority_id != handshake.installation_authority_id
+                or observed.authority_id != profile.expected_authority_id):
+            raise RuntimeError("authority v2 namespace binding is invalid")
+        return observed
 
     async def current(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
