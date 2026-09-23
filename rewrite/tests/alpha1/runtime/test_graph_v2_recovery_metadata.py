@@ -8,6 +8,7 @@ from sylanne3.contracts import StaleRead
 from sylanne3.graph_store import GraphRecoveryMetadataV2, GraphStore
 from sylanne3.graph_types import TypeRegistry
 from sylanne3.runtime.budget import BudgetLease, create_budget_lease
+from sylanne3.runtime.issuers import install_schema as install_issuer_schema
 from sylanne3.runtime_contracts import NamespaceId, SnapshotRequirementsV2
 
 
@@ -119,6 +120,32 @@ def test_unowned_legacy_clock_row_blocks_empty_namespace_genesis(tmp_path):
             "INSERT INTO runtime_deadlines(deadline_id,deadline_utc,floating_rule,"
             "timezone_name,policy_ref) VALUES(?,?,?,?,?)",
             ("deadline-a", "2030-01-01T00:00:00Z", None, "UTC", "policy-a"))
+        with pytest.raises(RuntimeError, match="unsealed"):
+            store.graph_recovery_metadata(NAMESPACE, _capability=capability)
+        with pytest.raises(RuntimeError, match="unsealed"):
+            store.install_graph_recovery_genesis(requirements(), _capability=capability)
+        assert store._db.execute("SELECT COUNT(*) FROM graph_recovery_metadata_v2").fetchone() == (0,)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("table,columns,values", [
+    ("runtime_budget_grants", "lease_id,version,grant_json,signature,status",
+     ("lease-a", 1, "{}", "signature-a", "active")),
+    ("runtime_resource_quotes", "quote_id,version,quote_json,signature,status",
+     ("quote-a", 1, "{}", "signature-a", "active")),
+    ("runtime_resource_outcomes", "quote_id,operation_id,version,outcome_json,signature",
+     ("quote-a", "operation-a", 1, "{}", "signature-a")),
+])
+def test_unowned_issuer_row_blocks_empty_namespace_genesis(tmp_path, table, columns, values):
+    capability = object()
+    store = open_store(tmp_path / "business.db", capability)
+    try:
+        install_issuer_schema(store._db)
+        store._db.execute(
+            f"INSERT INTO {table}({columns}) VALUES({','.join('?' for _ in values)})",
+            values,
+        )
         with pytest.raises(RuntimeError, match="unsealed"):
             store.graph_recovery_metadata(NAMESPACE, _capability=capability)
         with pytest.raises(RuntimeError, match="unsealed"):

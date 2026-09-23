@@ -6,7 +6,7 @@ The strings in CommandEnvelope are audit assertions, never authentication.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from contextlib import contextmanager, nullcontext
 import hashlib
 import json
@@ -27,7 +27,8 @@ from .runtime.restore_anchor import (
     ExecutionJournalPort, SnapshotRequirements, validate_restore,
 )
 from .runtime.budget import (
-    BudgetReceipt, get_budget_lease, reserve_budget, settle_budget,
+    BudgetLease, BudgetReceipt, create_budget_lease, get_budget_lease,
+    reserve_budget, settle_budget,
 )
 from .runtime.jobs import (
     PersistentJob, acquire_job, cancel_job, create_job, get_job,
@@ -109,6 +110,35 @@ class AuthorityDenied(PermissionError):
 
 class UnavailableGuard(RuntimeError):
     """A current authority, lease, or policy version is not installed."""
+
+
+@dataclass(frozen=True)
+class NamespaceProvisionReceiptV2:
+    """Durable business genesis and the exact Authority finish to reconcile."""
+
+    namespace: NamespaceId
+    operation_id: str
+    input_digest: str
+    installation_id: str
+    manifest_digest: str
+    authority_id: str
+    authority_namespace: str
+    generation: int
+    graph_incarnation: str
+    graph_revision: int
+    graph_epoch: int
+    catalogue_hash: str
+    scheme_version: str
+    operator_version: str
+    policy_version: str
+    root_lease_id: str
+    root_grant_id: str
+    root_grant_version: int
+    root_grant_signature: str
+    fence_attempt_id: str
+    finish_request_id: str
+    finish_request_digest: str
+    permit_wire: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -426,6 +456,366 @@ class GraphCoordinator:
             raise
         except Exception as exc:
             raise UnavailableGuard("v2 content authority is unavailable") from exc
+
+    @staticmethod
+    def _provision_row(db, namespace: NamespaceId):
+        return db.execute(
+            "SELECT operation_id,digest,receipt_json "
+            "FROM graph_namespace_provisioning_v2 WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()
+
+    @staticmethod
+    def _decode_provision_receipt(row) -> NamespaceProvisionReceiptV2:
+        try:
+            data = json.loads(row[2])
+            if (type(data) is not dict
+                    or set(data) != {item.name for item in fields(NamespaceProvisionReceiptV2)}
+                    or type(data["namespace"]) is not dict):
+                raise ValueError("invalid provisioning receipt fields")
+            data["namespace"] = NamespaceId(**data["namespace"])
+            receipt = NamespaceProvisionReceiptV2(**data)
+            if (row[:2] != (receipt.operation_id, receipt.input_digest)
+                    or canonical_json(asdict(receipt)) != row[2]):
+                raise ValueError("noncanonical provisioning receipt")
+            return receipt
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("durable v2 provisioning receipt is invalid") from exc
+
+    def _verify_provision_receipt(self, policy, operation_id: str, digest: str):
+        """Called with the graph lock; inspect linked business facts, not Authority."""
+        store = self.__store
+        namespace = policy.namespace
+        row = self._provision_row(store._db, namespace)
+        if row is None:
+            raise UnavailableGuard("durable v2 provisioning receipt is absent")
+        if row[0] != operation_id or row[1] != digest:
+            raise AuthorityDenied("namespace provisioning identity differs")
+        receipt = self._decode_provision_receipt(row)
+        metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        if (receipt.namespace != namespace
+                or receipt.installation_id != policy.installation_id
+                or receipt.manifest_digest != policy.manifest_digest
+                or receipt.authority_id != target.authority_id
+                or receipt.authority_namespace != target.authority_namespace
+                or receipt.generation != target.activation_generation
+                or receipt.graph_incarnation != target.graph_incarnation
+                or receipt.graph_revision != 0 or metadata.graph_revision < 0
+                or receipt.graph_epoch != 0 or epoch.revision < 0
+                or receipt.catalogue_hash != policy.catalogue_hash
+                or receipt.scheme_version != policy.scheme_version
+                or receipt.operator_version != policy.operator_version
+                or receipt.policy_version != policy.policy_version
+                or receipt.root_lease_id != policy.root_lease.lease_id
+                or receipt.root_grant_id != policy.root_grant.grant_id
+                or receipt.root_grant_version != policy.root_grant.version):
+            raise UnavailableGuard("durable v2 provisioning receipt differs from recovery state")
+        from .authority_service.v2_contract import FencePermitV2, from_wire
+        try:
+            permit = from_wire(receipt.permit_wire)
+        except (TypeError, ValueError) as exc:
+            raise UnavailableGuard("durable v2 provisioning permit is invalid") from exc
+        if (type(permit) is not FencePermitV2 or permit.operation_id != receipt.fence_attempt_id
+                or permit.authority_id != target.authority_id
+                or permit.namespace != target.authority_namespace
+                or permit.generation != target.activation_generation
+                or permit.operation != "write" or permit.holder != self.__holder
+                or permit.pinned_anchor.deletion_journal_id != target.deletion_journal_id
+                or permit.pinned_anchor.execution_journal_id != target.execution_journal_id
+                or permit.pinned_anchor.deletion_seq != 0
+                or permit.pinned_anchor.deletion_digest != "genesis"
+                or permit.pinned_anchor.execution_seq != 0
+                or permit.pinned_anchor.execution_digest != "genesis"
+                or permit.pinned_anchor.revocation_epoch != 0
+                or receipt.finish_request_id != "finish:" + receipt.fence_attempt_id
+                or receipt.finish_request_digest != "sha256:" + canonical_digest({
+                    "operation_id": receipt.fence_attempt_id,
+                    "permit_token": permit.token,
+                    "action": "finish_namespace_provision",
+                    "business_operation_id": operation_id,
+                    "input_digest": digest,
+                })):
+            raise UnavailableGuard("durable v2 provisioning fence identity differs")
+        for kind, version in (("scheme", policy.scheme_version),
+                              ("operator", policy.operator_version),
+                              ("policy", policy.policy_version),
+                              ("activation", str(target.activation_generation))):
+            if self._version(store._db, namespace, kind, "current") != str(version):
+                raise UnavailableGuard("durable v2 provisioning guard changed")
+        lease = get_budget_lease(store._db, policy.root_lease.lease_id)
+        if (lease.parent_id is not None or lease.lease_id != policy.root_lease.lease_id
+                or (lease.bot_id, lease.persona_id) != namespace.as_tuple
+                or lease.currency != policy.root_lease.currency
+                or lease.limits != policy.root_lease.limits):
+            raise UnavailableGuard("durable v2 root budget differs")
+        if self.__d11_issuer.current_budget_grant(store._db, lease.lease_id) != policy.root_grant:
+            raise UnavailableGuard("durable v2 D11 budget grant differs")
+        grant_row = store._db.execute(
+            "SELECT signature FROM runtime_budget_grants WHERE lease_id=? AND version=?",
+            (lease.lease_id, policy.root_grant.version),
+        ).fetchone()
+        if grant_row != (receipt.root_grant_signature,):
+            raise UnavailableGuard("durable v2 D11 signature differs")
+        return receipt, metadata, epoch
+
+    def _reconcile_provision_v2(self, policy, operation_id: str, digest: str):
+        """Resolve an old write fence, then read under a fresh current fence."""
+        from .authority_service.v2_contract import FencePermitV2, from_wire
+
+        store = self.__store
+        namespace = policy.namespace
+        port = self.__content_fence_v2
+        with store._lock:
+            receipt, metadata, epoch = self._verify_provision_receipt(
+                policy, operation_id, digest)
+        target = metadata.requirements
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("v2 provisioning recovery anchor differs")
+        if not callable(getattr(port, "get_fence_operation", None)):
+            raise UnavailableGuard("v2 Authority fence status is unavailable")
+        original = from_wire(receipt.permit_wire)
+        observed_permit, state = port.get_fence_operation(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            operation_id=receipt.fence_attempt_id)
+        if (type(original) is not FencePermitV2
+                or type(observed_permit) is not FencePermitV2
+                or observed_permit != original
+                or state not in {"active", "finished"}):
+            raise UnavailableGuard("v2 provisioning Authority fence status differs")
+        if state == "active":
+            if (metadata.graph_revision != receipt.graph_revision
+                    or epoch.revision != receipt.graph_epoch
+                    or original.pinned_anchor != anchor):
+                raise UnavailableGuard("active v2 provisioning fence lost its business stamp")
+            write_scope = FenceScope(
+                namespace, target.authority_namespace,
+                target.activation_generation, "write", receipt.fence_attempt_id,
+                original, anchor, epoch, metadata.graph_revision)
+            if port.validate_fence(write_scope) != original:
+                raise UnavailableGuard("active v2 provisioning permit changed")
+            port.finish_fence(
+                write_scope, request_id=receipt.finish_request_id,
+                request_digest=receipt.finish_request_digest)
+        attempt_id = "provision-read-" + secrets.token_hex(16)
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=target.activation_generation,
+            operation="read", operation_id=attempt_id, expected_anchor=anchor)
+        scope = FenceScope(namespace, target.authority_namespace,
+                           target.activation_generation, "read", attempt_id,
+                           permit, anchor, epoch, metadata.graph_revision)
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("v2 provisioning read permit changed")
+            with store._lock:
+                confirmed = self._verify_provision_receipt(policy, operation_id, digest)
+                if confirmed != (receipt, metadata, epoch):
+                    raise UnavailableGuard("v2 provisioning state changed during read")
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("v2 provisioning read permit changed")
+            with store._lock:
+                if self._verify_provision_receipt(policy, operation_id, digest) != confirmed:
+                    raise UnavailableGuard("v2 provisioning state changed during read")
+            return receipt
+        finally:
+            port.finish_fence(
+                scope, request_id="finish:" + attempt_id,
+                request_digest="sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_provision_read",
+                }))
+
+    def provision_namespace_v2(self, bootstrap: object, policy, *,
+                               operation_id: str) -> NamespaceProvisionReceiptV2:
+        """Install one administrator-owned namespace under a v2 write fence.
+
+        The DTO is a value contract, not administrator authentication. The host
+        must load it through its protected installation profile before passing
+        this coordinator's opaque bootstrap capability.
+        """
+        from .installation_policy import AdminInstallationPolicy
+        from .runtime.issuers import (
+            BudgetLeaseGrant, D11BudgetJobIssuer,
+            install_schema as install_issuer_schema,
+        )
+        from .runtime_contracts import (
+            InstallationGrantV2, NamespaceBootstrapV2, NamespaceRuntimeState,
+            SnapshotRequirementsV2,
+        )
+        from .authority_service.v2_contract import to_wire
+
+        self._admin(bootstrap)
+        store = self.__store
+        port = self.__content_fence_v2
+        if (not isinstance(store, ProductionGraphStore) or port is None
+                or not callable(getattr(port, "provision_namespace", None))
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer):
+            raise UnavailableGuard("production v2 provisioning authorities are unavailable")
+        if type(policy) is not AdminInstallationPolicy:
+            raise TypeError("verified administrator installation policy is required")
+        if (type(operation_id) is not str or not operation_id
+                or len(operation_id) > 128):
+            raise ValueError("invalid namespace provisioning operation ID")
+        grant = getattr(port, "installation_grant", None)
+        namespace = policy.namespace
+        if (type(grant) is not InstallationGrantV2
+                or grant.authority_id != policy.expected_authority_id
+                or grant.administrator_holder != policy.administrator_holder
+                or grant.installation_id != policy.installation_id
+                or grant.manifest_digest != policy.manifest_digest
+                or self.__holder != policy.administrator_holder
+                or policy.catalogue_hash != store._registry.catalogue_hash
+                or policy.root_lease.parent_id is not None
+                or (policy.root_lease.bot_id, policy.root_lease.persona_id) != namespace.as_tuple
+                or (policy.root_grant.bot_id, policy.root_grant.persona_id) != namespace.as_tuple
+                or policy.root_grant.lease_id != policy.root_lease.lease_id):
+            raise AuthorityDenied("administrator installation policy differs from paired authority")
+        digest = canonical_digest(policy.digest_payload())
+        # The installation DTO freezes its budget maps. D11's durable JSON
+        # primitives take their own normalized, mutable value copies.
+        source_lease = policy.root_lease
+        root_lease = BudgetLease(
+            source_lease.lease_id, source_lease.parent_id,
+            source_lease.bot_id, source_lease.persona_id,
+            source_lease.currency, dict(source_lease.limits),
+            dict(source_lease.used), dict(source_lease.reserved),
+            dict(source_lease.unconfirmed), source_lease.version,
+            source_lease.state,
+        )
+        source_grant = policy.root_grant
+        root_grant = BudgetLeaseGrant(
+            source_grant.grant_id, source_grant.version,
+            source_grant.bot_id, source_grant.persona_id,
+            source_grant.lease_id, source_grant.currency,
+            dict(source_grant.max_ceiling),
+            tuple(source_grant.allowed_work_kinds),
+            source_grant.valid_until_utc, source_grant.policy_ref,
+        )
+        with store._lock:
+            store._ensure_open()
+            row = self._provision_row(store._db, namespace)
+            if row is not None:
+                if row[:2] != (operation_id, digest):
+                    raise AuthorityDenied("namespace provisioning identity differs")
+            elif (store._recovery_row(namespace) is not None
+                  or store._has_namespace_history(namespace)):
+                raise UnavailableGuard("namespace has unsealed business history")
+        if row is not None:
+            return self._reconcile_provision_v2(policy, operation_id, digest)
+
+        request_id = "namespace-genesis-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "input_digest": digest,
+        })[:48]
+        observed = port.provision_namespace(namespace=namespace, request_id=request_id)
+        if (type(observed) is not NamespaceBootstrapV2
+                or observed.namespace != namespace
+                or observed.authority_id != policy.expected_authority_id
+                or observed.authority_namespace != policy.authority_namespace
+                or observed.holder != self.__holder
+                or observed.state is not NamespaceRuntimeState.ACTIVE
+                or observed.phase != "active" or observed.generation != 1
+                or observed.anchor is None or observed.blocking_reasons):
+            raise UnavailableGuard("Authority v2 namespace genesis is not active")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=observed.authority_namespace)
+        if anchor != observed.anchor:
+            raise UnavailableGuard("Authority v2 current anchor differs from genesis")
+        with store._lock:
+            epoch = GraphStore.graph_epoch(
+                store, *namespace.as_tuple, _capability=self.__graph_capability)
+            if epoch.revision != 0:
+                raise UnavailableGuard("namespace graph has a prior epoch")
+        attempt_id = "provision-write-" + secrets.token_hex(16)
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=observed.authority_namespace,
+            holder=self.__holder, generation=1, operation="write",
+            operation_id=attempt_id, expected_anchor=anchor)
+        scope = FenceScope(namespace, observed.authority_namespace, 1, "write",
+                           attempt_id, permit, anchor, epoch, 0)
+        finish_id = "finish:" + attempt_id
+        finish_digest = "sha256:" + canonical_digest({
+            "operation_id": attempt_id, "permit_token": permit.token,
+            "action": "finish_namespace_provision",
+            "business_operation_id": operation_id, "input_digest": digest,
+        })
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("v2 provisioning write permit changed")
+            requirements = SnapshotRequirementsV2(
+                namespace, anchor.authority_id, anchor.namespace,
+                anchor.activation_generation, anchor.deletion_journal_id,
+                anchor.deletion_seq, anchor.deletion_digest,
+                anchor.execution_journal_id, anchor.execution_seq,
+                anchor.execution_digest, anchor.revocation_epoch,
+                "graph:" + secrets.token_hex(16),
+            )
+            with store._lock:
+                store._ensure_open()
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._provision_row(db, namespace) is not None:
+                        raise UnavailableGuard("namespace provisioned concurrently; retry reconciliation")
+                    if GraphStore.graph_epoch(
+                            store, *namespace.as_tuple,
+                            _capability=self.__graph_capability) != epoch:
+                        raise UnavailableGuard("namespace graph epoch changed")
+                    store._install_graph_recovery_genesis_locked(
+                        requirements, _capability=self.__graph_capability)
+                    for kind, version in (("scheme", policy.scheme_version),
+                                          ("operator", policy.operator_version),
+                                          ("policy", policy.policy_version),
+                                          ("activation", "1")):
+                        db.execute(
+                            "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                            "VALUES(?,?,?,?,?)",
+                            namespace.as_tuple + (kind, "current", str(version)),
+                        )
+                    create_budget_lease(
+                        db, root_lease,
+                        "root-budget-" + canonical_digest({
+                            "namespace": list(namespace.as_tuple),
+                            "operation_id": operation_id,
+                        })[:48], digest)
+                    install_issuer_schema(db)
+                    grant_signature = self.__d11_issuer.issue_budget_grant(
+                        db, root_grant)
+                    receipt = NamespaceProvisionReceiptV2(
+                        namespace, operation_id, digest, policy.installation_id,
+                        policy.manifest_digest, anchor.authority_id,
+                        anchor.namespace, 1, requirements.graph_incarnation,
+                        0, epoch.revision, policy.catalogue_hash,
+                        str(policy.scheme_version), str(policy.operator_version),
+                        str(policy.policy_version), policy.root_lease.lease_id,
+                        policy.root_grant.grant_id, policy.root_grant.version,
+                        grant_signature, attempt_id, finish_id, finish_digest,
+                        to_wire(permit),
+                    )
+                    db.execute(
+                        "INSERT INTO graph_namespace_provisioning_v2"
+                        "(bot,persona,operation_id,digest,receipt_json) VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + (operation_id, digest,
+                                              canonical_json(asdict(receipt))),
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("v2 provisioning write permit changed after commit")
+            with store._lock:
+                if self._verify_provision_receipt(policy, operation_id, digest)[0] != receipt:
+                    raise UnavailableGuard("v2 provisioning state changed after commit")
+            return receipt
+        finally:
+            # A failed or uncertain finish must propagate: the business receipt
+            # does not by itself prove the independent Authority fence finished.
+            port.finish_fence(scope, request_id=finish_id,
+                              request_digest=finish_digest)
 
     def _admit_content(self, namespace: NamespaceId, generation: int,
                        operation: str, refs: tuple[str, ...] = ()) -> None:

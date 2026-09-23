@@ -178,6 +178,11 @@ class GraphStore(Store):
                 requirements_json TEXT NOT NULL,
                 graph_revision INTEGER NOT NULL CHECK(graph_revision >= 0),
                 PRIMARY KEY(bot,persona));
+            CREATE TABLE IF NOT EXISTS graph_namespace_provisioning_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, digest TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                PRIMARY KEY(bot,persona));
         """)
 
     @staticmethod
@@ -276,10 +281,50 @@ class GraphStore(Store):
         ).fetchone()
 
     def _has_namespace_history(self, namespace):
-        """Reject genesis for scoped rows or legacy clocks without ownership."""
-        # Clock rows have no namespace columns yet. Until that schema carries
-        # ownership, any old clock row makes every namespace genesis ambiguous.
-        unscoped_clocks = {
+        """Reject history in this namespace and unowned legacy records.
+
+        Some old tables omit namespace columns but carry a lease, quote or
+        canonical graph token. An owner is accepted only when that other
+        namespace already has durable recovery metadata; an orphan remains a
+        global blocker rather than being assigned to an arbitrary new role.
+        """
+        def sealed_elsewhere(bot, persona):
+            try:
+                owner = NamespaceId(bot, persona)
+                return (owner != namespace and
+                        self._decode_recovery(self._recovery_row(owner), owner) is not None)
+            except (TypeError, ValueError):
+                return False
+
+        def lease_owner(lease_id):
+            row = self._db.execute(
+                "SELECT bot_id,persona_id FROM runtime_budget_leases WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+            return row if row is not None and sealed_elsewhere(*row) else None
+
+        def graph_tokens_owned_elsewhere(table):
+            for dependent, dependency in self._db.execute(
+                    f"SELECT dependent_token,dependency_token FROM {table}"):
+                try:
+                    left = AtomKey.from_token(dependent)
+                    right = AtomKey.from_token(dependency)
+                    left_owner = (left.owner.bot, left.owner.persona)
+                    right_owner = (right.owner.bot, right.owner.persona)
+                except (TypeError, ValueError):
+                    return False
+                if (left_owner != right_owner
+                        or not sealed_elsewhere(*left_owner)):
+                    return False
+                row = self._db.execute(
+                    "SELECT bot,persona FROM graph_atoms WHERE token=?",
+                    (dependent,),
+                ).fetchone()
+                if row != left_owner:
+                    return False
+            return True
+
+        globally_unowned = {
             "runtime_character_clocks", "runtime_clock_operations",
             "runtime_deadlines", "runtime_deadline_operations",
         }
@@ -289,9 +334,80 @@ class GraphStore(Store):
                          "graph_type_authority"}:
                 continue
             quoted = '"' + table.replace('"', '""') + '"'
-            if table in unscoped_clocks:
+            if table in globally_unowned:
                 if self._db.execute(f"SELECT 1 FROM {quoted} LIMIT 1").fetchone():
                     return True
+                continue
+            if table in {"graph_dependencies", "graph_dependency_edges"}:
+                if not graph_tokens_owned_elsewhere(table):
+                    return True
+                continue
+            if table == "runtime_budget_reservations":
+                if any(lease_owner(row[0]) is None for row in self._db.execute(
+                        "SELECT lease_id FROM runtime_budget_reservations")):
+                    return True
+                continue
+            if table == "runtime_budget_grants":
+                for lease_id, version, payload in self._db.execute(
+                        "SELECT lease_id,version,grant_json FROM runtime_budget_grants"):
+                    owner = lease_owner(lease_id)
+                    try:
+                        grant = json.loads(payload)
+                    except (TypeError, ValueError):
+                        return True
+                    if (owner is None or type(grant) is not dict
+                            or (grant.get("bot_id"), grant.get("persona_id")) != owner
+                            or grant.get("lease_id") != lease_id
+                            or grant.get("version") != version):
+                        return True
+                continue
+            if table == "runtime_resource_quotes":
+                for quote_id, version, payload in self._db.execute(
+                        "SELECT quote_id,version,quote_json FROM runtime_resource_quotes"):
+                    try:
+                        quote = json.loads(payload)
+                    except (TypeError, ValueError):
+                        return True
+                    if (type(quote) is not dict
+                            or quote.get("quote_id") != quote_id
+                            or quote.get("version") != version
+                            or (quote.get("bot_id"), quote.get("persona_id"))
+                            != lease_owner(quote.get("parent_budget_lease_ref"))):
+                        return True
+                continue
+            if table == "runtime_resource_outcomes":
+                for quote_id, operation_id, version, payload in self._db.execute(
+                        "SELECT quote_id,operation_id,version,outcome_json "
+                        "FROM runtime_resource_outcomes"):
+                    try:
+                        outcome = json.loads(payload)
+                    except (TypeError, ValueError):
+                        return True
+                    if (type(outcome) is not dict
+                            or outcome.get("quote_id") != quote_id
+                            or outcome.get("operation_id") != operation_id
+                            or outcome.get("version") != version):
+                        return True
+                    quotes = self._db.execute(
+                        "SELECT quote_json FROM runtime_resource_quotes WHERE quote_id=?",
+                        (quote_id,),
+                    ).fetchall()
+                    matched = False
+                    for (quote_payload,) in quotes:
+                        try:
+                            quote = json.loads(quote_payload)
+                        except (TypeError, ValueError):
+                            return True
+                        if (type(quote) is dict
+                                and quote.get("operation_id") == operation_id
+                                and (quote.get("bot_id"), quote.get("persona_id"))
+                                == (outcome.get("bot_id"), outcome.get("persona_id"))
+                                and sealed_elsewhere(quote.get("bot_id"),
+                                                     quote.get("persona_id"))):
+                            matched = True
+                            break
+                    if not matched:
+                        return True
                 continue
             columns = {row[1] for row in self._db.execute(
                 f"PRAGMA table_info({quoted})")}
@@ -302,6 +418,8 @@ class GraphStore(Store):
             elif {"event_bot", "event_persona"}.issubset(columns):
                 pair = ("event_bot", "event_persona")
             else:
+                if self._db.execute(f"SELECT 1 FROM {quoted} LIMIT 1").fetchone():
+                    return True
                 continue
             if self._db.execute(
                     f'SELECT 1 FROM {quoted} WHERE {pair[0]}=? AND {pair[1]}=? LIMIT 1',
