@@ -20,6 +20,7 @@ from ..authority_service.v2_contract import (
 from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
+    OwnerActorBindingV1, OwnerPrincipalV1,
 )
 from ..authority_service.v2_owner_proof import (
     OwnerCredentialRegistrationV1, OwnerProofAcceptanceV1,
@@ -359,6 +360,46 @@ class V2FencePort:
                 or request.authority_namespace != authority_namespace
                 or request.installation_id != grant.installation_id):
             raise RuntimeError("v2 Owner session identity mismatch")
+
+    def current_owner_actor_binding(self, *, namespace: NamespaceId,
+                                    authority_namespace: str,
+                                    actor_id: str) -> OwnerActorBindingV1 | None:
+        return self._submit(self._with_session_repair(lambda: self._owner_binding(
+            namespace, authority_namespace, actor_id=actor_id)))
+
+    def current_owner_principal_binding(self, *, namespace: NamespaceId,
+                                        authority_namespace: str,
+                                        principal: OwnerPrincipalV1) -> OwnerActorBindingV1 | None:
+        return self._submit(self._with_session_repair(lambda: self._owner_binding(
+            namespace, authority_namespace, principal=principal)))
+
+    async def _owner_binding(self, namespace: NamespaceId,
+                             authority_namespace: str, *,
+                             actor_id: str | None = None,
+                             principal: OwnerPrincipalV1 | None = None,
+                             ) -> OwnerActorBindingV1 | None:
+        if (type(namespace) is not NamespaceId
+                or namespace_ref(namespace) != authority_namespace
+                or (actor_id is None) == (principal is None)):
+            raise ValueError("Owner binding query identity is invalid")
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        if actor_id is not None:
+            binding = await self._transport.v2_current_owner_actor_binding(
+                self._request, handshake, namespace=authority_namespace,
+                actor_id=actor_id)
+        else:
+            binding = await self._transport.v2_current_owner_principal_binding(
+                self._request, handshake, namespace=authority_namespace,
+                principal=principal)
+        if (binding is not None
+                and (binding.authority_id != grant.authority_id
+                     or binding.installation_id != grant.installation_id
+                     or binding.namespace != namespace
+                     or (actor_id is not None and binding.actor_id != actor_id)
+                     or (principal is not None and binding.principal != principal))):
+            raise RuntimeError("Owner binding installation identity differs")
+        return binding
 
     def begin_owner_session(self, *, namespace: NamespaceId,
                             authority_namespace: str,

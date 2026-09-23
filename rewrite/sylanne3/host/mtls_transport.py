@@ -17,7 +17,7 @@ import secrets
 import ssl
 from typing import Mapping
 
-from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit
+from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit, identifier
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
@@ -27,6 +27,7 @@ from ..authority_service.v2_contract import (
 from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
+    OwnerActorBindingV1, OwnerPrincipalV1,
     from_wire as owner_from_wire, to_wire as owner_to_wire,
 )
 from ..authority_service.v2_owner_proof import (
@@ -898,6 +899,50 @@ class MtlsAuthorityTransport:
                 or owner_to_wire(result) != response[field]):
             raise RuntimeError("authority owner response is invalid")
         return result
+
+    async def v2_current_owner_actor_binding(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, actor_id: str,
+    ) -> OwnerActorBindingV1 | None:
+        identifier(actor_id, "actor_id")
+        response = await self._content_rpc(
+            request, handshake, "current_owner_actor_binding_v1",
+            {"namespace": namespace, "actor_id": actor_id},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        return self._owner_binding_result(response, handshake)
+
+    async def v2_current_owner_principal_binding(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, principal: OwnerPrincipalV1,
+    ) -> OwnerActorBindingV1 | None:
+        if type(principal) is not OwnerPrincipalV1:
+            raise TypeError("stable Owner principal is required")
+        response = await self._content_rpc(
+            request, handshake, "current_owner_principal_binding_v1",
+            {"namespace": namespace, "principal": owner_to_wire(principal)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        binding = self._owner_binding_result(response, handshake)
+        if binding is not None and binding.principal != principal:
+            raise RuntimeError("Authority Owner principal binding differs")
+        return binding
+
+    @staticmethod
+    def _owner_binding_result(response: dict[str, object],
+                              handshake: AuthorityHandshake) -> OwnerActorBindingV1 | None:
+        if (type(response) is not dict
+                or set(response) != {"binding", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("Authority Owner binding response is invalid")
+        raw = response["binding"]
+        if raw is None:
+            return None
+        try:
+            binding = owner_from_wire(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Authority Owner binding response is invalid") from exc
+        if type(binding) is not OwnerActorBindingV1 or owner_to_wire(binding) != raw:
+            raise RuntimeError("Authority Owner binding response is invalid")
+        return binding
 
     @staticmethod
     def _owner_proof_result(response: dict[str, object], handshake: AuthorityHandshake,

@@ -303,6 +303,38 @@ class AuthorityOwnerPairingSource:
                 return None
             return current[0]
 
+    def current_principal_binding(self, *, authority_namespace: str,
+                                  installation_id: str,
+                                  principal: OwnerPrincipalV1) -> OwnerActorBindingV1 | None:
+        """Resolve one live principal from the same Authority-owned actor table."""
+        identifier(authority_namespace, "authority_namespace")
+        identifier(installation_id, "installation_id")
+        if type(principal) is not OwnerPrincipalV1:
+            raise TypeError("stable Owner principal is required")
+        with self._core._lock:
+            db = self._core._db
+            if db is None:
+                raise AuthorityUnavailable("Authority is unavailable")
+            self._require_mode(db)
+            self._require_actor_schema(db)
+            self._core._row(db, authority_namespace)
+            rows = db.execute(
+                "SELECT actor_id FROM authority_owner_actor_bindings_v1 "
+                "WHERE authority_namespace=? AND principal_bytes=? AND active=1",
+                (authority_namespace, canonical_bytes(principal)),
+            ).fetchall()
+            if len(rows) > 1:
+                raise AuthorityUnavailable("Owner principal binding is ambiguous")
+            if not rows:
+                return None
+            current = self._actor_binding(db, authority_namespace, rows[0][0])
+            if (current is None or not current[1]
+                    or current[0].principal != principal
+                    or current[0].installation_id != installation_id
+                    or not self._paired_registration(db, current[0])):
+                return None
+            return current[0]
+
     def pair_creation(self, *, administrator_credential: object,
                       authority_namespace: str, ticket: OwnerClaimTicketV1,
                       client_certificate_sha256: str,

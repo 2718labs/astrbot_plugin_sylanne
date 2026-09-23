@@ -100,6 +100,8 @@ def test_product_composition_rechecks_creation_pairing_after_pending(tmp_path):
         assert server._v2_owner_proofs._current_pairing_source is source
         assert server._v2_owner_tickets._creation_pairing_source is source
         assert server._v2_owner_sessions._current_pairing_source is source
+        assert server._v2_owner_pairings is source
+        assert server._v2_owner_pairings._core is core
 
         owner_tickets = server._v2_owner_tickets
         owner_tickets.register_ticket(

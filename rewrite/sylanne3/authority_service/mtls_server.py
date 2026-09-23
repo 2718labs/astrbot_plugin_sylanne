@@ -13,7 +13,7 @@ import secrets
 import ssl
 import threading
 import time
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_journal import (
@@ -33,6 +33,7 @@ from .v2_execution_bridge import AuthorityV2ExecutionBridge
 from .v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
+    OwnerPrincipalV1,
     from_wire as owner_from_wire, to_wire as owner_to_wire,
 )
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
@@ -47,6 +48,9 @@ from .v2_owner_session import (
     to_wire as session_to_wire,
 )
 from ..graph_coordinator import namespace_ref
+
+if TYPE_CHECKING:
+    from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
 
 
 _MAX_SESSIONS = 256
@@ -165,6 +169,7 @@ class AuthorityRpcServer:
         v2_owner_tickets: AuthorityV2OwnerTicketStore | None = None,
         v2_owner_proofs: AuthorityV2OwnerProofStore | None = None,
         v2_owner_sessions: AuthorityV2OwnerSessionStore | None = None,
+        v2_owner_pairings: AuthorityOwnerPairingSource | None = None,
         v2_final_handoff_authorizers: Mapping[str, Callable] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
@@ -209,6 +214,12 @@ class AuthorityRpcServer:
                      or v2_owner_sessions._core is not core)):
             raise TypeError("v2 Owner sessions must use the same Authority core")
         self._v2_owner_sessions = v2_owner_sessions
+        from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
+        if (v2_owner_pairings is not None
+                and (type(v2_owner_pairings) is not AuthorityOwnerPairingSource
+                     or v2_owner_pairings._core is not core)):
+            raise TypeError("v2 Owner pairings must use the same Authority core")
+        self._v2_owner_pairings = v2_owner_pairings
         handoff_authorizers = dict(v2_final_handoff_authorizers or {})
         if any(namespace not in services or not callable(callback)
                for namespace, callback in handoff_authorizers.items()):
@@ -505,6 +516,39 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method in {"current_owner_actor_binding_v1",
+                          "current_owner_principal_binding_v1"}:
+                namespace = identifier(command.get("namespace"), "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                pairings = self._v2_owner_pairings
+                if installed is None or pairings is None:
+                    raise AuthorityUnavailable("Owner actor binding service is unavailable")
+                if method == "current_owner_actor_binding_v1":
+                    if set(command) != {"namespace", "actor_id"}:
+                        raise AuthorityUnavailable("Owner actor query fields differ")
+                    binding = pairings.current_actor_binding(
+                        authority_namespace=namespace,
+                        installation_id=installed.installation_id,
+                        actor_id=identifier(command["actor_id"], "actor_id"))
+                else:
+                    if set(command) != {"namespace", "principal"}:
+                        raise AuthorityUnavailable("Owner principal query fields differ")
+                    raw = command["principal"]
+                    principal = owner_from_wire(raw)
+                    if type(principal) is not OwnerPrincipalV1 or owner_to_wire(principal) != raw:
+                        raise AuthorityUnavailable("Owner principal query differs")
+                    binding = pairings.current_principal_binding(
+                        authority_namespace=namespace,
+                        installation_id=installed.installation_id,
+                        principal=principal)
+                if (binding is not None
+                        and (binding.authority_id != self._authority_id()
+                             or binding.installation_id != installed.installation_id
+                             or namespace_ref(binding.namespace) != namespace)):
+                    raise AuthorityUnavailable("Owner actor binding identity differs")
+                return {"binding": None if binding is None else owner_to_wire(binding)}
             if method == "describe_owner_session_v1":
                 if set(command) != {"namespace", "token"}:
                     raise AuthorityUnavailable("Owner session description fields differ")

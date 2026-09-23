@@ -144,6 +144,7 @@ def compose_local_owner_authority(
         core, v2_fences=services, v2_owner_tickets=owner_tickets,
         v2_owner_proofs=owner_proofs,
         v2_owner_sessions=owner_sessions,
+        v2_owner_pairings=creation_pairing_source,
         administrator_authorizer=administrator_authorizer,
         publisher_manifest_verifier=publisher_manifest_verifier,
         installations_v2=installations_v2,
