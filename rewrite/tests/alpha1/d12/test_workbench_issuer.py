@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 from types import MappingProxyType
+import pytest
 
 from sylanne3.domain_registry import DomainRegistration, DomainRegistry
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphPage, GraphSnapshot, NamespaceEpoch, Owner
@@ -11,6 +12,7 @@ from sylanne3.workbench_api import (
     AuthenticatedSession, CoordinatorGrant, CurrentDomainViewRegistry, GraphWorkbenchIssuer,
     RequestContext, WorkbenchService,
 )
+from sylanne3.workbench_api.domain_registry import PROJECTION_CONTEXT_V1
 
 
 SCOPE = "bot/persona"
@@ -312,3 +314,94 @@ def test_type_metadata_without_explicit_field_projector_never_returns_secret_ato
     current = CurrentDomainViewRegistry(lambda: domain_registry(provider=MetadataOnlyProvider()))
     assert current.view_types(authority()) == {}
     assert current.catalogue(authority()).unavailable_domains == {"d01": "no_field_projection_contract"}
+
+
+def test_context_v1_filters_with_server_grant_and_hides_raw_page_metadata():
+    class FilteredProvider:
+        workbench_view_contract = {"memory": {
+            "types": ("memory.source",), "fields": ("items",),
+            "projection_context": PROJECTION_CONTEXT_V1,
+        }}
+
+        @staticmethod
+        def project_workbench(view_type, atoms, *, context):
+            assert view_type == "memory"
+            assert context.schema_version == PROJECTION_CONTEXT_V1
+            assert context.authority.actor == "actor"
+            assert context.purpose == "workbench_view"
+            return {"items": [atom["value"]["label"] for atom in atoms
+                              if context.audience in atom["value"]["audiences"]]}
+
+    current = CurrentDomainViewRegistry(lambda: domain_registry(
+        provider=FilteredProvider(), domain="d06", spec_name="memory.source",
+        owner_kind="event"))
+    session = AuthenticatedSession(
+        "actor", "session", {SCOPE: frozenset({"workbench.read"})},
+        {SCOPE: frozenset({"public"})}, {SCOPE: frozenset({"workbench_view"})})
+    grant = CoordinatorGrant(SCOPE, authority(audience=("public",)), object())
+    public = GraphAtom(AtomKey(Owner("event", "bot", "persona", "source-1"),
+                               "memory.source", "public"), 1,
+                       {"label": "visible", "audiences": ["public"]})
+    private = GraphAtom(AtomKey(Owner("event", "bot", "persona", "source-2"),
+                                "memory.source", "private"), 1,
+                        {"label": "hidden", "audiences": ["owner"]})
+    page = GraphPage(GraphSnapshot((public, private),
+                                   (NamespaceEpoch("bot", "persona", 13),)), private.key)
+    coordinator = Coordinator(page)
+    coordinator.query = lambda *_args, **_kwargs: page
+    issuer = GraphWorkbenchIssuer(coordinator, Resolver(grant), current)
+
+    read = request(view_type="memory")
+    read["audience"] = "public"
+    response = WorkbenchService(issuer).handle(
+        read, session=session, context=CONTEXT)
+    assert response.status == "ready"
+    assert response.projection["data"] == {"items": ["visible"]}
+    assert "coverage" not in response.projection
+    assert "next_cursor" not in response.projection
+    assert "snapshot_epoch" not in response.projection
+    assert "hidden" not in str(response.as_dict())
+
+    open_request = request("open_workspace")
+    open_request["audience"] = "public"
+    workspace = WorkbenchService(issuer).handle(
+        open_request, session=session, context=CONTEXT)
+    assert workspace.status == "ready"
+    assert workspace.projection["views"] == (
+        {"view_type": "memory", "status": "available"},)
+
+    # A hidden record, raw continuation, and changed namespace epoch must not
+    # change either public response.
+    page = GraphPage(GraphSnapshot((public,), (NamespaceEpoch("bot", "persona", 12),)), None)
+    same_visible = WorkbenchService(issuer).handle(read, session=session, context=CONTEXT)
+    assert same_visible.projection == response.projection
+    same_workspace = WorkbenchService(issuer).handle(
+        open_request, session=session, context=CONTEXT)
+    assert same_workspace.projection == workspace.projection
+
+    denied = WorkbenchService(issuer).handle(
+        request(view_type="memory"), session=session, context=CONTEXT)
+    assert denied.status == "unauthorized"
+    assert denied.projection is None
+    with pytest.raises(PermissionError):
+        current.project_workbench(grant.authority, "memory", (),
+                                  audience="owner", purpose="workbench_view")
+
+
+def test_unsupported_context_version_does_not_fall_back_to_legacy_projection():
+    class UnsupportedProvider:
+        workbench_view_contract = {"memory": {
+            "types": ("memory.source",), "fields": ("items",),
+            "projection_context": "d12.projection_context.v2",
+        }}
+
+        @staticmethod
+        def project_workbench(view_type, atoms):
+            raise AssertionError("unsupported contract must not project")
+
+    current = CurrentDomainViewRegistry(lambda: domain_registry(
+        provider=UnsupportedProvider(), domain="d06", spec_name="memory.source",
+        owner_kind="event"))
+    assert current.view_types(authority()) == {}
+    assert current.catalogue(authority()).unavailable_domains == {
+        "d06": "invalid_public_projection_contract"}

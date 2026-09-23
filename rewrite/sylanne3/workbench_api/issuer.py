@@ -12,6 +12,7 @@ from typing import Any, Mapping, Protocol
 
 from ..graph_types import GraphPage
 from ..runtime_contracts import AuthorityContext
+from .domain_registry import PROJECTION_CONTEXT_V1
 from .service import AuthenticatedSession
 
 
@@ -67,6 +68,8 @@ class GraphWorkbenchIssuer:
 
     def read_projection(self, *, session: AuthenticatedSession, scope: str, view_type: str,
                         purpose: str, audience: str) -> Mapping[str, Any]:
+        if not session.allows(scope, "workbench.read", purpose, audience):
+            return _unavailable("authority_unavailable")
         grant = self._resolve(session, scope, purpose, audience)
         if grant is None:
             return _unavailable("authority_unavailable")
@@ -79,6 +82,10 @@ class GraphWorkbenchIssuer:
         owner_kind = self._owner_kind(grant, view_type)
         if owner_kind is None:
             return _unavailable("view_unsupported")
+        try:
+            context_version = self._context_version(grant, view_type)
+        except (TypeError, ValueError, LookupError):
+            return _unavailable("field_projection_unavailable")
         try:
             page = self._coordinator.query(grant.authority, grant.lease,
                                            type_names=types, owner_kind=owner_kind, limit=100)
@@ -108,27 +115,33 @@ class GraphWorkbenchIssuer:
         if not callable(projector):
             return _unavailable("field_projection_unavailable")
         try:
-            projected = projector(grant.authority, view_type, atoms)
+            if context_version == PROJECTION_CONTEXT_V1:
+                projected = projector(grant.authority, view_type, atoms,
+                                      audience=audience, purpose=purpose)
+            else:
+                projected = projector(grant.authority, view_type, atoms)
         except Exception:
             return _unavailable("field_projection_unavailable")
         if not isinstance(projected, Mapping):
             return _unavailable("invalid_field_projection")
-        return {
-            "status": "ready",
-            "projection": {
-                "view_type": view_type,
-                "namespace": {"bot": epoch.bot, "persona": epoch.persona},
-                "snapshot_epoch": epoch.revision,
-                "coverage": {"requested_types": types, "returned_atoms": len(atoms),
-                             "truncated": page.next_after is not None},
-                "data": dict(projected),
-                "next_cursor": page.next_after.token if page.next_after is not None else None,
-                "access_generation": grant.authority.activation_generation,
-            },
+        projection = {
+            "view_type": view_type,
+            "namespace": {"bot": epoch.bot, "persona": epoch.persona},
+            "data": dict(projected),
+            "access_generation": grant.authority.activation_generation,
         }
+        if context_version is None:
+            projection["snapshot_epoch"] = epoch.revision
+            projection["coverage"] = {"requested_types": types, "returned_atoms": len(atoms),
+                                      "truncated": page.next_after is not None}
+            projection["next_cursor"] = (page.next_after.token
+                                         if page.next_after is not None else None)
+        return {"status": "ready", "projection": projection}
 
     def open_workspace(self, *, session: AuthenticatedSession, scope: str, purpose: str,
                        audience: str) -> Mapping[str, Any]:
+        if not session.allows(scope, "workbench.read", purpose, audience):
+            return _unavailable("authority_unavailable")
         grant = self._resolve(session, scope, purpose, audience)
         if grant is None:
             return _unavailable("authority_unavailable")
@@ -139,6 +152,11 @@ class GraphWorkbenchIssuer:
         for name, types in sorted(views.items()):
             owner_kind = self._owner_kind(grant, name)
             if owner_kind is None:
+                entries.append({"view_type": name, "status": "unavailable"})
+                continue
+            try:
+                context_version = self._context_version(grant, name)
+            except (TypeError, ValueError, LookupError):
                 entries.append({"view_type": name, "status": "unavailable"})
                 continue
             try:
@@ -159,9 +177,11 @@ class GraphWorkbenchIssuer:
                 entries.append({"view_type": name, "status": "unavailable"})
                 continue
             epoch = page.snapshot.epochs[0]
-            entries.append({"view_type": name, "status": "available",
-                            "snapshot_epoch": epoch.revision,
-                            "cursor": page.next_after.token if page.next_after else None})
+            entry = {"view_type": name, "status": "available"}
+            if context_version is None:
+                entry["snapshot_epoch"] = epoch.revision
+                entry["cursor"] = page.next_after.token if page.next_after else None
+            entries.append(entry)
         return {"status": "ready", "projection": {
             "namespace": {"bot": grant.authority.namespace.bot_id,
                           "persona": grant.authority.namespace.persona_id},
@@ -201,6 +221,17 @@ class GraphWorkbenchIssuer:
         if not isinstance(owner_kind, str) or owner_kind not in grant.authority.owner_scope:
             return None
         return owner_kind
+
+    def _context_version(self, grant: CoordinatorGrant, view_type: str) -> str | None:
+        resolver = getattr(self._view_registry, "projection_context_version", None)
+        if resolver is None:
+            return None
+        if not callable(resolver):
+            raise TypeError("invalid projection context resolver")
+        version = resolver(grant.authority, view_type)
+        if version not in (None, PROJECTION_CONTEXT_V1):
+            raise ValueError("unsupported projection context version")
+        return version
 
     def _unavailable_domains(self, grant: CoordinatorGrant) -> tuple[Mapping[str, str], ...]:
         catalogue = getattr(self._view_registry, "catalogue", None)
