@@ -14,6 +14,7 @@ from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationOperationV1, OwnerAuthorizationReceiptV1, OwnerClaimTicketV1,
     OwnerGraphCommitProofV1,
 )
+from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..graph_coordinator import namespace_ref
 from ..graph_types import owner_grant_policy_digest_v1, validate_owner_grant_v1
 from ..graph_worker import GraphWorker
@@ -48,7 +49,10 @@ class FirstOwnerIssueOrchestrator:
 
     async def issue(self, *, ticket: OwnerClaimTicketV1,
                     operation: OwnerAuthorizationOperationV1,
-                    grant_value: dict) -> OwnerAuthorizationReceiptV1:
+                    grant_value: dict,
+                    owner_session_token: str | None = None,
+                    owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+                    ) -> OwnerAuthorizationReceiptV1:
         """Register, reserve, commit and finalize one exact issue identity.
 
         Every phase is durable and replayable with the same inputs. Exceptions
@@ -61,6 +65,20 @@ class FirstOwnerIssueOrchestrator:
                 or operation.action != "issue" or operation.ticket != ticket
                 or ticket.namespace != self._namespace):
             raise ValueError("first Owner ticket and operation identity differ")
+        if (owner_session_token is None) != (owner_session_request is None):
+            raise ValueError("Owner session token and request must be supplied together")
+        if owner_session_request is not None:
+            if (type(owner_session_token) is not str or not owner_session_token
+                    or type(owner_session_request) is not OwnerSessionLoginRequestV1
+                    or owner_session_request.authority_id != ticket.authority_id
+                    or owner_session_request.authority_namespace != self._authority_namespace
+                    or owner_session_request.installation_id != ticket.installation_id
+                    or owner_session_request.principal != ticket.principal
+                    or owner_session_request.audience != "sylanne-owner-console"):
+                raise ValueError("Owner session differs from first Owner issue identity")
+        # The no-session path remains the Authority's paired-claimant proof mode.
+        # A signed-session deployment requires both values and validates the
+        # credential and token again inside each Authority write transaction.
         validate_owner_grant_v1(grant_value)
         if (grant_value["authority_id"] != operation.authority_id
                 or grant_value["installation_id"] != operation.installation_id
@@ -91,7 +109,8 @@ class FirstOwnerIssueOrchestrator:
         pending = await self._worker.call(
             lambda _graph: self._claimant.reserve_owner_issue(
                 namespace=namespace, authority_namespace=authority_namespace,
-                operation=operation))
+                operation=operation, owner_session_token=owner_session_token,
+                owner_session_request=owner_session_request))
         if (type(pending) is not OwnerAuthorizationReceiptV1
                 or pending.operation != operation or pending.phase != "pending"):
             raise RuntimeError("Authority returned a different pending Owner issue")
@@ -105,7 +124,9 @@ class FirstOwnerIssueOrchestrator:
         committed = await self._worker.call(
             lambda _graph: self._claimant.finalize_owner_issue(
                 namespace=namespace, authority_namespace=authority_namespace,
-                operation=operation, proof=proof))
+                operation=operation, proof=proof,
+                owner_session_token=owner_session_token,
+                owner_session_request=owner_session_request))
         if (type(committed) is not OwnerAuthorizationReceiptV1
                 or committed.operation != operation or committed.phase != "committed"):
             raise RuntimeError("Authority returned a different Owner issue commit")
