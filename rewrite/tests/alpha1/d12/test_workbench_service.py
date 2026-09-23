@@ -60,7 +60,7 @@ def test_missing_provider_returns_unavailable_without_a_write_receipt():
 
 
 @pytest.mark.parametrize("action,input_data,capability", [
-    ("create_character", {"display_name": "小岚", "blueprint": "blank",
+    ("create_character", {"display_name": "小岚", "blueprint": "d01.persona.warm-listener.v1",
                           "model_capability_ref": "host/model", "budget_ref": "host/budget"},
      "workbench.create"),
     ("bind_scene", {"scene_ref": "scene:private-123", "visibility": "private",
@@ -83,7 +83,7 @@ def test_onboarding_commands_require_trusted_issuer_and_durable_receipt(action, 
 
 
 @pytest.mark.parametrize("action,input_data,receipt", [
-    ("create_character", {"display_name": "小岚", "blueprint": "blank",
+    ("create_character", {"display_name": "小岚", "blueprint": "d01.persona.curious-maker.v1",
                           "model_capability_ref": "host/model", "budget_ref": "host/budget"},
      {"phase": "role_initialized", "role_ref": "bot/persona"}),
     ("bind_scene", {"scene_ref": "scene:private-123", "visibility": "private",
@@ -107,6 +107,16 @@ def test_scene_visibility_must_be_explicitly_acknowledged():
         request("bind_scene", scene_ref="scene:group-123", visibility="group",
                 acknowledgement=False),
         session=session("workbench.bind_scene"), context=CONTEXT)
+    assert answer.problem["code"] == "invalid_request"
+
+
+@pytest.mark.parametrize("blueprint", ["", "../preset", "d01..preset", "d01/preset", "x" * 193])
+def test_create_rejects_malformed_blueprint_reference(blueprint):
+    answer = WorkbenchService().handle(
+        request("create_character", display_name="小岚", blueprint=blueprint,
+                model_capability_ref="host/model", budget_ref="host/budget"),
+        session=session("workbench.create"), context=CONTEXT)
+    assert answer.status == "unavailable"
     assert answer.problem["code"] == "invalid_request"
 
 

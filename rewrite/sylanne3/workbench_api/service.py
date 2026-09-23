@@ -19,6 +19,7 @@ from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 
 D12_SCHEMA = "d12.contract.v1"
 _SCOPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
+_BLUEPRINT_REF = re.compile(r"[A-Za-z0-9]+(?:[._:-][A-Za-z0-9]+)*\Z")
 _ACTIONS = frozenset({
     "open_workspace", "create_character", "bind_scene", "compile_scheme", "activate_scheme", "read_character_view",
     "correct_or_edit", "run_experiment", "prepare_transfer", "execute_transfer",
@@ -203,8 +204,10 @@ class WorkbenchService:
             if (not isinstance(input_data["display_name"], str)
                     or not 1 <= len(input_data["display_name"].strip()) <= 80):
                 raise ValueError("create_character requires a display name")
-            if input_data["blueprint"] not in {"blank", "example"}:
-                raise ValueError("create_character requires a known blueprint")
+            blueprint = input_data["blueprint"]
+            if (not isinstance(blueprint, str) or len(blueprint) > 192
+                    or _BLUEPRINT_REF.fullmatch(blueprint) is None):
+                raise ValueError("create_character requires a bounded blueprint reference")
             if any(not isinstance(input_data[name], str) or not _SCOPE.fullmatch(input_data[name])
                    for name in ("model_capability_ref", "budget_ref")):
                 raise ValueError("create_character requires server-resolvable capability and budget references")

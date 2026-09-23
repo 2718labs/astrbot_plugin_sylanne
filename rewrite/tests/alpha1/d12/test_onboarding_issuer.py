@@ -41,7 +41,7 @@ def command(operation_id: str | None = None, *, budget_ref: str = "host/budget")
         "schema_version": "d12.contract.v1", "action": "create_character",
         "scope": SCOPE, "purpose": "workbench_user_action", "audience": "owner",
         "operation_id": operation_id or str(uuid4()),
-        "input": {"display_name": "小岚", "blueprint": "blank",
+        "input": {"display_name": "小岚", "blueprint": "d01.persona.warm-listener.v1",
                   "model_capability_ref": "host/model", "budget_ref": budget_ref},
     }
 
@@ -109,6 +109,25 @@ def test_create_uses_server_policy_and_exact_graph_receipt():
     assert graph.calls[0]["plan"] is PLAN
     assert graph.calls[0]["principal"] is PRINCIPAL
     assert graph.calls[0]["request_digest"] == policy.calls[0]["request_digest"]
+
+
+def test_unknown_well_formed_blueprint_reaches_resolver_and_holds():
+    class CatalogueHold:
+        def __init__(self):
+            self.seen = []
+
+        def resolve_create_character(self, **kwargs):
+            self.seen.append(kwargs["input_data"]["blueprint"])
+            return None
+
+    resolver = CatalogueHold()
+    service = WorkbenchService(GraphWorkbenchIssuer(Graph(), Grants(), Views(), resolver))
+    payload = command()
+    payload["input"]["blueprint"] = "d01.persona.uninstalled.v1"
+    answer = service.handle(payload, session=SESSION, context=CONTEXT)
+    assert resolver.seen == ["d01.persona.uninstalled.v1"]
+    assert answer.status == "unavailable"
+    assert answer.problem["code"] == "role_initialization_policy_unavailable"
 
 
 def test_create_rejects_wrong_session_resolution_and_wrong_request_receipt():
