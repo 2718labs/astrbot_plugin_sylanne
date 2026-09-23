@@ -55,8 +55,15 @@ class Authority:
     def __init__(self):
         self.current = True
         self.logout_failure = False
+        self.begun = 0
         self.accepted = 0
         self.described = 0
+
+    def begin_owner_session(self, *, namespace, authority_namespace, request):
+        assert (namespace, authority_namespace, request) == (
+            NAMESPACE, namespace_ref(NAMESPACE), REQUEST)
+        self.begun += 1
+        return CHALLENGE
 
     def accept_owner_session(self, *, namespace, authority_namespace,
                              challenge, signature):
@@ -124,6 +131,7 @@ async def test_signed_login_binds_current_owner_facts_to_one_dashboard_user(inst
     resolver, authority, coordinator = installed
     assert await resolver.resolve_current_owner_session(
         username="dashboard-a", owner_session_token=TOKEN) is None
+    assert await resolver.begin_signed_login(request=Request(), login_request=REQUEST) == CHALLENGE
     token = await resolver.complete_signed_login(
         request=Request(), challenge=CHALLENGE, signature=b"s" * 64)
     assert token == TOKEN and authority.accepted == 1
@@ -144,6 +152,7 @@ async def test_signed_login_binds_current_owner_facts_to_one_dashboard_user(inst
 @pytest.mark.asyncio
 async def test_each_resolution_rechecks_authority_and_fenced_graph(installed):
     resolver, authority, coordinator = installed
+    await resolver.begin_signed_login(request=Request(), login_request=REQUEST)
     await resolver.complete_signed_login(
         request=Request(), challenge=CHALLENGE, signature=b"s" * 64)
     paired = CurrentOwnerDashboardSessions(resolver)
@@ -159,6 +168,7 @@ async def test_each_resolution_rechecks_authority_and_fenced_graph(installed):
 @pytest.mark.asyncio
 async def test_local_logout_revokes_binding_even_if_authority_rpc_fails(installed):
     resolver, authority, _ = installed
+    await resolver.begin_signed_login(request=Request(), login_request=REQUEST)
     await resolver.complete_signed_login(
         request=Request(), challenge=CHALLENGE, signature=b"s" * 64)
     authority.logout_failure = True
@@ -167,7 +177,7 @@ async def test_local_logout_revokes_binding_even_if_authority_rpc_fails(installe
             username="dashboard-a", owner_session_token=TOKEN)
     assert await resolver.resolve_current_owner_session(
         username="dashboard-a", owner_session_token=TOKEN) is None
-    with pytest.raises(RuntimeError, match="already bound or revoked"):
+    with pytest.raises(ValueError, match="same Dashboard user"):
         await resolver.complete_signed_login(
             request=Request(), challenge=CHALLENGE, signature=b"s" * 64)
 
@@ -184,11 +194,26 @@ async def test_login_requires_authenticated_host_origin_and_real_graph_head(inst
             request=Request(origin="https://evil.invalid"), challenge=CHALLENGE,
             signature=b"s" * 64)
     assert authority.accepted == 0
+    await resolver.begin_signed_login(request=Request(), login_request=REQUEST)
     coordinator.view = CurrentOwnerViewV1(
         GUARD, replace(BINDING, principal=OwnerPrincipalV1(
             "other", "account", "incarnation")))
     with pytest.raises(RuntimeError, match="graph grant"):
         await resolver.complete_signed_login(
             request=Request(), challenge=CHALLENGE, signature=b"s" * 64)
+    assert authority.current is False
     assert await resolver.resolve_current_owner_session(
         username="dashboard-a", owner_session_token=TOKEN) is None
+
+
+@pytest.mark.asyncio
+async def test_signed_challenge_cannot_be_redeemed_by_another_dashboard_user(installed):
+    resolver, authority, _ = installed
+    await resolver.begin_signed_login(request=Request(), login_request=REQUEST)
+    with pytest.raises(ValueError, match="same Dashboard user"):
+        await resolver.complete_signed_login(
+            request=Request(username="dashboard-b"), challenge=CHALLENGE,
+            signature=b"s" * 64)
+    assert authority.accepted == 0
+    assert await resolver.complete_signed_login(
+        request=Request(), challenge=CHALLENGE, signature=b"s" * 64) == TOKEN

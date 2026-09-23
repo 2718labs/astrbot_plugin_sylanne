@@ -29,7 +29,7 @@ def test_host_mount_serves_packaged_assets_without_promoting_dashboard_admin_to_
     mount = WorkbenchHostMount()
     with patch("astrbot.api.web.request", SimpleNamespace(username="dashboard-admin")):
         mount.register(context)
-        assert len(context.registered_web_apis) == 5
+        assert len(context.registered_web_apis) == 8
         assert context.registered_web_apis[0][0] == COMMAND_ROUTE
         matched = _match_registered_web_api(
             context.registered_web_apis, COMMAND_ROUTE, "POST",
