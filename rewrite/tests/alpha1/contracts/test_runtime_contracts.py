@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import math
 import unittest
 from typing import runtime_checkable
@@ -198,7 +199,9 @@ class RuntimeContractTests(unittest.TestCase):
             outbox_refs=("outbox:1",),
         )
         self.assertEqual(bundle.proposals, (proposal,))
-        self.assertEqual(bundle.digest, canonical_digest(bundle))
+        legacy_wire = json.loads(canonical_serialize(bundle))
+        legacy_wire.pop("product_advance")
+        self.assertEqual(bundle.digest, canonical_digest(legacy_wire))
         self.assertEqual(proposal.typed_writes[0].value, {"value": 1})
         other_proposal = dataclasses.replace(
             proposal, envelope=envelope(NamespaceId("other", "persona")),
