@@ -104,6 +104,7 @@ pub(crate) struct OperatorBounds {
     pub(crate) k_row_abs_upper: f64,
     pub(crate) r_row_abs_upper: f64,
     pub(crate) j_row_abs_upper: f64,
+    pub(crate) jr_operator_norm_upper: f64,
     pub(crate) a_row_abs_upper: f64,
 }
 
@@ -190,6 +191,7 @@ pub(crate) fn verify_joint_step(
     let (k_coercivity_lower, k_row_abs_upper) = validate_positive_operator(input.k, MatrixRole::K)?;
     let (r_coercivity_lower, r_row_abs_upper) = validate_positive_operator(input.r, MatrixRole::R)?;
     let j_row_abs_upper = validate_skew_operator(input.j)?;
+    let jr_operator_norm_upper = combined_operator_norm_upper(input.j, input.r)?;
     let a_row_abs_upper = row_abs_upper(input.a)?;
 
     let x = point_vector(input.x)?;
@@ -285,6 +287,7 @@ pub(crate) fn verify_joint_step(
             k_row_abs_upper,
             r_row_abs_upper,
             j_row_abs_upper,
+            jr_operator_norm_upper,
             a_row_abs_upper,
         },
     })
@@ -354,12 +357,9 @@ pub(crate) fn verify_joint_error_bounds(
     let zero = Interval::point(0.0)?;
     let one = Interval::point(1.0)?;
     let step = Interval::point(input.h)?;
-    let operator = finite_interval(
-        Interval::point(envelope.operator_bounds.j_row_abs_upper)?
-            .add(Interval::point(envelope.operator_bounds.r_row_abs_upper)?)?,
-    )?;
-    // K is symmetric and J is skew-symmetric; for either, ||.||_2 is bounded
-    // by the verified maximum absolute row sum. Each nonlinear Hessian term
+    let operator = Interval::point(envelope.operator_bounds.jr_operator_norm_upper)?;
+    // Symmetric K has ||K||_2 bounded by its verified maximum absolute row sum.
+    // The full J-R norm uses verified row and column sums. Each Hessian term
     // is alpha_l * a_l a_l^T, with spectral norm alpha_l * ||a_l||_2^2.
     let mut gradient_lipschitz = Interval::point(envelope.operator_bounds.k_row_abs_upper)?;
     for row in 0..input.a.rows {
@@ -580,6 +580,63 @@ fn row_abs_upper(matrix: SparseMatrix<'_>) -> Result<f64, VerifierError> {
         maximum = maximum.max(sum.upper());
     }
     Ok(maximum)
+}
+
+/// Bound ||J-R||_2 from the complete sparse operator. For any matrix B,
+/// ||B||_2 <= sqrt(||B||_1 ||B||_inf) <= max(||B||_1, ||B||_inf).
+/// Both row and column sums use outward intervals, including J/R overlap.
+fn combined_operator_norm_upper(
+    j: SparseMatrix<'_>,
+    r: SparseMatrix<'_>,
+) -> Result<f64, VerifierError> {
+    let mut column_sums = vec![Interval::point(0.0)?; j.cols];
+    let mut row_max: f64 = 0.0;
+    for row in 0..j.rows {
+        let mut j_position = j.offsets[row] as usize;
+        let j_end = j.offsets[row + 1] as usize;
+        let mut r_position = r.offsets[row] as usize;
+        let r_end = r.offsets[row + 1] as usize;
+        let mut row_sum = Interval::point(0.0)?;
+        while j_position < j_end || r_position < r_end {
+            let j_column = if j_position < j_end {
+                j.indices[j_position] as usize
+            } else {
+                j.cols
+            };
+            let r_column = if r_position < r_end {
+                r.indices[r_position] as usize
+            } else {
+                r.cols
+            };
+            let column = j_column.min(r_column);
+            let j_value = if j_column == column {
+                let value = j.values[j_position];
+                j_position += 1;
+                value
+            } else {
+                0.0
+            };
+            let r_value = if r_column == column {
+                let value = r.values[r_position];
+                r_position += 1;
+                value
+            } else {
+                0.0
+            };
+            let difference =
+                finite_interval(Interval::point(j_value)?.sub(Interval::point(r_value)?)?)?;
+            let absolute_upper = difference.lower().abs().max(difference.upper().abs());
+            let absolute = Interval::new(0.0, absolute_upper)?;
+            row_sum = finite_interval(row_sum.add(absolute)?)?;
+            column_sums[column] = finite_interval(column_sums[column].add(absolute)?)?;
+        }
+        row_max = row_max.max(row_sum.upper());
+    }
+    let column_max = column_sums
+        .iter()
+        .map(|sum| sum.upper())
+        .fold(0.0_f64, f64::max);
+    Ok(row_max.max(column_max))
 }
 
 fn point_vector(values: &[f64]) -> Result<Vec<Interval>, VerifierError> {
@@ -913,6 +970,37 @@ mod tests {
             verify_joint_error_bounds(&input, Interval::point(0.0).unwrap()),
             Err(VerifierError::ContractionNotProven)
         );
+    }
+
+    #[test]
+    fn complete_operator_bound_admits_disjoint_damping_and_coupling() {
+        let identity_offsets = [0, 1, 2, 3];
+        let identity_indices = [0, 1, 2];
+        let identity_values = [1.0, 1.0, 1.0];
+        let damping_values = [0.1, 0.1, 1.0];
+        let input = JointVerificationInput {
+            k: SparseMatrix::new(3, 3, &identity_offsets, &identity_indices, &identity_values),
+            r: SparseMatrix::new(3, 3, &identity_offsets, &identity_indices, &damping_values),
+            j: SparseMatrix::new(3, 3, &[0, 1, 2, 2], &[1, 0], &[1.0, -1.0]),
+            a: SparseMatrix::new(1, 3, &[0, 1], &[0], &[0.25]),
+            alpha: &[0.2],
+            x: &[0.2, 0.0, 0.0],
+            y: &[0.18, 0.0, 0.0],
+            h: 1.0,
+            drive: &[0.0, 0.0, 0.0],
+        };
+
+        let envelope = verify_joint_step(&input).unwrap();
+        // Separate maxima give ||J||_inf + ||R||_inf = 2 and q >= 1.
+        // The complete J-R has absolute row and column sums at most 1.1;
+        // its exact 2-norm is sqrt(1.01), so the new upper bound is safe.
+        assert!(envelope.operator_bounds.jr_operator_norm_upper >= 1.01_f64.sqrt());
+        assert!(envelope.operator_bounds.jr_operator_norm_upper < 1.2);
+        let bounds = verify_joint_error_bounds(&input, Interval::point(0.0).unwrap()).unwrap();
+        assert!(bounds.contraction_upper < 0.8);
+        assert!(bounds.gradient_lipschitz_upper >= 1.0125);
+        assert!(bounds.vector_field_lipschitz_upper >= 1.01_f64.sqrt());
+        assert!(bounds.time_error.upper().is_finite());
     }
 
     #[test]
