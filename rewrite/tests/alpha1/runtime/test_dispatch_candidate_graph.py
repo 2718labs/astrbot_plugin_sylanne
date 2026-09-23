@@ -1,9 +1,7 @@
 """A source-HOLD dispatch candidate survives the actual graph bundle transaction."""
 
 from dataclasses import asdict, replace
-import sqlite3
 import time
-from types import SimpleNamespace
 
 import pytest
 
@@ -23,11 +21,6 @@ from sylanne3.host.authority_profile import (
     AdminIngressClockPolicy, AdminIngressEncodingPolicy,
 )
 from sylanne3.runtime.budget import BudgetLease, create_budget_lease, get_budget_lease
-from sylanne3.runtime.issuers import build_runtime_issuers
-from sylanne3.runtime.d11_types import (
-    D11RuntimeProvider, D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
-    graph_type_specs,
-)
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, DependencySet, DomainBundle, DomainProposal,
     NamespaceId, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA,
@@ -35,7 +28,8 @@ from sylanne3.runtime_contracts import (
 )
 
 from test_dispatch_admission_preflight import _candidates
-from test_graph_v2_provisioning import AuthorityPort, policy_for
+from test_graph_v2_provisioning import AuthorityPort
+from test_scene_binding_v2 import _scene_case
 
 
 class _Resources:
@@ -114,9 +108,15 @@ def _bundle(coordinator, authority, lease, providers, *, tamper=False,
     snapshot = coordinator.read_snapshot(
         authority, lease, (source, access) + tuple(write.key for write in writes),
     )
+    epochs = coordinator._GraphCoordinator__store._db.execute(
+        "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+        "WHERE bot=? AND persona=?", namespace.as_tuple,
+    ).fetchone()
+    access_epoch, delete_epoch = epochs if epochs is not None else (0, 0)
     guard = VersionGuard(
         snapshot.versions, (QueryEpoch(namespace, "all", snapshot.epochs[0].revision),),
-        0, 0, coordinator._GraphCoordinator__store._registry.catalogue_hash,
+        access_epoch, delete_epoch,
+        coordinator._GraphCoordinator__store._registry.catalogue_hash,
         "scheme-1", "operator-1", "policy-1", (), (), (),
     )
     envelope = CommandEnvelope(
@@ -221,32 +221,27 @@ def test_receipt_insert_failure_rolls_back_graph_and_budget(tmp_path):
 
 
 def test_v2_fenced_candidate_commit_and_cold_recovery(tmp_path):
-    registry, providers = _registry()
-    for spec in graph_type_specs():
-        registry.register(spec)
-    store = ProductionGraphStore(tmp_path / "business.db", registry)
-    authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
-    port = AuthorityPort(store, authority_db)
-    d02, d11 = build_runtime_issuers(b"candidate-v2-signing-key-32bytes")
-    bootstrap = object()
-    coordinator = GraphCoordinator(
-        store, bootstrap, holder="administrator", content_fence_v2=port,
-        d02_issuer=d02, d11_issuer=d11,
-    )
-    policy = policy_for(store)
-    policy = replace(policy, root_grant=replace(
-        policy.root_grant, allowed_work_kinds=("d06.encode_source",)))
-    coordinator.provision_namespace_v2(bootstrap, policy, operation_id="install-persona")
-    for domain, provider in zip(("d06", "d08", "d09"), providers):
+    _, providers = _registry()
+    extra_specs = tuple(
+        spec for provider in providers[1:]
+        for spec in provider.register_types())
+    (store, authority_db, port, coordinator, namespace, principal,
+     scene_proposal, scene_prior, scene_digest, _scene_key, policy,
+     bootstrap) = _scene_case(
+         tmp_path, enable_ingress=True, extra_specs=extra_specs)
+    registry = store._registry
+    coordinator.commit_scene_binding_v2(
+        namespace=namespace, operation_id="scene-bind-1",
+        proposal=scene_proposal, prior=scene_prior, principal=principal,
+        request_digest=scene_digest)
+    for domain, provider in zip(("d08", "d09"), providers[1:]):
         coordinator.register_provider(
             bootstrap, domain, provider,
-            "d06.contract.v1" if domain == "d06" else f"{domain}.proposal.v1",
+            f"{domain}.proposal.v1",
             provider.descriptor.request_schema_hash,
         )
-    coordinator.register_provider(
-        bootstrap, "d11", D11RuntimeProvider(),
-        D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
-    )
+    d02 = coordinator._GraphCoordinator__d02_issuer
+    d11 = coordinator._GraphCoordinator__d11_issuer
     host = IngressHostFacts(
         policy.namespace, "platform", "conversation", "sender", "message",
         "Hello", 10.0, time.time(), "private",
@@ -256,10 +251,6 @@ def test_v2_fenced_candidate_commit_and_cold_recovery(tmp_path):
     clock = AdminIngressClockPolicy("authority", 1.0, 1.0)
     encoding = AdminIngressEncodingPolicy(
         120.0, {"cpu_ms": 20}, "snapshot-1", "resource-1", "character-1")
-    port.read_ingress_clock = lambda _: SimpleNamespace(
-        utc_upper_bound_seconds=time.time() + 0.01,
-        monotonic_after_seconds=time.monotonic(),
-    )
     assert coordinator.commit_first_ingress_v2(
         bootstrap, host, policy, clock, encoding).status == "committed"
     source_row = store._db.execute(
@@ -289,10 +280,11 @@ def test_v2_fenced_candidate_commit_and_cold_recovery(tmp_path):
         assert first.evidence.status == "source_hold"
         assert first.graph_incarnation == coordinator._v2_graph_stamp(
             policy.namespace)[0].requirements.graph_incarnation
-        assert first.graph_revision == 2
+        assert first.graph_revision == coordinator._v2_graph_stamp(
+            policy.namespace)[0].graph_revision
         store.close()
 
-        reopened = ProductionGraphStore(tmp_path / "business.db", registry)
+        reopened = ProductionGraphStore(tmp_path / "owner-business.db", registry)
         next_port = AuthorityPort(reopened, authority_db)
         next_port.anchors.update(port.anchors)
         next_bootstrap = object()
