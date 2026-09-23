@@ -1197,7 +1197,8 @@ class GraphCoordinator:
             prior.monotonic_deadline, sample.wall_now_utc,
             sample.monotonic_now)
 
-    def _exact_ingress_without_query(self, db, bundle: DomainBundle) -> bool:
+    def _exact_ingress_without_query(self, db, bundle: DomainBundle, *,
+                                     deadline_check=None) -> bool:
         """Only the issued four-key first ingress may omit a range predicate."""
         if not isinstance(bundle, DomainBundle):
             return False
@@ -1263,12 +1264,16 @@ class GraphCoordinator:
             raise UnavailableGuard("durable ingress policy is invalid") from exc
         if policy.deadline_utc != envelope.deadline_utc:
             return False
-        self._admit_ingress_deadline(
-            namespace, identity.operation_id,
-            authority.activation_generation, policy.deadline_utc)
+        if deadline_check is None:
+            self._admit_ingress_deadline(
+                namespace, identity.operation_id,
+                authority.activation_generation, policy.deadline_utc)
+        else:
+            deadline_check(policy.deadline_utc)
         return True
 
-    def _check_guard(self, db, bundle: DomainBundle) -> GraphSnapshot:
+    def _check_guard(self, db, bundle: DomainBundle, *,
+                     ingress_deadline_check=None) -> GraphSnapshot:
         store = self.__store
         envelope = bundle.envelope
         namespace = envelope.authority.namespace
@@ -1298,7 +1303,8 @@ class GraphCoordinator:
             raise StaleRead("access or deletion epoch changed")
         graph_epoch = GraphStore.graph_epoch(
             store, *namespace.as_tuple, _capability=self.__graph_capability)
-        if not guard.query_epochs and not self._exact_ingress_without_query(db, bundle):
+        if not guard.query_epochs and not self._exact_ingress_without_query(
+                db, bundle, deadline_check=ingress_deadline_check):
             raise UnavailableGuard("namespace query epoch is required")
         for query in guard.query_epochs:
             if query.namespace != namespace or query.revision != graph_epoch.revision:
@@ -1703,13 +1709,16 @@ class GraphCoordinator:
                     store._db.execute("ROLLBACK")
                     raise
 
-    def _admit_runtime_bundle(self, db, bundle: DomainBundle) -> RuntimeAdmission:
+    def _admit_runtime_bundle(self, db, bundle: DomainBundle, *,
+                              now_utc: float | None = None) -> RuntimeAdmission:
         """Apply D02/D11 decisions in the graph's existing SQLite transaction."""
         if self.__d02_issuer is None or self.__d11_issuer is None:
             raise UnavailableGuard("D02 and D11 runtime issuers are required")
-        if self.__d02_issuer.authorize_resources(bundle, db) is not True:
+        time_kwargs = {} if now_utc is None else {"now_utc": now_utc}
+        if self.__d02_issuer.authorize_resources(
+                bundle, db, **time_kwargs) is not True:
             raise AuthorityDenied("D02 resource admission did not approve the bundle")
-        admission = self.__d11_issuer.admit_runtime(bundle, db)
+        admission = self.__d11_issuer.admit_runtime(bundle, db, **time_kwargs)
         if not isinstance(admission, RuntimeAdmission):
             raise AuthorityDenied("D11 did not issue a typed runtime admission")
         envelope = bundle.envelope
@@ -2232,7 +2241,14 @@ class GraphCoordinator:
 
     def _commit_domain_bundle_fenced(self, bundle: DomainBundle,
                                      lease: object, *, v2_read: bool = False,
-                                     v2_write=None, v2_transaction_state=None) -> CommitReceipt:
+                                     v2_write=None, v2_transaction_state=None,
+                                     in_transaction: bool = False,
+                                     now_utc: float | None = None,
+                                     ingress_deadline_check=None) -> CommitReceipt:
+        """Join a caller-owned graph transaction when ``in_transaction`` is set.
+
+        The caller holds the store lock and owns COMMIT or ROLLBACK.
+        """
         envelope = bundle.envelope
         namespace = envelope.authority.namespace
         domains = frozenset(proposal.domain for proposal in bundle.proposals)
@@ -2383,7 +2399,8 @@ class GraphCoordinator:
                 if prior[0] != digest:
                     raise EventConflict("operation ID reused with different bundle")
                 return
-            snapshot = self._check_guard(db, bundle)
+            snapshot = self._check_guard(
+                db, bundle, ingress_deadline_check=ingress_deadline_check)
             for source in envelope.source_qualification.source_refs:
                 key = self._parse_ref(source, namespace)
                 if key in new_sources:
@@ -2406,7 +2423,8 @@ class GraphCoordinator:
                 validated = provider.validate(proposal, snapshot)
                 if validated is not True and validated != proposal:
                     raise AuthorityDenied("domain validation did not approve proposal")
-            runtime_admissions.append(self._admit_runtime_bundle(db, bundle))
+            runtime_admissions.append(self._admit_runtime_bundle(
+                db, bundle, now_utc=now_utc))
             for proposal in bundle.proposals:
                 for write in proposal.typed_writes:
                     if write.key.type_name.startswith("runtime."):
@@ -2463,7 +2481,8 @@ class GraphCoordinator:
                         envelope.version_guard.access_epoch,
                         envelope.version_guard.delete_epoch):
                     raise StaleRead("ingress access or deletion epoch changed before commit")
-                if not self._exact_ingress_without_query(db, bundle):
+                if not self._exact_ingress_without_query(
+                        db, bundle, deadline_check=ingress_deadline_check):
                     raise UnavailableGuard("sealed ingress authority changed before commit")
             seq_row = db.execute(
                 "SELECT last_seq FROM graph_bundle_sequence WHERE bot=? AND persona=?",
@@ -2543,13 +2562,19 @@ class GraphCoordinator:
                 bundle.outbox_refs,
             ))
 
-        GraphStore.graph_commit(
-            store, GraphCandidate(event, envelope.version_guard.read_versions,
-                                  writes, ()),
-            _guard=guard, _receipt_hook=receipt_hook,
-            _capability=self.__graph_capability,
-            _transaction_state=v2_transaction_state,
-        )
+        candidate = GraphCandidate(event, envelope.version_guard.read_versions,
+                                   writes, ())
+        if in_transaction:
+            GraphStore._graph_commit_in_transaction(
+                store, candidate, _guard=guard, _receipt_hook=receipt_hook,
+                _capability=self.__graph_capability,
+            )
+        else:
+            GraphStore.graph_commit(
+                store, candidate, _guard=guard, _receipt_hook=receipt_hook,
+                _capability=self.__graph_capability,
+                _transaction_state=v2_transaction_state,
+            )
         return result[0]
 
 
