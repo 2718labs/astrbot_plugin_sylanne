@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-async function mountWorkbench({ sessionResponses = [], statusResponses = [], ownerFields = {}, origin = "https://localhost:6185" } = {}) {
+async function mountWorkbench({ sessionResponses = [], statusResponses = [], sceneCandidates = [], deferSceneCandidates = false, ownerFields = {}, origin = "https://localhost:6185" } = {}) {
   const previousDocument = globalThis.document;
   const previousFetch = globalThis.fetch;
   const previousFormData = globalThis.FormData;
   const previousLocation = globalThis.location;
   const requests = [];
+  const candidateRequests = [];
   const app = {
     innerHTML: "",
     addEventListener(type, listener) { if (type === "click") this.click = listener; }
@@ -17,12 +18,16 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], own
   let statusRequests = 0;
   let pageFields = {};
   let createFields = {};
+  const pageForm = { id: "page-form", elements: { namedItem(name) { return {
+    set value(value) { pageFields[name] = value; },
+    set checked(value) { pageFields[name] = value ? "on" : ""; }
+  }; } } };
   globalThis.document = {
     querySelector(selector) {
       if (selector === "#app") return app;
       if (selector === "#role-input") return { value: roleInput };
       if (selector === "#owner-login-form") return { id: "owner-login-form" };
-      if (selector === "#page-form") return { id: "page-form" };
+      if (selector === "#page-form") return pageForm;
       if (selector === "#create-character-form") return { id: "create-character-form" };
       if (selector === "#owner-signature") return { value: ownerSignature };
       return null;
@@ -43,6 +48,18 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], own
         const body = statusResponses[statusRequests++] ?? { schema_version: "sylanne.install-status.v1", runtime_stage: "limited", reason_code: "runtime_unavailable" };
         return { ok: true, status: 200, json: async () => body };
       }
+      if (url.endsWith("/scene-candidates")) {
+        if (deferSceneCandidates) return new Promise((resolve) => {
+          candidateRequests.push({ resolve: (candidates) => resolve({ ok: true, status: 200, json: async () => ({
+            schema_version: "sylanne.scene-candidates.v1", status: candidates.length ? "ready" : "empty",
+            candidates
+          }) }) });
+        });
+        return { ok: true, status: 200, json: async () => ({
+          schema_version: "sylanne.scene-candidates.v1", status: sceneCandidates.length ? "ready" : "empty",
+          candidates: sceneCandidates
+        }) };
+      }
       const body = sessionResponses[sessionRequests++] ?? { status: "ready", dashboard_session: "authenticated", owner_session: "unlocked", csrf_token: "issued" };
       return { ok: body.status === "ready", status: body.status === "ready" ? 200 : 401, json: async () => body };
     }
@@ -60,15 +77,17 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], own
     return requests[index];
   }
   return {
-    app, requests, nextRequest,
+    app, requests, candidateRequests, nextRequest,
     get sessionRequests() { return sessionRequests; },
     get statusRequests() { return statusRequests; },
     setRole(value) { roleInput = value; },
     setOwnerSignature(value) { ownerSignature = value; },
     setPageFields(value) { pageFields = value; },
+    getPageFields() { return pageFields; },
     setCreateFields(value) { createFields = value; },
     clickCommand(command) { return app.click({ target: { closest(selector) { return selector === "[data-command]" ? { dataset: { command } } : null; } } }); },
     clickView(view) { return app.click({ target: { closest(selector) { return selector === "[data-view]" ? { dataset: { view } } : null; } } }); },
+    clickCandidate(index) { return app.click({ target: { closest(selector) { return selector === "[data-scene-candidate]" ? { dataset: { sceneCandidate: String(index) } } : null; } } }); },
     restore() {
       globalThis.document = previousDocument;
       globalThis.fetch = previousFetch;
@@ -219,6 +238,44 @@ test("setup names pending Owner, role, and scene work from server reason codes",
   } finally { ui.restore(); }
 });
 
+test("Owner selects a recent scene but acknowledgement and submit remain separate", async () => {
+  const scene_ref = `scene:conversation-v1:${"a".repeat(64)}`;
+  const ui = await mountWorkbench({ sceneCandidates: [{
+    platform_ref: "onebot", conversation_ref: "group-7", visibility: "group", scene_ref
+  }] });
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    await ui.clickCommand("refresh-scene-candidates");
+    assert.match(ui.app.innerHTML, /onebot · group-7 · 群聊/);
+    await ui.clickCandidate(0);
+    assert.deepEqual(ui.getPageFields(), { scene_ref, visibility: "group", acknowledgement: "" });
+    assert.equal(ui.requests.length, 0);
+  } finally { ui.restore(); }
+});
+
+test("switching roles clears candidates and rejects an earlier candidate response", async () => {
+  const candidate = {
+    platform_ref: "onebot", conversation_ref: "old-group", visibility: "group",
+    scene_ref: `scene:conversation-v1:${"a".repeat(64)}`
+  };
+  const ui = await mountWorkbench({ deferSceneCandidates: true });
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    const pending = ui.clickCommand("refresh-scene-candidates");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(ui.candidateRequests.length, 1);
+    ui.setRole("role-b");
+    const switching = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.candidateRequests[0].resolve([candidate]);
+    await pending;
+    assert.doesNotMatch(ui.app.innerHTML, /old-group/);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await switching;
+    assert.doesNotMatch(ui.app.innerHTML, /old-group/);
+  } finally { ui.restore(); }
+});
+
 test("a command response from the previous role cannot alter projection or receipt", async () => {
   const ui = await mountWorkbench();
   try {
@@ -315,8 +372,8 @@ test("Owner can explicitly submit a manually supplied scene binding with acknowl
     await ui.nextRequest(0);
     ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
     await opened;
-    assert.match(ui.app.innerHTML, /管理员可信渠道提供的当前会话场景引用/);
-    assert.match(ui.app.innerHTML, /服务端仍会核验角色、场景和权限，可能暂缓绑定/);
+    assert.match(ui.app.innerHTML, /近期场景候选仅来自宿主已观察到的会话/);
+    assert.match(ui.app.innerHTML, /服务端仍会核验场景和权限，可能暂缓绑定/);
 
     const sceneRef = `scene:conversation-v1:${"a".repeat(64)}`;
     ui.setPageFields({ scene_ref: sceneRef, visibility: "group", acknowledgement: "on" });

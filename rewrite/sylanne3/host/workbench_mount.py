@@ -14,7 +14,7 @@ from ..authority_service.v2_owner_session import (
     from_wire as owner_session_from_wire, to_wire as owner_session_to_wire,
 )
 from ..workbench_api.http_transport import (
-    ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, SESSION_ROUTE,
+    ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, SCENE_CANDIDATES_ROUTE, SESSION_ROUTE,
     SYLANNE_OWNER_SESSION_COOKIE, WorkbenchHttpTransport,
 )
 from ..workbench_api.owner_session_resolver import BoundOwnerSessions
@@ -118,10 +118,12 @@ def _owner_cookie(response: Any, token: str | None) -> None:
 class WorkbenchHostMount:
     """One host route whose handler fails closed across plugin reloads."""
 
-    def __init__(self, status_provider: Callable[[], tuple[str, str]] | None = None) -> None:
+    def __init__(self, status_provider: Callable[[], tuple[str, str]] | None = None,
+                 scene_candidates: Callable[[Any], tuple[object, ...]] | None = None) -> None:
         self._transport: WorkbenchHttpTransport | None = None
         self._owner_sessions: BoundOwnerSessions | None = None
         self._status_provider = status_provider
+        self._scene_candidates = scene_candidates
         self._closed = False
 
     def attach_transport(self, transport: WorkbenchHttpTransport) -> None:
@@ -209,6 +211,24 @@ class WorkbenchHostMount:
                 return json_response(_unavailable("authority_unavailable"), status_code=503,
                                      headers=_STATIC_HEADERS)
             result = await transport.open_session(request)
+            status_code = result.pop("http_status", 200)
+            return json_response(result, status_code=status_code, headers=_STATIC_HEADERS)
+
+        async def scene_candidates():
+            if self._closed:
+                return json_response(_unavailable("host_stopped"), status_code=503,
+                                     headers=_STATIC_HEADERS)
+            if not isinstance(request.username, str) or not request.username:
+                return json_response(
+                    {"status": "unauthorized", "problem": {"code": "host_session_missing",
+                     "retryable": False}}, status_code=401, headers=_STATIC_HEADERS)
+            transport, sessions, provider = (self._transport, self._owner_sessions,
+                                             self._scene_candidates)
+            if transport is None or sessions is None or provider is None:
+                return json_response(_unavailable("scene_candidates_unavailable"),
+                                     status_code=503, headers=_STATIC_HEADERS)
+            result = await transport.scene_candidates(
+                request, namespace=sessions.namespace, provider=provider)
             status_code = result.pop("http_status", 200)
             return json_response(result, status_code=status_code, headers=_STATIC_HEADERS)
 
@@ -341,6 +361,10 @@ class WorkbenchHostMount:
             SESSION_ROUTE, session, ["GET"], "Sylanne current Owner session",
         )
         context.register_web_api(
+            SCENE_CANDIDATES_ROUTE, scene_candidates, ["GET"],
+            "Sylanne current Owner scene observations",
+        )
+        context.register_web_api(
             STATUS_ROUTE, status, ["GET"], "Sylanne installation stage",
         )
         context.register_web_api(
@@ -361,6 +385,7 @@ class WorkbenchHostMount:
         self._transport = None
         self._owner_sessions = None
         self._status_provider = None
+        self._scene_candidates = None
 
 
 def _unavailable(code: str) -> dict[str, object]:

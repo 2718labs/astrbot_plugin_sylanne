@@ -36,6 +36,25 @@ test("installation status uses the host session without opening Owner session", 
   assert.equal(api.hasSession, false);
 });
 
+test("scene candidates require a current Owner session and accept only bounded scene fields", async () => {
+  const requested = [];
+  const scene_ref = `scene:conversation-v1:${"a".repeat(64)}`;
+  const api = new WorkbenchApi({ fetchImpl: async (url, init) => {
+    requested.push({ url, init });
+    return { ok: true, json: async () => url.endsWith("/session")
+      ? { status: "ready", dashboard_session: "authenticated", owner_session: "unlocked", csrf_token: "issued" }
+      : { schema_version: "sylanne.scene-candidates.v1", status: "ready", candidates: [{
+        platform_ref: "onebot", conversation_ref: "group-7", visibility: "group", scene_ref
+      }] } };
+  } });
+  assert.deepEqual(await api.sceneCandidates(), [{
+    platform_ref: "onebot", conversation_ref: "group-7", visibility: "group", scene_ref
+  }]);
+  assert.equal(requested[1].url, `${DEFAULT_WORKBENCH_API_BASE}/scene-candidates`);
+  assert.equal(requested[1].init.credentials, "same-origin");
+  assert.equal(requested[1].init.method, "GET");
+});
+
 test("Owner login request uses the registered installation fields and exact browser Origin", () => {
   const values = {
     authority_id: "authority-a", authority_namespace: "authority-ns", installation_id: "install-a",

@@ -61,7 +61,8 @@ class Sylanne3Plugin(Star):
         self._installed_namespace: NamespaceId | None = None
         self._scene_candidates = SceneCandidateCatalog()
         self.runtime_health = RuntimeHealth("limited", ("not_started",))
-        self._workbench = WorkbenchHostMount(self._installation_status)
+        self._workbench = WorkbenchHostMount(
+            self._installation_status, self.observed_scene_candidates)
         self._workbench.register(context)
         self._workbench_dependencies = (
             workbench_pairing, workbench_owner_grants,

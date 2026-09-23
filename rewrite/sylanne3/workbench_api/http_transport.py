@@ -12,12 +12,13 @@ import inspect
 import json
 from pathlib import Path
 import secrets
-from typing import Any, Awaitable, Mapping, Protocol
+from typing import Any, Awaitable, Callable, Mapping, Protocol
 from urllib.parse import urlsplit
 
 from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerPrincipalV1,
 )
+from ..runtime_contracts import NamespaceId
 from .service import ApiResponse, AuthenticatedSession, RequestContext
 
 
@@ -25,6 +26,7 @@ MAX_JSON_BYTES = 64 * 1024
 PLUGIN_ROUTE_PREFIX = "/astrbot_plugin_sylanne/workbench"
 COMMAND_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/commands"
 SESSION_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/session"
+SCENE_CANDIDATES_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/scene-candidates"
 ASSET_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/<path:asset>"
 SYLANNE_OWNER_SESSION_COOKIE = "sylanne_owner_session"
 
@@ -214,6 +216,27 @@ class WorkbenchHttpTransport:
             return self._error("unavailable", "csrf_unavailable", "防跨站令牌不可用。", 503)
         return {"status": "ready", "dashboard_session": "authenticated",
                 "owner_session": "unlocked", "csrf_token": issue(session=session)}
+
+    async def scene_candidates(self, request: PluginRequest, *, namespace: NamespaceId,
+                               provider: Callable[[NamespaceId], tuple[object, ...]]) -> dict[str, Any]:
+        """Read recent host observations under the current signed Owner session."""
+        if not isinstance(request.username, str) or not request.username:
+            return self._error("unauthorized", "host_session_missing", "AstrBot 未提供已认证会话。", 401)
+        session = await self._bound_session(request)
+        if session is None:
+            return self._error("unauthorized", "owner_session_locked", "Sylanne Owner 会话未解锁或已失效。", 401)
+        if not self._session_origin_allowed(request):
+            return self._error("unauthorized", "origin_denied", "请求来源未获允许。", 403)
+        scope = f"{namespace.bot_id}/{namespace.persona_id}"
+        if not session.allows(scope, "workbench.read", "workbench_view", "owner"):
+            return self._error("unauthorized", "owner_scope_denied", "当前 Owner 无权读取场景候选。", 403)
+        candidates = tuple(item for item in provider(namespace) if item.namespace == namespace)
+        return {"schema_version": "sylanne.scene-candidates.v1",
+                "status": "ready" if candidates else "empty",
+                "candidates": [{"platform_ref": item.platform_ref,
+                                "conversation_ref": item.conversation_ref,
+                                "visibility": item.visibility, "scene_ref": item.scene_ref}
+                               for item in candidates]}
 
     async def _bound_session(self, request: PluginRequest) -> AuthenticatedSession | None:
         # AstrBot authenticates username, while Sylanne's own bearer cookie

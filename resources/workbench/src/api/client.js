@@ -50,6 +50,32 @@ export class WorkbenchApi {
     return { stage: body.runtime_stage, reason: body.reason_code };
   }
 
+  async sceneCandidates() {
+    await this.openSession();
+    let response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}/scene-candidates`, {
+        method: "GET", credentials: "same-origin", headers: { accept: "application/json" }
+      });
+    } catch (error) {
+      throw new WorkbenchApiError("无法读取当前场景候选。", { detail: error });
+    }
+    const body = await this.#readBody(response);
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) this.clearSession();
+      throw this.#responseError(response, body, "场景候选暂不可用。");
+    }
+    if (body?.schema_version !== "sylanne.scene-candidates.v1" ||
+        !["ready", "empty"].includes(body.status) || !Array.isArray(body.candidates) ||
+        body.candidates.some((item) => typeof item.platform_ref !== "string" ||
+          typeof item.conversation_ref !== "string" ||
+          !["private", "group"].includes(item.visibility) ||
+          !/^scene:conversation-v1:[0-9a-f]{64}$/.test(item.scene_ref))) {
+      throw new WorkbenchApiError("场景候选响应无效。", { code: "invalid_scene_candidates", retryable: true });
+    }
+    return body.candidates;
+  }
+
   async openSession() {
     if (this.csrfToken) return;
     if (!this.sessionRequest) {

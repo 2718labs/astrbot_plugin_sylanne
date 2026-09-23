@@ -29,6 +29,9 @@ let ownerChallenge = null;
 let ownerSigningPayload = "";
 let ownerSignature = "";
 let ownerProblem = null;
+let sceneCandidates = [];
+let sceneCandidatesProblem = null;
+let sceneCandidatesEpoch = 0;
 const ownerDraft = {};
 
 function escapeHtml(value) {
@@ -51,7 +54,7 @@ function statusCopy(status, problem) {
 }
 
 function formMarkup(page) {
-  if (page[0] === "setup") return `<p class="setup-hint">请仅填写管理员可信渠道提供的当前会话场景引用。聊天消息不会授权或自动绑定场景；服务端仍会核验角色、场景和权限，可能暂缓绑定。</p><label>场景引用<input name="scene_ref" required autocomplete="off" placeholder="scene:conversation-v1:（64 位小写十六进制值）" /></label><label>可见范围<select name="visibility" required><option value="">请选择</option><option value="private">私聊</option><option value="group">群聊</option></select></label><label class="acknowledgement"><input type="checkbox" name="acknowledgement" required /><span>我确认此引用及可见范围由管理员可信渠道提供，且适用于当前角色。</span></label>`;
+  if (page[0] === "setup") return `<p class="setup-hint">近期场景候选仅来自宿主已观察到的会话，供 Owner 点选。点选不会绑定场景；服务端仍会核验场景和权限，可能暂缓绑定。</p><button type="button" class="quiet" data-command="refresh-scene-candidates" ${state.sessionReady ? "" : "disabled"}>刷新场景候选</button><div class="scene-candidates" aria-label="近期场景候选">${sceneCandidatesProblem ? `<p>${escapeHtml(sceneCandidatesProblem)}</p>` : sceneCandidates.length ? sceneCandidates.map((item, index) => `<button type="button" class="quiet" data-scene-candidate="${index}">${escapeHtml(item.platform_ref)} · ${escapeHtml(item.conversation_ref)} · ${item.visibility === "group" ? "群聊" : "私聊"}</button>`).join("") : "<p>暂无近期场景候选；需在目标会话中产生真实消息后刷新。</p>"}</div><label>场景引用<input name="scene_ref" required autocomplete="off" placeholder="scene:conversation-v1:（64 位小写十六进制值）" /></label><label>可见范围<select name="visibility" required><option value="">请选择</option><option value="private">私聊</option><option value="group">群聊</option></select></label><label class="acknowledgement"><input type="checkbox" name="acknowledgement" required /><span>我确认所选场景和可见范围适用于当前角色，并明确申请绑定。</span></label>`;
   if (page[0] === "creation") return `<label>方案草稿（JSON 对象，可编辑）<textarea name="draft_json" placeholder='{"fields":{},"field_sources":{}}'></textarea></label><label>已有方案草稿引用（与 JSON 二选一）<input name="draft_ref" placeholder="由已授权草稿提供" /></label><label>已编译候选引用<input name="compiled_scheme_ref" placeholder="采用前由服务签发" /></label><label>操作<select name="mode"><option value="compile">编译候选</option><option value="activate">采用方案</option></select></label>`;
   if (["relations", "memory"].includes(page[0])) return `<label>纠错类型<select name="correction_kind"><option value="source_correction">来源更正</option><option value="interpretation_challenge">解释质疑</option><option value="administrative_edit">创作调整</option></select></label><label>新说明<textarea name="statement" required></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" /></label>`;
   if (["cognition", "action", "expression"].includes(page[0])) return `<label>对象引用<input name="object_ref" required /></label><label>控制请求<input name="control" placeholder="只提交领域可解释的控制请求" /></label>`;
@@ -131,6 +134,7 @@ function setupMarkup() {
 }
 
 function render() {
+  if (!state.sessionReady) sceneCandidates = [];
   const page = pages.find(([id]) => id === state.view) ?? pages[0];
   const [statusTitle, statusDetail] = state.view === "setup" && hasVerifiedCatalogue()
     ? ["工作台会话已核验", "角色初始化、场景绑定与验证对话仍需各自的真实回执。"]
@@ -217,6 +221,9 @@ async function ownerAction(action) {
     ++ownerFlowEpoch;
     ++sessionCheckEpoch;
     ++requestEpoch;
+    ++sceneCandidatesEpoch;
+    sceneCandidates = [];
+    sceneCandidatesProblem = null;
     ownerBusy = true;
     clearOwnerChallenge();
     ownerProblem = null;
@@ -298,8 +305,12 @@ async function command(action) {
     return;
   }
   if (action?.startsWith("owner-") || action === "copy-owner-payload") return ownerAction(action);
+  if (action === "refresh-scene-candidates") return loadSceneCandidates();
   if (action === "switch-role") {
     const value = document.querySelector("#role-input")?.value.trim();
+    ++sceneCandidatesEpoch;
+    sceneCandidates = [];
+    sceneCandidatesProblem = null;
     Object.assign(state, switchRole(state, value)); render(); await loadView(); return;
   }
   if (action === "retry-session") return verifySession(true);
@@ -335,6 +346,23 @@ async function command(action) {
   }
 }
 
+async function loadSceneCandidates() {
+  const epoch = ++sceneCandidatesEpoch;
+  sceneCandidates = [];
+  sceneCandidatesProblem = null;
+  if (!state.sessionReady) { render(); return; }
+  try {
+    const candidates = await api.sceneCandidates();
+    if (epoch !== sceneCandidatesEpoch) return;
+    sceneCandidates = candidates;
+  } catch (error) {
+    if (epoch !== sceneCandidatesEpoch) return;
+    sceneCandidatesProblem = normalizeError(error).message;
+    if (!api.hasSession) state.sessionReady = false;
+  }
+  render();
+}
+
 async function commandAction(action, input, purpose = "workbench_user_action") {
   if (!state.role) return loadView();
   const epoch = ++requestEpoch;
@@ -357,6 +385,9 @@ async function commandAction(action, input, purpose = "workbench_user_action") {
 async function verifySession(refreshRole = false) {
   const checkEpoch = ++sessionCheckEpoch;
   if (refreshRole) {
+    ++sceneCandidatesEpoch;
+    sceneCandidates = [];
+    sceneCandidatesProblem = null;
     ++requestEpoch;
     api.clearSession();
     state.sessionReady = false;
@@ -398,6 +429,16 @@ async function verifyInstallationStatus() {
 }
 
 app.addEventListener("click", async (event) => {
+  const candidateIndex = event.target.closest("[data-scene-candidate]")?.dataset.sceneCandidate;
+  if (candidateIndex !== undefined) {
+    const candidate = sceneCandidates[Number(candidateIndex)];
+    const form = document.querySelector("#page-form");
+    if (!candidate || !form || !state.sessionReady) return;
+    form.elements.namedItem("scene_ref").value = candidate.scene_ref;
+    form.elements.namedItem("visibility").value = candidate.visibility;
+    form.elements.namedItem("acknowledgement").checked = false;
+    return;
+  }
   const view = event.target.closest("[data-view]")?.dataset.view;
   if (view) {
     if (view !== state.view) { state.view = view; state.projection = null; }

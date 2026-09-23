@@ -116,6 +116,10 @@ class BoundOwnerSessions:
     def origin(self) -> str:
         return self._origin
 
+    @property
+    def namespace(self) -> NamespaceId:
+        return self._namespace
+
     def _key(self, token: str) -> bytes:
         if type(token) is not str or _TOKEN.fullmatch(token) is None:
             raise ValueError("invalid Owner session token")
