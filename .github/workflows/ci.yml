@@ -72,7 +72,7 @@ jobs:
           cargo fmt --check --manifest-path rewrite/native/Cargo.toml
           cargo test --manifest-path rewrite/native/Cargo.toml
 
-      - name: Build and load this platform's dev-probe package
+      - name: Build and cold-load this platform's dev-probe ZIP without Rust or source path
         run: |
           cargo build --release --manifest-path rewrite/native/Cargo.toml
           python scripts/alpha1/probe_current_platform_package.py
