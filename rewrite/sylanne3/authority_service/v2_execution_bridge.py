@@ -137,6 +137,9 @@ class AuthorityV2ExecutionBridge:
         if row[:4] != (pending.permit.operation_id, self.namespace, subject,
                        pending.request_digest) or row[6] != canonical_bytes(pending):
             raise AuthorityUnavailable("mutation ID identity or digest conflict")
+        kind, saved, _, _ = self.fences._decode_mutation_row(row)
+        if kind != "execution" or saved != pending:
+            raise AuthorityUnavailable("mutation recovery footprint is absent or differs")
         return row
 
     @staticmethod
@@ -205,7 +208,8 @@ class AuthorityV2ExecutionBridge:
             self._check_effects(db, self.namespace, permit.effect_id, keys)
             self.fences.record_pending_locked(
                 db, pending, subject=subject,
-                current_anchor=permit.pinned_anchor, conflict_keys=keys)
+                current_anchor=permit.pinned_anchor, footprint=footprint,
+                conflict_keys=keys)
         return pending
 
     def append_pending(self, pending: PendingMutationV2, *, credential,

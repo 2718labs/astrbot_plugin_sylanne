@@ -169,12 +169,13 @@ def test_genesis_rejects_unsettled_or_used_namespace(tmp_path, blocker):
                 "fence_epoch,revision,state,permit) VALUES(?,?,?,?,1,0,'active',?)",
                 ("operation-a", "ns-a", "subject-a", "token-a", b"invalid"))
         elif blocker == "pending_mutation":
+            # Direct SQL fixture tests ledger occupancy; genesis does not decode it.
             core._db.execute(
                 "INSERT INTO authority_v2_mutations(mutation_id,operation_id,namespace,subject,"
-                "request_digest,state,conflict_keys_json,pending,mutation_kind) "
-                "VALUES(?,?,?,?,?,'pending','[]',?,'execution')",
+                "request_digest,state,conflict_keys_json,pending,mutation_kind,footprint) "
+                "VALUES(?,?,?,?,?,'pending','[]',?,'execution',?)",
                 ("mutation-a", "operation-a", "ns-a", "subject-a", "sha256:" + "a" * 64,
-                 b"pending"))
+                 b"pending", b"fixture-footprint"))
         else:
             core._db.execute(
                 "INSERT INTO authority_meta(key,value) VALUES('deletion_v2_migration',?)",

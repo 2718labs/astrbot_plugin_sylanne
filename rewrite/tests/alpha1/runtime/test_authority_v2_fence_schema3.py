@@ -85,14 +85,17 @@ def test_explicit_upgrade_preserves_old_execution_bytes_and_kind(tmp_path):
     with pytest.raises(AuthorityUnavailable):
         AuthorityV2FenceStore(db)
     AuthorityV2FenceStore.upgrade_schema_2_to_3(db)
-    store = AuthorityV2FenceStore(db)
     assert db.execute("SELECT pending,receipt,updated_permit,mutation_kind,deletion_evidence FROM authority_v2_mutations").fetchone() == (*old, "execution", None)
-    assert store.get_mutation(pending.mutation_id, subject="subject-a",
-                              namespace="ns-a") == ("execution", pending, receipt, updated)
+    with pytest.raises(AuthorityUnavailable, match="version|migration"):
+        AuthorityV2FenceStore(db)
+    with pytest.raises(AuthorityUnavailable, match="footprint|HOLD"):
+        AuthorityV2FenceStore.upgrade_schema_3_to_4(db)
+    assert db.execute("SELECT value FROM authority_v2_meta").fetchone() == ("3",)
     db.close()
     reopened = open_db(path)
-    assert AuthorityV2FenceStore(reopened).get_mutation(
-        pending.mutation_id, subject="subject-a", namespace="ns-a")[2] == receipt
+    with pytest.raises(AuthorityUnavailable, match="version|migration"):
+        AuthorityV2FenceStore(reopened)
+    assert reopened.execute("SELECT pending,receipt,updated_permit FROM authority_v2_mutations").fetchone() == old
     reopened.close()
 
 
@@ -167,7 +170,7 @@ def test_deletion_rows_are_strictly_readable_but_no_dto_write_api(tmp_path):
     # Direct SQL is a test fixture only; no service deletion admission exists.
     db.execute("UPDATE authority_v2_fences SET pending=? WHERE operation_id=?",
                (canonical_bytes(pending), permit.operation_id))
-    db.execute("INSERT INTO authority_v2_mutations VALUES(?,?,?,?,?,'pending','null',?,NULL,NULL,'deletion',?)", (
+    db.execute("INSERT INTO authority_v2_mutations VALUES(?,?,?,?,?,'pending','null',?,NULL,NULL,'deletion',?,NULL)", (
         pending.mutation_id, permit.operation_id, permit.namespace,
         permit.subject, pending.request_digest, canonical_bytes(pending),
         canonical_bytes(evidence)))

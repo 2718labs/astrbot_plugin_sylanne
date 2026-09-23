@@ -116,13 +116,14 @@ def test_deletion_history_quarantines_even_after_head_catches_up(installed):
 
 def test_pending_mutation_ledger_blocks_activation(installed):
     service, core, deletion, guard, execution = installed
+    # Direct SQL fixture tests ledger occupancy; this path does not decode the footprint.
     core._db.execute(
         "INSERT INTO authority_v2_mutations("
         "mutation_id,operation_id,namespace,subject,request_digest,state,"
-        "conflict_keys_json,pending,mutation_kind) "
-        "VALUES(?,?,?,?,?,'pending','[]',?,'execution')",
+        "conflict_keys_json,pending,mutation_kind,footprint) "
+        "VALUES(?,?,?,?,?,'pending','[]',?,'execution',?)",
         ("mutation-a", "operation-a", "ns-a", "subject-a",
-         "sha256:" + "a" * 64, b"pending"))
+         "sha256:" + "a" * 64, b"pending", b"fixture-footprint"))
     result = observe(service)
     assert result.state is NamespaceRuntimeState.RECOVERING
     assert result.blocking_reasons == ("pending_mutation",)

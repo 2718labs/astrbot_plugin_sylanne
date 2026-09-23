@@ -13,7 +13,10 @@ from sylanne3.authority_service.v2_execution_journal import AuthorityV2Execution
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.runtime.deletion import DeletionJournal
-from sylanne3.runtime_journal import RecoveryConstraintFootprint
+from sylanne3.runtime_journal import (
+    BudgetConstraint, QuotaOccupancy, RecoveryConstraintFootprint,
+    ReservationConstraint,
+)
 
 
 def setup_service(tmp_path, *, create=True):
@@ -62,6 +65,19 @@ def footprint():
     return RecoveryConstraintFootprint(
         namespace="ns-a", activity_id="activity-a", effect_id="effect-a",
         conflict_keys=("resource-a",),
+    )
+
+
+def rich_footprint():
+    return RecoveryConstraintFootprint(
+        namespace="ns-a", activity_id="activity-a", effect_id="effect-a",
+        external_idempotency_ref="idem-a", external_query_ref="query-a",
+        conflict_keys=("resource-a",), communication_action="send",
+        contact_id="contact-a", segment_id="segment-a",
+        object_gate_keys=("gate-a",),
+        quota_occupancies=(QuotaOccupancy("quota-a", "window-a", 2),),
+        reservations=(ReservationConstraint("reserve-a", "component-a", "4"),),
+        budgets=(BudgetConstraint("budget-a", "2", "1", "5"),),
     )
 
 
@@ -205,6 +221,56 @@ def test_fsync_then_authority_commit_failure_recovers_after_reopen(tmp_path, mon
     assert receipt.durable_state == "committed"
     assert updated.revision == 1
     assert authority_anchor(core) == receipt.after_anchor
+    core.close()
+    journal.close()
+
+
+def test_crash_after_authority_pending_before_append_retains_full_limits(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(tmp_path)
+    item = rich_footprint()
+    permit = begin(core, fences, item)
+    pending = bridge.prepare_pending(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    assert journal.verified_head().seq == 0
+    core.close()
+    journal.close()
+
+    core, fences, journal, bridge, _ = setup_service(tmp_path, create=False)
+    assert fences.get_recovery_footprint(
+        "mutation-a", subject="subject-a", namespace="ns-a") == item
+    assert bridge.observe_prepared(
+        credential="ok", subject="subject-a", pending=pending).append is None
+    bridge.append_pending(pending, credential="ok", subject="subject-a")
+    receipt, _ = bridge.reconcile_mutation(
+        credential="ok", subject="subject-a", pending=pending)
+    assert receipt.durable_state == "committed"
+    assert fences.get_recovery_footprint(
+        "mutation-a", subject="subject-a", namespace="ns-a") == item
+    core.close()
+    journal.close()
+
+
+def test_tampered_authority_footprint_blocks_append_recovery_and_observe(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(tmp_path)
+    item = rich_footprint()
+    permit = begin(core, fences, item)
+    pending = bridge.prepare_pending(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    changed = replace(item, budgets=(BudgetConstraint("budget-a", "3", "1", "5"),))
+    core._db.execute(
+        "UPDATE authority_v2_mutations SET footprint=? WHERE mutation_id=?",
+        (changed._json().encode(), pending.mutation_id))
+    with pytest.raises(AuthorityUnavailable, match="footprint|mutation kind"):
+        bridge.append_pending(pending, credential="ok", subject="subject-a")
+    with pytest.raises(AuthorityUnavailable, match="footprint|mutation kind"):
+        bridge.reconcile_mutation(
+            credential="ok", subject="subject-a", pending=pending, allow_cancel=True)
+    with pytest.raises(AuthorityUnavailable, match="footprint|mutation kind"):
+        bridge.observe_prepared(
+            credential="ok", subject="subject-a", pending=pending)
+    assert journal.verified_head().seq == 0
     core.close()
     journal.close()
 

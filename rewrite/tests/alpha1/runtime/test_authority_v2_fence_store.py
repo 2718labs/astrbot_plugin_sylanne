@@ -2,6 +2,8 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import hashlib
+import json
 import sqlite3
 import threading
 
@@ -9,8 +11,13 @@ import pytest
 
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.v2_contract import PendingMutationV2
-from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
+from sylanne3.authority_service.v2_contract import to_wire
+from sylanne3.authority_service.v2_fence_store import (
+    AuthorityV2FenceStore, _EPOCH_DDL, _FENCE_DDL, _INDEX_DDL,
+    _META_DDL, _MUTATION_DDL_V3,
+)
 from sylanne3.runtime.restore_anchor import RestoreAnchor
+from sylanne3.runtime_journal import BudgetConstraint, RecoveryConstraintFootprint
 
 
 def digest(char: str) -> str:
@@ -49,6 +56,28 @@ def finish(store, permit, *, current_anchor=None, **changes):
                   request_id="finish-a", request_digest=digest("f"))
     fields.update(changes)
     return store.finish_fence(permit, **fields)
+
+
+def footprint():
+    return RecoveryConstraintFootprint(
+        namespace="ns-a", activity_id="activity-a", effect_id="effect-a",
+        conflict_keys=("resource-a",),
+        communication_action="send", contact_id="contact-a",
+        budgets=(BudgetConstraint("parent-a", "2.5", "1", "10"),),
+    )
+
+
+def prepared(permit, item):
+    request = json.dumps({
+        "permit": to_wire(permit), "mutation_id": "mutation-a",
+        "footprint": json.loads(item._json()), "phase": "prepared",
+    }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return PendingMutationV2(
+        permit=permit, mutation_id="mutation-a",
+        request_digest="sha256:" + hashlib.sha256(request).hexdigest(),
+        phase="prepared", before_anchor=anchor(), expected_append_id="append-a",
+        expected_append_digest=digest("d"),
+    )
 
 
 def test_exclusive_retry_finish_epoch_and_restart(tmp_path):
@@ -114,21 +143,21 @@ def test_identity_anchor_and_finish_conflicts_fail_closed(tmp_path):
 def test_pending_survives_restart_and_blocks_all_finishes(tmp_path):
     path = tmp_path / "service.db"
     db, store = open_store(path, create=True)
+    item = footprint()
     permit = begin(store, operation="dispatch", effect_id="effect-a",
-                   command_digest=digest("a"), footprint_digest=digest("b"))
-    pending = PendingMutationV2(
-        permit=permit, mutation_id="mutation-a", request_digest=digest("c"),
-        phase="prepared", before_anchor=anchor(), expected_append_id="append-a",
-        expected_append_digest=digest("d"),
-    )
-    assert store.record_pending(pending, subject="subject-a", current_anchor=anchor()) == pending
-    assert store.record_pending(pending, subject="subject-a", current_anchor=anchor()) == pending
+                   command_digest=digest("a"), footprint_digest="sha256:" +
+                   hashlib.sha256(item._json().encode()).hexdigest())
+    pending = prepared(permit, item)
+    assert store.record_pending(pending, subject="subject-a", current_anchor=anchor(), footprint=item) == pending
+    assert store.record_pending(pending, subject="subject-a", current_anchor=anchor(), footprint=item) == pending
     with pytest.raises(AuthorityUnavailable):
         store.record_pending(replace(pending, request_digest=digest("e")),
-                             subject="subject-a", current_anchor=anchor())
+                             subject="subject-a", current_anchor=anchor(), footprint=item)
     db.close()
     db, store = open_store(path)
     assert store.get_operation("op-a", subject="subject-a", namespace="ns-a") == (permit, "active", pending)
+    assert store.get_recovery_footprint("mutation-a", subject="subject-a",
+                                        namespace="ns-a") == item
     with pytest.raises(AuthorityUnavailable):
         store.validate_fence(permit, subject="subject-a", current_anchor=anchor())
     with pytest.raises(AuthorityUnavailable):
@@ -188,4 +217,47 @@ def test_corrupt_persisted_permit_is_not_accepted(tmp_path):
     db.execute("UPDATE authority_v2_fences SET permit=? WHERE operation_id='op-a'", (b'{}',))
     with pytest.raises(AuthorityUnavailable):
         store.validate_fence(permit, subject="subject-a", current_anchor=anchor())
+    db.close()
+
+
+def test_schema3_requires_explicit_empty_ledger_upgrade(tmp_path):
+    def old_db(path):
+        db = sqlite3.connect(path, isolation_level=None)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        for ddl in (_META_DDL, _EPOCH_DDL, _FENCE_DDL, _INDEX_DDL,
+                    _MUTATION_DDL_V3):
+            db.execute(ddl)
+        db.execute("INSERT INTO authority_v2_meta VALUES('schema_version','3')")
+        return db
+
+    path = tmp_path / "old-empty.db"
+    db = old_db(path)
+    with pytest.raises(AuthorityUnavailable, match="version|migration"):
+        AuthorityV2FenceStore(db)
+    AuthorityV2FenceStore.upgrade_schema_3_to_4(db)
+    AuthorityV2FenceStore(db)
+    assert db.execute("SELECT value FROM authority_v2_meta").fetchone() == ("4",)
+    db.close()
+
+    path = tmp_path / "old-with-mutation.db"
+    db = old_db(path)
+    db.execute(
+        "INSERT INTO authority_v2_mutations VALUES(?,?,?,?,?,'pending',?,?,NULL,NULL,'execution',NULL)",
+        ("mutation-a", "operation-a", "ns-a", "subject-a", digest("a"),
+         "[]", b"{}"))
+    with pytest.raises(AuthorityUnavailable, match="footprint|HOLD"):
+        AuthorityV2FenceStore.upgrade_schema_3_to_4(db)
+    assert db.execute("SELECT value FROM authority_v2_meta").fetchone() == ("3",)
+    with pytest.raises(AuthorityUnavailable, match="version|migration"):
+        AuthorityV2FenceStore(db)
+    db.close()
+
+    path = tmp_path / "old-with-execution-head.db"
+    db = old_db(path)
+    db.execute("CREATE TABLE authority_namespaces(execution_seq INTEGER NOT NULL)")
+    db.execute("INSERT INTO authority_namespaces VALUES(1)")
+    with pytest.raises(AuthorityUnavailable, match="history|HOLD"):
+        AuthorityV2FenceStore.upgrade_schema_3_to_4(db)
+    assert db.execute("SELECT value FROM authority_v2_meta").fetchone() == ("3",)
     db.close()

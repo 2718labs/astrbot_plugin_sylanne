@@ -2,8 +2,10 @@
 
 The caller supplies an *already authenticated* subject and the service-current
 RestoreAnchor. This store does not authenticate callers, attest anchors, or
-verify a journal or a dispatch footprint. The service must do those checks before calling it, and must
-not expose this connection or these methods to a plugin. It owns no parallel
+verify a journal or attest a dispatch footprint's issuer. It does verify the
+canonical footprint bytes against the permit and request digest. The service
+must verify the issuer before calling it and must not expose this connection
+or these methods to a plugin. It owns no parallel
 activation or journal truth. One store instance owns one injected autocommit
 connection; separate instances may use separate connections to the same DB.
 
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -23,15 +26,17 @@ import threading
 import uuid
 
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime_journal import RecoveryConstraintFootprint
 from .contract import AuthorityUnavailable, identifier
+from .local_bridge import constraint_keys_from_footprint
 from .v2_contract import (
     DeletionEvidenceV1, DeletionMutationReceiptV1, DeletionPendingV1,
     FencePermitV2, MutationReceiptV2,
-    PendingMutationV2, SCHEMA, canonical_bytes, decode_bytes,
+    PendingMutationV2, SCHEMA, canonical_bytes, decode_bytes, to_wire,
 )
 
 
-_VERSION = "3"
+_VERSION = "4"
 _META_DDL = "CREATE TABLE authority_v2_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 _EPOCH_DDL = "CREATE TABLE authority_v2_epochs(namespace TEXT PRIMARY KEY, last_epoch INTEGER NOT NULL CHECK(last_epoch >= 0))"
 _FENCE_DDL = """CREATE TABLE authority_v2_fences(
@@ -56,7 +61,7 @@ _MUTATION_DDL_V2 = """CREATE TABLE authority_v2_mutations(
     CHECK((state='pending' AND receipt IS NULL AND updated_permit IS NULL)
        OR (state!='pending' AND receipt IS NOT NULL AND updated_permit IS NOT NULL))
 )"""
-_MUTATION_DDL = """CREATE TABLE authority_v2_mutations(
+_MUTATION_DDL_V3 = """CREATE TABLE authority_v2_mutations(
     mutation_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL,
     namespace TEXT NOT NULL, subject TEXT NOT NULL,
     request_digest TEXT NOT NULL,
@@ -68,6 +73,21 @@ _MUTATION_DDL = """CREATE TABLE authority_v2_mutations(
     CHECK((mutation_kind='execution' AND deletion_evidence IS NULL)
        OR (mutation_kind='deletion' AND deletion_evidence IS NOT NULL
            AND state!='cancelled_unappended')),
+    CHECK((state='pending' AND receipt IS NULL AND updated_permit IS NULL)
+       OR (state!='pending' AND receipt IS NOT NULL AND updated_permit IS NOT NULL))
+)"""
+_MUTATION_DDL = """CREATE TABLE authority_v2_mutations(
+    mutation_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL,
+    namespace TEXT NOT NULL, subject TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','committed','cancelled_unappended')),
+    conflict_keys_json TEXT NOT NULL, pending BLOB NOT NULL,
+    receipt BLOB, updated_permit BLOB,
+    mutation_kind TEXT NOT NULL CHECK(mutation_kind IN ('execution','deletion')),
+    deletion_evidence BLOB, footprint BLOB,
+    CHECK((mutation_kind='execution' AND deletion_evidence IS NULL AND footprint IS NOT NULL)
+       OR (mutation_kind='deletion' AND deletion_evidence IS NOT NULL
+           AND footprint IS NULL AND state!='cancelled_unappended')),
     CHECK((state='pending' AND receipt IS NULL AND updated_permit IS NULL)
        OR (state!='pending' AND receipt IS NOT NULL AND updated_permit IS NOT NULL))
 )"""
@@ -83,10 +103,13 @@ _TABLES = {
         "mutation_id", "operation_id", "namespace", "subject",
         "request_digest", "state", "conflict_keys_json", "pending",
         "receipt", "updated_permit", "mutation_kind", "deletion_evidence",
+        "footprint",
     ),
 }
 _TABLES_V2 = {**_TABLES, "authority_v2_mutations":
               _TABLES["authority_v2_mutations"][:10]}
+_TABLES_V3 = {**_TABLES, "authority_v2_mutations":
+              _TABLES["authority_v2_mutations"][:12]}
 
 
 class AuthorityV2FenceStore:
@@ -130,9 +153,17 @@ class AuthorityV2FenceStore:
 
     @staticmethod
     def _check_schema_version(db: sqlite3.Connection, version: str) -> None:
-        if version not in ("2", "3"):
+        if version not in ("2", "3", "4"):
             raise AuthorityUnavailable("unknown v2 fence schema version")
-        tables = _TABLES if version == "3" else _TABLES_V2
+        try:
+            row = db.execute(
+                "SELECT value FROM authority_v2_meta WHERE key='schema_version'").fetchone()
+            count = db.execute("SELECT count(*) FROM authority_v2_meta").fetchone()[0]
+        except sqlite3.Error as exc:
+            raise AuthorityUnavailable("malformed v2 fence schema") from exc
+        if row != (version,) or count != 1:
+            raise AuthorityUnavailable("v2 fence schema version requires explicit migration")
+        tables = {"2": _TABLES_V2, "3": _TABLES_V3, "4": _TABLES}[version]
         objects = {(kind, name) for kind, name in db.execute(
             "SELECT type,name FROM sqlite_master WHERE name LIKE 'authority_v2_%'")}
         expected_objects = {("table", table) for table in tables} | {
@@ -143,8 +174,10 @@ class AuthorityV2FenceStore:
             "authority_v2_meta": _META_DDL,
             "authority_v2_epochs": _EPOCH_DDL,
             "authority_v2_fences": _FENCE_DDL,
-            "authority_v2_mutations": (_MUTATION_DDL if version == "3"
-                                        else _MUTATION_DDL_V2),
+            "authority_v2_mutations": {
+                "2": _MUTATION_DDL_V2, "3": _MUTATION_DDL_V3,
+                "4": _MUTATION_DDL,
+            }[version],
         }
         for table, expected in tables.items():
             columns = tuple(row[1] for row in db.execute(f"PRAGMA table_info({table})"))
@@ -153,9 +186,6 @@ class AuthorityV2FenceStore:
             stored_ddl = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
             if stored_ddl != (expected_ddl[table],):
                 raise AuthorityUnavailable("unsafe v2 fence schema migration")
-        row = db.execute("SELECT value FROM authority_v2_meta WHERE key='schema_version'").fetchone()
-        if row != (version,) or db.execute("SELECT count(*) FROM authority_v2_meta").fetchone()[0] != 1:
-            raise AuthorityUnavailable("unknown v2 fence schema version")
         index = db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='authority_v2_one_active'").fetchone()
         if index != (_INDEX_DDL,):
             raise AuthorityUnavailable("v2 exclusive index is absent or unsafe")
@@ -208,7 +238,7 @@ class AuthorityV2FenceStore:
                             or (keys is not None and type(keys) is not list)):
                         raise AuthorityUnavailable("old execution mutation identity changed")
                 connection.execute("DROP TABLE authority_v2_mutations")
-                connection.execute(_MUTATION_DDL)
+                connection.execute(_MUTATION_DDL_V3)
                 connection.executemany(
                     "INSERT INTO authority_v2_mutations VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)",
                     (row + ("execution",) for row in rows),
@@ -219,6 +249,77 @@ class AuthorityV2FenceStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+
+    @staticmethod
+    def upgrade_schema_3_to_4(connection: sqlite3.Connection, *,
+                              lock: threading.RLock | None = None) -> None:
+        """Explicit empty-ledger upgrade; old execution rows lack recoverable limits."""
+        if type(connection) is not sqlite3.Connection or connection.isolation_level is not None:
+            raise AuthorityUnavailable("schema upgrade requires service autocommit connection")
+        if (not connection.execute("PRAGMA database_list").fetchone()[2]
+                or connection.execute("PRAGMA synchronous").fetchone()[0] < 2):
+            raise AuthorityUnavailable("schema upgrade requires durable service SQLite")
+        with (lock if lock is not None else threading.RLock()):
+            if connection.in_transaction:
+                raise AuthorityUnavailable("schema upgrade requires no open transaction")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                AuthorityV2FenceStore._check_schema_version(connection, "3")
+                if connection.execute(
+                        "SELECT 1 FROM authority_v2_fences WHERE state='active' "
+                        "OR pending IS NOT NULL LIMIT 1").fetchone():
+                    raise AuthorityUnavailable("live fence blocks footprint schema upgrade")
+                if connection.execute(
+                        "SELECT 1 FROM authority_v2_mutations LIMIT 1").fetchone():
+                    raise AuthorityUnavailable(
+                        "old mutation lacks a complete recovery footprint; HOLD")
+                if connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='authority_namespaces'").fetchone():
+                    if connection.execute(
+                            "SELECT 1 FROM authority_namespaces WHERE execution_seq>0 "
+                            "LIMIT 1").fetchone():
+                        raise AuthorityUnavailable(
+                            "old execution history lacks recovery footprints; HOLD")
+                connection.execute("DROP TABLE authority_v2_mutations")
+                connection.execute(_MUTATION_DDL)
+                connection.execute(
+                    "UPDATE authority_v2_meta SET value='4' WHERE key='schema_version'")
+                AuthorityV2FenceStore._check_schema_version(connection, "4")
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def _canonical_footprint(pending: PendingMutationV2,
+                             footprint: RecoveryConstraintFootprint) -> bytes:
+        if type(footprint) is not RecoveryConstraintFootprint:
+            raise AuthorityUnavailable("complete recovery footprint required")
+        raw = footprint._json().encode("utf-8")
+        request = json.dumps({
+            "permit": to_wire(pending.permit), "mutation_id": pending.mutation_id,
+            "footprint": json.loads(raw), "phase": "prepared",
+        }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if (footprint.namespace != pending.permit.namespace
+                or footprint.effect_id != pending.permit.effect_id
+                or pending.permit.footprint_digest !=
+                    "sha256:" + hashlib.sha256(raw).hexdigest()
+                or pending.request_digest !=
+                    "sha256:" + hashlib.sha256(request).hexdigest()):
+            raise AuthorityUnavailable("recovery footprint identity or digest mismatch")
+        return raw
+
+    @staticmethod
+    def _decode_footprint(pending: PendingMutationV2,
+                          encoded: bytes) -> RecoveryConstraintFootprint:
+        try:
+            footprint = RecoveryConstraintFootprint._from_json(encoded.decode("utf-8"))
+            if encoded != AuthorityV2FenceStore._canonical_footprint(pending, footprint):
+                raise ValueError("noncanonical footprint")
+            return footprint
+        except (AttributeError, TypeError, ValueError, KeyError, UnicodeError) as exc:
+            raise AuthorityUnavailable("persisted recovery footprint is invalid") from exc
 
     @staticmethod
     def _require_no_migration(db: sqlite3.Connection) -> None:
@@ -399,18 +500,20 @@ class AuthorityV2FenceStore:
 
     def record_pending(self, pending: PendingMutationV2, *, subject: str,
                        current_anchor: RestoreAnchor,
+                       footprint: RecoveryConstraintFootprint | None = None,
                        conflict_keys: tuple[str, ...] | None = None) -> PendingMutationV2:
-        """Persist a prepare marker only; journal append/recovery is future work."""
+        """Persist the full recovery footprint with the prepare marker."""
         with self._tx() as db:
             self._check_schema(db)
             self._require_no_migration(db)
             return self.record_pending_locked(
                 db, pending, subject=subject, current_anchor=current_anchor,
-                conflict_keys=conflict_keys)
+                footprint=footprint, conflict_keys=conflict_keys)
 
     def record_pending_locked(self, db: sqlite3.Connection,
                               pending: PendingMutationV2, *, subject: str,
                               current_anchor: RestoreAnchor,
+                              footprint: RecoveryConstraintFootprint | None = None,
                               conflict_keys: tuple[str, ...] | None = None,
                               ) -> PendingMutationV2:
         """Same operation inside the service's already open Authority txn."""
@@ -420,6 +523,14 @@ class AuthorityV2FenceStore:
         permit = pending.permit
         identifier(subject, "subject")
         self._require_anchor(current_anchor, permit.namespace)
+        raw_footprint = self._canonical_footprint(pending, footprint)
+        expected_keys = constraint_keys_from_footprint(footprint)
+        if conflict_keys is not None:
+            if type(conflict_keys) is not tuple or len(conflict_keys) > 64:
+                raise AuthorityUnavailable("invalid verified conflict keys")
+            if tuple(sorted(conflict_keys)) != expected_keys:
+                raise AuthorityUnavailable("verified conflict keys differ from recovery footprint")
+        conflict_keys = expected_keys
         if conflict_keys is not None:
             if (type(conflict_keys) is not tuple or len(conflict_keys) > 64
                     or len(set(conflict_keys)) != len(conflict_keys)):
@@ -434,18 +545,20 @@ class AuthorityV2FenceStore:
         saved = self._permit(row)
         if saved != permit or saved.subject != subject or saved.pinned_anchor != current_anchor:
             raise AuthorityUnavailable("pending mutation fence identity or anchor mismatch")
-        prior = db.execute("SELECT operation_id,namespace,subject,request_digest,state,conflict_keys_json,pending,mutation_kind,deletion_evidence FROM authority_v2_mutations WHERE mutation_id=?", (pending.mutation_id,)).fetchone()
+        prior = db.execute("SELECT operation_id,namespace,subject,request_digest,state,conflict_keys_json,pending,mutation_kind,deletion_evidence,footprint FROM authority_v2_mutations WHERE mutation_id=?", (pending.mutation_id,)).fetchone()
         if prior is not None:
             if prior != (permit.operation_id, permit.namespace, subject,
                          pending.request_digest, "pending", keys_json,
-                         canonical_bytes(pending), "execution", None) or row[10] != canonical_bytes(pending):
+                         canonical_bytes(pending), "execution", None,
+                         raw_footprint) or row[10] != canonical_bytes(pending):
                 raise AuthorityUnavailable("mutation ID reused with different identity or digest")
             return pending
         if row[10] is not None:
             raise AuthorityUnavailable("fence already has another pending mutation")
-        db.execute("INSERT INTO authority_v2_mutations(mutation_id,operation_id,namespace,subject,request_digest,state,conflict_keys_json,pending,mutation_kind,deletion_evidence) VALUES(?,?,?,?,?,'pending',?,?,'execution',NULL)", (
+        db.execute("INSERT INTO authority_v2_mutations(mutation_id,operation_id,namespace,subject,request_digest,state,conflict_keys_json,pending,mutation_kind,deletion_evidence,footprint) VALUES(?,?,?,?,?,'pending',?,?,'execution',NULL,?)", (
             pending.mutation_id, permit.operation_id, permit.namespace, subject,
-            pending.request_digest, keys_json, canonical_bytes(pending)))
+            pending.request_digest, keys_json, canonical_bytes(pending),
+            raw_footprint))
         db.execute("UPDATE authority_v2_fences SET pending=? WHERE operation_id=?", (
             canonical_bytes(pending), permit.operation_id))
         return pending
@@ -453,26 +566,30 @@ class AuthorityV2FenceStore:
     @staticmethod
     def mutation_locked(db: sqlite3.Connection, mutation_id: str):
         identifier(mutation_id, "mutation_id")
-        return db.execute("SELECT operation_id,namespace,subject,request_digest,state,conflict_keys_json,pending,receipt,updated_permit,mutation_kind,deletion_evidence FROM authority_v2_mutations WHERE mutation_id=?", (mutation_id,)).fetchone()
+        return db.execute("SELECT operation_id,namespace,subject,request_digest,state,conflict_keys_json,pending,receipt,updated_permit,mutation_kind,deletion_evidence,footprint FROM authority_v2_mutations WHERE mutation_id=?", (mutation_id,)).fetchone()
 
     @staticmethod
     def _decode_mutation_row(row):
-        if row is None or len(row) != 11:
+        if row is None or len(row) != 12:
             raise AuthorityUnavailable("mutation row is absent or malformed")
         try:
             pending = decode_bytes(row[6])
             if row[9] == "execution":
                 keys = json.loads(row[5])
                 if (type(pending) is not PendingMutationV2 or row[10] is not None
-                        or (keys is not None and type(keys) is not list)):
+                        or type(keys) is not list):
                     raise ValueError("execution mutation kind or evidence mismatch")
+                footprint = AuthorityV2FenceStore._decode_footprint(pending, row[11])
+                if (row[11] != footprint._json().encode("utf-8")
+                        or tuple(keys) != constraint_keys_from_footprint(footprint)):
+                    raise ValueError("execution recovery limits differ from conflict keys")
             elif row[9] == "deletion":
                 evidence = decode_bytes(row[10])
                 if (type(pending) is not DeletionPendingV1
                         or type(evidence) is not DeletionEvidenceV1
                         or pending.evidence != evidence
                         or row[10] != canonical_bytes(evidence)
-                        or row[5] != "null"):
+                        or row[5] != "null" or row[11] is not None):
                     raise ValueError("deletion mutation kind or evidence mismatch")
             else:
                 raise ValueError("unknown mutation kind")
@@ -497,7 +614,7 @@ class AuthorityV2FenceStore:
                     or row[8] != canonical_bytes(updated)):
                 raise ValueError("mutation result identity mismatch")
             return row[9], pending, receipt, updated
-        except (TypeError, ValueError, UnicodeError) as exc:
+        except (TypeError, ValueError, UnicodeError, AuthorityUnavailable) as exc:
             raise AuthorityUnavailable("persisted mutation kind, evidence or result is invalid") from exc
 
     def get_mutation(self, mutation_id: str, *, subject: str, namespace: str):
@@ -511,6 +628,22 @@ class AuthorityV2FenceStore:
             if row is None or row[1:3] != (namespace, subject):
                 raise AuthorityUnavailable("mutation unavailable for subject or namespace")
             return self._decode_mutation_row(row)
+
+    def get_recovery_footprint(self, mutation_id: str, *, subject: str,
+                               namespace: str) -> RecoveryConstraintFootprint:
+        """Return exact Authority-persisted limits after subject and ledger checks."""
+        identifier(subject, "subject")
+        identifier(namespace, "namespace")
+        with self._tx() as db:
+            self._check_schema(db)
+            self._require_no_migration(db)
+            row = self.mutation_locked(db, mutation_id)
+            if row is None or row[1:3] != (namespace, subject):
+                raise AuthorityUnavailable("mutation unavailable for subject or namespace")
+            kind, pending, _, _ = self._decode_mutation_row(row)
+            if kind != "execution":
+                raise AuthorityUnavailable("mutation has no execution recovery footprint")
+            return self._decode_footprint(pending, row[11])
 
     def finish_mutation_locked(self, db: sqlite3.Connection,
                                receipt: MutationReceiptV2, *, subject: str,
@@ -528,8 +661,9 @@ class AuthorityV2FenceStore:
                 or mutation[:5] != (permit.operation_id, permit.namespace, subject,
                                     pending.request_digest, "pending")
                 or mutation[6] != canonical_bytes(pending)
-                or mutation[9:] != ("execution", None)):
+                or mutation[9] != "execution" or mutation[10] is not None):
             raise AuthorityUnavailable("pending mutation no longer owns fence")
+        self._decode_mutation_row(mutation)
         updated = replace(permit, revision=receipt.updated_revision,
                           pinned_anchor=receipt.after_anchor)
         db.execute("UPDATE authority_v2_fences SET revision=?,permit=?,pending=NULL WHERE operation_id=?", (

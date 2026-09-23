@@ -1,13 +1,14 @@
 """Protected B2.3c fence lifecycle; the store alone is not a trust root."""
 
 from dataclasses import replace
+import hashlib
 import json
 
 import pytest
 
 from sylanne3.authority_service.contract import AuthorityUnavailable, JournalHead
 from sylanne3.authority_service.core import AuthorityServiceCore
-from sylanne3.authority_service.v2_contract import PendingMutationV2
+from sylanne3.authority_service.v2_contract import PendingMutationV2, to_wire
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
@@ -18,6 +19,14 @@ from sylanne3.runtime_journal import RecoveryConstraintFootprint
 
 def digest(char):
     return "sha256:" + char * 64
+
+
+def prepare_request_digest(permit, item):
+    material = json.dumps({
+        "permit": to_wire(permit), "mutation_id": "mutation-a",
+        "footprint": json.loads(item._json()), "phase": "prepared",
+    }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return "sha256:" + hashlib.sha256(material).hexdigest()
 
 
 @pytest.fixture
@@ -136,12 +145,17 @@ def test_subject_credential_revision_and_pending_fail_closed(installed):
         with pytest.raises(AuthorityUnavailable):
             action(service, replace(
                 permit, pinned_anchor=replace(permit.pinned_anchor, proof="wrong")))
+    item = RecoveryConstraintFootprint(
+        namespace="ns-a", activity_id="activity-a", effect_id="effect-a",
+        conflict_keys=("resource-a",))
     pending = PendingMutationV2(
-        permit=permit, mutation_id="mutation-a", request_digest=digest("c"),
+        permit=permit, mutation_id="mutation-a",
+        request_digest=prepare_request_digest(permit, item),
         phase="prepared", before_anchor=permit.pinned_anchor,
         expected_append_id="append-a", expected_append_digest=digest("d"))
     assert fences.record_pending(
-        pending, subject="subject-a", current_anchor=permit.pinned_anchor) == pending
+        pending, subject="subject-a", current_anchor=permit.pinned_anchor,
+        footprint=item) == pending
     with pytest.raises(AuthorityUnavailable, match="pending"):
         validate(service, permit)
     with pytest.raises(AuthorityUnavailable, match="pending"):
