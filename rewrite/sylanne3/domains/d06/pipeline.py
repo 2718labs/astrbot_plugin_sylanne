@@ -19,8 +19,8 @@ from ...memory_recollection_view import prepare_affective_recollection_view
 from ...memory_reconstruction import DetailCue, RecollectionReconstruction, reconstruct_recollection_candidate
 from ...memory_types import source_key
 from ...memory_types import access_key
-from ...memory_types import episode_key, subjective_trace_key
-from ...memory_types import validate_episode, validate_subjective_trace
+from ...memory_types import episode_key, subjective_trace_key, subjective_trace_v2_key
+from ...memory_types import validate_episode, validate_subjective_trace, validate_subjective_trace_v2
 from ...runtime_contracts import NamespaceId, SourceQualification
 from ...graph_types import AtomKey, GraphSnapshot
 from ..d04 import AffectCoupling, AffectScheme
@@ -119,6 +119,7 @@ class CommittedEncodingEvidence:
     source_ref: str
     episode_ref: str
     trace_ref: str
+    encoding_baseline_ref: str | None
     then_feeling_refs: tuple[str, ...]
     detail_weights: tuple[tuple[str, float], ...]
     proof_versions: tuple[GraphVersion, ...]
@@ -141,20 +142,27 @@ class D06MemoryPipeline:
 
     def read_committed_encoding(
         self, source_ref: str, trace_id: str, *, audience: str, purpose: str,
+        trace_version: int = 1,
     ) -> CommittedEncodingEvidence:
         """Read one persisted trace tied to a source still accessible now."""
+        if trace_version not in (1, 2):
+            raise ValueError("trace_version must be 1 or 2")
         namespace = self.adapter.namespace.as_tuple
         source, source_proof = self.repository.read_source_evidence(
             source_ref, audience=audience, purpose=purpose,
         )
         if source is None:
             raise PermissionError("encoding source is unavailable")
-        trace_key = subjective_trace_key(*namespace, trace_id)
+        trace_key = (subjective_trace_key if trace_version == 1 else subjective_trace_v2_key)(
+            *namespace, trace_id,
+        )
         trace_snapshot = self.repository.store.graph_snapshot((trace_key,))
         trace = trace_snapshot.get(trace_key)
         if trace is None or not trace.valid:
             raise ValueError("committed subjective trace is unavailable")
-        validate_subjective_trace(trace.value)
+        (validate_subjective_trace if trace_version == 1 else validate_subjective_trace_v2)(
+            trace.value,
+        )
         if trace.value["trace_id"] != trace_id:
             raise ValueError("subjective trace identity differs from key")
         episode_ref = AtomKey.from_token(trace.value["episode_ref"])
@@ -169,22 +177,53 @@ class D06MemoryPipeline:
             raise ValueError("memory episode identity differs from key")
         if source_key(*namespace, source_ref).token not in episode.value["source_refs"]:
             raise ValueError("memory episode does not contain this source")
+        baseline_snapshot = None
+        baseline_key = None
+        source_proofs = [source_proof]
+        if trace_version == 2:
+            baseline_key = AtomKey.from_token(trace.value["encoding_baseline_ref"])
+            spec = self.repository.store._registry.spec(baseline_key.type_name)
+            if spec.writer_domain != "d04" or not spec.immutable:
+                raise ValueError("encoding baseline requires the registered immutable D04 type")
+            baseline_snapshot = self.repository.store.graph_snapshot((baseline_key,))
+            baseline = baseline_snapshot.get(baseline_key)
+            if baseline is None or not baseline.valid or baseline.revision == 0:
+                raise ValueError("committed D04 encoding baseline is unavailable")
+            decoded = spec.validator(baseline.value)
+            if source_key(*namespace, source_ref).token not in decoded.source_refs:
+                raise ValueError("encoding baseline does not qualify this source")
+            for baseline_source in decoded.source_refs:
+                linked = AtomKey.from_token(baseline_source)
+                record, proof = self.repository.read_source_evidence(
+                    linked.owner.subject, audience=audience, purpose=purpose,
+                )
+                if record is None or proof.epochs != source_proof.epochs:
+                    raise PermissionError("encoding baseline source is unavailable")
+                source_proofs.append(proof)
         current = self.repository.store.graph_snapshot(tuple(dict.fromkeys(
-            (*[version.key for version in source_proof.versions], trace_key, episode_ref)
+            (*[version.key for proof in source_proofs for version in proof.versions],
+             trace_key, episode_ref,
+             *((baseline_key,) if baseline_key is not None else ()))
         )))
         if (current.epochs != source_proof.epochs or
                 current.get(trace_key) != trace or current.get(episode_ref) != episode or
+                (baseline_key is not None and
+                 current.get(baseline_key) != baseline_snapshot.get(baseline_key)) or
                 any(current.get(version.key) is None or
                     current.get(version.key).revision != version.revision or
                     not current.get(version.key).valid
-                    for version in source_proof.versions)):
+                    for proof in source_proofs for version in proof.versions)):
             raise RuntimeError("encoding source, access, or trace changed during read")
         return CommittedEncodingEvidence(
             source_ref, episode_ref.token, trace_key.token,
+            trace.value.get("encoding_baseline_ref"),
             tuple(trace.value["then_feeling_refs"]),
             tuple((detail, weight) for detail, weight in trace.value["detail_weights"]),
-            tuple(dict.fromkeys((*source_proof.versions, *episode_snapshot.versions,
-                                  *trace_snapshot.versions))), source_proof.epochs[0],
+            tuple(dict.fromkeys((*(version for proof in source_proofs for version in proof.versions),
+                                  *episode_snapshot.versions,
+                                  *trace_snapshot.versions,
+                                  *(baseline_snapshot.versions if baseline_snapshot is not None else ())))),
+            source_proof.epochs[0],
         )
 
     def prepare_affective_recollection(

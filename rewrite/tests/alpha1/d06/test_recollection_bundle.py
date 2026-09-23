@@ -220,6 +220,7 @@ class RecollectionBundleTests(unittest.TestCase):
             {
                 "memory.source", "memory.access", "memory.interpretation",
                 "memory.episode.v1", "memory.subjective_trace.v1",
+                "memory.subjective_trace.v2",
                 "memory.association.v1", "d06.recollection.v1",
             },
         )
@@ -227,6 +228,10 @@ class RecollectionBundleTests(unittest.TestCase):
         for spec in specs:
             self.assertEqual(spec.writer_domain, "d06")
             registry.register(spec)
+        traces = {spec.name: spec for spec in specs
+                  if spec.name.startswith("memory.subjective_trace.v")}
+        self.assertEqual(set(traces), {"memory.subjective_trace.v1", "memory.subjective_trace.v2"})
+        self.assertEqual(len({spec.schema_hash for spec in traces.values()}), 2)
         invalid = self._key("activity", "activity-1", "d06.recollection.v1", "bad")
         with self.assertRaises(ValueError):
             registry.validate(invalid, {"recollection_id": "bad"})

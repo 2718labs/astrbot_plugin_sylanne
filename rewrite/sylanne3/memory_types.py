@@ -47,6 +47,7 @@ _TRACE_FIELDS = frozenset({
     "trace_id", "episode_ref", "perspective_ref", "then_feeling_refs",
     "interpretation_refs", "detail_weights",
 })
+_TRACE_V2_FIELDS = _TRACE_FIELDS | {"encoding_baseline_ref"}
 _ASSOCIATION_FIELDS = frozenset({
     "association_id", "source_ref", "target_ref", "kind", "weight",
     "context_tags", "basis_source_refs", "content_reality",
@@ -79,6 +80,10 @@ _EPISODE_SCHEMA_HASH = schema_hash({
 _TRACE_SCHEMA_HASH = schema_hash({
     "type": "memory.subjective_trace.v1", "version": 1,
     "fields": sorted(_TRACE_FIELDS), "immutable": True,
+})
+_TRACE_V2_SCHEMA_HASH = schema_hash({
+    "type": "memory.subjective_trace.v2", "version": 2,
+    "fields": sorted(_TRACE_V2_FIELDS), "immutable": True,
 })
 _ASSOCIATION_SCHEMA_HASH = schema_hash({
     "type": "memory.association.v1", "version": 1,
@@ -265,6 +270,10 @@ def subjective_trace_key(bot: str, persona: str, trace_id: str) -> AtomKey:
     return AtomKey(Owner("event", bot, persona, trace_id), "memory.subjective_trace.v1", "record")
 
 
+def subjective_trace_v2_key(bot: str, persona: str, trace_id: str) -> AtomKey:
+    return AtomKey(Owner("event", bot, persona, trace_id), "memory.subjective_trace.v2", "record")
+
+
 def association_key(bot: str, persona: str, source_id: str, association_id: str) -> AtomKey:
     return AtomKey(Owner("event", bot, persona, source_id), "memory.association.v1", association_id)
 
@@ -319,6 +328,17 @@ def validate_subjective_trace(value: object) -> None:
         seen.add(detail)
         if type(weight) not in (int, float) or not math.isfinite(weight) or not 0 <= weight <= 1:
             raise ValueError("detail weight must be finite and between 0 and 1")
+
+
+def validate_subjective_trace_v2(value: object) -> None:
+    data = _exact_object(value, _TRACE_V2_FIELDS, "subjective trace v2")
+    validate_subjective_trace({key: data[key] for key in _TRACE_FIELDS})
+    episode = _graph_ref(data["episode_ref"], "episode_ref")
+    baseline = _graph_ref(data["encoding_baseline_ref"], "encoding_baseline_ref")
+    if (baseline.type_name != "d04.encoding_baseline.v1" or
+            (baseline.owner.bot, baseline.owner.persona) !=
+            (episode.owner.bot, episode.owner.persona)):
+        raise ValueError("encoding_baseline_ref must name same-namespace D04 baseline")
 
 
 def validate_association(value: object) -> None:
@@ -385,6 +405,10 @@ def register_memory_types(registry: TypeRegistry) -> None:
     registry.register(TypeSpec(
         "memory.subjective_trace.v1", ("event",), "source", validate_subjective_trace,
         immutable=True, writer_domain="d06", schema_hash=_TRACE_SCHEMA_HASH,
+    ))
+    registry.register(TypeSpec(
+        "memory.subjective_trace.v2", ("event",), "source", validate_subjective_trace_v2,
+        immutable=True, writer_domain="d06", schema_hash=_TRACE_V2_SCHEMA_HASH,
     ))
     registry.register(TypeSpec(
         "memory.association.v1", ("event",), "source", validate_association,

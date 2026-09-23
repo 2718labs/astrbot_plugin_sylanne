@@ -16,7 +16,8 @@ import math
 
 from ...memory_types import (
     SourceRecord, association_key, episode_key, register_memory_types, source_key,
-    subjective_trace_key, validate_episode, validate_subjective_trace,
+    subjective_trace_key, subjective_trace_v2_key, validate_episode,
+    validate_subjective_trace, validate_subjective_trace_v2,
 )
 from ...memory_types import access_key, validate_access, validate_association
 from ...memory_retrieval import MemoryBatch
@@ -540,14 +541,16 @@ class D06DomainProvider:
             if spec.writer_domain != "d06":
                 raise ValueError("D06 proposal contains a non-D06 graph write")
             registry.validate(write.key, write.value)
+        trace_types = {"memory.subjective_trace.v1", "memory.subjective_trace.v2"}
         encoding = {write.key.type_name: write for write in proposal.typed_writes
-                    if write.key.type_name in {"memory.episode.v1", "memory.subjective_trace.v1"}}
+                    if write.key.type_name in {"memory.episode.v1", *trace_types}}
         if encoding:
+            traces = trace_types.intersection(encoding)
             if (len(proposal.typed_writes) != 2
-                    or set(encoding) != {"memory.episode.v1", "memory.subjective_trace.v1"}):
+                    or "memory.episode.v1" not in encoding or len(traces) != 1):
                 raise ValueError("C02 must include exactly one episode and one trace")
             episode = encoding["memory.episode.v1"]
-            trace = encoding["memory.subjective_trace.v1"]
+            trace = encoding[next(iter(traces))]
             source_refs = tuple(AtomKey.from_token(token) for token in episode.value["source_refs"])
             if (len(source_refs) != 1
                     or proposal.envelope.source_qualification.source_refs != (source_refs[0].token,)
@@ -558,6 +561,8 @@ class D06DomainProvider:
             required = (source, access, *(AtomKey.from_token(token) for token in (
                 episode.value["event_ref"], trace.value["perspective_ref"],
                 *trace.value["then_feeling_refs"], *trace.value["interpretation_refs"],
+                *((trace.value["encoding_baseline_ref"],)
+                  if trace.key.type_name == "memory.subjective_trace.v2" else ()),
             )))
             reads = {ref.key: ref for ref in proposal.envelope.version_guard.read_versions}
             historical = set(proposal.dependencies.historical_provenance)
@@ -895,6 +900,20 @@ class D06DomainAdapter:
         )
 
     def compile_encoding(self, envelope: CommandEnvelope, prepared: object) -> DomainProposal:
+        return self._compile_encoding(envelope, prepared, encoding_baseline_ref=None)
+
+    def compile_encoding_v2(
+        self, envelope: CommandEnvelope, prepared: object, *, encoding_baseline_ref: str,
+    ) -> DomainProposal:
+        """Compile C02 with a committed D04 baseline reference, never raw intervals."""
+        return self._compile_encoding(
+            envelope, prepared, encoding_baseline_ref=encoding_baseline_ref,
+        )
+
+    def _compile_encoding(
+        self, envelope: CommandEnvelope, prepared: object, *,
+        encoding_baseline_ref: str | None,
+    ) -> DomainProposal:
         """Compile a proof-bound C02 candidate; only GraphCoordinator may admit it."""
         from .pipeline import PreparedEncoding
 
@@ -950,7 +969,12 @@ class D06DomainAdapter:
             frozenset({"d07.current_interpretation.v1", "d07.belief_revision.v1"}),
         )
                                 for ref in proposal.trace.interpretation_refs)
-        required = (source, event, perspective, *feelings, *interpretations)
+        baseline = (graph_ref(
+            encoding_baseline_ref, "encoding_baseline_ref",
+            frozenset({"d04.encoding_baseline.v1"}),
+        ) if encoding_baseline_ref is not None else None)
+        required = (source, event, perspective, *feelings, *interpretations,
+                    *((baseline,) if baseline is not None else ()))
         context_versions: dict[AtomKey, int] = {}
         for ref, revision in proposal.read_versions:
             key = source if ref in {prepared.source_ref, source.token} else AtomKey.from_token(ref)
@@ -963,7 +987,9 @@ class D06DomainAdapter:
             raise ValueError("encoding context lacks required read_versions")
 
         episode = episode_key(*self.namespace.as_tuple, proposal.episode.episode_id)
-        trace = subjective_trace_key(*self.namespace.as_tuple, proposal.trace.trace_id)
+        trace = (subjective_trace_v2_key if baseline is not None else subjective_trace_key)(
+            *self.namespace.as_tuple, proposal.trace.trace_id,
+        )
         if (guarded.get(episode) != GraphVersion(episode, 0)
                 or guarded.get(trace) != GraphVersion(trace, 0)):
             raise ValueError("C02 requires revision-0 episode and trace proofs")
@@ -980,15 +1006,18 @@ class D06DomainAdapter:
             "interpretation_refs": [key.token for key in interpretations],
             "detail_weights": [[detail, float(weight)] for detail, weight in proposal.trace.detail_weights],
         }
+        if baseline is not None:
+            trace_value["encoding_baseline_ref"] = baseline.token
         validate_episode(episode_value)
-        validate_subjective_trace(trace_value)
+        (validate_subjective_trace_v2 if baseline is not None else validate_subjective_trace)(trace_value)
         writes = (
             GraphWrite(episode, episode_value),
             GraphWrite(trace, trace_value),
         )
         historical = tuple(dict.fromkeys((
             *prepared.proof_versions,
-            *(guarded[key] for key in (event, perspective, *feelings, *interpretations)),
+            *(guarded[key] for key in (event, perspective, *feelings, *interpretations,
+                                      *((baseline,) if baseline is not None else ()))),
         )))
         return self.wrap_runtime_proposal(
             envelope,

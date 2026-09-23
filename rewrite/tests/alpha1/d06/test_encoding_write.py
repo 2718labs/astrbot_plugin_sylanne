@@ -15,6 +15,7 @@ from sylanne3.graph_types import (
 from sylanne3.memory_repository import MemoryRepository
 from sylanne3.memory_types import (
     SourceRecord, access_key, register_memory_types, source_key,
+    subjective_trace_v2_key,
 )
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
@@ -48,6 +49,8 @@ class EncodingWriteTests(unittest.TestCase):
         self.perspective = AtomKey(Owner("scene", "bot", "persona", "scene-1"), "d03.role_binding", "current")
         self.feeling = AtomKey(Owner("persona", "bot", "persona"), "d04.feeling_state.v1", "current")
         self.interpretation = AtomKey(Owner("persona", "bot", "persona"), "d07.belief_revision.v1", "current")
+        self.baseline = AtomKey(Owner("event", "bot", "persona", "world-1"),
+                                "d04.encoding_baseline.v1", "record")
 
     def event(self, kind):
         self.sequence += 1
@@ -74,7 +77,7 @@ class EncodingWriteTests(unittest.TestCase):
         )
         return prepared
 
-    def envelope(self, prepared, *, missing=()):
+    def envelope(self, prepared, *, missing=(), baseline=False):
         episode = prepared.proposal.episode.episode_id
         trace = prepared.proposal.trace.trace_id
         from sylanne3.memory_types import episode_key, subjective_trace_key
@@ -83,7 +86,9 @@ class EncodingWriteTests(unittest.TestCase):
             *(GraphVersion(key, 1) for key in
               (self.event_ref, self.perspective, self.feeling, self.interpretation)),
             GraphVersion(episode_key("bot", "persona", episode), 0),
-            GraphVersion(subjective_trace_key("bot", "persona", trace), 0),
+            GraphVersion((subjective_trace_v2_key if baseline else subjective_trace_key)(
+                "bot", "persona", trace), 0),
+            *( (GraphVersion(self.baseline, 1),) if baseline else () ),
         ) if version.key not in missing)
         admission = self.adapter.admit_source(SourceAdmission(
             "source-1", "A reported promise", "alice", "reported", "reported",
@@ -162,6 +167,40 @@ class EncodingWriteTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "episode_ref"):
             D06DomainProvider().validate(replace(proposal, typed_writes=(episode, detached)))
+
+    def test_v2_baseline_is_typed_and_bound_to_read_and_historical_proofs(self):
+        prepared = self.seed()
+        with_baseline = replace(prepared, proposal=replace(
+            prepared.proposal,
+            read_versions=(*prepared.proposal.read_versions, (self.baseline.token, 1)),
+        ))
+        envelope = self.envelope(with_baseline, baseline=True)
+        proposal = self.adapter.compile_encoding_v2(
+            envelope, with_baseline, encoding_baseline_ref=self.baseline.token,
+        )
+        self.assertEqual(proposal.typed_writes[1].key.type_name, "memory.subjective_trace.v2")
+        self.assertEqual(proposal.typed_writes[1].value["encoding_baseline_ref"], self.baseline.token)
+        self.assertIn(GraphVersion(self.baseline, 1), proposal.dependencies.historical_provenance)
+        D06DomainProvider().validate(proposal)
+
+        without_history = replace(proposal, dependencies=replace(
+            proposal.dependencies, historical_provenance=tuple(
+                version for version in proposal.dependencies.historical_provenance
+                if version.key != self.baseline),
+        ))
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            D06DomainProvider().validate(without_history)
+        with self.assertRaisesRegex(ValueError, "committed read proof"):
+            self.adapter.compile_encoding_v2(
+                self.envelope(prepared, baseline=False), prepared,
+                encoding_baseline_ref=self.baseline.token,
+            )
+        wrong_namespace = AtomKey(Owner("event", "other", "persona", "world-1"),
+                                  "d04.encoding_baseline.v1", "record")
+        with self.assertRaisesRegex(ValueError, "same-namespace"):
+            self.adapter.compile_encoding_v2(
+                envelope, with_baseline, encoding_baseline_ref=wrong_namespace.token,
+            )
 
 
 if __name__ == "__main__":

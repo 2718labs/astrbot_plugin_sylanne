@@ -12,7 +12,8 @@ from sylanne3.memory_repository import MemoryRepository
 from sylanne3.memory_reconstruction import DetailCue
 from sylanne3.memory_retrieval import MemoryQuery
 from sylanne3.memory_types import (
-    SourceRecord, episode_key, register_memory_types, source_key, subjective_trace_key,
+    SourceRecord, episode_key, register_memory_types, source_key,
+    subjective_trace_key, subjective_trace_v2_key,
 )
 from sylanne3.runtime_contracts import NamespaceId, SourceQualification
 
@@ -133,6 +134,91 @@ class AffectivePipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "unavailable"):
             self.pipeline.read_committed_encoding(
                 "message-1", "trace-1", audience="owner", purpose="context")
+
+    def test_v2_trace_reports_baseline_reference_without_claiming_numeric_value(self):
+        episode = episode_key("bot", "persona", "episode-2")
+        trace = subjective_trace_v2_key("bot", "persona", "trace-2")
+        baseline = AtomKey(Owner("event", "bot", "persona", "event-2"),
+                           "d04.encoding_baseline.v1", "record")
+        event = AtomKey(Owner("event", "bot", "persona", "event-2"), "d03.world_event", "current")
+        perspective = AtomKey(Owner("scene", "bot", "persona", "scene-2"), "d03.role_binding", "current")
+        prior = self.store.graph_snapshot((episode, trace))
+        self.store.graph_commit(GraphCandidate(
+            Event(self.scope, "encoding-v2", 2, "encoding", {}), prior.versions, (
+                GraphWrite(episode, {"episode_id": "episode-2", "source_refs": [
+                    source_key("bot", "persona", "message-1").token], "event_ref": event.token}),
+                GraphWrite(trace, {"trace_id": "trace-2", "episode_ref": episode.token,
+                                   "perspective_ref": perspective.token,
+                                   "then_feeling_refs": [], "interpretation_refs": [],
+                                   "detail_weights": [["waiting", 0.8]],
+                                   "encoding_baseline_ref": baseline.token}),
+            ), prior.epochs,
+        ))
+        with self.assertRaisesRegex(ValueError, "baseline is unavailable"):
+            self.pipeline.read_committed_encoding(
+                "message-1", "trace-2", audience="owner", purpose="context", trace_version=2)
+
+        baseline_value = {
+            "baseline_id": "baseline-2",
+            "source_refs": [source_key("bot", "persona", "message-1").token],
+            "perspective_ref": perspective.token,
+            "then_feeling_versions": [], "interpretation_versions": [],
+            "as_known_at": None, "projection_policy_ref": "policy-unresolved",
+            "projection_policy_version": "policy-v1", "basis_version": "scheme-1",
+            "parameter_version": "parameters-1", "salience_interval": None,
+            "tone_interval": None,
+            "unknown_reasons": ["salience_interval:unknown", "tone_interval:unknown"],
+        }
+        prior = self.store.graph_snapshot((baseline,))
+        self.store.graph_commit(GraphCandidate(
+            Event(self.scope, "baseline-v2", 3, "baseline", {}), prior.versions,
+            (GraphWrite(baseline, baseline_value),), prior.epochs,
+        ))
+        evidence = self.pipeline.read_committed_encoding(
+            "message-1", "trace-2", audience="owner", purpose="context", trace_version=2)
+        self.assertEqual(evidence.encoding_baseline_ref, baseline.token)
+        self.assertIn(baseline, (version.key for version in evidence.proof_versions))
+        self.assertFalse(hasattr(evidence, "base_salience"))
+        self.repository.set_access(
+            Event(self.scope, "withdraw-v2", 4, "withdraw", {}), "message-1",
+            audiences=("owner",), purposes=("context",), status="withdrawn", recorded_at=4,
+        )
+        with self.assertRaisesRegex(PermissionError, "source is unavailable"):
+            self.pipeline.read_committed_encoding(
+                "message-1", "trace-2", audience="owner", purpose="context", trace_version=2)
+
+    def test_v2_rejects_baseline_for_another_source(self):
+        episode = episode_key("bot", "persona", "episode-3")
+        trace = subjective_trace_v2_key("bot", "persona", "trace-3")
+        baseline = AtomKey(Owner("event", "bot", "persona", "event-3"),
+                           "d04.encoding_baseline.v1", "record")
+        event = AtomKey(Owner("event", "bot", "persona", "event-3"), "d03.world_event", "current")
+        perspective = AtomKey(Owner("scene", "bot", "persona", "scene-3"), "d03.role_binding", "current")
+        wrong_source = source_key("bot", "persona", "other-message").token
+        prior = self.store.graph_snapshot((episode, trace, baseline))
+        self.store.graph_commit(GraphCandidate(
+            Event(self.scope, "encoding-other-source", 2, "encoding", {}), prior.versions, (
+                GraphWrite(episode, {"episode_id": "episode-3", "source_refs": [
+                    source_key("bot", "persona", "message-1").token], "event_ref": event.token}),
+                GraphWrite(trace, {"trace_id": "trace-3", "episode_ref": episode.token,
+                                   "perspective_ref": perspective.token,
+                                   "then_feeling_refs": [], "interpretation_refs": [],
+                                   "detail_weights": [], "encoding_baseline_ref": baseline.token}),
+                GraphWrite(baseline, {
+                    "baseline_id": "baseline-3", "source_refs": [wrong_source],
+                    "perspective_ref": perspective.token,
+                    "then_feeling_versions": [], "interpretation_versions": [],
+                    "as_known_at": None, "projection_policy_ref": "policy-unresolved",
+                    "projection_policy_version": "policy-v1", "basis_version": "scheme-1",
+                    "parameter_version": "parameters-1", "salience_interval": None,
+                    "tone_interval": None,
+                    "unknown_reasons": ["salience_interval:unknown", "tone_interval:unknown"],
+                }),
+            ), prior.epochs,
+        ))
+        with self.assertRaisesRegex(ValueError, "does not qualify this source"):
+            self.pipeline.read_committed_encoding(
+                "message-1", "trace-3", audience="owner", purpose="context", trace_version=2)
 
 
 if __name__ == "__main__":
