@@ -60,6 +60,10 @@ def _finite(value: float, field: str) -> float:
     return float(value)
 
 
+def _now_utc(value: float | None) -> float:
+    return _finite(time.time() if value is None else value, "now_utc")
+
+
 def _amounts(value: Mapping[str, int], *, nonempty: bool = True) -> dict[str, int]:
     if not isinstance(value, Mapping) or len(value) > MAX_DIMENSIONS:
         raise ValueError("resource amounts have too many dimensions")
@@ -367,7 +371,8 @@ class D02ResourceIssuer:
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
             raise IssuerAuthorityDenied("resource quote payload is invalid") from exc
 
-    def qualified_quote(self, envelope: CommandEnvelope, db) -> ResourceQuote:
+    def qualified_quote(self, envelope: CommandEnvelope, db, *,
+                        now_utc: float | None = None) -> ResourceQuote:
         if not isinstance(envelope, CommandEnvelope):
             raise TypeError("envelope must be CommandEnvelope")
         refs = envelope.version_guard.resource_lease_versions
@@ -376,7 +381,7 @@ class D02ResourceIssuer:
         quote = self._load_quote(db, refs[0].ref, refs[0].version)
         identity = envelope.identity
         namespace = envelope.authority.namespace
-        now_utc = time.time()
+        now_utc = _now_utc(now_utc)
         if (envelope.deadline_utc <= now_utc
                 or quote.valid_until_utc <= now_utc
                 or (quote.bot_id, quote.persona_id) != namespace.as_tuple
@@ -413,16 +418,18 @@ class D02ResourceIssuer:
         self._verify_outcome_authority(outcome, quote, db)
         return outcome
 
-    def authorize_schedule(self, envelope: CommandEnvelope, db) -> bool:
-        quote = self.qualified_quote(envelope, db)
+    def authorize_schedule(self, envelope: CommandEnvelope, db, *,
+                           now_utc: float | None = None) -> bool:
+        quote = self.qualified_quote(envelope, db, now_utc=now_utc)
         if quote.graph_job_ref is None:
             raise IssuerAuthorityDenied("scheduling quote lacks a graph job identity")
         return True
 
-    def authorize_resources(self, bundle: DomainBundle, db) -> bool:
+    def authorize_resources(self, bundle: DomainBundle, db, *,
+                            now_utc: float | None = None) -> bool:
         if not isinstance(bundle, DomainBundle):
             raise TypeError("bundle must be DomainBundle")
-        quote = self.qualified_quote(bundle.envelope, db)
+        quote = self.qualified_quote(bundle.envelope, db, now_utc=now_utc)
         expected_jobs = (quote.graph_job_ref,) if quote.graph_job_ref is not None else ()
         if (bundle.persistent_job_refs != expected_jobs
                 or bundle.outbox_refs != quote.outbox_refs
@@ -506,11 +513,10 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         """Return the D02 authority this budget issuer actually verifies."""
         return self._d02
 
-    def _admission_state(self, envelope: CommandEnvelope, db):
-        quote = self._d02.qualified_quote(envelope, db)
+    def _admission_state(self, envelope: CommandEnvelope, db, *, now_utc: float):
+        quote = self._d02.qualified_quote(envelope, db, now_utc=now_utc)
         grant = self._load_grant(db, envelope.parent_budget_lease_ref)
         lease = get_budget_lease(db, grant.lease_id)
-        now_utc = time.time()
         if (envelope.deadline_utc <= now_utc
                 or quote.valid_until_utc <= now_utc
                 or grant.valid_until_utc <= now_utc
@@ -537,8 +543,11 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         except (OverflowError, OSError, ValueError) as exc:
             raise IssuerAuthorityDenied("command deadline is not representable") from exc
 
-    def job_for(self, envelope: CommandEnvelope, db) -> PersistentJob:
-        quote, _, lease = self._admission_state(envelope, db)
+    def job_for(self, envelope: CommandEnvelope, db, *,
+                now_utc: float | None = None) -> PersistentJob:
+        quote, _, lease = self._admission_state(
+            envelope, db, now_utc=_now_utc(now_utc)
+        )
         if quote.graph_job_ref is None:
             raise IssuerAuthorityDenied("resource quote has no scheduled graph job")
         try:
@@ -559,21 +568,25 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
             None, None, 0, 0, {}, None,
         )
 
-    def admit_schedule(self, envelope: CommandEnvelope, db) -> ScheduleAdmission:
-        quote, _, lease = self._admission_state(envelope, db)
+    def admit_schedule(self, envelope: CommandEnvelope, db, *,
+                       now_utc: float | None = None) -> ScheduleAdmission:
+        now_utc = _now_utc(now_utc)
+        quote, _, lease = self._admission_state(envelope, db, now_utc=now_utc)
         if quote.required_worker_fence is not None:
             raise IssuerAuthorityDenied("new schedule cannot start with an existing worker fence")
         return ScheduleAdmission(
             BudgetAdmission(lease.lease_id, lease.version, dict(quote.ceiling)),
-            self.job_for(envelope, db),
+            self.job_for(envelope, db, now_utc=now_utc),
         )
 
-    def admit_runtime(self, bundle: DomainBundle, db) -> RuntimeAdmission:
+    def admit_runtime(self, bundle: DomainBundle, db, *,
+                      now_utc: float | None = None) -> RuntimeAdmission:
         if not isinstance(bundle, DomainBundle):
             raise TypeError("bundle must be DomainBundle")
         envelope = bundle.envelope
-        quote, _, lease = self._admission_state(envelope, db)
-        self._d02.authorize_resources(bundle, db)
+        now_utc = _now_utc(now_utc)
+        quote, _, lease = self._admission_state(envelope, db, now_utc=now_utc)
+        self._d02.authorize_resources(bundle, db, now_utc=now_utc)
         digest = budget_operation_digest(envelope, lease.lease_id, dict(quote.ceiling))
         reservation = db.execute(
             "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
@@ -595,7 +608,7 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
                 except Exception as exc:
                     raise IssuerAuthorityDenied("pre-reserved quote lacks its durable job") from exc
             else:
-                job = self.job_for(envelope, db)
+                job = self.job_for(envelope, db, now_utc=now_utc)
             if envelope.authority.worker_fence is not None:
                 if (job.phase != "running"
                         or job.lease_holder != envelope.authority.actor
