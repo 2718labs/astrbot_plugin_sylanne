@@ -102,6 +102,8 @@ def test_rejects_platform_mismatch(installed_dev_probe: tuple[Path, str]) -> Non
     manifest_path = root / "release-manifest.json"
     manifest = json.loads(manifest_path.read_bytes())
     manifest["platform"]["os"] = "macos" if platform.system() != "Darwin" else "windows"
+    manifest["platform"]["arch"] = "x86_64"
+    manifest["platform"]["libc"] = None
     manifest["platform"]["native_filename"] = (
         "libsylanne3_kernel.dylib" if platform.system() != "Darwin" else "sylanne3_kernel.dll"
     )
