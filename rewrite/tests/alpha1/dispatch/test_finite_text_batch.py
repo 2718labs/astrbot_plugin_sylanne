@@ -33,7 +33,7 @@ def _fixture():
     requests = tuple(DispatchRequest(
         "namespace:1", f"operation:{i}", "activity:reply", item.effect_id,
         f"attempt:{i}", hashlib.sha256(f"command:{i}".encode()).hexdigest(),
-        f"payload:{i}", hashlib.sha256(text.encode()).hexdigest(), "capability:astrbot",
+        f"payload:{i}", item.payload_digest, "capability:astrbot",
         checks, 1, 1, 1, "content:fence", 0,
         RecoveryConstraintFootprint(
             "namespace:1", "activity:reply", item.effect_id,

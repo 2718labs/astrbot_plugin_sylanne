@@ -22,13 +22,16 @@ from ..dispatch_runtime import (
     DispatchBlocked, DispatchRequest, DispatchUnavailable, HandoffStartReceipt,
     HandoffUncertain, PlatformCapabilityDescriptor, PlatformObservation,
 )
+from ..domains.d09 import ClaimUse, segment_payload_digest
 
 
 @dataclass(frozen=True)
 class ResolvedTextPayload:
-    """Trusted bytes and routing facts bound to one dispatch payload reference."""
+    """Trusted D09 text segment and routing facts bound to one payload reference."""
 
     payload: bytes
+    media_refs: tuple[str, ...]
+    claim_uses: tuple[ClaimUse, ...]
     namespace: str
     platform_id: str
     self_id: str
@@ -105,8 +108,8 @@ class AstrBotTextPlatformCapability:
                 or resolved.platform_id != self._platform_id
                 or resolved.self_id != self._self_id):
             raise DispatchBlocked("payload routing identity differs from the bound namespace")
-        if not isinstance(resolved.payload, bytes) or hashlib.sha256(resolved.payload).hexdigest() != request.payload_digest:
-            raise DispatchBlocked("dispatch payload digest differs")
+        if type(resolved.payload) is not bytes or resolved.media_refs:
+            raise DispatchBlocked("dispatch route requires text without media")
         if not isinstance(resolved.umo, str):
             raise DispatchBlocked("AstrBot session is invalid")
         try:
@@ -114,6 +117,12 @@ class AstrBotTextPlatformCapability:
             session = MessageSession.from_str(resolved.umo)
         except (UnicodeError, ValueError, TypeError, IndexError) as exc:
             raise DispatchBlocked("payload text or AstrBot session is invalid") from exc
+        try:
+            digest = segment_payload_digest(text, resolved.media_refs, resolved.claim_uses)
+        except (ValueError, TypeError) as exc:
+            raise DispatchBlocked("resolved D09 segment metadata is invalid") from exc
+        if digest != request.payload_digest:
+            raise DispatchBlocked("dispatch payload digest differs")
         if not text or session.platform_id != self._platform_id or not session.session_id:
             raise DispatchBlocked("empty text or cross-platform session")
         # The resolver's self_id binds the UMO to the installed bot identity;

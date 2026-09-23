@@ -7,8 +7,6 @@ cannot turn a prepared expression into permission to send.
 
 from __future__ import annotations
 
-import hashlib
-
 from ..dispatch_runtime import DispatchBlocked, DispatchRequest, DispatchResult, DispatchRuntime
 from ..domains.d08.execution import CommunicationIntentGrant
 from ..domains.d09 import StagingResult, segment_payload_digest
@@ -73,7 +71,7 @@ def dispatch_finite_text_batch(
             or request.segment_count != len(requests)
             or request.contact_policy_check_ref != grant.contact_policy_check_ref
             or request.proactive_contact != (grant.contact_policy_check_ref is not None)
-            or request.payload_digest != hashlib.sha256(segment.body.encode("utf-8")).hexdigest()
+            or request.payload_digest != segment.payload_digest
             or request.operation_id in seen_operations
         ):
             raise DispatchBlocked("D11 request differs from the finite segment authorization")

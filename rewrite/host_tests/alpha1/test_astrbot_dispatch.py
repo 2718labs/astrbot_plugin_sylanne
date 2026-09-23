@@ -16,6 +16,7 @@ from sylanne3.dispatch_runtime import (
     DispatchBlocked, DispatchRequest, DispatchUnavailable, HandoffStartReceipt,
     HandoffUncertain,
 )
+from sylanne3.domains.d09 import ClaimKind, ClaimUse, segment_payload_digest
 from sylanne3.host.astrbot_dispatch import AstrBotTextPlatformCapability, ResolvedTextPayload
 from sylanne3.runtime_journal import RecoveryConstraintFootprint
 
@@ -33,7 +34,7 @@ def _request() -> DispatchRequest:
     return DispatchRequest(
         namespace="namespace-1", operation_id="operation-1", activity_id="activity-1",
         effect_id="effect-1", attempt_id="attempt-1", command_digest=_digest(b"command"),
-        payload_ref="payload-1", payload_digest=_digest(PAYLOAD),
+        payload_ref="payload-1", payload_digest=segment_payload_digest(TEXT, (), ()),
         platform_capability_ref="capability-1", required_check_refs=("check-1",),
         dispatch_generation=1, activation_generation=1, worker_fence=1,
         content_fence="fence-1", cancel_epoch=0,
@@ -51,7 +52,7 @@ def _start() -> HandoffStartReceipt:
 
 class Resolver:
     def __init__(self):
-        self.result = ResolvedTextPayload(PAYLOAD, "namespace-1", "platform-1", "bot-1", UMO)
+        self.result = ResolvedTextPayload(PAYLOAD, (), (), "namespace-1", "platform-1", "bot-1", UMO)
 
     def resolve(self, payload_ref: str) -> ResolvedTextPayload:
         if payload_ref != "payload-1":
@@ -93,6 +94,16 @@ class AstrBotTextDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.resolver.result = replace(self.resolver.result, payload=b"changed")
         with self.assertRaises(DispatchBlocked):
             await asyncio.to_thread(self.capability.handoff, _request(), _start())
+        self.resolver.result = replace(self.resolver.result, payload=PAYLOAD,
+                                       claim_uses=(ClaimUse("claim:1", 0, 2, ClaimKind.RHETORIC),))
+        with self.assertRaises(DispatchBlocked):
+            await asyncio.to_thread(self.capability.handoff, _request(), _start())
+        self.resolver.result = replace(self.resolver.result, claim_uses=(), media_refs=("media:1",))
+        with self.assertRaises(DispatchBlocked):
+            await asyncio.to_thread(self.capability.handoff, _request(), _start())
+        self.resolver.result = replace(self.resolver.result, media_refs=(), claim_uses=[])  # type: ignore[arg-type]
+        with self.assertRaises(DispatchBlocked):
+            await asyncio.to_thread(self.capability.handoff, _request(), _start())
         self.resolver.result = replace(self.resolver.result, payload=PAYLOAD, umo="other:FriendMessage:123456")
         with self.assertRaises(DispatchBlocked):
             await asyncio.to_thread(self.capability.handoff, _request(), _start())
@@ -100,6 +111,15 @@ class AstrBotTextDispatchTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(DispatchBlocked):
             await asyncio.to_thread(self.capability.handoff, _request(), _start())
         self.platform.send_by_session.assert_not_awaited()
+
+    async def test_claim_qualified_text_uses_d09_digest_and_sends_original_body(self) -> None:
+        use = ClaimUse("claim:1", 0, len(TEXT), ClaimKind.RHETORIC)
+        self.resolver.result = replace(self.resolver.result, claim_uses=(use,))
+        request = replace(_request(), payload_digest=segment_payload_digest(TEXT, (), (use,)))
+        result = await asyncio.to_thread(self.capability.handoff, request, _start())
+        self.assertEqual(result.status, "handed_off")
+        _, chain = self.platform.send_by_session.await_args.args
+        self.assertEqual(chain.chain[0].text, TEXT)
 
     async def test_no_matching_platform_is_failed(self) -> None:
         self.context.platform_manager.platform_insts = []
