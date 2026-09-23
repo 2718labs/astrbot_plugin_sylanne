@@ -11,7 +11,7 @@ from __future__ import annotations
 import errno
 import ctypes
 from contextlib import ExitStack, contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import ipaddress
 import json
 import os
@@ -78,6 +78,15 @@ class _ByHandleFileInformation(ctypes.Structure):
 
 class AuthorityProfileUnavailable(RuntimeError):
     """The host cannot establish the installed-profile trust boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class AdminInstallationBundle:
+    """One verified installation snapshot for Authority client assembly."""
+
+    tls_profile: AuthorityTlsProfile
+    installation_policy: AdminInstallationPolicy
+    d11_signing_key: bytes
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -576,6 +585,68 @@ def _read_windows_signing_key(handle: int) -> bytes:
     return bytes(buffer[:count.value])
 
 
+def _checked_signing_key(raw: bytes) -> bytes:
+    if len(raw) != _D11_SIGNING_KEY_BYTES:
+        raise ValueError("administrator D11 signing key must be exactly 32 bytes")
+    return raw
+
+
+def _load_installation_bundle_from_root(
+    profile_id: str, profile_root: Path, system: str,
+) -> AdminInstallationBundle:
+    """Load a POSIX installation through one pinned directory and file set."""
+    _check_profile_id(profile_id)
+    if system not in {"Linux", "Darwin"} or os.name != "posix":
+        raise AuthorityProfileUnavailable("POSIX directory-descriptor traversal is unavailable")
+    profile_dir = Path(profile_root) / profile_id
+    with _opened_profile(profile_dir, system, signing_key=True) as files:
+        payload = _read_profile_json(files["profile.json"])
+        policy = _policy_from_payload(payload)
+        prepared = _prepared_ssl_context(files, system)
+        profile = _profile_from_payload(profile_id, profile_dir, payload, prepared)
+        signing_key = _checked_signing_key(
+            _read_fd_bounded(files[_D11_SIGNING_KEY], _D11_SIGNING_KEY_BYTES)
+        )
+    return AdminInstallationBundle(profile, policy, signing_key)
+
+
+def _load_windows_installation_bundle(
+    profile_id: str, profile_root: Path,
+) -> AdminInstallationBundle:
+    """Keep every checked Windows handle pinned until TLS and key reads finish."""
+    _check_profile_id(profile_id)
+    profile_dir = Path(profile_root) / profile_id
+    with _opened_windows_profile(profile_dir, signing_key=True) as handles:
+        _check_windows_handles(profile_dir, handles)
+        payload = _read_profile_json(profile_dir / "profile.json")
+        policy = _policy_from_payload(payload)
+        profile = _profile_from_payload(profile_id, profile_dir, payload)
+        profile = replace(profile, prepared_ssl_context=profile.ssl_context())
+        signing_key = _checked_signing_key(
+            _read_windows_signing_key(handles[profile_dir / _D11_SIGNING_KEY])
+        )
+    return AdminInstallationBundle(profile, policy, signing_key)
+
+
+def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
+    """Load schema-2 TLS, policy and D11 key from one administrator snapshot."""
+    _check_profile_id(profile_id)
+    system = platform.system()
+    if system in {"Linux", "Darwin"}:
+        if os.name != "posix":
+            raise AuthorityProfileUnavailable("POSIX directory-descriptor traversal is unavailable")
+        if os.geteuid() == 0:
+            raise AuthorityProfileUnavailable("Authority client must run without administrator identity")
+        root = (Path("/etc/sylanne/client/profiles") if system == "Linux" else
+                Path("/Library/Application Support/Sylanne/client/profiles"))
+        return _load_installation_bundle_from_root(profile_id, root, system)
+    if system == "Windows":
+        from .windows_profile_security import programdata_profile_root
+
+        return _load_windows_installation_bundle(profile_id, programdata_profile_root())
+    raise AuthorityProfileUnavailable("unsupported Authority profile platform")
+
+
 def load_admin_d11_signing_key(profile_id: str) -> bytes:
     """Read a schema-2 installation's separate 32-byte administrator D11 key."""
     _check_profile_id(profile_id)
@@ -606,7 +677,7 @@ def load_admin_d11_signing_key(profile_id: str) -> bytes:
 
 
 __all__ = (
-    "AdminInstallationPolicy", "AuthorityProfileUnavailable",
+    "AdminInstallationBundle", "AdminInstallationPolicy", "AuthorityProfileUnavailable",
     "build_admin_authority_transport", "load_admin_installation_policy",
-    "load_admin_d11_signing_key",
+    "load_admin_d11_signing_key", "load_admin_installation_bundle",
 )

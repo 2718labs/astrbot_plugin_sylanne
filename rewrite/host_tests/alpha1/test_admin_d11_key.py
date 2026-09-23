@@ -5,9 +5,14 @@ from __future__ import annotations
 import importlib
 import os
 from pathlib import Path
+import platform
+import shutil
 import stat
+import subprocess
 import sys
 import types
+from contextlib import contextmanager
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -140,6 +145,48 @@ def test_posix_signing_key_rejects_acl() -> None:
                                             system="Linux")
 
 
+@pytest.mark.skipif(os.name != "posix" or platform.system() not in {"Linux", "Darwin"}
+                    or shutil.which("openssl") is None,
+                    reason="native POSIX descriptor traversal and OpenSSL required")
+def test_posix_bundle_uses_one_pinned_profile_snapshot(tmp_path: Path) -> None:
+    profile = _profile(tmp_path)
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(profile / "client-key.pem"),
+        "-out", str(profile / "client-cert.pem"),
+        "-subj", "/CN=profile-test", "-days", "1",
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    shutil.copyfile(profile / "client-cert.pem", profile / "trust-root.pem")
+    opened_profile = authority_profile._opened_profile
+    opened_count = 0
+
+    @contextmanager
+    def swap_paths_after_open(profile_dir: Path, system: str, *, signing_key: bool = False):
+        nonlocal opened_count
+        opened_count += 1
+        with opened_profile(profile_dir, system, signing_key=signing_key) as files:
+            assert signing_key and "d11-signing.key" in files
+            (profile / "profile.json").rename(profile / "original-profile.json")
+            (profile / "profile.json").write_text("{}", encoding="utf-8")
+            (profile / "d11-signing.key").rename(profile / "original-signing.key")
+            (profile / "d11-signing.key").write_bytes(b"X" * 32)
+            yield files
+
+    with patch.object(authority_profile, "_check_opened"), \
+         patch.object(authority_profile, "_opened_profile",
+                      side_effect=swap_paths_after_open), \
+         patch.object(authority_profile, "load_admin_installation_policy",
+                      side_effect=AssertionError("reopened policy")), \
+         patch.object(authority_profile, "load_admin_d11_signing_key",
+                      side_effect=AssertionError("reopened key")):
+        bundle = authority_profile._load_installation_bundle_from_root(
+            "safe", tmp_path, platform.system())
+    assert opened_count == 1
+    assert bundle.installation_policy.installation_id == "install-a"
+    assert bundle.tls_profile.prepared_ssl_context is not None
+    assert bundle.d11_signing_key == b"K" * 32
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows pinned handles")
 def test_windows_signing_key_reads_pinned_handle(tmp_path: Path) -> None:
     profile = _profile(tmp_path)
@@ -206,6 +253,46 @@ def test_windows_loader_rejects_developer_owned_key(tmp_path: Path) -> None:
                           return_value=tmp_path):
             with pytest.raises(PermissionError, match="owner|non-admin write|private-key"):
                 authority_profile.load_admin_d11_signing_key("safe")
+
+
+@pytest.mark.skipif(os.name != "nt" or shutil.which("openssl") is None,
+                    reason="native Windows pinned handles and OpenSSL required")
+def test_windows_bundle_reads_one_pinned_installation_snapshot(tmp_path: Path) -> None:
+    profile = _profile(tmp_path)
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(profile / "client-key.pem"),
+        "-out", str(profile / "client-cert.pem"),
+        "-subj", "/CN=profile-test", "-days", "1", "-config", "NUL",
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    shutil.copyfile(profile / "client-cert.pem", profile / "trust-root.pem")
+    read_key = authority_profile._read_windows_signing_key
+
+    def read_while_pinned(handle: int) -> bytes:
+        with pytest.raises(OSError):
+            (profile / "profile.json").rename(profile / "other-profile.json")
+        with pytest.raises(OSError):
+            (profile / "d11-signing.key").open("r+b")
+        return read_key(handle)
+
+    with patch.dict(sys.modules, {"sylanne3.host": _host_package}):
+        security = importlib.import_module("sylanne3.host.windows_profile_security")
+        with patch.object(security, "programdata_profile_root", return_value=tmp_path), \
+             patch.object(authority_profile, "_check_windows_handles") as checked, \
+             patch.object(authority_profile, "_read_windows_signing_key",
+                          side_effect=read_while_pinned), \
+             patch.object(authority_profile, "load_admin_installation_policy",
+                          side_effect=AssertionError("reopened policy")), \
+             patch.object(authority_profile, "load_admin_d11_signing_key",
+                          side_effect=AssertionError("reopened key")):
+            bundle = authority_profile.load_admin_installation_bundle("safe")
+    checked.assert_called_once()
+    assert bundle.tls_profile.prepared_ssl_context is not None
+    assert bundle.tls_profile.expected_authority_id == "authority:production"
+    assert bundle.installation_policy.installation_id == "install-a"
+    assert bundle.d11_signing_key == b"K" * 32
+    with pytest.raises(FrozenInstanceError):
+        bundle.d11_signing_key = b"other"
 
 
 def test_schema1_tls_profile_does_not_require_d11_key(tmp_path: Path) -> None:
