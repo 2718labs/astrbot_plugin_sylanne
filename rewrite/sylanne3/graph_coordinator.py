@@ -39,6 +39,12 @@ from .runtime.jobs import (
     PersistentJob, acquire_job, cancel_job, create_job, get_job,
 )
 from .runtime.d11_types import reconcile_runtime_write
+from .runtime.dispatch_admission import (
+    DispatchAdmissionV1, DispatchAdmissionReceiptV1,
+    check_receipts_against_specs, install_schema as install_dispatch_admission_schema,
+    load_admission,
+)
+from .runtime.dispatch_admission_preflight import preflight_dispatch_admission
 from .runtime.dispatch_candidate import (
     DispatchCandidateRecoveryV1, qualify_dispatch_candidate_sources,
     validate_dispatch_candidate_writes,
@@ -426,7 +432,8 @@ class GraphCoordinator:
                  content_fence_v2: ContentFencePortV2 | None = None,
                  closure_verifier=None, d02_issuer=None, d11_issuer=None,
                  ingress_policy=None, ingress_clock=None,
-                 owner_principal_resolver=None):
+                 owner_principal_resolver=None,
+                 dispatch_admission_issuer=None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -454,6 +461,9 @@ class GraphCoordinator:
         self.__closure_verifier = closure_verifier
         self.__d02_issuer = d02_issuer
         self.__d11_issuer = d11_issuer
+        # Installed by trusted host composition only.  A missing issuer leaves
+        # D08/D09 candidates in HOLD; caller receipt strings are never enough.
+        self.__dispatch_admission_issuer = dispatch_admission_issuer
         # No product numeric issuer is installed in alpha1. A DTO is never a permit.
         self.__product_advance_issuer = None
         if ingress_policy is not None and not callable(ingress_policy):
@@ -4854,6 +4864,168 @@ class GraphCoordinator:
             raise AuthorityDenied("product numeric issuer did not verify evidence")
         return {**asdict(evidence), "process_id": old_feeling.value["process_id"]}
 
+    def get_dispatch_admission(self, authority: AuthorityContext, lease: object,
+                               admission_ref: str) -> DispatchAdmissionReceiptV1 | None:
+        """Read a committed D11 admission identity through the normal content fence."""
+        self._authorize(lease, authority, frozenset({"d11"}))
+        reader = lambda: load_admission(
+            self.__store._db, authority.namespace, admission_ref)
+        if (isinstance(self.__store, ProductionGraphStore)
+                and self.__content_fence_v2 is not None):
+            return self._read_v2(authority, reader)
+        with self._content_fence(authority.namespace,
+                                 authority.activation_generation, "read"):
+            with self.__store._lock:
+                self._admit_content(authority.namespace,
+                                    authority.activation_generation, "read")
+                return reader()
+
+    def _issue_dispatch_admission(self, db, bundle, snapshot, candidate,
+                                  action, schema, grant, batch, *,
+                                  graph_receipt, v2_write, now_utc):
+        """Fail closed unless a host issuer supplies and proves every current fact.
+
+        This is called from the graph receipt hook, after D11's reservation,
+        while the ordinary graph write transaction and fence remain active.
+        """
+        issuer = self.__dispatch_admission_issuer
+        if issuer is None:
+            return None
+        if (candidate.status != "source_qualified"
+                or (isinstance(self.__store, ProductionGraphStore)
+                    and v2_write is None)):
+            raise UnavailableGuard("dispatch admission requires current D06 proof and write fence")
+        for method in ("issue_dispatch_admission", "verify_required_check",
+                       "verify_command_provenance", "verify_journal_constraints",
+                       "verify_domain_context"):
+            if not callable(getattr(issuer, method, None)):
+                raise UnavailableGuard("trusted dispatch admission issuer is incomplete")
+        envelope = bundle.envelope
+        identity = envelope.identity
+        graph_incarnation = (
+            v2_write[0].requirements.graph_incarnation
+            if v2_write is not None else "nonproduction-graphstore"
+        )
+        if now_utc is None:
+            raise UnavailableGuard("trusted dispatch admission clock is unavailable")
+        if type(now_utc) not in (int, float) or not math.isfinite(now_utc):
+            raise UnavailableGuard("trusted dispatch admission clock is invalid")
+        now = float(now_utc)
+        issued = issuer.issue_dispatch_admission(
+            bundle, snapshot, candidate, db, graph_incarnation=graph_incarnation,
+            now_utc=now,
+        )
+        if (type(issued) is not tuple or len(issued) != 2
+                or type(issued[1]) is not DispatchAdmissionV1):
+            raise UnavailableGuard("trusted issuer did not produce typed dispatch admission")
+        request, admission = issued
+        from .dispatch_runtime import DispatchRequest
+
+        if type(request) is not DispatchRequest:
+            raise UnavailableGuard("trusted issuer did not produce typed dispatch command")
+        preflight = preflight_dispatch_admission(
+            schema, action, batch, request, admission.check_receipts,
+            now_utc=now, trusted_check_verifier=lambda spec, receipt: (
+                issuer.verify_required_check(spec, receipt, snapshot, db) is True),
+        )
+        if set(preflight.missing) != {
+            "d09.source_qualification", "dispatch.command_provenance",
+            "graph.current_admission",
+        }:
+            raise UnavailableGuard("dispatch admission candidate or checks are incomplete")
+        check_receipts_against_specs(admission, schema.required_checks, now)
+        admission.require_current(now)
+        if (issuer.verify_domain_context(admission, snapshot, db) is not True
+                or issuer.verify_command_provenance(request, admission, db) is not True
+                or issuer.verify_journal_constraints(request, admission) is not True):
+            raise UnavailableGuard("dispatch domain, command, or journal is unverified")
+        reads = tuple((item.key.token, item.revision) for item in snapshot.versions)
+        parts = (action.identity.activity_id, action.identity.effect_id,
+                 action.identity.attempt_id, action.identity.operation_id)
+        segment = batch["segments"][request.segment_index]
+        if (
+            admission.namespace != "/".join(envelope.authority.namespace.as_tuple)
+            or admission.graph_incarnation != graph_incarnation
+            or (admission.activity_id, admission.effect_id,
+                admission.attempt_id, admission.operation_id) != parts
+            or admission.dispatch_generation != request.dispatch_generation
+            or request.activation_generation != envelope.authority.activation_generation
+            or admission.dispatch_generation != envelope.authority.activation_generation
+            or admission.candidate_digest != candidate.digest
+            or admission.request_digest != canonical_digest(request)
+            or admission.action_intent_digest != candidate.action_digest
+            or admission.action_schema_digest != candidate.schema_digest
+            or admission.required_checks_digest != canonical_digest(schema.required_checks)
+            or admission.grant_digest != candidate.grant_digest
+            or admission.batch_digest != candidate.batch_digest
+            or admission.segment_index != request.segment_index
+            or admission.payload_digest != segment["payload_digest"]
+            or admission.scene_ref != batch["scene_ref"]
+            or admission.object_ref != action.target_ref
+            or admission.action_ref != action.action_id
+            or admission.purpose != action.purpose
+            or admission.audience != envelope.authority.audience
+            or admission.graph_reads != reads
+            or admission.query_epoch != snapshot.epochs[0].revision
+            or (admission.access_epoch, admission.delete_epoch) != (
+                envelope.version_guard.access_epoch,
+                envelope.version_guard.delete_epoch)
+            or admission.budget_parent_lease_ref != envelope.parent_budget_lease_ref
+            or admission.budget_lease_ref != envelope.parent_budget_lease_ref
+            or admission.budget_reservation_operation_id != identity.operation_id
+            or admission.budget_reservation_digest != budget_operation_digest(
+                envelope, admission.budget_lease_ref, dict(admission.budget_ceiling))
+            or not any(
+                item.parent_budget_ref == admission.budget_lease_ref
+                and item.upper_bound is not None
+                for item in request.footprint.budgets
+            )
+        ):
+            raise UnavailableGuard("dispatch admission differs from current graph candidate")
+        if (admission.action_intent_schema_version != "d08.action_intent.v1"
+                or admission.action_schema_version != "d08.action_schema.v1"
+                or admission.required_checks_schema_version != "d08.required_check_spec.v1"):
+            raise UnavailableGuard("dispatch contract schema version differs")
+        lease = get_budget_lease(db, admission.budget_lease_ref)
+        reservation = db.execute(
+            "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
+            "WHERE lease_id=? AND operation_id=?",
+            (admission.budget_lease_ref, admission.budget_reservation_operation_id),
+        ).fetchone()
+        if (lease.state != "active" or lease.version != admission.budget_version
+                or lease.currency != admission.budget_currency
+                or (lease.bot_id, lease.persona_id) != envelope.authority.namespace.as_tuple
+                or reservation is None
+                or reservation[0] != admission.budget_reservation_digest
+                or json.loads(reservation[1]) != dict(admission.budget_ceiling)
+                or reservation[2] != "reserved"):
+            raise UnavailableGuard("dispatch budget reservation changed before admission")
+        if request.proactive_contact and admission.contact_reservation_ref is None:
+            raise UnavailableGuard("proactive contact has no durable occupation")
+        graph_revision = (v2_write[0].graph_revision + 1 if v2_write is not None
+                          else graph_receipt.epoch.revision)
+        receipt = DispatchAdmissionReceiptV1(
+            admission, graph_revision, graph_receipt.epoch.revision,
+            canonical_digest({
+                "admission_digest": admission.digest,
+                "graph_revision": graph_revision,
+                "graph_epoch": graph_receipt.epoch.revision,
+            }),
+        )
+        install_dispatch_admission_schema(db)
+        db.execute(
+            "INSERT INTO graph_dispatch_admissions(bot,persona,admission_ref,"
+            "operation_id,effect_id,admission_digest,admission_json,graph_revision,"
+            "graph_epoch,receipt_digest) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            envelope.authority.namespace.as_tuple + (
+                admission.admission_ref, identity.operation_id, identity.effect_id,
+                admission.digest,
+                canonical_json(json.loads(json.dumps(asdict(admission), allow_nan=False))),
+                receipt.graph_revision, receipt.graph_epoch, receipt.receipt_digest,
+            ),
+        )
+        return receipt
+
     def commit_domain_bundle(self, bundle: DomainBundle, lease: object) -> CommitReceipt:
         if not isinstance(bundle, DomainBundle):
             raise TypeError("bundle must be DomainBundle")
@@ -5304,6 +5476,7 @@ class GraphCoordinator:
         runtime_admissions: list[RuntimeAdmission] = []
         product_advances: list[dict] = []
         qualified_dispatch_candidates = []
+        guard_snapshots: list[GraphSnapshot] = []
 
         def guard(db):
             if v2_write is not None:
@@ -5332,6 +5505,7 @@ class GraphCoordinator:
                 return
             snapshot = self._check_guard(
                 db, bundle, ingress_deadline_check=ingress_deadline_check)
+            guard_snapshots.append(snapshot)
             product_advance = self._check_product_advance(db, bundle, snapshot, writes)
             if product_advance is not None:
                 product_advances.append(product_advance)
@@ -5487,6 +5661,34 @@ class GraphCoordinator:
                         v2_write[0].graph_revision + 1
                         if v2_write is not None else None),
                 }
+                if self.__dispatch_admission_issuer is not None:
+                    from .domains.d08 import GoalExecutionProvider
+
+                    d08_types = {spec.name: spec for spec in
+                                 GoalExecutionProvider().register_types()}
+                    linked = {write.key.type_name: write.value for write in writes
+                              if write.key.type_name in {
+                                  "d08.action_intent.v1", "d08.action_schema.v1",
+                                  "d08.communication_intent_grant.v1",
+                                  "d09.verified_segment_batch.v1",
+                              }}
+                    admission_receipt = self._issue_dispatch_admission(
+                        db, bundle, guard_snapshots[0], candidate_evidence,
+                        d08_types["d08.action_intent.v1"].validator(
+                            linked["d08.action_intent.v1"]),
+                        d08_types["d08.action_schema.v1"].validator(
+                            linked["d08.action_schema.v1"]),
+                        d08_types["d08.communication_intent_grant.v1"].validator(
+                            linked["d08.communication_intent_grant.v1"]),
+                        linked["d09.verified_segment_batch.v1"],
+                        graph_receipt=graph_receipt, v2_write=v2_write,
+                        now_utc=now_utc,
+                    )
+                    data["dispatch_admission"] = {
+                        "schema": admission_receipt.admission.schema,
+                        "ref": admission_receipt.admission.admission_ref,
+                        "digest": admission_receipt.receipt_digest,
+                    }
             if product_advances:
                 data["product_advance_candidate"] = product_advances[0]
             db.execute(
