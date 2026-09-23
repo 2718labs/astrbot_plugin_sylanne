@@ -404,6 +404,22 @@ class V2FencePort:
         return self._submit(self._with_session_repair(lambda: self._owner_session_action(
             "current", namespace, authority_namespace, request, token)))
 
+    def describe_owner_session(self, *, namespace: NamespaceId,
+                               authority_namespace: str,
+                               token: str) -> OwnerSessionLoginRequestV1:
+        return self._submit(self._with_session_repair(lambda: self._describe_owner_session(
+            namespace, authority_namespace, token)))
+
+    async def _describe_owner_session(self, namespace: NamespaceId,
+                                      authority_namespace: str,
+                                      token: str) -> OwnerSessionLoginRequestV1:
+        await self._mapped(namespace, authority_namespace)
+        handshake, _ = self._identity()
+        described = await self._transport.v2_describe_owner_session(
+            self._request, handshake, namespace=authority_namespace, token=token)
+        self._owner_session_identity(namespace, authority_namespace, described)
+        return described
+
     def logout_owner_session(self, *, namespace: NamespaceId,
                              authority_namespace: str,
                              request: OwnerSessionLoginRequestV1, token: str) -> None:

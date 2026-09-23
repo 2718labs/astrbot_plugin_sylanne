@@ -1082,6 +1082,27 @@ class MtlsAuthorityTransport:
             request, handshake, "current_owner_session_v1",
             namespace=namespace, login_request=login_request, token=token)
 
+    async def v2_describe_owner_session(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, token: str,
+    ) -> OwnerSessionLoginRequestV1:
+        if type(token) is not str or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None:
+            raise ValueError("Owner session token is invalid")
+        response = await self._content_rpc(
+            request, handshake, "describe_owner_session_v1",
+            {"namespace": namespace, "token": token}, protocol=AUTHORITY_V2_PROTOCOL)
+        raw = self._owner_session_response(response, handshake, "request")
+        try:
+            described = session_from_wire(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Authority Owner session description is invalid") from exc
+        if (type(described) is not OwnerSessionLoginRequestV1
+                or session_to_wire(described) != raw
+                or described.authority_id != handshake.installation_authority_id
+                or described.authority_namespace != namespace):
+            raise RuntimeError("Authority Owner session description binding differs")
+        return described
+
     async def v2_logout_owner_session(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, login_request: OwnerSessionLoginRequestV1, token: str,

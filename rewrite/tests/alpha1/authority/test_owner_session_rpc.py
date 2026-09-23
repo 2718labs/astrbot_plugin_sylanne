@@ -125,6 +125,13 @@ def test_owner_session_mtls_port_round_trip_and_missing_store_hold(tmp_path):
         token = port.accept_owner_session(namespace=ROLE, authority_namespace=AUTH_NS,
                                           challenge=challenge,
                                           signature=key.sign(challenge.signed_bytes()))
+        assert port.describe_owner_session(namespace=ROLE, authority_namespace=AUTH_NS,
+                                           token=token) == login_request
+        with pytest.raises(RuntimeError):
+            server._v2_command(
+                "describe_owner_session_v1", peer, "installed", "c" * 64,
+                {"namespace": "unmapped-namespace", "token": token},
+            )
         assert port.current_owner_session(namespace=ROLE, authority_namespace=AUTH_NS,
                                           request=login_request, token=token)
         port.revoke_all_owner_sessions(namespace=ROLE, authority_namespace=AUTH_NS,
@@ -132,6 +139,15 @@ def test_owner_session_mtls_port_round_trip_and_missing_store_hold(tmp_path):
         with pytest.raises(RuntimeError):
             port.current_owner_session(namespace=ROLE, authority_namespace=AUTH_NS,
                                        request=login_request, token=token)
+        with pytest.raises(RuntimeError):
+            port.describe_owner_session(namespace=ROLE, authority_namespace=AUTH_NS,
+                                        token=token)
+        with pytest.raises(RuntimeError):
+            server._v2_command(
+                "describe_owner_session_v1", peer, "installed", "c" * 64,
+                {"namespace": AUTH_NS, "token": token,
+                 "request": session_to_wire(login_request)},
+            )
         second_challenge = port.begin_owner_session(
             namespace=ROLE, authority_namespace=AUTH_NS, request=login_request)
         second = port.accept_owner_session(

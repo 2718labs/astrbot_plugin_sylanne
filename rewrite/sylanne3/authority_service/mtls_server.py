@@ -505,6 +505,20 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method == "describe_owner_session_v1":
+                if set(command) != {"namespace", "token"}:
+                    raise AuthorityUnavailable("Owner session description fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                sessions = self._v2_owner_sessions
+                if installed is None or sessions is None:
+                    raise AuthorityUnavailable("Owner session service is unavailable")
+                request = sessions.describe_current(
+                    transport_credential=credential, token=command["token"],
+                    namespace=namespace, installation_id=installed.installation_id)
+                return {"request": session_to_wire(request)}
             if method in {"begin_owner_session_v1", "accept_owner_session_v1",
                           "current_owner_session_v1", "logout_owner_session_v1",
                           "revoke_all_owner_sessions_v1", "revoke_owner_session_key_v1"}:

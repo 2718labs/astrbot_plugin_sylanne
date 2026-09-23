@@ -129,6 +129,13 @@ def test_logout_revoke_all_and_key_revoke_apply_in_same_transaction(tmp_path):
             sessions.require_current(transport_credential="installed-peer", token=first,
                                      request=request)
         _, second = login(sessions, key, request)
+        assert sessions.describe_current(
+            transport_credential="installed-peer", namespace=NAMESPACE,
+            installation_id="installation-a", token=second) == request
+        with pytest.raises(AuthorityUnavailable):
+            sessions.describe_current(
+                transport_credential="installed-peer", namespace=NAMESPACE,
+                installation_id="other-installation", token=second)
         pending = sessions.begin_login(transport_credential="installed-peer", request=request)
         sessions.revoke_all(transport_credential="installed-peer", token=second,
                             request=request)
@@ -138,6 +145,10 @@ def test_logout_revoke_all_and_key_revoke_apply_in_same_transaction(tmp_path):
         with pytest.raises(AuthorityUnavailable):
             with core._tx() as db:
                 sessions.require_current_in_tx(db, token=second, request=request)
+        with pytest.raises(AuthorityUnavailable):
+            sessions.describe_current(
+                transport_credential="installed-peer", namespace=NAMESPACE,
+                installation_id="installation-a", token=second)
         _, third = login(sessions, key, request)
         sessions.revoke_credential(transport_credential="installed-peer", token=third,
                                    request=request)

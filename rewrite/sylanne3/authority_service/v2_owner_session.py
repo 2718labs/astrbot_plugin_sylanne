@@ -363,6 +363,43 @@ class AuthorityV2OwnerSessionStore:
         with self._core._tx() as db:
             return self.require_current_in_tx(db, token=token, request=request)
 
+    def describe_current_in_tx(self, db: sqlite3.Connection, *, token: str,
+                               namespace: str,
+                               installation_id: str) -> OwnerSessionLoginRequestV1:
+        """Resolve the persisted claim and recheck it in this Authority transaction."""
+        identifier(namespace, "namespace")
+        identifier(installation_id, "installation_id")
+        if db is not self._core._db or not db.in_transaction:
+            raise AuthorityUnavailable("Owner session description needs current Authority transaction")
+        row = db.execute(
+            "SELECT request_json FROM authority_owner_sessions_v1 WHERE verifier=?",
+            (_verifier(token),),
+        ).fetchone()
+        if row is None:
+            raise AuthorityUnavailable("Owner session is not current")
+        try:
+            stored = json.loads(row[0])
+            if type(stored) is not dict:
+                raise ValueError("stored request is not an object")
+            request = from_wire({"kind": "owner_session_login_request_v1", **stored})
+        except (TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise AuthorityUnavailable("stored Owner session request differs") from exc
+        if (type(request) is not OwnerSessionLoginRequestV1
+                or _canonical(request) != row[0]
+                or request.authority_namespace != namespace
+                or request.installation_id != installation_id):
+            raise AuthorityUnavailable("Owner session description identity differs")
+        return self.require_current_in_tx(db, token=token, request=request)
+
+    def describe_current(self, *, transport_credential: object, token: str,
+                         namespace: str,
+                         installation_id: str) -> OwnerSessionLoginRequestV1:
+        self._core._require(transport_credential, "owner_session", namespace)
+        with self._core._tx() as db:
+            return self.describe_current_in_tx(
+                db, token=token, namespace=namespace,
+                installation_id=installation_id)
+
     def logout(self, *, transport_credential: object, token: str,
                request: OwnerSessionLoginRequestV1) -> None:
         self._core._require(transport_credential, "owner_session", request.authority_namespace)
