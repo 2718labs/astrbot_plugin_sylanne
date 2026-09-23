@@ -7,7 +7,9 @@ import time
 
 import pytest
 
-from sylanne3.contracts import StaleRead
+from sylanne3.contracts import Event, Scope, StaleRead
+from sylanne3.domains.d03 import ContextProvider, RoleBinding
+from sylanne3.domains.d05 import BoundaryRule, RelationshipProvider
 from sylanne3.dispatch_runtime import DispatchRequest
 from sylanne3.domains.d06 import D06DomainProvider, SourceGrantRead
 from sylanne3.domains.d08 import ActionSchema, ActionSchemaRecord
@@ -19,8 +21,11 @@ from sylanne3.graph_coordinator import (
 )
 from sylanne3.authority_service.v2_clock import IngressClockSampleV2
 from sylanne3.host.v2_fence_port import VerifiedIngressClockV2
-from sylanne3.graph_types import AtomKey, GraphWrite, Owner
-from sylanne3.memory_types import access_key, source_key
+from sylanne3.graph_store import GraphStore
+from sylanne3.graph_types import AtomKey, GraphCandidate, GraphVersion, GraphWrite, Owner
+from sylanne3.memory_repository import MemoryRepository
+from sylanne3.memory_types import SourceRecord, access_key, source_key
+from sylanne3.runtime.budget import BudgetLease, create_budget_lease
 from sylanne3.runtime.budget import get_budget_lease
 from sylanne3.runtime.d11_types import (
     D11RuntimeProvider, D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
@@ -37,10 +42,12 @@ from sylanne3.runtime_contracts import (
 from sylanne3.runtime_journal import BudgetConstraint, RecoveryConstraintFootprint
 
 from test_dispatch_admission_preflight import _candidates
-from test_dispatch_candidate_graph import _Budget, _Resources, _bundle, _json, _ready
+from test_dispatch_candidate_graph import (
+    _Budget, _Resources, _bundle, _json, _ready, _registry,
+)
 
 
-def _qualified_bundle(coordinator, authority, lease, providers):
+def _qualified_bundle(coordinator, authority, lease, providers, *, projection_keys=()):
     """Use actual D06 source/access graph versions for the source check."""
     source = source_key("bot", "persona", "source-1")
     access = access_key("bot", "persona", "source-1")
@@ -95,7 +102,8 @@ def _qualified_bundle(coordinator, authority, lease, providers):
         value if isinstance(value, dict) else _json(asdict(value)),
     ) for kind, name, value in values)
     snapshot = coordinator.read_snapshot(
-        authority, lease, (source, access) + tuple(write.key for write in writes))
+        authority, lease, (source, access) + tuple(projection_keys)
+        + tuple(write.key for write in writes))
     guard = VersionGuard(
         snapshot.versions,
         (QueryEpoch(authority.namespace, "all", snapshot.epochs[0].revision),),
@@ -351,8 +359,58 @@ def test_committed_candidate_does_not_create_admission_without_issuer(tmp_path):
     store.close()
 
 
-def _issuer_case(tmp_path):
-    store, _old, _authority, _lease, providers, _registry = _ready(tmp_path)
+def _issuer_case(tmp_path, *, with_projection=False):
+    if with_projection:
+        registry, providers = _registry()
+        for provider in (ContextProvider(), RelationshipProvider()):
+            for spec in provider.type_specs():
+                registry.register(spec)
+        store = GraphStore(tmp_path / "candidate.db", registry)
+        seed = object()
+        seed_coordinator = GraphCoordinator(
+            store, seed, d02_issuer=_Resources(), d11_issuer=_Budget())
+        namespace = NamespaceId("bot", "persona")
+        for kind, version in (("scheme", "scheme-1"), ("operator", "operator-1"),
+                              ("policy", "policy-1"), ("activation", 1)):
+            seed_coordinator.set_guard_version(seed, namespace, kind, "current", version)
+        with store._lock:
+            create_budget_lease(store._db, BudgetLease(
+                "parent", None, "bot", "persona", "USD", {"cpu_ms": 10},
+                {}, {}, {}, 1, "active"), "install-parent", "0" * 64)
+        MemoryRepository(store, "bot", "persona").ingest(
+            Event(Scope("bot", "persona", "session"), "source-ingress", 1.0, "ingress", {}),
+            SourceRecord("source-1", "Hello", "alice", "observed", "confirmed",
+                         1.0, 2.0, "family-1", ("entity:user",), ("expression",)),
+        )
+        source_ref = source_key("bot", "persona", "source-1").token
+        role = RoleBinding(
+            "binding:test", "persona:persona", "role:test", "entity:user", None,
+            "scene:one", "scene:one", "private", ("norm:test",), 0.0, None,
+            1, (source_ref,), 1, "active",
+        )
+        boundary = BoundaryRule(
+            "boundary:test", "persona:persona", "entity:user", "message",
+            "entity:user", "scene:one", "allow", "runtime_policy", (source_ref,),
+            (), (), 0.0, None, 1, "owner", (), "active",
+        )
+        writes = (
+            GraphWrite(AtomKey(Owner("scene", "bot", "persona", "scene:one"),
+                               "d03.role_binding", role.role_binding_id), _json(asdict(role))),
+            GraphWrite(AtomKey(Owner("relation", "bot", "persona", "entity:user"),
+                               "d05.boundary_rule", boundary.rule_id), _json(asdict(boundary))),
+        )
+        epoch = GraphStore.graph_epoch(
+            store, "bot", "persona",
+            _capability=seed_coordinator._GraphCoordinator__graph_capability)
+        GraphStore.graph_commit(
+            store, GraphCandidate(
+                Event(Scope("bot", "persona", "test-domain-seed"),
+                      "seed-current-projections", 2.0, "domain_seed", {}),
+                tuple(GraphVersion(write.key, 0) for write in writes), writes, (epoch,),
+            ), _capability=seed_coordinator._GraphCoordinator__graph_capability,
+        )
+    else:
+        store, _old, _authority, _lease, providers, _registry_unused = _ready(tmp_path)
     bootstrap = object()
     issuer = _TestAdmissionIssuer()
     budget = _ClockBudget()
@@ -367,6 +425,13 @@ def _issuer_case(tmp_path):
             "d06.contract.v1" if domain == "d06" else f"{domain}.proposal.v1",
             provider.descriptor.request_schema_hash,
         )
+    if with_projection:
+        for domain, provider in (("d03", ContextProvider()),
+                                 ("d05", RelationshipProvider())):
+            coordinator.register_provider(
+                bootstrap, domain, provider, f"{domain}.proposal.v1",
+                provider.descriptor.request_schema_hash,
+            )
     coordinator.register_provider(
         bootstrap, "d11", D11RuntimeProvider(),
         D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
@@ -374,21 +439,28 @@ def _issuer_case(tmp_path):
     namespace = NamespaceId("bot", "persona")
     lease, capability = coordinator.grant(
         bootstrap, actor="host", issuer_domain="d06", namespace=namespace,
-        domains=("d06", "d08", "d09", "d11"), activation_generation=1,
+        domains=("d06", "d08", "d09", "d11", "d03", "d05")
+        if with_projection else ("d06", "d08", "d09", "d11"),
+        activation_generation=1,
     )
     from sylanne3.runtime_contracts import AuthorityContext
 
     authority = AuthorityContext(
-        "host", "d06", capability, namespace, ("event", "activity"),
+        "host", "d06", capability, namespace,
+        ("event", "activity", "scene", "relation") if with_projection
+        else ("event", "activity"),
         "expression", ("entity:user",), "policy-1", 1,
     )
-    bundle, values = _qualified_bundle(coordinator, authority, lease, providers)
+    bundle, values = _qualified_bundle(
+        coordinator, authority, lease, providers,
+        projection_keys=tuple(write.key for write in writes) if with_projection else (),
+    )
     issuer.bind(values)
     return store, coordinator, authority, lease, bundle, issuer
 
 
-def test_same_graph_transaction_persists_test_issuer_admission(tmp_path):
-    """The graph hook advances a paired reading during the same transaction."""
+def test_issuer_without_current_d03_scene_binding_cannot_persist_admission(tmp_path):
+    """A test issuer cannot turn an unbound scene into dispatch admission."""
     store, coordinator, authority, lease, bundle, issuer = _issuer_case(tmp_path)
     namespace = authority.namespace
     monotonic = time.monotonic()
@@ -397,10 +469,10 @@ def test_same_graph_transaction_persists_test_issuer_admission(tmp_path):
                              time.time(), monotonic, "epoch:test", 0.1),
         monotonic - 0.01, monotonic, time.time() + 0.2,
     )
-    committed = coordinator._commit_domain_bundle_fenced(
-        bundle, lease, dispatch_clock_reading=reading,
-    )
-    assert committed.status == "committed"
+    with pytest.raises(UnavailableGuard, match="current D03 scene binding"):
+        coordinator._commit_domain_bundle_fenced(
+            bundle, lease, dispatch_clock_reading=reading,
+        )
     assert issuer.last_now_utc >= reading.utc_upper_bound_seconds
     assert issuer.budget.last_now_utc >= reading.utc_upper_bound_seconds
     assert issuer.last_now_utc >= issuer.budget.last_now_utc
@@ -409,17 +481,44 @@ def test_same_graph_transaction_persists_test_issuer_admission(tmp_path):
             "SELECT receipt_json FROM graph_bundle_operations WHERE operation_id=?",
             (bundle.envelope.identity.operation_id,),
         ).fetchone()
-        assert row is not None
-        assert json.loads(row[0])["dispatch_admission"]["ref"] == "admission:one"
-        stored = load_admission(store._db, namespace, "admission:one")
-    assert stored is not None
-    assert stored.admission == issuer.admission
-    assert stored.graph_epoch == committed.invalidated_epochs[0].revision
-    assert coordinator.commit_domain_bundle(bundle, lease).status == "duplicate"
+        assert row is None
+        assert load_admission(store._db, namespace, "admission:one") is None
     store.close()
     reopened = sqlite3.connect(tmp_path / "candidate.db")
     try:
-        assert load_admission(reopened, namespace, "admission:one") == stored
+        assert load_admission(reopened, namespace, "admission:one") is None
+    finally:
+        reopened.close()
+
+
+def test_current_d03_d05_projection_preserves_admission_transaction_test(tmp_path):
+    store, coordinator, authority, lease, bundle, issuer = _issuer_case(
+        tmp_path, with_projection=True)
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic - 0.01, monotonic, time.time() + 0.2,
+    )
+    committed = coordinator._commit_domain_bundle_fenced(
+        bundle, lease, dispatch_clock_reading=reading)
+    assert committed.status == "committed"
+    assert issuer.last_now_utc >= reading.utc_upper_bound_seconds
+    assert issuer.budget.last_now_utc >= reading.utc_upper_bound_seconds
+    with store._lock:
+        row = store._db.execute(
+            "SELECT receipt_json FROM graph_bundle_operations WHERE operation_id=?",
+            (bundle.envelope.identity.operation_id,),
+        ).fetchone()
+        assert row is not None
+        assert json.loads(row[0])["dispatch_admission"]["ref"] == "admission:one"
+        stored = load_admission(store._db, authority.namespace, "admission:one")
+    assert stored is not None and stored.admission == issuer.admission
+    assert stored.graph_epoch == committed.invalidated_epochs[0].revision
+    store.close()
+    reopened = sqlite3.connect(tmp_path / "candidate.db")
+    try:
+        assert load_admission(reopened, authority.namespace, "admission:one") == stored
     finally:
         reopened.close()
 

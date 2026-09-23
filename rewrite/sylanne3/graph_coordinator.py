@@ -4938,7 +4938,7 @@ class GraphCoordinator:
 
     def _issue_dispatch_admission(self, db, bundle, snapshot, candidate,
                                   action, schema, grant, batch, *,
-                                  graph_receipt, v2_write, now_utc,
+                                  graph_receipt, v2_write, now_utc, projection,
                                   clock_reading=None):
         """Fail closed unless a host issuer supplies and proves every current fact.
 
@@ -4952,6 +4952,8 @@ class GraphCoordinator:
                 or (isinstance(self.__store, ProductionGraphStore)
                     and v2_write is None)):
             raise UnavailableGuard("dispatch admission requires current D06 proof and write fence")
+        if projection is None:
+            raise UnavailableGuard("dispatch admission lacks complete D03/D05 graph projection")
         for method in ("issue_dispatch_admission", "verify_required_check",
                        "verify_command_provenance", "verify_journal_constraints",
                        "verify_domain_context"):
@@ -4976,6 +4978,25 @@ class GraphCoordinator:
                 or type(issued[1]) is not DispatchAdmissionV1):
             raise UnavailableGuard("trusted issuer did not produce typed dispatch admission")
         request, admission = issued
+        from .domains.d03 import RoleBinding
+
+        current_bindings = []
+        for atom in projection.role_bindings:
+            value = atom.value
+            binding = RoleBinding(**{
+                **value, "norm_refs": tuple(value["norm_refs"]),
+                "source_refs": tuple(value["source_refs"]),
+            })
+            if (atom.key.name == binding.role_binding_id
+                    and atom.revision == binding.binding_version
+                    and binding.status == "active"
+                    and binding.scene_ref == batch["scene_ref"]
+                    and binding.effective_from <= now
+                    and (binding.effective_until is None or now <= binding.effective_until)):
+                current_bindings.append(binding)
+        if not any(binding.role_binding_id == admission.binding_ref
+                   for binding in current_bindings):
+            raise UnavailableGuard("dispatch admission lacks a current D03 scene binding")
         if isinstance(self.__store, ProductionGraphStore):
             policy = self.__dispatch_clock_policy
             if (clock_reading is None or policy is None
@@ -5555,6 +5576,7 @@ class GraphCoordinator:
         product_advances: list[dict] = []
         qualified_dispatch_candidates = []
         guard_snapshots: list[GraphSnapshot] = []
+        dispatch_projections = []
 
         def guard(db):
             if v2_write is not None:
@@ -5583,6 +5605,20 @@ class GraphCoordinator:
                 return
             snapshot = self._check_guard(
                 db, bundle, ingress_deadline_check=ingress_deadline_check)
+            if dispatch_candidate is not None and self.__dispatch_admission_issuer is not None:
+                from .runtime.dispatch_current_projection import (
+                    read_current_dispatch_projection,
+                )
+
+                if len(envelope.version_guard.query_epochs) != 1:
+                    raise UnavailableGuard("dispatch admission needs one full graph query")
+                try:
+                    dispatch_projections.append(read_current_dispatch_projection(
+                        db, namespace, snapshot, envelope.version_guard.query_epochs[0],
+                    ))
+                except ValueError as exc:
+                    raise UnavailableGuard(
+                        "dispatch D03/D05 graph projection is incomplete") from exc
             guard_snapshots.append(snapshot)
             product_advance = self._check_product_advance(db, bundle, snapshot, writes)
             if product_advance is not None:
@@ -5762,6 +5798,7 @@ class GraphCoordinator:
                             linked["d08.communication_intent_grant.v1"]),
                         linked["d09.verified_segment_batch.v1"],
                         graph_receipt=graph_receipt, v2_write=v2_write,
+                        projection=dispatch_projections[0] if dispatch_projections else None,
                         now_utc=(
                             self._dispatch_clock_upper(dispatch_clock_reading)
                             if dispatch_clock_reading is not None else now_utc),
