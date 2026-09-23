@@ -12,6 +12,9 @@ from sylanne3.authority_service.v2_execution_bridge import AuthorityV2ExecutionB
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
+from sylanne3.authority_service.v2_contract import (
+    ExecutionBindingV1, canonical_bytes, decode_bytes,
+)
 from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime_journal import (
     BudgetConstraint, QuotaOccupancy, RecoveryConstraintFootprint,
@@ -95,6 +98,103 @@ def begin(core, fences, item):
 def authority_anchor(core):
     with core._tx() as db:
         return core._anchor(db, "ns-a", core._row(db, "ns-a"))
+
+
+def execution_binding(permit, item, **changes):
+    fields = dict(
+        permit=permit, namespace="ns-a", activity_id=item.activity_id,
+        effect_id=item.effect_id, attempt_id="attempt-a",
+        operation_id=permit.operation_id, dispatch_generation=1,
+        activation_generation=permit.generation, admission_ref="admission-a",
+        verified_check_refs=("check-a",), payload_digest="sha256:" + "b" * 64,
+        platform_capability_ref="capability-a", adapter_ref="adapter-a",
+        account_ref="account-a", destination_ref="destination-a",
+        worker_fence=1, content_fence="content-a", cancel_epoch=0,
+        footprint=item,
+    )
+    fields.update(changes)
+    return ExecutionBindingV1(**fields)
+
+
+def test_claim_advances_same_operation_and_replays_after_restart(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(tmp_path)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, prepared_permit = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    binding = execution_binding(permit, item)
+    claimed, claimed_permit = bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding)
+    assert claimed.pending.phase == "claimed"
+    assert claimed.pending.prepared_receipt == prepared
+    assert claimed.pending.binding == binding
+    assert claimed.pending.permit == prepared_permit
+    assert claimed.durable_state == "committed"
+    assert claimed_permit.operation_id == permit.operation_id
+    assert claimed_permit.revision == 2
+    assert claimed_permit.pinned_anchor == authority_anchor(core)
+    assert journal.verified_head().seq == 2
+    assert core._db.execute(
+        "SELECT state,execution_seq FROM authority_effects WHERE namespace=? AND effect_id=?",
+        ("ns-a", "effect-a")).fetchone() == ("unresolved", 2)
+    core.close()
+    journal.close()
+
+    core, fences, journal, bridge, _ = setup_service(tmp_path, create=False)
+    assert bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding) == (claimed, claimed_permit)
+    with pytest.raises(AuthorityUnavailable):
+        bridge.execution_claim(
+            credential="ok", subject="subject-a", prepared_receipt=prepared,
+            binding=execution_binding(permit, item, attempt_id="attempt-b"))
+    with pytest.raises(AuthorityUnavailable):
+        bridge.execution_claim(
+            credential="ok", subject="subject-b", prepared_receipt=prepared,
+            binding=binding)
+    assert journal.verified_head().seq == 2
+    core.close()
+    journal.close()
+
+
+def test_claim_pending_recovers_one_append_without_platform_handoff(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(tmp_path)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    binding = execution_binding(permit, item)
+    pending = bridge.prepare_claim_pending(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding)
+    assert decode_bytes(canonical_bytes(pending)) == pending
+    assert journal.verified_head().seq == 1
+    assert fences.get_operation("operation-a", subject="subject-a", namespace="ns-a")[2] == pending
+    with pytest.raises(AuthorityUnavailable, match="claimed pending requires"):
+        bridge.reconcile_mutation(
+            credential="ok", subject="subject-a", pending=pending,
+            allow_cancel=True)
+    with pytest.raises(AuthorityUnavailable):
+        bridge.prepare_claim_pending(
+            credential="ok", subject="subject-a", prepared_receipt=prepared,
+            binding=execution_binding(permit, item, attempt_id="attempt-b"))
+    assert journal.verified_head().seq == 1
+    bridge.append_pending(pending, credential="ok", subject="subject-a")
+    core.close()
+    journal.close()
+
+    core, fences, journal, bridge, _ = setup_service(tmp_path, create=False)
+    claimed, updated = bridge.reconcile_mutation(
+        credential="ok", subject="subject-a", pending=pending)
+    assert claimed.durable_state == "committed"
+    assert updated.revision == 2 and journal.verified_head().seq == 2
+    assert bridge.reconcile_mutation(
+        credential="ok", subject="subject-a", pending=pending) == (claimed, updated)
+    core.close()
+    journal.close()
 
 
 def test_prepared_commit_updates_head_effect_fence_and_receipt(tmp_path):

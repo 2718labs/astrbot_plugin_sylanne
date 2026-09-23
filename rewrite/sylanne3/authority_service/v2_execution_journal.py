@@ -182,6 +182,8 @@ class AuthorityV2ExecutionJournal:
     def _require_pending(self, pending: PendingMutationV2) -> None:
         if type(pending) is not PendingMutationV2:
             raise AuthorityUnavailable("PendingMutationV2 required")
+        if pending.phase not in ("prepared", "claimed"):
+            raise AuthorityUnavailable("execution journal phase is not implemented")
         if (pending.permit.namespace != self.namespace
                 or pending.expected_execution_journal_id != self.journal_id):
             raise AuthorityUnavailable("pending namespace or journal mismatch")
@@ -205,6 +207,7 @@ class AuthorityV2ExecutionJournal:
             except (TypeError, ValueError, UnicodeError) as exc:
                 raise AuthorityUnavailable("malformed persisted execution pending") from exc
             if (type(pending) is not PendingMutationV2
+                    or pending.phase not in ("prepared", "claimed")
                     or encoded != canonical_bytes(pending)
                     or seq != expected_seq or prev != previous
                     or (mutation_id, request_digest, append_id) != (

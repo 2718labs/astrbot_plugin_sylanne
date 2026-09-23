@@ -3,8 +3,8 @@
 The host service supplies an authenticated subject; Core's authorizer and D08
 verifier run before locks. The mTLS adapter exposes only prepared dispatch;
 this is not a platform send or a production RuntimeDependency.
-Only the `prepared` phase is implemented. A locked observation can report its
-durable state, but cannot infer platform delivery or confirmation. The persistent v2-only Core seal
+The `prepared` and `claimed` phases are service-owned journal transitions.
+Neither proves platform delivery or confirmation. The persistent v2-only Core seal
 gates legacy entrances; deletion and execution writers are frozen in a fixed
 order before each append or final Authority commit.
 """
@@ -20,7 +20,7 @@ from .contract import AuthorityUnavailable, identifier
 from .core import AuthorityServiceCore
 from .local_bridge import constraint_keys_from_footprint
 from .v2_contract import (
-    FencePermitV2, MutationReceiptV2, PendingMutationV2, canonical_bytes,
+    ExecutionBindingV1, FencePermitV2, MutationReceiptV2, PendingMutationV2, canonical_bytes,
     decode_bytes, to_wire,
 )
 from .v2_execution_journal import AuthorityV2ExecutionJournal, VerifiedAppendV2
@@ -93,6 +93,35 @@ class AuthorityV2ExecutionBridge:
             expected_append_id=append_id,
             expected_append_digest="sha256:" + "0" * 64,
         )
+        return replace(draft, expected_append_digest=
+                       self.journal.expected_digest(draft))
+
+    def _build_claim_pending(self, receipt: MutationReceiptV2,
+                             binding: ExecutionBindingV1) -> PendingMutationV2:
+        if (type(receipt) is not MutationReceiptV2
+                or receipt.pending.phase != "prepared"
+                or receipt.durable_state != "committed"
+                or type(binding) is not ExecutionBindingV1
+                or binding.permit != receipt.pending.permit):
+            raise AuthorityUnavailable("claim requires the original committed prepare")
+        permit = replace(receipt.pending.permit,
+                         revision=receipt.updated_revision,
+                         pinned_anchor=receipt.after_anchor)
+        mutation_id = "claim-" + hashlib.sha256((
+            permit.operation_id + "\0" + receipt.pending.mutation_id).encode()).hexdigest()
+        # FenceStore schema 4 computes this request digest over the permit and
+        # original footprint. The claimed phase and binding are in the canonical
+        # pending bytes and execution chain digest, and are checked on replay.
+        request_digest = self._request_digest(permit, mutation_id, binding.footprint)
+        append_id = "append-" + hashlib.sha256((
+            mutation_id + "\0" + request_digest).encode()).hexdigest()
+        draft = PendingMutationV2(
+            permit=permit, mutation_id=mutation_id,
+            request_digest=request_digest, phase="claimed",
+            before_anchor=permit.pinned_anchor,
+            expected_append_id=append_id,
+            expected_append_digest="sha256:" + "0" * 64,
+            prepared_receipt=receipt, binding=binding)
         return replace(draft, expected_append_digest=
                        self.journal.expected_digest(draft))
 
@@ -212,11 +241,63 @@ class AuthorityV2ExecutionBridge:
                 conflict_keys=keys)
         return pending
 
+    def prepare_claim_pending(self, *, credential, subject: str,
+                              prepared_receipt: MutationReceiptV2,
+                              binding: ExecutionBindingV1) -> PendingMutationV2:
+        """Persist the claim intent for the same operation before its append."""
+        identifier(subject, "subject")
+        pending = self._build_claim_pending(prepared_receipt, binding)
+        permit = pending.permit
+        if permit.subject != subject or permit.namespace != self.namespace:
+            raise AuthorityUnavailable("claim subject or namespace differs")
+        self.core._require(credential, "execution", self.namespace, permit.holder)
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    raise AuthorityUnavailable("historical deletion closure blocks claim")
+                inspection = self.journal.inspect_expected(prepared_receipt.pending)
+                if inspection.first_append is None:
+                    raise AuthorityUnavailable("original prepared append is absent")
+                with self.core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    self.fences._check_schema(db)
+                    self._check_deletion_locked(db, deletion_head)
+                    original = self._load_mutation_locked(
+                        db, prepared_receipt.pending, subject)
+                    if (self._completed_result(original) !=
+                            (prepared_receipt, permit)):
+                        raise AuthorityUnavailable("original prepared receipt differs")
+                    footprint = self.fences._decode_footprint(
+                        prepared_receipt.pending, original[11])
+                    if footprint != binding.footprint:
+                        raise AuthorityUnavailable("claim footprint differs from prepare")
+                    existing = self.fences.mutation_locked(db, pending.mutation_id)
+                    if existing is not None:
+                        self._load_mutation_locked(db, pending, subject)
+                        return pending
+                    if inspection.following_count != 1:
+                        raise AuthorityUnavailable("prepared append is no longer current")
+                    self._check_core_owner(db, permit)
+                    self._check_fence_locked(db, permit, subject)
+                    effect = db.execute(
+                        "SELECT state,conflict_keys_json,execution_seq FROM authority_effects "
+                        "WHERE namespace=? AND effect_id=?",
+                        (self.namespace, permit.effect_id)).fetchone()
+                    if effect != ("unresolved", original[5],
+                                  prepared_receipt.pending.expected_execution_seq):
+                        raise AuthorityUnavailable("prepared effect constraint differs")
+                    self.fences.record_pending_locked(
+                        db, pending, subject=subject,
+                        current_anchor=permit.pinned_anchor, footprint=footprint,
+                        conflict_keys=tuple(json.loads(original[5])))
+        return pending
+
     def append_pending(self, pending: PendingMutationV2, *, credential,
                        subject: str):
         """Recheck durable pending under the sole writer, then sync one append."""
-        if type(pending) is not PendingMutationV2 or pending.phase != "prepared":
-            raise AuthorityUnavailable("only prepared dispatch append is supported")
+        if type(pending) is not PendingMutationV2 or pending.phase not in ("prepared", "claimed"):
+            raise AuthorityUnavailable("unsupported dispatch append phase")
         identifier(subject, "subject")
         self.core._require(credential, "execution", self.namespace,
                            pending.permit.holder)
@@ -241,8 +322,8 @@ class AuthorityV2ExecutionBridge:
                            pending: PendingMutationV2,
                            allow_cancel: bool = False):
         """Exactly 0 or 1 matching append; no replay of an external effect."""
-        if type(pending) is not PendingMutationV2 or pending.phase != "prepared":
-            raise AuthorityUnavailable("only prepared dispatch recovery is supported")
+        if type(pending) is not PendingMutationV2 or pending.phase not in ("prepared", "claimed"):
+            raise AuthorityUnavailable("unsupported dispatch recovery phase")
         identifier(subject, "subject")
         self.core._require(credential, "recover" if allow_cancel else "execution",
                            self.namespace,
@@ -266,6 +347,15 @@ class AuthorityV2ExecutionBridge:
                 self.fences._check_schema(db)
                 self._check_deletion_locked(db, deletion_head)
                 mutation = self._load_mutation_locked(db, pending, subject)
+                if pending.phase == "claimed":
+                    original = self._load_mutation_locked(
+                        db, pending.prepared_receipt.pending, subject)
+                    if (self._completed_result(original) !=
+                            (pending.prepared_receipt, pending.permit)
+                            or self.fences._decode_footprint(
+                                pending.prepared_receipt.pending, original[11])
+                            != pending.binding.footprint):
+                        raise AuthorityUnavailable("claim lost original prepared receipt or footprint")
                 completed = self._completed_result(mutation)
                 if completed is not None:
                     return completed
@@ -273,6 +363,8 @@ class AuthorityV2ExecutionBridge:
                     raise inspection_error
                 if inspection.following_count > 1:
                     raise AuthorityUnavailable("extra execution append quarantines pending fence")
+                if inspection.following_count == 0 and pending.phase == "claimed":
+                    raise AuthorityUnavailable("claimed pending requires its original append")
                 if inspection.following_count == 0 and not allow_cancel:
                     raise AuthorityUnavailable("prepared mutation has no durable append")
                 self._check_core_owner(db, pending.permit)
@@ -282,17 +374,39 @@ class AuthorityV2ExecutionBridge:
                     raise AuthorityUnavailable("verified conflict keys are absent")
                 keys = tuple(json.loads(mutation[5]))
                 if inspection.following_count == 1:
-                    self._check_effects(db, self.namespace,
-                                        pending.permit.effect_id, keys)
-                    db.execute("INSERT INTO authority_effects(namespace,effect_id,state,conflict_keys_json,execution_seq) VALUES(?,?,?,?,?)", (
-                        self.namespace, pending.permit.effect_id, "unresolved",
-                        json.dumps(keys, separators=(",", ":")),
-                        pending.expected_execution_seq))
+                    if pending.phase == "prepared":
+                        self._check_effects(db, self.namespace,
+                                            pending.permit.effect_id, keys)
+                        db.execute("INSERT INTO authority_effects(namespace,effect_id,state,conflict_keys_json,execution_seq) VALUES(?,?,?,?,?)", (
+                            self.namespace, pending.permit.effect_id, "unresolved",
+                            json.dumps(keys, separators=(",", ":")),
+                            pending.expected_execution_seq))
+                    else:
+                        original = self._load_mutation_locked(
+                            db, pending.prepared_receipt.pending, subject)
+                        if (self._completed_result(original) !=
+                                (pending.prepared_receipt, pending.permit)
+                                or self.fences._decode_footprint(
+                                    pending.prepared_receipt.pending, original[11])
+                                != pending.binding.footprint):
+                            raise AuthorityUnavailable("original prepare changed before claim commit")
+                        effect = db.execute(
+                            "SELECT state,conflict_keys_json,execution_seq FROM authority_effects "
+                            "WHERE namespace=? AND effect_id=?",
+                            (self.namespace, pending.permit.effect_id)).fetchone()
+                        if effect != ("unresolved", mutation[5],
+                                      pending.prepared_receipt.pending.expected_execution_seq):
+                            raise AuthorityUnavailable("prepared effect changed before claim commit")
+                        db.execute(
+                            "UPDATE authority_effects SET execution_seq=? "
+                            "WHERE namespace=? AND effect_id=?",
+                            (pending.expected_execution_seq, self.namespace,
+                             pending.permit.effect_id))
                     db.execute("UPDATE authority_namespaces SET execution_seq=?,execution_digest=?,anchor_nonce=? WHERE namespace=?", (
                         pending.expected_execution_seq,
                         pending.expected_append_digest,
                         self.core._new_nonce(), self.namespace))
-                    self.core._event(db, self.namespace, "execution_v2_prepared",
+                    self.core._event(db, self.namespace, "execution_v2_" + pending.phase,
                                      pending.permit.generation,
                                      (pending.mutation_id, pending.request_digest,
                                       pending.expected_append_digest))
@@ -392,6 +506,23 @@ class AuthorityV2ExecutionBridge:
             self.prepare_pending(credential=credential, subject=subject,
                                  permit=permit, mutation_id=mutation_id,
                                  footprint=footprint)
+        self.append_pending(pending, credential=credential, subject=subject)
+        return self.reconcile_mutation(
+            credential=credential, subject=subject, pending=pending)
+
+    def execution_claim(self, *, credential, subject: str,
+                        prepared_receipt: MutationReceiptV2,
+                        binding: ExecutionBindingV1):
+        """Durably claim the original prepared operation; no platform call."""
+        pending = self.prepare_claim_pending(
+            credential=credential, subject=subject,
+            prepared_receipt=prepared_receipt, binding=binding)
+        with self.core._tx() as db:
+            mutation = self._load_mutation_locked(db, pending, subject)
+            completed = self._completed_result(mutation)
+        if completed is not None:
+            return self.reconcile_mutation(
+                credential=credential, subject=subject, pending=pending)
         self.append_pending(pending, credential=credential, subject=subject)
         return self.reconcile_mutation(
             credential=credential, subject=subject, pending=pending)

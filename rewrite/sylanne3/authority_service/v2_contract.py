@@ -7,7 +7,7 @@ can make those decisions against its current state and service-owned journal.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import hashlib
 import json
@@ -149,7 +149,7 @@ class FencePermitV2:
 
 @dataclass(frozen=True, slots=True)
 class PendingMutationV2:
-    """One durable prepare for exactly one service-owned execution append."""
+    """One durable phase transition for one service-owned execution append."""
 
     permit: FencePermitV2
     mutation_id: str
@@ -159,6 +159,8 @@ class PendingMutationV2:
     expected_append_id: str
     expected_append_digest: str
     schema: str = SCHEMA
+    prepared_receipt: MutationReceiptV2 | None = None
+    binding: ExecutionBindingV1 | None = None
 
     def __post_init__(self) -> None:
         _schema(self.schema)
@@ -177,6 +179,22 @@ class PendingMutationV2:
                 self.permit.namespace, self.permit.generation)
         if self.before_anchor != self.permit.pinned_anchor:
             raise ValueError("pending before-head differs from pinned fence head")
+        if self.phase == "claimed":
+            receipt, binding = self.prepared_receipt, self.binding
+            if (type(receipt) is not MutationReceiptV2
+                    or receipt.pending.phase != "prepared"
+                    or receipt.durable_state != "committed"
+                    or type(binding) is not ExecutionBindingV1
+                    or binding.permit != receipt.pending.permit):
+                raise ValueError("claim requires original committed prepare and binding")
+            if (self.permit != replace(receipt.pending.permit,
+                                       revision=receipt.updated_revision,
+                                       pinned_anchor=receipt.after_anchor)
+                    or self.before_anchor != receipt.after_anchor
+                    or binding.operation_id != self.permit.operation_id):
+                raise ValueError("claim differs from original prepared operation or fence")
+        elif self.prepared_receipt is not None or self.binding is not None:
+            raise ValueError("only claimed phase may carry prepared receipt and binding")
 
     @property
     def expected_execution_seq(self) -> int:
@@ -556,13 +574,17 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             "footprint_digest": value.footprint_digest,
         }
     if type(value) is PendingMutationV2:
-        return {
+        wire = {
             "schema": value.schema, "kind": "pending_mutation", "permit": to_wire(value.permit),
             "mutation_id": value.mutation_id, "request_digest": value.request_digest,
             "phase": value.phase, "before_anchor": _anchor_wire(value.before_anchor),
             "expected_append_id": value.expected_append_id,
             "expected_append_digest": value.expected_append_digest,
         }
+        if value.phase == "claimed":
+            wire["prepared_receipt"] = to_wire(value.prepared_receipt)
+            wire["binding"] = to_wire(value.binding)
+        return wire
     if type(value) is ExecutionBindingV1:
         return {
             "schema": value.schema, "kind": "execution_binding_v1",
@@ -666,20 +688,25 @@ def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationRec
         return FencePermitV2(**{key: (_anchor_from_wire(item) if key == "pinned_anchor" else item)
                                 for key, item in value.items() if key != "kind"})
     if kind == "pending_mutation":
-        _fields(value, frozenset({
+        fields = frozenset({
             "schema", "kind", "permit", "mutation_id", "request_digest", "phase",
             "before_anchor", "expected_append_id", "expected_append_digest",
-        }), "pending mutation")
+        })
+        if value.get("phase") == "claimed":
+            fields |= frozenset({"prepared_receipt", "binding"})
+        _fields(value, fields, "pending mutation")
         permit = from_wire(value["permit"])
         if type(permit) is not FencePermitV2:
             raise ValueError("pending permit kind mismatch")
+        receipt = from_wire(value["prepared_receipt"]) if value["phase"] == "claimed" else None
+        binding = from_wire(value["binding"]) if value["phase"] == "claimed" else None
         return PendingMutationV2(
             permit=permit, mutation_id=value["mutation_id"],
             request_digest=value["request_digest"], phase=value["phase"],
             before_anchor=_anchor_from_wire(value["before_anchor"]),
             expected_append_id=value["expected_append_id"],
             expected_append_digest=value["expected_append_digest"],
-            schema=value["schema"],
+            schema=value["schema"], prepared_receipt=receipt, binding=binding,
         )
     if kind == "execution_binding_v1":
         _fields(value, frozenset({
