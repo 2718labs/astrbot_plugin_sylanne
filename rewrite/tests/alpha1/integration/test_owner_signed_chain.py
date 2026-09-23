@@ -35,6 +35,7 @@ from sylanne3.workbench_api.owner_grant import (
     DurableOwnerGrantResolver, GraphCurrentOwnerGrantPort,
 )
 from sylanne3.workbench_api.service import RequestContext
+from sylanne3.workbench_api.installed_owner_ports import InstalledOwnerOnboardingPorts
 from sylanne3.runtime.d11_types import (
     D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH, D11RuntimeProvider,
 )
@@ -203,6 +204,12 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
                 owner_session_request=owner_session_request), permit)
 
         port.get_current_owner_guard_for_fence = current_guard
+        port.current_owner_actor_binding = (
+            lambda *, namespace, authority_namespace, actor_id:
+            source.current_actor_binding(
+                authority_namespace=authority_namespace,
+                installation_id="installation", actor_id=actor_id)
+            if namespace == ROLE else None)
         registry = TypeRegistry()
         registry.register(owner_grant_spec())
         live = {}
@@ -237,6 +244,19 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
         assert resolved.principal == principal
         assert resolved.session.actor_id == "owner-actor"
         assert "workbench.read" in resolved.session.scope_capabilities["bot/persona"]
+        onboarding = InstalledOwnerOnboardingPorts(
+            policy=policy, authority=port,
+            coordinator=live["coordinator"], bootstrap=bootstrap)
+        assert onboarding.resolve_installed_namespace(scope="bot/persona") == ROLE
+        assert onboarding.resolve_installed_namespace(scope="other/persona") is None
+        identity = onboarding.resolve_current_owner_identity(
+            session=resolved.session, scope="bot/persona", namespace=ROLE)
+        assert identity is not None
+        assert (identity.actor_id, identity.session_id, identity.principal) == (
+            "owner-actor", resolved.session.session_id, principal)
+        assert onboarding.resolve_current_owner_identity(
+            session=replace(resolved.session, owner_session_token="wrong"),
+            scope="bot/persona", namespace=ROLE) is None
         grant_port = GraphCurrentOwnerGrantPort(
             live["coordinator"], bootstrap, namespace=ROLE,
             activation_generation=1, domains=("d11",))
@@ -294,6 +314,8 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
             request_digest="sha256:" + "e" * 64)
         source.revoke_actor(
             administrator_credential=ADMIN, binding=actor_binding)
+        assert onboarding.resolve_current_owner_identity(
+            session=resolved.session, scope="bot/persona", namespace=ROLE) is None
         anchor = service.current_anchor(credential=WORKER, subject=SUBJECT)
         revoked_permit = service.begin_fence(
             credential=WORKER, subject=SUBJECT, holder="administrator",
