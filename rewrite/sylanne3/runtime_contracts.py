@@ -15,9 +15,11 @@ import math
 from typing import Any, Protocol, runtime_checkable
 
 from .graph_types import AtomKey, GraphVersion, GraphWrite, NamespaceEpoch, Owner
+from .runtime.restore_anchor import RestoreAnchor
 
 
 RUNTIME_SCHEMA = "sylanne.runtime.v1"
+AUTHORITY_BOOTSTRAP_SCHEMA_V2 = "sylanne3.authority.v2"
 _HEX_DIGEST_LENGTH = 64
 _OWNER_SCOPES = frozenset({"persona", "relation", "scene", "event", "activity"})
 _SOURCE_FAMILIES = frozenset({"observed", "reported", "authored", "simulated", "derived"})
@@ -171,6 +173,100 @@ class NamespaceId:
         if not isinstance(key, AtomKey):
             raise TypeError("key must be AtomKey")
         return cls(key.owner.bot, key.owner.persona)
+
+
+class NamespaceRuntimeState(str, Enum):
+    """Observed namespace availability; this is never a content permit."""
+
+    UNBOUND = "unbound"
+    RECOVERING = "recovering"
+    ACTIVE = "active"
+    UNAVAILABLE = "unavailable"
+    QUARANTINED = "quarantined"
+
+
+@dataclass(frozen=True, slots=True)
+class InstallationGrantV2:
+    """Installation identity facts for one authenticated TLS channel."""
+
+    authority_id: str
+    subject: str
+    administrator_holder: str
+    installation_id: str
+    manifest_digest: str
+    publisher_policy_ref: str
+    service_capability_version: str
+    channel_binding_sha256: str
+    schema: str = AUTHORITY_BOOTSTRAP_SCHEMA_V2
+
+    def __post_init__(self) -> None:
+        if self.schema != AUTHORITY_BOOTSTRAP_SCHEMA_V2:
+            raise ValueError("unknown authority bootstrap schema")
+        for name in ("authority_id", "subject", "administrator_holder", "installation_id",
+                     "publisher_policy_ref", "service_capability_version"):
+            _nonempty(getattr(self, name), name)
+        _digest(self.manifest_digest, "manifest_digest")
+        _digest(self.channel_binding_sha256, "channel_binding_sha256")
+
+
+@dataclass(frozen=True, slots=True)
+class NamespaceBootstrapV2:
+    """One namespace's observed activation and recovery facts, not authorization."""
+
+    authority_id: str
+    namespace: NamespaceId
+    authority_namespace: str
+    holder: str | None
+    generation: int
+    phase: str
+    state: NamespaceRuntimeState
+    anchor: RestoreAnchor | None
+    blocking_reasons: tuple[str, ...]
+    schema: str = AUTHORITY_BOOTSTRAP_SCHEMA_V2
+
+    def __post_init__(self) -> None:
+        if self.schema != AUTHORITY_BOOTSTRAP_SCHEMA_V2:
+            raise ValueError("unknown authority bootstrap schema")
+        _nonempty(self.authority_id, "authority_id")
+        if type(self.namespace) is not NamespaceId:
+            raise TypeError("namespace must be NamespaceId")
+        _nonempty(self.authority_namespace, "authority_namespace")
+        if self.holder is not None:
+            _nonempty(self.holder, "holder")
+        _exact_nonnegative(self.generation, "generation")
+        if self.phase not in {"unbound", "active", "revoked", "recovering"}:
+            raise ValueError(f"unknown activation phase: {self.phase!r}")
+        if type(self.state) is not NamespaceRuntimeState:
+            raise TypeError("state must be NamespaceRuntimeState")
+        object.__setattr__(self, "blocking_reasons", _strings(self.blocking_reasons, "blocking_reasons"))
+        if self.anchor is not None:
+            if type(self.anchor) is not RestoreAnchor:
+                raise TypeError("anchor must be RestoreAnchor")
+            if (self.anchor.authority_id != self.authority_id
+                    or self.anchor.namespace != self.authority_namespace
+                    or self.anchor.activation_generation != self.generation):
+                raise ValueError("anchor authority, namespace or generation mismatch")
+            for journal in ("deletion", "execution"):
+                _nonempty(getattr(self.anchor, f"{journal}_journal_id"), f"{journal}_journal_id")
+                seq = _exact_nonnegative(getattr(self.anchor, f"{journal}_seq"), f"{journal}_seq")
+                digest = getattr(self.anchor, f"{journal}_digest")
+                if (seq == 0 and digest != "genesis") or (seq > 0 and
+                                                          (not isinstance(digest, str) or
+                                                           not digest.startswith("sha256:"))):
+                    raise ValueError(f"invalid {journal} head")
+                if seq > 0:
+                    _digest(digest[7:], f"{journal}_digest")
+            _exact_nonnegative(self.anchor.revocation_epoch, "revocation_epoch")
+            _nonempty(self.anchor.proof, "proof")
+        if self.state is NamespaceRuntimeState.ACTIVE:
+            if (self.phase != "active" or self.holder is None or self.generation == 0
+                    or self.anchor is None or self.blocking_reasons):
+                raise ValueError("active namespace requires holder, generation, matching anchor and no blockers")
+        elif self.state is NamespaceRuntimeState.UNBOUND:
+            if self.phase != "unbound" or self.holder is not None or self.anchor is not None:
+                raise ValueError("unbound namespace cannot have a holder or anchor")
+        elif not self.blocking_reasons:
+            raise ValueError("non-active bound state requires blocking reasons")
 
 
 # GraphVersion is the canonical (AtomKey, revision) identity.  Re-exporting it
@@ -561,7 +657,8 @@ class DomainProvider(Protocol):
 
 
 __all__ = [
-    "RUNTIME_SCHEMA", "Owner", "AtomKey", "AtomRef", "NamespaceId", "VersionedRef", "QueryEpoch",
+    "RUNTIME_SCHEMA", "AUTHORITY_BOOTSTRAP_SCHEMA_V2", "Owner", "AtomKey", "AtomRef", "NamespaceId",
+    "NamespaceRuntimeState", "InstallationGrantV2", "NamespaceBootstrapV2", "VersionedRef", "QueryEpoch",
     "OperationIdentity", "AuthorityContext", "VersionGuard", "SourceQualification", "DependencySet",
     "CommandEnvelope", "DomainProposal", "DomainBundle", "CommitReceipt", "ProviderDescriptor",
     "CheckReceipt", "DomainProvider", "canonical_serialize", "canonical_digest", "schema_hash",
