@@ -2,8 +2,8 @@
 //! linear system only, never the temporal discretization error.
 use std::slice;
 
-// Arithmetic foundation only; ABI2 certificates stay disabled until the
-// independent nonlinear verifier and strict-build evidence are complete.
+// ABI2 certifies only the received fixed block after independent interval
+// verification; arithmetic reports never grant a product certificate.
 mod arithmetic_report;
 #[allow(dead_code)]
 mod interval;

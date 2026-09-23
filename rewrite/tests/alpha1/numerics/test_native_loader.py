@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -10,12 +12,15 @@ import unittest
 from unittest import mock
 
 from sylanne3.native_runtime import (
+    ABI2_FIXED_BLOCK_INTERVAL_V1,
     ABI2ResultError,
     ABI2StepResult,
+    NativeReportedFixedBlockIntervalBounds,
     NativeIntegrityError,
     NativePlatformError,
     diagnostic_step_result,
     load_production_native,
+    parse_fixed_block_interval_result,
 )
 from sylanne3.native import NativeKernel
 
@@ -48,6 +53,26 @@ def _runtime_platform() -> tuple[str, str]:
         "aarch64": "aarch64",
     }[machine]
     return os_name, arch
+
+
+def _fixed_block_raw() -> ABI2StepResult:
+    """Hand-built ABI2 output for parser tests; no native call is made."""
+    raw = ABI2StepResult()
+    raw.struct_size = ctypes.sizeof(ABI2StepResult)
+    raw.abi_version = 2
+    raw.status = 0
+    raw.iterations = 3
+    raw.certificate_flags = ABI2_FIXED_BLOCK_INTERVAL_V1
+    raw.residual = 1e-9
+    raw.iteration_error = 0.1
+    raw.time_defect = 0.2
+    raw.trajectory_error = 0.3
+    raw.energy_before = 4.0
+    raw.energy_after = 3.5
+    raw.energy_balance_defect = 0.4
+    raw.q_upper = 0.8
+    raw.boundary_eta = 0.0
+    return raw
 
 
 class NativeLoaderTests(unittest.TestCase):
@@ -203,6 +228,71 @@ class NativeLoaderTests(unittest.TestCase):
         raw.certificate_flags = 1
         with self.assertRaisesRegex(ABI2ResultError, "certificate flags"):
             diagnostic_step_result(raw)
+
+    def test_parses_native_reported_fixed_block_math_without_product_authority(self) -> None:
+        raw = _fixed_block_raw()
+        report = parse_fixed_block_interval_result(raw)
+        self.assertIsInstance(report, NativeReportedFixedBlockIntervalBounds)
+        self.assertEqual(report.certificate_flags, ABI2_FIXED_BLOCK_INTERVAL_V1)
+        for field in (
+            "residual",
+            "iteration_error",
+            "time_defect",
+            "trajectory_error",
+            "energy_before",
+            "energy_after",
+            "energy_balance_defect",
+            "q_upper",
+            "boundary_eta",
+        ):
+            self.assertEqual(getattr(report, field), getattr(raw, field))
+        with self.assertRaisesRegex(ABI2ResultError, "certificate flags"):
+            diagnostic_step_result(raw)
+
+    def test_fixed_block_parser_rejects_wrong_layout_status_and_flags(self) -> None:
+        cases = (
+            ("struct_size", ctypes.sizeof(ABI2StepResult) - 1),
+            ("abi_version", 1),
+            ("status", 1),
+            ("certificate_flags", 0),
+            ("certificate_flags", ABI2_FIXED_BLOCK_INTERVAL_V1 | 0x2),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                raw = _fixed_block_raw()
+                setattr(raw, field, value)
+                with self.assertRaises(ABI2ResultError):
+                    parse_fixed_block_interval_result(raw)
+
+    def test_fixed_block_parser_rejects_invalid_bounds_and_point_values(self) -> None:
+        bounds = (
+            "residual",
+            "iteration_error",
+            "time_defect",
+            "trajectory_error",
+            "energy_balance_defect",
+            "q_upper",
+            "boundary_eta",
+        )
+        for field in bounds:
+            for value in (-0.1, math.nan, math.inf):
+                with self.subTest(field=field, value=value):
+                    raw = _fixed_block_raw()
+                    setattr(raw, field, value)
+                    with self.assertRaises(ABI2ResultError):
+                        parse_fixed_block_interval_result(raw)
+        for field in ("energy_before", "energy_after"):
+            with self.subTest(field=field):
+                raw = _fixed_block_raw()
+                setattr(raw, field, math.inf)
+                with self.assertRaises(ABI2ResultError):
+                    parse_fixed_block_interval_result(raw)
+        for field, value in (("q_upper", 0.800001), ("boundary_eta", 0.01)):
+            with self.subTest(field=field, value=value):
+                raw = _fixed_block_raw()
+                setattr(raw, field, value)
+                with self.assertRaisesRegex(ABI2ResultError, "preconditions"):
+                    parse_fixed_block_interval_result(raw)
 
     def test_abi1_reference_requires_explicit_library_and_developer_opt_in(self) -> None:
         with self.assertRaisesRegex(TypeError, "library_path"):

@@ -1,5 +1,5 @@
 //! Independent outward-interval verification kernel for the bounded ABI 2
-//! sparse nonlinear step. This module does not enable any ABI certificate bit.
+//! sparse nonlinear step. ABI 2 uses it for a fixed complete block certificate.
 
 use crate::interval::{environment_supported, Interval, IntervalError};
 
@@ -125,7 +125,7 @@ pub(crate) struct JointVerificationEnvelope {
 }
 
 /// Conservative bounds for one complete, fixed-parameter coupled step.
-/// These values are verifier diagnostics; ABI 2 certificate flags remain zero.
+/// ABI 2 can publish these bounds when all fixed-block certificate gates pass.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct JointErrorBounds {
     pub(crate) gradient_lipschitz_upper: f64,
@@ -139,9 +139,8 @@ pub(crate) struct JointErrorBounds {
 /// Independently reconstruct the bounded nonlinear discrete gradient, fixed-point
 /// residual and endpoint energy difference using outward interval arithmetic.
 ///
-/// This is only a local arithmetic foundation. It does not prove the contraction
-/// factor, temporal defect, inherited initial error, omitted-boundary closure or
-/// build provenance required by a complete ABI 2 certificate.
+/// This envelope is local to the supplied block. It does not prove the origin
+/// of inherited error, omitted-boundary closure, or input provenance.
 pub(crate) fn verify_joint_step(
     input: &JointVerificationInput<'_>,
 ) -> Result<JointVerificationEnvelope, VerifierError> {
@@ -330,7 +329,7 @@ pub(crate) fn linear_readout(
 ///
 /// `inherited_error` must already be a trusted enclosure of the preceding
 /// state error. This local function cannot authenticate that provenance, an
-/// event boundary, or the surrounding ABI. It makes no production certificate.
+/// event boundary, or the surrounding ABI.
 pub(crate) fn verify_joint_error_bounds(
     input: &JointVerificationInput<'_>,
     inherited_error: Interval,

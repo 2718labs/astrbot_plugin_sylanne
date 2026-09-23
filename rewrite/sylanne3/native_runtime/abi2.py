@@ -6,6 +6,7 @@ import math
 
 
 ABI_VERSION = 2
+ABI2_FIXED_BLOCK_INTERVAL_V1 = 0x1
 
 
 class ABI2CSR(ctypes.Structure):
@@ -76,6 +77,33 @@ class DiagnosticStepResult:
     certified: bool = False
 
 
+@dataclass(frozen=True)
+class NativeReportedFixedBlockIntervalBounds:
+    """Native-reported conditional bounds for the received fixed complete joint block.
+
+    These mathematical bounds do not establish source, build, or previous-step
+    error eligibility, and do not authorize D04 product adoption.
+
+    iteration_error is an endpoint bound; time_defect is a reconstruction
+    defect bound; trajectory_error is an inherited bound; and
+    energy_balance_defect is an absolute balance bound. energy_before and
+    energy_after are point values.
+    """
+
+    status: int
+    iterations: int
+    certificate_flags: int
+    residual: float
+    iteration_error: float
+    time_defect: float
+    trajectory_error: float
+    energy_before: float
+    energy_after: float
+    energy_balance_defect: float
+    q_upper: float
+    boundary_eta: float
+
+
 class ABI2ResultError(RuntimeError):
     pass
 
@@ -105,6 +133,45 @@ def diagnostic_step_result(raw: ABI2StepResult) -> DiagnosticStepResult:
         status=raw.status,
         iterations=raw.iterations,
         certificate_flags=0,
+        residual=raw.residual,
+        iteration_error=raw.iteration_error,
+        time_defect=raw.time_defect,
+        trajectory_error=raw.trajectory_error,
+        energy_before=raw.energy_before,
+        energy_after=raw.energy_after,
+        energy_balance_defect=raw.energy_balance_defect,
+        q_upper=raw.q_upper,
+        boundary_eta=raw.boundary_eta,
+    )
+
+
+def parse_fixed_block_interval_result(raw: ABI2StepResult) -> NativeReportedFixedBlockIntervalBounds:
+    """Parse native-reported conditional mathematical bounds, not a product receipt."""
+    if raw.struct_size != ctypes.sizeof(ABI2StepResult) or raw.abi_version != ABI_VERSION:
+        raise ABI2ResultError("ABI2 result layout or version mismatch")
+    if raw.status != 0:
+        raise ABI2ResultError(f"ABI2 fixed-block interval step did not succeed: {raw.status}")
+    if raw.certificate_flags != ABI2_FIXED_BLOCK_INTERVAL_V1:
+        raise ABI2ResultError("unsupported native certificate flags")
+    bounds = (
+        raw.residual,
+        raw.iteration_error,
+        raw.time_defect,
+        raw.trajectory_error,
+        raw.energy_balance_defect,
+        raw.q_upper,
+        raw.boundary_eta,
+    )
+    if not all(math.isfinite(value) and value >= 0 for value in bounds):
+        raise ABI2ResultError("ABI2 fixed-block interval bounds must be finite and nonnegative")
+    if not math.isfinite(raw.energy_before) or not math.isfinite(raw.energy_after):
+        raise ABI2ResultError("ABI2 energy point values must be finite")
+    if raw.q_upper > 0.8 or raw.boundary_eta != 0:
+        raise ABI2ResultError("ABI2 fixed-block interval preconditions not met")
+    return NativeReportedFixedBlockIntervalBounds(
+        status=raw.status,
+        iterations=raw.iterations,
+        certificate_flags=raw.certificate_flags,
         residual=raw.residual,
         iteration_error=raw.iteration_error,
         time_defect=raw.time_defect,

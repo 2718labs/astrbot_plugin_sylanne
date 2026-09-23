@@ -1,7 +1,11 @@
 //! ABI 2 sparse nonlinear AVF step.
 //!
-//! All current step results are diagnostic. Certificate bits remain reserved
-//! until an independent outward-rounding verifier covers the full operator.
+//! Bit 0 certifies the fixed, complete block received by this call when the
+//! independent outward-interval verifier accepts its candidate endpoint.
+use crate::interval::{environment_supported, Interval};
+use crate::interval_verifier::{
+    verify_joint_error_bounds, verify_joint_step, JointVerificationInput, SparseMatrix,
+};
 use std::{
     ptr, slice,
     sync::atomic::{AtomicU32, Ordering},
@@ -11,6 +15,7 @@ const ABI: u32 = 2;
 const MAX_N: usize = 65_536;
 const MAX_NNZ: usize = 2_000_000;
 const MAX_ITER: u32 = 256;
+const ABI2_FIXED_BLOCK_INTERVAL_V1: u32 = 0x0000_0001;
 
 #[repr(C)]
 pub struct Csr {
@@ -68,8 +73,11 @@ pub extern "C" fn sylanne3_v2_abi_version() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn sylanne3_v2_supported_certificate_flags() -> u32 {
-    // Current f64 estimates lack cross-platform directed-rounding proof.
-    0
+    if environment_supported() {
+        ABI2_FIXED_BLOCK_INTERVAL_V1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -84,6 +92,9 @@ struct Matrix<'a> {
     values: &'a [f64],
 }
 impl Matrix<'_> {
+    fn verified_view(&self, cols: usize) -> SparseMatrix<'_> {
+        SparseMatrix::new(self.rows, cols, self.offsets, self.indices, self.values)
+    }
     fn mul(&self, x: &[f64]) -> Vec<f64> {
         (0..self.rows)
             .map(|i| {
@@ -294,6 +305,74 @@ fn energy(k: &Matrix, a: &Matrix, alpha: &[f64], z: &[f64]) -> f64 {
             .zip(alpha)
             .map(|(v, c)| c * logcosh(*v))
             .sum::<f64>()
+}
+
+struct CertifiedMetrics {
+    residual: f64,
+    iteration_error: f64,
+    time_defect: f64,
+    trajectory_error: f64,
+    q_upper: f64,
+    energy_balance_defect: f64,
+}
+
+/// Certifies only the received fixed CSR block and supplied inherited-error
+/// bound. The caller remains responsible for their provenance and completeness.
+fn verify_fixed_block(
+    k: &Matrix<'_>,
+    r: &Matrix<'_>,
+    j: &Matrix<'_>,
+    a: &Matrix<'_>,
+    alpha: &[f64],
+    x: &[f64],
+    y: &[f64],
+    drive: &[f64],
+    h: f64,
+    previous_error: f64,
+    tolerance: f64,
+) -> Option<CertifiedMetrics> {
+    let n = x.len();
+    let input = JointVerificationInput {
+        k: k.verified_view(n),
+        r: r.verified_view(n),
+        j: j.verified_view(n),
+        a: a.verified_view(n),
+        alpha,
+        x,
+        y,
+        h,
+        drive,
+    };
+    let envelope = verify_joint_step(&input).ok()?;
+    let inherited_error = Interval::new(0.0, previous_error).ok()?;
+    let errors = verify_joint_error_bounds(&input, inherited_error).ok()?;
+    if errors.contraction_upper > 0.8 || errors.endpoint_error.upper() > tolerance {
+        return None;
+    }
+    let energy_balance_defect = envelope
+        .energy_balance_defect
+        .lower()
+        .abs()
+        .max(envelope.energy_balance_defect.upper().abs());
+    let metrics = CertifiedMetrics {
+        residual: envelope.residual_norm.upper(),
+        iteration_error: errors.endpoint_error.upper(),
+        time_defect: errors.reconstruction_defect.upper(),
+        trajectory_error: errors.time_error.upper(),
+        q_upper: errors.contraction_upper,
+        energy_balance_defect,
+    };
+    [
+        metrics.residual,
+        metrics.iteration_error,
+        metrics.time_defect,
+        metrics.trajectory_error,
+        metrics.q_upper,
+        metrics.energy_balance_defect,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    .then_some(metrics)
 }
 
 fn discrete_gradient(k: &Matrix, a: &Matrix, alpha: &[f64], x: &[f64], y: &[f64]) -> Vec<f64> {
@@ -549,7 +628,52 @@ unsafe fn step_impl(
         out.status = -2;
         return -2;
     }
+    let certificate = if inp.boundary_eta == 0.0 {
+        verify_fixed_block(
+            &k,
+            &r,
+            &j,
+            &a,
+            alpha,
+            x,
+            &y,
+            drive,
+            inp.h,
+            inp.previous_error,
+            inp.tolerance,
+        )
+    } else {
+        None
+    };
+    if cancellation
+        .map(|(epoch, expected)| epoch.load(Ordering::Acquire) != expected)
+        .unwrap_or(false)
+    {
+        out.status = -4;
+        return -4;
+    }
     ptr::copy_nonoverlapping(y.as_ptr(), output, n);
+    let certified = certificate.is_some();
+    let (residual, iteration_error, defect, trajectory, q_upper, balance) =
+        if let Some(bounds) = certificate {
+            (
+                bounds.residual,
+                bounds.iteration_error,
+                bounds.time_defect,
+                bounds.trajectory_error,
+                bounds.q_upper,
+                bounds.energy_balance_defect,
+            )
+        } else {
+            (
+                residual,
+                iteration_error,
+                defect,
+                trajectory,
+                q_upper,
+                balance,
+            )
+        };
     *out = StepResult {
         struct_size: std::mem::size_of::<StepResult>() as u32,
         abi_version: ABI,
@@ -559,7 +683,11 @@ unsafe fn step_impl(
             1
         },
         iterations: used,
-        certificate_flags: 0,
+        certificate_flags: if certified {
+            ABI2_FIXED_BLOCK_INTERVAL_V1
+        } else {
+            0
+        },
         residual,
         iteration_error,
         time_defect: defect,
@@ -570,9 +698,6 @@ unsafe fn step_impl(
         q_upper,
         boundary_eta: inp.boundary_eta,
     };
-    // Keep all bounds diagnostic until independently verified outward interval
-    // arithmetic encloses every intermediate operation and transcendental.
-    out.certificate_flags = 0;
     out.status
 }
 
@@ -759,6 +884,18 @@ mod tests {
         assert!(result.energy_after < result.energy_before);
         assert!(result.energy_balance_defect.abs() < 1e-12);
         assert_eq!(result.certificate_flags, 0);
+
+        // The verifier encloses the nonlinear AVF quotient over the entire
+        // endpoint segment; with an honest wider tolerance it can certify it.
+        input.tolerance = 1e-2;
+        input.max_iterations = 20;
+        input.iterate = current.as_ptr();
+        assert_eq!(
+            unsafe { sylanne3_v2_step(&input, out.as_mut_ptr(), 1, &mut result) },
+            0
+        );
+        assert_eq!(result.certificate_flags, ABI2_FIXED_BLOCK_INTERVAL_V1);
+        assert!((out[0] - (lo + hi) / 2.0).abs() <= result.iteration_error);
     }
 
     #[test]
@@ -824,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn diagonal_quadratic_scope_reports_diagnostic_endpoint_bounds() {
+    fn diagonal_quadratic_scope_certifies_against_analytic_solution() {
         let offs = [0, 1];
         let inds = [0];
         let kval = [2.0];
@@ -866,13 +1003,139 @@ mod tests {
             }
         }
         assert_eq!(result.status, 0);
-        assert_eq!(result.certificate_flags, 0);
+        assert_eq!(result.certificate_flags, ABI2_FIXED_BLOCK_INTERVAL_V1);
         let discrete_exact = (x[0] * (1.0 - 0.1) + 0.1 * drive[0]) / (1.0 + 0.1);
         assert!((out[0] - discrete_exact).abs() <= result.iteration_error);
         let equilibrium = drive[0] / 2.0;
         let continuous_exact = equilibrium + (x[0] - equilibrium) * (-0.2_f64).exp();
         assert!((out[0] - continuous_exact).abs() <= result.trajectory_error);
         assert!(result.energy_balance_defect >= 0.0);
+    }
+
+    #[test]
+    fn coupled_linear_block_needs_converged_full_operator() {
+        let offsets = [0, 1, 2];
+        let diagonal_indices = [0, 1];
+        let k_values = [2.0, 2.0];
+        let r_values = [1.0, 1.0];
+        let j_offsets = [0, 1, 2];
+        let j_indices = [1, 0];
+        let j_values = [0.2, -0.2];
+        let a_offsets = [0];
+        let empty_indices: [u32; 0] = [];
+        let empty_values: [f64; 0] = [];
+        let x = [0.4, -0.2];
+        let drive = [0.0, 0.0];
+        let mut output = [0.0; 2];
+        let mut result = StepResult::default();
+        let mut input = StepInput {
+            struct_size: std::mem::size_of::<StepInput>() as u32,
+            abi_version: ABI,
+            n: 2,
+            k: csr(2, 2, &offsets, &diagonal_indices, &k_values),
+            r: csr(2, 2, &offsets, &diagonal_indices, &r_values),
+            j: csr(2, 2, &j_offsets, &j_indices, &j_values),
+            a: csr(0, 2, &a_offsets, &empty_indices, &empty_values),
+            alpha: std::ptr::null(),
+            previous: x.as_ptr(),
+            drive: drive.as_ptr(),
+            iterate: x.as_ptr(),
+            h: 0.1,
+            previous_error: 1e-4,
+            max_iterations: 1,
+            tolerance: 1e-10,
+            boundary_eta: 0.0,
+        };
+        assert_eq!(
+            unsafe { sylanne3_v2_step(&input, output.as_mut_ptr(), 2, &mut result) },
+            1
+        );
+        assert_eq!(result.certificate_flags, 0);
+        let one_iteration = output;
+
+        input.max_iterations = 30;
+        assert_eq!(
+            unsafe { sylanne3_v2_step(&input, output.as_mut_ptr(), 2, &mut result) },
+            0
+        );
+        assert_eq!(result.certificate_flags, ABI2_FIXED_BLOCK_INTERVAL_V1);
+        assert_eq!(result.boundary_eta, 0.0);
+        assert!(result.iteration_error <= input.tolerance);
+        assert!(result.q_upper <= 0.8);
+        // B=(J-R)K=[[-2,0.4],[-0.4,-2]]. The midpoint AVF step is
+        // (I-hB/2)^-1(I+hB/2)x, and exp(hB)x is the exact trajectory.
+        let rhs = [0.9 * x[0] + 0.02 * x[1], -0.02 * x[0] + 0.9 * x[1]];
+        let denominator = 1.1_f64.powi(2) + 0.02_f64.powi(2);
+        let discrete = [
+            (1.1 * rhs[0] + 0.02 * rhs[1]) / denominator,
+            (-0.02 * rhs[0] + 1.1 * rhs[1]) / denominator,
+        ];
+        let endpoint_distance = (output[0] - discrete[0]).hypot(output[1] - discrete[1]);
+        assert!(endpoint_distance <= result.iteration_error);
+        assert!((one_iteration[0] - discrete[0]).hypot(one_iteration[1] - discrete[1]) > 1e-4);
+        let (sin, cos) = 0.04_f64.sin_cos();
+        let damping = (-0.2_f64).exp();
+        let continuous = [
+            damping * (cos * x[0] + sin * x[1]),
+            damping * (-sin * x[0] + cos * x[1]),
+        ];
+        let trajectory_distance = (output[0] - continuous[0]).hypot(output[1] - continuous[1]);
+        assert!(trajectory_distance <= result.trajectory_error);
+        assert!(result.trajectory_error >= input.previous_error);
+        let gradient = [x[0] + output[0], x[1] + output[1]];
+        let residual = [
+            output[0] - x[0] - input.h * (0.2 * gradient[1] - gradient[0]),
+            output[1] - x[1] - input.h * (-0.2 * gradient[0] - gradient[1]),
+        ];
+        let energy_before = x[0] * x[0] + x[1] * x[1];
+        let energy_after = output[0] * output[0] + output[1] * output[1];
+        let balance = energy_after - energy_before
+            + input.h * (gradient[0] * gradient[0] + gradient[1] * gradient[1])
+            - gradient[0] * residual[0]
+            - gradient[1] * residual[1];
+        assert!((result.energy_before - energy_before).abs() < 1e-14);
+        assert!((result.energy_after - energy_after).abs() < 1e-14);
+        assert!(balance.abs() <= result.energy_balance_defect);
+    }
+
+    #[test]
+    fn verifier_domain_rejection_leaves_diagnostics_uncertified() {
+        let offsets = [0, 1];
+        let indices = [0];
+        let k_values = [0.5];
+        let r_values = [0.5];
+        let empty_offsets = [0, 0];
+        let a_offsets = [0];
+        let empty_indices: [u32; 0] = [];
+        let empty_values: [f64; 0] = [];
+        let x = [0.4];
+        let drive = [0.0];
+        let input = StepInput {
+            struct_size: std::mem::size_of::<StepInput>() as u32,
+            abi_version: ABI,
+            n: 1,
+            k: csr(1, 1, &offsets, &indices, &k_values),
+            r: csr(1, 1, &offsets, &indices, &r_values),
+            j: csr(1, 1, &empty_offsets, &empty_indices, &empty_values),
+            a: csr(0, 1, &a_offsets, &empty_indices, &empty_values),
+            alpha: std::ptr::null(),
+            previous: x.as_ptr(),
+            drive: drive.as_ptr(),
+            iterate: x.as_ptr(),
+            h: 1.1, // accepted by the diagnostic step, outside verifier domain
+            previous_error: 0.0,
+            max_iterations: 1,
+            tolerance: 1.0,
+            boundary_eta: 0.0,
+        };
+        let mut output = [7.0];
+        let mut result = StepResult::default();
+        assert_eq!(
+            unsafe { sylanne3_v2_step(&input, output.as_mut_ptr(), 1, &mut result) },
+            0
+        );
+        assert_eq!(result.certificate_flags, 0);
+        assert!(result.residual.is_finite());
     }
 
     #[test]
@@ -898,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_or_nonlinearity_stays_outside_certified_scope() {
+    fn nonzero_boundary_stays_outside_certified_scope() {
         let offs = [0, 1];
         let inds = [0];
         let kval = [2.0];
@@ -968,7 +1231,10 @@ mod tests {
         };
         let cancel_epoch = std::sync::atomic::AtomicU32::new(2);
         let mut out = [123.0];
-        let mut result = StepResult::default();
+        let mut result = StepResult {
+            certificate_flags: ABI2_FIXED_BLOCK_INTERVAL_V1,
+            ..StepResult::default()
+        };
         let status = unsafe {
             sylanne3_v2_step_cancelable(
                 &input,
@@ -981,6 +1247,7 @@ mod tests {
         };
         assert_eq!(status, -4);
         assert_eq!(result.status, -4);
+        assert_eq!(result.certificate_flags, 0);
         assert_eq!(out, [123.0]);
     }
 
@@ -1022,7 +1289,14 @@ mod tests {
 
     #[test]
     fn supported_flag_mask_is_explicit_and_csr_rejects_misaligned_offsets() {
-        assert_eq!(sylanne3_v2_supported_certificate_flags(), 0);
+        assert_eq!(
+            sylanne3_v2_supported_certificate_flags(),
+            if environment_supported() {
+                ABI2_FIXED_BLOCK_INTERVAL_V1
+            } else {
+                0
+            }
+        );
         let bytes = [0u8; 16];
         let indices = [0u32];
         let values = [1.0f64];
