@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-import time
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -65,8 +64,8 @@ class AdminInstallationPolicy:
         if (lease.parent_id is not None or lease.version != 1 or lease.state != "active"
                 or lease.used or lease.reserved or lease.unconfirmed):
             raise ValueError("root lease must start active, unused and without a parent")
-        if (grant.version != 1 or grant.valid_until_utc <= time.time()):
-            raise ValueError("root grant must be initial and unexpired")
+        if grant.version != 1:
+            raise ValueError("root grant must be initial")
         if ((lease.bot_id, lease.persona_id) != self.namespace.as_tuple
                 or (grant.bot_id, grant.persona_id) != self.namespace.as_tuple
                 or grant.lease_id != lease.lease_id

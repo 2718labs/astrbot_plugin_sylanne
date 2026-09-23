@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import secrets
+import time
 from typing import Mapping
 from types import SimpleNamespace
 
@@ -541,6 +542,8 @@ class GraphCoordinator:
             try:
                 intent = self._provision_intent_row(db, namespace)
                 if intent is None:
+                    if policy.root_grant.valid_until_utc <= time.time():
+                        raise UnavailableGuard("root grant expired before namespace genesis")
                     if (self._provision_row(db, namespace) is not None
                             or store._recovery_row(namespace) is not None
                             or store._has_namespace_history(namespace)
@@ -694,13 +697,16 @@ class GraphCoordinator:
                 or lease.currency != policy.root_lease.currency
                 or lease.limits != policy.root_lease.limits):
             raise UnavailableGuard("durable v2 root budget differs")
-        if self.__d11_issuer.current_budget_grant(store._db, lease.lease_id) != policy.root_grant:
+        from .runtime.issuers import IssuerAuthorityDenied
+        try:
+            original_grant, original_signature = (
+                self.__d11_issuer.signed_budget_grant_at_version(
+                    store._db, lease.lease_id, receipt.root_grant_version))
+        except IssuerAuthorityDenied as exc:
+            raise UnavailableGuard("durable v2 D11 budget grant is invalid") from exc
+        if original_grant != policy.root_grant:
             raise UnavailableGuard("durable v2 D11 budget grant differs")
-        grant_row = store._db.execute(
-            "SELECT signature FROM runtime_budget_grants WHERE lease_id=? AND version=?",
-            (lease.lease_id, policy.root_grant.version),
-        ).fetchone()
-        if grant_row != (receipt.root_grant_signature,):
+        if original_signature != receipt.root_grant_signature:
             raise UnavailableGuard("durable v2 D11 signature differs")
         return receipt, metadata, epoch
 

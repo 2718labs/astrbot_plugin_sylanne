@@ -4,6 +4,7 @@ from dataclasses import replace
 import shutil
 import sqlite3
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -23,6 +24,7 @@ from sylanne3.runtime_contracts import (
     InstallationGrantV2, NamespaceBootstrapV2, NamespaceId,
     NamespaceRuntimeState,
 )
+import sylanne3.graph_coordinator as coordinator_module
 
 
 class AuthorityPort:
@@ -199,6 +201,83 @@ def test_success_stages_recovery_guards_real_budget_and_reconcilable_receipt(sys
     assert row_counts(store)["runtime_budget_leases"] == 1
     assert len(port.genesis_requests) == 1
     assert port.validations == ["write", "write", "read", "read"]
+
+
+def test_expired_installation_grant_reloads_and_reconciles_existing_receipt(system):
+    store, coordinator, bootstrap, port, _ = system
+    policy = policy_for(store)
+    receipt = coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="install-persona")
+    with patch.object(coordinator_module.time, "time",
+                      return_value=policy.root_grant.valid_until_utc + 1):
+        reloaded = replace(policy)
+        assert reloaded.digest_payload() == policy.digest_payload()
+        assert coordinator.provision_namespace_v2(
+            bootstrap, reloaded, operation_id="install-persona") == receipt
+    assert len(port.genesis_requests) == 1
+
+
+def test_expired_grant_cannot_start_new_genesis(system):
+    store, coordinator, bootstrap, port, _ = system
+    policy = policy_for(store)
+    with patch.object(coordinator_module.time, "time",
+                      return_value=policy.root_grant.valid_until_utc + 1):
+        with pytest.raises(UnavailableGuard, match="root grant expired"):
+            coordinator.provision_namespace_v2(
+                bootstrap, policy, operation_id="install-persona")
+    assert row_counts(store)["graph_namespace_provision_intents_v2"] == 0
+    assert not port.genesis_requests
+
+
+def test_expired_grant_can_resume_only_the_original_pending_intent(system):
+    store, coordinator, bootstrap, port, _ = system
+    policy = policy_for(store)
+    port.lose_genesis_after_durable = True
+    with pytest.raises(RuntimeError, match="genesis response lost"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    intent = coordinator._provision_intent_row(store._db, policy.namespace)
+    assert intent.anchor_json is None
+    with patch.object(coordinator_module.time, "time",
+                      return_value=policy.root_grant.valid_until_utc + 1):
+        with pytest.raises(AuthorityDenied, match="identity differs"):
+            coordinator.provision_namespace_v2(
+                bootstrap, policy, operation_id="another-install")
+        receipt = coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    assert receipt.fence_attempt_id == intent.fence_attempt_id
+    assert port.genesis_requests == [
+        (policy.namespace, intent.genesis_request_id)] * 2
+
+
+def test_receipt_reconciles_after_signed_grant_renewal(system):
+    store, coordinator, bootstrap, port, d11 = system
+    policy = policy_for(store)
+    receipt = coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="install-persona")
+    renewed = replace(policy.root_grant, grant_id="grant-renewed", version=2,
+                      valid_until_utc=policy.root_grant.valid_until_utc + 3600)
+    d11.issue_budget_grant(store._db, renewed)
+    assert d11.current_budget_grant(store._db, policy.root_lease.lease_id) == renewed
+    assert coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="install-persona") == receipt
+    assert len(port.genesis_requests) == 1
+
+
+def test_renewed_grant_does_not_mask_tampered_bootstrap_signature(system):
+    store, coordinator, bootstrap, _, d11 = system
+    policy = policy_for(store)
+    coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="install-persona")
+    d11.issue_budget_grant(store._db, replace(
+        policy.root_grant, grant_id="grant-renewed", version=2))
+    store._db.execute(
+        "UPDATE runtime_budget_grants SET signature=? "
+        "WHERE lease_id=? AND version=1",
+        ("tampered", policy.root_lease.lease_id))
+    with pytest.raises(UnavailableGuard, match="D11 budget grant is invalid"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
 
 
 def test_issuer_failure_rolls_back_genesis_but_keeps_exact_intent_and_fence(system):

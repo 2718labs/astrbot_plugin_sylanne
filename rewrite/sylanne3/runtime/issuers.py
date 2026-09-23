@@ -473,6 +473,24 @@ class D11BudgetGrantIssuer:
         """Verify and return the active signed grant in this business transaction."""
         return self._load_grant(db, lease_id)
 
+    def signed_budget_grant_at_version(self, db, lease_id: str,
+                                       version: int) -> tuple[BudgetLeaseGrant, str]:
+        """Verify an original signed grant for receipt replay, regardless of current status."""
+        row = db.execute(
+            "SELECT grant_json,signature FROM runtime_budget_grants "
+            "WHERE lease_id=? AND version=?", (lease_id, version),
+        ).fetchone()
+        if row is None:
+            raise IssuerAuthorityDenied("historical D11 budget lease grant is absent")
+        self._signer.verify("budget-grant.v1", row[0], row[1])
+        try:
+            grant = _decode_grant(row[0])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("historical budget grant payload is invalid") from exc
+        if (grant.lease_id, grant.version) != (lease_id, version):
+            raise IssuerAuthorityDenied("historical budget grant identity differs")
+        return grant, row[1]
+
 
 class D11BudgetJobIssuer(D11BudgetGrantIssuer):
     """Issues typed GraphCoordinator admissions from signed D02 and D11 state."""
