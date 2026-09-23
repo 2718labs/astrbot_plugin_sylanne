@@ -1933,6 +1933,9 @@ class GraphCoordinator:
         authority = bundle.envelope.authority
         self._authorize(lease, authority,
                         frozenset(proposal.domain for proposal in bundle.proposals))
+        if (isinstance(self.__store, ProductionGraphStore)
+                and self.__content_fence_v2 is not None):
+            return self._commit_domain_bundle_v2(bundle, lease)
         with self._content_fence(authority.namespace, authority.activation_generation, "write"):
             store = self.__store
             with store._lock:
@@ -1944,8 +1947,167 @@ class GraphCoordinator:
                 )
             return self._commit_domain_bundle_fenced(bundle, lease)
 
+    def _commit_domain_bundle_v2(self, bundle: DomainBundle,
+                                 lease: object) -> CommitReceipt:
+        """Commit under a durable write attempt; reconcile before any duplicate read."""
+        from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
+
+        store = self.__store
+        port = self.__content_fence_v2
+        authority = bundle.envelope.authority
+        namespace = authority.namespace
+        operation_id = bundle.envelope.identity.operation_id
+        digest = bundle.digest
+        attempt_id = "graph-write-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "bundle_digest": digest,
+        })[:48]
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            prior = store._db.execute(
+                "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            saved = store._db.execute(
+                "SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,"
+                "post_graph_revision,post_graph_epoch,finish_request_id,finish_request_digest "
+                "FROM graph_bundle_fences_v2 WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            intent = store._db.execute(
+                "SELECT digest,fence_attempt_id,requirements_json,anchor_json,"
+                "graph_revision,graph_epoch FROM graph_bundle_intents_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+        target = metadata.requirements
+        if target.namespace != namespace or target.activation_generation != authority.activation_generation:
+            raise UnavailableGuard("v2 graph recovery identity or generation differs")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("v2 graph recovery anchor differs")
+        requirements_json = canonical_json(asdict(target))
+        anchor_json = canonical_json(asdict(anchor))
+        if intent is None and prior is None:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("v2 graph recovery stamp changed before intent")
+                    db.execute(
+                        "INSERT OR IGNORE INTO graph_bundle_intents_v2"
+                        "(bot,persona,operation_id,digest,fence_attempt_id,"
+                        "requirements_json,anchor_json,graph_revision,graph_epoch) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            operation_id, digest, attempt_id, requirements_json,
+                            anchor_json, metadata.graph_revision, epoch.revision),
+                    )
+                    intent = db.execute(
+                        "SELECT digest,fence_attempt_id,requirements_json,anchor_json,"
+                        "graph_revision,graph_epoch FROM graph_bundle_intents_v2 "
+                        "WHERE bot=? AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone()
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+        if intent is None:
+            raise UnavailableGuard("durable v2 bundle intent is absent")
+        if intent[0] != digest:
+            raise EventConflict("operation ID reused with different bundle")
+        if (intent[1] != attempt_id or intent[2] != requirements_json
+                or intent[3] != anchor_json):
+            raise UnavailableGuard("durable v2 bundle intent identity differs")
+        if prior is None and (intent[4], intent[5]) != (
+                metadata.graph_revision, epoch.revision):
+            raise UnavailableGuard("uncommitted v2 bundle intent lost its graph stamp")
+        if prior is not None:
+            if prior[0] != digest:
+                raise EventConflict("operation ID reused with different bundle")
+            if saved is None or saved[0] != digest:
+                raise UnavailableGuard("durable v2 bundle fence receipt is absent")
+            try:
+                original = from_wire(json.loads(saved[1]))
+            except (TypeError, ValueError) as exc:
+                raise UnavailableGuard("durable v2 bundle permit is invalid") from exc
+            if (type(original) is not FencePermitV2
+                    or original.operation_id != attempt_id
+                    or original.operation != "write" or original.holder != self.__holder
+                    or original.subject != port.installation_grant.subject
+                    or original.authority_id != target.authority_id
+                    or original.namespace != target.authority_namespace
+                    or original.generation != target.activation_generation
+                    or original.pinned_anchor != anchor
+                    or (saved[2], saved[3]) != (intent[4], intent[5])
+                    or saved[4] != saved[2] + 1
+                    or saved[5] < saved[3]
+                    or saved[6] != "finish:" + attempt_id
+                    or saved[7] != "sha256:" + canonical_digest({
+                        "operation_id": attempt_id, "permit_token": original.token,
+                        "action": "finish_domain_bundle",
+                        "business_operation_id": operation_id, "bundle_digest": digest,
+                    })):
+                raise UnavailableGuard("durable v2 bundle fence identity differs")
+            observed, state = port.get_fence_operation(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                operation_id=attempt_id)
+            if observed != original or state not in {"active", "finished"}:
+                raise UnavailableGuard("v2 bundle Authority fence status differs")
+            if state == "active":
+                if (metadata.graph_revision != saved[4]
+                        or epoch.revision != saved[5]):
+                    raise UnavailableGuard("active v2 bundle fence lost its business stamp")
+                scope = FenceScope(
+                    namespace, target.authority_namespace, target.activation_generation,
+                    "write", attempt_id, original, anchor,
+                    NamespaceEpoch(*namespace.as_tuple, saved[3]), saved[2])
+                if port.validate_fence(scope) != original:
+                    raise UnavailableGuard("v2 bundle write permit changed")
+                port.finish_fence(scope, request_id=saved[6], request_digest=saved[7])
+            elif (metadata.graph_revision < saved[4]
+                  or epoch.revision < saved[5]):
+                raise UnavailableGuard("finished v2 bundle fence lost its business stamp")
+            return self._read_v2(authority, lambda: self._commit_domain_bundle_fenced(
+                bundle, lease, v2_read=True))
+        if saved is not None:
+            raise UnavailableGuard("v2 bundle fence exists without business receipt")
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=target.activation_generation,
+            operation="write", operation_id=attempt_id, expected_anchor=anchor,
+            retain_on_unknown=True)
+        scope = FenceScope(namespace, target.authority_namespace,
+                           target.activation_generation, "write", attempt_id,
+                           permit, anchor, epoch, metadata.graph_revision)
+        finish_id = "finish:" + attempt_id
+        finish_digest = "sha256:" + canonical_digest({
+            "operation_id": attempt_id, "permit_token": permit.token,
+            "action": "finish_domain_bundle", "business_operation_id": operation_id,
+            "bundle_digest": digest,
+        })
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("v2 bundle write permit changed")
+        receipt = self._commit_domain_bundle_fenced(
+            bundle, lease, v2_write=(metadata, epoch, finish_id,
+                                     finish_digest, canonical_json(to_wire(permit))))
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("v2 bundle write permit changed after commit")
+        with store._lock:
+            current, current_epoch = self._v2_graph_stamp(namespace)
+            if (current.requirements != metadata.requirements
+                    or current.graph_revision != metadata.graph_revision + 1
+                    or current_epoch.revision != receipt.invalidated_epochs[0].revision):
+                raise UnavailableGuard("v2 bundle graph stamp changed after commit")
+        port.finish_fence(scope, request_id=finish_id, request_digest=finish_digest)
+        return receipt
+
     def _commit_domain_bundle_fenced(self, bundle: DomainBundle,
-                                     lease: object) -> CommitReceipt:
+                                     lease: object, *, v2_read: bool = False,
+                                     v2_write=None) -> CommitReceipt:
         envelope = bundle.envelope
         namespace = envelope.authority.namespace
         domains = frozenset(proposal.domain for proposal in bundle.proposals)
@@ -2072,11 +2234,16 @@ class GraphCoordinator:
         runtime_admissions: list[RuntimeAdmission] = []
 
         def guard(db):
-            self._admit_content(
-                namespace, envelope.authority.activation_generation, "write",
-                tuple(item.key.token for item in envelope.version_guard.read_versions)
-                + tuple(write.key.token for write in writes),
-            )
+            if v2_write is not None:
+                expected, expected_epoch = v2_write[:2]
+                if self._v2_graph_stamp(namespace) != (expected, expected_epoch):
+                    raise StaleRead("v2 graph recovery stamp changed")
+            elif not v2_read:
+                self._admit_content(
+                    namespace, envelope.authority.activation_generation, "write",
+                    tuple(item.key.token for item in envelope.version_guard.read_versions)
+                    + tuple(write.key.token for write in writes),
+                )
             prior = db.execute(
                 "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
                 "AND operation_id=?", namespace.as_tuple + (identity.operation_id,),
@@ -2144,11 +2311,16 @@ class GraphCoordinator:
                 # This runs after graph writes but before SQLite COMMIT.  The
                 # sealed four-key exception must still hold, and the current
                 # process clock may have advanced during provider validation.
-                self._admit_content(
-                    namespace, envelope.authority.activation_generation, "write",
-                    tuple(item.key.token for item in envelope.version_guard.read_versions)
-                    + tuple(write.key.token for write in writes),
-                )
+                if v2_write is not None:
+                    expected, expected_epoch = v2_write[:2]
+                    if self._v2_graph_stamp(namespace) != (expected, expected_epoch):
+                        raise StaleRead("v2 graph recovery stamp changed")
+                elif not v2_read:
+                    self._admit_content(
+                        namespace, envelope.authority.activation_generation, "write",
+                        tuple(item.key.token for item in envelope.version_guard.read_versions)
+                        + tuple(write.key.token for write in writes),
+                    )
                 if self._version(db, namespace, "activation", "current") != str(
                         envelope.authority.activation_generation):
                     raise StaleRead("ingress activation generation changed before commit")
@@ -2217,6 +2389,22 @@ class GraphCoordinator:
                                 (write.key.token, ref.key.token, ref.revision, kind,
                                  identity.operation_id),
                             )
+            if v2_write is not None:
+                expected, expected_epoch, finish_id, finish_digest, permit_json = v2_write
+                store.cas_graph_recovery_metadata(
+                    expected, expected.requirements,
+                    _capability=self.__graph_capability)
+                db.execute(
+                    "INSERT INTO graph_bundle_fences_v2"
+                    "(bot,persona,operation_id,digest,permit_json,pre_graph_revision,"
+                    "pre_graph_epoch,post_graph_revision,post_graph_epoch,"
+                    "finish_request_id,finish_request_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (
+                        identity.operation_id, digest, permit_json,
+                        expected.graph_revision, expected_epoch.revision,
+                        expected.graph_revision + 1, graph_receipt.epoch.revision,
+                        finish_id, finish_digest),
+                )
             result.append(CommitReceipt(
                 "committed", identity.operation_id, digest, identity.activity_id,
                 identity.effect_id, seq, envelope.version_guard.read_versions,

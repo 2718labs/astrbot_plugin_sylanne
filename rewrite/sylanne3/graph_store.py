@@ -183,6 +183,30 @@ class GraphStore(Store):
                 operation_id TEXT NOT NULL, digest TEXT NOT NULL,
                 receipt_json TEXT NOT NULL,
                 PRIMARY KEY(bot,persona));
+            CREATE TABLE IF NOT EXISTS graph_bundle_fences_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, digest TEXT NOT NULL,
+                permit_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL,
+                pre_graph_epoch INTEGER NOT NULL,
+                post_graph_revision INTEGER NOT NULL,
+                post_graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL,
+                finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_bundle_intents_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, digest TEXT NOT NULL,
+                fence_attempt_id TEXT NOT NULL UNIQUE,
+                requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id));
+            CREATE TRIGGER IF NOT EXISTS graph_bundle_intent_no_update_v2
+                BEFORE UPDATE ON graph_bundle_intents_v2
+                BEGIN SELECT RAISE(ABORT, 'bundle intent is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_bundle_intent_no_delete_v2
+                BEFORE DELETE ON graph_bundle_intents_v2
+                BEGIN SELECT RAISE(ABORT, 'bundle intent is immutable'); END;
             CREATE TABLE IF NOT EXISTS graph_namespace_provision_intents_v2 (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 operation_id TEXT NOT NULL, digest TEXT NOT NULL,

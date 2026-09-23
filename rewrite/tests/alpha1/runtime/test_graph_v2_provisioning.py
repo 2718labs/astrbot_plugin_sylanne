@@ -8,12 +8,15 @@ from unittest.mock import patch
 
 import pytest
 
+from sylanne3.contracts import EventConflict, StaleRead
+from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.graph_coordinator import (
-    AuthorityDenied, GraphCoordinator, UnavailableGuard,
+    AuthorityDenied, BudgetAdmission, GraphCoordinator, RuntimeAdmission,
+    UnavailableGuard,
 )
 from sylanne3.graph_store import ProductionGraphStore
-from sylanne3.graph_types import AtomKey, Owner, TypeRegistry
+from sylanne3.graph_types import AtomKey, GraphWrite, Owner, TypeRegistry, TypeSpec
 from sylanne3.installation_policy import AdminInstallationPolicy
 from sylanne3.runtime.budget import BudgetLease, get_budget_lease
 from sylanne3.runtime.issuers import (
@@ -21,8 +24,10 @@ from sylanne3.runtime.issuers import (
 )
 from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime_contracts import (
-    InstallationGrantV2, NamespaceBootstrapV2, NamespaceId,
-    NamespaceRuntimeState,
+    AuthorityContext, CommandEnvelope, DependencySet, DomainBundle,
+    DomainProposal, InstallationGrantV2, NamespaceBootstrapV2, NamespaceId,
+    NamespaceRuntimeState, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA,
+    SourceQualification, VersionGuard, canonical_digest,
 )
 import sylanne3.graph_coordinator as coordinator_module
 
@@ -151,6 +156,246 @@ def row_counts(store):
             "runtime_budget_leases", "runtime_budget_operations",
             "runtime_budget_grants", "graph_namespace_provisioning_v2",
             "graph_namespace_provision_intents_v2")}
+
+
+@pytest.fixture
+def bundle_system(tmp_path):
+    registry = TypeRegistry()
+    registry.register(TypeSpec(
+        "state", ("persona",), "state", lambda value: None,
+        writer_domain="d06", schema_hash="a" * 64))
+    store = ProductionGraphStore(tmp_path / "business.db", registry)
+    authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
+    port = AuthorityPort(store, authority_db)
+    _, d11 = build_runtime_issuers(b"issuer-key-" * 4)
+    d11.admit_runtime = lambda bundle, db: RuntimeAdmission(BudgetAdmission(
+        "lease-persona", get_budget_lease(db, "lease-persona").version,
+        {"cpu_ms": 1}))
+    d02 = type("D02Admission", (), {"authorize_resources":
+                lambda self, bundle, db: True})()
+    bootstrap = object()
+    coordinator = GraphCoordinator(
+        store, bootstrap, holder="administrator", content_fence_v2=port,
+        d02_issuer=d02, d11_issuer=d11)
+    policy = policy_for(store)
+    coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="install-persona")
+    provider = type("Provider", (), {"validate":
+                    lambda self, proposal, snapshot: True})()
+    coordinator.register_provider(
+        bootstrap, "d06", provider, "d06.contract.v1", "b" * 64)
+    lease, capability = coordinator.grant(
+        bootstrap, actor="host", issuer_domain="d06", namespace=policy.namespace,
+        domains=("d06",), activation_generation=1, operation_id="write-a")
+    authority = AuthorityContext(
+        "host", "d06", capability, policy.namespace, ("persona",),
+        "remember", ("internal",), "policy-1", 1)
+
+    def bundle(operation="write-a", value=1):
+        key = AtomKey(Owner("persona", "bot", "persona"), "state", "mood")
+        snapshot = coordinator.read_snapshot(authority, lease, (key,))
+        envelope = CommandEnvelope(
+            RUNTIME_SCHEMA,
+            OperationIdentity("activity", None, "attempt", "commit", operation,
+                              canonical_digest({"input_refs": []})),
+            authority,
+            VersionGuard(
+                snapshot.versions,
+                (QueryEpoch(policy.namespace, "all", snapshot.epochs[0].revision),),
+                0, 0, registry.catalogue_hash, "scheme-1", "operator-1",
+                "policy-1", (), (), ()),
+            SourceQualification(
+                (), "reported", 1.0, 1.0, "external_report", "qualified", 0.5,
+                "not_applicable"),
+            (), "lease-persona", 4_102_444_800.0, 100.0, "character-v1", (),
+        )
+        proposal = DomainProposal(
+            "d06", "d06.contract.v1", "b" * 64, envelope,
+            (GraphWrite(key, {"n": value}),), DependencySet(), (), ())
+        return DomainBundle(envelope, (proposal,), (), (), (), (), (), (), ())
+
+    try:
+        yield store, coordinator, bootstrap, port, policy, lease, bundle, d02, d11, provider
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def restart_bundle_system(bundle_system, tmp_path):
+    store, _, _, port, policy, _, _, d02, d11, provider = bundle_system
+    anchor = port.anchors[policy.namespace]
+    store.close()
+    port.fences._db.close()
+    reopened = ProductionGraphStore(tmp_path / "business.db", store._registry)
+    authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
+    next_port = AuthorityPort(reopened, authority_db)
+    next_port.anchors[policy.namespace] = anchor
+    next_bootstrap = object()
+    next_coordinator = GraphCoordinator(
+        reopened, next_bootstrap, holder="administrator",
+        content_fence_v2=next_port, d02_issuer=d02, d11_issuer=d11)
+    next_coordinator.register_provider(
+        next_bootstrap, "d06", provider, "d06.contract.v1", "b" * 64)
+    next_lease, next_ref = next_coordinator.grant(
+        next_bootstrap, actor="host", issuer_domain="d06",
+        namespace=policy.namespace, domains=("d06",), activation_generation=1,
+        operation_id="write-a")
+    return reopened, next_coordinator, next_port, next_lease, next_ref, authority_db
+
+
+def test_v2_bundle_commit_advances_business_stamp_and_duplicate_is_read_only(bundle_system):
+    store, coordinator, _, port, policy, lease, make_bundle, *_ = bundle_system
+    first = make_bundle()
+    receipt = coordinator.commit_domain_bundle(first, lease)
+    assert receipt.status == "committed"
+    metadata = coordinator._v2_graph_stamp(policy.namespace)[0]
+    assert metadata.graph_revision == 1
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_fences_v2").fetchone() == (1,)
+    second = make_bundle("write-b", 2)
+    coordinator.commit_domain_bundle(second, lease)
+    duplicate = coordinator.commit_domain_bundle(first, lease)
+    assert duplicate.status == "duplicate"
+    assert coordinator._v2_graph_stamp(policy.namespace)[0].graph_revision == 2
+    assert len([item for item in port.finishes
+                if item[1].startswith("finish:graph-write-")]) == 2
+
+
+def test_v2_bundle_precommit_rollback_reuses_active_attempt(bundle_system):
+    store, coordinator, _, port, policy, lease, make_bundle, *_ = bundle_system
+    candidate = make_bundle()
+    port.lose_begin_after_durable = True
+    with pytest.raises(RuntimeError, match="begin response lost"):
+        coordinator.commit_domain_bundle(candidate, lease)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
+    assert not [item for item in port.finishes if item[0] == "write"
+                and item[1].startswith("finish:graph-write-")]
+    receipt = coordinator.commit_domain_bundle(candidate, lease)
+    assert receipt.status == "committed"
+    assert coordinator._v2_graph_stamp(policy.namespace)[0].graph_revision == 1
+
+
+def test_v2_bundle_lost_finish_recovers_from_durable_receipt(bundle_system):
+    store, coordinator, _, port, policy, lease, make_bundle, *_ = bundle_system
+    candidate = make_bundle()
+    port.lose_finish_after_durable = True
+    with pytest.raises(RuntimeError, match="finish response lost"):
+        coordinator.commit_domain_bundle(candidate, lease)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (1,)
+    assert coordinator.commit_domain_bundle(candidate, lease).status == "duplicate"
+    assert coordinator._v2_graph_stamp(policy.namespace)[0].graph_revision == 1
+
+
+def test_v2_bundle_cold_restart_finishes_only_after_durable_business_receipt(
+        bundle_system, tmp_path):
+    store, coordinator, _, port, policy, lease, make_bundle, *_ = bundle_system
+    candidate = make_bundle()
+    port.finish_fence = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("simulated crash before finish"))
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        coordinator.commit_domain_bundle(candidate, lease)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (1,)
+    reopened, next_coordinator, next_port, next_lease, next_ref, authority_db = (
+        restart_bundle_system(bundle_system, tmp_path))
+    assert next_ref == candidate.envelope.authority.capability_ref
+    try:
+        assert next_coordinator.commit_domain_bundle(candidate, next_lease).status == "duplicate"
+        assert next_coordinator._v2_graph_stamp(policy.namespace)[0].graph_revision == 1
+        assert next_port.finishes[0][1].startswith("finish:graph-write-")
+    finally:
+        reopened.close()
+        authority_db.close()
+
+
+def test_v2_bundle_unknown_begin_cold_restart_reuses_intent(bundle_system, tmp_path):
+    store, coordinator, _, port, policy, lease, make_bundle, *_ = bundle_system
+    candidate = make_bundle()
+    port.lose_begin_after_durable = True
+    with pytest.raises(RuntimeError, match="begin response lost"):
+        coordinator.commit_domain_bundle(candidate, lease)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_intents_v2").fetchone() == (1,)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
+    reopened, next_coordinator, next_port, next_lease, next_ref, authority_db = (
+        restart_bundle_system(bundle_system, tmp_path))
+    assert next_ref == candidate.envelope.authority.capability_ref
+    try:
+        assert next_coordinator.commit_domain_bundle(candidate, next_lease).status == "committed"
+        assert reopened._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (1,)
+        assert len([item for item in next_port.finishes
+                    if item[1].startswith("finish:graph-write-")]) == 1
+    finally:
+        reopened.close()
+        authority_db.close()
+
+
+def test_v2_bundle_changed_candidate_after_finished_uncommitted_attempt_holds(bundle_system):
+    store, coordinator, _, port, policy, lease, make_bundle, *_ = bundle_system
+    original = make_bundle()
+    changed = make_bundle(value=2)
+    port.lose_begin_after_durable = True
+    with pytest.raises(RuntimeError, match="begin response lost"):
+        coordinator.commit_domain_bundle(original, lease)
+    intent = store._db.execute(
+        "SELECT fence_attempt_id FROM graph_bundle_intents_v2 WHERE bot=? AND persona=? "
+        "AND operation_id=?", policy.namespace.as_tuple + ("write-a",)).fetchone()
+    permit, state = port.get_fence_operation(
+        namespace=policy.namespace, authority_namespace=policy.authority_namespace,
+        operation_id=intent[0])
+    assert state == "active"
+    port.fences.finish_fence(
+        permit, subject="subject", current_anchor=port.anchors[policy.namespace],
+        request_id="external-finish", request_digest="sha256:" + "f" * 64)
+    with pytest.raises(EventConflict, match="different bundle"):
+        coordinator.commit_domain_bundle(changed, lease)
+    with pytest.raises(AuthorityUnavailable, match="completed fence"):
+        coordinator.commit_domain_bundle(original, lease)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
+
+
+def test_v2_bundle_changed_authority_head_writes_nothing(bundle_system):
+    store, coordinator, _, port, policy, lease, make_bundle, *_ = bundle_system
+    candidate = make_bundle()
+    port.anchors[policy.namespace] = replace(
+        port.anchors[policy.namespace], execution_seq=1,
+        execution_digest="sha256:" + "a" * 64)
+    with pytest.raises(UnavailableGuard, match="anchor differs"):
+        coordinator.commit_domain_bundle(candidate, lease)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
+    assert coordinator._v2_graph_stamp(policy.namespace)[0].graph_revision == 0
+
+
+def test_v2_bundle_d11_failure_rolls_back_graph_and_stamp(bundle_system):
+    store, coordinator, _, port, policy, lease, make_bundle, _, d11, _ = bundle_system
+    candidate = make_bundle()
+    original = d11.admit_runtime
+    d11.admit_runtime = lambda *_: (_ for _ in ()).throw(RuntimeError("D11 unavailable"))
+    with pytest.raises(RuntimeError, match="D11 unavailable"):
+        coordinator.commit_domain_bundle(candidate, lease)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_fences_v2").fetchone() == (0,)
+    assert coordinator._v2_graph_stamp(policy.namespace)[0].graph_revision == 0
+    d11.admit_runtime = original
+    assert coordinator.commit_domain_bundle(candidate, lease).status == "committed"
+
+
+def test_v2_bundle_changed_graph_stamp_after_permit_writes_nothing(bundle_system):
+    store, coordinator, _, port, policy, lease, make_bundle, *_ = bundle_system
+    candidate = make_bundle()
+    original = port.validate_fence
+
+    def advance_stamp(scope):
+        result = original(scope)
+        if scope.operation == "write":
+            store._db.execute(
+                "UPDATE graph_recovery_metadata_v2 SET graph_revision=graph_revision+1 "
+                "WHERE bot=? AND persona=?", policy.namespace.as_tuple)
+            port.validate_fence = original
+        return result
+
+    port.validate_fence = advance_stamp
+    with pytest.raises(StaleRead, match="stamp changed"):
+        coordinator.commit_domain_bundle(candidate, lease)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_fences_v2").fetchone() == (0,)
 
 
 def test_genesis_uses_d11_grant_capability_without_d02(tmp_path):
