@@ -12,6 +12,7 @@ from typing import Mapping, Protocol
 from uuid import UUID
 
 from ..authority_service.v2_owner_contract import OwnerAuthorizationGuardV1, OwnerPrincipalV1
+from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..domains.d01 import ActiveRoleQualification
 from ..domains.d03 import ContextProvider, RoleBinding, RoleBindingResolution
 from ..graph_types import AtomKey, GraphVersion, Owner
@@ -85,7 +86,7 @@ class HostScenePolicyPort(Protocol):
     def resolve_current_scene(
         self, *, namespace: NamespaceId, scene_ref: str, visibility: str,
         purpose: str, audience: str, operation_id: str,
-        request_digest: str,
+        request_digest: str, proof: CurrentFirstBindingProof,
     ) -> VerifiedHostScenePolicy | None: ...
 
 
@@ -135,6 +136,10 @@ class CurrentD03OnboardingResolver:
         if (not isinstance(session, AuthenticatedSession)
                 or not session.allows(scope, "workbench.bind_scene", purpose, audience)):
             return hold("session_capability_unavailable")
+        if (type(session.owner_session_token) is not str
+                or not session.owner_session_token
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1):
+            return hold("signed_owner_session_unavailable")
         if (self._namespaces is None or self._owners is None
                 or self._scenes is None or not isinstance(self._provider, ContextProvider)):
             return hold("trusted_scene_ports_uninstalled")
@@ -174,31 +179,16 @@ class CurrentD03OnboardingResolver:
             return hold("current_owner_pairing_unavailable")
         scene_ref = input_data["scene_ref"]
         visibility = input_data["visibility"]
-        policy = self._scenes.resolve_current_scene(
-            namespace=namespace, scene_ref=scene_ref, visibility=visibility,
-            purpose=purpose, audience=audience, operation_id=operation_id,
-            request_digest=request_digest)
-        if (not isinstance(policy, VerifiedHostScenePolicy)
-                or policy.namespace != namespace
-                or policy.scene_ref != scene_ref
-                or policy.visibility != visibility
-                or policy.binding.scene_ref != scene_ref
-                or policy.binding.visibility_scope != visibility
-                or policy.binding.subject_persona_ref != f"persona:{namespace.persona_id}"
-                or policy.binding.scope_selector != "scene"
-                or policy.binding.target_entity_ref is not None
-                or policy.binding.group_ref is not None
-                or policy.binding.status != "active"
-                or policy.binding.binding_version != 1):
-            return hold("host_scene_policy_unavailable")
         read = getattr(coordinator, "read_first_scene_binding_proof_v2", None)
         if not callable(read):
             return hold("current_graph_negative_proof_uninstalled")
         try:
             proof = read(namespace=namespace, scene_ref=scene_ref,
                          purpose=purpose, principal=owner.principal,
-                         actor_id=owner.actor_id)
-        except (LookupError, PermissionError, ValueError):
+                         actor_id=owner.actor_id,
+                         owner_session_token=session.owner_session_token,
+                         owner_session_request=session.owner_session_request)
+        except (LookupError, PermissionError, RuntimeError, ValueError):
             return hold("current_graph_negative_proof_unavailable")
         if (not isinstance(proof, CurrentFirstBindingProof)
                 or proof.owner_guard != owner.guard
@@ -219,19 +209,45 @@ class CurrentD03OnboardingResolver:
                 or proof.prior.request.requested_action_kind != "bind_scene"
                 or proof.prior.request.purpose != purpose):
             return hold("current_graph_negative_proof_invalid")
+        policy = self._scenes.resolve_current_scene(
+            namespace=namespace, scene_ref=scene_ref, visibility=visibility,
+            purpose=purpose, audience=audience, operation_id=operation_id,
+            request_digest=request_digest, proof=proof)
+        if (not isinstance(policy, VerifiedHostScenePolicy)
+                or policy.namespace != namespace
+                or policy.scene_ref != scene_ref
+                or policy.visibility != visibility
+                or policy.binding.scene_ref != scene_ref
+                or policy.binding.visibility_scope != visibility
+                or policy.binding.subject_persona_ref != f"persona:{namespace.persona_id}"
+                or policy.binding.scope_selector != "scene"
+                or policy.binding.target_entity_ref is not None
+                or policy.binding.group_ref is not None
+                or policy.binding.status != "active"
+                or policy.binding.binding_version != 1):
+            return hold("host_scene_policy_unavailable")
         envelope = policy.envelope
         key = AtomKey(Owner("scene", *namespace.as_tuple, scene_ref),
                       "d03.role_binding", policy.binding.role_binding_id)
         expected_reads = (set(proof.active_role.read_versions)
                           | set(proof.prior.read_versions) | {GraphVersion(key, 0)})
+        graph_guard = proof.graph_guard
+        version_guard = envelope.version_guard
         if (envelope.authority.namespace != namespace
                 or envelope.authority.actor != session.actor_id
                 or envelope.authority.issuer_domain != "d11"
                 or envelope.authority.purpose != purpose
                 or audience not in envelope.authority.audience
                 or envelope.identity.operation_id != operation_id
-                or set(envelope.version_guard.read_versions) != expected_reads
-                or envelope.version_guard.query_epochs != (proof.prior.query_epoch,)
+                or len(version_guard.read_versions) != len(expected_reads)
+                or set(version_guard.read_versions) != expected_reads
+                or version_guard.query_epochs != (proof.prior.query_epoch,)
+                or version_guard.access_epoch != graph_guard.access_epoch
+                or version_guard.delete_epoch != graph_guard.delete_epoch
+                or version_guard.catalogue_version != graph_guard.catalogue_version
+                or version_guard.scheme_version != graph_guard.scheme_version
+                or version_guard.operator_version != graph_guard.operator_version
+                or version_guard.policy_version != graph_guard.policy_version
                 or envelope.source_qualification.evidence_eligibility != "qualified"
                 or not set(policy.binding.source_refs).issubset(
                     envelope.source_qualification.source_refs)):
