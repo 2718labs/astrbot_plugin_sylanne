@@ -18,6 +18,7 @@ from .rewrite.sylanne3.host import (
 )
 from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
 from .rewrite.sylanne3.host.authority_profile import AuthorityProfileUnavailable
+from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, SceneCandidateCatalog
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
 from .rewrite.sylanne3.runtime_contracts import NamespaceId, canonical_digest
@@ -56,6 +57,8 @@ class Sylanne3Plugin(Star):
             self._enabled = False
             self._config_valid = False
         self._runtime: RuntimeContext | None = None
+        self._installed_namespace: NamespaceId | None = None
+        self._scene_candidates = SceneCandidateCatalog()
         self.runtime_health = RuntimeHealth("limited", ("not_started",))
         self._workbench = WorkbenchHostMount(self._installation_status)
         self._workbench.register(context)
@@ -69,6 +72,29 @@ class Sylanne3Plugin(Star):
         health = self.runtime_health
         return health.status, (health.missing_capabilities[0]
                                if health.missing_capabilities else "none")
+
+    def observed_scene_candidates(self, namespace: NamespaceId) -> tuple[ObservedSceneCandidate, ...]:
+        """Server-side observations only; an Owner route must still authenticate."""
+        if (not self._enabled or self._runtime is None
+                or self._installed_namespace != namespace
+                or self.runtime_health.status not in {"limited", "ready"}):
+            return ()
+        return self._scene_candidates.for_namespace(namespace)
+
+    def lookup_observed_scene_candidate(
+        self, *, namespace: NamespaceId, platform_ref: str,
+        conversation_ref: str, visibility: str, scene_ref: str,
+    ) -> ObservedSceneCandidate | None:
+        """Require exact host identity; this lookup does not authorize binding."""
+        if (not self._enabled or self._runtime is None
+                or self._installed_namespace != namespace
+                or self.runtime_health.status not in {"limited", "ready"}):
+            return None
+        return self._scene_candidates.get_exact(
+            namespace=namespace, platform_ref=platform_ref,
+            conversation_ref=conversation_ref, visibility=visibility,
+            scene_ref=scene_ref,
+        )
 
     async def initialize(self) -> None:
         if not self._config_valid:
@@ -132,6 +158,7 @@ class Sylanne3Plugin(Star):
                 owner_principal_resolver=self._owner_principal_resolver,
             )
             health = await self._runtime.start_v2(installation)
+            self._installed_namespace = installation.installation_policy.namespace
         except Exception:
             self.runtime_health = RuntimeHealth("blocked", ("runtime_bootstrap",))
             logger.error("Sylanne 3 startup blocked: v2 graph bootstrap failed")
@@ -176,6 +203,8 @@ class Sylanne3Plugin(Star):
 
     async def terminate(self) -> None:
         self._workbench.close()
+        self._scene_candidates.clear()
+        self._installed_namespace = None
         if self._runtime is not None:
             self.runtime_health = await self._runtime.stop()
             self._runtime = None
@@ -185,10 +214,19 @@ class Sylanne3Plugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def ingress(self, event: AstrMessageEvent) -> None:
         runtime = self._runtime
-        if runtime is None or self.runtime_health.status != "ready":
+        if (not self._enabled or runtime is None
+                or self.runtime_health.status not in {"limited", "ready"}
+                or (self.runtime_health.status == "limited" and (
+                    self._installed_namespace is None
+                    or self.runtime_health.missing_capabilities == ("not_started",)))):
             return
+        ready = self.runtime_health.status == "ready"
         try:
             envelope = await build_astrbot_ingress(event, self.context)
+            if envelope.namespace == self._installed_namespace:
+                self._scene_candidates.observe(envelope)
+            if not ready:
+                return
             receipt = await runtime.handle_ingress(envelope)
         except AstrBotIngressError:
             logger.warning("Sylanne 3 ingress rejected: invalid host identity or ownership")

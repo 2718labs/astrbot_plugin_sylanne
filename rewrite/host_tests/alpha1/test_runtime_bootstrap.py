@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import importlib
 import os
@@ -41,6 +41,7 @@ from sylanne3.host import (
 from sylanne3.host.authority_client import AuthorityClient, AuthoritySelection
 from sylanne3.host.d06_ingress import ingress_source_identity
 from sylanne3.host.ingress_assembler import ingress_content_fingerprint
+from sylanne3.host.scene_candidates import SceneCandidateCatalog
 from sylanne3.runtime.ingress_contracts import CommittedIngressReplay
 from sylanne3.runtime_contracts import (
     AuthorityContext,
@@ -570,10 +571,91 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         plugin._runtime = controlled
         plugin.runtime_health = RuntimeHealth("ready")
         event = Event()
+        expected = await module.build_astrbot_ingress(event, plugin.context)
+        plugin._installed_namespace = expected.namespace
         await plugin.ingress(event)
         self.assertTrue(event.is_stopped())
         self.assertEqual(len(controlled.envelopes), 1)
         self.assertEqual(controlled.envelopes[0].lineage.source_ref.__len__(), 64)
+        self.assertEqual(len(plugin.observed_scene_candidates(expected.namespace)), 1)
+
+    async def test_limited_runtime_records_only_exact_real_host_scene_identity(self) -> None:
+        module = load_plugin_module()
+
+        class NoIngress:
+            async def handle_ingress(self, _envelope):
+                raise AssertionError("limited runtime must not ingest content")
+
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),
+            {"enabled": True},
+        )
+        plugin.context = _IngressContext()
+        plugin._runtime = NoIngress()
+        plugin.runtime_health = RuntimeHealth("limited", ("scene_binding",))
+        event = Event(text="private message content")
+        expected = await module.build_astrbot_ingress(event, plugin.context)
+        plugin._installed_namespace = expected.namespace
+
+        await plugin.ingress(event)
+        scene_ref = importlib.import_module(
+            f"{module.__package__}.rewrite.sylanne3.runtime.first_ingress_v2"
+        ).scene_ref_for_conversation(
+            expected.namespace, expected.platform_ref, expected.conversation_ref)
+        exact = dict(namespace=expected.namespace, platform_ref=expected.platform_ref,
+                     conversation_ref=expected.conversation_ref,
+                     visibility=expected.visibility, scene_ref=scene_ref)
+        candidate = plugin.lookup_observed_scene_candidate(**exact)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.scene_ref, scene_ref)
+        self.assertEqual(plugin.observed_scene_candidates(expected.namespace), (candidate,))
+        self.assertFalse(event.is_stopped())
+        self.assertFalse(any(name in asdict(candidate) for name in
+                             ("text", "sender_ref", "message_id", "lineage")))
+        self.assertNotIn(event.get_message_str(), repr(candidate))
+
+        for change in (
+            {"namespace": type(expected.namespace)("another-bot", expected.namespace.persona_id)},
+            {"platform_ref": "another-platform"},
+            {"conversation_ref": "another-conversation"},
+            {"visibility": "group"},
+            {"scene_ref": "scene:another"},
+        ):
+            self.assertIsNone(plugin.lookup_observed_scene_candidate(**(exact | change)))
+        other_bot = Event()
+        other_bot.message_obj.self_id = "bot-2"
+        await plugin.ingress(other_bot)
+        self.assertEqual(plugin.observed_scene_candidates(expected.namespace), (candidate,))
+        media = Event(text="image")
+        media.message_obj.message = [Image.fromURL("https://example.invalid/a.png")]
+        await plugin.ingress(media)
+        self.assertEqual(plugin.observed_scene_candidates(expected.namespace), (candidate,))
+
+        plugin._enabled = False
+        await plugin.ingress(event)
+        self.assertEqual(plugin.observed_scene_candidates(expected.namespace), ())
+        self.assertIsNone(plugin.lookup_observed_scene_candidate(**exact))
+
+    async def test_scene_candidate_catalogue_is_bounded_and_expires(self) -> None:
+        tick = [0.0]
+        catalogue = SceneCandidateCatalog(capacity=2, ttl_seconds=5.0,
+                                          clock=lambda: tick[0])
+        envelope = await build_astrbot_ingress(Event(), _IngressContext())
+        first = catalogue.observe(envelope)
+        tick[0] = 1.0
+        second = catalogue.observe(replace(envelope, conversation_ref="conversation:second"))
+        tick[0] = 2.0
+        third = catalogue.observe(replace(envelope, conversation_ref="conversation:third"))
+        self.assertEqual(catalogue.for_namespace(envelope.namespace), (second, third))
+        self.assertIsNone(catalogue.get_exact(
+            namespace=first.namespace, platform_ref=first.platform_ref,
+            conversation_ref=first.conversation_ref, visibility=first.visibility,
+            scene_ref=first.scene_ref))
+        self.assertIsNone(catalogue.observe(replace(envelope, visibility="other")))
+        tick[0] = 6.5
+        self.assertEqual(catalogue.for_namespace(envelope.namespace), (third,))
+        tick[0] = 7.0
+        self.assertEqual(catalogue.for_namespace(envelope.namespace), ())
 
     async def test_stock_authority_client_requires_enrollment_and_ignores_self_signed_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
