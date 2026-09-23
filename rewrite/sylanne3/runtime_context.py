@@ -11,9 +11,12 @@ from typing import Awaitable, Callable
 from .domain_registry import DomainRegistry, discover_domain_registry
 from .graph_coordinator import GraphCoordinator, IngressClockSample, IngressIssuancePolicy
 from .graph_store import ProductionGraphStore
+from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
+from .host.installed_package import verify_installed_package
+from .host.v2_fence_port import V2FenceOutcomeUnknown
 from .runtime.restore_anchor import ExecutionJournalPort
-from .runtime_contracts import NamespaceId
+from .runtime_contracts import InstallationGrantV2, NamespaceId
 
 
 @dataclass(frozen=True)
@@ -99,14 +102,91 @@ class RuntimeContext:
         self._domains = domains or discover_domain_registry()
         self._store: ProductionGraphStore | None = None
         self._coordinator: GraphCoordinator | None = None
+        self._worker: GraphWorker | None = None
         self._ingress_handler: Callable[
             [HostIngressEnvelope, GraphCoordinator], Awaitable[IngressReceipt]
         ] | None = None
         self._lock = asyncio.Lock()
         self.health = RuntimeHealth("limited", ("not_started",))
 
+    async def start_v2(
+        self,
+        installation_grant: InstallationGrantV2,
+        fence_port_factory: Callable,
+        *,
+        capacity: int = 8,
+    ) -> RuntimeHealth:
+        """Own a v2 graph worker; pairing alone never admits a namespace."""
+        async with self._lock:
+            if "v2_fence_recovery" in self.health.missing_capabilities:
+                return self.health
+            if self._worker is not None:
+                return self.health
+            if self._store is not None:
+                return self.health
+            if not self._domains.complete:
+                self.health = RuntimeHealth("blocked", ("domain_registry",))
+                return self.health
+            if type(installation_grant) is not InstallationGrantV2:
+                self.health = RuntimeHealth("blocked", ("installation_grant",))
+                return self.health
+            package = await asyncio.to_thread(
+                verify_installed_package,
+                self._package_root,
+                installation_grant.manifest_digest,
+            )
+            if not package.verified or package.build_mode != "formal-alpha1":
+                self.health = RuntimeHealth(
+                    "blocked", ("installed_package",),
+                    package.reason if not package.verified else "formal-alpha1 package required",
+                )
+                return self.health
+
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+
+            def make_store():
+                return ProductionGraphStore(
+                    self._data_dir / "sylanne3.sqlite3", self._domains.type_registry,
+                )
+
+            def make_coordinator(store, port):
+                if port.installation_grant() != installation_grant:
+                    raise RuntimeError("v2 port installation grant changed")
+                bootstrap = object()
+                coordinator = GraphCoordinator(
+                    store, bootstrap, holder=installation_grant.administrator_holder,
+                    content_fence_v2=port,
+                )
+                for registration in self._domains.registrations.values():
+                    coordinator.register_provider(
+                        bootstrap, registration.domain, registration.provider,
+                        registration.proposal_schema,
+                        registration.proposal_schema_hash,
+                    )
+                return coordinator
+
+            try:
+                self._worker = await GraphWorker.start(
+                    make_store, make_coordinator,
+                    fence_port_factory=fence_port_factory, capacity=capacity,
+                )
+            except Exception:
+                self.health = RuntimeHealth(
+                    "blocked", ("graph_worker",), "v2 graph worker could not initialize",
+                )
+                return self.health
+            self.health = RuntimeHealth(
+                "limited", ("namespace_activation",),
+                "v2 graph worker started; namespace admission is pending",
+            )
+            return self.health
+
     async def start(self) -> RuntimeHealth:
         async with self._lock:
+            if "v2_fence_recovery" in self.health.missing_capabilities:
+                return self.health
+            if self._worker is not None:
+                return self.health
             if self.health.status == "ready":
                 return self.health
             missing_capabilities = []
@@ -234,10 +314,22 @@ class RuntimeContext:
 
     async def stop(self) -> RuntimeHealth:
         async with self._lock:
+            if "v2_fence_recovery" in self.health.missing_capabilities:
+                return self.health
             self.health = RuntimeHealth("draining")
+            worker, self._worker = self._worker, None
             store, self._store = self._store, None
             self._coordinator = None
             self._ingress_handler = None
+            if worker is not None:
+                try:
+                    await worker.close()
+                except V2FenceOutcomeUnknown:
+                    self.health = RuntimeHealth(
+                        "blocked", ("v2_fence_recovery",),
+                        "v2 Authority fence outcome is unresolved",
+                    )
+                    raise
             if store is not None:
                 await asyncio.to_thread(store.close)
             self.health = RuntimeHealth("stopped")

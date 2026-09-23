@@ -134,3 +134,60 @@ def test_close_rejects_new_work_and_drains_queued_calls():
             await worker.close()
 
     asyncio.run(scenario())
+
+
+def test_v2_port_creation_binding_and_shutdown_share_graph_thread():
+    async def scenario():
+        trace = []
+        store_factory, _ = _factory(trace)
+
+        class Port:
+            def __init__(self):
+                trace.append(("port_open", get_ident()))
+
+            def close(self):
+                trace.append(("port_close", get_ident()))
+
+        def make_coordinator(store, port):
+            trace.append(("coordinator_open", get_ident()))
+            return store, port
+
+        worker = await GraphWorker.start(
+            store_factory, make_coordinator, fence_port_factory=Port,
+        )
+        try:
+            worker_thread = await worker.call(lambda _: get_ident())
+        finally:
+            await worker.close()
+        assert [event for event, _ in trace] == [
+            "store_open", "port_open", "coordinator_open", "port_close", "store_close",
+        ]
+        assert worker_thread != get_ident()
+        assert {thread for _, thread in trace} == {worker_thread}
+
+    asyncio.run(scenario())
+
+
+def test_v2_port_and_store_close_when_coordinator_factory_fails():
+    async def scenario():
+        trace = []
+        store_factory, _ = _factory(trace)
+
+        class Port:
+            def __init__(self):
+                trace.append(("port_open", get_ident()))
+
+            def close(self):
+                trace.append(("port_close", get_ident()))
+
+        def fail(_store, _port):
+            raise RuntimeError("binding failed")
+
+        with pytest.raises(RuntimeError, match="binding failed"):
+            await GraphWorker.start(store_factory, fail, fence_port_factory=Port)
+        assert [event for event, _ in trace] == [
+            "store_open", "port_open", "port_close", "store_close",
+        ]
+        assert len({thread for _, thread in trace}) == 1
+
+    asyncio.run(scenario())

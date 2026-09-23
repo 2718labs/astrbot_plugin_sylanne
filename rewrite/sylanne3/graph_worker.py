@@ -18,20 +18,24 @@ _STOP = object()
 class GraphWorker:
     """Run store creation, coordinator calls, and store close on one thread.
 
-    ``store_factory`` creates a ProductionGraphStore. ``coordinator_factory``
-    binds and returns its GraphCoordinator. A submitted callable receives that
+    ``store_factory`` creates a ProductionGraphStore. When supplied,
+    ``fence_port_factory`` creates the V2FencePort on the same thread before
+    ``coordinator_factory`` binds it to the GraphCoordinator. A submitted callable receives that
     coordinator as its first argument. The fixed capacity counts both running
     and queued calls until the worker actually finishes them.
     """
 
     def __init__(self, store_factory: Callable, coordinator_factory: Callable,
-                 *, capacity: int = 8) -> None:
+                 *, fence_port_factory: Callable | None = None, capacity: int = 8) -> None:
         if not callable(store_factory) or not callable(coordinator_factory):
             raise TypeError("graph worker requires store and coordinator factories")
+        if fence_port_factory is not None and not callable(fence_port_factory):
+            raise TypeError("graph worker fence port factory must be callable")
         if type(capacity) is not int or capacity < 1:
             raise ValueError("graph worker capacity must be a positive integer")
         self._store_factory = store_factory
         self._coordinator_factory = coordinator_factory
+        self._fence_port_factory = fence_port_factory
         self._slots = BoundedSemaphore(capacity)
         # One extra cell is reserved for the shutdown marker, never for work.
         self._queue: Queue = Queue(maxsize=capacity + 1)
@@ -43,8 +47,10 @@ class GraphWorker:
 
     @classmethod
     async def start(cls, store_factory: Callable, coordinator_factory: Callable,
-                    *, capacity: int = 8) -> GraphWorker:
-        worker = cls(store_factory, coordinator_factory, capacity=capacity)
+                    *, fence_port_factory: Callable | None = None,
+                    capacity: int = 8) -> GraphWorker:
+        worker = cls(store_factory, coordinator_factory,
+                     fence_port_factory=fence_port_factory, capacity=capacity)
         worker._thread.start()
         try:
             await asyncio.shield(asyncio.wrap_future(worker._started))
@@ -59,10 +65,15 @@ class GraphWorker:
 
     def _run(self) -> None:
         store = None
+        fence_port = None
         failure = None
         try:
             store = self._store_factory()
-            coordinator = self._coordinator_factory(store)
+            if self._fence_port_factory is None:
+                coordinator = self._coordinator_factory(store)
+            else:
+                fence_port = self._fence_port_factory()
+                coordinator = self._coordinator_factory(store, fence_port)
             self._started.set_result(None)
             while True:
                 item = self._queue.get()
@@ -86,6 +97,12 @@ class GraphWorker:
         except BaseException as exc:
             failure = exc
         finally:
+            if fence_port is not None:
+                try:
+                    fence_port.close()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
             if store is not None:
                 try:
                     store.close()
@@ -122,8 +139,10 @@ class GraphWorker:
             if not self._closed:
                 self._closed = True
                 self._queue.put_nowait(_STOP)
-        await asyncio.shield(asyncio.wrap_future(self._stopped))
-        await asyncio.to_thread(self._thread.join)
+        try:
+            await asyncio.shield(asyncio.wrap_future(self._stopped))
+        finally:
+            await asyncio.to_thread(self._thread.join)
 
 
 __all__ = ("GraphWorker",)
