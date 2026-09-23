@@ -2,6 +2,7 @@
 //! sparse nonlinear step. ABI 2 uses it for a fixed complete block certificate.
 
 use crate::interval::{environment_supported, Interval, IntervalError};
+use sha2::{Digest, Sha256};
 
 pub(crate) const MAX_VERIFIED_N: usize = 64;
 const MAX_VERIFIED_A_ROWS: usize = 64;
@@ -31,6 +32,7 @@ pub(crate) enum VerifierError {
     InvalidState,
     InvalidStep,
     InvalidInheritedError,
+    TrajectorySourceMismatch,
     ContractionNotProven,
     TemporalBoundUnavailable,
     NonlinearArgumentOutOfRange,
@@ -135,6 +137,109 @@ pub(crate) struct JointErrorBounds {
     pub(crate) endpoint_error: Interval,
     pub(crate) reconstruction_defect: Interval,
     pub(crate) time_error: Interval,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FixedTrajectoryBounds {
+    pub(crate) steps: Vec<JointErrorBounds>,
+    pub(crate) final_time_error: Interval,
+    /// Digest of the complete mathematical inputs actually verified here.
+    /// A digest binds bytes but does not authenticate their external origin.
+    pub(crate) input_sha256: [u8; 32],
+}
+
+/// Verify a mathematical fixed-parameter IVP from the first exact input state.
+/// Subsequent inherited errors are computed from the preceding verified step,
+/// never supplied by a caller. This establishes neither the external origin of
+/// the initial state nor whether this CSR block closes a larger graph.
+pub(crate) fn verify_fixed_trajectory(
+    steps: &[JointVerificationInput<'_>],
+) -> Result<FixedTrajectoryBounds, VerifierError> {
+    let Some(first) = steps.first() else {
+        return Err(VerifierError::InvalidDimension);
+    };
+    let mut prior_error = Interval::point(0.0)?;
+    let mut verified = Vec::with_capacity(steps.len());
+    let mut digest = Sha256::new();
+    digest.update(b"sylanne3-fixed-trajectory-math-v1\0");
+    hash_length(&mut digest, steps.len());
+    for (index, step) in steps.iter().enumerate() {
+        if index > 0 {
+            let previous = &steps[index - 1];
+            if !same_f64_bits(previous.y, step.x) || !same_fixed_model(first, step) {
+                return Err(VerifierError::TrajectorySourceMismatch);
+            }
+        }
+        let bounds = verify_joint_error_bounds(step, prior_error)?;
+        hash_joint_input(&mut digest, step);
+        prior_error = bounds.time_error;
+        verified.push(bounds);
+    }
+    Ok(FixedTrajectoryBounds {
+        steps: verified,
+        final_time_error: prior_error,
+        input_sha256: digest.finalize().into(),
+    })
+}
+
+fn hash_length(digest: &mut Sha256, length: usize) {
+    digest.update((length as u64).to_le_bytes());
+}
+
+fn hash_f64_values(digest: &mut Sha256, values: &[f64]) {
+    hash_length(digest, values.len());
+    for value in values {
+        digest.update(value.to_bits().to_le_bytes());
+    }
+}
+
+fn hash_matrix(digest: &mut Sha256, matrix: SparseMatrix<'_>) {
+    hash_length(digest, matrix.rows);
+    hash_length(digest, matrix.cols);
+    hash_length(digest, matrix.offsets.len());
+    for offset in matrix.offsets {
+        digest.update(offset.to_le_bytes());
+    }
+    hash_length(digest, matrix.indices.len());
+    for index in matrix.indices {
+        digest.update(index.to_le_bytes());
+    }
+    hash_f64_values(digest, matrix.values);
+}
+
+fn hash_joint_input(digest: &mut Sha256, input: &JointVerificationInput<'_>) {
+    for matrix in [input.k, input.r, input.j, input.a] {
+        hash_matrix(digest, matrix);
+    }
+    for values in [input.alpha, input.x, input.y, input.drive] {
+        hash_f64_values(digest, values);
+    }
+    digest.update(input.h.to_bits().to_le_bytes());
+}
+
+fn same_f64_bits(lhs: &[f64], rhs: &[f64]) -> bool {
+    lhs.len() == rhs.len()
+        && lhs
+            .iter()
+            .zip(rhs)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+fn same_matrix_bits(lhs: SparseMatrix<'_>, rhs: SparseMatrix<'_>) -> bool {
+    lhs.rows == rhs.rows
+        && lhs.cols == rhs.cols
+        && lhs.offsets == rhs.offsets
+        && lhs.indices == rhs.indices
+        && same_f64_bits(lhs.values, rhs.values)
+}
+
+fn same_fixed_model(lhs: &JointVerificationInput<'_>, rhs: &JointVerificationInput<'_>) -> bool {
+    same_matrix_bits(lhs.k, rhs.k)
+        && same_matrix_bits(lhs.r, rhs.r)
+        && same_matrix_bits(lhs.j, rhs.j)
+        && same_matrix_bits(lhs.a, rhs.a)
+        && same_f64_bits(lhs.alpha, rhs.alpha)
+        && same_f64_bits(lhs.drive, rhs.drive)
 }
 
 /// Independently reconstruct the bounded nonlinear discrete gradient, fixed-point
@@ -910,6 +1015,62 @@ mod tests {
             bounds.time_error.upper() >= (input.y[0] - exact_flow).abs() + (-input.h).exp() * 0.01
         );
         assert!(bounds.time_error.lower() >= 0.0);
+    }
+
+    #[test]
+    fn fixed_trajectory_inherits_error_and_rejects_state_reset() {
+        let values = [1.0];
+        let empty = SparseMatrix::new(1, 1, &[0, 0], &[], &[]);
+        let first = JointVerificationInput {
+            k: scalar_matrix(&values),
+            r: scalar_matrix(&values),
+            j: empty,
+            a: SparseMatrix::new(0, 1, &[0], &[], &[]),
+            alpha: &[],
+            x: &[1.0],
+            y: &[0.9],
+            h: 0.1,
+            drive: &[0.0],
+        };
+        let second = JointVerificationInput {
+            x: &[0.9],
+            y: &[0.82],
+            ..first
+        };
+        let chain = verify_fixed_trajectory(&[first, second]).unwrap();
+        let repeated = verify_fixed_trajectory(&[first, second]).unwrap();
+        let reset = verify_joint_error_bounds(&second, Interval::point(0.0).unwrap()).unwrap();
+        assert_eq!(chain.steps.len(), 2);
+        assert_eq!(chain.input_sha256, repeated.input_sha256);
+        assert!(chain.final_time_error.upper() > reset.time_error.upper());
+        assert!(chain.final_time_error.upper() >= (0.82 - (-0.2_f64).exp()).abs());
+        let changed_endpoint = JointVerificationInput {
+            y: &[0.83],
+            ..second
+        };
+        assert_ne!(
+            chain.input_sha256,
+            verify_fixed_trajectory(&[first, changed_endpoint])
+                .unwrap()
+                .input_sha256
+        );
+
+        let forged_previous = JointVerificationInput {
+            x: &[1.0],
+            ..second
+        };
+        assert_eq!(
+            verify_fixed_trajectory(&[first, forged_previous]),
+            Err(VerifierError::TrajectorySourceMismatch)
+        );
+        let changed_drive = JointVerificationInput {
+            drive: &[0.1],
+            ..second
+        };
+        assert_eq!(
+            verify_fixed_trajectory(&[first, changed_drive]),
+            Err(VerifierError::TrajectorySourceMismatch)
+        );
     }
 
     #[test]
