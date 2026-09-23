@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import secrets
@@ -13,6 +13,7 @@ import time
 from typing import Callable
 
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime_contracts import InstallationGrantV2
 from .core import AuthorityServiceCore
 from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, ContentPermit, identifier
 from .v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire
@@ -43,6 +44,17 @@ class MtlsPeerCredential:
                 or len(self.certificate_sha256) != 64
                 or any(item not in "0123456789abcdef" for item in self.certificate_sha256)):
             raise ValueError("invalid mTLS peer credential")
+
+
+@dataclass(frozen=True)
+class AdministratorInstallationV2:
+    """Administrator-installed identity and trusted package for one mTLS profile."""
+
+    installation_id: str
+    administrator_holder: str
+    publisher_policy_ref: str
+    service_capability_version: str
+    manifest_digest: str
 
 
 @dataclass(frozen=True)
@@ -109,6 +121,7 @@ class AuthorityRpcServer:
         administrator_authorizer: Callable[[object, str, str, str | None], bool],
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
+        installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
     ) -> None:
         if not isinstance(core, AuthorityServiceCore):
             raise TypeError("AuthorityServiceCore is required")
@@ -131,6 +144,15 @@ class AuthorityRpcServer:
         self._administrator_authorizer = administrator_authorizer
         self._publisher_manifest_verifier = publisher_manifest_verifier
         self._v2_fences = services
+        installed = dict(installations_v2 or {})
+        if any(type(key) is not tuple or len(key) != 2
+               or type(key[0]) is not str or len(key[0]) != 64
+               or any(ch not in "0123456789abcdef" for ch in key[0])
+               or type(key[1]) is not str or not key[1]
+               or type(value) is not AdministratorInstallationV2
+               for key, value in installed.items()):
+            raise TypeError("administrator v2 installations are invalid")
+        self._installations_v2 = installed
         self._sessions: dict[str, tuple[float, str, str]] = {}
 
     @staticmethod
@@ -395,6 +417,22 @@ class AuthorityRpcServer:
         if handshake_binding != binding:
             raise RuntimeError("authority unavailable")
         self._paired_session(binding, peer, wire)
+        if method == "installation_grant_v2":
+            if wire.protocol != AUTHORITY_V2_PROTOCOL or command != {}:
+                raise RuntimeError("authority unavailable")
+            installed = self._installations_v2.get((peer, wire.profile_id))
+            if installed is None or installed.manifest_digest != wire.manifest_sha256:
+                raise RuntimeError("authority unavailable")
+            return asdict(InstallationGrantV2(
+                authority_id=self._authority_id(),
+                subject="mtls:sha256:" + peer,
+                administrator_holder=installed.administrator_holder,
+                installation_id=installed.installation_id,
+                manifest_digest=wire.manifest_sha256,
+                publisher_policy_ref=installed.publisher_policy_ref,
+                service_capability_version=installed.service_capability_version,
+                channel_binding_sha256=binding,
+            ))
         if method == "capability_grant":
             if command is not None:
                 raise RuntimeError("authority unavailable")
@@ -507,4 +545,5 @@ class AuthorityRpcServer:
         )
 
 
-__all__ = ("AuthorityRpcServer", "AuthorityServerTlsConfig", "MtlsPeerCredential")
+__all__ = ("AdministratorInstallationV2", "AuthorityRpcServer",
+           "AuthorityServerTlsConfig", "MtlsPeerCredential")

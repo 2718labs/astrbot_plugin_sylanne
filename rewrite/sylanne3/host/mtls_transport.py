@@ -23,6 +23,7 @@ from ..authority_service.v2_contract import (
 )
 from ..runtime.activation import ActivationProof
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime_contracts import InstallationGrantV2
 from .authority_client import (
     AUTHORITY_PROTOCOL,
     AuthorityCapabilityGrant,
@@ -358,6 +359,31 @@ class MtlsAuthorityTransport:
             revocation_epoch=response.get("revocation_epoch", -1),
             capabilities=tuple(capabilities),
         )
+
+    async def installation_grant_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+    ) -> InstallationGrantV2:
+        """Read installation facts only from the paired v2 TLS session."""
+        if not handshake.valid_pairing():
+            raise RuntimeError("authority v2 pairing is invalid")
+        response = await self._content_rpc(
+            request, handshake, "installation_grant_v2", {},
+            protocol=AUTHORITY_V2_PROTOCOL,
+        )
+        if set(response) != set(InstallationGrantV2.__dataclass_fields__):
+            raise RuntimeError("authority v2 installation grant is invalid")
+        try:
+            grant = InstallationGrantV2(**response)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority v2 installation grant is invalid") from exc
+        profile = self.profile_for(request.profile_id)
+        if (grant.authority_id != profile.expected_authority_id
+                or grant.authority_id != handshake.installation_authority_id
+                or grant.subject != handshake.installation_identity_ref
+                or grant.manifest_digest != request.publisher_package.manifest_sha256
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
+            raise RuntimeError("authority v2 installation grant binding is invalid")
+        return grant
 
     async def current(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

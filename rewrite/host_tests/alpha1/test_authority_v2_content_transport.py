@@ -1,7 +1,7 @@
 """Host transport keeps typed v2 content permits bound to their request."""
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,6 +27,7 @@ from sylanne3.host.mtls_transport import (
 if not hasattr(_host_package, "__file__"):
     sys.modules.pop("sylanne3.host", None)
 from sylanne3.runtime.restore_anchor import RestoreAnchor
+from sylanne3.runtime_contracts import InstallationGrantV2
 
 
 class ContentTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -149,3 +150,49 @@ class ContentTransportTests(unittest.IsolatedAsyncioTestCase):
                 namespace="ns:role", holder="holder-a", operation="write",
                 operation_id="operation-a", expected_anchor=self.anchor,
             )
+
+    async def test_installation_grant_checks_exact_v2_response_and_bindings(self):
+        grant = InstallationGrantV2(
+            authority_id="authority-1", subject=self.handshake.installation_identity_ref,
+            administrator_holder="admin-holder", installation_id="installation-a",
+            manifest_digest="a" * 64, publisher_policy_ref="policy-a",
+            service_capability_version="capabilities-v2",
+            channel_binding_sha256=self.handshake.channel_binding_sha256,
+        )
+        response = asdict(grant)
+        calls = []
+
+        async def rpc(request, handshake, method, command, *, protocol):
+            calls.append((method, command, protocol))
+            return response
+
+        self.transport._content_rpc = rpc
+        self.assertEqual(
+            await self.transport.installation_grant_v2(self.request, self.handshake), grant,
+        )
+        self.assertEqual(calls, [("installation_grant_v2", {}, SCHEMA)])
+        for changed in (
+            {**response, "extra": "forged"},
+            {**response, "subject": "mtls:sha256:" + "d" * 64},
+            {**response, "authority_id": "other-authority"},
+            {**response, "manifest_digest": "d" * 64},
+            {**response, "channel_binding_sha256": "d" * 64},
+            {**response, "schema": "sylanne3.authority.v1"},
+        ):
+            response = changed
+            with self.assertRaises(RuntimeError):
+                await self.transport.installation_grant_v2(self.request, self.handshake)
+
+    async def test_v1_session_cannot_request_installation_grant(self):
+        class Writer:
+            def is_closing(self):
+                return False
+
+        self.transport._content_rpc = MtlsAuthorityTransport._content_rpc.__get__(self.transport)
+        self.transport._owner_loop = asyncio.get_running_loop()
+        digest = hashlib.sha256(_canonical(_request_payload(self.request))).hexdigest()
+        self.transport._sessions["authority"] = _Session(
+            None, Writer(), self.handshake.channel_binding_sha256, digest,
+        )
+        with self.assertRaisesRegex(RuntimeError, "handshake channel"):
+            await self.transport.installation_grant_v2(self.request, self.handshake)

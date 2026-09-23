@@ -7,7 +7,9 @@ from dataclasses import replace
 import hashlib
 from pathlib import Path
 import ssl
+import sys
 import tempfile
+import types
 import unittest
 
 from cryptography import x509
@@ -17,6 +19,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from sylanne3.authority_service import AuthorityServiceCore, JournalHead
 from sylanne3.authority_service.mtls_server import (
+    AdministratorInstallationV2,
     AuthorityRpcServer,
     AuthorityServerTlsConfig,
     MtlsPeerCredential,
@@ -26,6 +29,12 @@ from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuar
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
+# Import the transport without requiring an installed AstrBot host.
+_host_package = sys.modules.get("sylanne3.host")
+if _host_package is None:
+    _host_package = types.ModuleType("sylanne3.host")
+    _host_package.__path__ = [str(Path(__file__).resolve().parents[2] / "sylanne3" / "host")]
+    sys.modules["sylanne3.host"] = _host_package
 from sylanne3.host.authority_client import (
     AUTHORITY_PROTOCOL,
     AuthorityEnrollmentGrant,
@@ -33,6 +42,8 @@ from sylanne3.host.authority_client import (
     PublisherPackageIdentity,
 )
 from sylanne3.host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
+if not hasattr(_host_package, "__file__"):
+    sys.modules.pop("sylanne3.host", None)
 from sylanne3.runtime.deletion import DeletionJournal
 
 
@@ -308,7 +319,13 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                     administrator_authorizer=lambda candidate, action, namespace, holder:
                         candidate in peers.values() and action == "pair"
                         and namespace == "authority:enrollment",
-                    publisher_manifest_verifier=lambda *args: True)
+                    publisher_manifest_verifier=lambda *args: True,
+                    installations_v2={
+                        (peers["client"].certificate_sha256, "first"):
+                            AdministratorInstallationV2(
+                                "installation-a", "host:one", "publisher-policy-a",
+                                "capabilities-v2", "a" * 64),
+                    })
                 listener = await server.start(
                     "127.0.0.1", 0,
                     AuthorityServerTlsConfig(
@@ -333,6 +350,15 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 first, first_request = client("client", "first")
                 first_handshake = await first.handshake(
                     first_request, protocol=AUTHORITY_V2_PROTOCOL)
+                installation = await first.installation_grant_v2(
+                    first_request, first_handshake)
+                self.assertEqual(installation.installation_id, "installation-a")
+                self.assertEqual(installation.administrator_holder, "host:one")
+                self.assertEqual(installation.authority_id, server._authority_id())
+                self.assertEqual(installation.subject, first_handshake.installation_identity_ref)
+                self.assertEqual(installation.manifest_digest, "a" * 64)
+                self.assertEqual(installation.channel_binding_sha256,
+                                 first_handshake.channel_binding_sha256)
                 anchor = await first.v2_current_anchor(
                     first_request, first_handshake, "ns:role")
                 permit = await first.v2_begin_read_fence(
@@ -346,6 +372,8 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 second, second_request = client("second", "second")
                 second_handshake = await second.handshake(
                     second_request, protocol=AUTHORITY_V2_PROTOCOL)
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await second.installation_grant_v2(second_request, second_handshake)
                 with self.assertRaisesRegex(RuntimeError, "unavailable"):
                     await second.v2_validate_fence(
                         second_request, second_handshake, permit)
