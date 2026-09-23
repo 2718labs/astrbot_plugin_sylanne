@@ -398,9 +398,30 @@ class MtlsAuthorityTransport:
             request, handshake, "namespace_bootstrap",
             {"namespace": asdict(namespace)}, protocol=AUTHORITY_V2_PROTOCOL,
         )
+        return self._v2_namespace_response(request, handshake, namespace, response)
+
+    async def v2_namespace_genesis(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        namespace: NamespaceId, request_id: str,
+    ) -> NamespaceBootstrapV2:
+        """Explicit administrator-authorized genesis for one mapped namespace."""
+        if (not handshake.valid_pairing() or type(namespace) is not NamespaceId
+                or not isinstance(request_id, str) or not request_id):
+            raise RuntimeError("authority v2 namespace genesis request is invalid")
+        response = await self._content_rpc(
+            request, handshake, "namespace_genesis",
+            {"namespace": asdict(namespace), "request_id": request_id},
+            protocol=AUTHORITY_V2_PROTOCOL,
+        )
+        return self._v2_namespace_response(request, handshake, namespace, response)
+
+    def _v2_namespace_response(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        namespace: NamespaceId, response: dict[str, object],
+    ) -> NamespaceBootstrapV2:
         if set(response) != set(NamespaceBootstrapV2.__dataclass_fields__) | {
             "channel_binding_sha256"
-        }:
+        } or response["channel_binding_sha256"] != handshake.channel_binding_sha256:
             raise RuntimeError("authority v2 namespace response is invalid")
         namespace_wire = response["namespace"]
         anchor_wire = response["anchor"]

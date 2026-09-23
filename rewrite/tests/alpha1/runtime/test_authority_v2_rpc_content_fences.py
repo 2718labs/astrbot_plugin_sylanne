@@ -5,7 +5,8 @@ import pytest
 from sylanne3.authority_service.contract import CONTENT_OPERATIONS, JournalHead
 from sylanne3.authority_service.core import AuthorityServiceCore
 from sylanne3.authority_service.mtls_server import (
-    AUTHORITY_V2_PROTOCOL, AuthorityRpcServer, MtlsPeerCredential,
+    AUTHORITY_V2_PROTOCOL, AdministratorInstallationV2, AuthorityRpcServer,
+    MtlsPeerCredential,
 )
 from sylanne3.authority_service.v2_contract import from_wire
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
@@ -13,6 +14,7 @@ from sylanne3.authority_service.v2_execution_journal import AuthorityV2Execution
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.runtime.deletion import DeletionJournal
+from sylanne3.runtime_contracts import NamespaceId
 
 
 _PEER_A = MtlsPeerCredential("a" * 64)
@@ -65,6 +67,16 @@ def rpc(tmp_path):
             credential in (_PEER_A, _PEER_B),
         publisher_manifest_verifier=lambda *args: True,
         v2_fences=service,
+        installations_v2={
+            (peer.certificate_sha256, "profile-a"): AdministratorInstallationV2(
+                f"installation-{name}", "holder-a", "policy-a",
+                "capabilities-v2", "c" * 64)
+            for peer, name in ((_PEER_A, "a"), (_PEER_B, "b"))
+        },
+        namespace_bindings_v2={
+            (_PEER_A.certificate_sha256, "profile-a",
+             NamespaceId("bot-a", "persona-a")): "ns-a",
+        },
     )
     try:
         yield server
@@ -136,6 +148,8 @@ def test_other_mtls_peer_cannot_validate_or_finish_content_permit(rpc):
     second = paired(rpc, _PEER_B, b"channel-b")
     anchor = first("current_anchor", {"namespace": "ns-a"})
     anchor.pop("channel_binding_sha256")
+    with pytest.raises(RuntimeError, match="authority unavailable"):
+        second("current_anchor", {"namespace": "ns-a"})
     permit = first("begin_fence", begin_command(anchor, "model_egress", "egress-a"))["permit"]
     with pytest.raises(RuntimeError, match="authority unavailable"):
         second("validate_fence", {"permit": permit})

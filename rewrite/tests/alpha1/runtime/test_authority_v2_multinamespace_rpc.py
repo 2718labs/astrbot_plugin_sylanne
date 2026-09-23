@@ -5,13 +5,15 @@ import pytest
 from sylanne3.authority_service.contract import JournalHead
 from sylanne3.authority_service.core import AuthorityServiceCore
 from sylanne3.authority_service.mtls_server import (
-    AUTHORITY_V2_PROTOCOL, AuthorityRpcServer, MtlsPeerCredential,
+    AUTHORITY_V2_PROTOCOL, AdministratorInstallationV2, AuthorityRpcServer,
+    MtlsPeerCredential,
 )
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.runtime.deletion import DeletionJournal
+from sylanne3.runtime_contracts import NamespaceId
 
 
 _ADMIN = MtlsPeerCredential("0" * 64)
@@ -76,6 +78,17 @@ def installed(tmp_path):
             credential in _PEERS.values(),
         publisher_manifest_verifier=lambda *args: True,
         v2_fences=routing,
+        installations_v2={
+            (peer.certificate_sha256, "profile-a"): AdministratorInstallationV2(
+                f"installation-{namespace}", f"holder-{namespace[-1]}",
+                "policy-a", "capabilities-v2", "c" * 64)
+            for namespace, peer in _PEERS.items()
+        },
+        namespace_bindings_v2={
+            (peer.certificate_sha256, "profile-a",
+             NamespaceId("bot", namespace)): namespace
+            for namespace, peer in _PEERS.items()
+        },
     )
     try:
         yield server, services, routing, core

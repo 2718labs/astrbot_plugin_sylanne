@@ -161,6 +161,14 @@ class AuthorityRpcServer:
                or type(namespace) is not str or namespace not in services
                for key, namespace in bindings.items()):
             raise TypeError("administrator v2 namespace bindings are invalid")
+        namespace_to_role = {}
+        role_to_namespace = {}
+        for (_, _, role), namespace in bindings.items():
+            if (namespace_to_role.get(namespace, role) != role
+                    or role_to_namespace.get(role, namespace) != namespace):
+                raise ValueError("administrator v2 namespace bindings must be one-to-one")
+            namespace_to_role[namespace] = role
+            role_to_namespace[role] = namespace
         self._namespace_bindings_v2 = bindings
         self._sessions: dict[str, tuple[float, str, str]] = {}
 
@@ -350,19 +358,32 @@ class AuthorityRpcServer:
             raise AuthorityUnavailable("namespace unavailable")
         return service
 
+    def _bound_v2_service(self, credential: MtlsPeerCredential, profile_id: str,
+                          manifest_digest: str, namespace: object) -> AuthorityV2FenceService:
+        installed = self._installations_v2.get((credential.certificate_sha256, profile_id))
+        if (installed is None or installed.manifest_digest != manifest_digest
+                or not any(peer == credential.certificate_sha256
+                           and profile == profile_id and mapped == namespace
+                           for (peer, profile, _), mapped in self._namespace_bindings_v2.items())):
+            raise AuthorityUnavailable("namespace unavailable")
+        return self._v2_service(namespace)
+
     def _v2_command(self, method: str, credential: MtlsPeerCredential,
+                    profile_id: str, manifest_digest: str,
                     command: object) -> dict[str, object]:
         if type(command) is not dict:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
             if method == "current_anchor" and set(command) == {"namespace"}:
-                service = self._v2_service(command["namespace"])
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, command["namespace"])
                 return self._anchor_payload(service.current_anchor(
                     credential=credential, subject=subject))
             if method == "begin_fence" and set(command) == {
                     "namespace", "holder", "operation", "operation_id", "expected_anchor"}:
-                service = self._v2_service(command["namespace"])
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, command["namespace"])
                 operation = command["operation"]
                 if (type(operation) is not str
                         or operation not in _V2_REMOTE_CONTENT_OPERATIONS):
@@ -378,7 +399,8 @@ class AuthorityRpcServer:
                 if (type(permit) is not FencePermitV2
                         or permit.operation not in _V2_REMOTE_CONTENT_OPERATIONS):
                     raise AuthorityUnavailable("content fence required")
-                service = self._v2_service(permit.namespace)
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, permit.namespace)
                 return {"permit": to_wire(service.validate_fence(
                     credential=credential, subject=subject, permit=permit))}
             if method == "finish_fence" and set(command) == {
@@ -387,7 +409,8 @@ class AuthorityRpcServer:
                 if (type(permit) is not FencePermitV2
                         or permit.operation not in _V2_REMOTE_CONTENT_OPERATIONS):
                     raise AuthorityUnavailable("content fence required")
-                service = self._v2_service(permit.namespace)
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, permit.namespace)
                 service.finish_fence(
                     credential=credential, subject=subject, permit=permit,
                     request_id=command["request_id"],
@@ -442,9 +465,10 @@ class AuthorityRpcServer:
                 service_capability_version=installed.service_capability_version,
                 channel_binding_sha256=binding,
             ))
-        if method == "namespace_bootstrap":
+        if method in {"namespace_bootstrap", "namespace_genesis"}:
             if (wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict
-                    or set(command) != {"namespace"}
+                    or set(command) != ({"namespace"} if method == "namespace_bootstrap"
+                                        else {"namespace", "request_id"})
                     or type(command["namespace"]) is not dict
                     or set(command["namespace"]) != {"bot_id", "persona_id"}):
                 raise RuntimeError("authority unavailable")
@@ -458,10 +482,18 @@ class AuthorityRpcServer:
             namespace = self._namespace_bindings_v2.get((peer, wire.profile_id, namespace_id))
             if namespace is None:
                 raise RuntimeError("authority unavailable")
-            result = self._v2_service(namespace).namespace_bootstrap(
-                credential=credential, subject="mtls:sha256:" + peer,
-                namespace_id=namespace_id,
-            )
+            service = self._v2_service(namespace)
+            if method == "namespace_genesis":
+                result = service.activate_namespace(
+                    credential=credential, subject="mtls:sha256:" + peer,
+                    holder=installed.administrator_holder,
+                    namespace_id=namespace_id, request_id=command["request_id"],
+                )
+            else:
+                result = service.namespace_bootstrap(
+                    credential=credential, subject="mtls:sha256:" + peer,
+                    namespace_id=namespace_id,
+                )
             if (type(result) is not NamespaceBootstrapV2
                     or result.authority_id != self._authority_id()
                     or result.namespace != namespace_id
@@ -478,7 +510,8 @@ class AuthorityRpcServer:
                 "capabilities": list(_ENROLLMENT_CAPABILITIES),
                 "channel_binding_sha256": binding,
             }
-        result = (self._v2_command(method, credential, command)
+        result = (self._v2_command(
+            method, credential, wire.profile_id, wire.manifest_sha256, command)
                   if wire.protocol == AUTHORITY_V2_PROTOCOL else
                   self._content_command(method, credential, command))
         result["channel_binding_sha256"] = binding

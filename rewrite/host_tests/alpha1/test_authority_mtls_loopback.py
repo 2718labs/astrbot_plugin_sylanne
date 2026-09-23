@@ -471,6 +471,139 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 deletion_guard.close()
                 deletion_journal.close()
 
+    async def test_v2_namespace_genesis_requires_mapped_tls_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = self._certificates(root)
+            peers = {
+                name: MtlsPeerCredential(hashlib.sha256(ssl.PEM_cert_to_DER_cert(
+                    files[f"{name}.pem"].read_text(encoding="ascii"))).hexdigest())
+                for name in ("client", "second")
+            }
+            seed = DeletionJournal(root / "seed-deletion.db", create=True)
+            deletion = DeletionJournal(root / "deletion.db", create=True)
+            guard = AuthorityV2DeletionGuard(root / "deletion.db")
+            execution = AuthorityV2ExecutionJournal(
+                root / "execution.db", namespace="opaque-role-a",
+                journal_id="execution-a", create=True)
+            head = seed.latest_head()
+            seed_head = JournalHead(head.journal_id, head.seq, head.chain_digest)
+            role = NamespaceId("bot-a", "persona-a")
+
+            def authorize(candidate, action, namespace, holder):
+                if action in {"install", "seal_v2_only"}:
+                    return candidate == peers["client"]
+                return (candidate == peers["client"]
+                        and namespace == "opaque-role-a"
+                        and action in {"current", "namespace_genesis"}
+                        and (holder is None or holder == "holder-a"))
+
+            core = AuthorityServiceCore(
+                root / "authority.db", create=True, authorizer=authorize,
+                deletion_verifier=lambda ns, before, current, phase:
+                    ns == "seed" and current == seed_head and phase == "clear",
+                execution_verifier=lambda ns, before, current, phase:
+                    ns == "seed" and current == JournalHead("seed-execution", 0, "genesis"),
+                effect_verifier=lambda *args: True,
+                dispatch_verifier=lambda *args: True,
+            )
+            listener = None
+            transports = []
+            try:
+                core.register_namespace(
+                    peers["client"], "seed", "seed-holder", seed_head,
+                    JournalHead("seed-execution", 0, "genesis"))
+                core.seal_v2_only(peers["client"])
+                fences = AuthorityV2FenceStore(core._db, create=True, lock=core._lock)
+                service = AuthorityV2FenceService(
+                    core=core, fences=fences, deletion=guard, execution=execution,
+                    namespace="opaque-role-a")
+                server = AuthorityRpcServer(
+                    core, v2_fences=service,
+                    administrator_authorizer=lambda candidate, action, namespace, holder:
+                        candidate in peers.values() and action == "pair"
+                        and namespace == "authority:enrollment",
+                    publisher_manifest_verifier=lambda *args: True,
+                    installations_v2={
+                        (peers[name].certificate_sha256, "installed"):
+                            AdministratorInstallationV2(
+                                f"installation-{name}", f"holder-{suffix}",
+                                "publisher-policy-a", "capabilities-v2", "a" * 64)
+                        for name, suffix in (("client", "a"), ("second", "b"))
+                    },
+                    namespace_bindings_v2={
+                        (peers["client"].certificate_sha256, "installed", role):
+                            "opaque-role-a",
+                    },
+                )
+                listener = await server.start(
+                    "127.0.0.1", 0,
+                    AuthorityServerTlsConfig(
+                        str(files["server.pem"]), str(files["server.key"]),
+                        str(files["ca.pem"]), timeout_seconds=1,
+                        max_message_bytes=16_384))
+                port = listener.sockets[0].getsockname()[1]
+
+                async def connect(name):
+                    profile = AuthorityTlsProfile(
+                        "installed", "127.0.0.1", port, "localhost",
+                        server._authority_id(), files["ca.pem"],
+                        files[f"{name}.pem"], files[f"{name}.key"],
+                        timeout_seconds=1, max_message_bytes=16_384)
+                    transport = MtlsAuthorityTransport({"installed": profile})
+                    transports.append(transport)
+                    request = AuthorityProvisioningRequest(
+                        AUTHORITY_PROTOCOL, "installed", "astrbot_plugin_sylanne",
+                        "4.28.1", root, root, PublisherPackageIdentity("a" * 64))
+                    handshake = await transport.handshake(
+                        request, protocol=AUTHORITY_V2_PROTOCOL)
+                    return transport, request, handshake
+
+                first, request, handshake = await connect("client")
+                grant = await first.installation_grant_v2(request, handshake)
+                self.assertEqual(grant.administrator_holder, "holder-a")
+                before = await first.v2_namespace_bootstrap(request, handshake, role)
+                self.assertEqual(before.state, NamespaceRuntimeState.UNBOUND)
+                self.assertIsNone(core._db.execute(
+                    "SELECT 1 FROM authority_namespaces WHERE namespace='opaque-role-a'"
+                ).fetchone())
+                active = await first.v2_namespace_genesis(
+                    request, handshake, role, "genesis-a")
+                self.assertEqual(active.state, NamespaceRuntimeState.ACTIVE)
+                self.assertEqual(active.holder, "holder-a")
+                self.assertEqual(active.authority_namespace, "opaque-role-a")
+                self.assertEqual(active.generation, 1)
+                self.assertEqual(
+                    await first.v2_namespace_genesis(request, handshake, role, "genesis-a"),
+                    active)
+                self.assertEqual(
+                    (await first.v2_namespace_bootstrap(request, handshake, role)).state,
+                    NamespaceRuntimeState.ACTIVE)
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await first.v2_namespace_genesis(
+                        request, handshake, NamespaceId("bot-x", "persona-x"),
+                        "genesis-x")
+
+                second, second_request, second_handshake = await connect("second")
+                await second.installation_grant_v2(second_request, second_handshake)
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await second.v2_namespace_genesis(
+                        second_request, second_handshake, role, "genesis-b")
+                self.assertEqual(core._db.execute(
+                    "SELECT count(*) FROM authority_events WHERE namespace='opaque-role-a'"
+                ).fetchone(), (1,))
+            finally:
+                for transport in transports:
+                    await transport.close()
+                if listener is not None:
+                    listener.close()
+                    await listener.wait_closed()
+                core.close()
+                seed.close()
+                deletion.close()
+                guard.close()
+                execution.close()
+
 
 if __name__ == "__main__":
     unittest.main()
