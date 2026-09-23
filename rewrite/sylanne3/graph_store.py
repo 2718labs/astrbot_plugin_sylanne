@@ -772,9 +772,7 @@ class GraphStore(Store):
         if visited != len(nodes):
             raise ValueError("instantaneous dependency cycle")
 
-    def graph_commit(self, candidate: GraphCandidate, *, _guard=None, _receipt_hook=None,
-                     _capability=None, _transaction_state=None):
-        self._require_coordinator(_capability)
+    def _prepare_graph_candidate(self, candidate: GraphCandidate):
         if not isinstance(candidate, GraphCandidate):
             raise TypeError("candidate must be GraphCandidate")
         event = candidate.event
@@ -817,7 +815,12 @@ class GraphStore(Store):
         # retained for audit but is not part of the event conflict digest.
         digest = event.digest
         scope_key = (event.scope.bot, event.scope.persona, event.scope.session, event.event_id)
+        return namespace, reads, writes, epochs, prepared, digest, scope_key
 
+    def graph_commit(self, candidate: GraphCandidate, *, _guard=None, _receipt_hook=None,
+                     _capability=None, _transaction_state=None):
+        self._require_coordinator(_capability)
+        prepared = self._prepare_graph_candidate(candidate)
         with self._lock:
             self._ensure_open()
             if _transaction_state is not None:
@@ -826,182 +829,8 @@ class GraphStore(Store):
             if _transaction_state is not None:
                 _transaction_state["phase"] = "transaction_open"
             try:
-                if _guard is not None:
-                    _guard(self._db)
-                prior = self._db.execute(
-                    "SELECT digest,revisions,invalidated,epoch_revision FROM graph_events "
-                    "WHERE bot=? AND persona=? AND session=? AND event_id=?", scope_key
-                ).fetchone()
-                if prior:
-                    if prior[0] != digest:
-                        raise EventConflict("event ID reused with different graph candidate")
-                    receipt = GraphReceipt(
-                        "duplicate", self._version_rows(prior[1]),
-                        self._version_rows(prior[2]),
-                        NamespaceEpoch(namespace[0], namespace[1], prior[3]),
-                    )
-                    if _receipt_hook is not None:
-                        _receipt_hook(self._db, receipt)
-                    if _transaction_state is not None:
-                        _transaction_state["phase"] = "commit_attempted"
-                    self._db.execute("COMMIT")
-                    if _transaction_state is not None:
-                        _transaction_state["phase"] = "committed"
-                    return receipt
-
-                for read in reads:
-                    actual = self._current_revision(read.key.token)
-                    if actual != read.revision:
-                        raise StaleRead(
-                            f"{read.key.token}: expected {read.revision}, observed {actual}"
-                        )
-                epoch_row = self._db.execute(
-                    "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", namespace
-                ).fetchone()
-                current_epoch = epoch_row[0] if epoch_row else 0
-                for epoch in epochs:
-                    if epoch.revision != current_epoch:
-                        raise StaleRead(
-                            f"namespace epoch: expected {epoch.revision}, observed {current_epoch}"
-                        )
-                for write, spec, _ in prepared:
-                    if spec.immutable and self._current_revision(write.key.token) != 0:
-                        raise ValueError(f"immutable graph atom already exists: {write.key.token}")
-
-                write_tokens = {write.key.token for write in writes}
-                closure = self._reverse_closure(write_tokens)
-                to_invalidate = closure - write_tokens
-                replacements = {
-                    write.key.token: tuple(key.token for key in write.dependencies)
-                    for write in writes
-                }
-                self._assert_acyclic(namespace, replacements)
-
-                post_revisions = {read.key.token: read.revision for read in reads}
-                for write in writes:
-                    post_revisions[write.key.token] = post_revisions[write.key.token] + 1
-                post_valid = {}
-                for token in to_invalidate:
-                    row = self._db.execute(
-                        "SELECT valid FROM graph_atoms WHERE token=?", (token,)
-                    ).fetchone()
-                    post_valid[token] = False if row else False
-                for write in writes:
-                    post_valid[write.key.token] = True
-                for write in writes:
-                    for dependency in write.dependencies:
-                        token = dependency.token
-                        if token in post_valid:
-                            valid = post_valid[token]
-                        else:
-                            row = self._db.execute(
-                                "SELECT valid FROM graph_atoms WHERE token=?", (token,)
-                            ).fetchone()
-                            # Revision-zero dependencies are explicit observations of
-                            # absence. They remain valid until that key first appears,
-                            # at which point the reverse edge invalidates the dependent.
-                            valid = bool(row[0]) if row else True
-                        if not valid:
-                            raise ValueError(
-                                f"dependency is absent or invalid after transaction: {token}"
-                            )
-
-                invalidation_rows = []
-                for token in sorted(to_invalidate):
-                    row = self._db.execute(
-                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (token,)
-                    ).fetchone()
-                    if row and row[2]:
-                        invalidation_rows.append((token, row[0] + 1, row[1]))
-
-                state_changed = bool(writes or invalidation_rows)
-                new_epoch = current_epoch + int(state_changed)
-                revisions = tuple(
-                    GraphVersion(write.key, post_revisions[write.key.token]) for write in writes
-                )
-                invalidated = tuple(
-                    GraphVersion(AtomKey.from_token(token), revision)
-                    for token, revision, _ in invalidation_rows
-                )
-                reads_json = canonical_json([[r.key.token, r.revision] for r in reads])
-                epoch_reads_json = canonical_json(
-                    [[e.bot, e.persona, e.revision] for e in epochs]
-                )
-                revisions_json = canonical_json(
-                    [[r.key.token, r.revision] for r in revisions]
-                )
-                invalidated_json = canonical_json(
-                    [[r.key.token, r.revision] for r in invalidated]
-                )
-                self._db.execute(
-                    "INSERT INTO graph_events(bot,persona,session,event_id,digest,reads,epoch_reads,"
-                    "revisions,invalidated,epoch_revision) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    scope_key + (digest, reads_json, epoch_reads_json, revisions_json,
-                                 invalidated_json, new_epoch),
-                )
-
-                for write, _, value_json in prepared:
-                    token = write.key.token
-                    revision = post_revisions[token]
-                    owner = write.key.owner
-                    self._db.execute(
-                        "INSERT INTO graph_atoms(token,bot,persona,owner_kind,subject,type_name,name,"
-                        "revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,1) "
-                        "ON CONFLICT(token) DO UPDATE SET revision=excluded.revision,"
-                        "value=excluded.value,valid=1",
-                        (token, owner.bot, owner.persona, owner.kind, owner.subject,
-                         write.key.type_name, write.key.name, revision, value_json),
-                    )
-                    self._db.execute(
-                        "DELETE FROM graph_dependencies WHERE dependent_token=?", (token,)
-                    )
-                    dependency_rows = []
-                    for dependency in write.dependencies:
-                        dep_revision = post_revisions.get(dependency.token)
-                        if dep_revision is None:
-                            dep_revision = self._current_revision(dependency.token)
-                        dependency_rows.append((token, dependency.token, dep_revision))
-                    self._db.executemany(
-                        "INSERT INTO graph_dependencies(dependent_token,dependency_token,"
-                        "dependency_revision) VALUES(?,?,?)", dependency_rows
-                    )
-                    dependencies_json = canonical_json(
-                        [[dependency, revision] for _, dependency, revision in dependency_rows]
-                    )
-                    self._db.execute(
-                        "INSERT INTO graph_history(token,revision,value,valid,dependencies,event_bot,"
-                        "event_persona,event_session,event_id) VALUES(?,?,?,?,?,?,?,?,?)",
-                        (token, revision, value_json, 1, dependencies_json) + scope_key,
-                    )
-
-                for token, revision, value_json in invalidation_rows:
-                    self._db.execute(
-                        "UPDATE graph_atoms SET revision=?,valid=0 WHERE token=?",
-                        (revision, token),
-                    )
-                    dependencies = self._db.execute(
-                        "SELECT dependency_token,dependency_revision FROM graph_dependencies "
-                        "WHERE dependent_token=? ORDER BY dependency_token", (token,)
-                    ).fetchall()
-                    self._db.execute(
-                        "INSERT INTO graph_history(token,revision,value,valid,dependencies,event_bot,"
-                        "event_persona,event_session,event_id) VALUES(?,?,?,?,?,?,?,?,?)",
-                        (token, revision, value_json, 0,
-                         canonical_json([list(row) for row in dependencies])) + scope_key,
-                    )
-
-                if state_changed:
-                    self._db.execute(
-                        "INSERT INTO graph_epochs(bot,persona,revision) VALUES(?,?,?) "
-                        "ON CONFLICT(bot,persona) DO UPDATE SET revision=excluded.revision",
-                        namespace + (new_epoch,),
-                    )
-                receipt = GraphReceipt(
-                    "committed", revisions, invalidated,
-                    NamespaceEpoch(namespace[0], namespace[1], new_epoch),
-                )
-                if _receipt_hook is not None:
-                    _receipt_hook(self._db, receipt)
+                receipt = self._graph_commit_core(
+                    *prepared, _guard=_guard, _receipt_hook=_receipt_hook)
                 if _transaction_state is not None:
                     _transaction_state["phase"] = "commit_attempted"
                 self._db.execute("COMMIT")
@@ -1014,6 +843,193 @@ class GraphStore(Store):
                         and _transaction_state["phase"] != "commit_attempted"):
                     _transaction_state["phase"] = "rolled_back"
                 raise
+
+    def _graph_commit_in_transaction(self, candidate: GraphCandidate, *,
+                                     _guard=None, _receipt_hook=None, _capability=None):
+        """Run a graph commit inside the coordinator's existing write transaction.
+
+        Caller holds this store's lock and owns COMMIT or ROLLBACK.
+        """
+        self._require_recovery_capability(_capability)
+        if not self._lock._is_owned() or not self._db.in_transaction:
+            raise RuntimeError("graph transaction requires the store lock and active transaction")
+        self._ensure_open()
+        prepared = self._prepare_graph_candidate(candidate)
+        return self._graph_commit_core(*prepared, _guard=_guard, _receipt_hook=_receipt_hook)
+
+    def _graph_commit_core(self, namespace, reads, writes, epochs, prepared,
+                           digest, scope_key, *, _guard=None, _receipt_hook=None):
+        if _guard is not None:
+            _guard(self._db)
+        prior = self._db.execute(
+            "SELECT digest,revisions,invalidated,epoch_revision FROM graph_events "
+            "WHERE bot=? AND persona=? AND session=? AND event_id=?", scope_key
+        ).fetchone()
+        if prior:
+            if prior[0] != digest:
+                raise EventConflict("event ID reused with different graph candidate")
+            receipt = GraphReceipt(
+                "duplicate", self._version_rows(prior[1]),
+                self._version_rows(prior[2]),
+                NamespaceEpoch(namespace[0], namespace[1], prior[3]),
+            )
+            if _receipt_hook is not None:
+                _receipt_hook(self._db, receipt)
+            return receipt
+        for read in reads:
+            actual = self._current_revision(read.key.token)
+            if actual != read.revision:
+                raise StaleRead(
+                    f"{read.key.token}: expected {read.revision}, observed {actual}"
+                )
+        epoch_row = self._db.execute(
+            "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", namespace
+        ).fetchone()
+        current_epoch = epoch_row[0] if epoch_row else 0
+        for epoch in epochs:
+            if epoch.revision != current_epoch:
+                raise StaleRead(
+                    f"namespace epoch: expected {epoch.revision}, observed {current_epoch}"
+                )
+        for write, spec, _ in prepared:
+            if spec.immutable and self._current_revision(write.key.token) != 0:
+                raise ValueError(f"immutable graph atom already exists: {write.key.token}")
+
+        write_tokens = {write.key.token for write in writes}
+        closure = self._reverse_closure(write_tokens)
+        to_invalidate = closure - write_tokens
+        replacements = {
+            write.key.token: tuple(key.token for key in write.dependencies)
+            for write in writes
+        }
+        self._assert_acyclic(namespace, replacements)
+
+        post_revisions = {read.key.token: read.revision for read in reads}
+        for write in writes:
+            post_revisions[write.key.token] = post_revisions[write.key.token] + 1
+        post_valid = {}
+        for token in to_invalidate:
+            row = self._db.execute(
+                "SELECT valid FROM graph_atoms WHERE token=?", (token,)
+            ).fetchone()
+            post_valid[token] = False if row else False
+        for write in writes:
+            post_valid[write.key.token] = True
+        for write in writes:
+            for dependency in write.dependencies:
+                token = dependency.token
+                if token in post_valid:
+                    valid = post_valid[token]
+                else:
+                    row = self._db.execute(
+                        "SELECT valid FROM graph_atoms WHERE token=?", (token,)
+                    ).fetchone()
+                    # Revision-zero dependencies are explicit observations of
+                    # absence. They remain valid until that key first appears,
+                    # at which point the reverse edge invalidates the dependent.
+                    valid = bool(row[0]) if row else True
+                if not valid:
+                    raise ValueError(
+                        f"dependency is absent or invalid after transaction: {token}"
+                    )
+
+        invalidation_rows = []
+        for token in sorted(to_invalidate):
+            row = self._db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (token,)
+            ).fetchone()
+            if row and row[2]:
+                invalidation_rows.append((token, row[0] + 1, row[1]))
+
+        state_changed = bool(writes or invalidation_rows)
+        new_epoch = current_epoch + int(state_changed)
+        revisions = tuple(
+            GraphVersion(write.key, post_revisions[write.key.token]) for write in writes
+        )
+        invalidated = tuple(
+            GraphVersion(AtomKey.from_token(token), revision)
+            for token, revision, _ in invalidation_rows
+        )
+        reads_json = canonical_json([[r.key.token, r.revision] for r in reads])
+        epoch_reads_json = canonical_json(
+            [[e.bot, e.persona, e.revision] for e in epochs]
+        )
+        revisions_json = canonical_json(
+            [[r.key.token, r.revision] for r in revisions]
+        )
+        invalidated_json = canonical_json(
+            [[r.key.token, r.revision] for r in invalidated]
+        )
+        self._db.execute(
+            "INSERT INTO graph_events(bot,persona,session,event_id,digest,reads,epoch_reads,"
+            "revisions,invalidated,epoch_revision) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            scope_key + (digest, reads_json, epoch_reads_json, revisions_json,
+                         invalidated_json, new_epoch),
+        )
+
+        for write, _, value_json in prepared:
+            token = write.key.token
+            revision = post_revisions[token]
+            owner = write.key.owner
+            self._db.execute(
+                "INSERT INTO graph_atoms(token,bot,persona,owner_kind,subject,type_name,name,"
+                "revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,1) "
+                "ON CONFLICT(token) DO UPDATE SET revision=excluded.revision,"
+                "value=excluded.value,valid=1",
+                (token, owner.bot, owner.persona, owner.kind, owner.subject,
+                 write.key.type_name, write.key.name, revision, value_json),
+            )
+            self._db.execute(
+                "DELETE FROM graph_dependencies WHERE dependent_token=?", (token,)
+            )
+            dependency_rows = []
+            for dependency in write.dependencies:
+                dep_revision = post_revisions.get(dependency.token)
+                if dep_revision is None:
+                    dep_revision = self._current_revision(dependency.token)
+                dependency_rows.append((token, dependency.token, dep_revision))
+            self._db.executemany(
+                "INSERT INTO graph_dependencies(dependent_token,dependency_token,"
+                "dependency_revision) VALUES(?,?,?)", dependency_rows
+            )
+            dependencies_json = canonical_json(
+                [[dependency, revision] for _, dependency, revision in dependency_rows]
+            )
+            self._db.execute(
+                "INSERT INTO graph_history(token,revision,value,valid,dependencies,event_bot,"
+                "event_persona,event_session,event_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (token, revision, value_json, 1, dependencies_json) + scope_key,
+            )
+
+        for token, revision, value_json in invalidation_rows:
+            self._db.execute(
+                "UPDATE graph_atoms SET revision=?,valid=0 WHERE token=?",
+                (revision, token),
+            )
+            dependencies = self._db.execute(
+                "SELECT dependency_token,dependency_revision FROM graph_dependencies "
+                "WHERE dependent_token=? ORDER BY dependency_token", (token,)
+            ).fetchall()
+            self._db.execute(
+                "INSERT INTO graph_history(token,revision,value,valid,dependencies,event_bot,"
+                "event_persona,event_session,event_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (token, revision, value_json, 0,
+                 canonical_json([list(row) for row in dependencies])) + scope_key,
+            )
+
+        if state_changed:
+            self._db.execute(
+                "INSERT INTO graph_epochs(bot,persona,revision) VALUES(?,?,?) "
+                "ON CONFLICT(bot,persona) DO UPDATE SET revision=excluded.revision",
+                namespace + (new_epoch,),
+            )
+        receipt = GraphReceipt(
+            "committed", revisions, invalidated,
+            NamespaceEpoch(namespace[0], namespace[1], new_epoch),
+        )
+        if _receipt_hook is not None:
+            _receipt_hook(self._db, receipt)
+        return receipt
 
 
 class ProductionGraphStore(GraphStore):
