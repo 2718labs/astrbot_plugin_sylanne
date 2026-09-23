@@ -17,7 +17,7 @@ import secrets
 import ssl
 from typing import Mapping
 
-from ..authority_service.contract import ContentPermit
+from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit
 from ..authority_service.v2_contract import (
     FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
 )
@@ -35,6 +35,7 @@ from .authority_client import (
 _PROFILE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}\Z")
 _AUTHORITY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_V2_CONTENT_OPERATIONS = CONTENT_OPERATIONS - {"dispatch"}
 
 
 def _canonical(value: object) -> bytes:
@@ -520,8 +521,31 @@ class MtlsAuthorityTransport:
             permit = from_wire(response["permit"])
         except (TypeError, ValueError) as exc:
             raise RuntimeError("authority v2 permit response is invalid") from exc
-        if type(permit) is not FencePermitV2 or permit.operation != "read":
-            raise RuntimeError("authority v2 read permit is invalid")
+        if type(permit) is not FencePermitV2 or permit.operation not in _V2_CONTENT_OPERATIONS:
+            raise RuntimeError("authority v2 content permit is invalid")
+        return permit
+
+    async def v2_begin_content_fence(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, holder: str, operation: str, operation_id: str,
+        expected_anchor: RestoreAnchor,
+    ) -> FencePermitV2:
+        if type(expected_anchor) is not RestoreAnchor:
+            raise TypeError("RestoreAnchor is required")
+        if type(operation) is not str or operation not in _V2_CONTENT_OPERATIONS:
+            raise ValueError("unsupported authority v2 content operation")
+        response = await self._content_rpc(
+            request, handshake, "begin_fence",
+            {"namespace": namespace, "holder": holder, "operation": operation,
+             "operation_id": operation_id, "expected_anchor": asdict(expected_anchor)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        permit = self._v2_permit_response(response)
+        if (permit.namespace != namespace or permit.holder != holder
+                or permit.operation != operation
+                or permit.operation_id != operation_id
+                or permit.pinned_anchor != expected_anchor
+                or permit.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority v2 permit binding is invalid")
         return permit
 
     async def v2_begin_read_fence(
@@ -529,27 +553,20 @@ class MtlsAuthorityTransport:
         *, namespace: str, holder: str, operation_id: str,
         expected_anchor: RestoreAnchor,
     ) -> FencePermitV2:
-        if type(expected_anchor) is not RestoreAnchor:
-            raise TypeError("RestoreAnchor is required")
-        response = await self._content_rpc(
-            request, handshake, "begin_fence",
-            {"namespace": namespace, "holder": holder, "operation": "read",
-             "operation_id": operation_id, "expected_anchor": asdict(expected_anchor)},
-            protocol=AUTHORITY_V2_PROTOCOL)
-        permit = self._v2_permit_response(response)
-        if (permit.namespace != namespace or permit.holder != holder
-                or permit.operation_id != operation_id
-                or permit.pinned_anchor != expected_anchor
-                or permit.authority_id != handshake.installation_authority_id):
-            raise RuntimeError("authority v2 permit binding is invalid")
-        return permit
+        return await self.v2_begin_content_fence(
+            request, handshake, namespace=namespace, holder=holder,
+            operation="read", operation_id=operation_id,
+            expected_anchor=expected_anchor,
+        )
 
     async def v2_validate_fence(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         permit: FencePermitV2,
     ) -> FencePermitV2:
-        if type(permit) is not FencePermitV2 or permit.operation != "read":
-            raise TypeError("read FencePermitV2 is required")
+        if type(permit) is not FencePermitV2 or permit.operation not in _V2_CONTENT_OPERATIONS:
+            raise TypeError("content FencePermitV2 is required")
+        if permit.authority_id != handshake.installation_authority_id:
+            raise RuntimeError("authority v2 permit binding is invalid")
         response = await self._content_rpc(
             request, handshake, "validate_fence", {"permit": to_wire(permit)},
             protocol=AUTHORITY_V2_PROTOCOL)
@@ -562,8 +579,10 @@ class MtlsAuthorityTransport:
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         permit: FencePermitV2, *, request_id: str, request_digest: str,
     ) -> None:
-        if type(permit) is not FencePermitV2 or permit.operation != "read":
-            raise TypeError("read FencePermitV2 is required")
+        if type(permit) is not FencePermitV2 or permit.operation not in _V2_CONTENT_OPERATIONS:
+            raise TypeError("content FencePermitV2 is required")
+        if permit.authority_id != handshake.installation_authority_id:
+            raise RuntimeError("authority v2 permit binding is invalid")
         response = await self._content_rpc(
             request, handshake, "finish_fence",
             {"permit": to_wire(permit), "request_id": request_id,

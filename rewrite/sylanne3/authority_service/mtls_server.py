@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
@@ -13,7 +14,7 @@ from typing import Callable
 
 from ..runtime.restore_anchor import RestoreAnchor
 from .core import AuthorityServiceCore
-from .contract import AuthorityUnavailable, ContentPermit, identifier
+from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, ContentPermit, identifier
 from .v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire
 from .v2_fence_service import AuthorityV2FenceService
 
@@ -22,6 +23,7 @@ _MAX_SESSIONS = 256
 _SESSION_TTL_SECONDS = 30.0
 AUTHORITY_PROTOCOL = "sylanne3.authority.v1"
 _ENROLLMENT_CAPABILITIES = ("enrollment",)
+_V2_REMOTE_CONTENT_OPERATIONS = CONTENT_OPERATIONS - {"dispatch"}
 
 
 def _canonical(value: object) -> bytes:
@@ -106,18 +108,29 @@ class AuthorityRpcServer:
         *,
         administrator_authorizer: Callable[[object, str, str, str | None], bool],
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
-        v2_fences: AuthorityV2FenceService | None = None,
+        v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
     ) -> None:
         if not isinstance(core, AuthorityServiceCore):
             raise TypeError("AuthorityServiceCore is required")
         if not callable(administrator_authorizer) or not callable(publisher_manifest_verifier):
             raise TypeError("server-side authorizer and publisher verifier are required")
-        if v2_fences is not None and type(v2_fences) is not AuthorityV2FenceService:
-            raise TypeError("AuthorityV2FenceService is required")
+        if v2_fences is None:
+            services = {}
+        elif type(v2_fences) is AuthorityV2FenceService:
+            services = {v2_fences.namespace: v2_fences}
+        elif isinstance(v2_fences, Mapping):
+            services = dict(v2_fences)
+        else:
+            raise TypeError("AuthorityV2FenceService mapping is required")
+        if any(type(namespace) is not str
+               or type(service) is not AuthorityV2FenceService
+               or service.namespace != namespace or service.core is not core
+               for namespace, service in services.items()):
+            raise TypeError("v2 fence services must match their namespace and Authority core")
         self._core = core
         self._administrator_authorizer = administrator_authorizer
         self._publisher_manifest_verifier = publisher_manifest_verifier
-        self._v2_fences = v2_fences
+        self._v2_fences = services
         self._sessions: dict[str, tuple[float, str, str]] = {}
 
     @staticmethod
@@ -298,39 +311,52 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable") from exc
         raise RuntimeError("authority unavailable")
 
+    def _v2_service(self, namespace: object) -> AuthorityV2FenceService:
+        if type(namespace) is not str:
+            raise AuthorityUnavailable("namespace unavailable")
+        service = self._v2_fences.get(namespace)
+        if service is None:
+            raise AuthorityUnavailable("namespace unavailable")
+        return service
+
     def _v2_command(self, method: str, credential: MtlsPeerCredential,
                     command: object) -> dict[str, object]:
-        service = self._v2_fences
-        if service is None or type(command) is not dict:
+        if type(command) is not dict:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
             if method == "current_anchor" and set(command) == {"namespace"}:
-                if command["namespace"] != service.namespace:
-                    raise AuthorityUnavailable("namespace unavailable")
+                service = self._v2_service(command["namespace"])
                 return self._anchor_payload(service.current_anchor(
                     credential=credential, subject=subject))
             if method == "begin_fence" and set(command) == {
                     "namespace", "holder", "operation", "operation_id", "expected_anchor"}:
-                if command["namespace"] != service.namespace or command["operation"] != "read":
-                    raise AuthorityUnavailable("read fence unavailable")
+                service = self._v2_service(command["namespace"])
+                operation = command["operation"]
+                if (type(operation) is not str
+                        or operation not in _V2_REMOTE_CONTENT_OPERATIONS):
+                    raise AuthorityUnavailable("content fence unavailable")
                 anchor = self._anchor_from_command({"anchor": command["expected_anchor"]})
                 permit = service.begin_fence(
                     credential=credential, subject=subject, holder=command["holder"],
-                    operation="read", operation_id=command["operation_id"],
+                    operation=operation, operation_id=command["operation_id"],
                     expected_anchor=anchor)
                 return {"permit": to_wire(permit)}
             if method == "validate_fence" and set(command) == {"permit"}:
                 permit = from_wire(command["permit"])
-                if type(permit) is not FencePermitV2 or permit.operation != "read":
-                    raise AuthorityUnavailable("read fence required")
+                if (type(permit) is not FencePermitV2
+                        or permit.operation not in _V2_REMOTE_CONTENT_OPERATIONS):
+                    raise AuthorityUnavailable("content fence required")
+                service = self._v2_service(permit.namespace)
                 return {"permit": to_wire(service.validate_fence(
                     credential=credential, subject=subject, permit=permit))}
             if method == "finish_fence" and set(command) == {
                     "permit", "request_id", "request_digest"}:
                 permit = from_wire(command["permit"])
-                if type(permit) is not FencePermitV2 or permit.operation != "read":
-                    raise AuthorityUnavailable("read fence required")
+                if (type(permit) is not FencePermitV2
+                        or permit.operation not in _V2_REMOTE_CONTENT_OPERATIONS):
+                    raise AuthorityUnavailable("content fence required")
+                service = self._v2_service(permit.namespace)
                 service.finish_fence(
                     credential=credential, subject=subject, permit=permit,
                     request_id=command["request_id"],

@@ -281,7 +281,7 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
 
             def core_authorizer(candidate, action, namespace, holder):
                 return (candidate in peers.values() and namespace == "ns:role"
-                        and action in {"install", "seal_v2_only", "current", "read"}
+                        and action in {"install", "seal_v2_only", "current", "read", "write"}
                         and (holder is None or holder == "host:one"))
 
             core = AuthorityServiceCore(
@@ -373,6 +373,38 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(RuntimeError, "unavailable"):
                     await first.v2_validate_fence(
                         first_request, first_handshake, permit)
+
+                write_permit = await first.v2_begin_content_fence(
+                    first_request, first_handshake, namespace="ns:role",
+                    holder="host:one", operation="write", operation_id="write-a",
+                    expected_anchor=anchor)
+                self.assertEqual(write_permit.operation, "write")
+                self.assertEqual(write_permit.subject, permit.subject)
+                self.assertEqual(await first.v2_validate_fence(
+                    first_request, first_handshake, write_permit), write_permit)
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await second.v2_validate_fence(
+                        second_request, second_handshake, write_permit)
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await second.v2_finish_fence(
+                        second_request, second_handshake, write_permit,
+                        request_id="finish-write-a", request_digest=finish_digest)
+
+                await first.v2_finish_fence(
+                    first_request, first_handshake, write_permit,
+                    request_id="finish-write-a", request_digest=finish_digest)
+                await first.close()
+                first_handshake = await first.handshake(
+                    first_request, protocol=AUTHORITY_V2_PROTOCOL)
+                await first.v2_finish_fence(
+                    first_request, first_handshake, write_permit,
+                    request_id="finish-write-a", request_digest=finish_digest)
+                self.assertEqual(fences.get_operation(
+                    "write-a", subject=write_permit.subject, namespace="ns:role")[1],
+                    "finished")
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await first.v2_validate_fence(
+                        first_request, first_handshake, write_permit)
 
                 legacy, legacy_request = client("client", "legacy")
                 legacy_handshake = await legacy.handshake(legacy_request)
