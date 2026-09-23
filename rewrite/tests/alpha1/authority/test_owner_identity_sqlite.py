@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import sqlite3
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -22,6 +23,7 @@ from sylanne3.authority_service.v2_owner_proof import (
 from sylanne3.authority_service.v2_owner_session import (
     AuthorityV2OwnerSessionStore, OwnerSessionLoginRequestV1,
 )
+from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.graph_coordinator import namespace_ref
 from sylanne3.host.owner_deployment import OwnerDeploymentVerifier
 from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
@@ -30,6 +32,8 @@ from sylanne3.runtime_contracts import NamespaceId
 
 NS = NamespaceId("bot", "persona")
 AUTH_NS = namespace_ref(NS)
+OTHER_NS = NamespaceId("bot", "other-persona")
+OTHER_AUTH_NS = namespace_ref(OTHER_NS)
 PRINCIPAL = OwnerPrincipalV1("local-admin", "account-1", "incarnation-1")
 ADMIN = MtlsPeerCredential("a" * 64)
 PLUGIN = MtlsPeerCredential("b" * 64)
@@ -41,7 +45,8 @@ def _core(path, *, create):
     core = AuthorityServiceCore(
         path, create=create,
         authorizer=lambda credential, action, namespace, _: (
-            type(credential) is MtlsPeerCredential and namespace == AUTH_NS and (
+            type(credential) is MtlsPeerCredential
+            and namespace in {AUTH_NS, OTHER_AUTH_NS} and (
                 credential == ADMIN and action in {"owner_identity_pair", "owner_identity_revoke"}
                 or credential == PLUGIN and action in {"owner_pair", "owner_session"}
             )
@@ -56,6 +61,13 @@ def _core(path, *, create):
                        (AUTH_NS, "holder", 1, "active", None, None, 0, "deletion", 0,
                         "genesis", "clear", "execution", 0, "genesis", "nonce"))
     return core
+
+
+def _fence_store(path):
+    db = sqlite3.connect(path, isolation_level=None)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    return db, AuthorityV2FenceStore(db, create=True)
 
 
 def _subjects(core):
@@ -261,6 +273,19 @@ def test_actor_binding_is_admin_paired_one_to_one_and_revisioned(tmp_path):
     assert source.current_actor_binding(authority_namespace=AUTH_NS,
                                         installation_id="installation",
                                         actor_id="owner-actor") == binding
+    with pytest.raises(AuthorityUnavailable, match="transaction"):
+        source.require_current_actor_in_tx(
+            core._db, authority_namespace=AUTH_NS, installation_id="installation",
+            actor_id="owner-actor", principal=PRINCIPAL)
+    with core._tx() as db:
+        assert source.require_current_actor_in_tx(
+            db, authority_namespace=AUTH_NS, installation_id="installation",
+            actor_id="owner-actor", principal=PRINCIPAL, revision=1) == binding
+        with pytest.raises(AuthorityUnavailable, match="not current"):
+            source.require_current_actor_in_tx(
+                db, authority_namespace=AUTH_NS,
+                installation_id="installation", actor_id="owner-actor",
+                principal=PRINCIPAL, revision=2)
     assert source.current_actor_binding(authority_namespace=AUTH_NS,
                                         installation_id="other-installation",
                                         actor_id="owner-actor") is None
@@ -275,6 +300,10 @@ def test_actor_binding_is_admin_paired_one_to_one_and_revisioned(tmp_path):
     assert source.current_actor_binding(authority_namespace=AUTH_NS,
                                         installation_id="installation",
                                         actor_id="owner-actor") is None
+    with core._tx() as db, pytest.raises(AuthorityUnavailable, match="not current"):
+        source.require_current_actor_in_tx(
+            db, authority_namespace=AUTH_NS, installation_id="installation",
+            actor_id="owner-actor", principal=PRINCIPAL, revision=1)
     with pytest.raises(AuthorityUnavailable, match="not current"):
         source.revoke_actor(administrator_credential=ADMIN, binding=binding)
     rebound = replace(binding, actor_id="second-actor")
@@ -317,3 +346,184 @@ def test_actor_revoke_invalidates_existing_owner_session_in_same_authority_db(tm
         sessions.require_current(transport_credential=PLUGIN, token=token,
                                  request=request)
     core.close()
+
+
+def test_separate_connection_active_fence_blocks_owner_revokes_until_finished(tmp_path):
+    path = tmp_path / "authority.sqlite"
+    core = _core(path, create=True)
+    _, registration, ticket = _subjects(core)
+    source = AuthorityOwnerPairingSource(core, utc_clock=lambda: NOW, create=True)
+    source.pair_creation(administrator_credential=ADMIN, authority_namespace=AUTH_NS,
+                         ticket=ticket, client_certificate_sha256=PLUGIN.certificate_sha256,
+                         valid_until_utc=EXPIRY)
+    source.pair_credential(administrator_credential=ADMIN, registration=registration,
+                           client_certificate_sha256=PLUGIN.certificate_sha256,
+                           valid_until_utc=EXPIRY)
+    binding = OwnerActorBindingV1(
+        registration.authority_id, "installation", NS, "owner-actor", PRINCIPAL, 1)
+    source.pair_actor(administrator_credential=ADMIN, binding=binding)
+    fence_db, fences = _fence_store(path)
+    try:
+        with core._tx() as db:
+            anchor = core._anchor(db, AUTH_NS, core._row(db, AUTH_NS))
+        permit = fences.begin_fence(
+            subject="content-reader", holder="holder", operation="read",
+            current_anchor=anchor, operation_id="owner-pairing-fence")
+        for revoke in (
+            lambda: source.revoke_actor(administrator_credential=ADMIN, binding=binding),
+            lambda: source.revoke_creation(administrator_credential=ADMIN,
+                                           authority_namespace=AUTH_NS),
+            lambda: source.revoke_credential(administrator_credential=ADMIN,
+                                             authority_namespace=AUTH_NS,
+                                             principal=PRINCIPAL),
+        ):
+            with pytest.raises(AuthorityUnavailable, match="busy/not_applied"):
+                revoke()
+        assert source.current_actor_binding(authority_namespace=AUTH_NS,
+                                            installation_id="installation",
+                                            actor_id="owner-actor") == binding
+        assert source.current_creation_pairing(AUTH_NS) is not None
+        assert source.current_owner_pairing(AUTH_NS, PRINCIPAL) is not None
+        fences.finish_fence(
+            permit, subject="content-reader", current_anchor=anchor,
+            request_id="owner-pairing-finish",
+            request_digest="sha256:" + "a" * 64)
+        assert source.revoke_actor(administrator_credential=ADMIN, binding=binding) == 2
+        source.revoke_creation(administrator_credential=ADMIN,
+                               authority_namespace=AUTH_NS)
+        source.revoke_credential(administrator_credential=ADMIN,
+                                 authority_namespace=AUTH_NS, principal=PRINCIPAL)
+        assert source.current_actor_binding(authority_namespace=AUTH_NS,
+                                            installation_id="installation",
+                                            actor_id="owner-actor") is None
+        assert source.current_creation_pairing(AUTH_NS) is None
+        assert source.current_owner_pairing(AUTH_NS, PRINCIPAL) is None
+    finally:
+        fence_db.close()
+        core.close()
+
+
+def test_other_namespace_pairing_changes_continue_during_foreign_fence(tmp_path):
+    path = tmp_path / "authority.sqlite"
+    core = _core(path, create=True)
+    with core._tx() as db:
+        db.execute("INSERT INTO authority_namespaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (OTHER_AUTH_NS, "holder", 1, "active", None, None, 0,
+                    "deletion", 0, "genesis", "clear", "execution", 0,
+                    "genesis", "other-nonce"))
+    source = AuthorityOwnerPairingSource(core, utc_clock=lambda: NOW, create=True)
+    _, registration, ticket = _subjects(core)
+    other_principal = OwnerPrincipalV1("local-admin", "account-2", "incarnation-1")
+    other_registration = replace(
+        registration, authority_namespace=OTHER_AUTH_NS, principal=other_principal,
+        enrollment_operation_id="enroll-other")
+    other_ticket = replace(
+        ticket, namespace=OTHER_NS, principal=other_principal,
+        ticket_id="ticket-other", creation_operation_id="create-other")
+    other_binding = OwnerActorBindingV1(
+        registration.authority_id, "installation", OTHER_NS,
+        "other-owner-actor", other_principal, 1)
+    binding = OwnerActorBindingV1(
+        registration.authority_id, "installation", NS, "owner-actor", PRINCIPAL, 1)
+    fence_db, fences = _fence_store(path)
+    try:
+        with core._tx() as db:
+            anchor = core._anchor(db, AUTH_NS, core._row(db, AUTH_NS))
+        permit = fences.begin_fence(
+            subject="content-reader", holder="holder", operation="read",
+            current_anchor=anchor, operation_id="foreign-pairing-fence")
+        for pair in (
+            lambda: source.pair_creation(
+                administrator_credential=ADMIN, authority_namespace=AUTH_NS,
+                ticket=ticket, client_certificate_sha256=PLUGIN.certificate_sha256,
+                valid_until_utc=EXPIRY),
+            lambda: source.pair_credential(
+                administrator_credential=ADMIN, registration=registration,
+                client_certificate_sha256=PLUGIN.certificate_sha256,
+                valid_until_utc=EXPIRY),
+            lambda: source.pair_actor(administrator_credential=ADMIN,
+                                      binding=binding),
+        ):
+            with pytest.raises(AuthorityUnavailable, match="busy/not_applied"):
+                pair()
+        assert source.current_creation_pairing(AUTH_NS) is None
+        assert source.current_owner_pairing(AUTH_NS, PRINCIPAL) is None
+        source.pair_creation(
+            administrator_credential=ADMIN, authority_namespace=OTHER_AUTH_NS,
+            ticket=other_ticket, client_certificate_sha256=PLUGIN.certificate_sha256,
+            valid_until_utc=EXPIRY)
+        source.pair_credential(
+            administrator_credential=ADMIN, registration=other_registration,
+            client_certificate_sha256=PLUGIN.certificate_sha256,
+            valid_until_utc=EXPIRY)
+        source.pair_actor(administrator_credential=ADMIN, binding=other_binding)
+        assert source.current_actor_binding(authority_namespace=OTHER_AUTH_NS,
+                                            installation_id="installation",
+                                            actor_id="other-owner-actor") == other_binding
+        source.revoke_actor(administrator_credential=ADMIN, binding=other_binding)
+        source.revoke_creation(administrator_credential=ADMIN,
+                               authority_namespace=OTHER_AUTH_NS)
+        source.revoke_credential(administrator_credential=ADMIN,
+                                 authority_namespace=OTHER_AUTH_NS,
+                                 principal=other_principal)
+        assert source.current_actor_binding(authority_namespace=OTHER_AUTH_NS,
+                                            installation_id="installation",
+                                            actor_id="other-owner-actor") is None
+        fences.finish_fence(
+            permit, subject="content-reader", current_anchor=anchor,
+            request_id="foreign-pairing-finish",
+            request_digest="sha256:" + "b" * 64)
+    finally:
+        fence_db.close()
+        core.close()
+
+
+def test_pending_fence_or_mutation_marker_blocks_pairing_after_fence_finish(tmp_path):
+    path = tmp_path / "authority.sqlite"
+    core = _core(path, create=True)
+    source = AuthorityOwnerPairingSource(core, utc_clock=lambda: NOW, create=True)
+    _, _, ticket = _subjects(core)
+    fence_db, fences = _fence_store(path)
+    try:
+        with core._tx() as db:
+            anchor = core._anchor(db, AUTH_NS, core._row(db, AUTH_NS))
+        permit = fences.begin_fence(
+            subject="content-reader", holder="holder", operation="read",
+            current_anchor=anchor, operation_id="pending-pairing-fence")
+        fences.finish_fence(
+            permit, subject="content-reader", current_anchor=anchor,
+            request_id="pending-pairing-finish",
+            request_digest="sha256:" + "c" * 64)
+        fence_db.execute(
+            "UPDATE authority_v2_fences SET pending=? WHERE operation_id=?",
+            (b"unresolved", permit.operation_id))
+        def pair():
+            source.pair_creation(
+                administrator_credential=ADMIN, authority_namespace=AUTH_NS,
+                ticket=ticket, client_certificate_sha256=PLUGIN.certificate_sha256,
+                valid_until_utc=EXPIRY)
+        with pytest.raises(AuthorityUnavailable, match="busy/not_applied"):
+            pair()
+        assert source.current_creation_pairing(AUTH_NS) is None
+        fence_db.execute(
+            "UPDATE authority_v2_fences SET pending=NULL WHERE operation_id=?",
+            (permit.operation_id,))
+        fence_db.execute(
+            "INSERT INTO authority_v2_mutations"
+            "(mutation_id,operation_id,namespace,subject,request_digest,state,"
+            "conflict_keys_json,pending,mutation_kind,footprint) "
+            "VALUES(?,?,?,?,?,'pending',?,?,'execution',?)",
+            ("pending-pairing-mutation", permit.operation_id, AUTH_NS,
+             "content-reader", "sha256:" + "d" * 64, "[]",
+             b"unresolved", b"footprint"))
+        with pytest.raises(AuthorityUnavailable, match="busy/not_applied"):
+            pair()
+        assert source.current_creation_pairing(AUTH_NS) is None
+        fence_db.execute(
+            "DELETE FROM authority_v2_mutations WHERE mutation_id=?",
+            ("pending-pairing-mutation",))
+        pair()
+        assert source.current_creation_pairing(AUTH_NS) is not None
+    finally:
+        fence_db.close()
+        core.close()

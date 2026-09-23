@@ -16,6 +16,7 @@ from typing import Callable
 
 from ..authority_service.contract import AuthorityUnavailable, identifier
 from ..authority_service.core import AuthorityServiceCore
+from ..authority_service.v2_fence_store import AuthorityV2FenceStore
 from ..authority_service.v2_owner_contract import (
     OwnerActorBindingV1, OwnerClaimTicketV1, OwnerPrincipalV1, canonical_bytes,
     decode_bytes as decode_owner_bytes,
@@ -156,6 +157,27 @@ class AuthorityOwnerPairingSource:
         self._core._row(db, authority_namespace)
 
     @staticmethod
+    def _require_idle_owner_write(db: sqlite3.Connection,
+                                  authority_namespace: str) -> None:
+        """Serialize pairing changes behind this namespace's v2 content work."""
+        present = AuthorityV2FenceStore._v2_tables(db)
+        if not present:
+            # A standalone pre-fence Authority cannot compose a v2 owner RPC.
+            return
+        AuthorityV2FenceStore._check_schema(db)
+        AuthorityV2FenceStore._require_no_migration(db)
+        if db.execute(
+            "SELECT 1 FROM authority_v2_fences WHERE namespace=? "
+            "AND (state='active' OR pending IS NOT NULL) LIMIT 1",
+            (authority_namespace,),
+        ).fetchone() or db.execute(
+            "SELECT 1 FROM authority_v2_mutations WHERE namespace=? "
+            "AND state='pending' LIMIT 1",
+            (authority_namespace,),
+        ).fetchone():
+            raise AuthorityUnavailable("Owner pairing busy/not_applied: v2 namespace work is pending")
+
+    @staticmethod
     def _require_actor_schema(db: sqlite3.Connection) -> None:
         if db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -217,6 +239,7 @@ class AuthorityOwnerPairingSource:
             self._require_mode(db)
             self._require_actor_schema(db)
             self._scope(db, namespace, binding.authority_id)
+            self._require_idle_owner_write(db, namespace)
             if not self._paired_registration(db, binding):
                 raise AuthorityUnavailable("Owner actor principal has no current installation pairing")
             previous = self._actor_binding(db, namespace, binding.actor_id)
@@ -257,6 +280,7 @@ class AuthorityOwnerPairingSource:
             self._require_mode(db)
             self._require_actor_schema(db)
             self._scope(db, namespace, binding.authority_id)
+            self._require_idle_owner_write(db, namespace)
             current = self._actor_binding(db, namespace, binding.actor_id)
             if current != (binding, True):
                 raise AuthorityUnavailable("Owner actor binding is not current")
@@ -302,6 +326,34 @@ class AuthorityOwnerPairingSource:
                     or not self._paired_registration(db, current[0])):
                 return None
             return current[0]
+
+    def require_current_actor_in_tx(
+            self, db: sqlite3.Connection, *, authority_namespace: str,
+            installation_id: str, actor_id: str,
+            principal: OwnerPrincipalV1,
+            revision: int | None = None) -> OwnerActorBindingV1:
+        """Check the live actor and Owner key pairing inside a caller's Core tx."""
+        if db is not self._core._db or not db.in_transaction:
+            raise AuthorityUnavailable("Owner actor check needs Authority transaction")
+        for name, value in (("authority_namespace", authority_namespace),
+                            ("installation_id", installation_id),
+                            ("actor_id", actor_id)):
+            identifier(value, name)
+        if type(principal) is not OwnerPrincipalV1:
+            raise TypeError("stable Owner principal is required")
+        if revision is not None and (type(revision) is not int or revision < 1):
+            raise ValueError("Owner actor revision must be positive")
+        self._require_mode(db)
+        self._require_actor_schema(db)
+        self._core._row(db, authority_namespace)
+        current = self._actor_binding(db, authority_namespace, actor_id)
+        if (current is None or not current[1]
+                or current[0].installation_id != installation_id
+                or current[0].principal != principal
+                or (revision is not None and current[0].revision != revision)
+                or not self._paired_registration(db, current[0])):
+            raise AuthorityUnavailable("Owner actor binding is not current")
+        return current[0]
 
     def current_principal_binding(self, *, authority_namespace: str,
                                   installation_id: str,
@@ -350,6 +402,7 @@ class AuthorityOwnerPairingSource:
         with self._core._tx() as db:
             self._require_mode(db)
             self._scope(db, authority_namespace, ticket.authority_id)
+            self._require_idle_owner_write(db, authority_namespace)
             db.execute("INSERT INTO authority_owner_creation_pairings_v1 VALUES(?,?,?,?)",
                        (authority_namespace, canonical_bytes(ticket), certificate, expiry))
 
@@ -369,6 +422,7 @@ class AuthorityOwnerPairingSource:
         with self._core._tx() as db:
             self._require_mode(db)
             self._scope(db, namespace, registration.authority_id)
+            self._require_idle_owner_write(db, namespace)
             db.execute("INSERT INTO authority_owner_credential_pairings_v1 VALUES(?,?,?,?,?)",
                        (namespace, canonical_bytes(registration.principal),
                         _registration_bytes(registration), certificate, expiry))
@@ -379,6 +433,7 @@ class AuthorityOwnerPairingSource:
         with self._core._tx() as db:
             self._require_mode(db)
             self._core._row(db, authority_namespace)
+            self._require_idle_owner_write(db, authority_namespace)
             db.execute("DELETE FROM authority_owner_creation_pairings_v1 WHERE authority_namespace=?",
                        (authority_namespace,))
 
@@ -393,6 +448,7 @@ class AuthorityOwnerPairingSource:
         with self._core._tx() as db:
             self._require_mode(db)
             self._core._row(db, authority_namespace)
+            self._require_idle_owner_write(db, authority_namespace)
             row = db.execute(
                 "SELECT registration_bytes FROM authority_owner_credential_pairings_v1 "
                 "WHERE authority_namespace=? AND principal_bytes=?",
