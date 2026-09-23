@@ -24,6 +24,12 @@ from .arithmetic_report import (
     ReportInput,
     parse_arithmetic_report,
 )
+from .fixed_block_transcript import (
+    FixedBlockCSR,
+    FixedBlockMathTranscript,
+    FixedBlockStep,
+    run_fixed_block_math,
+)
 
 __all__ = [
     "ArithmeticReport",
@@ -46,4 +52,8 @@ __all__ = [
     "diagnostic_step_result",
     "parse_fixed_block_interval_result",
     "load_production_native",
+    "FixedBlockCSR",
+    "FixedBlockMathTranscript",
+    "FixedBlockStep",
+    "run_fixed_block_math",
 ]
