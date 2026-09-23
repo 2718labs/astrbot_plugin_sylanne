@@ -86,6 +86,8 @@ class RecordingJournal:
     def __init__(self, journal, events):
         self.journal = journal
         self.events = events
+        self.fail_claimed = False
+        self.claimed_ref = None
 
     def prepare(self, **kwargs):
         self.events.append("journal.prepare")
@@ -93,7 +95,12 @@ class RecordingJournal:
 
     def observe(self, effect_id, command_digest, phase, observation_ref):
         self.events.append(f"journal.observe:{phase}")
-        return self.journal.observe(effect_id, command_digest, phase, observation_ref)
+        if phase == "claimed" and self.fail_claimed:
+            raise OSError("claimed journal append failed")
+        entry = self.journal.observe(effect_id, command_digest, phase, observation_ref)
+        if phase == "claimed":
+            self.claimed_ref = entry.observation_ref
+        return entry
 
     def latest_execution_seq(self):
         return self.journal.latest_execution_seq()
@@ -108,6 +115,7 @@ class FakeAuthority:
         self.omit_check = None
         self.stale_content_fence = False
         self.stale_handoff_start = False
+        self.fail_handoff_start = False
         self.fail_settlement = False
         self.settlement_status_override = None
         self.release_calls = 0
@@ -182,6 +190,8 @@ class FakeAuthority:
 
     def begin_handoff(self, permit, request):
         self.events.append("begin_handoff")
+        if self.fail_handoff_start:
+            raise RuntimeError("handoff start unavailable")
         return HandoffStartReceipt(
             start_ref=f"handoff-start:{request.effect_id}",
             permit_ref=permit.permit_ref,
@@ -331,24 +341,46 @@ class DispatchRuntimeTests(unittest.TestCase):
         self.assertEqual(self.raw_journal.latest_execution_seq(), 0)
         self.assertEqual(self.platform.handoff_count, 0)
 
-    def test_dispatch_order_is_claim_prepare_current_fences_handoff_observe_settle(self):
+    def test_dispatch_order_claims_durably_before_current_fences_and_handoff(self):
         result = self.runtime.dispatch(_request())
         self.assertEqual(result.status, "accepted")
         self.assertEqual(
             self.events,
             [
-                "recovery_check", "lookup", "claim", "journal.prepare", "revalidate",
-                "begin_handoff", "journal.observe:claimed", "handoff",
+                "recovery_check", "lookup", "claim", "journal.prepare",
+                "journal.observe:claimed", "revalidate", "begin_handoff", "handoff",
                 "journal.observe:acknowledged", "settle",
             ],
         )
+        self.assertEqual(self.journal.claimed_ref, "admission:operation-1")
         self.assertEqual(self.platform.handoff_count, 1)
+
+    def test_claimed_append_failure_never_consumes_start_or_calls_platform(self):
+        self.journal.fail_claimed = True
+        with self.assertRaisesRegex(OSError, "claimed journal append failed"):
+            self.runtime.dispatch(_request())
+        self.assertEqual(self.raw_journal.latest_execution_seq(), 1)
+        self.assertNotIn("revalidate", self.events)
+        self.assertNotIn("begin_handoff", self.events)
+        self.assertEqual(self.platform.handoff_count, 0)
+
+    def test_failed_handoff_start_keeps_original_effect_pending_without_resend(self):
+        self.authority.fail_handoff_start = True
+        with self.assertRaisesRegex(RuntimeError, "handoff start unavailable"):
+            self.runtime.dispatch(_request())
+        self.assertEqual(self.raw_journal.latest_execution_seq(), 2)
+        self.assertEqual(self.platform.handoff_count, 0)
+        self.authority.fail_handoff_start = False
+        result = self.runtime.dispatch(_request())
+        self.assertEqual(result.status, "pending_confirmation")
+        self.assertEqual(self.platform.handoff_count, 0)
+        self.assertEqual(self.platform.query_count, 1)
 
     def test_stale_content_fence_after_prepare_blocks_handoff(self):
         self.authority.stale_content_fence = True
         with self.assertRaises(DispatchBlocked):
             self.runtime.dispatch(_request())
-        self.assertEqual(self.raw_journal.latest_execution_seq(), 1)
+        self.assertEqual(self.raw_journal.latest_execution_seq(), 2)
         self.assertEqual(self.platform.handoff_count, 0)
 
     def test_handoff_start_must_atomically_bind_the_current_fences(self):
@@ -356,7 +388,7 @@ class DispatchRuntimeTests(unittest.TestCase):
         with self.assertRaises(DispatchBlocked):
             self.runtime.dispatch(_request())
         self.assertEqual(self.platform.handoff_count, 0)
-        self.assertNotIn("journal.observe:claimed", self.events)
+        self.assertIn("journal.observe:claimed", self.events)
 
     def test_uncertain_handoff_is_journaled_and_restart_queries_original_without_resend(self):
         self.platform.next_handoff = HandoffUncertain("provider:timeout-1")

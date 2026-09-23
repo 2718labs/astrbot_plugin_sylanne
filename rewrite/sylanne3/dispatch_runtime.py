@@ -611,13 +611,13 @@ class DispatchRuntime:
             admission_ref=claim.admission_ref,
             footprint=request.footprint,
         )
+        claimed = self._journal.observe(
+            request.effect_id, request.command_digest, "claimed", claim.admission_ref,
+        )
         permit = self._authority.revalidate(claim, request)
         self._assert_permit(permit, claim, request)
         start = self._authority.begin_handoff(permit, request)
         self._assert_handoff_start(start, permit, request)
-        claimed = self._journal.observe(
-            request.effect_id, request.command_digest, "claimed", start.start_ref,
-        )
         try:
             # The configured adapter is contractually required to resolve the
             # opaque payload_ref and verify its bytes against payload_digest
