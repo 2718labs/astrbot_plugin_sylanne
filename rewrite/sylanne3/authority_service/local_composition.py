@@ -44,6 +44,7 @@ def compose_local_owner_authority(
     current_claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1,
                                         OwnerProofAcceptanceV1], bool] | None = None,
     owner_sessions: AuthorityV2OwnerSessionStore | None = None,
+    creation_pairing_source: object | None = None,
 ) -> AuthorityRpcServer:
     """Build the independent local Authority endpoint from trusted install config.
 
@@ -67,6 +68,11 @@ def compose_local_owner_authority(
             and (type(owner_sessions) is not AuthorityV2OwnerSessionStore
                  or owner_sessions._core is not core)):
         raise AuthorityUnavailable("Owner sessions require this Authority core")
+    if creation_pairing_source is not None:
+        from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
+        if (type(creation_pairing_source) is not AuthorityOwnerPairingSource
+                or creation_pairing_source._core is not core):
+            raise AuthorityUnavailable("creation pairing requires this Authority core")
     if owner_sessions is not None:
         if (owner_proofs is not None and (
                 type(owner_proofs) is not AuthorityV2OwnerProofStore
@@ -131,6 +137,7 @@ def compose_local_owner_authority(
         claimant_verifier=verified_claimant,
         graph_commit_verifier=graph_verifier,
         owner_sessions=owner_sessions,
+        creation_pairing_source=creation_pairing_source,
         create=create_owner_schema,
     )
     return AuthorityRpcServer(

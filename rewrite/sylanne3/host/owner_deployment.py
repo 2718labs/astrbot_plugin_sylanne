@@ -213,6 +213,7 @@ def compose_owner_deployment(
         core, utc_clock=utc_clock,
         pairing_verifier=verifier.pair_credential,
         session_verifier=verifier.current_session if owner_sessions is None else None,
+        current_pairing_source=identity if owner_sessions is not None else None,
         create=create_owner_schema,
     )
     return compose_local_owner_authority(
@@ -222,6 +223,7 @@ def compose_owner_deployment(
         current_claimant_verifier=(verifier.current_claimant
                                    if owner_sessions is None else None),
         owner_sessions=owner_sessions,
+        creation_pairing_source=identity if owner_sessions is not None else None,
         administrator_authorizer=administrator_authorizer,
         publisher_manifest_verifier=publisher_manifest_verifier,
         installations_v2=installations_v2,

@@ -341,14 +341,24 @@ class AuthorityV2OwnerProofStore:
                  session_verifier: Callable[[object, OwnerProofRequestV1], bool] | None = None,
                  recovery_verifier: Callable[[object, OwnerCredentialRegistrationV1,
                                               OwnerCredentialRegistrationV1], bool] | None = None,
+                 current_pairing_source: object | None = None,
                  create: bool = False) -> None:
         if type(core) is not AuthorityServiceCore:
             raise TypeError("Owner proof needs an independent Authority core")
+        if current_pairing_source is not None:
+            # Import at construction time: the host pairing source decodes these
+            # proof DTOs, so a module-level import would create a cycle.
+            from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
+
+            if (type(current_pairing_source) is not AuthorityOwnerPairingSource
+                    or current_pairing_source._core is not core):
+                raise TypeError("current Owner pairing must use the same Authority core")
         self._core = core
         self._utc_clock = utc_clock
         self._pairing_verifier = pairing_verifier
         self._session_verifier = session_verifier
         self._recovery_verifier = recovery_verifier
+        self._current_pairing_source = current_pairing_source
         with core._tx() as db:
             self._require_mode(db)
             present = {row[0] for row in db.execute(
@@ -411,6 +421,19 @@ class AuthorityV2OwnerProofStore:
             "AND installation_id=? AND principal_json=?",
             (namespace, installation, principal)).fetchone()
 
+    def _require_current_pairing_in_tx(
+            self, db: sqlite3.Connection, transport_credential: object,
+            registration: OwnerCredentialRegistrationV1) -> None:
+        source = self._current_pairing_source
+        if source is None:
+            return
+        from .mtls_server import MtlsPeerCredential
+
+        if type(transport_credential) is not MtlsPeerCredential:
+            raise AuthorityUnavailable("Owner pairing requires a verified mTLS peer")
+        source.require_current_registration_in_tx(
+            db, registration, transport_credential.certificate_sha256)
+
     def register_credential(self, *, transport_credential: object,
                             registration: OwnerCredentialRegistrationV1,
                             rotation_signature: bytes | None = None) -> OwnerCredentialRegistrationV1:
@@ -423,6 +446,7 @@ class AuthorityV2OwnerProofStore:
         with self._core._tx() as db:
             self._require_mode(db)
             self._scope(db, registration.authority_id, registration.authority_namespace)
+            self._require_current_pairing_in_tx(db, transport_credential, registration)
             current = self._credential(db, registration.authority_namespace,
                                        registration.installation_id, principal)
             if current is not None and current[4] == encoded:
@@ -459,6 +483,7 @@ class AuthorityV2OwnerProofStore:
         with self._core._tx() as db:
             self._require_mode(db)
             self._scope(db, registration.authority_id, registration.authority_namespace)
+            self._require_current_pairing_in_tx(db, transport_credential, registration)
             current = self._credential(db, registration.authority_namespace,
                                        registration.installation_id, principal)
             if current is not None and current[4] == encoded:

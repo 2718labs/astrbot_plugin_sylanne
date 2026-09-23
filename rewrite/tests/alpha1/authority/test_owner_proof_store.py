@@ -169,6 +169,84 @@ def test_signed_proof_acceptance_is_one_use_and_durable_across_restart(tmp_path)
         core.close()
 
 
+def test_pairing_revoke_between_verification_and_enrollment_denies_write(tmp_path):
+    from rewrite.tests.alpha1.authority.test_owner_identity_sqlite import (
+        ADMIN, AUTH_NS, EXPIRY, NOW, PLUGIN, PRINCIPAL,
+        _core, _subjects,
+    )
+    from sylanne3.host.owner_deployment import OwnerDeploymentVerifier
+    from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
+
+    core = _core(tmp_path / "authority.sqlite", create=True)
+    _, reg, _ = _subjects(core)
+    source = AuthorityOwnerPairingSource(core, utc_clock=lambda: NOW, create=True)
+    source.pair_credential(
+        administrator_credential=ADMIN, registration=reg,
+        client_certificate_sha256=PLUGIN.certificate_sha256,
+        valid_until_utc=EXPIRY,
+    )
+    verifier = OwnerDeploymentVerifier(source, lambda: NOW)
+
+    def verified_then_revoked(credential, registration):
+        assert verifier.pair_credential(credential, registration)
+        source.revoke_credential(
+            administrator_credential=ADMIN,
+            authority_namespace=AUTH_NS, principal=PRINCIPAL,
+        )
+        return True
+
+    try:
+        proofs = AuthorityV2OwnerProofStore(
+            core, utc_clock=lambda: NOW, pairing_verifier=verified_then_revoked,
+            current_pairing_source=source, create=True,
+        )
+        with pytest.raises(AuthorityUnavailable, match="pairing is not current"):
+            proofs.register_credential(transport_credential=PLUGIN, registration=reg)
+        with core._tx() as db:
+            assert db.execute(
+                "SELECT 1 FROM authority_owner_credentials_v1 WHERE authority_namespace=?",
+                (AUTH_NS,),
+            ).fetchone() is None
+    finally:
+        core.close()
+
+
+def test_pairing_natural_expiry_between_verification_and_enrollment_denies_write(tmp_path):
+    from rewrite.tests.alpha1.authority.test_owner_identity_sqlite import (
+        ADMIN, NOW, PLUGIN, _core, _subjects,
+    )
+    from sylanne3.host.owner_deployment import OwnerDeploymentVerifier
+    from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
+
+    core = _core(tmp_path / "authority.sqlite", create=True)
+    _, reg, _ = _subjects(core)
+    now = [NOW]
+    expires = NOW + timedelta(seconds=10)
+    source = AuthorityOwnerPairingSource(core, utc_clock=lambda: now[0], create=True)
+    source.pair_credential(
+        administrator_credential=ADMIN, registration=reg,
+        client_certificate_sha256=PLUGIN.certificate_sha256,
+        valid_until_utc=expires,
+    )
+    verifier = OwnerDeploymentVerifier(source, lambda: now[0])
+
+    def verified_then_expired(credential, registration):
+        assert verifier.pair_credential(credential, registration)
+        now[0] = expires
+        return True
+
+    try:
+        proofs = AuthorityV2OwnerProofStore(
+            core, utc_clock=lambda: now[0], pairing_verifier=verified_then_expired,
+            current_pairing_source=source, create=True,
+        )
+        with pytest.raises(AuthorityUnavailable, match="pairing is not current"):
+            proofs.register_credential(transport_credential=PLUGIN, registration=reg)
+        with core._tx() as db:
+            assert db.execute("SELECT 1 FROM authority_owner_credentials_v1").fetchone() is None
+    finally:
+        core.close()
+
 def test_signature_expiry_and_independent_pairing_are_required(tmp_path):
     core = core_at(tmp_path / "authority.db", initialize=True)
     clock = Clock()

@@ -1,7 +1,7 @@
 """A live Owner session is checked in the same transaction as first issue."""
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -13,7 +13,9 @@ from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuar
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
 from sylanne3.authority_service.local_composition import compose_local_owner_authority
-from sylanne3.authority_service.mtls_server import AdministratorInstallationV2
+from sylanne3.authority_service.mtls_server import (
+    AdministratorInstallationV2, MtlsPeerCredential,
+)
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
@@ -28,6 +30,7 @@ from sylanne3.authority_service.v2_owner_session import (
 from sylanne3.authority_service.v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 from sylanne3.authority_service.current_graph_verifier import PinnedCurrentGraphVerifier
 from sylanne3.graph_coordinator import namespace_ref
+from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
 from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime_contracts import NamespaceId
 from rewrite.tests.alpha1.authority.test_local_owner_round_trip import (
@@ -47,7 +50,7 @@ def digest(char):
     return "sha256:" + char * 64
 
 
-def setup(tmp_path, *, graph_verifier):
+def setup(tmp_path, *, graph_verifier, register_ticket=True):
     core = AuthorityServiceCore(
         tmp_path / "authority.db", create=True,
         authorizer=lambda credential, action, namespace, _: (
@@ -111,9 +114,42 @@ def setup(tmp_path, *, graph_verifier):
         graph_commit_verifier=graph_verifier,
         owner_sessions=sessions,
     )
-    store.register_ticket(
-        credential="installed-peer", authority_namespace=AUTH_NS, ticket=ticket)
+    if register_ticket:
+        store.register_ticket(
+            credential="installed-peer", authority_namespace=AUTH_NS, ticket=ticket)
     return core, sessions, request, token, operation, proof, store
+
+
+PAIRING_ADMIN = MtlsPeerCredential("a" * 64)
+PAIRING_CLIENT = MtlsPeerCredential("b" * 64)
+
+
+def paired_case(tmp_path, *, graph_verifier, first_claim_verifier):
+    core, sessions, request, token, operation, proof, _ = setup(
+        tmp_path, graph_verifier=graph_verifier, register_ticket=False)
+    original_authorizer = core._authorize_callback
+    core._authorize_callback = lambda credential, action, namespace, holder: (
+        (namespace == AUTH_NS and (
+            credential == PAIRING_ADMIN
+            and action in {"owner_identity_pair", "owner_identity_revoke"}
+            or credential == PAIRING_CLIENT
+            and action in {"owner_pair", "owner_claim"}))
+        or original_authorizer(credential, action, namespace, holder)
+    )
+    source = AuthorityOwnerPairingSource(core, utc_clock=lambda: NOW, create=True)
+    source.pair_creation(
+        administrator_credential=PAIRING_ADMIN,
+        authority_namespace=AUTH_NS, ticket=operation.ticket,
+        client_certificate_sha256=PAIRING_CLIENT.certificate_sha256,
+        valid_until_utc=NOW + timedelta(days=365),
+    )
+    tickets = AuthorityV2OwnerTicketStore(
+        core, utc_clock=lambda: NOW,
+        first_claim_verifier=first_claim_verifier,
+        graph_commit_verifier=graph_verifier,
+        owner_sessions=sessions, creation_pairing_source=source,
+    )
+    return core, sessions, request, token, operation, proof, tickets, source
 
 
 def reserve(store, operation, request, token):
@@ -336,3 +372,125 @@ def test_real_graph_first_issue_uses_live_owner_session(tmp_path):
     finally:
         for resource in resources:
             resource.close()
+
+
+def test_creation_revoke_after_first_claim_check_prevents_ticket_write(tmp_path):
+    state = {}
+
+    def verified_then_revoked(*_):
+        state["source"].revoke_creation(
+            administrator_credential=PAIRING_ADMIN, authority_namespace=AUTH_NS)
+        return True
+
+    (core, _, _, _, operation, _, tickets, source) = paired_case(
+        tmp_path, graph_verifier=lambda *_: True,
+        first_claim_verifier=verified_then_revoked)
+    state["source"] = source
+    try:
+        with pytest.raises(AuthorityUnavailable, match="creation pairing is not current"):
+            tickets.register_ticket(
+                credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+                ticket=operation.ticket)
+        with core._tx() as db:
+            assert db.execute(
+                "SELECT COUNT(*) FROM authority_owner_claim_tickets_v1"
+            ).fetchone() == (0,)
+    finally:
+        core.close()
+
+
+def test_current_creation_pairing_allows_first_issue_and_exact_replay(tmp_path):
+    (core, _, request, token, operation, proof, tickets, _) = paired_case(
+        tmp_path, graph_verifier=lambda *_: True,
+        first_claim_verifier=lambda *_: True)
+    try:
+        tickets.register_ticket(
+            credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+            ticket=operation.ticket)
+        pending = tickets.reserve_issue(
+            credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+            operation=operation, session_token=token, session_request=request)
+        assert pending.phase == "pending"
+        committed = tickets.finalize_issue(
+            credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+            operation=operation, proof=proof,
+            session_token=token, session_request=request)
+        assert committed.phase == "committed"
+        assert tickets.finalize_issue(
+            credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+            operation=operation, proof=proof,
+            session_token=token, session_request=request) == committed
+    finally:
+        core.close()
+
+
+def test_creation_revoke_after_pending_blocks_final_issue_and_replay(tmp_path):
+    (core, _, request, token, operation, proof, tickets, source) = paired_case(
+        tmp_path, graph_verifier=lambda *_: True,
+        first_claim_verifier=lambda *_: True)
+    try:
+        tickets.register_ticket(
+            credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+            ticket=operation.ticket)
+        pending = tickets.reserve_issue(
+            credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+            operation=operation, session_token=token, session_request=request)
+        assert pending.phase == "pending"
+        source.revoke_creation(
+            administrator_credential=PAIRING_ADMIN, authority_namespace=AUTH_NS)
+        with pytest.raises(AuthorityUnavailable, match="creation pairing is not current"):
+            tickets.reserve_issue(
+                credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+                operation=operation, session_token=token, session_request=request)
+        with pytest.raises(AuthorityUnavailable, match="creation pairing is not current"):
+            tickets.finalize_issue(
+                credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+                operation=operation, proof=proof,
+                session_token=token, session_request=request)
+        with core._tx() as db:
+            assert db.execute(
+                "SELECT COUNT(*) FROM authority_owner_issue_pending_v1"
+            ).fetchone() == (1,)
+            assert db.execute(
+                "SELECT COUNT(*) FROM authority_owner_issue_committed_v1"
+            ).fetchone() == (0,)
+            assert db.execute(
+                "SELECT COUNT(*) FROM authority_owner_authorization_heads_v1"
+            ).fetchone() == (0,)
+    finally:
+        core.close()
+
+
+def test_creation_revoke_during_graph_verification_blocks_final_write(tmp_path):
+    state = {}
+
+    def graph_verified_then_revoked(*_):
+        state["source"].revoke_creation(
+            administrator_credential=PAIRING_ADMIN, authority_namespace=AUTH_NS)
+        return True
+
+    (core, _, request, token, operation, proof, tickets, source) = paired_case(
+        tmp_path, graph_verifier=graph_verified_then_revoked,
+        first_claim_verifier=lambda *_: True)
+    state["source"] = source
+    try:
+        tickets.register_ticket(
+            credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+            ticket=operation.ticket)
+        tickets.reserve_issue(
+            credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+            operation=operation, session_token=token, session_request=request)
+        with pytest.raises(AuthorityUnavailable, match="creation pairing is not current"):
+            tickets.finalize_issue(
+                credential=PAIRING_CLIENT, authority_namespace=AUTH_NS,
+                operation=operation, proof=proof,
+                session_token=token, session_request=request)
+        with core._tx() as db:
+            assert db.execute(
+                "SELECT COUNT(*) FROM authority_owner_issue_committed_v1"
+            ).fetchone() == (0,)
+            assert db.execute(
+                "SELECT COUNT(*) FROM authority_owner_authorization_heads_v1"
+            ).fetchone() == (0,)
+    finally:
+        core.close()

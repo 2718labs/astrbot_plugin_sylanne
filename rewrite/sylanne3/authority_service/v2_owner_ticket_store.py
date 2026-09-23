@@ -88,6 +88,7 @@ class AuthorityV2OwnerTicketStore:
                  graph_commit_verifier: Callable[[OwnerAuthorizationOperationV1,
                                                  OwnerGraphCommitProofV1], bool] | None = None,
                  owner_sessions: AuthorityV2OwnerSessionStore | None = None,
+                 creation_pairing_source: object | None = None,
                  create: bool = False) -> None:
         if type(core) is not AuthorityServiceCore:
             raise TypeError("owner tickets require the independent Authority core")
@@ -101,6 +102,12 @@ class AuthorityV2OwnerTicketStore:
                 or owner_sessions._core is not core):
             raise TypeError("Owner sessions must use the same Authority core")
         self._owner_sessions = owner_sessions
+        if creation_pairing_source is not None:
+            from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
+            if (type(creation_pairing_source) is not AuthorityOwnerPairingSource
+                    or creation_pairing_source._core is not core):
+                raise TypeError("creation pairing requires this Authority core")
+        self._creation_pairing_source = creation_pairing_source
         with core._tx() as db:
             self._require_mode(db)
             present = self._present(db)
@@ -355,6 +362,19 @@ class AuthorityV2OwnerTicketStore:
             raise AuthorityUnavailable("Owner session differs from issue operation")
         sessions.require_current_in_tx(db, token=session_token, request=session_request)
 
+    def _require_creation_pairing(self, db: sqlite3.Connection,
+                                  credential: object, authority_namespace: str,
+                                  ticket: OwnerClaimTicketV1) -> None:
+        source = self._creation_pairing_source
+        if source is None:
+            return
+        from .mtls_server import MtlsPeerCredential
+        if type(credential) is not MtlsPeerCredential:
+            raise AuthorityUnavailable("Owner creation pairing requires an mTLS peer")
+        source.require_current_creation_pairing_in_tx(
+            db, authority_namespace=authority_namespace, ticket=ticket,
+            client_certificate_sha256=credential.certificate_sha256)
+
     def register_ticket(self, *, credential: object, authority_namespace: str,
                         ticket: OwnerClaimTicketV1) -> OwnerClaimTicketV1:
         """Register exactly one original creation binding; never infer owner."""
@@ -365,6 +385,7 @@ class AuthorityV2OwnerTicketStore:
         encoded = canonical_bytes(ticket)
         with self._core._tx() as db:
             self._require_mode(db)
+            self._require_creation_pairing(db, credential, authority_namespace, ticket)
             self._bound_namespace(db, ticket, authority_namespace)
             prior = db.execute(
                 "SELECT authority_namespace,ticket_bytes FROM authority_owner_claim_tickets_v1 "
@@ -389,6 +410,7 @@ class AuthorityV2OwnerTicketStore:
             raise AuthorityUnavailable("owner claim ticket has expired")
         with self._core._tx() as db:
             self._require_mode(db)
+            self._require_creation_pairing(db, credential, authority_namespace, ticket)
             self._bound_namespace(db, ticket, authority_namespace)
             prior = db.execute(
                 "SELECT authority_namespace,ticket_bytes FROM authority_owner_claim_tickets_v1 "
@@ -429,6 +451,7 @@ class AuthorityV2OwnerTicketStore:
             self._require_mode(db)
             self._require_owner_session(db, authority_namespace, operation,
                                         session_token, session_request)
+            self._require_creation_pairing(db, credential, authority_namespace, ticket)
             self._bound_namespace(db, ticket, authority_namespace)
             prior = self._checked_pending(db, authority_namespace, operation.operation_id)
             if prior is not None:
@@ -445,6 +468,7 @@ class AuthorityV2OwnerTicketStore:
             self._require_mode(db)
             self._require_owner_session(db, authority_namespace, operation,
                                         session_token, session_request)
+            self._require_creation_pairing(db, credential, authority_namespace, ticket)
             self._bound_namespace(db, ticket, authority_namespace)
             prior = self._checked_pending(db, authority_namespace, operation.operation_id)
             if prior is not None:
@@ -603,6 +627,9 @@ class AuthorityV2OwnerTicketStore:
             self._require_mode(db)
             self._require_owner_session(db, authority_namespace, operation,
                                         session_token, session_request)
+            ticket = operation.ticket
+            assert ticket is not None
+            self._require_creation_pairing(db, credential, authority_namespace, ticket)
             pending = self._checked_pending(db, authority_namespace,
                                             operation.operation_id)
             if pending is None or pending[0] != operation:
@@ -634,6 +661,7 @@ class AuthorityV2OwnerTicketStore:
                                         session_token, session_request)
             ticket = operation.ticket
             assert ticket is not None
+            self._require_creation_pairing(db, credential, authority_namespace, ticket)
             self._bound_namespace(db, ticket, authority_namespace)
             pending = self._checked_pending(db, authority_namespace,
                                             operation.operation_id)
