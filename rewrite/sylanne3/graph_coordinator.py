@@ -6,7 +6,7 @@ The strings in CommandEnvelope are audit assertions, never authentication.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, fields, replace
 from contextlib import contextmanager, nullcontext
 import hashlib
 import json
@@ -111,6 +111,14 @@ class AuthorityDenied(PermissionError):
 
 class UnavailableGuard(RuntimeError):
     """A current authority, lease, or policy version is not installed."""
+
+
+class FirstIngressOutcomeUnknown(UnavailableGuard):
+    """The original ingress operation needs exact Authority reconciliation."""
+
+    def __init__(self, operation_id: str, message: str):
+        super().__init__(message)
+        self.operation_id = operation_id
 
 
 @dataclass(frozen=True)
@@ -1338,6 +1346,575 @@ class GraphCoordinator:
             raise AuthorityDenied("bundle reference crosses namespace")
         return key
 
+    def commit_first_ingress_v2(self, bootstrap: object, host: IngressHostFacts,
+                                installation_policy, clock_policy,
+                                encoding_policy) -> CommitReceipt:
+        """Commit the first reported source and encoding job in one fenced write."""
+        from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
+        from .domains.d06 import D06DomainAdapter, SourceAdmission
+        from .host.authority_profile import (
+            AdminIngressClockPolicy, AdminIngressEncodingPolicy,
+        )
+        from .installation_policy import AdminInstallationPolicy
+        from .runtime.d11_types import runtime_job_key, runtime_outbox_key
+        from .runtime.first_ingress_bundle import build_first_ingress_bundle
+        from .runtime.first_ingress_v2 import (
+            finish_digest, ingress_ids, policy_identity, trusted_upper,
+        )
+        from .runtime.issuers import (
+            D02ResourceIssuer, D11BudgetJobIssuer, ResourceQuote,
+            install_schema as install_issuer_schema,
+        )
+        from .runtime_contracts import (
+            RUNTIME_SCHEMA, CommandEnvelope, OperationIdentity,
+            VersionGuard, VersionedRef,
+        )
+
+        self._admin(bootstrap)
+        if (installation_policy is None or clock_policy is None
+                or encoding_policy is None):
+            raise UnavailableGuard("v2 first ingress administrator policy missing; HOLD")
+        if (type(host) is not IngressHostFacts
+                or type(installation_policy) is not AdminInstallationPolicy
+                or type(clock_policy) is not AdminIngressClockPolicy
+                or type(encoding_policy) is not AdminIngressEncodingPolicy):
+            raise TypeError("typed v2 first ingress facts and policies required")
+        store = self.__store
+        port = self.__content_fence_v2
+        if (not isinstance(store, ProductionGraphStore) or port is None
+                or type(self.__d02_issuer) is not D02ResourceIssuer
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or self.__d11_issuer.resource_issuer is not self.__d02_issuer):
+            raise UnavailableGuard("v2 first ingress authorities are unavailable")
+        namespace = host.namespace
+        policy = installation_policy
+        if namespace != policy.namespace or host.lineage.source_ref == "":
+            raise AuthorityDenied("first ingress namespace or source differs")
+        source_identity, activity_id, operation_id, job_id, outbox_id, idem = (
+            ingress_ids(host.lineage.source_ref))
+        fingerprint = ingress_host_fingerprint(host)
+        identity_json = policy_identity(
+            policy, clock_policy, encoding_policy, fingerprint,
+            host.lineage.source_ref, host.conversation_ref)
+        attempt_id = "first-ingress-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "identity": identity_json,
+        })[:48]
+        grant = policy.root_grant
+        if ("d06.encode_source" not in grant.allowed_work_kinds
+                or any(amount > grant.max_ceiling.get(name, 0)
+                       for name, amount in encoding_policy.quote_ceiling.items())):
+            raise UnavailableGuard("root grant does not admit source encoding ceiling")
+
+        # All Authority calls precede the business lock. The profile's signed
+        # root grant is read from the provisioned DB; no new grant is minted.
+        with store._lock:
+            provision = self._provision_row(store._db, namespace)
+            if provision is None:
+                raise UnavailableGuard("v2 namespace is not provisioned")
+            genesis = self._decode_provision_receipt(provision)
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            stored_grant, signature = self.__d11_issuer.signed_budget_grant_at_version(
+                store._db, grant.lease_id, grant.version)
+            if (stored_grant != grant or signature != genesis.root_grant_signature
+                    or genesis.root_grant_id != grant.grant_id
+                    or genesis.root_lease_id != grant.lease_id
+                    or genesis.installation_id != policy.installation_id
+                    or genesis.manifest_digest != policy.manifest_digest):
+                raise UnavailableGuard("provisioned signed root grant differs")
+            row = store._db.execute(
+                "SELECT identity_json,learned_at,deadline_utc,fence_attempt_id,"
+                "requirements_json,anchor_json,graph_revision,graph_epoch,"
+                "monotonic_deadline "
+                "FROM graph_first_ingress_intents_v2 WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+        target = metadata.requirements
+        if (target.namespace != namespace
+                or target.authority_id != policy.expected_authority_id
+                or target.authority_namespace != policy.authority_namespace
+                or target.activation_generation != genesis.generation):
+            raise UnavailableGuard("v2 first ingress recovery identity differs")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("v2 first ingress Authority anchor differs")
+        reading = None
+        upper = None
+        requirements_json = canonical_json(asdict(target))
+        anchor_json = canonical_json(asdict(anchor))
+
+        def read_clock():
+            try:
+                sample = port.read_ingress_clock(clock_policy)
+                return sample, trusted_upper(sample)
+            except Exception as exc:
+                raise UnavailableGuard("paired ingress clock unavailable; HOLD") from exc
+
+        if row is None:
+            reading, upper = read_clock()
+            learned_at = upper
+            deadline = min(
+                math.nextafter(math.fsum((learned_at,
+                    encoding_policy.deadline_after_seconds)), -math.inf),
+                grant.valid_until_utc)
+            if (deadline <= learned_at or
+                    host.occurred_at is not None and host.occurred_at > learned_at):
+                raise UnavailableGuard("paired ingress clock cannot admit source")
+            monotonic_deadline = reading.monotonic_after_seconds + (
+                deadline - reading.utc_upper_bound_seconds)
+            if not math.isfinite(monotonic_deadline):
+                raise UnavailableGuard("paired ingress monotonic deadline is invalid")
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("first ingress pre-stamp changed")
+                    db.execute(
+                        "INSERT OR IGNORE INTO graph_first_ingress_intents_v2"
+                        "(bot,persona,operation_id,identity_json,learned_at,"
+                        "deadline_utc,fence_attempt_id,requirements_json,"
+                        "anchor_json,graph_revision,graph_epoch,"
+                        "monotonic_deadline) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (operation_id, identity_json,
+                        learned_at, deadline, attempt_id, requirements_json,
+                        anchor_json, metadata.graph_revision, epoch.revision,
+                        monotonic_deadline),
+                    )
+                    row = db.execute(
+                        "SELECT identity_json,learned_at,deadline_utc,"
+                        "fence_attempt_id,requirements_json,anchor_json,"
+                        "graph_revision,graph_epoch,monotonic_deadline "
+                        "FROM graph_first_ingress_intents_v2 "
+                        "WHERE bot=? AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone()
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+        if (row[0] != identity_json or row[3] != attempt_id
+                or row[4] != requirements_json or row[5] != anchor_json):
+            raise UnavailableGuard("durable first ingress intent identity differs")
+        learned_at, deadline = row[1:3]
+        if (not math.isfinite(learned_at) or not math.isfinite(deadline)
+                or not math.isfinite(row[8])
+                or deadline <= learned_at or deadline > grant.valid_until_utc):
+            raise UnavailableGuard("durable first ingress time is invalid")
+
+        def deadline_check(expected):
+            if expected != deadline or trusted_upper(reading) >= deadline:
+                raise UnavailableGuard("first ingress paired deadline expired")
+
+        with store._lock:
+            db = store._db
+            saved = db.execute(
+                "SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,"
+                "post_graph_revision,post_graph_epoch,finish_request_id,"
+                "finish_request_digest FROM graph_bundle_fences_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            rejected = db.execute(
+                "SELECT status,permit_json,graph_revision,graph_epoch,"
+                "finish_request_id,finish_request_digest "
+                "FROM graph_first_ingress_rejections_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            receipt = self._get_operation_fenced(
+                AuthorityContext(policy.administrator_holder, "d06", "audit",
+                    namespace, ("event", "activity"), "context",
+                    (host.conversation_ref,), grant.policy_ref,
+                    target.activation_generation), operation_id, v2=True)
+        if receipt is not None or rejected is not None:
+            if (receipt is None) == (rejected is None):
+                raise UnavailableGuard("first ingress terminal ledgers disagree")
+            encoded = saved[1] if receipt is not None and saved else (
+                rejected[1] if rejected else None)
+            if encoded is None:
+                raise UnavailableGuard("first ingress terminal permit absent")
+            permit = from_wire(json.loads(encoded))
+            if (type(permit) is not FencePermitV2
+                    or permit.operation_id != attempt_id
+                    or permit.pinned_anchor != anchor
+                    or permit.holder != self.__holder
+                    or permit.subject != port.installation_grant.subject):
+                raise UnavailableGuard("first ingress terminal permit differs")
+            try:
+                observed, state = port.get_fence_operation(
+                    namespace=namespace,
+                    authority_namespace=target.authority_namespace,
+                    operation_id=attempt_id)
+            except Exception as exc:
+                raise FirstIngressOutcomeUnknown(
+                    operation_id, "first ingress terminal Authority status unknown; HOLD"
+                ) from exc
+            if observed != permit or state not in {"active", "finished"}:
+                raise UnavailableGuard("first ingress Authority status differs")
+            if receipt is not None:
+                with store._lock:
+                    obs = store._db.execute(
+                        "SELECT content_fingerprint,learned_at,bundle_digest "
+                        "FROM ingress_first_observations WHERE bot=? AND persona=? "
+                        "AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone()
+                if (saved[0] != receipt.operation_digest
+                        or obs != (fingerprint, learned_at, receipt.operation_digest)
+                        or saved[2:4] != row[6:8]
+                        or saved[4] != saved[2] + 1
+                        or saved[5] != receipt.invalidated_epochs[0].revision
+                        or saved[5] <= saved[3]
+                        or saved[6] != "finish:" + attempt_id
+                        or saved[7] != finish_digest(
+                            attempt_id, permit.token, operation_id,
+                            receipt.operation_digest)):
+                    raise UnavailableGuard("first ingress business receipt differs")
+                if state == "active":
+                    if (metadata.graph_revision != saved[4]
+                            or epoch.revision != saved[5]):
+                        raise UnavailableGuard("first ingress committed stamp differs")
+                    scope = FenceScope(namespace, target.authority_namespace,
+                        target.activation_generation, "write", attempt_id,
+                        permit, anchor, NamespaceEpoch(*namespace.as_tuple,
+                            row[7]), row[6])
+                    try:
+                        if port.validate_fence(scope) != permit:
+                            raise UnavailableGuard("first ingress permit changed")
+                        port.finish_fence(scope, request_id=saved[6],
+                                          request_digest=saved[7])
+                    except Exception as exc:
+                        raise FirstIngressOutcomeUnknown(
+                            operation_id,
+                            "first ingress committed finish unconfirmed; HOLD"
+                        ) from exc
+                elif (metadata.graph_revision < saved[4]
+                      or epoch.revision < saved[5]):
+                    raise UnavailableGuard(
+                        "finished first ingress lost its business recovery stamp")
+                return receipt
+            if (rejected[0] != "rejected_no_commit"
+                    or rejected[2:4] != row[6:8]
+                    or rejected[4] != "abort:" + attempt_id
+                    or rejected[5] != finish_digest(
+                        attempt_id, permit.token, operation_id, None,
+                        rejected=True)):
+                raise UnavailableGuard("first ingress rejection differs")
+            scope = FenceScope(namespace, target.authority_namespace,
+                target.activation_generation, "write", attempt_id,
+                permit, anchor, NamespaceEpoch(*namespace.as_tuple, row[7]),
+                row[6])
+            if state == "active":
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("first ingress rejected permit changed")
+                try:
+                    port.finish_fence(scope, request_id=rejected[4],
+                                      request_digest=rejected[5])
+                except Exception as exc:
+                    raise FirstIngressOutcomeUnknown(
+                        operation_id,
+                        "first ingress rejected finish unconfirmed; HOLD"
+                    ) from exc
+            raise UnavailableGuard("first ingress terminal rejected_no_commit")
+        if reading is None:
+            reading, upper = read_clock()
+        if upper >= deadline or upper >= grant.valid_until_utc:
+            raise UnavailableGuard("first ingress paired deadline expired")
+        if (metadata.graph_revision, epoch.revision) != row[6:8]:
+            raise UnavailableGuard("uncommitted first ingress pre-stamp changed")
+        try:
+            # Authority treats the original active operation ID as an exact
+            # retry, including after a lost begin response or process crash.
+            permit = port.begin_fence(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                holder=self.__holder, generation=target.activation_generation,
+                operation="write", operation_id=attempt_id,
+                expected_anchor=anchor, retain_on_unknown=True)
+        except Exception as exc:
+            raise FirstIngressOutcomeUnknown(
+                operation_id,
+                "first ingress begin outcome unknown; HOLD original attempt") from exc
+        scope = FenceScope(namespace, target.authority_namespace,
+            target.activation_generation, "write", attempt_id, permit,
+            anchor, epoch, metadata.graph_revision)
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("first ingress write permit changed")
+
+        actor = policy.administrator_holder
+        lease, capability_ref = self.grant(
+            bootstrap, actor=actor, issuer_domain="d06", namespace=namespace,
+            domains=("d06", "d11"),
+            activation_generation=target.activation_generation,
+            operation_id=operation_id)
+        authority = AuthorityContext(
+            actor, "d06", capability_ref, namespace, ("event", "activity"),
+            "context", (host.conversation_ref,), grant.policy_ref,
+            target.activation_generation)
+        source = source_key(*namespace.as_tuple, host.lineage.source_ref)
+        access = access_key(*namespace.as_tuple, host.lineage.source_ref)
+        job_key = runtime_job_key(*namespace.as_tuple, activity_id, job_id)
+        outbox_key = runtime_outbox_key(*namespace.as_tuple, activity_id, outbox_id)
+        quote_id = "ingress-q-" + hashlib.sha256(
+            canonical_json([*namespace.as_tuple, operation_id]).encode()
+        ).hexdigest()[:40]
+        ingress_policy = IngressIssuancePolicy(
+            grant.lease_id, dict(encoding_policy.quote_ceiling),
+            dict(grant.max_ceiling), deadline, grant.valid_until_utc,
+            row[8],
+            encoding_policy.snapshot_ref, encoding_policy.resource_ref,
+            encoding_policy.character_interval_ref)
+        result = None
+        transaction_rolled_back = False
+        try:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("first ingress recovery stamp changed")
+                    if db.execute(
+                        "SELECT identity_json,learned_at,deadline_utc,"
+                        "fence_attempt_id,requirements_json,anchor_json,"
+                        "graph_revision,graph_epoch,monotonic_deadline "
+                        "FROM graph_first_ingress_intents_v2 WHERE bot=? "
+                        "AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone() != row:
+                        raise UnavailableGuard("first ingress durable intent changed")
+                    deadline_check(deadline)
+                    for key in (source, access, job_key, outbox_key):
+                        if db.execute("SELECT 1 FROM graph_atoms WHERE token=?",
+                                      (key.token,)).fetchone():
+                            raise StaleRead("first ingress revision-0 key changed")
+                    if db.execute(
+                        "SELECT 1 FROM graph_bundle_operations WHERE bot=? "
+                        "AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone():
+                        raise EventConflict("first ingress operation already committed")
+                    current_grant = self.__d11_issuer.current_budget_grant(
+                        db, grant.lease_id)
+                    if current_grant != grant:
+                        raise AuthorityDenied("root grant changed before ingress")
+                    budget = get_budget_lease(db, grant.lease_id)
+                    if budget.state != "active" or any(
+                            amount > budget.limits.get(name, 0)
+                            - budget.used.get(name, 0)
+                            - budget.reserved.get(name, 0)
+                            - budget.unconfirmed.get(name, 0)
+                            for name, amount in encoding_policy.quote_ceiling.items()):
+                        raise UnavailableGuard("root budget has insufficient capacity")
+                    epochs = db.execute(
+                        "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                        "WHERE bot=? AND persona=?", namespace.as_tuple,
+                    ).fetchone() or (0, 0)
+                    guard_data = {
+                        "access_epoch": epochs[0], "delete_epoch": epochs[1],
+                        "scheme": self._version(db, namespace, "scheme", "current"),
+                        "operator": self._version(db, namespace, "operator", "current"),
+                        "policy": self._version(db, namespace, "policy", "current"),
+                    }
+                    admission = SourceAdmission(
+                        host.lineage.source_ref, host.text, host.sender_ref,
+                        host.lineage.source_kind, "reported",
+                        host.lineage.evidence_eligibility,
+                        host.lineage.internal_activity_actuality,
+                        host.occurred_at, learned_at,
+                        host.lineage.provenance_family,
+                        (host.conversation_ref,), ("context", "consolidation"))
+                    candidate = D06DomainAdapter(namespace).admit_source(admission)
+                    command = CommandEnvelope(
+                        RUNTIME_SCHEMA,
+                        OperationIdentity(activity_id, None, "first", "ingress",
+                            operation_id, canonical_digest({
+                                "input_refs": list(candidate.qualification.source_refs)})),
+                        authority,
+                        VersionGuard(
+                            tuple(GraphVersion(key, 0) for key in
+                                  (source, access, job_key, outbox_key)),
+                            (), epochs[0], epochs[1],
+                            store._registry.catalogue_hash,
+                            guard_data["scheme"], guard_data["operator"],
+                            guard_data["policy"], (), (),
+                            (VersionedRef(quote_id, 1),)),
+                        candidate.qualification,
+                        candidate.qualification.source_refs,
+                        grant.lease_id, deadline,
+                        ingress_policy.monotonic_deadline,
+                        encoding_policy.character_interval_ref,
+                        (host.message_id,))
+                    install_issuer_schema(db)
+                    db.execute("""CREATE TABLE IF NOT EXISTS ingress_first_observations(
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        operation_id TEXT NOT NULL,
+                        content_fingerprint TEXT NOT NULL,
+                        learned_at REAL NOT NULL CHECK(learned_at > 0),
+                        bundle_digest TEXT,
+                        PRIMARY KEY(bot,persona,operation_id))""")
+                    db.execute("""CREATE TABLE IF NOT EXISTS runtime_ingress_issuance(
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        operation_id TEXT NOT NULL,
+                        activation_generation INTEGER NOT NULL,
+                        request_digest TEXT NOT NULL, policy_json TEXT NOT NULL,
+                        quote_id TEXT NOT NULL, grant_id TEXT NOT NULL,
+                        guard_json TEXT NOT NULL,
+                        PRIMARY KEY(bot,persona,operation_id))""")
+                    db.execute(
+                        "INSERT INTO ingress_first_observations"
+                        "(bot,persona,operation_id,content_fingerprint,"
+                        "learned_at,bundle_digest) VALUES(?,?,?,?,?,NULL)",
+                        namespace.as_tuple + (operation_id, fingerprint,
+                                              learned_at))
+                    quote = ResourceQuote(
+                        quote_id, 1, *namespace.as_tuple, activity_id,
+                        operation_id, None, grant.lease_id,
+                        "d06.encode_source", encoding_policy.snapshot_ref,
+                        deadline, encoding_policy.resource_ref, job_key.token,
+                        (outbox_key.token,), (), dict(encoding_policy.quote_ceiling),
+                        None, deadline)
+                    self.__d02_issuer.issue_quote(db, quote)
+                    db.execute(
+                        "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                        "VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + ("resource_lease", quote_id, "1"))
+                    db.execute(
+                        "INSERT INTO runtime_ingress_issuance"
+                        "(bot,persona,operation_id,activation_generation,"
+                        "request_digest,policy_json,quote_id,grant_id,guard_json) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            operation_id, target.activation_generation,
+                            canonical_digest(identity_json),
+                            canonical_json(asdict(ingress_policy)), quote_id,
+                            grant.grant_id, canonical_json(guard_data)))
+                    now_utc = trusted_upper(reading)
+                    job = self.__d11_issuer.job_for(
+                        command, db, now_utc=now_utc)
+                    bundle = build_first_ingress_bundle(
+                        command, job, admission,
+                        source_identity=source_identity,
+                        payload_ref=host.lineage.source_ref,
+                        idempotency_key=idem)
+                    db.execute(
+                        "UPDATE ingress_first_observations SET bundle_digest=? "
+                        "WHERE bot=? AND persona=? AND operation_id=?",
+                        (bundle.digest,) + namespace.as_tuple + (operation_id,))
+                    finish_id = "finish:" + attempt_id
+                    finished_digest = finish_digest(
+                        attempt_id, permit.token, operation_id, bundle.digest)
+                    result = self._commit_domain_bundle_fenced(
+                        bundle, lease, in_transaction=True, now_utc=now_utc,
+                        ingress_deadline_check=deadline_check,
+                        v2_write=(metadata, epoch, finish_id,
+                                  finished_digest,
+                                  canonical_json(to_wire(permit))))
+                    db.execute("COMMIT")
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                        transaction_rolled_back = True
+                    raise
+        except Exception as exc:
+            if transaction_rolled_back:
+                try:
+                    self._reject_first_ingress_v2(
+                        namespace, operation_id, row, permit, scope)
+                except Exception as reconcile_exc:
+                    raise FirstIngressOutcomeUnknown(
+                        operation_id,
+                        "first ingress rejection finish unconfirmed; HOLD original attempt"
+                    ) from reconcile_exc
+                raise
+            raise FirstIngressOutcomeUnknown(
+                operation_id,
+                "first ingress commit outcome unknown; HOLD original attempt") from exc
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("first ingress permit changed after commit")
+        except Exception as exc:
+            raise FirstIngressOutcomeUnknown(
+                operation_id, "first ingress committed permit unconfirmed; HOLD"
+            ) from exc
+        with store._lock:
+            current, current_epoch = self._v2_graph_stamp(namespace)
+            if (current.graph_revision != metadata.graph_revision + 1
+                    or current_epoch.revision != result.invalidated_epochs[0].revision):
+                raise FirstIngressOutcomeUnknown(
+                    operation_id, "first ingress committed stamp unconfirmed; HOLD")
+        try:
+            port.finish_fence(scope, request_id=finish_id,
+                              request_digest=finished_digest)
+        except Exception as exc:
+            raise FirstIngressOutcomeUnknown(
+                operation_id,
+                "first ingress finish outcome unknown; HOLD original attempt") from exc
+        return result
+
+    def _reject_first_ingress_v2(self, namespace, operation_id, row,
+                                 permit, scope) -> None:
+        """Only a proven rollback may become a durable abort identity."""
+        from .authority_service.v2_contract import to_wire
+        from .runtime.first_ingress_v2 import finish_digest
+
+        store = self.__store
+        attempt_id = row[3]
+        abort_id = "abort:" + attempt_id
+        digest = finish_digest(
+            attempt_id, permit.token, operation_id, None, rejected=True)
+        expected = ("rejected_no_commit", canonical_json(to_wire(permit)),
+                    row[6], row[7], abort_id, digest)
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                current, current_epoch = self._v2_graph_stamp(namespace)
+                if (current_epoch != scope.graph_epoch
+                        or current.graph_revision != scope.graph_revision
+                        or db.execute(
+                            "SELECT 1 FROM graph_bundle_operations WHERE bot=? "
+                            "AND persona=? AND operation_id=?",
+                            namespace.as_tuple + (operation_id,),
+                        ).fetchone()):
+                    raise UnavailableGuard("first ingress rollback cannot be proven")
+                if current.graph_revision != row[6]:
+                    raise UnavailableGuard("first ingress rollback stamp changed")
+                db.execute(
+                    "INSERT OR IGNORE INTO graph_first_ingress_rejections_v2"
+                    "(bot,persona,operation_id,status,permit_json,graph_revision,"
+                    "graph_epoch,finish_request_id,finish_request_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (operation_id,) + expected)
+                if db.execute(
+                    "SELECT status,permit_json,graph_revision,graph_epoch,"
+                    "finish_request_id,finish_request_digest "
+                    "FROM graph_first_ingress_rejections_v2 "
+                    "WHERE bot=? AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (operation_id,),
+                ).fetchone() != expected:
+                    raise UnavailableGuard("first ingress rejection identity differs")
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        port = self.__content_fence_v2
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("first ingress rejected permit changed")
+        except Exception as exc:
+            raise FirstIngressOutcomeUnknown(
+                operation_id, "first ingress rejected permit unconfirmed; HOLD"
+            ) from exc
+        try:
+            port.finish_fence(scope, request_id=abort_id,
+                              request_digest=digest)
+        except Exception as exc:
+            raise FirstIngressOutcomeUnknown(
+                operation_id, "first ingress rejected finish outcome unknown; HOLD"
+            ) from exc
+
     def issue_ingress_authorization(self, bootstrap: object, request, session):
         """Issue first D06+D11 ingress from installation policy and signed facts.
 
@@ -2462,7 +3039,10 @@ class GraphCoordinator:
                 # process clock may have advanced during provider validation.
                 if v2_write is not None:
                     expected, expected_epoch = v2_write[:2]
-                    if self._v2_graph_stamp(namespace) != (expected, expected_epoch):
+                    current_metadata, current_epoch = self._v2_graph_stamp(namespace)
+                    if (current_metadata != expected
+                            or current_epoch != graph_receipt.epoch
+                            or current_epoch.revision != expected_epoch.revision + 1):
                         raise StaleRead("v2 graph recovery stamp changed")
                 elif not v2_read:
                     self._admit_content(
@@ -2579,7 +3159,8 @@ class GraphCoordinator:
 
 
 __all__ = [
-    "GraphCoordinator", "AuthorityDenied", "UnavailableGuard", "namespace_ref",
+    "GraphCoordinator", "AuthorityDenied", "UnavailableGuard",
+    "FirstIngressOutcomeUnknown", "namespace_ref",
     "BudgetAdmission", "JobBinding", "RuntimeAdmission", "ScheduleAdmission",
     "budget_operation_digest",
 ]

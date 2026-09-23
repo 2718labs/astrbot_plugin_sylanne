@@ -212,6 +212,43 @@ class GraphStore(Store):
                 PRIMARY KEY(bot,persona,operation_id),
                 FOREIGN KEY(bot,persona,operation_id)
                     REFERENCES graph_bundle_intents_v2(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_first_ingress_intents_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                identity_json TEXT NOT NULL,
+                learned_at REAL NOT NULL,
+                deadline_utc REAL NOT NULL,
+                monotonic_deadline REAL NOT NULL,
+                fence_attempt_id TEXT NOT NULL UNIQUE,
+                requirements_json TEXT NOT NULL,
+                anchor_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL,
+                graph_epoch INTEGER NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id));
+            CREATE TRIGGER IF NOT EXISTS graph_first_ingress_intent_no_update_v2
+                BEFORE UPDATE ON graph_first_ingress_intents_v2
+                BEGIN SELECT RAISE(ABORT, 'first ingress intent is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_first_ingress_intent_no_delete_v2
+                BEFORE DELETE ON graph_first_ingress_intents_v2
+                BEGIN SELECT RAISE(ABORT, 'first ingress intent is immutable'); END;
+            CREATE TABLE IF NOT EXISTS graph_first_ingress_rejections_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status='rejected_no_commit'),
+                permit_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL,
+                graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL,
+                finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id),
+                FOREIGN KEY(bot,persona,operation_id)
+                    REFERENCES graph_first_ingress_intents_v2(bot,persona,operation_id));
+            CREATE TRIGGER IF NOT EXISTS graph_first_ingress_rejection_no_update_v2
+                BEFORE UPDATE ON graph_first_ingress_rejections_v2
+                BEGIN SELECT RAISE(ABORT, 'first ingress rejection is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_first_ingress_rejection_no_delete_v2
+                BEFORE DELETE ON graph_first_ingress_rejections_v2
+                BEGIN SELECT RAISE(ABORT, 'first ingress rejection is immutable'); END;
             CREATE TRIGGER IF NOT EXISTS graph_bundle_rejection_no_update_v2
                 BEFORE UPDATE ON graph_bundle_rejections_v2
                 BEGIN SELECT RAISE(ABORT, 'bundle rejection is immutable'); END;
