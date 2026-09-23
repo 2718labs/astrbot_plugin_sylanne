@@ -35,6 +35,7 @@ class V2InstallationAssembly:
     available_cpu_features: frozenset[str] | None = None
     ingress_clock: AdminIngressClockPolicy | None = None
     ingress_encoding: AdminIngressEncodingPolicy | None = None
+    workbench_origin: str | None = None
 
 
 async def assemble_v2_installation(
@@ -111,7 +112,7 @@ async def assemble_v2_installation(
     return V2InstallationAssembly(
         policy, grant, bundle.d11_signing_key, bundle.d02_signing_key, make_fence_port,
         root, data, available_cpu_features, bundle.ingress_clock,
-        bundle.ingress_encoding,
+        bundle.ingress_encoding, bundle.workbench_origin,
     )
 
 

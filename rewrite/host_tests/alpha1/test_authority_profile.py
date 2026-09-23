@@ -82,6 +82,45 @@ def _schema2_payload() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("origin", (
+    "https://workbench.example.org",
+    "https://workbench.example.org:8443",
+    "https://127.0.0.1:6185",
+    "https://[::1]:6185",
+))
+def test_schema2_workbench_origin_is_canonical_and_optional(tmp_path: Path,
+                                                              origin: str) -> None:
+    payload = _schema2_payload()
+    profile_dir = _provision(tmp_path, payload=payload)
+    loaded = authority_profile._read_profile_json(profile_dir / "profile.json")
+    assert authority_profile._workbench_origin_from_payload(loaded) is None
+    payload["workbench_origin"] = origin
+    (profile_dir / "profile.json").write_text(json.dumps(payload), encoding="utf-8")
+    loaded = authority_profile._read_profile_json(profile_dir / "profile.json")
+    assert authority_profile._workbench_origin_from_payload(loaded) == origin
+    authority_profile._policy_from_payload(loaded)
+
+
+@pytest.mark.parametrize("origin", (
+    "http://workbench.example.org", "HTTPS://workbench.example.org",
+    "https://Workbench.example.org", "https://workbench.example.org/",
+    "https://workbench.example.org/path", "https://workbench.example.org?x=1",
+    "https://workbench.example.org#fragment", "https://user@workbench.example.org",
+    "https://workbench.example.org:0", "https://workbench.example.org:65536",
+    "https://workbench.example.org:", "https://workbench.example.org.",
+    "https://[fe80::1%25eth0]", "https://workbench.example.org:443/",
+    "https://workbench.example.org@evil.example.org", "",
+    None, 12,
+))
+def test_schema2_workbench_origin_rejects_noncanonical_content(tmp_path: Path,
+                                                                origin: object) -> None:
+    payload = _schema2_payload()
+    payload["workbench_origin"] = origin
+    profile_dir = _provision(tmp_path, payload=payload)
+    with pytest.raises(ValueError, match="workbench origin"):
+        authority_profile._read_profile_json(profile_dir / "profile.json")
+
+
 def test_profile_id_cannot_select_path_or_trust_material(tmp_path: Path) -> None:
     _provision(tmp_path)
     for selection in ("../safe", "safe/other", "safe\\other", "", "."):

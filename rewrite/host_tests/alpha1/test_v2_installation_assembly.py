@@ -25,6 +25,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
             tls_profile=profile, installation_policy=policy,
             d11_signing_key=b"k" * 32, d02_signing_key=b"d" * 32,
             ingress_clock=None, ingress_encoding=None,
+            workbench_origin="https://workbench.example.org:8443",
         )
         grant = InstallationGrantV2(
             authority_id="authority", subject="mtls:sha256:peer",
@@ -54,6 +55,8 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(assembled.package_root, Path.cwd() / "package")
             self.assertEqual(assembled.data_dir, Path.cwd() / "data")
             self.assertEqual(assembled.available_cpu_features, frozenset({"avx2"}))
+            self.assertEqual(assembled.workbench_origin,
+                             "https://workbench.example.org:8443")
             port_type.assert_not_called()
             await asyncio.to_thread(assembled.fence_port_factory)
             request, profiles, selected_grant = port_type.call_args.args

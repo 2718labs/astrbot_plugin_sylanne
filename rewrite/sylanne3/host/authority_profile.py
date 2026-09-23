@@ -23,6 +23,7 @@ import ssl
 import stat
 from types import MappingProxyType
 from typing import Iterator, Mapping
+from urllib.parse import urlsplit
 
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.budget import BudgetLease
@@ -156,6 +157,7 @@ class AdminInstallationBundle:
     d02_signing_key: bytes
     ingress_clock: AdminIngressClockPolicy | None = None
     ingress_encoding: AdminIngressEncodingPolicy | None = None
+    workbench_origin: str | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -455,13 +457,41 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
             or (set(value) != _PROFILE_FIELDS_V1 if value["schema"] == 1 else
                 not _valid_schema2_fields(value))):
         raise ValueError("authority profile schema is invalid")
+    _workbench_origin_from_payload(value)
     return value
 
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "workbench_origin"}
     )
+
+
+def _workbench_origin_from_payload(payload: dict[str, object]) -> str | None:
+    value = payload.get("workbench_origin")
+    if value is None and "workbench_origin" not in payload:
+        return None
+    if type(payload.get("schema")) is not int or payload["schema"] != 2:
+        raise ValueError("workbench origin requires profile schema 2")
+    if type(value) is not str or len(value) > 253:
+        raise ValueError("workbench origin must be a canonical HTTPS origin")
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+        if (parsed.scheme != "https" or host is None or parsed.username is not None
+                or parsed.password is not None or parsed.path or parsed.query
+                or parsed.fragment or "%" in host
+                or (port is not None and not 1 <= port <= 65535)):
+            raise ValueError("workbench origin must be a canonical HTTPS origin")
+        _endpoint_name(host)
+        canonical_host = f"[{host}]" if ":" in host else host.lower()
+        canonical = "https://" + canonical_host + (f":{port}" if port is not None else "")
+    except (ValueError, TypeError) as exc:
+        raise ValueError("workbench origin must be a canonical HTTPS origin") from exc
+    if canonical != value:
+        raise ValueError("workbench origin must be a canonical HTTPS origin")
+    return value
 
 
 def _endpoint_name(value: object) -> str:
@@ -539,6 +569,7 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
         raise ValueError("administrator installation policy requires profile schema 2")
     _ingress_clock_from_payload(payload)
     _ingress_encoding_from_payload(payload)
+    _workbench_origin_from_payload(payload)
     values = _exact_object(payload["installation_policy"], _INSTALLATION_FIELDS,
                            "installation policy")
     namespace = _exact_object(values["namespace"], frozenset({"bot_id", "persona_id"}),
@@ -718,7 +749,8 @@ def _load_installation_bundle_from_root(
         )
     return AdminInstallationBundle(profile, policy, d11_key, d02_key,
                                    _ingress_clock_from_payload(payload),
-                                   _ingress_encoding_from_payload(payload))
+                                   _ingress_encoding_from_payload(payload),
+                                   _workbench_origin_from_payload(payload))
 
 
 def _load_windows_installation_bundle(
@@ -741,7 +773,8 @@ def _load_windows_installation_bundle(
         )
     return AdminInstallationBundle(profile, policy, d11_key, d02_key,
                                    _ingress_clock_from_payload(payload),
-                                   _ingress_encoding_from_payload(payload))
+                                   _ingress_encoding_from_payload(payload),
+                                   _workbench_origin_from_payload(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
