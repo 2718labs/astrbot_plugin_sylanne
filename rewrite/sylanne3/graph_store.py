@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, dataclass, fields
 
 from .contracts import Event, EventConflict, StaleRead, canonical_json, json_object, nonempty
 from .graph_types import (
@@ -18,6 +19,25 @@ from .graph_types import (
 )
 from .store import Store
 from .runtime import install_schema as install_runtime_schema
+from .runtime_contracts import NamespaceId, SnapshotRequirementsV2
+
+
+@dataclass(frozen=True, slots=True)
+class GraphRecoveryMetadataV2:
+    """Stored comparison target and namespace commit stamp, not an Authority permit.
+
+    Every protected business commit must advance graph_revision when its writer
+    is connected to this seam; this storage slice does not connect those writers.
+    """
+
+    requirements: SnapshotRequirementsV2
+    graph_revision: int
+
+    def __post_init__(self):
+        if type(self.requirements) is not SnapshotRequirementsV2:
+            raise TypeError("requirements must be SnapshotRequirementsV2")
+        if type(self.graph_revision) is not int or self.graph_revision < 0:
+            raise ValueError("graph_revision must be a nonnegative integer")
 
 
 class GraphStore(Store):
@@ -152,6 +172,12 @@ class GraphStore(Store):
                 edge_kind TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
                 PRIMARY KEY(dependent_token,dependency_token,edge_kind,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_recovery_metadata_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                schema TEXT NOT NULL CHECK(schema='sylanne3.authority.v2'),
+                requirements_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL CHECK(graph_revision >= 0),
+                PRIMARY KEY(bot,persona));
         """)
 
     @staticmethod
@@ -213,6 +239,148 @@ class GraphStore(Store):
         if isinstance(self, ProductionGraphStore) and (
                 capability is None or capability is not getattr(self, "_coordinator_capability", None)):
             raise PermissionError("production graph access requires GraphCoordinator")
+
+    def _require_recovery_capability(self, capability):
+        if (capability is None or
+                capability is not getattr(self, "_coordinator_capability", None)):
+            raise PermissionError("graph recovery metadata requires GraphCoordinator")
+
+    @staticmethod
+    def _recovery_payload(requirements):
+        if type(requirements) is not SnapshotRequirementsV2:
+            raise TypeError("requirements must be SnapshotRequirementsV2")
+        return canonical_json(asdict(requirements))
+
+    @staticmethod
+    def _decode_recovery(row, namespace):
+        if row is None:
+            return None
+        schema, encoded, revision = row
+        data = json.loads(encoded)
+        expected = {field.name for field in fields(SnapshotRequirementsV2)}
+        if (schema != "sylanne3.authority.v2" or not isinstance(data, dict)
+                or set(data) != expected or not isinstance(data["namespace"], dict)
+                or set(data["namespace"]) != {"bot_id", "persona_id"}):
+            raise ValueError("incompatible graph recovery metadata")
+        data["namespace"] = NamespaceId(**data["namespace"])
+        result = GraphRecoveryMetadataV2(SnapshotRequirementsV2(**data), revision)
+        if result.requirements.namespace != namespace:
+            raise ValueError("graph recovery metadata crosses namespace")
+        return result
+
+    def _recovery_row(self, namespace):
+        return self._db.execute(
+            "SELECT schema,requirements_json,graph_revision "
+            "FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()
+
+    def _has_namespace_history(self, namespace):
+        """Reject genesis for scoped rows or legacy clocks without ownership."""
+        # Clock rows have no namespace columns yet. Until that schema carries
+        # ownership, any old clock row makes every namespace genesis ambiguous.
+        unscoped_clocks = {
+            "runtime_character_clocks", "runtime_clock_operations",
+            "runtime_deadlines", "runtime_deadline_operations",
+        }
+        for (table,) in self._db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+            if table in {"graph_recovery_metadata_v2", "graph_type_catalog",
+                         "graph_type_authority"}:
+                continue
+            quoted = '"' + table.replace('"', '""') + '"'
+            if table in unscoped_clocks:
+                if self._db.execute(f"SELECT 1 FROM {quoted} LIMIT 1").fetchone():
+                    return True
+                continue
+            columns = {row[1] for row in self._db.execute(
+                f"PRAGMA table_info({quoted})")}
+            if {"bot", "persona"}.issubset(columns):
+                pair = ("bot", "persona")
+            elif {"bot_id", "persona_id"}.issubset(columns):
+                pair = ("bot_id", "persona_id")
+            elif {"event_bot", "event_persona"}.issubset(columns):
+                pair = ("event_bot", "event_persona")
+            else:
+                continue
+            if self._db.execute(
+                    f'SELECT 1 FROM {quoted} WHERE {pair[0]}=? AND {pair[1]}=? LIMIT 1',
+                    namespace.as_tuple).fetchone():
+                return True
+        return False
+
+    def graph_recovery_metadata(self, namespace, *, _capability=None):
+        """Read stored v2 requirements, never derive them from a current anchor."""
+        self._require_recovery_capability(_capability)
+        if type(namespace) is not NamespaceId:
+            raise TypeError("namespace must be NamespaceId")
+        with self._lock:
+            self._ensure_open()
+            row = self._recovery_row(namespace)
+            if row is None and self._has_namespace_history(namespace):
+                raise RuntimeError("namespace has unsealed business state")
+            return self._decode_recovery(row, namespace)
+
+    def install_graph_recovery_genesis(self, requirements, *, _capability=None):
+        """Install explicit zero-head metadata only for an empty namespace."""
+        self._require_recovery_capability(_capability)
+        encoded = self._recovery_payload(requirements)
+        if (requirements.activation_generation == 0 or requirements.revocation_epoch != 0
+                or requirements.deletion_seq != 0 or requirements.execution_seq != 0):
+            raise ValueError("graph genesis requires an active zero-head snapshot")
+        with self._lock:
+            self._ensure_open()
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if self._recovery_row(requirements.namespace) is not None:
+                    raise StaleRead("graph recovery metadata already installed")
+                if self._has_namespace_history(requirements.namespace):
+                    raise RuntimeError("namespace has unsealed business state")
+                self._db.execute(
+                    "INSERT INTO graph_recovery_metadata_v2"
+                    "(bot,persona,schema,requirements_json,graph_revision) "
+                    "VALUES(?,?,?,?,0)",
+                    requirements.namespace.as_tuple + (requirements.schema, encoded),
+                )
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return GraphRecoveryMetadataV2(requirements, 0)
+
+    def cas_graph_recovery_metadata(self, expected, replacement, *, _capability=None):
+        """Advance the namespace commit stamp inside the caller's SQL transaction."""
+        self._require_recovery_capability(_capability)
+        if type(expected) is not GraphRecoveryMetadataV2:
+            raise TypeError("expected must be GraphRecoveryMetadataV2")
+        encoded = self._recovery_payload(replacement)
+        before = expected.requirements
+        if (replacement.namespace != before.namespace
+                or replacement.authority_id != before.authority_id
+                or replacement.authority_namespace != before.authority_namespace
+                or replacement.activation_generation != before.activation_generation
+                or replacement.deletion_journal_id != before.deletion_journal_id
+                or replacement.execution_journal_id != before.execution_journal_id
+                or replacement.graph_incarnation != before.graph_incarnation):
+            raise StaleRead("graph recovery identity changed")
+        if (replacement.deletion_seq < before.deletion_seq
+                or replacement.execution_seq < before.execution_seq
+                or replacement.revocation_epoch < before.revocation_epoch):
+            raise StaleRead("graph recovery watermark regressed")
+        with self._lock:
+            self._ensure_open()
+            if not self._db.in_transaction:
+                raise RuntimeError("graph recovery CAS requires an active SQL transaction")
+            changed = self._db.execute(
+                "UPDATE graph_recovery_metadata_v2 SET requirements_json=?,"
+                "graph_revision=graph_revision+1 WHERE bot=? AND persona=? "
+                "AND schema=? AND requirements_json=? AND graph_revision=?",
+                (encoded, *before.namespace.as_tuple, before.schema,
+                 self._recovery_payload(before), expected.graph_revision),
+            ).rowcount
+            if changed != 1:
+                raise StaleRead("graph recovery metadata changed")
+            return GraphRecoveryMetadataV2(replacement, expected.graph_revision + 1)
 
     def graph_epoch(self, bot, persona, *, _capability=None):
         self._require_coordinator(_capability)
