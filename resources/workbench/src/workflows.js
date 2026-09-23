@@ -14,6 +14,14 @@ function objectJson(value) {
 export function workflowForPage(page, values) {
   const mode = text(values.mode);
   switch (page) {
+    case "setup": {
+      const sceneRef = text(values.scene_ref);
+      const visibility = text(values.visibility);
+      if (!/^scene:conversation-v1:[a-f0-9]{64}$/.test(sceneRef)) throw new Error("请输入管理员可信渠道提供的当前会话场景引用（scene:conversation-v1: 后接 64 位小写十六进制值）。");
+      if (!["private", "group"].includes(visibility)) throw new Error("请选择场景可见范围。");
+      if (values.acknowledgement !== "on" && values.acknowledgement !== true) throw new Error("请确认场景引用和可见范围准确后再提交。");
+      return [ACTIONS.bindScene, { scene_ref: sceneRef, visibility, acknowledgement: true }];
+    }
     case "creation": {
       const draft = objectJson(values.draft_json);
       return mode === "activate"

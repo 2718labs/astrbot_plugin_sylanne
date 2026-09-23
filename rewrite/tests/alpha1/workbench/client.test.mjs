@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ACTIONS, D12_SCHEMA_VERSION, makeOwnerLoginRequest, makeRequest } from "../../../../webui-src/src/api/contract.js";
-import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "../../../../webui-src/src/api/client.js";
-import { applyProblem, applyResponse, initialState, switchRole, VIEW_STATES } from "../../../../webui-src/src/state.js";
-import { needsFreshProjection, workflowForPage } from "../../../../webui-src/src/workflows.js";
+import { ACTIONS, D12_SCHEMA_VERSION, makeOwnerLoginRequest, makeRequest } from "../../../../resources/workbench/src/api/contract.js";
+import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "../../../../resources/workbench/src/api/client.js";
+import { applyProblem, applyResponse, initialState, switchRole, VIEW_STATES } from "../../../../resources/workbench/src/state.js";
+import { needsFreshProjection, workflowForPage } from "../../../../resources/workbench/src/workflows.js";
 
 test("client posts to the AstrBot plugin extension route with host cookie and CSRF", async () => {
   const requested = [];
@@ -199,6 +199,11 @@ test("degraded server responses clear content and stale receipts", () => {
 });
 
 test("nine-page workflows map user inputs only to W10 action schemas", () => {
+  const [bind, binding] = workflowForPage("setup", { scene_ref: `scene:conversation-v1:${"a".repeat(64)}`, visibility: "private", acknowledgement: "on" });
+  assert.equal(bind, ACTIONS.bindScene);
+  assert.deepEqual(binding, { scene_ref: `scene:conversation-v1:${"a".repeat(64)}`, visibility: "private", acknowledgement: true });
+  assert.throws(() => workflowForPage("setup", { scene_ref: "scene:fake", visibility: "private" }), /conversation-v1/);
+  assert.throws(() => workflowForPage("setup", { scene_ref: "scene:other:42", visibility: "private", acknowledgement: "on" }), /conversation-v1/);
   const [compile, compileInput] = workflowForPage("creation", { mode: "compile", draft_ref: "draft:1" });
   const [correct, correction] = workflowForPage("memory", { correction_kind: "source_correction", statement: "修正", source_refs: "source:1,source:2" });
   const [erase, eraseInput] = workflowForPage("lifecycle", { mode: "erase", scope_selection: "all", data_choice: "delete" });

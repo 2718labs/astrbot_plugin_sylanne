@@ -2,6 +2,7 @@ export const D12_SCHEMA_VERSION = "d12.contract.v1";
 
 export const ACTIONS = Object.freeze({
   openWorkspace: "open_workspace",
+  bindScene: "bind_scene",
   compileScheme: "compile_scheme",
   activateScheme: "activate_scheme",
   readCharacterView: "read_character_view",

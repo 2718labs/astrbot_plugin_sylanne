@@ -51,7 +51,7 @@ function statusCopy(status, problem) {
 }
 
 function formMarkup(page) {
-  if (page[0] === "setup") return `<p class="setup-hint">AstrBot 控制台登录只允许打开工作台。Owner 登录需使用已登记的本机安装身份与离线签名。服务端签发会话后才可读取角色内容；输入角色 ID 不会创建角色或解锁会话。</p>`;
+  if (page[0] === "setup") return `<p class="setup-hint">请仅填写管理员可信渠道提供的当前会话场景引用。聊天消息不会授权或自动绑定场景；服务端仍会核验角色、场景和权限，可能暂缓绑定。</p><label>场景引用<input name="scene_ref" required autocomplete="off" placeholder="scene:conversation-v1:（64 位小写十六进制值）" /></label><label>可见范围<select name="visibility" required><option value="">请选择</option><option value="private">私聊</option><option value="group">群聊</option></select></label><label class="acknowledgement"><input type="checkbox" name="acknowledgement" required /><span>我确认此引用及可见范围由管理员可信渠道提供，且适用于当前角色。</span></label>`;
   if (page[0] === "creation") return `<label>方案草稿（JSON 对象，可编辑）<textarea name="draft_json" placeholder='{"fields":{},"field_sources":{}}'></textarea></label><label>已有方案草稿引用（与 JSON 二选一）<input name="draft_ref" placeholder="由已授权草稿提供" /></label><label>已编译候选引用<input name="compiled_scheme_ref" placeholder="采用前由服务签发" /></label><label>操作<select name="mode"><option value="compile">编译候选</option><option value="activate">采用方案</option></select></label>`;
   if (["relations", "memory"].includes(page[0])) return `<label>纠错类型<select name="correction_kind"><option value="source_correction">来源更正</option><option value="interpretation_challenge">解释质疑</option><option value="administrative_edit">创作调整</option></select></label><label>新说明<textarea name="statement" required></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" /></label>`;
   if (["cognition", "action", "expression"].includes(page[0])) return `<label>对象引用<input name="object_ref" required /></label><label>控制请求<input name="control" placeholder="只提交领域可解释的控制请求" /></label>`;
@@ -154,7 +154,7 @@ function render() {
         <div class="state-banner state-${state.status}" role="status"><strong>${statusTitle}</strong><span>${statusDetail}</span></div>
         <div class="workspace-grid"><section class="projection-panel">${body}</section>
           <aside class="inspector" aria-label="操作面板"><h2>操作</h2><p>操作由服务端能力、当前作用域和版本核验。页面不会直接改图或调用平台发送。</p>
-          <form id="page-form">${formMarkup(page)}<button type="button" class="primary" data-command="page-action" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>${page[0] === "setup" ? "核验当前连接" : page[3] === "read" ? "读取当前视图" : "提交给服务端"}</button></form>
+          <form id="page-form">${formMarkup(page)}<button type="button" class="primary" data-command="page-action" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>${page[0] === "setup" ? "提交场景绑定" : page[3] === "read" ? "读取当前视图" : "提交给服务端"}</button></form>
           <dl><dt>操作收据</dt><dd>${escapeHtml(state.receipt?.operation_id ?? "尚无")}</dd><dt>状态</dt><dd>${escapeHtml(state.receipt?.phase ?? statusTitle)}</dd></dl></aside>
         </div>
       </main>
@@ -304,6 +304,14 @@ async function command(action) {
   if (action === "open-workspace") return commandAction(ACTIONS.openWorkspace, { client_protocol: "d12.contract.v1" }, "workbench_view");
   if (action === "page-action") {
     const page = pages.find(([id]) => id === state.view) ?? pages[0];
+    if (page[0] === "setup") {
+      try {
+        const [nextAction, input] = workflowForPage("setup", Object.fromEntries(new FormData(document.querySelector("#page-form")).entries()));
+        return commandAction(nextAction, input);
+      } catch (error) {
+        Object.assign(state, applyProblem(state, { code: "invalid_input", message: error.message, retryable: false })); render(); return;
+      }
+    }
     if (page[3] === "read") return loadView();
     const form = document.querySelector("#page-form");
     try {

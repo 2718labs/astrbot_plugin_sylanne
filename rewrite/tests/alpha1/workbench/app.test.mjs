@@ -15,19 +15,21 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], own
   let ownerSignature = "";
   let sessionRequests = 0;
   let statusRequests = 0;
+  let pageFields = {};
   globalThis.document = {
     querySelector(selector) {
       if (selector === "#app") return app;
       if (selector === "#role-input") return { value: roleInput };
       if (selector === "#owner-login-form") return { id: "owner-login-form" };
+      if (selector === "#page-form") return { id: "page-form" };
       if (selector === "#owner-signature") return { value: ownerSignature };
       return null;
     }
   };
   globalThis.location = { origin };
   globalThis.FormData = class {
-    constructor(form) { assert.equal(form.id, "owner-login-form"); }
-    entries() { return Object.entries(ownerFields)[Symbol.iterator](); }
+    constructor(form) { this.form = form; }
+    entries() { return Object.entries(this.form.id === "owner-login-form" ? ownerFields : pageFields)[Symbol.iterator](); }
   };
   globalThis.fetch = async (url, init) => {
     if (init.method === "GET") {
@@ -45,7 +47,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], own
       }) });
     });
   };
-  await import(`../../../../webui-src/src/app.js?test=${Date.now()}-${Math.random()}`);
+  await import(`../../../../resources/workbench/src/app.js?test=${Date.now()}-${Math.random()}`);
   async function nextRequest(index) {
     for (let attempt = 0; attempt < 10 && requests.length <= index; attempt++) await new Promise((resolve) => setImmediate(resolve));
     assert.ok(requests[index], `expected command request ${index}`);
@@ -57,6 +59,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], own
     get statusRequests() { return statusRequests; },
     setRole(value) { roleInput = value; },
     setOwnerSignature(value) { ownerSignature = value; },
+    setPageFields(value) { pageFields = value; },
     clickCommand(command) { return app.click({ target: { closest(selector) { return selector === "[data-command]" ? { dataset: { command } } : null; } } }); },
     clickView(view) { return app.click({ target: { closest(selector) { return selector === "[data-view]" ? { dataset: { view } } : null; } } }); },
     restore() {
@@ -294,5 +297,34 @@ test("start page requests only the authenticated capability catalogue and never 
     assert.match(ui.app.innerHTML, /Sylanne Owner.*已解锁/s);
     assert.match(ui.app.innerHTML, /角色初始化.*未核验/s);
     assert.match(ui.app.innerHTML, /场景绑定.*未核验/s);
+  } finally { ui.restore(); }
+});
+
+test("Owner can explicitly submit a manually supplied scene binding with acknowledgement", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("role-a");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    assert.match(ui.app.innerHTML, /管理员可信渠道提供的当前会话场景引用/);
+    assert.match(ui.app.innerHTML, /服务端仍会核验角色、场景和权限，可能暂缓绑定/);
+
+    const sceneRef = `scene:conversation-v1:${"a".repeat(64)}`;
+    ui.setPageFields({ scene_ref: sceneRef, visibility: "group", acknowledgement: "on" });
+    const submitted = ui.clickCommand("page-action");
+    const request = await ui.nextRequest(1);
+    assert.equal(request.payload.action, "bind_scene");
+    assert.equal(request.payload.scope, "role-a");
+    assert.match(request.payload.operation_id, /^[0-9a-f-]{36}$/i);
+    assert.deepEqual(request.payload.input, {
+      scene_ref: sceneRef, visibility: "group", acknowledgement: true
+    });
+    request.resolve({ status: "ready", receipt: { operation_id: request.payload.operation_id, phase: "scene_bound", scene_ref: sceneRef, binding_revision: 1 } });
+    await ui.nextRequest(2);
+    ui.requests[2].resolve({ status: "ready", projection: { views: [] } });
+    await submitted;
+    assert.match(ui.app.innerHTML, /scene_bound/);
   } finally { ui.restore(); }
 });
