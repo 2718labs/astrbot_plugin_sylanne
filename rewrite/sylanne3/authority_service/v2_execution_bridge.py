@@ -22,7 +22,8 @@ from .contract import AuthorityUnavailable, identifier
 from .core import AuthorityServiceCore
 from .local_bridge import constraint_keys_from_footprint
 from .v2_contract import (
-    ExecutionBindingV1, FencePermitV2, MutationReceiptV2, PendingMutationV2, canonical_bytes,
+    ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
+    PendingMutationV2, canonical_bytes,
     canonical_digest,
     PlatformObservationV1, decode_bytes, from_wire, to_wire,
 )
@@ -195,11 +196,11 @@ class AuthorityV2ExecutionBridge:
                        self.journal.expected_digest(draft))
 
     def _build_claim_pending(self, receipt: MutationReceiptV2,
-                             binding: ExecutionBindingV1) -> PendingMutationV2:
+                             binding: ExecutionBindingV1 | ExecutionBindingV2) -> PendingMutationV2:
         if (type(receipt) is not MutationReceiptV2
                 or receipt.pending.phase != "prepared"
                 or receipt.durable_state != "committed"
-                or type(binding) is not ExecutionBindingV1
+                or type(binding) not in (ExecutionBindingV1, ExecutionBindingV2)
                 or binding.permit != receipt.pending.permit):
             raise AuthorityUnavailable("claim requires the original committed prepare")
         permit = replace(receipt.pending.permit,
@@ -420,7 +421,7 @@ class AuthorityV2ExecutionBridge:
 
     def prepare_claim_pending(self, *, credential, subject: str,
                               prepared_receipt: MutationReceiptV2,
-                              binding: ExecutionBindingV1) -> PendingMutationV2:
+                              binding: ExecutionBindingV1 | ExecutionBindingV2) -> PendingMutationV2:
         """Persist the claim intent for the same operation before its append."""
         identifier(subject, "subject")
         pending = self._build_claim_pending(prepared_receipt, binding)
@@ -858,7 +859,24 @@ class AuthorityV2ExecutionBridge:
     def execution_claim(self, *, credential, subject: str,
                         prepared_receipt: MutationReceiptV2,
                         binding: ExecutionBindingV1):
-        """Durably claim the original prepared operation; no platform call."""
+        """Historical V1 claim path; no platform call."""
+        if type(binding) is not ExecutionBindingV1:
+            raise AuthorityUnavailable("V1 claim requires an explicit V1 binding")
+        return self._execution_claim(credential=credential, subject=subject,
+                                     prepared_receipt=prepared_receipt, binding=binding)
+
+    def execution_claim_v2(self, *, credential, subject: str,
+                           prepared_receipt: MutationReceiptV2,
+                           binding: ExecutionBindingV2):
+        """Persist the full V2 admission identity in the claimed journal entry."""
+        if type(binding) is not ExecutionBindingV2:
+            raise AuthorityUnavailable("V2 claim requires complete V2 admission binding")
+        return self._execution_claim(credential=credential, subject=subject,
+                                     prepared_receipt=prepared_receipt, binding=binding)
+
+    def _execution_claim(self, *, credential, subject: str,
+                         prepared_receipt: MutationReceiptV2,
+                         binding: ExecutionBindingV1 | ExecutionBindingV2):
         pending = self.prepare_claim_pending(
             credential=credential, subject=subject,
             prepared_receipt=prepared_receipt, binding=binding)
@@ -901,6 +919,24 @@ class AuthorityV2ExecutionBridge:
     def begin_handoff(self, *, credential, subject: str,
                       claimed_receipt: MutationReceiptV2,
                       handoff_id: str) -> HandoffStartV2:
+        if (type(claimed_receipt) is not MutationReceiptV2
+                or type(claimed_receipt.pending.binding) is not ExecutionBindingV1):
+            raise AuthorityUnavailable("V1 handoff requires an explicit V1 claim")
+        return self._begin_handoff(credential=credential, subject=subject,
+                                   claimed_receipt=claimed_receipt, handoff_id=handoff_id)
+
+    def begin_handoff_v2(self, *, credential, subject: str,
+                         claimed_receipt: MutationReceiptV2,
+                         handoff_id: str) -> HandoffStartV2:
+        if (type(claimed_receipt) is not MutationReceiptV2
+                or type(claimed_receipt.pending.binding) is not ExecutionBindingV2):
+            raise AuthorityUnavailable("V2 handoff requires a complete V2 claim")
+        return self._begin_handoff(credential=credential, subject=subject,
+                                   claimed_receipt=claimed_receipt, handoff_id=handoff_id)
+
+    def _begin_handoff(self, *, credential, subject: str,
+                       claimed_receipt: MutationReceiptV2,
+                       handoff_id: str) -> HandoffStartV2:
         """Finalize business admission and durably mark one possible handoff.
 
         No platform call is made. The injected graph authority must atomically

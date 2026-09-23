@@ -160,7 +160,7 @@ class PendingMutationV2:
     expected_append_digest: str
     schema: str = SCHEMA
     prepared_receipt: MutationReceiptV2 | None = None
-    binding: ExecutionBindingV1 | None = None
+    binding: ExecutionBindingV1 | ExecutionBindingV2 | None = None
     claimed_receipt: MutationReceiptV2 | None = None
     platform_observation: PlatformObservationV1 | None = None
     predecessor_mutation_id: str | None = None
@@ -188,7 +188,7 @@ class PendingMutationV2:
             if (type(receipt) is not MutationReceiptV2
                     or receipt.pending.phase != "prepared"
                     or receipt.durable_state != "committed"
-                    or type(binding) is not ExecutionBindingV1
+                    or type(binding) not in (ExecutionBindingV1, ExecutionBindingV2)
                     or binding.permit != receipt.pending.permit
                     or self.claimed_receipt is not None
                     or self.platform_observation is not None
@@ -392,6 +392,22 @@ class ExecutionBindingV2:
             datetime.fromisoformat(self.utc_deadline.replace("Z", "+00:00"))
         except ValueError as exc:
             raise ValueError("invalid handoff UTC deadline") from exc
+
+    @property
+    def permit(self) -> FencePermitV2:
+        return self.origin.permit
+
+    @property
+    def namespace(self) -> str:
+        return self.origin.namespace
+
+    @property
+    def operation_id(self) -> str:
+        return self.origin.operation_id
+
+    @property
+    def footprint(self) -> RecoveryConstraintFootprint:
+        return self.origin.footprint
 
 
 @dataclass(frozen=True, slots=True)

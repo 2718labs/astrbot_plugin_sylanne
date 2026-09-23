@@ -20,7 +20,8 @@ from typing import Mapping
 from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
-    ExecutionBindingV1, FencePermitV2, MutationReceiptV2, SCHEMA as AUTHORITY_V2_PROTOCOL,
+    ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
+    SCHEMA as AUTHORITY_V2_PROTOCOL,
     canonical_digest, from_wire, to_wire,
 )
 from ..authority_service.v2_owner_contract import (
@@ -770,15 +771,34 @@ class MtlsAuthorityTransport:
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, prepared_receipt: MutationReceiptV2, binding: ExecutionBindingV1,
     ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        return await self._v2_execution_claim(
+            request, handshake, prepared_receipt=prepared_receipt,
+            binding=binding, method="execution_claim")
+
+    async def v2_execution_claim_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, prepared_receipt: MutationReceiptV2, binding: ExecutionBindingV2,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        return await self._v2_execution_claim(
+            request, handshake, prepared_receipt=prepared_receipt,
+            binding=binding, method="execution_claim_v2")
+
+    async def _v2_execution_claim(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, prepared_receipt: MutationReceiptV2,
+        binding: ExecutionBindingV1 | ExecutionBindingV2, method: str,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
         """Persist the exact claimed phase; this response is not a send permit."""
         if (type(prepared_receipt) is not MutationReceiptV2
                 or prepared_receipt.pending.phase != "prepared"
                 or prepared_receipt.durable_state != "committed"
-                or type(binding) is not ExecutionBindingV1
+                or type(binding) is not (
+                    ExecutionBindingV2 if method == "execution_claim_v2"
+                    else ExecutionBindingV1)
                 or binding.permit != prepared_receipt.pending.permit):
             raise TypeError("original prepared receipt and execution binding are required")
         response = await self._content_rpc(
-            request, handshake, "execution_claim", {
+            request, handshake, method, {
                 "prepared_receipt": to_wire(prepared_receipt),
                 "binding": to_wire(binding),
             }, protocol=AUTHORITY_V2_PROTOCOL)
@@ -807,13 +827,32 @@ class MtlsAuthorityTransport:
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, claimed_receipt: MutationReceiptV2, handoff_id: str,
     ) -> HandoffStartV2:
+        return await self._v2_execution_begin_handoff(
+            request, handshake, claimed_receipt=claimed_receipt,
+            handoff_id=handoff_id, method="execution_begin_handoff")
+
+    async def v2_execution_begin_handoff_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, claimed_receipt: MutationReceiptV2, handoff_id: str,
+    ) -> HandoffStartV2:
+        return await self._v2_execution_begin_handoff(
+            request, handshake, claimed_receipt=claimed_receipt,
+            handoff_id=handoff_id, method="execution_begin_handoff_v2")
+
+    async def _v2_execution_begin_handoff(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, claimed_receipt: MutationReceiptV2, handoff_id: str, method: str,
+    ) -> HandoffStartV2:
         """Durably begin one handoff; the RPC itself never sends content."""
         if (type(claimed_receipt) is not MutationReceiptV2
                 or claimed_receipt.pending.phase != "claimed"
-                or claimed_receipt.durable_state != "committed"):
+                or claimed_receipt.durable_state != "committed"
+                or type(claimed_receipt.pending.binding) is not (
+                    ExecutionBindingV2 if method == "execution_begin_handoff_v2"
+                    else ExecutionBindingV1)):
             raise TypeError("committed execution claim is required")
         response = await self._content_rpc(
-            request, handshake, "execution_begin_handoff", {
+            request, handshake, method, {
                 "claimed_receipt": to_wire(claimed_receipt),
                 "handoff_id": handoff_id,
             }, protocol=AUTHORITY_V2_PROTOCOL)

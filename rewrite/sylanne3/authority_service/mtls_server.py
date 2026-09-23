@@ -25,7 +25,7 @@ from .core import AuthorityServiceCore
 from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, ContentPermit, identifier
 from .v2_clock import AuthorityClockReadingV2, IngressClockSampleV2
 from .v2_contract import (
-    ExecutionBindingV1, FencePermitV2, MutationReceiptV2,
+    ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
     SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
 )
 from .v2_fence_service import AuthorityV2FenceService
@@ -704,13 +704,15 @@ class AuthorityRpcServer:
                     credential=credential, subject=subject, permit=permit,
                     mutation_id=command["mutation_id"], footprint=footprint)
                 return {"receipt": to_wire(receipt), "permit": to_wire(updated)}
-            if method == "execution_claim" and set(command) == {
+            if method in ("execution_claim", "execution_claim_v2") and set(command) == {
                     "prepared_receipt", "binding"}:
                 prepared = from_wire(command["prepared_receipt"])
                 binding = from_wire(command["binding"])
                 if (type(prepared) is not MutationReceiptV2
                         or prepared.pending.phase != "prepared"
-                        or type(binding) is not ExecutionBindingV1
+                        or type(binding) is not (
+                            ExecutionBindingV2 if method == "execution_claim_v2"
+                            else ExecutionBindingV1)
                         or to_wire(prepared) != command["prepared_receipt"]
                         or to_wire(binding) != command["binding"]
                         or binding.permit != prepared.pending.permit
@@ -718,23 +720,32 @@ class AuthorityRpcServer:
                     raise AuthorityUnavailable("prepared execution claim identity is invalid")
                 self._bound_v2_service(
                     credential, profile_id, manifest_digest, binding.namespace)
-                receipt, updated = self._v2_execution[binding.namespace].execution_claim(
+                claim = (self._v2_execution[binding.namespace].execution_claim_v2
+                         if method == "execution_claim_v2"
+                         else self._v2_execution[binding.namespace].execution_claim)
+                receipt, updated = claim(
                     credential=credential, subject=subject,
                     prepared_receipt=prepared, binding=binding)
                 return {"receipt": to_wire(receipt), "permit": to_wire(updated)}
-            if method == "execution_begin_handoff" and set(command) == {
+            if method in ("execution_begin_handoff", "execution_begin_handoff_v2") and set(command) == {
                     "claimed_receipt", "handoff_id"}:
                 claimed = from_wire(command["claimed_receipt"])
                 handoff_id = identifier(command["handoff_id"], "handoff_id")
                 if (type(claimed) is not MutationReceiptV2
                         or claimed.pending.phase != "claimed"
                         or claimed.durable_state != "committed"
+                        or type(claimed.pending.binding) is not (
+                            ExecutionBindingV2 if method == "execution_begin_handoff_v2"
+                            else ExecutionBindingV1)
                         or claimed.pending.permit.subject != subject):
                     raise AuthorityUnavailable("committed claim required")
                 namespace = claimed.pending.permit.namespace
                 self._bound_v2_service(
                     credential, profile_id, manifest_digest, namespace)
-                start = self._v2_execution[namespace].begin_handoff(
+                begin = (self._v2_execution[namespace].begin_handoff_v2
+                         if method == "execution_begin_handoff_v2"
+                         else self._v2_execution[namespace].begin_handoff)
+                start = begin(
                     credential=credential, subject=subject,
                     claimed_receipt=claimed, handoff_id=handoff_id)
                 return {"start": start.to_wire()}

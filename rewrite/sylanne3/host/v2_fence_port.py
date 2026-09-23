@@ -14,7 +14,7 @@ from typing import Awaitable, Callable, Coroutine, Mapping, TypeVar
 from ..authority_service.contract import CONTENT_OPERATIONS, identifier
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
-    ExecutionBindingV1, FencePermitV2, MutationReceiptV2,
+    ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
     SCHEMA as AUTHORITY_V2_PROTOCOL,
 )
 from ..authority_service.v2_owner_contract import (
@@ -795,10 +795,27 @@ class V2FencePort:
         self, *, namespace: NamespaceId, authority_namespace: str,
         prepared_receipt: MutationReceiptV2, binding: ExecutionBindingV1,
     ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        return self._claim(namespace=namespace, authority_namespace=authority_namespace,
+                           prepared_receipt=prepared_receipt, binding=binding,
+                           v2=False)
+
+    def execution_claim_v2(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        prepared_receipt: MutationReceiptV2, binding: ExecutionBindingV2,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        return self._claim(namespace=namespace, authority_namespace=authority_namespace,
+                           prepared_receipt=prepared_receipt, binding=binding,
+                           v2=True)
+
+    def _claim(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        prepared_receipt: MutationReceiptV2,
+        binding: ExecutionBindingV1 | ExecutionBindingV2, v2: bool,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
         """Persist a claimed operation; a separate current start is still required."""
         try:
             return self._submit(self._with_session_repair(lambda: self._execution_claim(
-                namespace, authority_namespace, prepared_receipt, binding)))
+                namespace, authority_namespace, prepared_receipt, binding, v2)))
         except RuntimeError as exc:
             if isinstance(exc, V2FenceOutcomeUnknown) or str(exc) in _REPAIRABLE_ERRORS:
                 raise V2FenceOutcomeUnknown(
@@ -808,11 +825,12 @@ class V2FencePort:
 
     async def _execution_claim(
         self, namespace: NamespaceId, authority_namespace: str,
-        prepared_receipt: MutationReceiptV2, binding: ExecutionBindingV1,
+        prepared_receipt: MutationReceiptV2,
+        binding: ExecutionBindingV1 | ExecutionBindingV2, v2: bool,
     ) -> tuple[MutationReceiptV2, FencePermitV2]:
         if (type(namespace) is not NamespaceId
                 or type(prepared_receipt) is not MutationReceiptV2
-                or type(binding) is not ExecutionBindingV1
+                or type(binding) is not (ExecutionBindingV2 if v2 else ExecutionBindingV1)
                 or binding.namespace != authority_namespace
                 or binding.permit != prepared_receipt.pending.permit):
             raise ValueError("v2 execution claim identity is invalid")
@@ -824,7 +842,9 @@ class V2FencePort:
                 or binding.permit.authority_id != grant.authority_id
                 or binding.permit.subject != grant.subject):
             raise RuntimeError("v2 execution claim mapping changed")
-        return await self._transport.v2_execution_claim(
+        claim = (self._transport.v2_execution_claim_v2 if v2
+                 else self._transport.v2_execution_claim)
+        return await claim(
             self._request, handshake,
             prepared_receipt=prepared_receipt, binding=binding)
 
@@ -832,11 +852,29 @@ class V2FencePort:
         self, *, namespace: NamespaceId, authority_namespace: str,
         claimed_receipt: MutationReceiptV2, handoff_id: str,
     ) -> HandoffStartV2:
+        return self._begin_handoff(namespace=namespace,
+                                   authority_namespace=authority_namespace,
+                                   claimed_receipt=claimed_receipt,
+                                   handoff_id=handoff_id, v2=False)
+
+    def execution_begin_handoff_v2(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        claimed_receipt: MutationReceiptV2, handoff_id: str,
+    ) -> HandoffStartV2:
+        return self._begin_handoff(namespace=namespace,
+                                   authority_namespace=authority_namespace,
+                                   claimed_receipt=claimed_receipt,
+                                   handoff_id=handoff_id, v2=True)
+
+    def _begin_handoff(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        claimed_receipt: MutationReceiptV2, handoff_id: str, v2: bool,
+    ) -> HandoffStartV2:
         """Record one final handoff start; never a platform send operation."""
         try:
             return self._submit(self._with_session_repair(
                 lambda: self._execution_begin_handoff(
-                    namespace, authority_namespace, claimed_receipt, handoff_id)))
+                    namespace, authority_namespace, claimed_receipt, handoff_id, v2)))
         except RuntimeError as exc:
             if isinstance(exc, V2FenceOutcomeUnknown) or str(exc) in _REPAIRABLE_ERRORS:
                 raise V2FenceOutcomeUnknown(
@@ -846,13 +884,15 @@ class V2FencePort:
 
     async def _execution_begin_handoff(
         self, namespace: NamespaceId, authority_namespace: str,
-        claimed_receipt: MutationReceiptV2, handoff_id: str,
+        claimed_receipt: MutationReceiptV2, handoff_id: str, v2: bool,
     ) -> HandoffStartV2:
         identifier(handoff_id, "handoff_id")
         if (type(namespace) is not NamespaceId
                 or type(claimed_receipt) is not MutationReceiptV2
                 or claimed_receipt.durable_state != "committed"
                 or claimed_receipt.pending.phase != "claimed"
+                or type(claimed_receipt.pending.binding) is not (
+                    ExecutionBindingV2 if v2 else ExecutionBindingV1)
                 or claimed_receipt.pending.permit.namespace != authority_namespace):
             raise ValueError("v2 handoff start identity is invalid")
         handshake, grant = self._identity()
@@ -864,7 +904,9 @@ class V2FencePort:
                 or permit.authority_id != grant.authority_id
                 or permit.subject != grant.subject):
             raise RuntimeError("v2 handoff start mapping changed")
-        return await self._transport.v2_execution_begin_handoff(
+        begin = (self._transport.v2_execution_begin_handoff_v2 if v2
+                 else self._transport.v2_execution_begin_handoff)
+        return await begin(
             self._request, handshake,
             claimed_receipt=claimed_receipt, handoff_id=handoff_id)
 
