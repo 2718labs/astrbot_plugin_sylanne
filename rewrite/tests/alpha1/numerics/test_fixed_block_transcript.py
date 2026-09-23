@@ -20,6 +20,7 @@ from sylanne3.native_runtime import (
     load_production_native,
     run_fixed_block_math,
 )
+from sylanne3.native_runtime.loader import _runtime_target
 
 
 def _block() -> FixedBlockStep:
@@ -53,12 +54,7 @@ class FixedBlockTranscriptTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         root = Path(self.tempdir.name)
-        os_name = {"Windows": "windows", "Linux": "linux", "Darwin": "macos"}[platform.system()]
-        arch = {"AMD64": "x86_64", "x86_64": "x86_64", "ARM64": "aarch64", "aarch64": "aarch64"}[platform.machine()]
-        libc = None
-        if os_name == "linux":
-            family = platform.libc_ver()[0].strip().lower()
-            libc = "glibc" if family in {"glibc", "gnu libc"} else family
+        os_name, arch, libc = _runtime_target()
         relative = f"rewrite/sylanne3/_native/{os_name}-{arch}/{self.native_asset.name}"
         asset = root / relative
         asset.parent.mkdir(parents=True)
