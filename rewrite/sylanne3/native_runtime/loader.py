@@ -48,6 +48,16 @@ class NativeCapabilities:
     diagnostic_only: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class NativeLoadBinding:
+    manifest_sha256: str
+    native_sha256: str
+    os: str
+    arch: str
+    libc: str | None
+    abi_version: int
+
+
 class ABI2NativeLibrary:
     """A validated ABI2 library handle; raw pointer execution is not public."""
 
@@ -76,6 +86,19 @@ class ABI2NativeLibrary:
         self._library = library
         self._step = step
         self.capabilities = NativeCapabilities(abi, max_dimension)
+        self._production_binding: NativeLoadBinding | None = None
+
+    @property
+    def production_binding(self) -> NativeLoadBinding | None:
+        return self._production_binding
+
+    @classmethod
+    def _from_verified_package(
+        cls, library: object, path: Path, binding: NativeLoadBinding
+    ) -> ABI2NativeLibrary:
+        handle = cls(library, path)
+        handle._production_binding = binding
+        return handle
 
 
 def _runtime_target() -> tuple[str, str, str | None]:
@@ -137,7 +160,8 @@ def load_production_native(
         raise NativeIntegrityError(f"missing safe {MANIFEST_NAME}")
     raw = manifest_path.read_bytes()
     expected_manifest_hash = _require_hash(trusted_manifest_sha256, "manifest trust root")
-    if not hmac.compare_digest(_sha256(raw), expected_manifest_hash):
+    manifest_sha256 = _sha256(raw)
+    if not hmac.compare_digest(manifest_sha256, expected_manifest_hash):
         raise NativeIntegrityError("manifest trust root mismatch")
     try:
         manifest = json.loads(raw)
@@ -206,4 +230,15 @@ def load_production_native(
         library = _cdll_factory(str(library_path))
     except OSError as exc:
         raise NativeLoadError(f"canonical native library could not be loaded: {exc}") from exc
-    return ABI2NativeLibrary(library, library_path)
+    return ABI2NativeLibrary._from_verified_package(
+        library,
+        library_path,
+        NativeLoadBinding(
+            manifest_sha256=manifest_sha256,
+            native_sha256=expected_native_hash.lower(),
+            os=os_name,
+            arch=arch,
+            libc=libc,
+            abi_version=ABI_VERSION,
+        ),
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from dataclasses import FrozenInstanceError
 import hashlib
 import json
 import math
@@ -12,6 +13,7 @@ import unittest
 from unittest import mock
 
 from sylanne3.native_runtime import (
+    ABI2NativeLibrary,
     ABI2_FIXED_BLOCK_INTERVAL_V1,
     ABI2ResultError,
     ABI2StepResult,
@@ -145,6 +147,25 @@ class NativeLoaderTests(unittest.TestCase):
         self.assertFalse(kernel.capabilities.numerically_certified)
         self.assertFalse(kernel.capabilities.supports_cancellation)
         self.assertTrue(kernel.capabilities.diagnostic_only)
+        binding = kernel.production_binding
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding.manifest_sha256, trust_root)
+        self.assertEqual(binding.native_sha256, hashlib.sha256(expected_library.read_bytes()).hexdigest())
+        expected_os, expected_arch = _runtime_platform()
+        self.assertEqual((binding.os, binding.arch), (expected_os, expected_arch))
+        self.assertEqual(binding.libc, None if expected_os != "linux" else (
+            "glibc" if platform.libc_ver()[0].strip().lower() in {"glibc", "gnu libc"}
+            else platform.libc_ver()[0].strip().lower()
+        ))
+        self.assertEqual(binding.abi_version, 2)
+        with self.assertRaises(FrozenInstanceError):
+            binding.abi_version = 1
+
+    def test_direct_abi2_handle_has_no_production_binding(self) -> None:
+        direct = ABI2NativeLibrary(_Library(), self.root / "unverified.dll")
+        self.assertIsNone(direct.production_binding)
+        with self.assertRaises(AttributeError):
+            direct.production_binding = object()
 
     def test_rejects_manifest_without_matching_external_trust_root(self) -> None:
         self._package()
