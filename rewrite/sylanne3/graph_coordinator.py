@@ -49,6 +49,9 @@ from .runtime.dispatch_candidate import (
     DispatchCandidateRecoveryV1, qualify_dispatch_candidate_sources,
     validate_dispatch_candidate_writes,
 )
+from .authority_service.v2_owner_contract import (
+    OwnerAuthorizationGuardV1, OwnerPrincipalV1,
+)
 
 
 @dataclass(frozen=True)
@@ -416,6 +419,14 @@ class OwnerLeaseBindingV1:
     revocation_epoch: int
 
 
+@dataclass(frozen=True, slots=True)
+class CurrentOwnerViewV1:
+    """Read-only Owner heads observed under one V2 content fence."""
+
+    authority_guard: OwnerAuthorizationGuardV1
+    graph_binding: OwnerLeaseBindingV1
+
+
 class GraphCoordinator:
     """One in-process authority over a GraphStore's business SQLite connection.
 
@@ -526,8 +537,11 @@ class GraphCoordinator:
 
     def _read_v2(self, authority: AuthorityContext, reader, *,
                  owner_principal=None,
-                 owner_binding: OwnerLeaseBindingV1 | None = None):
+                 owner_binding: OwnerLeaseBindingV1 | None = None,
+                 owner_view: bool = False):
         """Keep every Authority RPC outside the business graph lock."""
+        if owner_view and owner_principal is None:
+            raise ValueError("Owner view requires an expected principal")
         store = self.__store
         namespace = authority.namespace
         port = self.__content_fence_v2
@@ -553,7 +567,7 @@ class GraphCoordinator:
                 if port.validate_fence(scope) != permit:
                     raise UnavailableGuard("v2 read permit changed")
                 if owner_principal is not None or owner_binding is not None:
-                    observed_owner = self._owner_binding_in_fence(
+                    observed_guard, observed_owner = self._owner_binding_in_fence(
                         authority, scope, owner_principal, owner_binding)
                 with store._lock:
                     if self._v2_graph_stamp(namespace) != (metadata, epoch):
@@ -562,11 +576,17 @@ class GraphCoordinator:
                 if port.validate_fence(scope) != permit:
                     raise UnavailableGuard("v2 read permit changed")
                 if owner_principal is not None or owner_binding is not None:
-                    self._owner_binding_in_fence(
+                    current_guard, _ = self._owner_binding_in_fence(
                         authority, scope, owner_principal, observed_owner)
+                    if current_guard != observed_guard:
+                        raise UnavailableGuard("Owner Authority guard changed during read")
                 with store._lock:
                     if self._v2_graph_stamp(namespace) != (metadata, epoch):
                         raise UnavailableGuard("v2 graph recovery stamp changed")
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("v2 read permit changed")
+                if owner_view:
+                    return CurrentOwnerViewV1(observed_guard, observed_owner)
                 return result
             finally:
                 port.finish_fence(
@@ -3038,6 +3058,31 @@ class GraphCoordinator:
         self.__owner_leases[lease] = binding
         return authority, lease, binding
 
+    def read_current_owner_view(self, bootstrap: object, *, actor: str,
+                                namespace: NamespaceId, purpose: str,
+                                audience: str,
+                                expected_principal: OwnerPrincipalV1
+                                ) -> CurrentOwnerViewV1:
+        """Project current Owner heads without minting a process lease."""
+        self._admin(bootstrap)
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__owner_principal_resolver is None):
+            raise UnavailableGuard("current Owner read authority is unavailable")
+        if type(expected_principal) is not OwnerPrincipalV1:
+            raise UnavailableGuard("expected Owner principal is unavailable")
+        if not isinstance(namespace, NamespaceId):
+            raise TypeError("namespace must be NamespaceId")
+        with self.__store._lock:
+            metadata, _ = self._v2_graph_stamp(namespace)
+        authority = AuthorityContext(
+            actor, "d12", "owner-view:" + secrets.token_hex(16), namespace,
+            ("persona",), purpose, (audience,), "owner-view-v1",
+            metadata.requirements.activation_generation)
+        return self._read_v2(
+            authority, lambda: None, owner_principal=expected_principal,
+            owner_view=True)
+
     def _current_owner_principal(self, actor: str, namespace: NamespaceId):
         from .authority_service.v2_owner_contract import OwnerPrincipalV1
 
@@ -3125,9 +3170,7 @@ class GraphCoordinator:
     def _owner_binding_in_fence(self, authority: AuthorityContext,
                                 scope: FenceScope, principal,
                                 expected: OwnerLeaseBindingV1 | None
-                                ) -> OwnerLeaseBindingV1:
-        from .authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
-
+                                ) -> tuple[OwnerAuthorizationGuardV1, OwnerLeaseBindingV1]:
         port = self.__content_fence_v2
         if (principal is None and expected is None):
             raise UnavailableGuard("Owner lease has no paired principal")
@@ -3165,7 +3208,7 @@ class GraphCoordinator:
                 or guard.pending_revoke_operation_id is not None
                 or (expected is not None and current != expected)):
             raise UnavailableGuard("Owner lease differs from current grant or revoke head")
-        return current
+        return guard, current
 
     def _admin(self, bootstrap: object) -> None:
         if bootstrap is not self.__bootstrap:

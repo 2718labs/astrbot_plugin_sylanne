@@ -216,6 +216,69 @@ def test_owner_read_requires_resolved_principal_and_current_heads(owner_graph):
         owner_kind="persona")
 
 
+def test_current_owner_view_returns_guard_and_binding_without_lease(owner_graph):
+    _, coordinator, bootstrap, port, _, _ = owner_graph
+    leases_before = len(coordinator._GraphCoordinator__leases)
+    view = coordinator.read_current_owner_view(
+        bootstrap, actor="owner-session", namespace=NAMESPACE,
+        purpose="workbench_view", audience="owner",
+        expected_principal=PRINCIPAL)
+
+    assert view.authority_guard == port.guard
+    assert view.graph_binding.principal == PRINCIPAL
+    assert view.graph_binding.capabilities == frozenset({"workbench.read"})
+    assert len(coordinator._GraphCoordinator__leases) == leases_before
+    assert port.guard_reads == 2 and port.finishes == 1
+
+
+def test_current_owner_view_holds_on_changed_pairing_or_guard(owner_graph):
+    _, coordinator, bootstrap, port, _, pairing = owner_graph
+    pairing["principal"] = OwnerPrincipalV1("owner-idp", "other", "incarnation")
+    with pytest.raises(UnavailableGuard, match="pairing changed"):
+        coordinator.read_current_owner_view(
+            bootstrap, actor="owner-session", namespace=NAMESPACE,
+            purpose="workbench_view", audience="owner",
+            expected_principal=PRINCIPAL)
+    pairing["principal"] = PRINCIPAL
+    port.guard = replace(port.guard, pending_revoke_operation_id="revoke-1")
+    with pytest.raises(UnavailableGuard, match="Owner lease differs"):
+        coordinator.read_current_owner_view(
+            bootstrap, actor="owner-session", namespace=NAMESPACE,
+            purpose="workbench_view", audience="owner",
+            expected_principal=PRINCIPAL)
+
+
+def test_current_owner_view_holds_on_guard_or_graph_change_during_read(owner_graph):
+    graph, coordinator, bootstrap, port, _, _ = owner_graph
+    def change_guard(read_number):
+        if read_number == 2:
+            port.guard = replace(port.guard, minimum_revocation_revision=1)
+
+    port.on_guard_read = change_guard
+    with pytest.raises(UnavailableGuard, match="Owner lease differs"):
+        coordinator.read_current_owner_view(
+            bootstrap, actor="owner-session", namespace=NAMESPACE,
+            purpose="workbench_view", audience="owner",
+            expected_principal=PRINCIPAL)
+
+    port.guard = replace(port.guard, minimum_revocation_revision=0)
+    port.guard_reads = 0
+
+    def change_graph(read_number):
+        if read_number == 2:
+            with graph._lock:
+                graph._db.execute(
+                    "UPDATE graph_epochs SET revision=2 WHERE bot=? AND persona=?",
+                    NAMESPACE.as_tuple)
+
+    port.on_guard_read = change_graph
+    with pytest.raises(UnavailableGuard):
+        coordinator.read_current_owner_view(
+            bootstrap, actor="owner-session", namespace=NAMESPACE,
+            purpose="workbench_view", audience="owner",
+            expected_principal=PRINCIPAL)
+
+
 def test_owner_lease_denies_unpaired_and_changed_purpose(owner_graph):
     _, coordinator, bootstrap, port, key, _ = owner_graph
     with pytest.raises(UnavailableGuard, match="pairing"):
