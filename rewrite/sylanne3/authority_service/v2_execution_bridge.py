@@ -3,8 +3,10 @@
 The host service supplies an authenticated subject; Core's authorizer and D08
 verifier run before locks. The mTLS adapter exposes only prepared dispatch;
 this is not a platform send or a production RuntimeDependency.
-The `prepared` and `claimed` phases are service-owned journal transitions.
-Neither proves platform delivery or confirmation. The persistent v2-only Core seal
+The `prepared`, `claimed` and verified `observed` phases are service-owned
+journal transitions. Observation preserves the platform's stated evidence
+scope; `handed_off` and `unknown` do not prove delivery or settlement.
+The persistent v2-only Core seal
 gates legacy entrances; deletion and execution writers are frozen in a fixed
 order before each append or final Authority commit.
 """
@@ -21,7 +23,8 @@ from .core import AuthorityServiceCore
 from .local_bridge import constraint_keys_from_footprint
 from .v2_contract import (
     ExecutionBindingV1, FencePermitV2, MutationReceiptV2, PendingMutationV2, canonical_bytes,
-    decode_bytes, to_wire,
+    canonical_digest,
+    PlatformObservationV1, decode_bytes, to_wire,
 )
 from .v2_execution_journal import AuthorityV2ExecutionJournal, VerifiedAppendV2
 from .v2_deletion_guard import AuthorityV2DeletionGuard
@@ -42,7 +45,8 @@ class AuthorityV2ExecutionBridge:
     def __init__(self, *, core: AuthorityServiceCore,
                  fences: AuthorityV2FenceStore,
                  journal: AuthorityV2ExecutionJournal, namespace: str,
-                 deletion: AuthorityV2DeletionGuard | None = None):
+                 deletion: AuthorityV2DeletionGuard | None = None,
+                 observation_verifier=None):
         identifier(namespace, "namespace")
         if (type(core) is not AuthorityServiceCore
                 or type(fences) is not AuthorityV2FenceStore
@@ -59,6 +63,9 @@ class AuthorityV2ExecutionBridge:
         if type(deletion) is not AuthorityV2DeletionGuard:
             raise AuthorityUnavailable("v2 execution requires deletion writer guard")
         self.deletion = deletion
+        if observation_verifier is not None and not callable(observation_verifier):
+            raise AuthorityUnavailable("platform observation verifier must be installed by service")
+        self._observation_verifier = observation_verifier
 
     def _check_deletion_locked(self, db, head):
         row = self.core._row(db, self.namespace)
@@ -130,6 +137,41 @@ class AuthorityV2ExecutionBridge:
         return replace(draft, expected_append_digest=
                        self.journal.expected_digest(draft))
 
+    def _build_observed_pending(self, receipt: MutationReceiptV2,
+                                observation: PlatformObservationV1,
+                                predecessor: MutationReceiptV2) -> PendingMutationV2:
+        if (type(receipt) is not MutationReceiptV2
+                or receipt.pending.phase != "claimed"
+                or receipt.durable_state != "committed"
+                or type(observation) is not PlatformObservationV1
+                or observation.binding != receipt.pending.binding
+                or type(predecessor) is not MutationReceiptV2
+                or predecessor.durable_state != "committed"
+                or predecessor.pending.phase not in ("claimed", "observed")
+                or (predecessor.pending.phase == "observed"
+                    and predecessor.pending.claimed_receipt != receipt)):
+            raise AuthorityUnavailable("observation requires the original committed claim")
+        permit = replace(predecessor.pending.permit,
+                         revision=predecessor.updated_revision,
+                         pinned_anchor=predecessor.after_anchor)
+        mutation_id = "observe-" + hashlib.sha256((
+            permit.operation_id + "\0" + observation.observation_id).encode()).hexdigest()
+        request_digest = self._request_digest(
+            permit, mutation_id, observation.binding.footprint)
+        append_id = "append-" + hashlib.sha256((
+            mutation_id + "\0" + request_digest).encode()).hexdigest()
+        draft = PendingMutationV2(
+            permit=permit, mutation_id=mutation_id,
+            request_digest=request_digest, phase="observed",
+            before_anchor=permit.pinned_anchor,
+            expected_append_id=append_id,
+            expected_append_digest="sha256:" + "0" * 64,
+            claimed_receipt=receipt, platform_observation=observation,
+            predecessor_mutation_id=predecessor.pending.mutation_id,
+            predecessor_receipt_digest=canonical_digest(predecessor))
+        return replace(draft, expected_append_digest=
+                       self.journal.expected_digest(draft))
+
     def _check_core_owner(self, db, permit: FencePermitV2):
         core = self.core
         row = core._row(db, self.namespace)
@@ -193,6 +235,50 @@ class AuthorityV2ExecutionBridge:
                 or permit.revision != receipt.updated_revision):
             raise AuthorityUnavailable("persisted mutation result is inconsistent")
         return receipt, permit
+
+    def _check_observed_source_locked(self, db, pending: PendingMutationV2,
+                                      subject: str):
+        claimed = pending.claimed_receipt
+        claim_row = self._load_mutation_locked(db, claimed.pending, subject)
+        claim_permit = replace(claimed.pending.permit,
+                               revision=claimed.updated_revision,
+                               pinned_anchor=claimed.after_anchor)
+        if self._completed_result(claim_row) != (claimed, claim_permit):
+            raise AuthorityUnavailable("original claimed receipt differs")
+        prepared = claimed.pending.prepared_receipt
+        prepare_row = self._load_mutation_locked(db, prepared.pending, subject)
+        if self._completed_result(prepare_row) != (prepared, claimed.pending.permit):
+            raise AuthorityUnavailable("original prepared receipt differs")
+        footprint = self.fences._decode_footprint(prepared.pending, prepare_row[11])
+        if (footprint != pending.platform_observation.binding.footprint
+                or self.fences._decode_footprint(claimed.pending, claim_row[11])
+                != footprint):
+            raise AuthorityUnavailable("observation lost original recovery footprint")
+        predecessor_id = pending.predecessor_mutation_id
+        predecessor_row = self.fences.mutation_locked(db, predecessor_id)
+        if predecessor_row is None:
+            raise AuthorityUnavailable("observation predecessor is absent")
+        kind, saved, predecessor, updated = self.fences._decode_mutation_row(
+            predecessor_row)
+        if (kind != "execution" or predecessor is None
+                or predecessor_row[0:3] != (
+                    pending.permit.operation_id, self.namespace, subject)
+                or predecessor_row[4] != "committed"
+                or predecessor.pending.mutation_id != predecessor_id
+                or canonical_digest(predecessor) != pending.predecessor_receipt_digest
+                or updated != pending.permit
+                or predecessor.after_anchor != pending.before_anchor
+                or predecessor.pending.permit.effect_id != pending.permit.effect_id
+                or (predecessor_id == claimed.pending.mutation_id
+                    and predecessor != claimed)
+                or (predecessor_id != claimed.pending.mutation_id
+                    and (saved.phase != "observed"
+                         or saved.claimed_receipt != claimed))):
+            raise AuthorityUnavailable("observation predecessor receipt or fence differs")
+        if (self.fences._decode_footprint(saved, predecessor_row[11])
+                != footprint):
+            raise AuthorityUnavailable("observation predecessor footprint differs")
+        return predecessor, footprint, predecessor_row
 
     def prepare_pending(self, *, credential, subject: str,
                         permit: FencePermitV2, mutation_id: str,
@@ -300,10 +386,153 @@ class AuthorityV2ExecutionBridge:
                         conflict_keys=tuple(json.loads(original[5])))
         return pending
 
+    def _existing_observation_locked(self, db, mutation_id: str,
+                                     original_permit: FencePermitV2,
+                                     claimed_receipt: MutationReceiptV2,
+                                     observation: PlatformObservationV1,
+                                     subject: str):
+        existing = self.fences.mutation_locked(db, mutation_id)
+        if existing is None:
+            return None
+        kind, pending, receipt, _ = self.fences._decode_mutation_row(existing)
+        if (kind != "execution" or pending.phase != "observed"
+                or existing[0:3] != (
+                    original_permit.operation_id, self.namespace, subject)
+                or pending.claimed_receipt != claimed_receipt
+                or pending.platform_observation != observation):
+            raise AuthorityUnavailable("observation ID reused with different evidence")
+        self._check_observed_source_locked(db, pending, subject)
+        observed = self.journal.inspect_expected(pending)
+        if receipt is not None:
+            if observed.first_append is None:
+                raise AuthorityUnavailable("committed observation append is absent")
+            self._check_execution_head_locked(db, observed.verified_head)
+            return pending, True
+        if observed.following_count > 1:
+            raise AuthorityUnavailable("extra execution append quarantines observation")
+        if observed.first_append is None:
+            self._check_execution_head_locked(db, observed.verified_head)
+        return pending, False
+
+    def prepare_observation_pending(self, *, credential, subject: str,
+                                    claimed_receipt: MutationReceiptV2,
+                                    observation: PlatformObservationV1) -> PendingMutationV2:
+        """Persist one verifier-qualified report after the current operation tail."""
+        identifier(subject, "subject")
+        if (type(claimed_receipt) is not MutationReceiptV2
+                or claimed_receipt.pending.phase != "claimed"
+                or claimed_receipt.durable_state != "committed"
+                or type(observation) is not PlatformObservationV1
+                or observation.binding != claimed_receipt.pending.binding):
+            raise AuthorityUnavailable("observation requires the original committed claim")
+        original_permit = claimed_receipt.pending.permit
+        if original_permit.subject != subject or original_permit.namespace != self.namespace:
+            raise AuthorityUnavailable("observation subject or namespace differs")
+        self.core._require(credential, "execution", self.namespace,
+                           original_permit.holder)
+        mutation_id = "observe-" + hashlib.sha256((
+            original_permit.operation_id + "\0" + observation.observation_id
+        ).encode()).hexdigest()
+        # A committed report is immutable evidence. Replaying it needs the
+        # durable Authority and journal checks, not a live platform verifier.
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    raise AuthorityUnavailable("historical deletion closure blocks observation")
+                inspection = self.journal.inspect_expected(claimed_receipt.pending)
+                if inspection.first_append is None:
+                    raise AuthorityUnavailable("original claimed append is absent")
+                with self.core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    self.fences._check_schema(db)
+                    self._check_deletion_locked(db, deletion_head)
+                    existing = self._existing_observation_locked(
+                        db, mutation_id, original_permit, claimed_receipt,
+                        observation, subject)
+                    if existing is not None and existing[1]:
+                        return existing[0]
+                    if existing is None:
+                        self._check_execution_head_locked(db, inspection.verified_head)
+        verifier = self._observation_verifier
+        if verifier is None:
+            raise AuthorityUnavailable("service has no installed platform observation verifier")
+        try:
+            verified = verifier(self.namespace, claimed_receipt, observation)
+        except Exception as exc:
+            raise AuthorityUnavailable("platform observation verification failed") from exc
+        if type(verified) is not PlatformObservationV1 or verified != observation:
+            raise AuthorityUnavailable("platform observation evidence was not verified")
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    raise AuthorityUnavailable("historical deletion closure blocks observation")
+                inspection = self.journal.inspect_expected(claimed_receipt.pending)
+                if inspection.first_append is None:
+                    raise AuthorityUnavailable("original claimed append is absent")
+                with self.core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    self.fences._check_schema(db)
+                    self._check_deletion_locked(db, deletion_head)
+                    existing = self._existing_observation_locked(
+                        db, mutation_id, original_permit, claimed_receipt,
+                        observation, subject)
+                    if existing is not None:
+                        return existing[0]
+                    self._check_execution_head_locked(db, inspection.verified_head)
+                    claim_row = self._load_mutation_locked(
+                        db, claimed_receipt.pending, subject)
+                    claim_permit = replace(claimed_receipt.pending.permit,
+                                           revision=claimed_receipt.updated_revision,
+                                           pinned_anchor=claimed_receipt.after_anchor)
+                    if self._completed_result(claim_row) != (
+                            claimed_receipt, claim_permit):
+                        raise AuthorityUnavailable("original claimed receipt differs")
+                    current_anchor = self.core._anchor(
+                        db, self.namespace, self.core._row(db, self.namespace))
+                    predecessor = claimed_receipt if current_anchor == claimed_receipt.after_anchor else None
+                    predecessor_row = claim_row if predecessor is not None else None
+                    if predecessor is None:
+                        for row in db.execute(
+                                "SELECT mutation_id FROM authority_v2_mutations "
+                                "WHERE operation_id=? AND mutation_kind='execution' "
+                                "AND state='committed'",
+                                (original_permit.operation_id,)):
+                            candidate_row = self.fences.mutation_locked(db, row[0])
+                            kind, saved, receipt, _ = self.fences._decode_mutation_row(
+                                candidate_row)
+                            if (kind == "execution" and saved.phase == "observed"
+                                    and receipt.after_anchor == current_anchor):
+                                if predecessor is not None:
+                                    raise AuthorityUnavailable("multiple current observation predecessors")
+                                predecessor, predecessor_row = receipt, candidate_row
+                    if predecessor is None:
+                        raise AuthorityUnavailable("current operation has no committed observation tail")
+                    pending = self._build_observed_pending(
+                        claimed_receipt, observation, predecessor)
+                    permit = pending.permit
+                    _, footprint, _ = self._check_observed_source_locked(
+                        db, pending, subject)
+                    self._check_core_owner(db, permit)
+                    self._check_fence_locked(db, permit, subject)
+                    effect = db.execute(
+                        "SELECT state,conflict_keys_json,execution_seq FROM authority_effects "
+                        "WHERE namespace=? AND effect_id=?",
+                        (self.namespace, permit.effect_id)).fetchone()
+                    if effect != ("unresolved", predecessor_row[5],
+                                  predecessor.pending.expected_execution_seq):
+                        raise AuthorityUnavailable("observation effect constraint differs")
+                    self.fences.record_pending_locked(
+                        db, pending, subject=subject,
+                        current_anchor=permit.pinned_anchor, footprint=footprint,
+                        conflict_keys=tuple(json.loads(predecessor_row[5])))
+        return pending
+
     def append_pending(self, pending: PendingMutationV2, *, credential,
                        subject: str):
         """Recheck durable pending under the sole writer, then sync one append."""
-        if type(pending) is not PendingMutationV2 or pending.phase not in ("prepared", "claimed"):
+        if type(pending) is not PendingMutationV2 or pending.phase not in ("prepared", "claimed", "observed"):
             raise AuthorityUnavailable("unsupported dispatch append phase")
         identifier(subject, "subject")
         self.core._require(credential, "execution", self.namespace,
@@ -329,7 +558,7 @@ class AuthorityV2ExecutionBridge:
                            pending: PendingMutationV2,
                            allow_cancel: bool = False):
         """Exactly 0 or 1 matching append; no replay of an external effect."""
-        if type(pending) is not PendingMutationV2 or pending.phase not in ("prepared", "claimed"):
+        if type(pending) is not PendingMutationV2 or pending.phase not in ("prepared", "claimed", "observed"):
             raise AuthorityUnavailable("unsupported dispatch recovery phase")
         identifier(subject, "subject")
         self.core._require(credential, "recover" if allow_cancel else "execution",
@@ -365,16 +594,21 @@ class AuthorityV2ExecutionBridge:
                                 pending.prepared_receipt.pending, original[11])
                             != pending.binding.footprint):
                         raise AuthorityUnavailable("claim lost original prepared receipt or footprint")
+                elif pending.phase == "observed":
+                    self._check_observed_source_locked(db, pending, subject)
                 completed = self._completed_result(mutation)
                 if completed is not None:
+                    if inspection_error is not None and pending.phase != "prepared":
+                        raise inspection_error
                     self._check_execution_head_locked(db, verified_head)
                     return completed
                 if inspection_error is not None:
                     raise inspection_error
                 if inspection.following_count > 1:
                     raise AuthorityUnavailable("extra execution append quarantines pending fence")
-                if inspection.following_count == 0 and pending.phase == "claimed":
-                    raise AuthorityUnavailable("claimed pending requires its original append")
+                if inspection.following_count == 0 and pending.phase != "prepared":
+                    raise AuthorityUnavailable(
+                        f"{pending.phase} pending requires its original append")
                 if inspection.following_count == 0 and not allow_cancel:
                     raise AuthorityUnavailable("prepared mutation has no durable append")
                 self._check_core_owner(db, pending.permit)
@@ -391,7 +625,7 @@ class AuthorityV2ExecutionBridge:
                             self.namespace, pending.permit.effect_id, "unresolved",
                             json.dumps(keys, separators=(",", ":")),
                             pending.expected_execution_seq))
-                    else:
+                    elif pending.phase == "claimed":
                         original = self._load_mutation_locked(
                             db, pending.prepared_receipt.pending, subject)
                         if (self._completed_result(original) !=
@@ -407,6 +641,21 @@ class AuthorityV2ExecutionBridge:
                         if effect != ("unresolved", mutation[5],
                                       pending.prepared_receipt.pending.expected_execution_seq):
                             raise AuthorityUnavailable("prepared effect changed before claim commit")
+                        db.execute(
+                            "UPDATE authority_effects SET execution_seq=? "
+                            "WHERE namespace=? AND effect_id=?",
+                            (pending.expected_execution_seq, self.namespace,
+                             pending.permit.effect_id))
+                    else:
+                        predecessor, _, _ = self._check_observed_source_locked(
+                            db, pending, subject)
+                        effect = db.execute(
+                            "SELECT state,conflict_keys_json,execution_seq FROM authority_effects "
+                            "WHERE namespace=? AND effect_id=?",
+                            (self.namespace, pending.permit.effect_id)).fetchone()
+                        if effect != ("unresolved", mutation[5],
+                                      predecessor.pending.expected_execution_seq):
+                            raise AuthorityUnavailable("claimed effect changed before observation commit")
                         db.execute(
                             "UPDATE authority_effects SET execution_seq=? "
                             "WHERE namespace=? AND effect_id=?",
@@ -527,6 +776,23 @@ class AuthorityV2ExecutionBridge:
         pending = self.prepare_claim_pending(
             credential=credential, subject=subject,
             prepared_receipt=prepared_receipt, binding=binding)
+        with self.core._tx() as db:
+            mutation = self._load_mutation_locked(db, pending, subject)
+            completed = self._completed_result(mutation)
+        if completed is not None:
+            return self.reconcile_mutation(
+                credential=credential, subject=subject, pending=pending)
+        self.append_pending(pending, credential=credential, subject=subject)
+        return self.reconcile_mutation(
+            credential=credential, subject=subject, pending=pending)
+
+    def execution_observe(self, *, credential, subject: str,
+                          claimed_receipt: MutationReceiptV2,
+                          observation: PlatformObservationV1):
+        """Record one verified platform report; unknown remains unresolved."""
+        pending = self.prepare_observation_pending(
+            credential=credential, subject=subject,
+            claimed_receipt=claimed_receipt, observation=observation)
         with self.core._tx() as db:
             mutation = self._load_mutation_locked(db, pending, subject)
             completed = self._completed_result(mutation)

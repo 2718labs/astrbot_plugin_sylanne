@@ -161,6 +161,10 @@ class PendingMutationV2:
     schema: str = SCHEMA
     prepared_receipt: MutationReceiptV2 | None = None
     binding: ExecutionBindingV1 | None = None
+    claimed_receipt: MutationReceiptV2 | None = None
+    platform_observation: PlatformObservationV1 | None = None
+    predecessor_mutation_id: str | None = None
+    predecessor_receipt_digest: str | None = None
 
     def __post_init__(self) -> None:
         _schema(self.schema)
@@ -185,7 +189,11 @@ class PendingMutationV2:
                     or receipt.pending.phase != "prepared"
                     or receipt.durable_state != "committed"
                     or type(binding) is not ExecutionBindingV1
-                    or binding.permit != receipt.pending.permit):
+                    or binding.permit != receipt.pending.permit
+                    or self.claimed_receipt is not None
+                    or self.platform_observation is not None
+                    or self.predecessor_mutation_id is not None
+                    or self.predecessor_receipt_digest is not None):
                 raise ValueError("claim requires original committed prepare and binding")
             if (self.permit != replace(receipt.pending.permit,
                                        revision=receipt.updated_revision,
@@ -193,8 +201,40 @@ class PendingMutationV2:
                     or self.before_anchor != receipt.after_anchor
                     or binding.operation_id != self.permit.operation_id):
                 raise ValueError("claim differs from original prepared operation or fence")
-        elif self.prepared_receipt is not None or self.binding is not None:
-            raise ValueError("only claimed phase may carry prepared receipt and binding")
+        elif self.phase == "observed":
+            receipt, observation = self.claimed_receipt, self.platform_observation
+            if (type(receipt) is not MutationReceiptV2
+                    or receipt.pending.phase != "claimed"
+                    or receipt.durable_state != "committed"
+                    or type(observation) is not PlatformObservationV1
+                    or observation.binding != receipt.pending.binding
+                    or self.prepared_receipt is not None or self.binding is not None):
+                raise ValueError("observation requires original committed claim and platform evidence")
+            identifier(self.predecessor_mutation_id, "predecessor_mutation_id")
+            _digest(self.predecessor_receipt_digest, "predecessor_receipt_digest")
+            if (self.predecessor_mutation_id == self.mutation_id
+                    or self.permit.operation_id != receipt.pending.permit.operation_id
+                    or self.permit.subject != receipt.pending.permit.subject
+                    or self.permit.token != receipt.pending.permit.token
+                    or self.permit.fence_epoch != receipt.pending.permit.fence_epoch
+                    or self.permit.effect_id != receipt.pending.permit.effect_id
+                    or self.permit.command_digest != receipt.pending.permit.command_digest
+                    or self.permit.footprint_digest != receipt.pending.permit.footprint_digest):
+                raise ValueError("observation differs from claimed operation or fence")
+            if self.predecessor_mutation_id == receipt.pending.mutation_id:
+                if (self.predecessor_receipt_digest != canonical_digest(receipt)
+                        or self.permit != replace(receipt.pending.permit,
+                                                  revision=receipt.updated_revision,
+                                                  pinned_anchor=receipt.after_anchor)):
+                    raise ValueError("first observation predecessor differs from claim")
+            elif (self.permit.revision <= receipt.updated_revision
+                  or self.before_anchor.execution_seq <= receipt.after_anchor.execution_seq):
+                raise ValueError("later observation must advance beyond claim")
+        elif any(value is not None for value in (
+                self.prepared_receipt, self.binding, self.claimed_receipt,
+                self.platform_observation, self.predecessor_mutation_id,
+                self.predecessor_receipt_digest)):
+            raise ValueError("unexpected evidence on execution phase")
 
     @property
     def expected_execution_seq(self) -> int:
@@ -584,6 +624,11 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
         if value.phase == "claimed":
             wire["prepared_receipt"] = to_wire(value.prepared_receipt)
             wire["binding"] = to_wire(value.binding)
+        elif value.phase == "observed":
+            wire["claimed_receipt"] = to_wire(value.claimed_receipt)
+            wire["platform_observation"] = to_wire(value.platform_observation)
+            wire["predecessor_mutation_id"] = value.predecessor_mutation_id
+            wire["predecessor_receipt_digest"] = value.predecessor_receipt_digest
         return wire
     if type(value) is ExecutionBindingV1:
         return {
@@ -694,12 +739,18 @@ def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationRec
         })
         if value.get("phase") == "claimed":
             fields |= frozenset({"prepared_receipt", "binding"})
+        elif value.get("phase") == "observed":
+            fields |= frozenset({"claimed_receipt", "platform_observation",
+                                 "predecessor_mutation_id", "predecessor_receipt_digest"})
         _fields(value, fields, "pending mutation")
         permit = from_wire(value["permit"])
         if type(permit) is not FencePermitV2:
             raise ValueError("pending permit kind mismatch")
         receipt = from_wire(value["prepared_receipt"]) if value["phase"] == "claimed" else None
         binding = from_wire(value["binding"]) if value["phase"] == "claimed" else None
+        claimed = from_wire(value["claimed_receipt"]) if value["phase"] == "observed" else None
+        observation = (from_wire(value["platform_observation"])
+                       if value["phase"] == "observed" else None)
         return PendingMutationV2(
             permit=permit, mutation_id=value["mutation_id"],
             request_digest=value["request_digest"], phase=value["phase"],
@@ -707,6 +758,9 @@ def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationRec
             expected_append_id=value["expected_append_id"],
             expected_append_digest=value["expected_append_digest"],
             schema=value["schema"], prepared_receipt=receipt, binding=binding,
+            claimed_receipt=claimed, platform_observation=observation,
+            predecessor_mutation_id=value.get("predecessor_mutation_id"),
+            predecessor_receipt_digest=value.get("predecessor_receipt_digest"),
         )
     if kind == "execution_binding_v1":
         _fields(value, frozenset({

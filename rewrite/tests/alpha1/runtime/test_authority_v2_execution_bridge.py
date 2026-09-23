@@ -13,7 +13,8 @@ from sylanne3.authority_service.v2_execution_journal import AuthorityV2Execution
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.authority_service.v2_contract import (
-    ExecutionBindingV1, PendingMutationV2, canonical_bytes, decode_bytes,
+    ExecutionBindingV1, PendingMutationV2, PlatformObservationV1,
+    canonical_bytes, canonical_digest, decode_bytes,
 )
 from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime_journal import (
@@ -22,7 +23,7 @@ from sylanne3.runtime_journal import (
 )
 
 
-def setup_service(tmp_path, *, create=True):
+def setup_service(tmp_path, *, create=True, observation_verifier=None):
     deletion_journal = DeletionJournal(tmp_path / "deletion.db", create=create)
     deletion = AuthorityV2DeletionGuard(tmp_path / "deletion.db")
     deletion_head = deletion_journal.latest_head()
@@ -59,7 +60,8 @@ def setup_service(tmp_path, *, create=True):
     fences = AuthorityV2FenceStore(core._db, create=create, lock=core._lock)
     bridge = AuthorityV2ExecutionBridge(core=core, fences=fences,
                                         journal=journal, namespace="ns-a",
-                                        deletion=deletion)
+                                        deletion=deletion,
+                                        observation_verifier=observation_verifier)
     bridge._test_deletion_journal = deletion_journal
     return core, fences, journal, bridge, calls
 
@@ -115,6 +117,307 @@ def execution_binding(permit, item, **changes):
     fields.update(changes)
     return ExecutionBindingV1(**fields)
 
+
+def platform_observation(binding, **changes):
+    fields = dict(
+        binding=binding, handoff_start_ref="handoff-a",
+        adapter_ref=binding.adapter_ref, account_ref=binding.account_ref,
+        destination_ref=binding.destination_ref,
+        observation_id="observation-a", platform_request_id=None,
+        platform_message_id=None, evidence_source_ref="adapter-evidence-a",
+        outcome="unknown", status_code_summary=None,
+        observed_at_utc="2026-09-24T01:02:03Z", time_source_ref="clock-a",
+    )
+    fields.update(changes)
+    return PlatformObservationV1(**fields)
+
+
+def test_observation_requires_installed_verifier_and_keeps_unknown_unresolved(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(tmp_path)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    binding = execution_binding(permit, item)
+    claimed, _ = bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding)
+    report = platform_observation(binding)
+    with pytest.raises(AuthorityUnavailable, match="no installed platform observation verifier"):
+        bridge.execution_observe(
+            credential="ok", subject="subject-a",
+            claimed_receipt=claimed, observation=report)
+    mismatched = AuthorityV2ExecutionBridge(
+        core=core, fences=fences, journal=journal, namespace="ns-a",
+        deletion=bridge.deletion,
+        observation_verifier=lambda ns, receipt, evidence:
+            replace(evidence, outcome="accepted"))
+    with pytest.raises(AuthorityUnavailable, match="evidence was not verified"):
+        mismatched.execution_observe(
+            credential="ok", subject="subject-a",
+            claimed_receipt=claimed, observation=report)
+    assert journal.verified_head().seq == 2
+    assert core._db.execute(
+        "SELECT state,execution_seq FROM authority_effects WHERE effect_id='effect-a'"
+    ).fetchone() == ("unresolved", 2)
+    core.close()
+    journal.close()
+
+    verified_calls = []
+
+    def verify(namespace, receipt, observation):
+        assert namespace == "ns-a" and receipt == claimed
+        assert type(observation) is PlatformObservationV1
+        assert not core._db.in_transaction
+        assert journal._guard_owner is None
+        verified_calls.append(observation.observation_id)
+        return observation
+
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, create=False, observation_verifier=verify)
+    observed, updated = bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=report)
+    assert observed.pending.phase == "observed"
+    assert observed.pending.claimed_receipt == claimed
+    assert observed.pending.platform_observation == report
+    assert decode_bytes(canonical_bytes(observed.pending)) == observed.pending
+    assert observed.durable_state == "committed"
+    assert updated.revision == 3
+    assert journal.verified_head().seq == authority_anchor(core).execution_seq == 3
+    assert core._db.execute(
+        "SELECT state,execution_seq FROM authority_effects WHERE effect_id='effect-a'"
+    ).fetchone() == ("unresolved", 3)
+    assert verified_calls == ["observation-a"]
+    assert bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=report) == (observed, updated)
+    with pytest.raises(AuthorityUnavailable):
+        bridge.execution_observe(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            observation=platform_observation(binding, outcome="delivered"))
+    assert journal.verified_head().seq == 3
+    core.close()
+    journal.close()
+
+
+def test_observed_handoff_is_not_delivery_and_append_recovers(tmp_path):
+    def verify(namespace, receipt, observation):
+        assert namespace == "ns-a" and receipt.pending.phase == "claimed"
+        return observation
+
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, observation_verifier=verify)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    binding = execution_binding(permit, item)
+    claimed, _ = bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding)
+    report = platform_observation(binding, outcome="handed_off")
+    pending = bridge.prepare_observation_pending(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=report)
+    assert journal.verified_head().seq == 2
+    with pytest.raises(AuthorityUnavailable, match="observed pending requires"):
+        bridge.reconcile_mutation(
+            credential="ok", subject="subject-a", pending=pending,
+            allow_cancel=True)
+    bridge.append_pending(pending, credential="ok", subject="subject-a")
+    core.close()
+    journal.close()
+
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, create=False, observation_verifier=verify)
+    observed, updated = bridge.reconcile_mutation(
+        credential="ok", subject="subject-a", pending=pending)
+    assert observed.pending.platform_observation.outcome == "handed_off"
+    assert observed.durable_state == "committed"
+    assert core._db.execute(
+        "SELECT state FROM authority_effects WHERE effect_id='effect-a'"
+    ).fetchone() == ("unresolved",)
+    assert updated.revision == 3 and journal.verified_head().seq == 3
+    core.close()
+    journal.close()
+
+
+def test_observations_append_linearly_and_prior_ids_replay(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, observation_verifier=lambda ns, receipt, evidence: evidence)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    binding = execution_binding(permit, item)
+    claimed, _ = bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding)
+    unknown = platform_observation(binding)
+    first = bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=unknown)
+    accepted = platform_observation(
+        binding, observation_id="observation-b", outcome="accepted",
+        platform_request_id="request-b")
+    second = bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=accepted)
+    assert first[0].pending.predecessor_mutation_id == claimed.pending.mutation_id
+    assert first[0].pending.predecessor_receipt_digest == canonical_digest(claimed)
+    assert second[0].pending.predecessor_mutation_id == first[0].pending.mutation_id
+    assert second[0].pending.predecessor_receipt_digest == canonical_digest(first[0])
+    assert second[0].pending.claimed_receipt == claimed
+    assert second[0].pending.platform_observation.outcome == "accepted"
+    assert journal.verified_head().seq == authority_anchor(core).execution_seq == 4
+    assert core._db.execute(
+        "SELECT state,execution_seq FROM authority_effects WHERE effect_id='effect-a'"
+    ).fetchone() == ("unresolved", 4)
+    assert bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=unknown) == first
+    with pytest.raises(AuthorityUnavailable, match="different evidence"):
+        bridge.execution_observe(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            observation=replace(unknown, outcome="delivered"))
+    third_report = platform_observation(
+        binding, observation_id="observation-c", outcome="delivered",
+        platform_message_id="message-c")
+    third_pending = bridge.prepare_observation_pending(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=third_report)
+    assert third_pending.predecessor_mutation_id == second[0].pending.mutation_id
+    assert third_pending.predecessor_receipt_digest == canonical_digest(second[0])
+    bridge.append_pending(third_pending, credential="ok", subject="subject-a")
+    core.close()
+    journal.close()
+
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, create=False,
+        observation_verifier=lambda ns, receipt, evidence: evidence)
+    third = bridge.reconcile_mutation(
+        credential="ok", subject="subject-a", pending=third_pending)
+    assert third[0].pending.platform_observation.outcome == "delivered"
+    assert journal.verified_head().seq == authority_anchor(core).execution_seq == 5
+    assert bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=unknown) == first
+    assert core._db.execute(
+        "SELECT state FROM authority_effects WHERE effect_id='effect-a'"
+    ).fetchone() == ("unresolved",)
+    core.close()
+    journal.close()
+
+
+def test_committed_observation_replays_offline_but_new_evidence_needs_verifier(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, observation_verifier=lambda ns, receipt, evidence: evidence)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    binding = execution_binding(permit, item)
+    claimed, _ = bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding)
+    unknown = platform_observation(binding)
+    first = bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=unknown)
+    accepted = platform_observation(
+        binding, observation_id="observation-b", outcome="accepted",
+        platform_request_id="request-b")
+    second = bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=accepted)
+    core.close()
+    journal.close()
+
+    core, fences, journal, bridge, _ = setup_service(tmp_path, create=False)
+    assert bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=unknown) == first
+    with pytest.raises(AuthorityUnavailable, match="different evidence"):
+        bridge.execution_observe(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            observation=replace(unknown, outcome="delivered"))
+    with pytest.raises(AuthorityUnavailable, match="no installed platform observation verifier"):
+        bridge.execution_observe(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            observation=platform_observation(
+                binding, observation_id="observation-c", outcome="delivered"))
+    core.close()
+    journal.close()
+
+    def unavailable(*args):
+        raise RuntimeError("platform verifier offline")
+
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, create=False, observation_verifier=unavailable)
+    assert bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=unknown) == first
+    with pytest.raises(AuthorityUnavailable, match="platform observation verification failed"):
+        bridge.execution_observe(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            observation=platform_observation(
+                binding, observation_id="observation-c", outcome="delivered"))
+    draft = PendingMutationV2(
+        permit=second[1], mutation_id="mutation-extra",
+        request_digest="sha256:" + "c" * 64, phase="prepared",
+        before_anchor=second[0].after_anchor,
+        expected_append_id="append-extra",
+        expected_append_digest="sha256:" + "0" * 64)
+    journal.append_once(replace(
+        draft, expected_append_digest=journal.expected_digest(draft)))
+    with pytest.raises(AuthorityUnavailable, match="execution journal differs"):
+        bridge.execution_observe(
+            credential="ok", subject="subject-a",
+            claimed_receipt=claimed, observation=unknown)
+    core.close()
+    journal.close()
+
+
+def test_new_observation_holds_when_journal_ahead_of_authority(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, observation_verifier=lambda ns, receipt, evidence: evidence)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    binding = execution_binding(permit, item)
+    claimed, _ = bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding)
+    unknown = platform_observation(binding)
+    first, updated = bridge.execution_observe(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, observation=unknown)
+    draft = PendingMutationV2(
+        permit=updated, mutation_id="mutation-extra",
+        request_digest="sha256:" + "c" * 64, phase="prepared",
+        before_anchor=first.after_anchor, expected_append_id="append-extra",
+        expected_append_digest="sha256:" + "0" * 64)
+    journal.append_once(replace(
+        draft, expected_append_digest=journal.expected_digest(draft)))
+    assert journal.verified_head().seq == 4 and authority_anchor(core).execution_seq == 3
+    with pytest.raises(AuthorityUnavailable, match="execution journal differs"):
+        bridge.execution_observe(
+            credential="ok", subject="subject-a",
+            claimed_receipt=claimed, observation=unknown)
+    with pytest.raises(AuthorityUnavailable, match="execution journal differs"):
+        bridge.execution_observe(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            observation=platform_observation(
+                binding, observation_id="observation-b", outcome="accepted"))
+    core.close()
+    journal.close()
 
 def test_claim_advances_same_operation_and_replays_after_restart(tmp_path):
     core, fences, journal, bridge, _ = setup_service(tmp_path)
