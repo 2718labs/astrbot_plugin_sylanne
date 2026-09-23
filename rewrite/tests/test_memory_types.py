@@ -2,14 +2,16 @@ import math
 import unittest
 from dataclasses import FrozenInstanceError
 
-from sylanne3.graph_types import Owner, TypeRegistry
+from sylanne3.graph_types import AtomKey, Owner, TypeRegistry
 from sylanne3.memory_types import (
     InterpretationRecord,
     SourceRecord,
     access_key,
+    association_key,
     interpretation_key,
     register_memory_types,
     source_key,
+    subjective_trace_v2_key,
     validate_access,
 )
 
@@ -194,6 +196,7 @@ class MemoryGraphTypeTests(unittest.TestCase):
         self.assertEqual(set(specs), {
             "memory.source", "memory.access", "memory.interpretation",
             "memory.episode.v1", "memory.subjective_trace.v1",
+            "memory.subjective_trace.v2", "memory.association.v1",
         })
         self.assertEqual(
             (specs["memory.source"].owner_kinds,
@@ -205,10 +208,12 @@ class MemoryGraphTypeTests(unittest.TestCase):
             self.assertEqual(specs[name].owner_kinds, ("event",))
             self.assertEqual(specs[name].storage_role, "state")
             self.assertFalse(specs[name].immutable)
-        for name in ("memory.episode.v1", "memory.subjective_trace.v1"):
+        for name in ("memory.episode.v1", "memory.subjective_trace.v1",
+                     "memory.subjective_trace.v2", "memory.association.v1"):
             self.assertEqual(specs[name].owner_kinds, ("event",))
             self.assertEqual(specs[name].storage_role, "source")
             self.assertTrue(specs[name].immutable)
+            self.assertEqual(specs[name].writer_domain, "d06")
 
         source = SourceRecord(**source_value()).to_dict()
         interpretation = InterpretationRecord(**interpretation_value()).to_dict()
@@ -224,6 +229,43 @@ class MemoryGraphTypeTests(unittest.TestCase):
         registry.validate(
             interpretation_key("bot", "persona", "interpretation-1"), interpretation
         )
+        episode_ref = AtomKey(
+            Owner("event", "bot", "persona", "episode-1"),
+            "memory.episode.v1", "record").token
+        perspective_ref = AtomKey(
+            Owner("scene", "bot", "persona", "scene-1"),
+            "d03.role_binding", "current").token
+        baseline_ref = AtomKey(
+            Owner("event", "bot", "persona", "event-1"),
+            "d04.encoding_baseline.v1", "record").token
+        trace = {
+            "trace_id": "trace-1", "episode_ref": episode_ref,
+            "perspective_ref": perspective_ref, "then_feeling_refs": [],
+            "interpretation_refs": [], "detail_weights": [],
+            "encoding_baseline_ref": baseline_ref,
+        }
+        trace_key = subjective_trace_v2_key("bot", "persona", "trace-1")
+        self.assertEqual(registry.validate(trace_key, trace), trace)
+        with self.assertRaisesRegex(ValueError, "encoding_baseline_ref"):
+            registry.validate(trace_key, {
+                **trace, "encoding_baseline_ref": source_key(
+                    "bot", "persona", "source-1").token})
+
+        association = {
+            "association_id": "association-1",
+            "source_ref": source_key("bot", "persona", "source-1").token,
+            "target_ref": source_key("bot", "persona", "source-2").token,
+            "kind": "similarity", "weight": 0.5, "context_tags": ["bridge"],
+            "basis_source_refs": [source_key("bot", "persona", "source-1").token],
+            "content_reality": "reported",
+        }
+        association_type_key = association_key(
+            "bot", "persona", "source-1", "association-1")
+        self.assertEqual(registry.validate(association_type_key, association), association)
+        with self.assertRaisesRegex(ValueError, "cross namespace"):
+            registry.validate(association_type_key, {
+                **association, "target_ref": source_key(
+                    "other-bot", "persona", "source-2").token})
 
 
 if __name__ == "__main__":

@@ -122,15 +122,17 @@ def install(store, target):
         target, _capability=store._coordinator_capability)
 
 
-def test_v2_reads_use_full_stored_target_and_two_validations(setup):
+def test_v2_reads_use_full_stored_target_and_three_validations(setup):
     store, coordinator, bootstrap, port, target, authority, lease, key = setup
     install(store, target)
     snapshot = coordinator.read_snapshot(authority, lease, (key,))
     assert snapshot.get(key).revision == 0
+    assert port.validations == 3 and len(port.finishes) == 1
     assert coordinator.query(
         authority, lease, type_names=("state",), owner_kind="persona") is not None
+    assert port.validations == 6 and len(port.finishes) == 2
     assert coordinator.get_operation(authority, lease, "missing") is None
-    assert port.validations == 6 and len(port.finishes) == 3
+    assert port.validations == 9 and len(port.finishes) == 3
     with pytest.raises(UnavailableGuard, match="v2 graph write"):
         coordinator.set_guard_version(bootstrap, NAMESPACE, "policy", "current", "1")
 
