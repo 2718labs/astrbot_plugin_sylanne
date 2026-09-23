@@ -1,4 +1,4 @@
-import { ACTIONS, VIEW_TYPES } from "./api/contract.js";
+import { ACTIONS, VIEW_TYPES, makeOwnerLoginRequest } from "./api/contract.js";
 import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "./api/client.js";
 import { applyProblem, applyResponse, initialState, switchRole } from "./state.js";
 import { needsFreshProjection, workflowForPage } from "./workflows.js";
@@ -20,8 +20,16 @@ const state = initialState();
 const api = new WorkbenchApi({ baseUrl: globalThis.SYLANNE_WORKBENCH_API_BASE ?? DEFAULT_WORKBENCH_API_BASE });
 const app = document.querySelector("#app");
 let requestEpoch = 0;
+let sessionCheckEpoch = 0;
+let ownerFlowEpoch = 0;
 let installation = null;
 let installationProblem = null;
+let ownerBusy = false;
+let ownerChallenge = null;
+let ownerSigningPayload = "";
+let ownerSignature = "";
+let ownerProblem = null;
+const ownerDraft = {};
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
@@ -43,7 +51,7 @@ function statusCopy(status, problem) {
 }
 
 function formMarkup(page) {
-  if (page[0] === "setup") return `<p class="setup-hint">AstrBot 控制台登录只允许打开工作台。Sylanne Owner 还需独立登录，服务端签发可撤销会话后才能读取角色内容。当前工作台尚未接通 Owner 登录入口；接通后请刷新解锁状态。输入角色 ID 不会创建角色或解锁会话。</p>`;
+  if (page[0] === "setup") return `<p class="setup-hint">AstrBot 控制台登录只允许打开工作台。Owner 登录需使用已登记的本机安装身份与离线签名。服务端签发会话后才可读取角色内容；输入角色 ID 不会创建角色或解锁会话。</p>`;
   if (page[0] === "creation") return `<label>方案草稿（JSON 对象，可编辑）<textarea name="draft_json" placeholder='{"fields":{},"field_sources":{}}'></textarea></label><label>已有方案草稿引用（与 JSON 二选一）<input name="draft_ref" placeholder="由已授权草稿提供" /></label><label>已编译候选引用<input name="compiled_scheme_ref" placeholder="采用前由服务签发" /></label><label>操作<select name="mode"><option value="compile">编译候选</option><option value="activate">采用方案</option></select></label>`;
   if (["relations", "memory"].includes(page[0])) return `<label>纠错类型<select name="correction_kind"><option value="source_correction">来源更正</option><option value="interpretation_challenge">解释质疑</option><option value="administrative_edit">创作调整</option></select></label><label>新说明<textarea name="statement" required></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" /></label>`;
   if (["cognition", "action", "expression"].includes(page[0])) return `<label>对象引用<input name="object_ref" required /></label><label>控制请求<input name="control" placeholder="只提交领域可解释的控制请求" /></label>`;
@@ -54,6 +62,34 @@ function formMarkup(page) {
 
 function hasVerifiedCatalogue() {
   return state.status === "ready" && Array.isArray(state.projection?.views);
+}
+
+function ownerLoginMarkup() {
+  const problem = ownerProblem ? `<p class="owner-problem" role="alert">${escapeHtml(ownerProblem.message)}</p>` : "";
+  if (state.sessionReady) {
+    return `<section class="owner-login"><h3>Owner 已解锁</h3><p>工作台会话已由服务端核验。退出会立即清除当前页面中的角色投影。</p>${problem}<button type="button" class="quiet" data-command="owner-logout" ${ownerBusy ? "disabled" : ""}>退出 Owner</button></section>`;
+  }
+  if (!globalThis.location?.origin?.startsWith("https://")) {
+    return `<section class="owner-login"><h3>Owner 待配对</h3><p>Owner 签名登录需要受信 HTTPS 工作台地址。当前地址不能建立安全 Owner 会话；请从已配置的 HTTPS 入口打开工作台。</p>${problem}</section>`;
+  }
+  if (ownerChallenge) {
+    return `<section class="owner-login"><h3>离线签名</h3><p>将下面的 Base64 解码为原始字节，用已登记的 Owner Ed25519 私钥在本机签名。只把 64 字节签名的标准 Base64 填回这里。私钥不要输入工作台或发送给服务端。</p>
+      ${problem}<label>待签名原文（Base64）<textarea id="owner-signing-payload" readonly spellcheck="false">${escapeHtml(ownerSigningPayload)}</textarea></label>
+      <p>挑战有效期至 ${escapeHtml(ownerChallenge.expires_at_utc)}。刷新页面后需重新获取挑战。</p>
+      <button type="button" class="quiet" data-command="copy-owner-payload">复制待签名原文</button>
+      <label>签名（标准 Base64）<textarea id="owner-signature" autocomplete="off" spellcheck="false" placeholder="仅粘贴签名，不要粘贴私钥">${escapeHtml(ownerSignature)}</textarea></label>
+      <div class="owner-actions"><button type="button" class="primary" data-command="owner-complete" ${ownerBusy ? "disabled" : ""}>验证签名并解锁</button><button type="button" class="quiet" data-command="owner-restart" ${ownerBusy ? "disabled" : ""}>重新开始</button></div></section>`;
+  }
+  const fields = [
+    ["authority_id", "Authority ID"], ["authority_namespace", "Authority 命名空间"],
+    ["installation_id", "安装 ID"], ["identity_provider", "身份提供方"],
+    ["account_ref", "Owner 账号引用"], ["account_incarnation", "账号实例"],
+    ["credential_id", "已登记凭据 ID"], ["credential_epoch", "凭据版本"]
+  ];
+  return `<section class="owner-login"><h3>解锁 Owner</h3><p>从本机已配对的安装记录逐项填写身份与凭据引用。当前接口尚不能读取这些字段；没有真实记录时保持锁定。这里不需要私钥。</p>${problem}
+    <form id="owner-login-form" autocomplete="off"><div class="owner-fields">${fields.map(([name, label]) => `<label>${label}<input name="${name}" value="${escapeHtml(ownerDraft[name] ?? "")}" ${name === "credential_epoch" ? 'type="number" min="1" step="1"' : 'type="text"'} required /></label>`).join("")}</div>
+    <p>当前工作台 Origin：<code>${escapeHtml(globalThis.location?.origin ?? "待核验")}</code>。服务端会按当前安装、配对和 Origin 复核。</p>
+    <button type="button" class="primary" data-command="owner-challenge" ${ownerBusy || !state.dashboardAuthenticated ? "disabled" : ""}>获取签名挑战</button></form></section>`;
 }
 
 function setupMarkup() {
@@ -83,12 +119,12 @@ function setupMarkup() {
   const steps = [
     ["插件安装与运行", stage, reason],
     ["AstrBot 控制台", state.dashboardAuthenticated ? "已登录" : "登录失效", state.dashboardAuthenticated ? "已认证，可打开工作台和查看安装状态。" : "请重新登录 AstrBot 控制台。"],
-    ["Sylanne Owner", state.sessionReady ? "已解锁" : "锁定", state.sessionReady ? "服务端已复核当前可撤销 Owner 会话；每次命令还会重新复核。" : "需由服务端 Owner 登录入口完成身份认证并签发会话；当前入口尚未接通。"],
+    ["Sylanne Owner", state.sessionReady ? "已解锁" : "锁定", state.sessionReady ? "服务端已复核当前可撤销 Owner 会话；每次命令还会重新复核。" : "需使用已配对的安装身份和 Owner 签名完成登录。"],
     ["角色初始化", "未核验", "当前能力目录不包含角色初始化回执；填写角色 ID 不会创建角色。"],
     ["场景绑定", "未核验", "当前没有绑定成功回执；私聊或群聊不可据此视为已接通。"],
     ["验证对话", "未核验", "尚无真实对话和投递收据；不会自动向聊天场景发消息。"]
   ];
-  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${escapeHtml(detail)}</p></li>`).join("")}</ol><p class="setup-next">${state.sessionReady ? (state.role ? "可刷新能力目录；创建与绑定入口需服务端完成后才会开放。" : "填写已授权的角色范围后，可读取能力目录。") : "Owner 登录入口需先在服务端接通；当前不能读取角色内容或提交操作。"}</p><button class="quiet" data-command="retry-status">刷新安装状态</button><button class="quiet" data-command="retry-session">重新核验 Owner 会话</button></div>`;
+  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${escapeHtml(detail)}</p></li>`).join("")}</ol>${ownerLoginMarkup()}<p class="setup-next">${state.sessionReady ? (state.role ? "可刷新能力目录；创建与绑定入口需服务端完成后才会开放。" : "填写已授权的角色范围后，可读取能力目录。") : "完成 Owner 签名登录后，工作台会重新核验会话；在此之前角色内容和操作保持锁定。"}</p><button class="quiet" data-command="retry-status">刷新安装状态</button><button class="quiet" data-command="retry-session">重新核验 Owner 会话</button></div>`;
 }
 
 function render() {
@@ -150,6 +186,105 @@ function normalizeError(error) {
   return { code: "client_error", message: "工作台客户端遇到未识别错误；没有显示任何旧内容。", retryable: false };
 }
 
+function clearOwnerChallenge() {
+  ownerChallenge = null;
+  ownerSigningPayload = "";
+  ownerSignature = "";
+}
+
+async function ownerAction(action) {
+  if (action === "owner-restart") {
+    ++ownerFlowEpoch;
+    clearOwnerChallenge(); ownerProblem = null; render();
+    return;
+  }
+  if (action === "copy-owner-payload") {
+    try {
+      await navigator.clipboard.writeText(ownerSigningPayload);
+      ownerProblem = null;
+    } catch {
+      ownerProblem = { message: "无法自动复制；可手动复制上方待签名原文。" };
+    }
+    render();
+    return;
+  }
+  if (ownerBusy) return;
+  if (action === "owner-logout") {
+    ++ownerFlowEpoch;
+    ++sessionCheckEpoch;
+    ++requestEpoch;
+    ownerBusy = true;
+    clearOwnerChallenge();
+    ownerProblem = null;
+    api.clearSession();
+    state.sessionReady = false;
+    Object.assign(state, applyProblem(state, { code: "owner_session_locked", message: "页面已锁定，正在等待服务端确认 Owner 退出。" }));
+    render();
+    try {
+      await api.ownerLogout();
+      state.problem = { code: "owner_session_locked", message: "Owner 已退出；角色内容已清除。" };
+    } catch (error) {
+      ownerProblem = normalizeError(error);
+      state.problem = { code: "owner_session_locked", message: "页面已锁定；服务端退出未确认，请检查连接。" };
+    } finally {
+      ownerBusy = false;
+      render();
+    }
+    return;
+  }
+  if (action === "owner-challenge") {
+    let request;
+    try {
+      const form = document.querySelector("#owner-login-form");
+      const values = Object.fromEntries(new FormData(form).entries());
+      Object.assign(ownerDraft, values);
+      request = makeOwnerLoginRequest(values, globalThis.location?.origin);
+    } catch (error) {
+      ownerProblem = { message: error.message };
+      render();
+      return;
+    }
+    const epoch = ++ownerFlowEpoch;
+    ownerBusy = true; ownerProblem = null; render();
+    try {
+      const result = await api.ownerChallenge(request);
+      if (epoch !== ownerFlowEpoch) return;
+      ownerChallenge = result.challenge;
+      ownerSigningPayload = result.signingPayloadBase64;
+    } catch (error) {
+      if (epoch !== ownerFlowEpoch) return;
+      ownerProblem = normalizeError(error);
+      if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
+    } finally {
+      if (epoch === ownerFlowEpoch) { ownerBusy = false; render(); }
+    }
+    return;
+  }
+  if (action === "owner-complete" && ownerChallenge) {
+    ownerSignature = (document.querySelector("#owner-signature")?.value ?? ownerSignature).trim();
+    if (!ownerSignature) {
+      ownerProblem = { message: "请填入本机生成的 Ed25519 签名 Base64。" };
+      render(); return;
+    }
+    const epoch = ++ownerFlowEpoch;
+    const challenge = ownerChallenge;
+    ownerBusy = true; ownerProblem = null; render();
+    try {
+      await api.ownerComplete(challenge, ownerSignature);
+      if (epoch !== ownerFlowEpoch) return;
+      clearOwnerChallenge();
+      await verifySession(true);
+    } catch (error) {
+      if (epoch !== ownerFlowEpoch) return;
+      clearOwnerChallenge();
+      ownerProblem = normalizeError(error);
+      if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
+    } finally {
+      if (epoch === ownerFlowEpoch) { ownerBusy = false; render(); }
+    }
+  }
+}
+
 async function command(action) {
   if (action === "menu") {
     const sidebar = document.querySelector("#sidebar");
@@ -158,6 +293,7 @@ async function command(action) {
     trigger?.setAttribute("aria-expanded", String(Boolean(open)));
     return;
   }
+  if (action?.startsWith("owner-") || action === "copy-owner-payload") return ownerAction(action);
   if (action === "switch-role") {
     const value = document.querySelector("#role-input")?.value.trim();
     Object.assign(state, switchRole(state, value)); render(); await loadView(); return;
@@ -199,6 +335,7 @@ async function commandAction(action, input, purpose = "workbench_user_action") {
 }
 
 async function verifySession(refreshRole = false) {
+  const checkEpoch = ++sessionCheckEpoch;
   if (refreshRole) {
     ++requestEpoch;
     api.clearSession();
@@ -211,6 +348,7 @@ async function verifySession(refreshRole = false) {
   }
   try {
     await api.openSession();
+    if (checkEpoch !== sessionCheckEpoch) return;
     state.sessionReady = true;
     state.dashboardAuthenticated = true;
     if (refreshRole && state.role) return loadView();
@@ -219,6 +357,7 @@ async function verifySession(refreshRole = false) {
       state.problem = { code: "role_required", message: "会话已核验。填写已授权的角色范围后可读取能力目录。" };
     }
   } catch (error) {
+    if (checkEpoch !== sessionCheckEpoch) return;
     state.sessionReady = false;
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
@@ -246,6 +385,13 @@ app.addEventListener("click", async (event) => {
   }
   const action = event.target.closest("[data-command]")?.dataset.command;
   if (action) await command(action);
+});
+
+app.addEventListener("input", (event) => {
+  if (event.target?.form?.id === "owner-login-form" && event.target.name) {
+    ownerDraft[event.target.name] = event.target.value;
+  }
+  if (event.target?.id === "owner-signature") ownerSignature = event.target.value;
 });
 
 app.addEventListener("keydown", (event) => {
