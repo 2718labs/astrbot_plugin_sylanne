@@ -17,9 +17,6 @@ import sqlite3
 from typing import Callable
 from urllib.parse import urlsplit
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
 from .contract import AuthorityUnavailable, identifier
 from .core import AuthorityServiceCore
 from .v2_owner_contract import (
@@ -97,6 +94,18 @@ def _sha256(value: str, name: str) -> None:
         raise ValueError(f"{name} must be SHA-256")
 
 
+def _verify_signature(public_key: bytes, signature: bytes, payload: bytes,
+                      denial: str) -> None:
+    """Use the Authority-only crypto backend when a signature is verified."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, payload)
+    except (InvalidSignature, ValueError) as exc:
+        raise AuthorityUnavailable(denial) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class OwnerCredentialRegistrationV1:
     authority_id: str
@@ -120,7 +129,6 @@ class OwnerCredentialRegistrationV1:
             raise ValueError("credential epoch must be positive")
         if type(self.public_key) is not bytes or len(self.public_key) != 32:
             raise ValueError("Ed25519 public key must contain 32 bytes")
-        Ed25519PublicKey.from_public_bytes(self.public_key)
 
     def rotation_bytes(self) -> bytes:
         """Domain-separated bytes that the previous Owner key must sign."""
@@ -423,11 +431,9 @@ class AuthorityV2OwnerProofStore:
             if rotation_signature is not None:
                 if type(rotation_signature) is not bytes or len(rotation_signature) != 64:
                     raise ValueError("Owner rotation signature must contain 64 bytes")
-                try:
-                    Ed25519PublicKey.from_public_bytes(current[2]).verify(
-                        rotation_signature, registration.rotation_bytes())
-                except InvalidSignature as exc:
-                    raise AuthorityUnavailable("previous Owner key denied rotation") from exc
+                _verify_signature(current[2], rotation_signature,
+                                  registration.rotation_bytes(),
+                                  "previous Owner key denied rotation")
             else:
                 if not callable(self._recovery_verifier):
                     raise AuthorityUnavailable("Owner rotation needs current key or recovery proof")
@@ -568,11 +574,8 @@ class AuthorityV2OwnerProofStore:
                 return receipt
             if now >= _time(challenge.expires_at_utc):
                 raise AuthorityUnavailable("Owner challenge expired")
-            try:
-                Ed25519PublicKey.from_public_bytes(public_key).verify(signature,
-                                                                      challenge.signed_bytes())
-            except InvalidSignature as exc:
-                raise AuthorityUnavailable("Owner signature denied") from exc
+            _verify_signature(public_key, signature, challenge.signed_bytes(),
+                              "Owner signature denied")
             receipt = OwnerProofAcceptanceV1(
                 challenge, "sha256:" + hashlib.sha256(signature).hexdigest(), _stamp(now))
             db.execute(
@@ -646,11 +649,8 @@ class AuthorityV2OwnerProofStore:
                     or row[10] is None or row[11] is None or row[12] is None):
                 raise AuthorityUnavailable("Owner proof operation is not accepted")
             challenge = self._challenge(row, request)
-            try:
-                Ed25519PublicKey.from_public_bytes(public_key).verify(
-                    row[10], challenge.signed_bytes())
-            except InvalidSignature as exc:
-                raise AuthorityUnavailable("stored Owner signature differs") from exc
+            _verify_signature(public_key, row[10], challenge.signed_bytes(),
+                              "stored Owner signature differs")
             receipt = OwnerProofAcceptanceV1(
                 challenge, "sha256:" + hashlib.sha256(row[10]).hexdigest(), row[11])
             if row[12] != _canonical(receipt):
