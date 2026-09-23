@@ -64,6 +64,29 @@ class OwnerPrincipalV1:
 
 
 @dataclass(frozen=True, slots=True)
+class OwnerActorBindingV1:
+    """Administrator-paired graph actor for one stable Owner principal."""
+
+    authority_id: str
+    installation_id: str
+    namespace: NamespaceId
+    actor_id: str
+    principal: OwnerPrincipalV1
+    revision: int
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != SCHEMA:
+            raise ValueError("unknown owner actor binding schema")
+        for name in ("authority_id", "installation_id", "actor_id"):
+            identifier(getattr(self, name), name)
+        _namespace(self.namespace)
+        if type(self.principal) is not OwnerPrincipalV1:
+            raise TypeError("stable owner principal is required")
+        _revision(self.revision, "revision", minimum=1)
+
+
+@dataclass(frozen=True, slots=True)
 class OwnerClaimTicketV1:
     """One independently paired claim for one newly created namespace."""
 
@@ -307,7 +330,7 @@ def _operation_wire(value: OwnerAuthorizationOperationV1, *,
     return result
 
 
-def to_wire(value: OwnerPrincipalV1 | OwnerClaimTicketV1 |
+def to_wire(value: OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
             OwnerAuthorizationGuardV1 | OwnerAuthorizationOperationV1 |
             OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1) -> dict[str, Any]:
     if type(value) is OwnerGraphCommitProofV1:
@@ -323,6 +346,14 @@ def to_wire(value: OwnerPrincipalV1 | OwnerClaimTicketV1 |
                 "graph_receipt_digest": value.graph_receipt_digest}
     if type(value) is OwnerPrincipalV1:
         return {"schema": SCHEMA, "kind": "owner_principal_v1", **_principal_wire(value)}
+    if type(value) is OwnerActorBindingV1:
+        return {"schema": value.schema, "kind": "owner_actor_binding_v1",
+                "authority_id": value.authority_id,
+                "installation_id": value.installation_id,
+                "namespace": _namespace_wire(value.namespace),
+                "actor_id": value.actor_id,
+                "principal": _principal_wire(value.principal),
+                "revision": value.revision}
     if type(value) is OwnerClaimTicketV1:
         return _ticket_wire(value)
     if type(value) is OwnerAuthorizationGuardV1:
@@ -355,7 +386,7 @@ def _decode_principal(value: object) -> OwnerPrincipalV1:
     return OwnerPrincipalV1(**data)
 
 
-def from_wire(value: object) -> (OwnerPrincipalV1 | OwnerClaimTicketV1 |
+def from_wire(value: object) -> (OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
                                   OwnerAuthorizationGuardV1 |
                                   OwnerAuthorizationOperationV1 |
                                   OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1):
@@ -375,6 +406,16 @@ def from_wire(value: object) -> (OwnerPrincipalV1 | OwnerClaimTicketV1 |
                         "account_incarnation"}, "owner principal")
         return _decode_principal({key: value[key] for key in (
             "identity_provider", "account_ref", "account_incarnation")})
+    if kind == "owner_actor_binding_v1":
+        _fields(value, {"schema", "kind", "authority_id", "installation_id",
+                        "namespace", "actor_id", "principal", "revision"},
+                "owner actor binding")
+        return OwnerActorBindingV1(
+            value["authority_id"], value["installation_id"],
+            _decode_namespace(value["namespace"]), value["actor_id"],
+            _decode_principal(value["principal"]), value["revision"],
+            value["schema"],
+        )
     if kind == "owner_claim_ticket_v1":
         _fields(value, {"schema", "kind", "authority_id", "installation_id",
                         "namespace", "principal", "ticket_id", "creation_operation_id",
@@ -434,13 +475,13 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
-def canonical_bytes(value: OwnerPrincipalV1 | OwnerClaimTicketV1 |
+def canonical_bytes(value: OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
                     OwnerAuthorizationGuardV1 | OwnerAuthorizationOperationV1 |
                     OwnerAuthorizationReceiptV1) -> bytes:
     return _canonical_json(to_wire(value))
 
 
-def canonical_digest(value: OwnerPrincipalV1 | OwnerClaimTicketV1 |
+def canonical_digest(value: OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
                      OwnerAuthorizationGuardV1 | OwnerAuthorizationOperationV1 |
                      OwnerAuthorizationReceiptV1) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
@@ -459,7 +500,7 @@ def _reject_constant(value: str) -> None:
     raise ValueError(f"nonfinite owner JSON number: {value}")
 
 
-def decode_bytes(data: bytes) -> (OwnerPrincipalV1 | OwnerClaimTicketV1 |
+def decode_bytes(data: bytes) -> (OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
                                   OwnerAuthorizationGuardV1 |
                                   OwnerAuthorizationOperationV1 |
                                   OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1):
@@ -473,7 +514,7 @@ def decode_bytes(data: bytes) -> (OwnerPrincipalV1 | OwnerClaimTicketV1 |
     return value
 
 
-__all__ = ("SCHEMA", "OwnerPrincipalV1", "OwnerClaimTicketV1",
+__all__ = ("SCHEMA", "OwnerPrincipalV1", "OwnerActorBindingV1", "OwnerClaimTicketV1",
            "OwnerAuthorizationGuardV1", "OwnerAuthorizationOperationV1",
            "OwnerAuthorizationReceiptV1", "OwnerGraphCommitProofV1",
            "to_wire", "from_wire",

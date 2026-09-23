@@ -8,6 +8,7 @@ account. A Dashboard JWT is deliberately not a current Owner login source.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
@@ -16,7 +17,8 @@ from typing import Callable
 from ..authority_service.contract import AuthorityUnavailable, identifier
 from ..authority_service.core import AuthorityServiceCore
 from ..authority_service.v2_owner_contract import (
-    OwnerClaimTicketV1, OwnerPrincipalV1, canonical_bytes,
+    OwnerActorBindingV1, OwnerClaimTicketV1, OwnerPrincipalV1, canonical_bytes,
+    decode_bytes as decode_owner_bytes,
     from_wire as owner_from_wire,
 )
 from ..authority_service.v2_owner_proof import (
@@ -48,6 +50,19 @@ _TABLES = {
     "authority_owner_creation_pairings_v1": _CREATION,
     "authority_owner_credential_pairings_v1": _CREDENTIAL,
 }
+_ACTOR = """CREATE TABLE authority_owner_actor_bindings_v1 (
+    authority_namespace TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    installation_id TEXT NOT NULL,
+    principal_bytes BLOB NOT NULL,
+    binding_bytes BLOB NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    active INTEGER NOT NULL CHECK(active IN (0,1)),
+    PRIMARY KEY(authority_namespace,actor_id)
+) STRICT"""
+_ACTOR_UNIQUE = """CREATE UNIQUE INDEX authority_owner_actor_live_principal_v1
+ON authority_owner_actor_bindings_v1(authority_namespace,principal_bytes)
+WHERE active=1"""
 
 
 def _stamp(value: datetime) -> str:
@@ -103,6 +118,20 @@ class AuthorityOwnerPairingSource:
             for name, ddl in _TABLES.items():
                 if db.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone() != (ddl,):
                     raise AuthorityUnavailable("Owner pairing schema differs")
+            actor_schema = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='authority_owner_actor_bindings_v1'"
+            ).fetchone()
+            if actor_schema is None and create:
+                db.execute(_ACTOR)
+                db.execute(_ACTOR_UNIQUE)
+                actor_schema = (_ACTOR,)
+            if actor_schema is not None and actor_schema != (_ACTOR,):
+                raise AuthorityUnavailable("Owner actor binding schema differs")
+            if actor_schema is not None and db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='authority_owner_actor_live_principal_v1'"
+            ).fetchone() != (_ACTOR_UNIQUE,):
+                raise AuthorityUnavailable("Owner actor binding uniqueness schema differs")
 
     @staticmethod
     def _require_mode(db: sqlite3.Connection) -> None:
@@ -125,6 +154,154 @@ class AuthorityOwnerPairingSource:
         if self._core._id(db) != authority_id:
             raise AuthorityUnavailable("Owner pairing Authority identity differs")
         self._core._row(db, authority_namespace)
+
+    @staticmethod
+    def _require_actor_schema(db: sqlite3.Connection) -> None:
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='authority_owner_actor_bindings_v1'"
+        ).fetchone() is None:
+            raise AuthorityUnavailable("Owner actor binding schema is not initialized")
+
+    def _paired_registration(self, db: sqlite3.Connection,
+                             binding: OwnerActorBindingV1) -> bool:
+        row = db.execute(
+            "SELECT registration_bytes,valid_until_utc "
+            "FROM authority_owner_credential_pairings_v1 "
+            "WHERE authority_namespace=? AND principal_bytes=?",
+            (namespace_ref(binding.namespace), canonical_bytes(binding.principal)),
+        ).fetchone()
+        if row is None or self._now() >= _time(row[1]):
+            return False
+        registration = proof_from_wire(json.loads(row[0]))
+        if type(registration) is not OwnerCredentialRegistrationV1:
+            raise AuthorityUnavailable("stored Owner credential pairing differs")
+        return (registration.authority_id == binding.authority_id
+                and registration.authority_namespace == namespace_ref(binding.namespace)
+                and registration.installation_id == binding.installation_id
+                and registration.principal == binding.principal)
+
+    def _actor_binding(self, db: sqlite3.Connection, authority_namespace: str,
+                       actor_id: str) -> tuple[OwnerActorBindingV1, bool] | None:
+        row = db.execute(
+            "SELECT installation_id,principal_bytes,binding_bytes,revision,active "
+            "FROM authority_owner_actor_bindings_v1 "
+            "WHERE authority_namespace=? AND actor_id=?",
+            (authority_namespace, actor_id),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            binding = decode_owner_bytes(row[2])
+        except (TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise AuthorityUnavailable("stored Owner actor binding differs") from exc
+        if (type(binding) is not OwnerActorBindingV1
+                or namespace_ref(binding.namespace) != authority_namespace
+                or binding.authority_id != self._core._id(db)
+                or binding.actor_id != actor_id
+                or binding.installation_id != row[0]
+                or canonical_bytes(binding.principal) != row[1]
+                or binding.revision != row[3]
+                or row[4] not in (0, 1)):
+            raise AuthorityUnavailable("stored Owner actor binding differs")
+        return binding, bool(row[4])
+
+    def pair_actor(self, *, administrator_credential: object,
+                   binding: OwnerActorBindingV1) -> None:
+        """Bind one graph actor after an installer-approved Owner key pairing."""
+        if type(binding) is not OwnerActorBindingV1:
+            raise TypeError("Owner actor binding is required")
+        namespace = namespace_ref(binding.namespace)
+        self._core._require(administrator_credential, "owner_identity_pair", namespace)
+        with self._core._tx() as db:
+            self._require_mode(db)
+            self._require_actor_schema(db)
+            self._scope(db, namespace, binding.authority_id)
+            if not self._paired_registration(db, binding):
+                raise AuthorityUnavailable("Owner actor principal has no current installation pairing")
+            previous = self._actor_binding(db, namespace, binding.actor_id)
+            if previous is None:
+                if binding.revision != 1:
+                    raise AuthorityUnavailable("first Owner actor binding must have revision one")
+            elif previous[1] or binding.revision != previous[0].revision + 1:
+                raise AuthorityUnavailable("Owner actor requires explicit revoke and next revision")
+            if db.execute(
+                "SELECT 1 FROM authority_owner_actor_bindings_v1 "
+                "WHERE authority_namespace=? AND principal_bytes=? AND active=1",
+                (namespace, canonical_bytes(binding.principal)),
+            ).fetchone() is not None:
+                raise AuthorityUnavailable("Owner principal is already bound to an actor")
+            if previous is None:
+                db.execute("INSERT INTO authority_owner_actor_bindings_v1 VALUES(?,?,?,?,?,?,1)",
+                           (namespace, binding.actor_id, binding.installation_id,
+                            canonical_bytes(binding.principal), canonical_bytes(binding),
+                            binding.revision))
+            else:
+                db.execute(
+                    "UPDATE authority_owner_actor_bindings_v1 SET installation_id=?,"
+                    "principal_bytes=?,binding_bytes=?,revision=?,active=1 "
+                    "WHERE authority_namespace=? AND actor_id=? AND active=0",
+                    (binding.installation_id, canonical_bytes(binding.principal),
+                     canonical_bytes(binding), binding.revision, namespace,
+                     binding.actor_id),
+                )
+
+    def revoke_actor(self, *, administrator_credential: object,
+                     binding: OwnerActorBindingV1) -> int:
+        """Revoke a current binding and all sessions of its paired principal."""
+        if type(binding) is not OwnerActorBindingV1:
+            raise TypeError("Owner actor binding is required")
+        namespace = namespace_ref(binding.namespace)
+        self._core._require(administrator_credential, "owner_identity_revoke", namespace)
+        with self._core._tx() as db:
+            self._require_mode(db)
+            self._require_actor_schema(db)
+            self._scope(db, namespace, binding.authority_id)
+            current = self._actor_binding(db, namespace, binding.actor_id)
+            if current != (binding, True):
+                raise AuthorityUnavailable("Owner actor binding is not current")
+            next_revision = binding.revision + 1
+            tombstone = replace(binding, revision=next_revision)
+            db.execute(
+                "UPDATE authority_owner_actor_bindings_v1 "
+                "SET binding_bytes=?,revision=?,active=0 "
+                "WHERE authority_namespace=? AND actor_id=? AND active=1",
+                (canonical_bytes(tombstone), next_revision, namespace, binding.actor_id),
+            )
+            if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='authority_owner_session_principals_v1'"
+            ).fetchone() is not None:
+                db.execute(
+                    "INSERT INTO authority_owner_session_principals_v1 VALUES(?,?,?,1) "
+                    "ON CONFLICT(authority_namespace,installation_id,principal_json) "
+                    "DO UPDATE SET revocation_epoch=revocation_epoch+1",
+                    (namespace, binding.installation_id,
+                     _principal_bytes(binding.principal)),
+                )
+        return next_revision
+
+    def current_actor_binding(self, *, authority_namespace: str,
+                              installation_id: str,
+                              actor_id: str) -> OwnerActorBindingV1 | None:
+        """Read the current actor identity from Authority, never a graph grant."""
+        for name, value in (("authority_namespace", authority_namespace),
+                            ("installation_id", installation_id),
+                            ("actor_id", actor_id)):
+            identifier(value, name)
+        with self._core._lock:
+            db = self._core._db
+            if db is None:
+                raise AuthorityUnavailable("Authority is unavailable")
+            self._require_mode(db)
+            self._require_actor_schema(db)
+            self._core._row(db, authority_namespace)
+            current = self._actor_binding(db, authority_namespace, actor_id)
+            if (current is None or not current[1]
+                    or current[0].installation_id != installation_id
+                    or not self._paired_registration(db, current[0])):
+                return None
+            return current[0]
 
     def pair_creation(self, *, administrator_credential: object,
                       authority_namespace: str, ticket: OwnerClaimTicketV1,
@@ -196,6 +373,29 @@ class AuthorityOwnerPairingSource:
                     or registration.authority_namespace != authority_namespace
                     or registration.principal != principal):
                 raise AuthorityUnavailable("stored Owner credential pairing differs")
+            if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='authority_owner_actor_bindings_v1'"
+            ).fetchone() is not None:
+                actor = db.execute(
+                    "SELECT actor_id FROM authority_owner_actor_bindings_v1 "
+                    "WHERE authority_namespace=? AND principal_bytes=? AND active=1",
+                    (authority_namespace, principal_bytes),
+                ).fetchone()
+                if actor is not None:
+                    current = self._actor_binding(db, authority_namespace, actor[0])
+                    if (current is None or not current[1]
+                            or current[0].principal != principal
+                            or current[0].installation_id != registration.installation_id):
+                        raise AuthorityUnavailable("stored Owner actor binding differs")
+                    tombstone = replace(current[0], revision=current[0].revision + 1)
+                    db.execute(
+                        "UPDATE authority_owner_actor_bindings_v1 "
+                        "SET binding_bytes=?,revision=?,active=0 "
+                        "WHERE authority_namespace=? AND actor_id=? AND active=1",
+                        (canonical_bytes(tombstone), tombstone.revision,
+                         authority_namespace, actor[0]),
+                    )
             # Existing Owner sessions check the current registered key in this
             # same Core transaction. Removing it invalidates all bearer tokens.
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='authority_owner_credentials_v1'").fetchone():
