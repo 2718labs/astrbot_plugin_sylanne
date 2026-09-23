@@ -9,9 +9,13 @@ coordinator lease from a username.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Iterator, Protocol
 
+from ..contracts import StaleRead
+from ..graph_coordinator import GraphCoordinator, UnavailableGuard
 from ..runtime_contracts import NamespaceId
 from .issuer import CoordinatorGrant
 from .service import AuthenticatedSession
@@ -68,11 +72,90 @@ class CurrentOwnerGrantPort(Protocol):
                               purpose: str, audience: str) -> CurrentOwnerGrant | None: ...
 
 
+class GraphCurrentOwnerGrantPort:
+    """Resolve D12 reads through the installed W01 graph and Authority heads."""
+
+    def __init__(self, coordinator: GraphCoordinator, bootstrap: object, *,
+                 namespace: NamespaceId, activation_generation: int,
+                 domains: tuple[str, ...]) -> None:
+        if not isinstance(coordinator, GraphCoordinator):
+            raise TypeError("graph coordinator is required")
+        if not isinstance(namespace, NamespaceId):
+            raise TypeError("Owner namespace is required")
+        if type(activation_generation) is not int or activation_generation < 1:
+            raise ValueError("Owner activation generation is required")
+        if not domains or not all(isinstance(domain, str) and domain for domain in domains):
+            raise ValueError("Owner view domains are required")
+        self._coordinator = coordinator
+        self._bootstrap = bootstrap
+        self._namespace = namespace
+        self._activation_generation = activation_generation
+        self._domains = domains
+        self._scope = f"{namespace.bot_id}/{namespace.persona_id}"
+        self._request_leases: ContextVar[list[object] | None] = ContextVar(
+            "owner_workbench_request_leases", default=None)
+
+    @contextmanager
+    def request_scope(self) -> Iterator[None]:
+        leases: list[object] = []
+        token = self._request_leases.set(leases)
+        try:
+            yield
+        finally:
+            try:
+                release_error: BaseException | None = None
+                for lease in reversed(leases):
+                    try:
+                        self._coordinator.release_current_owner_lease(self._bootstrap, lease)
+                    except BaseException as exc:
+                        if release_error is None:
+                            release_error = exc
+                if release_error is not None:
+                    raise release_error
+            finally:
+                self._request_leases.reset(token)
+
+    def resolve_current_owner(self, *, actor_id: str, scope: str,
+                              purpose: str, audience: str) -> CurrentOwnerGrant | None:
+        leases = self._request_leases.get()
+        if leases is None:
+            return None
+        if (scope != self._scope or not actor_id or not purpose or not audience):
+            return None
+        try:
+            authority, lease, binding = self._coordinator.grant_current_owner(
+                self._bootstrap, actor=actor_id, namespace=self._namespace,
+                domains=self._domains, purpose=purpose, audience=audience,
+                activation_generation=self._activation_generation,
+            )
+        except (PermissionError, UnavailableGuard, StaleRead):
+            return None
+        leases.append(lease)
+        if (binding.actor != actor_id or binding.namespace != self._namespace
+                or binding.scope != "bot/persona" or binding.purpose != purpose
+                or binding.audience != audience):
+            return None
+        return CurrentOwnerGrant(
+            binding.grant_id, binding.issuer_ref, actor_id, self._scope,
+            self._namespace, binding.capabilities, binding.purposes,
+            binding.audiences, binding.grant_revision, binding.revocation_epoch,
+            CoordinatorGrant(self._scope, authority, lease),
+        )
+
+
 class DurableOwnerGrantResolver:
     """Validate W01's scoped result against the authenticated dashboard actor."""
 
     def __init__(self, port: CurrentOwnerGrantPort | None = None) -> None:
         self._port = port
+
+    @contextmanager
+    def request_scope(self) -> Iterator[None]:
+        if isinstance(self._port, GraphCurrentOwnerGrantPort):
+            with self._port.request_scope():
+                yield
+        else:
+            yield
 
     def resolve(self, *, session: AuthenticatedSession, scope: str,
                 purpose: str, audience: str) -> CoordinatorGrant | None:
@@ -102,4 +185,5 @@ class DurableOwnerGrantResolver:
         return grant
 
 
-__all__ = ("CurrentOwnerGrant", "CurrentOwnerGrantPort", "DurableOwnerGrantResolver")
+__all__ = ("CurrentOwnerGrant", "CurrentOwnerGrantPort",
+           "GraphCurrentOwnerGrantPort", "DurableOwnerGrantResolver")

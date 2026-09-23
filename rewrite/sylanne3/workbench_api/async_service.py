@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any
 
 from ..graph_worker import GraphWorker
@@ -30,7 +31,10 @@ class AsyncGraphWorkbenchService:
                           context: RequestContext) -> ApiResponse:
         issuer = GraphWorkbenchIssuer(coordinator, self._grants, self._view_registry,
                                       self._onboarding)
-        return WorkbenchService(issuer).handle(payload, session=session, context=context)
+        scope = getattr(self._grants, "request_scope", None)
+        with scope() if callable(scope) else nullcontext():
+            return WorkbenchService(issuer).handle(
+                payload, session=session, context=context)
 
 
 __all__ = ("AsyncGraphWorkbenchService",)

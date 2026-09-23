@@ -3073,6 +3073,14 @@ class GraphCoordinator:
         self.__owner_leases[lease] = binding
         return authority, lease, binding
 
+    def release_current_owner_lease(self, bootstrap: object, lease: object) -> None:
+        """End one D12 read lease after its worker command completes."""
+        self._admin(bootstrap)
+        if lease not in self.__owner_leases:
+            raise AuthorityDenied("current Owner lease required")
+        del self.__owner_leases[lease]
+        del self.__leases[lease]
+
     def read_current_owner_view(self, bootstrap: object, *, actor: str,
                                 namespace: NamespaceId, purpose: str,
                                 audience: str,

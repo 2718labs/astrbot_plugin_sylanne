@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, replace
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -15,6 +16,7 @@ from sylanne3.graph_coordinator import (
     GraphCoordinator, UnavailableGuard, namespace_ref,
 )
 from sylanne3.graph_store import ProductionGraphStore
+from sylanne3.graph_worker import GraphWorker
 from sylanne3.graph_types import (
     TypeRegistry, owner_grant_key, owner_grant_spec,
 )
@@ -22,6 +24,11 @@ from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime_contracts import (
     AuthorityContext, NamespaceId, SnapshotRequirementsV2, canonical_digest,
 )
+from sylanne3.workbench_api.owner_grant import (
+    DurableOwnerGrantResolver, GraphCurrentOwnerGrantPort,
+)
+from sylanne3.workbench_api.service import AuthenticatedSession
+from sylanne3.workbench_api import AsyncGraphWorkbenchService, RequestContext
 
 
 NAMESPACE = NamespaceId("bot", "persona")
@@ -214,6 +221,128 @@ def test_owner_read_requires_resolved_principal_and_current_heads(owner_graph):
     assert coordinator.query(
         refreshed, refreshed_lease, type_names=(key.type_name,),
         owner_kind="persona")
+
+
+def test_workbench_port_issues_real_current_owner_lease(owner_graph):
+    _, coordinator, bootstrap, _, key, _ = owner_graph
+    subject = GraphCurrentOwnerGrantPort(
+        coordinator, bootstrap, namespace=NAMESPACE,
+        activation_generation=1, domains=("d11",))
+
+    assert subject.resolve_current_owner(
+        actor_id="owner-session", scope="bot/persona",
+        purpose="workbench_view", audience="owner") is None
+    assert len(coordinator._GraphCoordinator__leases) == 0
+    session = AuthenticatedSession(
+        "owner-session", "signed-session",
+        {"bot/persona": frozenset({"workbench.read"})},
+        {"bot/persona": frozenset({"owner"})},
+        {"bot/persona": frozenset({"workbench_view"})},
+    )
+    with subject.request_scope():
+        assert subject.resolve_current_owner(
+            actor_id="owner-session", scope="other/persona",
+            purpose="workbench_view", audience="owner") is None
+        current = subject.resolve_current_owner(
+            actor_id="owner-session", scope="bot/persona",
+            purpose="workbench_view", audience="owner")
+        assert current is not None
+        assert current.scope == "bot/persona" and current.grant_id == "grant-1"
+        assert current.grant.authority.namespace == NAMESPACE
+        assert DurableOwnerGrantResolver(subject).resolve(
+            session=session, scope="bot/persona", purpose="workbench_view",
+            audience="owner") is not None
+        assert coordinator.query(
+            current.grant.authority, current.grant.lease,
+            type_names=(key.type_name,), owner_kind="persona")
+        with pytest.raises(PermissionError, match="host bootstrap"):
+            coordinator.release_current_owner_lease(object(), current.grant.lease)
+    assert len(coordinator._GraphCoordinator__leases) == 0
+    assert len(coordinator._GraphCoordinator__owner_leases) == 0
+    with pytest.raises(PermissionError, match="unknown process authority"):
+        coordinator.query(
+            current.grant.authority, current.grant.lease,
+            type_names=(key.type_name,), owner_kind="persona")
+    ordinary, _ = coordinator.grant(
+        bootstrap, actor="owner-session", issuer_domain="d11",
+        namespace=NAMESPACE, domains=("d11",), activation_generation=1)
+    with pytest.raises(PermissionError, match="current Owner lease required"):
+        coordinator.release_current_owner_lease(bootstrap, ordinary)
+
+
+def test_workbench_port_denies_wrong_actor_pairing_and_revoke(owner_graph):
+    _, coordinator, bootstrap, guard_port, _, pairing = owner_graph
+    subject = GraphCurrentOwnerGrantPort(
+        coordinator, bootstrap, namespace=NAMESPACE,
+        activation_generation=1, domains=("d11",))
+    request = dict(scope="bot/persona", purpose="workbench_view", audience="owner")
+    with subject.request_scope():
+        assert subject.resolve_current_owner(actor_id="dashboard-admin", **request) is None
+        pairing["principal"] = OwnerPrincipalV1("owner-idp", "other", "incarnation")
+        assert subject.resolve_current_owner(actor_id="owner-session", **request) is None
+        pairing["principal"] = PRINCIPAL
+        guard_port.guard = replace(guard_port.guard, pending_revoke_operation_id="revoke-1")
+        assert subject.resolve_current_owner(actor_id="owner-session", **request) is None
+    assert len(coordinator._GraphCoordinator__leases) == 0
+
+
+@pytest.mark.asyncio
+async def test_async_workbench_releases_owner_lease_after_each_read_and_exception(owner_graph):
+    _, coordinator, bootstrap, _, key, _ = owner_graph
+    port = GraphCurrentOwnerGrantPort(
+        coordinator, bootstrap, namespace=NAMESPACE,
+        activation_generation=1, domains=("d11",))
+    resolver = DurableOwnerGrantResolver(port)
+    session = AuthenticatedSession(
+        "owner-session", "signed-session",
+        {"bot/persona": frozenset({"workbench.read"})},
+        {"bot/persona": frozenset({"owner"})},
+        {"bot/persona": frozenset({"workbench_view"})},
+    )
+
+    class Views:
+        def view_types(self, authority):
+            return {"overview": (key.type_name,)}
+
+        def view_owner_kind(self, authority, view_type):
+            return "persona"
+
+        def project_workbench(self, authority, view_type, atoms):
+            return {"count": len(atoms)}
+
+    class Store:
+        def close(self):
+            pass
+
+    worker = await GraphWorker.start(Store, lambda store: coordinator)
+    try:
+        service = AsyncGraphWorkbenchService(worker, resolver, Views())
+        payload = {
+            "schema_version": "d12.contract.v1", "action": "read_character_view",
+            "scope": "bot/persona", "purpose": "workbench_view", "audience": "owner",
+            "operation_id": str(uuid4()), "input": {"view_type": "overview"},
+        }
+        for _ in range(3):
+            answer = await service.handle(
+                payload, session=session, context=RequestContext(True, True, True))
+            assert answer.status == "ready"
+            assert len(coordinator._GraphCoordinator__leases) == 0
+            assert len(coordinator._GraphCoordinator__owner_leases) == 0
+
+        class RaisingResolver(DurableOwnerGrantResolver):
+            def resolve(self, **kwargs):
+                assert super().resolve(**kwargs) is not None
+                raise RuntimeError("projection interrupted")
+
+        broken = AsyncGraphWorkbenchService(worker, RaisingResolver(port), Views())
+        failed = await broken.handle(
+            payload, session=session, context=RequestContext(True, True, True))
+        assert failed.status == "unavailable"
+        assert failed.problem["code"] == "provider_failed"
+        assert len(coordinator._GraphCoordinator__leases) == 0
+        assert len(coordinator._GraphCoordinator__owner_leases) == 0
+    finally:
+        await worker.close()
 
 
 def test_current_owner_view_returns_guard_and_binding_without_lease(owner_graph):
