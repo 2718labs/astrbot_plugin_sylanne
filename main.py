@@ -10,14 +10,12 @@ from astrbot.api.star import Context, Star, StarTools
 
 from .rewrite.sylanne3.host import (
     AstrBotIngressError,
-    AuthorityClient,
     AuthoritySelection,
+    assemble_v2_installation,
     build_astrbot_ingress,
 )
-from .rewrite.sylanne3.host.authority_profile import (
-    AuthorityProfileUnavailable,
-    build_admin_authority_transport,
-)
+from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
+from .rewrite.sylanne3.host.authority_profile import AuthorityProfileUnavailable
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
 
 
@@ -57,65 +55,69 @@ class Sylanne3Plugin(Star):
             self.runtime_health = RuntimeHealth("limited", ("disabled",))
             logger.info("Sylanne 3 is disabled")
             return
-        data_dir = await asyncio.to_thread(
-            lambda: Path(StarTools.get_data_dir(PLUGIN_NAME)).resolve()
-        )
         try:
-            transport = await asyncio.to_thread(
-                build_admin_authority_transport,
+            data_dir = await asyncio.to_thread(
+                lambda: Path(StarTools.get_data_dir(PLUGIN_NAME)).resolve()
+            )
+        except Exception:
+            self.runtime_health = RuntimeHealth("blocked", ("data_dir",))
+            logger.error("Sylanne 3 startup blocked: data directory unavailable")
+            return
+        try:
+            installation = await assemble_v2_installation(
                 self._authority_selection.profile_id,
+                package_root=PACKAGE_ROOT, data_dir=data_dir,
             )
         except FileNotFoundError:
             self.runtime_health = RuntimeHealth(
                 "enrollment_required", ("authority_profile",),
-                "administrator Authority profile is not installed",
             )
             logger.info("Sylanne 3 requires administrator authority enrollment")
             return
         except AuthorityProfileUnavailable:
             self.runtime_health = RuntimeHealth(
                 "blocked", ("authority_profile_verification",),
-                "administrator Authority profile verification is unavailable",
             )
             logger.error("Sylanne 3 startup blocked: Authority profile verification unavailable")
             return
         except (OSError, ValueError):
             self.runtime_health = RuntimeHealth(
                 "blocked", ("authority_profile_integrity",),
-                "administrator Authority profile is invalid or unsafe",
             )
             logger.error("Sylanne 3 startup blocked: Authority profile invalid or unsafe")
             return
-        authority = AuthorityClient(
-            self._authority_selection,
-            package_root=PACKAGE_ROOT,
-            data_dir=data_dir,
-            transport=transport,
-        )
-        authority_status = await authority.status_v2()
-        # The v2 grant proves this paired installation only. It carries no
-        # namespace activation or content permission. RuntimeDependencies and
-        # all twelve domains still need their production adapters.
-        if authority_status.state == "paired":
-            installation = await authority.installation_grant_v2()
-            authority_state = "paired" if installation is not None else "unavailable"
-        else:
-            authority_state = authority_status.state
-        self._runtime = RuntimeContext(
-            data_dir,
-            package_root=PACKAGE_ROOT,
-            dependencies=None,
-            authority_state=authority_state,
-        )
-        self.runtime_health = await self._runtime.start()
-        if self.runtime_health.status == "enrollment_required":
-            logger.info("Sylanne 3 requires administrator authority enrollment")
-        elif self.runtime_health.status != "ready":
-            logger.error(
-                "Sylanne 3 startup blocked: missing=%s detail=%s",
-                ",".join(self.runtime_health.missing_capabilities),
-                self.runtime_health.detail,
+        except Exception:
+            self.runtime_health = RuntimeHealth("blocked", ("installation_verification",))
+            logger.error("Sylanne 3 startup blocked: installation verification failed")
+            return
+        try:
+            verified = await asyncio.to_thread(
+                load_verified_affect_scheme,
+                PACKAGE_ROOT,
+                installation.installation_policy.manifest_digest,
+                available_cpu_features=installation.available_cpu_features,
             )
+        except Exception:
+            self.runtime_health = RuntimeHealth("blocked", ("affect_scheme_verification",))
+            logger.error("Sylanne 3 startup blocked: D04 scheme verification failed")
+            return
+        try:
+            self._runtime = RuntimeContext(
+                data_dir, package_root=PACKAGE_ROOT, dependencies=None,
+                domains=verified.registry,
+            )
+            health = await self._runtime.start_v2(installation)
+        except Exception:
+            self.runtime_health = RuntimeHealth("blocked", ("runtime_bootstrap",))
+            logger.error("Sylanne 3 startup blocked: v2 graph bootstrap failed")
+            return
+        if health.status == "limited":
+            self.runtime_health = RuntimeHealth("limited", health.missing_capabilities)
+        else:
+            self.runtime_health = RuntimeHealth(
+                "blocked", health.missing_capabilities or ("runtime_bootstrap",),
+            )
+            logger.error("Sylanne 3 startup blocked: v2 graph unavailable")
 
     async def terminate(self) -> None:
         if self._runtime is not None:

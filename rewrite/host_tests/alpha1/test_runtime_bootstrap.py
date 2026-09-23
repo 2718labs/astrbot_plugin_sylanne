@@ -523,7 +523,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             StarTools.get_data_dir = classmethod(lambda cls, plugin_name=None: Path(directory))
             try:
                 plugin = module.Sylanne3Plugin(Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None), {"enabled": True})
-                with patch.object(module, "build_admin_authority_transport", side_effect=FileNotFoundError):
+                with patch.object(module, "assemble_v2_installation", side_effect=FileNotFoundError):
                     await plugin.initialize()
                 event = Event()
                 await plugin.ingress(event)
@@ -592,7 +592,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                         "activation_generation": 999,
                     },
                 )
-                with patch.object(module, "build_admin_authority_transport", side_effect=FileNotFoundError):
+                with patch.object(module, "assemble_v2_installation", side_effect=FileNotFoundError):
                     await plugin.initialize()
                 self.assertEqual(plugin.runtime_health.status, "enrollment_required")
                 self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())
@@ -605,7 +605,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),
             {"enabled": False},
         )
-        with patch.object(module, "build_admin_authority_transport") as load:
+        with patch.object(module, "assemble_v2_installation") as load:
             await plugin.initialize()
         load.assert_not_called()
         self.assertEqual(plugin.runtime_health.status, "limited")
@@ -625,10 +625,10 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                         Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None, None),
                         {"enabled": True},
                     )
-                    with patch.object(module, "build_admin_authority_transport", side_effect=failure), \
-                            patch.object(module, "AuthorityClient") as client:
+                    with patch.object(module, "assemble_v2_installation", side_effect=failure), \
+                            patch.object(module, "RuntimeContext") as runtime:
                         await plugin.initialize()
-                    client.assert_not_called()
+                    runtime.assert_not_called()
                     self.assertEqual(plugin.runtime_health.status, status)
                     self.assertEqual(plugin.runtime_health.missing_capabilities, (missing,))
                     self.assertNotIn("secret", plugin.runtime_health.detail)
@@ -641,15 +641,13 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         missing_profile = "missing-" + uuid.uuid4().hex
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(StarTools, "get_data_dir", return_value=Path(directory)), \
-                    patch.object(module, "RuntimeContext") as runtime, \
-                    patch.object(module, "AuthorityClient") as client:
+                    patch.object(module, "RuntimeContext") as runtime:
                 plugin = module.Sylanne3Plugin(
                     Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),
                     {"enabled": True, "authority_profile": missing_profile},
                 )
                 await plugin.initialize()
             runtime.assert_not_called()
-            client.assert_not_called()
             self.assertEqual(plugin.runtime_health.status, "enrollment_required")
             self.assertEqual(
                 plugin.runtime_health.missing_capabilities,
@@ -658,27 +656,116 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(plugin._runtime)
             self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())
 
-    async def test_loaded_transport_reaches_authority_client_but_enrollment_grant_cannot_boot_runtime(self) -> None:
+    async def test_verified_v2_startup_orders_installation_scheme_and_worker(self) -> None:
         module = load_plugin_module()
-        transport = object()
+        order = []
+        registry = object()
+        installation = types.SimpleNamespace(
+            installation_policy=types.SimpleNamespace(manifest_digest="a" * 64),
+            available_cpu_features=frozenset({"avx2"}),
+        )
+
+        async def assemble(profile_id, *, package_root, data_dir):
+            order.append("installation")
+            self.assertEqual(profile_id, "installed")
+            self.assertEqual(package_root, module.PACKAGE_ROOT)
+            self.assertEqual(data_dir, resolved_dir)
+            return installation
+
+        def load_scheme(package_root, digest, *, available_cpu_features):
+            order.append("scheme")
+            self.assertEqual(package_root, module.PACKAGE_ROOT)
+            self.assertEqual(digest, "a" * 64)
+            self.assertEqual(available_cpu_features, frozenset({"avx2"}))
+            return types.SimpleNamespace(scheme=object(), registry=registry)
+
+        class ControlledRuntime:
+            def __init__(self, data_dir, *, package_root, dependencies, domains):
+                order.append("context")
+                self.arguments = (data_dir, package_root, dependencies, domains)
+
+            async def start_v2(self, assembled):
+                order.append("start_v2")
+                self_outer.assertIs(assembled, installation)
+                return RuntimeHealth("limited", ("namespace_activation",), "internal path")
+
+            async def provision_installed_namespace(self, operation_id):
+                self_outer.fail("startup must not provision")
+
+        self_outer = self
         with tempfile.TemporaryDirectory() as directory:
+            resolved_dir = await asyncio.to_thread(Path(directory).resolve)
             with patch.object(StarTools, "get_data_dir", return_value=Path(directory)), \
-                    patch.object(module, "build_admin_authority_transport", return_value=transport) as load, \
-                    patch.object(module, "AuthorityClient") as client_class:
-                client = client_class.return_value
-                client.status_v2 = AsyncMock(return_value=types.SimpleNamespace(state="paired"))
-                client.installation_grant_v2 = AsyncMock(return_value=None)
+                    patch.object(module, "assemble_v2_installation", side_effect=assemble), \
+                    patch.object(module, "load_verified_affect_scheme", side_effect=load_scheme), \
+                    patch.object(module, "RuntimeContext", ControlledRuntime):
                 plugin = module.Sylanne3Plugin(
                     Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None, None),
                     {"enabled": True, "authority_profile": "installed"},
                 )
                 await plugin.initialize()
-            load.assert_called_once_with("installed")
-            self.assertIs(client_class.call_args.kwargs["transport"], transport)
-            client.installation_grant_v2.assert_awaited_once()
-            self.assertEqual(plugin.runtime_health.status, "blocked")
-            self.assertIn("external_runtime_authorities", plugin.runtime_health.missing_capabilities)
+            self.assertEqual(order, ["installation", "scheme", "context", "start_v2"])
+            self.assertEqual(plugin._runtime.arguments, (
+                resolved_dir, module.PACKAGE_ROOT, None, registry,
+            ))
+            self.assertEqual(plugin.runtime_health.status, "limited")
+            self.assertEqual(plugin.runtime_health.missing_capabilities, ("namespace_activation",))
+            self.assertEqual(plugin.runtime_health.detail, "")
+            event = Event()
+            await plugin.ingress(event)
+            self.assertFalse(event.is_stopped())
             self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())
+
+    async def test_d04_verification_failure_blocks_before_runtime_without_leaking_detail(self) -> None:
+        module = load_plugin_module()
+        installation = types.SimpleNamespace(
+            installation_policy=types.SimpleNamespace(manifest_digest="a" * 64),
+            available_cpu_features=None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(StarTools, "get_data_dir", return_value=Path(directory)), \
+                    patch.object(module, "assemble_v2_installation", new=AsyncMock(return_value=installation)), \
+                    patch.object(module, "load_verified_affect_scheme",
+                                 side_effect=ValueError("secret package path")), \
+                    patch.object(module, "RuntimeContext") as runtime:
+                plugin = module.Sylanne3Plugin(
+                    Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None, None),
+                    {"enabled": True},
+                )
+                await plugin.initialize()
+            runtime.assert_not_called()
+            self.assertEqual(plugin.runtime_health.status, "blocked")
+            self.assertEqual(plugin.runtime_health.missing_capabilities,
+                             ("affect_scheme_verification",))
+            self.assertEqual(plugin.runtime_health.detail, "")
+            self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())
+
+    async def test_v2_bootstrap_cannot_publish_ready_from_runtime_result(self) -> None:
+        module = load_plugin_module()
+        installation = types.SimpleNamespace(
+            installation_policy=types.SimpleNamespace(manifest_digest="a" * 64),
+            available_cpu_features=None,
+        )
+        registry = object()
+        runtime = types.SimpleNamespace(start_v2=AsyncMock(return_value=RuntimeHealth("ready")))
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(StarTools, "get_data_dir", return_value=Path(directory)), \
+                    patch.object(module, "assemble_v2_installation", new=AsyncMock(return_value=installation)), \
+                    patch.object(module, "load_verified_affect_scheme",
+                                 return_value=types.SimpleNamespace(scheme=object(), registry=registry)), \
+                    patch.object(module, "RuntimeContext", return_value=runtime):
+                plugin = module.Sylanne3Plugin(
+                    Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),
+                    {"enabled": True},
+                )
+                await plugin.initialize()
+            runtime.start_v2.assert_awaited_once_with(installation)
+            self.assertEqual(plugin.runtime_health.status, "blocked")
+            self.assertEqual(plugin.runtime_health.missing_capabilities,
+                             ("runtime_bootstrap",))
+            event = Event()
+            await plugin.ingress(event)
+            self.assertFalse(event.is_stopped())
 
     async def test_ready_host_does_not_take_over_unknown_sender_identity(self) -> None:
         module = load_plugin_module()
