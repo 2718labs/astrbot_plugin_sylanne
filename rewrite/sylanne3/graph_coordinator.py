@@ -4997,6 +4997,31 @@ class GraphCoordinator:
         if not any(binding.role_binding_id == admission.binding_ref
                    for binding in current_bindings):
             raise UnavailableGuard("dispatch admission lacks a current D03 scene binding")
+        from .domains.d05 import BoundaryRule, RelationshipProvider
+
+        current_rules = tuple(BoundaryRule(**{
+            **atom.value,
+            "source_refs": tuple(atom.value["source_refs"]),
+            "communicated_refs": tuple(atom.value["communicated_refs"]),
+            "acknowledged_refs": tuple(atom.value["acknowledged_refs"]),
+            "exception_refs": tuple(atom.value["exception_refs"]),
+        }) for atom in projection.boundary_rules)
+        if any(atom.key.name != rule.rule_id
+               for atom, rule in zip(projection.boundary_rules, current_rules)):
+            raise UnavailableGuard("current D05 boundary identity differs")
+        # The transaction-checked projection proves read coverage. This only
+        # vetoes explicit deny/conflict; the issuer still owns full D05 approval.
+        for audience in envelope.authority.audience:
+            boundary = RelationshipProvider().provide_required_check(
+                subject_persona_ref=f"persona:{envelope.authority.namespace.persona_id}",
+                target_entity_ref=action.target_ref,
+                action_kind=action.action_kind,
+                audience_scope=audience,
+                scene_ref=batch["scene_ref"], at_time=now,
+                rules=current_rules, coverage_complete=True,
+            )
+            if boundary.result in {"deny", "conflict"}:
+                raise UnavailableGuard("current D05 boundary vetoed dispatch admission")
         if isinstance(self.__store, ProductionGraphStore):
             policy = self.__dispatch_clock_policy
             if (clock_reading is None or policy is None

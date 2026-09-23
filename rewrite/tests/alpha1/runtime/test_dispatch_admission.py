@@ -359,7 +359,8 @@ def test_committed_candidate_does_not_create_admission_without_issuer(tmp_path):
     store.close()
 
 
-def _issuer_case(tmp_path, *, with_projection=False):
+def _issuer_case(tmp_path, *, with_projection=False,
+                 boundary_effect="allow", conflicting_allow=False):
     if with_projection:
         registry, providers = _registry()
         for provider in (ContextProvider(), RelationshipProvider()):
@@ -390,15 +391,25 @@ def _issuer_case(tmp_path, *, with_projection=False):
         )
         boundary = BoundaryRule(
             "boundary:test", "persona:persona", "entity:user", "message",
-            "entity:user", "scene:one", "allow", "runtime_policy", (source_ref,),
+            "entity:user", "scene:one",
+            "allow" if boundary_effect == "none" else boundary_effect,
+            "runtime_policy", (source_ref,),
             (), (), 0.0, None, 1, "owner", (), "active",
         )
-        writes = (
+        writes = [
             GraphWrite(AtomKey(Owner("scene", "bot", "persona", "scene:one"),
                                "d03.role_binding", role.role_binding_id), _json(asdict(role))),
-            GraphWrite(AtomKey(Owner("relation", "bot", "persona", "entity:user"),
-                               "d05.boundary_rule", boundary.rule_id), _json(asdict(boundary))),
-        )
+        ]
+        if boundary_effect != "none":
+            writes.append(GraphWrite(
+                AtomKey(Owner("relation", "bot", "persona", "entity:user"),
+                        "d05.boundary_rule", boundary.rule_id), _json(asdict(boundary))))
+        if conflicting_allow:
+            second = replace(boundary, rule_id="boundary:second")
+            writes.append(GraphWrite(
+                AtomKey(Owner("relation", "bot", "persona", "entity:user"),
+                        "d05.boundary_rule", second.rule_id), _json(asdict(second))))
+        writes = tuple(writes)
         epoch = GraphStore.graph_epoch(
             store, "bot", "persona",
             _capability=seed_coordinator._GraphCoordinator__graph_capability)
@@ -491,9 +502,11 @@ def test_issuer_without_current_d03_scene_binding_cannot_persist_admission(tmp_p
         reopened.close()
 
 
-def test_current_d03_d05_projection_preserves_admission_transaction_test(tmp_path):
+@pytest.mark.parametrize("boundary_effect", ("allow", "none"))
+def test_current_d03_d05_projection_preserves_admission_transaction_test(
+        tmp_path, boundary_effect):
     store, coordinator, authority, lease, bundle, issuer = _issuer_case(
-        tmp_path, with_projection=True)
+        tmp_path, with_projection=True, boundary_effect=boundary_effect)
     monotonic = time.monotonic()
     reading = VerifiedIngressClockV2(
         IngressClockSampleV2("authority:test", "installation:test", "clock:test",
@@ -521,6 +534,33 @@ def test_current_d03_d05_projection_preserves_admission_transaction_test(tmp_pat
         assert load_admission(reopened, authority.namespace, "admission:one") == stored
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary_effect", "conflicting_allow"),
+    (("deny", False), ("allow", True)),
+)
+def test_current_d05_boundary_veto_rolls_back_admission(
+        tmp_path, boundary_effect, conflicting_allow):
+    store, coordinator, authority, lease, bundle, _issuer = _issuer_case(
+        tmp_path, with_projection=True, boundary_effect=boundary_effect,
+        conflicting_allow=conflicting_allow)
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic - 0.01, monotonic, time.time() + 0.2,
+    )
+    with pytest.raises(UnavailableGuard, match="D05 boundary vetoed"):
+        coordinator._commit_domain_bundle_fenced(
+            bundle, lease, dispatch_clock_reading=reading)
+    with store._lock:
+        assert load_admission(store._db, authority.namespace, "admission:one") is None
+        assert store._db.execute(
+            "SELECT 1 FROM graph_bundle_operations WHERE operation_id=?",
+            (bundle.envelope.identity.operation_id,),
+        ).fetchone() is None
+    store.close()
 
 
 def test_unqualified_dispatch_clock_rolls_back_graph_and_budget(tmp_path):
