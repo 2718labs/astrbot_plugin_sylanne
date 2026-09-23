@@ -8,12 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hmac
+import inspect
 import json
 from pathlib import Path
 import secrets
-from typing import Any, Mapping, Protocol
+from typing import Any, Awaitable, Mapping, Protocol
 
-from .service import AuthenticatedSession, RequestContext, WorkbenchService
+from .service import ApiResponse, AuthenticatedSession, RequestContext
 
 
 MAX_JSON_BYTES = 64 * 1024
@@ -42,6 +43,11 @@ class PluginRequest(Protocol):
     content_type: str | None
 
     async def body(self) -> bytes: ...
+
+
+class WorkbenchHandler(Protocol):
+    def handle(self, payload: object, *, session: AuthenticatedSession | None,
+               context: RequestContext) -> ApiResponse | Awaitable[ApiResponse]: ...
 
 
 class BoundDashboardSessions:
@@ -113,7 +119,7 @@ class TransportConfig:
 
 
 class WorkbenchHttpTransport:
-    def __init__(self, service: WorkbenchService, sessions: SessionResolver,
+    def __init__(self, service: WorkbenchHandler, sessions: SessionResolver,
                  csrf: CsrfValidator, config: TransportConfig) -> None:
         self._service, self._sessions, self._csrf, self._config = service, sessions, csrf, config
 
@@ -149,6 +155,8 @@ class WorkbenchHttpTransport:
             return self._error("unavailable", "invalid_json", "请求 JSON 无效。", 400)
         response = self._service.handle(payload, session=session,
                                         context=RequestContext(True, True, True))
+        if inspect.isawaitable(response):
+            response = await response
         return response.as_dict()
 
     def _bound_session(self, request: PluginRequest) -> AuthenticatedSession | None:

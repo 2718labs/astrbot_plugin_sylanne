@@ -58,6 +58,24 @@ async def test_transport_derives_identity_from_host_and_rejects_bad_origin_or_cs
 
 
 @pytest.mark.asyncio
+async def test_transport_awaits_async_service_after_host_checks(tmp_path):
+    calls = []
+
+    class AsyncService:
+        async def handle(self, body, *, session, context):
+            calls.append((body, session, context))
+            return WorkbenchService().handle(body, session=session, context=context)
+
+    subject = WorkbenchHttpTransport(
+        AsyncService(), Sessions(), Csrf(), TransportConfig("https://dashboard.local", tmp_path),
+    )
+    assert (await subject.command(Request(payload())))["problem"]["code"] == "provider_unavailable"
+    assert len(calls) == 1
+    assert (await subject.command(Request(payload(), csrf="wrong")))["problem"]["code"] == "csrf_denied"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_transport_bounds_and_parses_json_before_service(tmp_path):
     subject = transport(tmp_path)
     assert (await subject.command(Request(b"not-json")))["problem"]["code"] == "invalid_json"
