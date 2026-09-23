@@ -8,6 +8,7 @@ can make those decisions against its current state and service-owned journal.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import re
@@ -15,16 +16,22 @@ from typing import Any
 
 from .contract import CONTENT_OPERATIONS, identifier
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime_journal import RecoveryConstraintFootprint
 
 
 SCHEMA = "sylanne3.authority.v2"
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _HEAD_DIGEST = re.compile(r"^(?:genesis|sha256:[0-9a-f]{64})$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+_UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _OPERATIONS = CONTENT_OPERATIONS | frozenset({
     "delete", "migrate", "journal_maintenance", "recovery",
 })
 _PHASES = frozenset({"prepared", "claimed", "observed", "settled"})
+_PLATFORM_OUTCOMES = frozenset({
+    "handed_off", "accepted", "delivered", "read",
+    "failed_before_acceptance", "unknown",
+})
 _DELETION_TRANSITIONS = {
     ("absent", "pending"): "request_authorized",
     ("pending", "accepted"): "barrier_installed",
@@ -35,6 +42,12 @@ _ANCHOR_FIELDS = frozenset({
     "deletion_journal_id", "deletion_seq", "deletion_digest",
     "execution_journal_id", "execution_seq", "execution_digest",
     "revocation_epoch", "proof",
+})
+_FOOTPRINT_FIELDS = frozenset({
+    "namespace", "activity_id", "effect_id", "external_idempotency_ref",
+    "external_query_ref", "conflict_keys", "communication_action",
+    "contact_id", "segment_id", "object_gate_keys", "quota_occupancies",
+    "reservations", "budgets",
 })
 
 
@@ -172,6 +185,146 @@ class PendingMutationV2:
     @property
     def expected_execution_journal_id(self) -> str:
         return self.before_anchor.execution_journal_id
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionBindingV1:
+    """Immutable dispatch identity and recovery constraints; never a send permit.
+
+    The service must verify the original fence, claim and domain-owned footprint
+    against current state before any handoff. Parsing this DTO proves none of them.
+    """
+
+    permit: FencePermitV2
+    namespace: str
+    activity_id: str
+    effect_id: str
+    attempt_id: str
+    operation_id: str
+    dispatch_generation: int
+    activation_generation: int
+    admission_ref: str
+    verified_check_refs: tuple[str, ...]
+    payload_digest: str
+    platform_capability_ref: str
+    adapter_ref: str
+    account_ref: str
+    destination_ref: str
+    worker_fence: int
+    content_fence: str
+    cancel_epoch: int
+    footprint: RecoveryConstraintFootprint
+    proactive_contact: bool = False
+    segment_authorization_ref: str | None = None
+    segment_manifest_digest: str | None = None
+    segment_index: int | None = None
+    segment_count: int | None = None
+    contact_policy_check_ref: str | None = None
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        if type(self.permit) is not FencePermitV2 or self.permit.operation != "dispatch":
+            raise ValueError("execution binding requires original dispatch fence")
+        if type(self.footprint) is not RecoveryConstraintFootprint:
+            raise ValueError("execution binding requires recovery footprint")
+        for name in ("namespace", "activity_id", "effect_id", "attempt_id",
+                     "operation_id", "admission_ref", "platform_capability_ref",
+                     "adapter_ref", "account_ref", "destination_ref", "content_fence"):
+            identifier(getattr(self, name), name)
+        for name in ("dispatch_generation", "activation_generation", "worker_fence",
+                     "cancel_epoch"):
+            _exact_int(getattr(self, name), name)
+        _digest(self.payload_digest, "payload_digest")
+        if (type(self.verified_check_refs) is not tuple or not self.verified_check_refs
+                or len(set(self.verified_check_refs)) != len(self.verified_check_refs)):
+            raise ValueError("verified checks must be a nonempty unique tuple")
+        for check_ref in self.verified_check_refs:
+            identifier(check_ref, "verified_check_ref")
+        if type(self.proactive_contact) is not bool:
+            raise ValueError("proactive_contact must be an exact boolean")
+        if (self.namespace != self.permit.namespace
+                or self.activation_generation != self.permit.generation
+                or self.effect_id != self.permit.effect_id
+                or self.operation_id != self.permit.operation_id
+                or self.footprint.namespace != self.namespace
+                or self.footprint.activity_id != self.activity_id
+                or self.footprint.effect_id != self.effect_id):
+            raise ValueError("execution binding identity differs from fence or footprint")
+        footprint_digest = "sha256:" + hashlib.sha256(self.footprint._json().encode()).hexdigest()
+        if self.permit.footprint_digest != footprint_digest:
+            raise ValueError("execution binding footprint differs from original fence")
+        contact = self.footprint.contact_id is not None
+        segment = (self.segment_authorization_ref, self.segment_manifest_digest,
+                   self.segment_index, self.segment_count)
+        if contact:
+            if any(value is None for value in segment):
+                raise ValueError("contact requires complete finite segment summary")
+            identifier(self.segment_authorization_ref, "segment_authorization_ref")
+            _digest(self.segment_manifest_digest, "segment_manifest_digest")
+            count = _exact_int(self.segment_count, "segment_count", minimum=1)
+            if count > 3 or type(self.segment_index) is not int or not 0 <= self.segment_index < count:
+                raise ValueError("segment position outside finite three-segment manifest")
+            if self.proactive_contact:
+                identifier(self.contact_policy_check_ref, "contact_policy_check_ref")
+                if self.contact_policy_check_ref not in self.verified_check_refs:
+                    raise ValueError("proactive contact policy check is not among verified checks")
+                if not self.footprint.quota_occupancies:
+                    raise ValueError("proactive contact requires quota footprint")
+            elif self.contact_policy_check_ref is not None:
+                raise ValueError("responsive contact cannot carry proactive policy check")
+            elif self.footprint.quota_occupancies or self.footprint.object_gate_keys:
+                raise ValueError("responsive contact cannot occupy proactive contact constraints")
+        elif (any(value is not None for value in segment)
+              or self.contact_policy_check_ref is not None or self.proactive_contact):
+            raise ValueError("non-contact binding cannot carry segment or policy summary")
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformObservationV1:
+    """Reported platform evidence; only an installed verifier may trust its source."""
+
+    binding: ExecutionBindingV1
+    handoff_start_ref: str
+    adapter_ref: str
+    account_ref: str
+    destination_ref: str
+    observation_id: str
+    platform_request_id: str | None
+    platform_message_id: str | None
+    evidence_source_ref: str
+    outcome: str
+    status_code_summary: str | None
+    observed_at_utc: str
+    time_source_ref: str
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        if type(self.binding) is not ExecutionBindingV1:
+            raise ValueError("platform observation requires execution binding")
+        for name in ("handoff_start_ref", "adapter_ref", "account_ref",
+                     "destination_ref", "observation_id", "evidence_source_ref",
+                     "observed_at_utc", "time_source_ref"):
+            identifier(getattr(self, name), name)
+        for name in ("platform_request_id", "platform_message_id", "status_code_summary"):
+            value = getattr(self, name)
+            if value is not None:
+                identifier(value, name)
+        if type(self.outcome) is not str or self.outcome not in _PLATFORM_OUTCOMES:
+            raise ValueError("unknown platform observation outcome")
+        if not _UTC_TIMESTAMP.fullmatch(self.observed_at_utc):
+            raise ValueError("observed_at_utc must be a UTC second timestamp")
+        try:
+            datetime.fromisoformat(self.observed_at_utc.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("invalid observed_at_utc") from exc
+        if (self.adapter_ref != self.binding.adapter_ref
+                or self.account_ref != self.binding.account_ref
+                or self.destination_ref != self.binding.destination_ref):
+            raise ValueError("platform observation destination differs from binding")
+        _unique_ids(handoff_start_ref=self.handoff_start_ref,
+                    observation_id=self.observation_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,8 +524,25 @@ def _anchor_from_wire(value: object) -> RestoreAnchor:
     return RestoreAnchor(**fields)
 
 
+def _footprint_wire(footprint: RecoveryConstraintFootprint) -> dict[str, Any]:
+    return json.loads(footprint._json())
+
+
+def _footprint_from_wire(value: object) -> RecoveryConstraintFootprint:
+    _fields(value, _FOOTPRINT_FIELDS, "recovery footprint")
+    try:
+        encoded = json.dumps(value, allow_nan=False)
+        footprint = RecoveryConstraintFootprint._from_json(encoded)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ValueError("invalid recovery footprint") from exc
+    if _footprint_wire(footprint) != value:
+        raise ValueError("noncanonical recovery footprint")
+    return footprint
+
+
 def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
-            DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1) -> dict[str, Any]:
+            DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1 |
+            ExecutionBindingV1 | PlatformObservationV1) -> dict[str, Any]:
     """Produce a fresh, JSON-shaped dict with an explicit object kind."""
     if type(value) is FencePermitV2:
         return {
@@ -392,6 +562,44 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             "phase": value.phase, "before_anchor": _anchor_wire(value.before_anchor),
             "expected_append_id": value.expected_append_id,
             "expected_append_digest": value.expected_append_digest,
+        }
+    if type(value) is ExecutionBindingV1:
+        return {
+            "schema": value.schema, "kind": "execution_binding_v1",
+            "permit": to_wire(value.permit), "namespace": value.namespace,
+            "activity_id": value.activity_id, "effect_id": value.effect_id,
+            "attempt_id": value.attempt_id, "operation_id": value.operation_id,
+            "dispatch_generation": value.dispatch_generation,
+            "activation_generation": value.activation_generation,
+            "admission_ref": value.admission_ref,
+            "verified_check_refs": list(value.verified_check_refs),
+            "payload_digest": value.payload_digest,
+            "platform_capability_ref": value.platform_capability_ref,
+            "adapter_ref": value.adapter_ref, "account_ref": value.account_ref,
+            "destination_ref": value.destination_ref, "worker_fence": value.worker_fence,
+            "content_fence": value.content_fence, "cancel_epoch": value.cancel_epoch,
+            "footprint": _footprint_wire(value.footprint),
+            "proactive_contact": value.proactive_contact,
+            "segment_authorization_ref": value.segment_authorization_ref,
+            "segment_manifest_digest": value.segment_manifest_digest,
+            "segment_index": value.segment_index, "segment_count": value.segment_count,
+            "contact_policy_check_ref": value.contact_policy_check_ref,
+        }
+    if type(value) is PlatformObservationV1:
+        return {
+            "schema": value.schema, "kind": "platform_observation_v1",
+            "binding": to_wire(value.binding),
+            "handoff_start_ref": value.handoff_start_ref,
+            "adapter_ref": value.adapter_ref, "account_ref": value.account_ref,
+            "destination_ref": value.destination_ref,
+            "observation_id": value.observation_id,
+            "platform_request_id": value.platform_request_id,
+            "platform_message_id": value.platform_message_id,
+            "evidence_source_ref": value.evidence_source_ref,
+            "outcome": value.outcome,
+            "status_code_summary": value.status_code_summary,
+            "observed_at_utc": value.observed_at_utc,
+            "time_source_ref": value.time_source_ref,
         }
     if type(value) is MutationReceiptV2:
         return {
@@ -440,7 +648,10 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
     raise TypeError("unsupported authority v2 DTO")
 
 
-def from_wire(value: object) -> FencePermitV2 | PendingMutationV2 | MutationReceiptV2 | DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1:
+def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
+                                 DeletionEvidenceV1 | DeletionPendingV1 |
+                                 DeletionMutationReceiptV1 | ExecutionBindingV1 |
+                                 PlatformObservationV1):
     """Reject unknown schemas, fields, kinds and nested shapes before use."""
     if type(value) is not dict or value.get("schema") != SCHEMA:
         raise ValueError("unknown authority schema")
@@ -470,6 +681,38 @@ def from_wire(value: object) -> FencePermitV2 | PendingMutationV2 | MutationRece
             expected_append_digest=value["expected_append_digest"],
             schema=value["schema"],
         )
+    if kind == "execution_binding_v1":
+        _fields(value, frozenset({
+            "schema", "kind", "permit", "namespace", "activity_id", "effect_id",
+            "attempt_id", "operation_id", "dispatch_generation",
+            "activation_generation", "admission_ref", "verified_check_refs",
+            "payload_digest",
+            "platform_capability_ref", "adapter_ref", "account_ref", "destination_ref",
+            "worker_fence", "content_fence", "cancel_epoch", "footprint",
+            "proactive_contact", "segment_authorization_ref", "segment_manifest_digest",
+            "segment_index", "segment_count", "contact_policy_check_ref",
+        }), "execution binding")
+        permit = from_wire(value["permit"])
+        if type(permit) is not FencePermitV2 or type(value["verified_check_refs"]) is not list:
+            raise ValueError("execution binding fence kind mismatch")
+        return ExecutionBindingV1(
+            **{key: (permit if key == "permit" else
+                     _footprint_from_wire(item) if key == "footprint" else
+                     tuple(item) if key == "verified_check_refs" else item)
+               for key, item in value.items() if key != "kind"})
+    if kind == "platform_observation_v1":
+        _fields(value, frozenset({
+            "schema", "kind", "binding", "handoff_start_ref", "adapter_ref",
+            "account_ref", "destination_ref", "observation_id",
+            "platform_request_id", "platform_message_id", "evidence_source_ref",
+            "outcome", "status_code_summary", "observed_at_utc", "time_source_ref",
+        }), "platform observation")
+        binding = from_wire(value["binding"])
+        if type(binding) is not ExecutionBindingV1:
+            raise ValueError("platform observation binding kind mismatch")
+        return PlatformObservationV1(
+            **{key: (binding if key == "binding" else item)
+               for key, item in value.items() if key != "kind"})
     if kind == "mutation_receipt":
         _fields(value, frozenset({
             "schema", "kind", "pending", "after_anchor", "updated_revision",
@@ -544,18 +787,23 @@ def _reject_constant(value: str) -> None:
 
 def canonical_bytes(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                     DeletionEvidenceV1 | DeletionPendingV1 |
-                    DeletionMutationReceiptV1) -> bytes:
+                    DeletionMutationReceiptV1 | ExecutionBindingV1 |
+                    PlatformObservationV1) -> bytes:
     return json.dumps(to_wire(value), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
 def canonical_digest(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                      DeletionEvidenceV1 | DeletionPendingV1 |
-                     DeletionMutationReceiptV1) -> str:
+                     DeletionMutationReceiptV1 | ExecutionBindingV1 |
+                     PlatformObservationV1) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
-def decode_bytes(data: bytes) -> FencePermitV2 | PendingMutationV2 | MutationReceiptV2 | DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1:
+def decode_bytes(data: bytes) -> (FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
+                                  DeletionEvidenceV1 | DeletionPendingV1 |
+                                  DeletionMutationReceiptV1 | ExecutionBindingV1 |
+                                  PlatformObservationV1):
     if type(data) is not bytes:
         raise TypeError("authority wire data must be bytes")
     value = json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs,
@@ -564,6 +812,7 @@ def decode_bytes(data: bytes) -> FencePermitV2 | PendingMutationV2 | MutationRec
 
 
 __all__ = ["SCHEMA", "FencePermitV2", "PendingMutationV2", "MutationReceiptV2",
+           "ExecutionBindingV1", "PlatformObservationV1",
            "DeletionEvidenceV1", "DeletionPendingV1", "DeletionMutationReceiptV1",
            "deletion_scope_digest", "to_wire", "from_wire", "canonical_bytes",
            "canonical_digest", "decode_bytes"]
