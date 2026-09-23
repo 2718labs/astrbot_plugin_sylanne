@@ -1980,6 +1980,12 @@ class GraphCoordinator:
                 "WHERE bot=? AND persona=? AND operation_id=?",
                 namespace.as_tuple + (operation_id,),
             ).fetchone()
+            rejection = store._db.execute(
+                "SELECT digest,status,permit_json,graph_revision,graph_epoch,"
+                "finish_request_id,finish_request_digest FROM graph_bundle_rejections_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
         target = metadata.requirements
         if target.namespace != namespace or target.activation_generation != authority.activation_generation:
             raise UnavailableGuard("v2 graph recovery identity or generation differs")
@@ -2025,6 +2031,13 @@ class GraphCoordinator:
         if prior is None and (intent[4], intent[5]) != (
                 metadata.graph_revision, epoch.revision):
             raise UnavailableGuard("uncommitted v2 bundle intent lost its graph stamp")
+        if rejection is not None:
+            if prior is not None or saved is not None:
+                raise UnavailableGuard("rejected v2 bundle has a business receipt")
+            self._finish_rejected_bundle_v2(
+                namespace, metadata, epoch, anchor, attempt_id, digest,
+                operation_id, rejection)
+            raise UnavailableGuard("v2 bundle is terminal rejected_no_commit")
         if prior is not None:
             if prior[0] != digest:
                 raise EventConflict("operation ID reused with different bundle")
@@ -2091,9 +2104,21 @@ class GraphCoordinator:
         })
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("v2 bundle write permit changed")
-        receipt = self._commit_domain_bundle_fenced(
-            bundle, lease, v2_write=(metadata, epoch, finish_id,
-                                     finish_digest, canonical_json(to_wire(permit))))
+        transaction_state = {"phase": "before_transaction"}
+        try:
+            receipt = self._commit_domain_bundle_fenced(
+                bundle, lease, v2_write=(metadata, epoch, finish_id,
+                                         finish_digest, canonical_json(to_wire(permit))),
+                v2_transaction_state=transaction_state)
+        except Exception:
+            if transaction_state["phase"] in {"before_transaction", "rolled_back"}:
+                rejection = self._record_rejected_bundle_v2(
+                    namespace, operation_id, digest, attempt_id, metadata, epoch,
+                    intent, permit)
+                self._finish_rejected_bundle_v2(
+                    namespace, metadata, epoch, anchor, attempt_id, digest,
+                    operation_id, rejection)
+            raise
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("v2 bundle write permit changed after commit")
         with store._lock:
@@ -2105,9 +2130,109 @@ class GraphCoordinator:
         port.finish_fence(scope, request_id=finish_id, request_digest=finish_digest)
         return receipt
 
+    def _record_rejected_bundle_v2(self, namespace, operation_id, digest,
+                                   attempt_id, metadata, epoch, intent, permit):
+        """Record a proven rollback before any Authority abort finish."""
+        from .authority_service.v2_contract import to_wire
+
+        store = self.__store
+        finish_id = "abort:" + attempt_id
+        finish_digest = "sha256:" + canonical_digest({
+            "operation_id": attempt_id, "permit_token": permit.token,
+            "action": "rejected_no_commit", "business_operation_id": operation_id,
+            "bundle_digest": digest,
+        })
+        expected = (
+            digest, "rejected_no_commit", canonical_json(to_wire(permit)),
+            metadata.graph_revision, epoch.revision, finish_id, finish_digest,
+        )
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                current_intent = db.execute(
+                    "SELECT digest,fence_attempt_id,requirements_json,anchor_json,"
+                    "graph_revision,graph_epoch FROM graph_bundle_intents_v2 "
+                    "WHERE bot=? AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (operation_id,),
+                ).fetchone()
+                if (current_intent != intent
+                        or self._v2_graph_stamp(namespace) != (metadata, epoch)
+                        or db.execute(
+                            "SELECT 1 FROM graph_bundle_operations WHERE bot=? "
+                            "AND persona=? AND operation_id=?",
+                            namespace.as_tuple + (operation_id,),
+                        ).fetchone() is not None
+                        or db.execute(
+                            "SELECT 1 FROM graph_bundle_fences_v2 WHERE bot=? "
+                            "AND persona=? AND operation_id=?",
+                            namespace.as_tuple + (operation_id,),
+                        ).fetchone() is not None):
+                    raise UnavailableGuard("v2 bundle rollback cannot be proven")
+                db.execute(
+                    "INSERT OR IGNORE INTO graph_bundle_rejections_v2"
+                    "(bot,persona,operation_id,digest,status,permit_json,"
+                    "graph_revision,graph_epoch,finish_request_id,finish_request_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (operation_id,) + expected,
+                )
+                recorded = db.execute(
+                    "SELECT digest,status,permit_json,graph_revision,graph_epoch,"
+                    "finish_request_id,finish_request_digest "
+                    "FROM graph_bundle_rejections_v2 WHERE bot=? AND persona=? "
+                    "AND operation_id=?", namespace.as_tuple + (operation_id,),
+                ).fetchone()
+                if recorded != expected:
+                    raise UnavailableGuard("v2 bundle rejection identity differs")
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        return expected
+
+    def _finish_rejected_bundle_v2(self, namespace, metadata, epoch, anchor,
+                                   attempt_id, digest, operation_id, rejection):
+        from .authority_service.v2_contract import FencePermitV2, from_wire
+
+        port = self.__content_fence_v2
+        target = metadata.requirements
+        try:
+            permit = from_wire(json.loads(rejection[2]))
+        except (TypeError, ValueError) as exc:
+            raise UnavailableGuard("durable v2 rejected permit is invalid") from exc
+        if (rejection[0] != digest or rejection[1] != "rejected_no_commit"
+                or type(permit) is not FencePermitV2
+                or permit.operation_id != attempt_id or permit.operation != "write"
+                or permit.subject != port.installation_grant.subject
+                or permit.holder != self.__holder
+                or permit.authority_id != target.authority_id
+                or permit.namespace != target.authority_namespace
+                or permit.generation != target.activation_generation
+                or permit.pinned_anchor != anchor
+                or (rejection[3], rejection[4]) != (
+                    metadata.graph_revision, epoch.revision)
+                or rejection[5] != "abort:" + attempt_id
+                or rejection[6] != "sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "rejected_no_commit",
+                    "business_operation_id": operation_id, "bundle_digest": digest,
+                })):
+            raise UnavailableGuard("durable v2 rejected fence identity differs")
+        observed, state = port.get_fence_operation(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            operation_id=attempt_id)
+        if observed != permit or state not in {"active", "finished"}:
+            raise UnavailableGuard("rejected v2 Authority fence status differs")
+        scope = FenceScope(namespace, target.authority_namespace,
+                           target.activation_generation, "write", attempt_id,
+                           permit, anchor, epoch, metadata.graph_revision)
+        if state == "active" and port.validate_fence(scope) != permit:
+            raise UnavailableGuard("rejected v2 write permit changed")
+        port.finish_fence(scope, request_id=rejection[5], request_digest=rejection[6])
+
     def _commit_domain_bundle_fenced(self, bundle: DomainBundle,
                                      lease: object, *, v2_read: bool = False,
-                                     v2_write=None) -> CommitReceipt:
+                                     v2_write=None, v2_transaction_state=None) -> CommitReceipt:
         envelope = bundle.envelope
         namespace = envelope.authority.namespace
         domains = frozenset(proposal.domain for proposal in bundle.proposals)
@@ -2238,6 +2363,12 @@ class GraphCoordinator:
                 expected, expected_epoch = v2_write[:2]
                 if self._v2_graph_stamp(namespace) != (expected, expected_epoch):
                     raise StaleRead("v2 graph recovery stamp changed")
+                if db.execute(
+                        "SELECT 1 FROM graph_bundle_rejections_v2 WHERE bot=? "
+                        "AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (identity.operation_id,),
+                ).fetchone() is not None:
+                    raise UnavailableGuard("v2 bundle is terminal rejected_no_commit")
             elif not v2_read:
                 self._admit_content(
                     namespace, envelope.authority.activation_generation, "write",
@@ -2417,6 +2548,7 @@ class GraphCoordinator:
                                   writes, ()),
             _guard=guard, _receipt_hook=receipt_hook,
             _capability=self.__graph_capability,
+            _transaction_state=v2_transaction_state,
         )
         return result[0]
 

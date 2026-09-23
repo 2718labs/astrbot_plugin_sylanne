@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from sylanne3.contracts import EventConflict, StaleRead
+from sylanne3.contracts import EventConflict
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.graph_coordinator import (
@@ -363,7 +363,7 @@ def test_v2_bundle_changed_authority_head_writes_nothing(bundle_system):
     assert coordinator._v2_graph_stamp(policy.namespace)[0].graph_revision == 0
 
 
-def test_v2_bundle_d11_failure_rolls_back_graph_and_stamp(bundle_system):
+def test_v2_bundle_d11_failure_records_terminal_rejection_and_frees_fence(bundle_system):
     store, coordinator, _, port, policy, lease, make_bundle, _, d11, _ = bundle_system
     candidate = make_bundle()
     original = d11.admit_runtime
@@ -373,8 +373,13 @@ def test_v2_bundle_d11_failure_rolls_back_graph_and_stamp(bundle_system):
     assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
     assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_fences_v2").fetchone() == (0,)
     assert coordinator._v2_graph_stamp(policy.namespace)[0].graph_revision == 0
+    assert store._db.execute(
+        "SELECT status FROM graph_bundle_rejections_v2").fetchone() == (
+            "rejected_no_commit",)
+    assert any(item[1].startswith("abort:graph-write-") for item in port.finishes)
     d11.admit_runtime = original
-    assert coordinator.commit_domain_bundle(candidate, lease).status == "committed"
+    with pytest.raises(UnavailableGuard, match="terminal rejected_no_commit"):
+        coordinator.commit_domain_bundle(candidate, lease)
 
 
 def test_v2_bundle_changed_graph_stamp_after_permit_writes_nothing(bundle_system):
@@ -392,10 +397,65 @@ def test_v2_bundle_changed_graph_stamp_after_permit_writes_nothing(bundle_system
         return result
 
     port.validate_fence = advance_stamp
-    with pytest.raises(StaleRead, match="stamp changed"):
+    with pytest.raises(UnavailableGuard, match="rollback cannot be proven"):
         coordinator.commit_domain_bundle(candidate, lease)
     assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
     assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_fences_v2").fetchone() == (0,)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_rejections_v2").fetchone() == (0,)
+
+
+def test_v2_bundle_rejected_abort_recovers_after_cold_restart(bundle_system, tmp_path):
+    store, coordinator, _, port, policy, lease, make_bundle, _, d11, _ = bundle_system
+    candidate = make_bundle()
+    d11.admit_runtime = lambda *_: (_ for _ in ()).throw(RuntimeError("D11 unavailable"))
+    port.finish_fence = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("abort response lost"))
+    with pytest.raises(RuntimeError, match="abort response lost"):
+        coordinator.commit_domain_bundle(candidate, lease)
+    assert store._db.execute("SELECT status FROM graph_bundle_rejections_v2").fetchone() == (
+        "rejected_no_commit",)
+    reopened, next_coordinator, next_port, next_lease, _, authority_db = (
+        restart_bundle_system(bundle_system, tmp_path))
+    try:
+        with pytest.raises(UnavailableGuard, match="terminal rejected_no_commit"):
+            next_coordinator.commit_domain_bundle(candidate, next_lease)
+        assert reopened._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
+        assert next_port.finishes[0][1].startswith("abort:graph-write-")
+    finally:
+        reopened.close()
+        authority_db.close()
+
+
+def test_v2_bundle_commit_error_does_not_record_terminal_rejection(bundle_system):
+    store, coordinator, _, port, policy, lease, make_bundle, *_ = bundle_system
+    candidate = make_bundle()
+    validate = port.validate_fence
+
+    def deny_commit(action, argument, *_):
+        if action == sqlite3.SQLITE_TRANSACTION and argument == "COMMIT":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    def arm_commit_error(scope):
+        result = validate(scope)
+        if scope.operation == "write":
+            store._db.set_authorizer(deny_commit)
+            port.validate_fence = validate
+        return result
+
+    port.validate_fence = arm_commit_error
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            coordinator.commit_domain_bundle(candidate, lease)
+    finally:
+        store._db.set_authorizer(None)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_rejections_v2").fetchone() == (0,)
+    assert store._db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
+    intent = store._db.execute("SELECT fence_attempt_id FROM graph_bundle_intents_v2").fetchone()
+    _, state = port.get_fence_operation(
+        namespace=policy.namespace, authority_namespace=policy.authority_namespace,
+        operation_id=intent[0])
+    assert state == "active"
 
 
 def test_genesis_uses_d11_grant_capability_without_d02(tmp_path):

@@ -201,6 +201,23 @@ class GraphStore(Store):
                 requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
                 graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
                 PRIMARY KEY(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_bundle_rejections_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, digest TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status='rejected_no_commit'),
+                permit_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL,
+                finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id),
+                FOREIGN KEY(bot,persona,operation_id)
+                    REFERENCES graph_bundle_intents_v2(bot,persona,operation_id));
+            CREATE TRIGGER IF NOT EXISTS graph_bundle_rejection_no_update_v2
+                BEFORE UPDATE ON graph_bundle_rejections_v2
+                BEGIN SELECT RAISE(ABORT, 'bundle rejection is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_bundle_rejection_no_delete_v2
+                BEFORE DELETE ON graph_bundle_rejections_v2
+                BEGIN SELECT RAISE(ABORT, 'bundle rejection is immutable'); END;
             CREATE TRIGGER IF NOT EXISTS graph_bundle_intent_no_update_v2
                 BEFORE UPDATE ON graph_bundle_intents_v2
                 BEGIN SELECT RAISE(ABORT, 'bundle intent is immutable'); END;
@@ -756,7 +773,7 @@ class GraphStore(Store):
             raise ValueError("instantaneous dependency cycle")
 
     def graph_commit(self, candidate: GraphCandidate, *, _guard=None, _receipt_hook=None,
-                     _capability=None):
+                     _capability=None, _transaction_state=None):
         self._require_coordinator(_capability)
         if not isinstance(candidate, GraphCandidate):
             raise TypeError("candidate must be GraphCandidate")
@@ -803,7 +820,11 @@ class GraphStore(Store):
 
         with self._lock:
             self._ensure_open()
+            if _transaction_state is not None:
+                _transaction_state["phase"] = "begin_attempted"
             self._db.execute("BEGIN IMMEDIATE")
+            if _transaction_state is not None:
+                _transaction_state["phase"] = "transaction_open"
             try:
                 if _guard is not None:
                     _guard(self._db)
@@ -821,7 +842,11 @@ class GraphStore(Store):
                     )
                     if _receipt_hook is not None:
                         _receipt_hook(self._db, receipt)
+                    if _transaction_state is not None:
+                        _transaction_state["phase"] = "commit_attempted"
                     self._db.execute("COMMIT")
+                    if _transaction_state is not None:
+                        _transaction_state["phase"] = "committed"
                     return receipt
 
                 for read in reads:
@@ -977,10 +1002,17 @@ class GraphStore(Store):
                 )
                 if _receipt_hook is not None:
                     _receipt_hook(self._db, receipt)
+                if _transaction_state is not None:
+                    _transaction_state["phase"] = "commit_attempted"
                 self._db.execute("COMMIT")
+                if _transaction_state is not None:
+                    _transaction_state["phase"] = "committed"
                 return receipt
             except BaseException:
                 self._db.execute("ROLLBACK")
+                if (_transaction_state is not None
+                        and _transaction_state["phase"] != "commit_attempted"):
+                    _transaction_state["phase"] = "rolled_back"
                 raise
 
 
