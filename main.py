@@ -153,12 +153,17 @@ class Sylanne3Plugin(Star):
                 logger.error("Sylanne 3 startup blocked: namespace provisioning failed")
                 return
             health = self._runtime.health
-        if all(dependency is not None for dependency in self._workbench_dependencies):
+        pairing, grants, onboarding, origin = self._workbench_dependencies
+        origin = origin or installation.workbench_origin
+        if onboarding is not None and origin is not None:
             try:
-                pairing, grants, onboarding, origin = self._workbench_dependencies
-                self._workbench.attach_transport(self._runtime.workbench_transport(
+                transport = self._runtime.workbench_transport(
                     pairing=pairing, owner_grants=grants,
-                    onboarding=onboarding, origin=origin))
+                    onboarding=onboarding, origin=origin)
+                owner_sessions = self._runtime.workbench_owner_sessions
+                if owner_sessions is not None:
+                    self._workbench.attach_owner_sessions(owner_sessions)
+                self._workbench.attach_transport(transport)
             except Exception:
                 logger.error("Sylanne D12 workbench pairing could not be attached")
         if health.status == "limited":

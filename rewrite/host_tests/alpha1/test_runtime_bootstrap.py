@@ -684,6 +684,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         installation = types.SimpleNamespace(
             installation_policy=policy,
             available_cpu_features=frozenset({"avx2"}),
+            workbench_origin="https://profile.example",
         )
 
         async def assemble(profile_id, *, package_root, data_dir):
@@ -701,9 +702,11 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             return types.SimpleNamespace(scheme=object(), registry=registry)
 
         class ControlledRuntime:
-            def __init__(self, data_dir, *, package_root, dependencies, domains):
+            def __init__(self, data_dir, *, package_root, dependencies, domains,
+                         owner_principal_resolver=None):
                 order.append("context")
                 self.arguments = (data_dir, package_root, dependencies, domains)
+                self_outer.assertIsNone(owner_principal_resolver)
 
             async def start_v2(self, assembled):
                 order.append("start_v2")
@@ -747,10 +750,203 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                              ("product_ingress", "owner_guard", "active_role",
                               "scene_binding", "dispatch"))
             self.assertEqual(plugin.runtime_health.detail, "")
+            self.assertIsNone(plugin._workbench._transport)
             event = Event()
             await plugin.ingress(event)
             self.assertFalse(event.is_stopped())
             self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())
+
+    async def test_installed_v2_port_composes_owner_workbench_without_explicit_resolvers(self) -> None:
+        module = load_plugin_module()
+        package = module.RuntimeContext.__module__.rsplit(".", 1)[0]
+        runtime_module = importlib.import_module(f"{package}.runtime_context")
+        owner_contract = importlib.import_module(f"{package}.authority_service.v2_owner_contract")
+        graph_module = importlib.import_module(f"{package}.graph_coordinator")
+        host_package = importlib.import_module(f"{package}.host.installed_package")
+        installation_module = importlib.import_module(f"{package}.host.v2_installation")
+        policy_module = importlib.import_module(f"{package}.installation_policy")
+        budget_module = importlib.import_module(f"{package}.runtime.budget")
+        issuers_module = importlib.import_module(f"{package}.runtime.issuers")
+        contracts = importlib.import_module(f"{package}.runtime_contracts")
+
+        namespace = contracts.NamespaceId("bot", "persona")
+        principal = owner_contract.OwnerPrincipalV1("idp", "account", "incarnation")
+        binding = owner_contract.OwnerActorBindingV1(
+            "authority", "installation", namespace, "owner-actor", principal, 1,
+        )
+        grant = contracts.InstallationGrantV2(
+            "authority", "subject", "administrator", "installation",
+            "a" * 64, "publisher-trust", "2", "b" * 64,
+        )
+        policy = policy_module.AdminInstallationPolicy(
+            namespace, graph_module.namespace_ref(namespace), "installation", "a" * 64,
+            "administrator", "authority", "c" * 64, "scheme-1", "operator-1",
+            "policy-1",
+            budget_module.BudgetLease(
+                "root", None, *namespace.as_tuple, "USD", {"cpu_ms": 200},
+                {}, {}, {}, 1, "active",
+            ),
+            issuers_module.BudgetLeaseGrant(
+                "root-grant", 1, *namespace.as_tuple, "root", "USD",
+                {"cpu_ms": 100}, ("d06.encode_source",), 4_000_000_000,
+                "d11-policy",
+            ),
+        )
+        lookups = []
+
+        class ControlledPort:
+            installation_grant = grant
+
+            def __init__(self):
+                self.binding = binding
+
+            def current_owner_actor_binding(self, *, namespace, authority_namespace,
+                                            actor_id):
+                lookups.append(("actor", namespace, authority_namespace, actor_id))
+                return self.binding
+
+            def current_owner_principal_binding(self, *, namespace, authority_namespace,
+                                                principal):
+                lookups.append(("principal", namespace, authority_namespace, principal))
+                return self.binding
+
+            def begin_owner_session(self, **_kwargs):
+                raise AssertionError("login needs a signed Authority challenge")
+
+            def accept_owner_session(self, **_kwargs):
+                raise AssertionError("login needs a signed Authority challenge")
+
+            def describe_owner_session(self, **_kwargs):
+                raise AssertionError("no Owner session was issued")
+
+            def logout_owner_session(self, **_kwargs):
+                raise AssertionError("no Owner session was issued")
+
+            def close(self):
+                pass
+
+        class ControlledStore:
+            def __init__(self, *_args):
+                pass
+
+            def close(self):
+                pass
+
+        class ControlledCoordinator(graph_module.GraphCoordinator):
+            def __init__(self, _store, bootstrap, **kwargs):
+                self.bootstrap = bootstrap
+                self.owner_resolver = kwargs["owner_principal_resolver"]
+
+            def register_provider(self, *_args):
+                pass
+
+            def provision_namespace_v2(self, bootstrap, installed_policy, *, operation_id):
+                assert bootstrap is self.bootstrap and installed_policy is policy
+                return operation_id
+
+            def read_active_role_v2(self, *, namespace):
+                raise graph_module.UnavailableGuard("no active role")
+
+        domains = types.SimpleNamespace(
+            complete=True, type_registry=object(),
+            registrations={"d11": types.SimpleNamespace(
+                domain="d11", provider=object(), proposal_schema="d11.test",
+                proposal_schema_hash="b" * 64,
+            )},
+        )
+        onboarding = types.SimpleNamespace(
+            resolve_create_character=lambda **_kwargs: None,
+            resolve_bind_scene=lambda **_kwargs: None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = await asyncio.to_thread(Path(directory).resolve)
+            installation = installation_module.V2InstallationAssembly(
+                policy, grant, b"k" * 32, b"d" * 32, ControlledPort,
+                module.PACKAGE_ROOT, data_dir,
+                workbench_origin="https://profile.example",
+            )
+            with patch.object(StarTools, "get_data_dir", return_value=data_dir), \
+                    patch.object(module, "assemble_v2_installation",
+                                 new=AsyncMock(return_value=installation)), \
+                    patch.object(module, "load_verified_affect_scheme",
+                                 return_value=types.SimpleNamespace(registry=domains)), \
+                    patch.object(runtime_module, "verify_installed_package",
+                                 return_value=host_package.InstalledPackageVerification(
+                                     True, "verified", "a" * 64, "3.0.0-alpha1",
+                                     "formal-alpha1")), \
+                    patch.object(runtime_module, "ProductionGraphStore", ControlledStore), \
+                    patch.object(runtime_module, "GraphCoordinator", ControlledCoordinator), \
+                    patch.object(runtime_module, "V2FencePort", ControlledPort):
+                plugin = module.Sylanne3Plugin(
+                    Context(asyncio.Queue(), {}, None, None, None, None,
+                            None, None, None, None, None, None),
+                    {"enabled": True, "authority_profile": "installed",
+                     "workbench_origin": "https://untrusted-config.example"},
+                    workbench_onboarding=onboarding,
+                )
+                try:
+                    await plugin.initialize()
+                    self.assertEqual(plugin.runtime_health.status, "limited")
+                    self.assertIsInstance(
+                        plugin._workbench._owner_sessions,
+                        runtime_module.BoundOwnerSessions,
+                    )
+                    self.assertIsInstance(
+                        plugin._workbench._transport,
+                        runtime_module.WorkbenchHttpTransport,
+                    )
+                    self.assertEqual(
+                        plugin._workbench._owner_sessions.origin,
+                        "https://profile.example",
+                    )
+                    self.assertEqual(
+                        plugin._workbench._transport._config.origin,
+                        "https://profile.example",
+                    )
+                    self.assertFalse(plugin._workbench._transport._origin_allowed(
+                        types.SimpleNamespace(headers={
+                            "origin": "https://untrusted-config.example",
+                        }),
+                    ))
+                    owner_grants = plugin._workbench._transport._service._grants._port
+                    self.assertIsInstance(
+                        owner_grants, runtime_module.GraphCurrentOwnerGrantPort,
+                    )
+                    worker = plugin._runtime._worker
+                    sessions = plugin._workbench._owner_sessions
+                    self.assertEqual(
+                        await worker.call(
+                            lambda graph: graph.owner_resolver("owner-actor", namespace)),
+                        principal,
+                    )
+                    self.assertEqual(
+                        await worker.call(
+                            lambda graph: sessions._owner_actor(principal, namespace)),
+                        "owner-actor",
+                    )
+                    self.assertEqual([entry[0] for entry in lookups], ["actor", "principal"])
+                    self.assertEqual(
+                        {entry[2] for entry in lookups},
+                        {graph_module.namespace_ref(namespace)},
+                    )
+
+                    other_namespace = contracts.NamespaceId("other-bot", "persona")
+                    self.assertIsNone(await worker.call(
+                        lambda graph: graph.owner_resolver("owner-actor", other_namespace)))
+                    self.assertIsNone(await worker.call(
+                        lambda graph: sessions._owner_actor(principal, other_namespace)))
+                    self.assertEqual(len(lookups), 2)
+
+                    plugin._runtime._v2_port.binding = owner_contract.OwnerActorBindingV1(
+                        "authority", "other-installation", namespace,
+                        "owner-actor", principal, 1,
+                    )
+                    self.assertIsNone(await worker.call(
+                        lambda graph: graph.owner_resolver("owner-actor", namespace)))
+                    self.assertIsNone(await worker.call(
+                        lambda graph: sessions._owner_actor(principal, namespace)))
+                finally:
+                    await plugin.terminate()
 
     async def test_namespace_provision_hold_keeps_host_blocked(self) -> None:
         module = load_plugin_module()
@@ -765,8 +961,9 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         operation_ids = []
 
         class ControlledRuntime:
-            def __init__(self, data_dir, *, package_root, dependencies, domains):
-                pass
+            def __init__(self, data_dir, *, package_root, dependencies, domains,
+                         owner_principal_resolver=None):
+                self.assert_no_owner_resolver = owner_principal_resolver is None
 
             async def start_v2(self, assembled):
                 return RuntimeHealth("limited", ("namespace_activation",))
@@ -829,6 +1026,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         installation = types.SimpleNamespace(
             installation_policy=types.SimpleNamespace(manifest_digest="a" * 64),
             available_cpu_features=None,
+            workbench_origin=None,
         )
         registry = object()
         runtime = types.SimpleNamespace(start_v2=AsyncMock(return_value=RuntimeHealth("ready")))

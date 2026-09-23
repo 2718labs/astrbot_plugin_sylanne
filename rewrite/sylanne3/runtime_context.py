@@ -8,14 +8,14 @@ import inspect
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .authority_service.v2_owner_contract import OwnerPrincipalV1
+from .authority_service.v2_owner_contract import OwnerActorBindingV1, OwnerPrincipalV1
 from .contracts import StaleRead
 from .domain_registry import DomainRegistry, discover_domain_registry
 from .domains.d01 import ActiveRoleQualification
 from .domains.d03.context import RoleBinding
 from .graph_coordinator import (
     FirstIngressOutcomeUnknown, GraphCoordinator, IngressClockSample,
-    IngressIssuancePolicy, UnavailableGuard,
+    IngressIssuancePolicy, UnavailableGuard, namespace_ref,
 )
 from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
@@ -23,7 +23,7 @@ from .host.ingress import HostIngressEnvelope, IngressReceipt
 from .host.v2_ingress_adapter import ingress_host_facts
 from .host.installed_package import verify_installed_package
 from .host.v2_installation import V2InstallationAssembly
-from .host.v2_fence_port import V2FenceOutcomeUnknown
+from .host.v2_fence_port import V2FenceOutcomeUnknown, V2FencePort
 from .installation_policy import AdminInstallationPolicy
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.restore_anchor import ExecutionJournalPort
@@ -35,7 +35,10 @@ from .workbench_api.http_transport import (
     TransportConfig, WorkbenchHttpTransport,
 )
 from .workbench_api.onboarding import OnboardingPolicyResolver
-from .workbench_api.owner_grant import CurrentOwnerGrantPort, DurableOwnerGrantResolver
+from .workbench_api.owner_grant import (
+    CurrentOwnerGrantPort, DurableOwnerGrantResolver, GraphCurrentOwnerGrantPort,
+)
+from .workbench_api.owner_session_resolver import BoundOwnerSessions
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,13 @@ class RuntimeContext:
         self._store: ProductionGraphStore | None = None
         self._coordinator: GraphCoordinator | None = None
         self._worker: GraphWorker | None = None
+        self._v2_coordinator: GraphCoordinator | None = None
+        self._v2_bootstrap: object | None = None
+        self._v2_port: V2FencePort | None = None
+        self._v2_policy: AdminInstallationPolicy | None = None
+        self._v2_installation_grant: InstallationGrantV2 | None = None
+        self._v2_owner_actor: Callable[[OwnerPrincipalV1, NamespaceId], str | None] | None = None
+        self._workbench_owner_sessions: BoundOwnerSessions | None = None
         self._v2_provision: Callable | None = None
         self._v2_ingress: Callable | None = None
         self._v2_role_probe: Callable | None = None
@@ -201,12 +211,46 @@ class RuntimeContext:
 
             provision = None
             ingress = None
+            owner_runtime = None
 
             def make_coordinator(store, port):
-                nonlocal provision, ingress
+                nonlocal provision, ingress, owner_runtime
                 if port.installation_grant != installation_grant:
                     raise RuntimeError("v2 port installation grant changed")
                 bootstrap = object()
+                reader = getattr(port, "current_owner_actor_binding", None)
+                inverse_reader = getattr(port, "current_owner_principal_binding", None)
+                current_binding_available = (
+                    callable(reader) and callable(inverse_reader)
+                    and policy.authority_namespace == namespace_ref(policy.namespace)
+                )
+
+                def matching_binding(binding, namespace):
+                    return (type(binding) is OwnerActorBindingV1
+                            and binding.namespace == namespace == policy.namespace
+                            and binding.authority_id == installation_grant.authority_id
+                            and binding.installation_id == installation_grant.installation_id)
+
+                def current_principal(actor_id, namespace):
+                    if (not current_binding_available or namespace != policy.namespace
+                            or type(actor_id) is not str or not actor_id):
+                        return None
+                    binding = reader(
+                        namespace=namespace, authority_namespace=policy.authority_namespace,
+                        actor_id=actor_id)
+                    return (binding.principal if matching_binding(binding, namespace)
+                            and binding.actor_id == actor_id else None)
+
+                def current_actor(principal, namespace):
+                    if (not current_binding_available or namespace != policy.namespace
+                            or type(principal) is not OwnerPrincipalV1):
+                        return None
+                    binding = inverse_reader(
+                        namespace=namespace, authority_namespace=policy.authority_namespace,
+                        principal=principal)
+                    return (binding.actor_id if matching_binding(binding, namespace)
+                            and binding.principal == principal else None)
+
                 d02_issuer = D02ResourceIssuer(installation.d02_signing_key)
                 coordinator = GraphCoordinator(
                     store, bootstrap, holder=installation_grant.administrator_holder,
@@ -214,7 +258,10 @@ class RuntimeContext:
                     d02_issuer=d02_issuer,
                     d11_issuer=D11BudgetJobIssuer(
                         d02_issuer, installation.d11_signing_key),
-                    owner_principal_resolver=self._owner_principal_resolver,
+                    owner_principal_resolver=(self._owner_principal_resolver
+                                              if self._owner_principal_resolver is not None
+                                              else current_principal if current_binding_available
+                                              else None),
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(
@@ -231,6 +278,10 @@ class RuntimeContext:
                             bootstrap, host, policy,
                             installation.ingress_clock, installation.ingress_encoding,
                         )
+                owner_runtime = (
+                    coordinator, bootstrap, port, policy, current_actor
+                    if current_binding_available else None
+                )
                 return coordinator
 
             try:
@@ -246,6 +297,11 @@ class RuntimeContext:
             self._v2_provision = provision
             self._v2_ingress = ingress
             self._v2_namespace = policy.namespace
+            if owner_runtime is not None:
+                (self._v2_coordinator, self._v2_bootstrap, port,
+                 self._v2_policy, self._v2_owner_actor) = owner_runtime
+                self._v2_port = port if isinstance(port, V2FencePort) else None
+                self._v2_installation_grant = installation_grant
             self._v2_role_probe = lambda graph: graph.read_active_role_v2(
                 namespace=policy.namespace,
             )
@@ -359,13 +415,45 @@ class RuntimeContext:
             )
             return self.health
 
-    def workbench_transport(self, *, pairing: CurrentOwnerPairingPort,
-                            owner_grants: CurrentOwnerGrantPort,
+    @property
+    def workbench_owner_sessions(self) -> BoundOwnerSessions | None:
+        return self._workbench_owner_sessions
+
+    def workbench_transport(self, *, pairing: CurrentOwnerPairingPort | None = None,
+                            owner_grants: CurrentOwnerGrantPort | None = None,
                             onboarding: OnboardingPolicyResolver,
                             origin: str) -> WorkbenchHttpTransport:
-        """Compose D12 only with explicit external pairing and current W01 ports."""
+        """Compose D12 from the installed V2 port or explicit trusted ports."""
         if self._worker is None or not self._v2_namespace_provisioned:
             raise RuntimeError("v2 graph namespace is unavailable")
+        if (pairing is None) != (owner_grants is None):
+            raise TypeError("Owner pairing and grant ports must be supplied together")
+        if pairing is None:
+            policy = self._v2_policy
+            port = self._v2_port
+            grant = self._v2_installation_grant
+            if (not isinstance(policy, AdminInstallationPolicy)
+                    or not isinstance(port, V2FencePort)
+                    or not isinstance(grant, InstallationGrantV2)
+                    or not isinstance(self._v2_coordinator, GraphCoordinator)
+                    or self._v2_bootstrap is None
+                    or self._v2_owner_actor is None
+                    or policy.namespace != self._v2_namespace
+                    or policy.authority_namespace != namespace_ref(policy.namespace)
+                    or grant.authority_id != policy.expected_authority_id
+                    or grant.installation_id != policy.installation_id
+                    or not isinstance(origin, str) or not origin.startswith("https://")):
+                raise RuntimeError("installed Owner workbench authority is unavailable")
+            pairing = BoundOwnerSessions(
+                authority=port, worker=self._worker, bootstrap=self._v2_bootstrap,
+                owner_actor=self._v2_owner_actor, namespace=policy.namespace,
+                authority_id=policy.expected_authority_id,
+                installation_id=policy.installation_id, origin=origin)
+            owner_grants = GraphCurrentOwnerGrantPort(
+                self._v2_coordinator, self._v2_bootstrap,
+                namespace=policy.namespace, activation_generation=1,
+                domains=tuple(sorted(self._domains.registrations)),
+            )
         if not callable(getattr(owner_grants, "resolve_current_owner", None)):
             raise TypeError("current W01 Owner grant port is required")
         if (not callable(getattr(onboarding, "resolve_create_character", None))
@@ -375,9 +463,12 @@ class RuntimeContext:
         service = AsyncGraphWorkbenchService(
             self._worker, DurableOwnerGrantResolver(owner_grants),
             CurrentDomainViewRegistry(lambda: self._domains), onboarding)
-        return WorkbenchHttpTransport(
+        transport = WorkbenchHttpTransport(
             service, sessions, BoundCsrfTokens(),
             TransportConfig(origin, self._package_root / "resources" / "workbench"))
+        self._workbench_owner_sessions = (
+            pairing if isinstance(pairing, BoundOwnerSessions) else None)
+        return transport
 
     async def start(self) -> RuntimeHealth:
         async with self._lock:
@@ -535,6 +626,13 @@ class RuntimeContext:
             worker, self._worker = self._worker, None
             self._v2_provision = None
             self._v2_ingress = None
+            self._v2_coordinator = None
+            self._v2_bootstrap = None
+            self._v2_port = None
+            self._v2_policy = None
+            self._v2_installation_grant = None
+            self._v2_owner_actor = None
+            self._workbench_owner_sessions = None
             self._v2_role_probe = None
             self._v2_scene_probe = None
             self._v2_namespace = None
