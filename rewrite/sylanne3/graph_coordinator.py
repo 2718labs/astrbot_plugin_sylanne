@@ -13,7 +13,7 @@ import json
 import math
 import secrets
 import time
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
 from types import SimpleNamespace
 
 from .contracts import Event, EventConflict, Scope, StaleRead, canonical_json
@@ -52,6 +52,9 @@ from .runtime.dispatch_candidate import (
 from .authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerPrincipalV1,
 )
+
+if TYPE_CHECKING:
+    from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 
 
 @dataclass(frozen=True)
@@ -2456,18 +2459,22 @@ class GraphCoordinator:
 
     def read_first_scene_binding_proof_v2(
         self, *, namespace: NamespaceId, scene_ref: str, purpose: str,
-        principal, actor_id: str,
+        principal, actor_id: str, owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
     ):
         """Prove a complete first-binding absence with current Owner and D01 heads."""
         from .authority_service.contract import identifier
         from .authority_service.v2_owner_contract import (
             OwnerAuthorizationGuardV1, OwnerPrincipalV1,
         )
+        from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
         from .domains.d03 import (
             ContextProvider, RoleBindingRequest, RoleBindingResolution,
         )
         from .runtime_contracts import QueryEpoch
-        from .workbench_api.d03_onboarding import CurrentFirstBindingProof
+        from .workbench_api.d03_onboarding import (
+            CurrentFirstBindingProof, CurrentGraphGuardMetadata,
+        )
 
         if (not isinstance(self.__store, ProductionGraphStore)
                 or self.__content_fence_v2 is None or type(namespace) is not NamespaceId
@@ -2480,6 +2487,13 @@ class GraphCoordinator:
             raise ValueError("scene_ref must be a scene identity")
         if self._current_owner_principal(actor_id, namespace) != principal:
             raise UnavailableGuard("current Owner pairing differs")
+        signed_session = (owner_session_token is not None
+                          or owner_session_request is not None)
+        if signed_session and (type(owner_session_token) is not str
+                               or not owner_session_token
+                               or type(owner_session_request)
+                               is not OwnerSessionLoginRequestV1):
+            raise UnavailableGuard("Owner session token and request must be paired")
         port = self.__content_fence_v2
         guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
         if not callable(guard_reader):
@@ -2494,6 +2508,21 @@ class GraphCoordinator:
             namespace=namespace, authority_namespace=target.authority_namespace)
         if not self._anchor_matches(target, anchor):
             raise UnavailableGuard("first scene recovery anchor differs")
+        session_kwargs = {}
+        if signed_session:
+            if (owner_session_request.authority_id != anchor.authority_id
+                    or owner_session_request.authority_namespace
+                    != target.authority_namespace
+                    or owner_session_request.installation_id
+                    != port.installation_grant.installation_id
+                    or owner_session_request.principal != principal
+                    or owner_session_request.audience != "owner"):
+                raise UnavailableGuard("first scene Owner session identity differs")
+            session_kwargs = {
+                "owner_actor_id": actor_id,
+                "owner_session_token": owner_session_token,
+                "owner_session_request": owner_session_request,
+            }
         attempt_id = "scene-negative-read-" + secrets.token_hex(16)
         permit = port.begin_fence(
             namespace=namespace, authority_namespace=target.authority_namespace,
@@ -2509,7 +2538,7 @@ class GraphCoordinator:
             guarded = guard_reader(
                 namespace=namespace,
                 authority_namespace=target.authority_namespace,
-                permit=permit)
+                permit=permit, **session_kwargs)
             if (type(guarded) is not tuple or len(guarded) != 2
                     or type(guarded[0]) is not OwnerAuthorizationGuardV1
                     or guarded[1] != permit):
@@ -2532,6 +2561,22 @@ class GraphCoordinator:
                     or guard.pending_revoke_operation_id is not None):
                 raise UnavailableGuard("first scene Owner head changed")
             return binding
+
+        def current_graph_guard_locked():
+            db = store._db
+            epochs = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone()
+            if epochs is None:
+                raise UnavailableGuard("first scene graph authority epochs are unavailable")
+            return CurrentGraphGuardMetadata(
+                namespace, epoch.revision, epochs[0], epochs[1],
+                store._registry.catalogue_hash,
+                self._version(db, namespace, "scheme", "current"),
+                self._version(db, namespace, "operator", "current"),
+                self._version(db, namespace, "policy", "current"),
+            )
 
         try:
             guard = current_guard()
@@ -2561,6 +2606,7 @@ class GraphCoordinator:
                     result.applicable_norm_refs, result.missing_items,
                     versions, QueryEpoch(namespace, "d03.role_binding", epoch.revision),
                     result.valid_until, request)
+                graph_guard = current_graph_guard_locked()
             if port.validate_fence(scope) != permit:
                 raise UnavailableGuard("first scene read permit changed")
             if (self._current_owner_principal(actor_id, namespace) != principal
@@ -2569,7 +2615,9 @@ class GraphCoordinator:
             with store._lock:
                 if self._v2_graph_stamp(namespace) != (metadata, epoch):
                     raise StaleRead("first scene graph stamp changed after read")
-            return CurrentFirstBindingProof(role, prior, guard)
+                if current_graph_guard_locked() != graph_guard:
+                    raise StaleRead("first scene graph guard changed after read")
+            return CurrentFirstBindingProof(role, prior, guard, graph_guard)
         finally:
             port.finish_fence(
                 scope, request_id="finish:" + attempt_id,

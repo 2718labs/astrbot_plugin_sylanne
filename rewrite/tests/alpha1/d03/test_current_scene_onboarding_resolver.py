@@ -3,6 +3,8 @@
 from dataclasses import replace
 from uuid import uuid4
 
+import pytest
+
 from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationGuardV1, OwnerPrincipalV1
 from sylanne3.domains.d01 import ActiveRoleQualification, PersonaBlock, PersonaPlan
 from sylanne3.domains.d03 import ContextProvider, RoleBinding, RoleBindingRequest, RoleBindingResolution
@@ -13,7 +15,8 @@ from sylanne3.runtime_contracts import (
 )
 from sylanne3.workbench_api.d01_onboarding import CurrentOwnerIdentity
 from sylanne3.workbench_api.d03_onboarding import (
-    CurrentD03OnboardingResolver, CurrentFirstBindingProof, VerifiedHostScenePolicy,
+    CurrentD03OnboardingResolver, CurrentFirstBindingProof,
+    CurrentGraphGuardMetadata, VerifiedHostScenePolicy,
 )
 from sylanne3.workbench_api.service import AuthenticatedSession
 
@@ -82,7 +85,11 @@ def _qualified(operation_id):
         ("source:scene",), "budget:scene", 10.0, 10.0, "interval:scene", (),
     )
     return (VerifiedHostScenePolicy(NAMESPACE, SCENE, "private", binding, envelope),
-            CurrentFirstBindingProof(active, prior, GUARD))
+            CurrentFirstBindingProof(
+                active, prior, GUARD,
+                CurrentGraphGuardMetadata(
+                    NAMESPACE, 0, 1, 0, "catalogue", "scheme", "operator", "policy"),
+            ))
 
 
 class Scenes:
@@ -159,13 +166,12 @@ def test_browser_acknowledgement_and_host_scene_identity_are_not_inferred():
     assert graph.calls == 0
 
 
-def test_partial_or_stale_graph_proof_and_unqualified_source_hold():
+def test_stale_graph_proof_is_rejected_and_unqualified_source_holds():
     operation_id = str(uuid4())
     policy, proof = _qualified(operation_id)
-    stale = replace(proof, prior=replace(proof.prior,
-                                        query_epoch=QueryEpoch(NAMESPACE, "d03.role_binding", 1)))
-    assert _resolve(_resolver(policy), Graph(stale), operation_id).hold_reason == (
-        "current_graph_negative_proof_invalid")
+    with pytest.raises(ValueError, match="differs from read epoch"):
+        replace(proof, prior=replace(proof.prior,
+                                     query_epoch=QueryEpoch(NAMESPACE, "d03.role_binding", 1)))
     unqualified = replace(policy, envelope=replace(
         policy.envelope, source_qualification=replace(
             policy.envelope.source_qualification, evidence_eligibility="ineligible")))

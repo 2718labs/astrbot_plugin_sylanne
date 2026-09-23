@@ -35,12 +35,50 @@ class VerifiedHostScenePolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class CurrentGraphGuardMetadata:
+    """VersionGuard inputs observed with the first-binding graph read."""
+
+    namespace: NamespaceId
+    graph_epoch: int
+    access_epoch: int
+    delete_epoch: int
+    catalogue_version: str
+    scheme_version: str
+    operator_version: str
+    policy_version: str
+
+    def __post_init__(self) -> None:
+        if type(self.namespace) is not NamespaceId:
+            raise TypeError("graph guard namespace is required")
+        for name in ("graph_epoch", "access_epoch", "delete_epoch"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        for name in ("catalogue_version", "scheme_version",
+                     "operator_version", "policy_version"):
+            value = getattr(self, name)
+            if type(value) is not str or not value:
+                raise ValueError(f"{name} must be a current version")
+
+
+@dataclass(frozen=True, slots=True)
 class CurrentFirstBindingProof:
     """One fenced graph read of D01 and the complete D03 negative query."""
 
     active_role: ActiveRoleQualification
     prior: RoleBindingResolution
     owner_guard: OwnerAuthorizationGuardV1
+    graph_guard: CurrentGraphGuardMetadata
+
+    def __post_init__(self) -> None:
+        if type(self.graph_guard) is not CurrentGraphGuardMetadata:
+            raise TypeError("current graph guard metadata is required")
+        if (self.graph_guard.namespace != self.active_role.namespace
+                or self.graph_guard.namespace != self.owner_guard.namespace
+                or self.prior.query_epoch is None
+                or self.graph_guard.graph_epoch != self.active_role.graph_epoch
+                or self.graph_guard.graph_epoch != self.prior.query_epoch.revision):
+            raise ValueError("first binding graph guard differs from read epoch")
 
 
 class HostScenePolicyPort(Protocol):
@@ -213,5 +251,6 @@ class CurrentD03OnboardingResolver:
 
 __all__ = (
     "CurrentD03OnboardingResolver", "CurrentFirstBindingProof",
+    "CurrentGraphGuardMetadata",
     "HostScenePolicyPort", "SceneBindDecision", "VerifiedHostScenePolicy",
 )
