@@ -14,8 +14,10 @@ import json
 import math
 from typing import Any, Protocol, runtime_checkable
 
+from .authority_service.v2_contract import FencePermitV2
 from .graph_types import AtomKey, GraphVersion, GraphWrite, NamespaceEpoch, Owner
 from .runtime.restore_anchor import RestoreAnchor
+from .runtime_journal import RecoveryConstraintFootprint
 
 
 RUNTIME_SCHEMA = "sylanne.runtime.v1"
@@ -267,6 +269,109 @@ class NamespaceBootstrapV2:
                 raise ValueError("unbound namespace cannot have a holder or anchor")
         elif not self.blocking_reasons:
             raise ValueError("non-active bound state requires blocking reasons")
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotRequirementsV2:
+    """Business snapshot comparison target, never a current Authority proof."""
+
+    namespace: NamespaceId
+    authority_id: str
+    authority_namespace: str
+    activation_generation: int
+    deletion_journal_id: str
+    deletion_seq: int
+    deletion_digest: str
+    execution_journal_id: str
+    execution_seq: int
+    execution_digest: str
+    revocation_epoch: int
+    graph_incarnation: str
+    schema: str = AUTHORITY_BOOTSTRAP_SCHEMA_V2
+
+    def __post_init__(self) -> None:
+        if self.schema != AUTHORITY_BOOTSTRAP_SCHEMA_V2:
+            raise ValueError("unknown authority bootstrap schema")
+        if type(self.namespace) is not NamespaceId:
+            raise TypeError("namespace must be NamespaceId")
+        for name in ("authority_id", "authority_namespace", "graph_incarnation"):
+            _nonempty(getattr(self, name), name)
+        _exact_nonnegative(self.activation_generation, "activation_generation")
+        _exact_nonnegative(self.revocation_epoch, "revocation_epoch")
+        for journal in ("deletion", "execution"):
+            _nonempty(getattr(self, f"{journal}_journal_id"), f"{journal}_journal_id")
+            seq = _exact_nonnegative(getattr(self, f"{journal}_seq"), f"{journal}_seq")
+            digest = getattr(self, f"{journal}_digest")
+            if seq == 0:
+                if digest != "genesis":
+                    raise ValueError(f"invalid {journal} head")
+            elif not isinstance(digest, str) or not digest.startswith("sha256:"):
+                raise ValueError(f"invalid {journal} head")
+            else:
+                _digest(digest[7:], f"{journal}_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class FenceScope:
+    """One v2 permit pinned to a namespace and a graph admission stamp.
+
+    The stamp is a comparison target for admission and commit, not proof that
+    the permit remains live. Both boundaries must validate this same scope with
+    the independent Authority and compare the current graph stamp.
+    """
+
+    namespace: NamespaceId
+    authority_namespace: str
+    generation: int
+    operation: str
+    operation_id: str
+    permit: FencePermitV2
+    pinned_anchor: RestoreAnchor
+    graph_epoch: NamespaceEpoch
+    graph_revision: int
+
+    def __post_init__(self) -> None:
+        if type(self.namespace) is not NamespaceId:
+            raise TypeError("namespace must be NamespaceId")
+        _nonempty(self.authority_namespace, "authority_namespace")
+        _exact_nonnegative(self.generation, "generation")
+        _nonempty(self.operation, "operation")
+        _nonempty(self.operation_id, "operation_id")
+        if type(self.permit) is not FencePermitV2:
+            raise TypeError("permit must be FencePermitV2")
+        if type(self.pinned_anchor) is not RestoreAnchor:
+            raise TypeError("pinned_anchor must be RestoreAnchor")
+        if (self.permit.namespace != self.authority_namespace
+                or self.permit.generation != self.generation
+                or self.permit.operation != self.operation
+                or self.permit.operation_id != self.operation_id
+                or self.permit.pinned_anchor != self.pinned_anchor):
+            raise ValueError("scope does not match v2 permit")
+        if type(self.graph_epoch) is not NamespaceEpoch:
+            raise TypeError("graph_epoch must be NamespaceEpoch")
+        if (self.graph_epoch.bot, self.graph_epoch.persona) != self.namespace.as_tuple:
+            raise ValueError("graph epoch namespace mismatch")
+        _exact_nonnegative(self.graph_revision, "graph_revision")
+
+
+@runtime_checkable
+class ContentFencePortV2(Protocol):
+    """Authenticated adapter to the independent, durable v2 fence service.
+
+    The adapter owns transport credentials; constructing a scope or satisfying
+    this protocol structurally does not authenticate or activate a runtime.
+    """
+
+    def begin_fence(self, *, namespace: NamespaceId, authority_namespace: str,
+                    holder: str, generation: int, operation: str, operation_id: str,
+                    expected_anchor: RestoreAnchor,
+                    effect_id: str | None = None, command_digest: str | None = None,
+                    footprint: RecoveryConstraintFootprint | None = None) -> FencePermitV2: ...
+
+    def validate_fence(self, scope: FenceScope) -> FencePermitV2: ...
+
+    def finish_fence(self, scope: FenceScope, *, request_id: str,
+                     request_digest: str) -> None: ...
 
 
 # GraphVersion is the canonical (AtomKey, revision) identity.  Re-exporting it
@@ -658,7 +763,9 @@ class DomainProvider(Protocol):
 
 __all__ = [
     "RUNTIME_SCHEMA", "AUTHORITY_BOOTSTRAP_SCHEMA_V2", "Owner", "AtomKey", "AtomRef", "NamespaceId",
-    "NamespaceRuntimeState", "InstallationGrantV2", "NamespaceBootstrapV2", "VersionedRef", "QueryEpoch",
+    "NamespaceRuntimeState", "InstallationGrantV2", "NamespaceBootstrapV2", "SnapshotRequirementsV2",
+    "FenceScope", "ContentFencePortV2",
+    "VersionedRef", "QueryEpoch",
     "OperationIdentity", "AuthorityContext", "VersionGuard", "SourceQualification", "DependencySet",
     "CommandEnvelope", "DomainProposal", "DomainBundle", "CommitReceipt", "ProviderDescriptor",
     "CheckReceipt", "DomainProvider", "canonical_serialize", "canonical_digest", "schema_hash",

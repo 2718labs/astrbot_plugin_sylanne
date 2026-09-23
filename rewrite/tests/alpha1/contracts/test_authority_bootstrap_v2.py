@@ -11,6 +11,7 @@ from sylanne3.runtime_contracts import (
     NamespaceBootstrapV2,
     NamespaceId,
     NamespaceRuntimeState,
+    SnapshotRequirementsV2,
     canonical_serialize,
 )
 
@@ -116,3 +117,26 @@ def test_anchor_requires_complete_coherent_heads():
         replace(bootstrap(), anchor=replace(anchor(), execution_seq=0))
     with pytest.raises(ValueError, match="execution_digest"):
         replace(bootstrap(), anchor=replace(anchor(), execution_digest="sha256:" + "X" * 64))
+
+
+def test_snapshot_requirements_v2_pin_full_heads_and_graph_incarnation():
+    snapshot = SnapshotRequirementsV2(
+        namespace=NamespaceId("bot-A", "persona-A"),
+        authority_id="authority-A", authority_namespace="namespace-A",
+        activation_generation=3, deletion_journal_id="deletion-A",
+        deletion_seq=0, deletion_digest="genesis",
+        execution_journal_id="execution-A", execution_seq=2,
+        execution_digest="sha256:" + "c" * 64,
+        revocation_epoch=1, graph_incarnation="graph-incarnation-A",
+    )
+    assert snapshot.schema == AUTHORITY_BOOTSTRAP_SCHEMA_V2
+    assert snapshot.execution_journal_id == "execution-A"
+    assert snapshot.graph_incarnation == "graph-incarnation-A"
+    for change in (
+        {"deletion_digest": "sha256:" + "a" * 64},
+        {"execution_seq": 0},
+        {"execution_digest": "sha256:" + "C" * 64},
+        {"execution_digest": "genesis"},
+    ):
+        with pytest.raises(ValueError):
+            replace(snapshot, **change)
