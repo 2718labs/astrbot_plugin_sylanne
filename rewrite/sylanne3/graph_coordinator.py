@@ -18,7 +18,11 @@ from types import SimpleNamespace
 
 from .contracts import Event, EventConflict, Scope, StaleRead, canonical_json
 from .graph_store import GraphStore, ProductionGraphStore
-from .graph_types import AtomKey, GraphCandidate, GraphSnapshot, GraphAtom, GraphVersion, NamespaceEpoch
+from .graph_types import (
+    AtomKey, GraphCandidate, GraphSnapshot, GraphAtom, GraphVersion, GraphWrite,
+    NamespaceEpoch, owner_grant_key, owner_grant_policy_digest_v1,
+    validate_owner_grant_v1,
+)
 from .memory_types import access_key, source_key
 from .runtime_contracts import (
     AuthorityContext, CommitReceipt, ContentFencePortV2, DomainBundle, FenceScope,
@@ -789,6 +793,198 @@ class GraphCoordinator:
                     "action": "finish_provision_read",
                 }))
 
+    def _stage_first_owner_grant_locked(self, operation, pending, grant_value,
+                                        scope: FenceScope, expected_metadata,
+                                        expected_epoch):
+        """Commit one first Owner grant under an already verified v2 write fence.
+
+        This is deliberately private. A caller must obtain the original pending
+        operation online from the paired Authority while holding the same live
+        write fence. A caller-supplied pending DTO or bootstrap is not admission.
+        No public route is installed until that Authority port exists.
+        """
+        from .authority_service.v2_owner_contract import (
+            OwnerAuthorizationOperationV1, OwnerAuthorizationReceiptV1,
+            OwnerGraphCommitProofV1,
+        )
+        from .graph_store import GraphRecoveryMetadataV2
+
+        store = self.__store
+        if not isinstance(store, ProductionGraphStore) or self.__content_fence_v2 is None:
+            raise UnavailableGuard("owner grant requires a production v2 graph")
+        if not store._lock._is_owned() or not store._db.in_transaction:
+            raise RuntimeError("owner grant requires the graph lock and transaction")
+        if (type(operation) is not OwnerAuthorizationOperationV1
+                or operation.action != "issue" or operation.ticket is None
+                or type(pending) is not OwnerAuthorizationReceiptV1
+                or pending.phase != "pending" or pending.operation != operation
+                or pending.guard != operation.expected_guard):
+            raise AuthorityDenied("original pending Owner issue is required")
+        if (type(scope) is not FenceScope or scope.operation != "write"
+                or scope.namespace != operation.namespace
+                or scope.authority_namespace != scope.pinned_anchor.namespace
+                or scope.generation != 1
+                or type(expected_metadata) is not GraphRecoveryMetadataV2
+                or type(expected_epoch) is not NamespaceEpoch):
+            raise AuthorityDenied("Owner issue requires the exact v2 write scope")
+        namespace = operation.namespace
+        if (scope.graph_revision != expected_metadata.graph_revision
+                or scope.graph_epoch != expected_epoch
+                or expected_epoch.bot != namespace.bot_id
+                or expected_epoch.persona != namespace.persona_id
+                or self._v2_graph_stamp(namespace) != (expected_metadata, expected_epoch)):
+            raise StaleRead("Owner issue graph stamp changed")
+        target = expected_metadata.requirements
+        if (target.namespace != namespace or target.graph_incarnation == ""
+                or target.activation_generation != scope.generation
+                or target.authority_id != operation.authority_id
+                or target.authority_namespace != scope.authority_namespace
+                or not self._anchor_matches(target, scope.pinned_anchor)):
+            raise AuthorityDenied("Owner issue differs from graph recovery identity")
+        if (type(grant_value) is not dict
+                or "sha256:" + canonical_digest(grant_value) != operation.grant_digest):
+            raise AuthorityDenied("Owner grant payload differs from reserved digest")
+        validate_owner_grant_v1(grant_value)
+        ticket = operation.ticket
+        principal = operation.principal
+        if ticket.policy_digest != owner_grant_policy_digest_v1(
+                grant_value, bot=namespace.bot_id, persona=namespace.persona_id):
+            raise AuthorityDenied("Owner grant permissions differ from paired policy")
+        expected_fields = {
+            "authority_id": operation.authority_id,
+            "installation_id": operation.installation_id,
+            "grant_id": operation.grant_id,
+            "principal": {
+                "identity_provider": principal.identity_provider,
+                "account_ref": principal.account_ref,
+                "account_incarnation": principal.account_incarnation,
+            },
+            "ticket_id": ticket.ticket_id,
+            "creation_operation_id": ticket.creation_operation_id,
+            "creation_digest": ticket.creation_digest,
+            "issue_operation_id": operation.operation_id,
+            "grant_revision": 1,
+            "activation_generation": scope.generation,
+            "graph_incarnation": target.graph_incarnation,
+        }
+        if any(grant_value[name] != value for name, value in expected_fields.items()):
+            raise AuthorityDenied("Owner grant identity differs from pending issue")
+        provision_row = self._provision_row(store._db, namespace)
+        if provision_row is None:
+            raise UnavailableGuard("Owner issue requires completed namespace genesis")
+        provision = self._decode_provision_receipt(provision_row)
+        if (provision.operation_id != ticket.creation_operation_id
+                or "sha256:" + provision.input_digest != ticket.creation_digest
+                or provision.installation_id != operation.installation_id
+                or provision.authority_id != operation.authority_id
+                or provision.authority_namespace != target.authority_namespace
+                or provision.namespace != namespace
+                or provision.graph_incarnation != target.graph_incarnation
+                or provision.generation != scope.generation):
+            raise AuthorityDenied("Owner claim differs from completed creation")
+        row = store._db.execute(
+            "SELECT operation_id,request_digest,grant_id,grant_digest,"
+            "graph_incarnation,graph_access_epoch,graph_epoch,"
+            "graph_receipt_digest,proof_json FROM graph_owner_issue_operations_v1 "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        key = owner_grant_key(*namespace.as_tuple)
+        if row is not None:
+            if row[:5] != (operation.operation_id, operation.request_digest,
+                           operation.grant_id, operation.grant_digest,
+                           target.graph_incarnation):
+                raise AuthorityDenied("first Owner grant already belongs to another issue")
+            proof = OwnerGraphCommitProofV1(
+                namespace, row[0], row[1], row[2], row[3], row[4],
+                1, row[5], row[6], row[7])
+            atom = store._db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (key.token,),
+            ).fetchone()
+            if (row[8] != canonical_json(asdict(proof)) or atom is None
+                    or atom != (1, canonical_json(grant_value), 1)):
+                raise UnavailableGuard("durable Owner issue receipt differs from graph")
+            return proof
+        # The first Owner claim belongs to the namespace creation, not to a
+        # later state in which host ingress or another content operation has
+        # already established business history without that Owner.
+        if (expected_metadata.graph_revision != provision.graph_revision
+                or expected_epoch.revision != provision.graph_epoch
+                or provision.graph_revision != 0 or provision.graph_epoch != 0):
+            raise UnavailableGuard("first Owner claim requires creation genesis")
+        for table in (
+                "graph_first_ingress_intents_v2", "graph_bundle_intents_v2",
+                "graph_bundle_operations", "graph_product_advances",
+                "graph_events", "graph_atoms"):
+            if store._db.execute(
+                    f"SELECT 1 FROM {table} WHERE bot=? AND persona=? LIMIT 1",
+                    namespace.as_tuple).fetchone() is not None:
+                raise UnavailableGuard("first Owner claim follows business activity")
+        if (store._db.execute(
+                "SELECT 1 FROM graph_atoms WHERE token=?", (key.token,)
+                ).fetchone() is not None):
+            raise UnavailableGuard("first Owner grant atom already exists")
+        access_row = store._db.execute(
+            "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone() or (0, 0)
+        if access_row != (0, 0):
+            raise UnavailableGuard("first Owner grant requires zero access epochs")
+        event = Event(
+            Scope(*namespace.as_tuple, "owner-authorization-v1"),
+            operation.operation_id, 0, "first_owner_grant", {
+                "request_digest": operation.request_digest,
+                "grant_digest": operation.grant_digest,
+            },
+        )
+        candidate = GraphCandidate(
+            event, (GraphVersion(key, 0),),
+            (GraphWrite(key, grant_value),), (expected_epoch,),
+        )
+        graph_receipt = GraphStore._graph_commit_in_transaction(
+            store, candidate, _capability=self.__graph_capability,
+            _owner_issue=True)
+        if (graph_receipt.status != "committed"
+                or graph_receipt.revisions != (GraphVersion(key, 1),)):
+            raise UnavailableGuard("first Owner graph commit did not create revision one")
+        store._db.execute(
+            "INSERT INTO graph_authority_epochs(bot,persona,access_epoch,delete_epoch) "
+            "VALUES(?,?,1,0)", namespace.as_tuple,
+        )
+        store.cas_graph_recovery_metadata(
+            expected_metadata, target, _capability=self.__graph_capability)
+        digest = "sha256:" + canonical_digest({
+            "schema": "sylanne3.graph.owner_issue_receipt.v1",
+            "namespace": list(namespace.as_tuple),
+            "operation_id": operation.operation_id,
+            "request_digest": operation.request_digest,
+            "grant_id": operation.grant_id,
+            "grant_digest": operation.grant_digest,
+            "graph_incarnation": target.graph_incarnation,
+            "grant_revision": 1,
+            "graph_access_epoch": 1,
+            "graph_epoch": graph_receipt.epoch.revision,
+            "graph_revision": expected_metadata.graph_revision + 1,
+            "atom_token": key.token,
+        })
+        proof = OwnerGraphCommitProofV1(
+            namespace, operation.operation_id, operation.request_digest,
+            operation.grant_id, operation.grant_digest,
+            target.graph_incarnation, 1, 1, graph_receipt.epoch.revision, digest,
+        )
+        store._db.execute(
+            "INSERT INTO graph_owner_issue_operations_v1"
+            "(bot,persona,operation_id,request_digest,grant_id,grant_digest,"
+            "graph_incarnation,graph_access_epoch,graph_epoch,"
+            "graph_receipt_digest,proof_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            namespace.as_tuple + (
+                operation.operation_id, operation.request_digest,
+                operation.grant_id, operation.grant_digest,
+                target.graph_incarnation, 1, graph_receipt.epoch.revision,
+                digest, canonical_json(asdict(proof))),
+        )
+        return proof
+
     def provision_namespace_v2(self, bootstrap: object, policy, *,
                                operation_id: str) -> NamespaceProvisionReceiptV2:
         """Install one administrator-owned namespace under a v2 write fence.
@@ -1159,6 +1355,12 @@ class GraphCoordinator:
                 or not set(authority.owner_scope).issubset(owner_scope)
                 or not domains.issubset(allowed)):
             raise AuthorityDenied("authority assertion does not match process grant")
+        if (issuer_domain == "d12" and isinstance(self.__store, ProductionGraphStore)
+                and self.__content_fence_v2 is not None):
+            # A host bootstrap can mint process leases. W01 has not yet bound a
+            # lease to a current, committed Authority Owner guard in the same
+            # read fence; keeping D12 closed prevents bootstrap impersonation.
+            raise UnavailableGuard("durable Owner grant resolution is unavailable")
 
     @staticmethod
     def _version(db, namespace: NamespaceId, kind: str, ref: str) -> str:

@@ -230,6 +230,35 @@ class OwnerAuthorizationReceiptV1:
                 raise ValueError("committed revoke lacks an independent watermark")
 
 
+@dataclass(frozen=True, slots=True)
+class OwnerGraphCommitProofV1:
+    """Canonical graph receipt identity; trust comes only from graph verification."""
+
+    namespace: NamespaceId
+    operation_id: str
+    request_digest: str
+    grant_id: str
+    grant_digest: str
+    graph_incarnation: str
+    grant_revision: int
+    graph_access_epoch: int
+    graph_epoch: int
+    graph_receipt_digest: str
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != SCHEMA:
+            raise ValueError("unknown owner graph proof schema")
+        _namespace(self.namespace)
+        for name in ("operation_id", "grant_id", "graph_incarnation"):
+            identifier(getattr(self, name), name)
+        for name in ("request_digest", "grant_digest", "graph_receipt_digest"):
+            _digest(getattr(self, name), name)
+        _revision(self.grant_revision, "grant_revision", minimum=1)
+        _revision(self.graph_access_epoch, "graph_access_epoch")
+        _revision(self.graph_epoch, "graph_epoch")
+
+
 def _namespace_wire(namespace: NamespaceId) -> dict[str, str]:
     return {"bot_id": namespace.bot_id, "persona_id": namespace.persona_id}
 
@@ -280,7 +309,18 @@ def _operation_wire(value: OwnerAuthorizationOperationV1, *,
 
 def to_wire(value: OwnerPrincipalV1 | OwnerClaimTicketV1 |
             OwnerAuthorizationGuardV1 | OwnerAuthorizationOperationV1 |
-            OwnerAuthorizationReceiptV1) -> dict[str, Any]:
+            OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1) -> dict[str, Any]:
+    if type(value) is OwnerGraphCommitProofV1:
+        return {"schema": value.schema, "kind": "owner_graph_commit_proof_v1",
+                "namespace": _namespace_wire(value.namespace),
+                "operation_id": value.operation_id,
+                "request_digest": value.request_digest,
+                "grant_id": value.grant_id, "grant_digest": value.grant_digest,
+                "graph_incarnation": value.graph_incarnation,
+                "grant_revision": value.grant_revision,
+                "graph_access_epoch": value.graph_access_epoch,
+                "graph_epoch": value.graph_epoch,
+                "graph_receipt_digest": value.graph_receipt_digest}
     if type(value) is OwnerPrincipalV1:
         return {"schema": SCHEMA, "kind": "owner_principal_v1", **_principal_wire(value)}
     if type(value) is OwnerClaimTicketV1:
@@ -318,10 +358,18 @@ def _decode_principal(value: object) -> OwnerPrincipalV1:
 def from_wire(value: object) -> (OwnerPrincipalV1 | OwnerClaimTicketV1 |
                                   OwnerAuthorizationGuardV1 |
                                   OwnerAuthorizationOperationV1 |
-                                  OwnerAuthorizationReceiptV1):
+                                  OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1):
     if type(value) is not dict or value.get("schema") != SCHEMA:
         raise ValueError("unknown owner contract schema")
     kind = value.get("kind")
+    if kind == "owner_graph_commit_proof_v1":
+        _fields(value, {"schema", "kind", "namespace", "operation_id",
+                        "request_digest", "grant_id", "grant_digest",
+                        "graph_incarnation", "grant_revision", "graph_access_epoch",
+                        "graph_epoch", "graph_receipt_digest"}, "owner graph proof")
+        return OwnerGraphCommitProofV1(
+            **{key: item for key, item in value.items() if key not in {
+                "kind", "namespace"}}, namespace=_decode_namespace(value["namespace"]))
     if kind == "owner_principal_v1":
         _fields(value, {"schema", "kind", "identity_provider", "account_ref",
                         "account_incarnation"}, "owner principal")
@@ -414,7 +462,7 @@ def _reject_constant(value: str) -> None:
 def decode_bytes(data: bytes) -> (OwnerPrincipalV1 | OwnerClaimTicketV1 |
                                   OwnerAuthorizationGuardV1 |
                                   OwnerAuthorizationOperationV1 |
-                                  OwnerAuthorizationReceiptV1):
+                                  OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1):
     if type(data) is not bytes:
         raise TypeError("owner wire data must be bytes")
     value = from_wire(json.loads(data.decode("utf-8"),
@@ -427,5 +475,6 @@ def decode_bytes(data: bytes) -> (OwnerPrincipalV1 | OwnerClaimTicketV1 |
 
 __all__ = ("SCHEMA", "OwnerPrincipalV1", "OwnerClaimTicketV1",
            "OwnerAuthorizationGuardV1", "OwnerAuthorizationOperationV1",
-           "OwnerAuthorizationReceiptV1", "to_wire", "from_wire",
+           "OwnerAuthorizationReceiptV1", "OwnerGraphCommitProofV1",
+           "to_wire", "from_wire",
            "canonical_bytes", "canonical_digest", "decode_bytes")

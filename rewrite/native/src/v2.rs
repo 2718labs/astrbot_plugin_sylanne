@@ -208,9 +208,6 @@ fn validate_structured(m: &Matrix, sign: f64) -> bool {
             if i == j {
                 diagonal = v;
             } else {
-                if sign == 1.0 && v > 0.0 {
-                    return false;
-                }
                 off += v.abs();
                 if m.entry(j, i as u32) != Some(sign * v) {
                     return false;
@@ -222,6 +219,8 @@ fn validate_structured(m: &Matrix, sign: f64) -> bool {
                 return false;
             }
         } else if !(diagonal > off) {
+            // Symmetry plus strict dominance by absolute off-diagonal sum
+            // gives a positive Gershgorin lower bound for either sign.
             return false;
         }
     }
@@ -1103,6 +1102,138 @@ mod tests {
         assert!((result.energy_before - energy_before).abs() < 1e-14);
         assert!((result.energy_after - energy_after).abs() < 1e-14);
         assert!(balance.abs() <= result.energy_balance_defect);
+    }
+
+    #[test]
+    fn coupled_positive_off_diagonal_nonlinear_step_matches_independent_reference() {
+        // The oracle integrates tanh directly, then solves the two equations
+        // with a numerical Jacobian. It does not use the kernel's AVF quotient.
+        fn gradient(x: [f64; 2], y: [f64; 2]) -> [f64; 2] {
+            let argument = |s: f64| {
+                (0.5 * (x[0] + s * (y[0] - x[0])) - 0.25 * (x[1] + s * (y[1] - x[1]))).tanh()
+            };
+            let panels = 256;
+            let mut integral = argument(0.0) + argument(1.0);
+            for panel in 1..panels {
+                integral +=
+                    if panel % 2 == 0 { 2.0 } else { 4.0 } * argument(panel as f64 / panels as f64);
+            }
+            integral /= 3.0 * panels as f64;
+            let midpoint = [(x[0] + y[0]) / 2.0, (x[1] + y[1]) / 2.0];
+            [
+                2.0 * midpoint[0] + midpoint[1] + 0.1 * integral,
+                midpoint[0] + 2.0 * midpoint[1] - 0.05 * integral,
+            ]
+        }
+        fn force(g: [f64; 2]) -> [f64; 2] {
+            [
+                -1.5 * g[0] - 0.05 * g[1] + 0.01,
+                -0.45 * g[0] - 1.25 * g[1] - 0.02,
+            ]
+        }
+        fn equation(x: [f64; 2], y: [f64; 2], h: f64) -> [f64; 2] {
+            let f = force(gradient(x, y));
+            [y[0] - x[0] - h * f[0], y[1] - x[1] - h * f[1]]
+        }
+
+        let offsets = [0, 2, 4];
+        let indices = [0, 1, 0, 1];
+        let k_values = [2.0, 1.0, 1.0, 2.0];
+        let r_values = [1.5, 0.25, 0.25, 1.25];
+        let j_offsets = [0, 1, 2];
+        let j_indices = [1, 0];
+        let j_values = [0.2, -0.2];
+        let a_offsets = [0, 2];
+        let a_values = [0.5, -0.25];
+        let alpha = [0.2];
+        let x = [0.2, -0.1];
+        let drive = [0.01, -0.02];
+        let mut output = [0.0; 2];
+        let mut result = StepResult::default();
+        let mut input = StepInput {
+            struct_size: std::mem::size_of::<StepInput>() as u32,
+            abi_version: ABI,
+            n: 2,
+            k: csr(2, 2, &offsets, &indices, &k_values),
+            r: csr(2, 2, &offsets, &indices, &r_values),
+            j: csr(2, 2, &j_offsets, &j_indices, &j_values),
+            a: csr(1, 2, &a_offsets, &indices[..2], &a_values),
+            alpha: alpha.as_ptr(),
+            previous: x.as_ptr(),
+            drive: drive.as_ptr(),
+            iterate: x.as_ptr(),
+            h: 0.02,
+            previous_error: 0.0,
+            max_iterations: 30,
+            tolerance: 1e-3,
+            boundary_eta: 0.0,
+        };
+        assert_eq!(
+            unsafe { sylanne3_v2_step(&input, output.as_mut_ptr(), 2, &mut result) },
+            0
+        );
+        assert_eq!(result.certificate_flags, ABI2_FIXED_BLOCK_INTERVAL_V1);
+        assert!(result.q_upper <= 0.8);
+        let mut reference = x;
+        for _ in 0..8 {
+            let residual = equation(x, reference, input.h);
+            if residual[0].hypot(residual[1]) < 1e-14 {
+                break;
+            }
+            let epsilon = 1e-6;
+            let mut jacobian = [[0.0; 2]; 2];
+            for column in 0..2 {
+                let mut plus = reference;
+                let mut minus = reference;
+                plus[column] += epsilon;
+                minus[column] -= epsilon;
+                let fp = equation(x, plus, input.h);
+                let fm = equation(x, minus, input.h);
+                for row in 0..2 {
+                    jacobian[row][column] = (fp[row] - fm[row]) / (2.0 * epsilon);
+                }
+            }
+            let determinant = jacobian[0][0] * jacobian[1][1] - jacobian[0][1] * jacobian[1][0];
+            assert!(determinant.abs() > 0.5);
+            reference[0] -=
+                (jacobian[1][1] * residual[0] - jacobian[0][1] * residual[1]) / determinant;
+            reference[1] -=
+                (-jacobian[1][0] * residual[0] + jacobian[0][0] * residual[1]) / determinant;
+        }
+        let reference_residual = equation(x, reference, input.h);
+        assert!(reference_residual[0].hypot(reference_residual[1]) < 1e-13);
+        let distance = (output[0] - reference[0]).hypot(output[1] - reference[1]);
+        assert!(distance < 1e-10);
+        assert!(distance <= result.iteration_error);
+
+        let asymmetric_k = [2.0, 1.0, 0.5, 2.0];
+        input.k = csr(2, 2, &offsets, &indices, &asymmetric_k);
+        let saved = output;
+        assert_eq!(
+            unsafe { sylanne3_v2_step(&input, output.as_mut_ptr(), 2, &mut result) },
+            -1
+        );
+        assert_eq!(output, saved);
+        input.k = csr(2, 2, &offsets, &indices, &k_values);
+        let weak_r = [0.25, 0.25, 0.25, 0.25];
+        input.r = csr(2, 2, &offsets, &indices, &weak_r);
+        assert_eq!(
+            unsafe { sylanne3_v2_step(&input, output.as_mut_ptr(), 2, &mut result) },
+            -1
+        );
+        input.r = csr(2, 2, &offsets, &indices, &r_values);
+        input.h = 1.0;
+        assert_eq!(
+            unsafe { sylanne3_v2_step(&input, output.as_mut_ptr(), 2, &mut result) },
+            -3
+        );
+        input.h = 0.02;
+        input.boundary_eta = 1e-6;
+        assert_eq!(
+            unsafe { sylanne3_v2_step(&input, output.as_mut_ptr(), 2, &mut result) },
+            0
+        );
+        assert_eq!(result.certificate_flags, 0);
     }
 
     #[test]

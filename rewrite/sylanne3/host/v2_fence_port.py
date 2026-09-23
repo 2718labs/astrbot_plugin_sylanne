@@ -16,6 +16,7 @@ from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
     FencePermitV2, MutationReceiptV2, SCHEMA as AUTHORITY_V2_PROTOCOL,
 )
+from ..authority_service.v2_owner_contract import OwnerAuthorizationReceiptV1
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import (
     FenceScope, InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
@@ -323,6 +324,68 @@ class V2FencePort:
                 or state not in ("active", "finished")):
             raise RuntimeError("v2 fence status identity mismatch")
         return permit, state
+
+    def get_pending_owner_issue(self, *, namespace: NamespaceId,
+                                authority_namespace: str,
+                                operation_id: str) -> OwnerAuthorizationReceiptV1 | None:
+        """Read a pending owner issue as this installation's real mTLS peer."""
+        return self._submit(self._with_session_repair(lambda: self._get_pending_owner_issue(
+            namespace, authority_namespace, operation_id)))
+
+    async def _get_pending_owner_issue(self, namespace: NamespaceId,
+                                       authority_namespace: str,
+                                       operation_id: str) -> OwnerAuthorizationReceiptV1 | None:
+        identifier(operation_id, "operation_id")
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        receipt = await self._transport.v2_get_pending_owner_issue(
+            self._request, handshake, namespace=authority_namespace,
+            operation_id=operation_id)
+        if receipt is not None and (
+            type(receipt) is not OwnerAuthorizationReceiptV1
+            or receipt.phase != "pending"
+            or receipt.operation.operation_id != operation_id
+            or receipt.operation.namespace != namespace
+            or receipt.operation.authority_id != grant.authority_id
+            or receipt.operation.installation_id != grant.installation_id
+        ):
+            raise RuntimeError("v2 pending owner issue identity mismatch")
+        return receipt
+
+    def get_pending_owner_issue_for_graph_write(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        operation_id: str, permit: FencePermitV2,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        """Read the original pending issue under this active v2 write permit."""
+        return self._submit(self._with_session_repair(
+            lambda: self._get_pending_owner_issue_for_graph_write(
+                namespace, authority_namespace, operation_id, permit)))
+
+    async def _get_pending_owner_issue_for_graph_write(
+        self, namespace: NamespaceId, authority_namespace: str,
+        operation_id: str, permit: FencePermitV2,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        identifier(operation_id, "operation_id")
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.namespace != authority_namespace
+                or permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject):
+            raise RuntimeError("v2 owner graph read permit identity mismatch")
+        receipt = await self._transport.v2_get_pending_owner_issue_for_graph_write(
+            self._request, handshake, namespace=authority_namespace,
+            operation_id=operation_id, permit=permit)
+        if receipt is not None and (
+            type(receipt) is not OwnerAuthorizationReceiptV1
+            or receipt.phase != "pending"
+            or receipt.operation.operation_id != operation_id
+            or receipt.operation.namespace != namespace
+            or receipt.operation.authority_id != grant.authority_id
+            or receipt.operation.installation_id != grant.installation_id
+        ):
+            raise RuntimeError("v2 pending owner graph read identity mismatch")
+        return receipt
 
     def begin_fence(
         self, *, namespace: NamespaceId, authority_namespace: str, holder: str,

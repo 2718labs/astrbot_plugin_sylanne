@@ -5,7 +5,7 @@ from importlib import import_module
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from .graph_types import TypeRegistry, TypeSpec
+from .graph_types import TypeRegistry, TypeSpec, owner_grant_spec
 
 if TYPE_CHECKING:
     from .domains.d04 import AffectScheme
@@ -79,6 +79,7 @@ def discover_domain_registry(*, active_affect_scheme: AffectScheme | None = None
         if not isinstance(active_affect_scheme, AffectScheme):
             raise TypeError("active_affect_scheme must be an AffectScheme")
     catalogue = TypeRegistry()
+    catalogue.register(owner_grant_spec())
     registrations: dict[str, DomainRegistration] = {}
     unavailable: dict[str, str] = {}
     for domain, (module_name, class_name, proposal_schema) in _PROVIDERS.items():

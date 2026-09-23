@@ -15,6 +15,7 @@ from .graph_types import (
     GraphSnapshot,
     GraphVersion,
     NamespaceEpoch,
+    OWNER_GRANT_TYPE,
     TypeRegistry,
 )
 from .store import Store
@@ -199,6 +200,18 @@ class GraphStore(Store):
                 operation_id TEXT NOT NULL, digest TEXT NOT NULL,
                 receipt_json TEXT NOT NULL,
                 PRIMARY KEY(bot,persona));
+            CREATE TABLE IF NOT EXISTS graph_owner_issue_operations_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                grant_id TEXT NOT NULL,
+                grant_digest TEXT NOT NULL,
+                graph_incarnation TEXT NOT NULL,
+                graph_access_epoch INTEGER NOT NULL CHECK(graph_access_epoch > 0),
+                graph_epoch INTEGER NOT NULL CHECK(graph_epoch > 0),
+                graph_receipt_digest TEXT NOT NULL,
+                proof_json TEXT NOT NULL,
+                PRIMARY KEY(bot,persona), UNIQUE(operation_id), UNIQUE(grant_id));
             CREATE TABLE IF NOT EXISTS graph_bundle_fences_v2 (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 operation_id TEXT NOT NULL, digest TEXT NOT NULL,
@@ -825,7 +838,8 @@ class GraphStore(Store):
         if visited != len(nodes):
             raise ValueError("instantaneous dependency cycle")
 
-    def _prepare_graph_candidate(self, candidate: GraphCandidate):
+    def _prepare_graph_candidate(self, candidate: GraphCandidate, *,
+                                 _owner_issue: bool = False):
         if not isinstance(candidate, GraphCandidate):
             raise TypeError("candidate must be GraphCandidate")
         event = candidate.event
@@ -853,6 +867,8 @@ class GraphStore(Store):
         read_set = set(read_keys)
         prepared = []
         for write in writes:
+            if write.key.type_name == OWNER_GRANT_TYPE and not _owner_issue:
+                raise PermissionError("Owner grant requires the W01 fenced issue path")
             spec = self._validate_key(write.key)
             if self._namespace(write.key) != namespace:
                 raise ValueError("cross-namespace graph candidate")
@@ -898,7 +914,8 @@ class GraphStore(Store):
                 raise
 
     def _graph_commit_in_transaction(self, candidate: GraphCandidate, *,
-                                     _guard=None, _receipt_hook=None, _capability=None):
+                                     _guard=None, _receipt_hook=None, _capability=None,
+                                     _owner_issue: bool = False):
         """Run a graph commit inside the coordinator's existing write transaction.
 
         Caller holds this store's lock and owns COMMIT or ROLLBACK.
@@ -907,7 +924,7 @@ class GraphStore(Store):
         if not self._lock._is_owned() or not self._db.in_transaction:
             raise RuntimeError("graph transaction requires the store lock and active transaction")
         self._ensure_open()
-        prepared = self._prepare_graph_candidate(candidate)
+        prepared = self._prepare_graph_candidate(candidate, _owner_issue=_owner_issue)
         return self._graph_commit_core(*prepared, _guard=_guard, _receipt_hook=_receipt_hook)
 
     def _graph_commit_core(self, namespace, reads, writes, epochs, prepared,

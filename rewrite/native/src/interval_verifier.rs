@@ -521,7 +521,7 @@ fn validate_positive_operator(
             if column == row {
                 diagonal = Some(value);
             } else {
-                if value > 0.0 || matrix.entry(column, row) != Some(value) {
+                if matrix.entry(column, row) != Some(value) {
                     return Err(VerifierError::InvalidStructure(role));
                 }
                 off_diagonal = off_diagonal.add(Interval::point(value.abs())?)?;
@@ -533,6 +533,8 @@ fn validate_positive_operator(
         if diagonal <= 0.0 {
             return Err(VerifierError::PositivityNotProven(role));
         }
+        // Absolute off-diagonal radius proves coercivity for symmetric K/R,
+        // including positive couplings; the interval lower endpoint is outward.
         let margin = Interval::point(diagonal)?.sub(off_diagonal)?;
         if margin.lower() <= 0.0 || !margin.lower().is_finite() {
             return Err(VerifierError::PositivityNotProven(role));
@@ -940,6 +942,51 @@ mod tests {
     }
 
     #[test]
+    fn positive_off_diagonals_use_absolute_gershgorin_radius() {
+        let offsets = [0, 2, 4];
+        let indices = [0, 1, 0, 1];
+        let k_values = [2.0, 1.0, 1.0, 2.0];
+        let r_values = [1.5, 0.25, 0.25, 1.25];
+        let input = JointVerificationInput {
+            k: SparseMatrix::new(2, 2, &offsets, &indices, &k_values),
+            r: SparseMatrix::new(2, 2, &offsets, &indices, &r_values),
+            j: SparseMatrix::new(2, 2, &[0, 1, 2], &[1, 0], &[0.2, -0.2]),
+            a: SparseMatrix::new(1, 2, &[0, 2], &[0, 1], &[0.5, -0.25]),
+            alpha: &[0.2],
+            x: &[0.2, -0.1],
+            y: &[0.19, -0.1],
+            h: 0.02,
+            drive: &[0.01, -0.02],
+        };
+        let envelope = verify_joint_step(&input).unwrap();
+        assert!(envelope.operator_bounds.k_coercivity_lower > 0.0);
+        assert!(envelope.operator_bounds.k_coercivity_lower <= 1.0);
+        assert!(envelope.operator_bounds.r_coercivity_lower > 0.0);
+        assert!(envelope.operator_bounds.r_coercivity_lower <= 1.0);
+        assert!(envelope.operator_bounds.k_row_abs_upper >= 3.0);
+        assert!(verify_joint_error_bounds(&input, Interval::point(0.0).unwrap()).is_ok());
+
+        let asymmetric_k = [2.0, 1.0, 0.5, 2.0];
+        let asymmetric = JointVerificationInput {
+            k: SparseMatrix::new(2, 2, &offsets, &indices, &asymmetric_k),
+            ..input
+        };
+        assert_eq!(
+            verify_joint_step(&asymmetric),
+            Err(VerifierError::InvalidStructure(MatrixRole::K))
+        );
+        let weak_k = [1.0, 1.0, 1.0, 1.0];
+        let weak = JointVerificationInput {
+            k: SparseMatrix::new(2, 2, &offsets, &indices, &weak_k),
+            ..input
+        };
+        assert_eq!(
+            verify_joint_step(&weak),
+            Err(VerifierError::PositivityNotProven(MatrixRole::K))
+        );
+    }
+
+    #[test]
     fn malformed_csr_and_capacity_are_rejected() {
         let values = [1.0, 1.0];
         let malformed = SparseMatrix::new(1, 1, &[0, 2], &[0, 0], &values);
@@ -984,7 +1031,7 @@ mod tests {
     fn operator_structure_and_positivity_fail_closed() {
         let offsets = [0, 2, 4];
         let indices = [0, 1, 0, 1];
-        let bad_k_values = [1.0, 0.25, 0.25, 1.0];
+        let bad_k_values = [1.0, 0.25, 0.2, 1.0];
         let r_values = [1.0, -0.1, -0.1, 1.0];
         let bad_j_values = [0.2, 0.2];
         let j_offsets = [0, 1, 2];

@@ -28,6 +28,7 @@ from sylanne3.domains.d06 import D06DomainProvider
 from sylanne3.graph_coordinator import (
     GraphCoordinator, IngressClockSample, IngressIssuancePolicy,
 )
+from sylanne3.graph_types import OWNER_GRANT_TYPE
 from sylanne3.host import (
     AuthorizedIngressCommit,
     CanonicalIngressObservation,
@@ -166,6 +167,20 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("d12", registry.registrations)
         self.assertTrue(registry.type_registry.specs)
         self.assertTrue(all(spec.writer_domain for spec in registry.type_registry.specs))
+
+    def test_owner_grant_has_one_reserved_d11_catalogue_spec(self) -> None:
+        registry = registry_with_test_affect_scheme()
+        self.assertTrue(registry.complete)
+        matching = [
+            spec for spec in registry.type_registry.specs
+            if spec.name == OWNER_GRANT_TYPE
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].writer_domain, "d11")
+        self.assertFalse(any(
+            spec.name == OWNER_GRANT_TYPE
+            for spec in registry.registrations["d11"].type_specs
+        ))
 
     async def test_runtime_without_external_authorities_fails_before_opening_business_db(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

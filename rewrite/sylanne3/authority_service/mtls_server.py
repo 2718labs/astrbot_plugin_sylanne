@@ -27,6 +27,8 @@ from .v2_clock import AuthorityClockReadingV2, IngressClockSampleV2
 from .v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire
 from .v2_fence_service import AuthorityV2FenceService
 from .v2_execution_bridge import AuthorityV2ExecutionBridge
+from .v2_owner_contract import OwnerAuthorizationReceiptV1, to_wire as owner_to_wire
+from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 
 
 _MAX_SESSIONS = 256
@@ -142,6 +144,7 @@ class AuthorityRpcServer:
         administrator_authorizer: Callable[[object, str, str, str | None], bool],
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
+        v2_owner_tickets: AuthorityV2OwnerTicketStore | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
         clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
@@ -170,6 +173,11 @@ class AuthorityRpcServer:
         self._administrator_authorizer = administrator_authorizer
         self._publisher_manifest_verifier = publisher_manifest_verifier
         self._v2_fences = services
+        if (v2_owner_tickets is not None
+                and (type(v2_owner_tickets) is not AuthorityV2OwnerTicketStore
+                     or v2_owner_tickets._core is not core)):
+            raise TypeError("v2 owner tickets must use the same Authority core")
+        self._v2_owner_tickets = v2_owner_tickets
         self._v2_execution = {
             namespace: AuthorityV2ExecutionBridge(
                 core=core, fences=service.fences, journal=service.execution,
@@ -438,6 +446,48 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method == "get_pending_owner_issue_for_graph_write" and set(command) == {
+                    "namespace", "operation_id", "permit"}:
+                namespace = identifier(command["namespace"], "namespace")
+                operation_id = identifier(command["operation_id"], "operation_id")
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                if self._v2_owner_tickets is None:
+                    raise AuthorityUnavailable("owner ticket service is unavailable")
+                permit = from_wire(command["permit"])
+                if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                        or permit.namespace != namespace or permit.subject != subject):
+                    raise AuthorityUnavailable("owner graph read requires a write fence")
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                if installed is None:
+                    raise AuthorityUnavailable("installation is unavailable")
+                service.validate_fence(
+                    credential=credential, subject=subject, permit=permit)
+                receipt = self._v2_owner_tickets.get_pending_for_graph_write(
+                    credential=credential, authority_namespace=namespace,
+                    operation_id=operation_id, installation_id=installed.installation_id,
+                    subject=subject, permit=permit)
+                return {"receipt": None if receipt is None else owner_to_wire(receipt)}
+            if method == "get_pending_owner_issue" and set(command) == {
+                    "namespace", "operation_id"}:
+                namespace = identifier(command["namespace"], "namespace")
+                operation_id = identifier(command["operation_id"], "operation_id")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                if self._v2_owner_tickets is None:
+                    raise AuthorityUnavailable("owner ticket service is unavailable")
+                receipt = self._v2_owner_tickets.get_pending(
+                    credential=credential, authority_namespace=namespace,
+                    operation_id=operation_id)
+                if receipt is not None and (
+                    type(receipt) is not OwnerAuthorizationReceiptV1
+                    or receipt.phase != "pending"
+                    or receipt.operation.operation_id != operation_id
+                    or receipt.operation.authority_id != self._authority_id()
+                ):
+                    raise AuthorityUnavailable("owner receipt identity mismatch")
+                return {"receipt": None if receipt is None else owner_to_wire(receipt)}
             if method == "begin_dispatch_fence" and set(command) == {
                     "namespace", "holder", "operation_id", "expected_anchor",
                     "effect_id", "command_digest", "footprint"}:

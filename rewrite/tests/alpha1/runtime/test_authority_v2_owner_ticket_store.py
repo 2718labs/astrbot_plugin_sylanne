@@ -16,6 +16,7 @@ from sylanne3.authority_service.v2_owner_contract import (
 )
 from sylanne3.authority_service import v2_owner_ticket_store as ticket_store_module
 from sylanne3.authority_service.v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.graph_coordinator import namespace_ref
 from sylanne3.runtime_contracts import NamespaceId
 
@@ -157,6 +158,49 @@ def test_ticket_and_pending_are_durable_and_exact_replays_survive_restart(tmp_pa
     finally:
         core.close()
 
+
+def test_graph_write_reads_only_its_original_pending_under_active_fence(tmp_path):
+    core = open_core(tmp_path / "authority.db", initialize=True)
+    try:
+        subject, _ = store(core, create=True)
+        claim = ticket(core)
+        subject.register_ticket(
+            credential="paired-operator", authority_namespace=AUTH_NS, ticket=claim)
+        pending = subject.reserve_issue(
+            credential="paired-claimant", authority_namespace=AUTH_NS,
+            operation=issue(claim))
+        fences = AuthorityV2FenceStore(core._db, create=True, lock=core._lock)
+        with core._tx() as db:
+            anchor = core._anchor(db, AUTH_NS, core._row(db, AUTH_NS))
+        permit = fences.begin_fence(
+            subject="graph-installation", holder="holder", operation="write",
+            current_anchor=anchor, operation_id="graph-write-a")
+        original_authorize = core._authorize_callback
+        core._authorize_callback = lambda credential, action, namespace, holder: (
+            (credential == "graph-peer" and action == "write"
+             and namespace == AUTH_NS and holder == "holder")
+            or original_authorize(credential, action, namespace, holder))
+        query = dict(
+            credential="graph-peer", authority_namespace=AUTH_NS,
+            operation_id="issue-a", installation_id="installation-a",
+            subject="graph-installation", permit=permit)
+        assert subject.get_pending_for_graph_write(**query) == pending
+        with pytest.raises(AuthorityUnavailable):
+            subject.get_pending_for_graph_write(
+                **{**query, "installation_id": "another-installation"})
+        with pytest.raises(AuthorityUnavailable):
+            subject.get_pending_for_graph_write(
+                **{**query, "permit": replace(permit, token="x" * 48)})
+        with pytest.raises(AuthorityUnavailable):
+            subject.get_pending_for_graph_write(
+                **{**query, "credential": "paired-claimant"})
+        fences.finish_fence(
+            permit, subject="graph-installation", current_anchor=anchor,
+            request_id="finish-graph-write", request_digest=digest("f"))
+        with pytest.raises(AuthorityUnavailable):
+            subject.get_pending_for_graph_write(**query)
+    finally:
+        core.close()
 
 def test_registration_is_one_original_binding_and_changed_bytes_fail(tmp_path):
     core = open_core(tmp_path / "authority.db", initialize=True)

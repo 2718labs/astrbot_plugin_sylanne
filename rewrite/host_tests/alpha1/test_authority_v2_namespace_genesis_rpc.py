@@ -15,6 +15,7 @@ from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuar
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
+from sylanne3.authority_service.v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 from sylanne3.host.authority_client import (
     AUTHORITY_PROTOCOL, AuthorityHandshake, AuthorityProvisioningRequest,
     PublisherPackageIdentity,
@@ -210,3 +211,97 @@ async def test_transport_decodes_only_bound_genesis_response(installed):
     transport._content_rpc = bad_rpc
     with pytest.raises(RuntimeError, match="response is invalid"):
         await transport.v2_namespace_genesis(request, handshake, ROLE, "genesis-b")
+
+
+def test_pending_owner_query_requires_installed_mapping_store_and_real_claimant(installed):
+    server, core, _, _ = installed
+    call, _ = paired(server)
+    command = {"namespace": "opaque-role-a", "operation_id": "issue-a"}
+    with pytest.raises(RuntimeError, match="unavailable"):
+        call("get_pending_owner_issue", command)
+
+    tickets = AuthorityV2OwnerTicketStore(core, create=True)
+    server._v2_owner_tickets = tickets
+    original_authorize = core._authorize_callback
+    core._authorize_callback = lambda credential, action, namespace, holder: (
+        action != "owner_claim" and original_authorize(
+            credential, action, namespace, holder))
+    try:
+        with pytest.raises(RuntimeError, match="unavailable"):
+            call("get_pending_owner_issue", command)
+    finally:
+        core._authorize_callback = original_authorize
+
+    # No pending row is a valid result only after the real certificate has
+    # passed the owner-claim permission; a second unmapped peer remains denied.
+    result = call("get_pending_owner_issue", command)
+    assert result == {"receipt": None,
+                      "channel_binding_sha256": paired(server)[1]["channel_binding_sha256"]}
+    other_call, _ = paired(server, PEER_B)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        other_call("get_pending_owner_issue", command)
+
+
+def test_graph_pending_query_requires_live_installed_write_fence(installed):
+    server, core, _, _ = installed
+    call, _ = paired(server)
+    genesis = call("namespace_genesis", {
+        "namespace": asdict(ROLE), "request_id": "graph-owner-genesis"})
+    tickets = AuthorityV2OwnerTicketStore(core, create=True)
+    server._v2_owner_tickets = tickets
+    original_authorize = core._authorize_callback
+    core._authorize_callback = lambda credential, action, namespace, holder: (
+        action != "owner_claim" and original_authorize(
+            credential, action, namespace, holder))
+    try:
+        write = call("begin_fence", {
+            "namespace": "opaque-role-a", "holder": "holder-a",
+            "operation": "write", "operation_id": "graph-write-a",
+            "expected_anchor": genesis["anchor"],
+        })["permit"]
+        query = {"namespace": "opaque-role-a", "operation_id": "issue-a",
+                 "permit": write}
+        assert call("get_pending_owner_issue_for_graph_write", query)["receipt"] is None
+        with pytest.raises(RuntimeError, match="unavailable"):
+            call("get_pending_owner_issue", {
+                "namespace": "opaque-role-a", "operation_id": "issue-a"})
+        other_call, _ = paired(server, PEER_B)
+        with pytest.raises(RuntimeError, match="unavailable"):
+            other_call("get_pending_owner_issue_for_graph_write", query)
+        with pytest.raises(RuntimeError, match="unavailable"):
+            call("get_pending_owner_issue_for_graph_write", {
+                **query, "permit": {**write, "token": "x" * 48}})
+        call("finish_fence", {"permit": write, "request_id": "finish-graph-write",
+                              "request_digest": "sha256:" + "f" * 64})
+        with pytest.raises(RuntimeError, match="unavailable"):
+            call("get_pending_owner_issue_for_graph_write", query)
+    finally:
+        core._authorize_callback = original_authorize
+
+
+@pytest.mark.asyncio
+async def test_transport_rejects_unbound_pending_owner_response(installed):
+    server, _, _, root = installed
+    _, paired_response = paired(server)
+    profile = AuthorityTlsProfile(
+        "installed", "localhost", 443, "localhost", server._authority_id(),
+        root / "ca.pem", root / "client.pem", root / "client.key",
+    )
+    transport = MtlsAuthorityTransport({"installed": profile})
+    request = AuthorityProvisioningRequest(
+        AUTHORITY_PROTOCOL, "installed", "astrbot_plugin_sylanne", "4.28.1",
+        root, root, PublisherPackageIdentity("c" * 64),
+    )
+    handshake = AuthorityHandshake(
+        paired_response["state"], paired_response["installation_authority_id"],
+        paired_response["installation_identity_ref"],
+        paired_response["channel_binding_sha256"], True,
+    )
+
+    async def bad_rpc(*args, **kwargs):
+        return {"receipt": None, "channel_binding_sha256": "d" * 64}
+
+    transport._content_rpc = bad_rpc
+    with pytest.raises(RuntimeError, match="response is invalid"):
+        await transport.v2_get_pending_owner_issue(
+            request, handshake, namespace="opaque-role-a", operation_id="issue-a")

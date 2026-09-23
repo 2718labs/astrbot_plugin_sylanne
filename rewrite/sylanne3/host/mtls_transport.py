@@ -23,6 +23,9 @@ from ..authority_service.v2_contract import (
     FencePermitV2, MutationReceiptV2, SCHEMA as AUTHORITY_V2_PROTOCOL,
     from_wire, to_wire,
 )
+from ..authority_service.v2_owner_contract import (
+    OwnerAuthorizationReceiptV1, from_wire as owner_from_wire,
+)
 from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
 from ..runtime.restore_anchor import RestoreAnchor
@@ -754,6 +757,58 @@ class MtlsAuthorityTransport:
                 or updated.authority_id != handshake.installation_authority_id):
             raise RuntimeError("authority v2 prepared receipt binding is invalid")
         return receipt, updated
+
+    async def v2_get_pending_owner_issue(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation_id: str,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        response = await self._content_rpc(
+            request, handshake, "get_pending_owner_issue",
+            {"namespace": namespace, "operation_id": operation_id},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"receipt", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority owner issue response is invalid")
+        if response["receipt"] is None:
+            return None
+        try:
+            receipt = owner_from_wire(response["receipt"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority owner issue response is invalid") from exc
+        if (type(receipt) is not OwnerAuthorizationReceiptV1
+                or receipt.phase != "pending"
+                or receipt.operation.operation_id != operation_id
+                or receipt.operation.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority owner issue response is invalid")
+        return receipt
+
+    async def v2_get_pending_owner_issue_for_graph_write(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation_id: str, permit: FencePermitV2,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.namespace != namespace
+                or permit.subject != handshake.installation_identity_ref):
+            raise RuntimeError("owner graph read requires this installation's write fence")
+        response = await self._content_rpc(
+            request, handshake, "get_pending_owner_issue_for_graph_write",
+            {"namespace": namespace, "operation_id": operation_id,
+             "permit": to_wire(permit)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"receipt", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority owner graph read response is invalid")
+        if response["receipt"] is None:
+            return None
+        try:
+            receipt = owner_from_wire(response["receipt"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority owner graph read response is invalid") from exc
+        if (type(receipt) is not OwnerAuthorizationReceiptV1
+                or receipt.phase != "pending"
+                or receipt.operation.operation_id != operation_id
+                or receipt.operation.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority owner graph read response is invalid")
+        return receipt
 
     async def v2_get_content_fence_operation(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

@@ -4,27 +4,43 @@ from dataclasses import replace
 import shutil
 import sqlite3
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from sylanne3.contracts import EventConflict
+from sylanne3.domains.d06 import D06DomainProvider
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
+from sylanne3.authority_service.v2_owner_contract import (
+    OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
+    OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerPrincipalV1,
+)
 from sylanne3.graph_coordinator import (
     AuthorityDenied, BudgetAdmission, GraphCoordinator, RuntimeAdmission,
-    UnavailableGuard,
+    IngressHostFacts, IngressLineage, UnavailableGuard,
 )
 from sylanne3.graph_store import ProductionGraphStore
-from sylanne3.graph_types import AtomKey, GraphWrite, Owner, TypeRegistry, TypeSpec
+from sylanne3.graph_types import (
+    AtomKey, GraphWrite, Owner, TypeRegistry, TypeSpec,
+    owner_grant_key, owner_grant_policy_digest_v1, owner_grant_spec,
+)
 from sylanne3.installation_policy import AdminInstallationPolicy
+from sylanne3.host.authority_profile import (
+    AdminIngressClockPolicy, AdminIngressEncodingPolicy,
+)
 from sylanne3.runtime.budget import BudgetLease, get_budget_lease
+from sylanne3.runtime.d11_types import (
+    D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
+    D11RuntimeProvider, graph_type_specs,
+)
 from sylanne3.runtime.issuers import (
     BudgetLeaseGrant, D11BudgetGrantIssuer, build_runtime_issuers,
 )
 from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime_contracts import (
-    AuthorityContext, CommandEnvelope, DependencySet, DomainBundle,
+    AuthorityContext, CommandEnvelope, DependencySet, DomainBundle, FenceScope,
     DomainProposal, InstallationGrantV2, NamespaceBootstrapV2, NamespaceId,
     NamespaceRuntimeState, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA,
     SourceQualification, VersionGuard, canonical_digest,
@@ -303,6 +319,243 @@ def test_v2_bundle_cold_restart_finishes_only_after_durable_business_receipt(
         assert next_port.finishes[0][1].startswith("finish:graph-write-")
     finally:
         reopened.close()
+        authority_db.close()
+
+
+def _owner_issue_case(tmp_path, *, first_ingress=False):
+    """Exercise the private graph transaction; this is not Authority admission."""
+    registry = TypeRegistry()
+    registry.register(owner_grant_spec())
+    if first_ingress:
+        for spec in D06DomainProvider.type_specs() + graph_type_specs():
+            registry.register(spec)
+    store = ProductionGraphStore(tmp_path / "owner-business.db", registry)
+    authority_db = sqlite3.connect(tmp_path / "owner-authority.db", isolation_level=None)
+    port = AuthorityPort(store, authority_db)
+    d02, d11 = build_runtime_issuers(b"issuer-key-" * 4)
+    bootstrap = object()
+    coordinator = GraphCoordinator(
+        store, bootstrap, holder="administrator", content_fence_v2=port,
+        d02_issuer=d02 if first_ingress else None, d11_issuer=d11)
+    policy = policy_for(store)
+    if first_ingress:
+        policy = replace(policy, root_grant=replace(
+            policy.root_grant, allowed_work_kinds=("d06.encode_source",)))
+        d06 = D06DomainProvider()
+        coordinator.register_provider(
+            bootstrap, "d06", d06, "d06.contract.v1",
+            d06.descriptor.request_schema_hash)
+        coordinator.register_provider(
+            bootstrap, "d11", D11RuntimeProvider(),
+            D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH)
+    creation = coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="owner-creation")
+    if first_ingress:
+        host = IngressHostFacts(
+            policy.namespace, "platform", "conversation", "sender", "message",
+            "hello", 10.0, time.time(), "private",
+            IngressLineage("b" * 64, "reported", "platform",
+                           "external_report", "reported_claim", "not_applicable"))
+        clock = AdminIngressClockPolicy("authority", 1.0, 1.0)
+        encoding = AdminIngressEncodingPolicy(
+            120.0, {"cpu_ms": 20}, "snapshot-1", "resource-1", "character-1")
+        port.read_ingress_clock = lambda _: SimpleNamespace(
+            utc_upper_bound_seconds=time.time() + 0.01,
+            monotonic_after_seconds=time.monotonic())
+        ingress_receipt = coordinator.commit_first_ingress_v2(
+            bootstrap, host, policy, clock, encoding)
+        assert ingress_receipt.status == "committed"
+    principal = OwnerPrincipalV1("paired-idp", "account", "incarnation-1")
+    ticket = OwnerClaimTicketV1(
+        "authority", "installation", policy.namespace, principal, "ticket-1",
+        creation.operation_id, "sha256:" + creation.input_digest,
+        "sha256:" + creation.input_digest, "a" * 32,
+        "2099-01-01T00:00:00Z")
+    value = {
+        "schema": "sylanne3.graph.owner_grant.v1",
+        "authority_id": "authority", "installation_id": "installation",
+        "grant_id": "first-owner", "principal": {
+            "identity_provider": principal.identity_provider,
+            "account_ref": principal.account_ref,
+            "account_incarnation": principal.account_incarnation,
+        },
+        "ticket_id": ticket.ticket_id,
+        "creation_operation_id": ticket.creation_operation_id,
+        "creation_digest": ticket.creation_digest,
+        "issue_operation_id": "owner-issue-1",
+        "grant_revision": 1, "state": "pending_authority",
+        "scope": "bot/persona", "issuer_ref": "authority:paired-installation",
+        "capabilities": ["workbench.read"],
+        "purposes": ["workbench_view"], "audiences": ["owner"],
+        "activation_generation": 1,
+        "graph_incarnation": creation.graph_incarnation,
+    }
+    ticket = replace(ticket, policy_digest=owner_grant_policy_digest_v1(
+        value, bot=policy.namespace.bot_id, persona=policy.namespace.persona_id))
+    guard = OwnerAuthorizationGuardV1(
+        "authority", "installation", policy.namespace, 0, "genesis", 0, 0)
+    operation = OwnerAuthorizationOperationV1(
+        "issue", "owner-issue-1", "authority", "installation",
+        policy.namespace, principal, "first-owner",
+        "sha256:" + canonical_digest(value), 0, guard, ticket)
+    pending = OwnerAuthorizationReceiptV1(
+        operation, "pending", "owner-issue-pending", guard)
+    return store, authority_db, port, coordinator, policy, operation, pending, value
+
+
+def _owner_write_scope(store, port, coordinator, namespace, attempt_id):
+    with store._lock:
+        metadata, epoch = coordinator._v2_graph_stamp(namespace)
+    anchor = port.current_anchor(
+        namespace=namespace, authority_namespace="opaque:persona")
+    permit = port.begin_fence(
+        namespace=namespace, authority_namespace=anchor.namespace,
+        holder="administrator", generation=1, operation="write",
+        operation_id=attempt_id, expected_anchor=anchor)
+    scope = FenceScope(
+        namespace, anchor.namespace, 1, "write", attempt_id,
+        permit, anchor, epoch, metadata.graph_revision)
+    return metadata, epoch, scope
+
+
+def test_first_owner_graph_commit_is_atomic_and_idempotent(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     pending, value) = _owner_issue_case(tmp_path)
+    namespace = policy.namespace
+    try:
+        metadata, epoch, scope = _owner_write_scope(
+            store, port, coordinator, namespace, "owner-write-1")
+        assert port.validate_fence(scope) == scope.permit
+        with store._lock:
+            store._db.execute("BEGIN IMMEDIATE")
+            try:
+                proof = coordinator._stage_first_owner_grant_locked(
+                    operation, pending, value, scope, metadata, epoch)
+                store._db.execute("COMMIT")
+            except BaseException:
+                store._db.execute("ROLLBACK")
+                raise
+        assert proof.grant_revision == 1
+        assert proof.graph_access_epoch == 1
+        assert proof.graph_epoch == 1
+        assert port.validate_fence(scope) == scope.permit
+        port.finish_fence(scope, request_id="finish:owner-write-1",
+                          request_digest="sha256:" + "a" * 64)
+        current, current_epoch, retry_scope = _owner_write_scope(
+            store, port, coordinator, namespace, "owner-write-2")
+        with store._lock:
+            store._db.execute("BEGIN IMMEDIATE")
+            try:
+                repeated = coordinator._stage_first_owner_grant_locked(
+                    operation, pending, value, retry_scope, current, current_epoch)
+                store._db.execute("COMMIT")
+            except BaseException:
+                store._db.execute("ROLLBACK")
+                raise
+            assert repeated == proof
+            assert store._db.execute(
+                "SELECT access_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?",
+                namespace.as_tuple).fetchone() == (1,)
+            assert store._db.execute(
+                "SELECT revision,valid FROM graph_atoms WHERE token=?",
+                (owner_grant_key(*namespace.as_tuple).token,)).fetchone() == (1, 1)
+            assert store._db.execute(
+                "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (1,)
+        port.finish_fence(retry_scope, request_id="finish:owner-write-2",
+                          request_digest="sha256:" + "b" * 64)
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_first_owner_graph_commit_rejects_wrong_creation_without_partial_write(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     pending, value) = _owner_issue_case(tmp_path)
+    namespace = policy.namespace
+    try:
+        metadata, epoch, scope = _owner_write_scope(
+            store, port, coordinator, namespace, "owner-write-wrong")
+        wrong_ticket = replace(operation.ticket,
+                               creation_operation_id="unrelated-creation")
+        wrong_operation = replace(operation, ticket=wrong_ticket,
+                                  request_digest=None)
+        wrong_pending = OwnerAuthorizationReceiptV1(
+            wrong_operation, "pending", "owner-issue-pending", operation.expected_guard)
+        with store._lock:
+            store._db.execute("BEGIN IMMEDIATE")
+            with pytest.raises(AuthorityDenied):
+                coordinator._stage_first_owner_grant_locked(
+                    wrong_operation, wrong_pending, value, scope, metadata, epoch)
+            store._db.execute("ROLLBACK")
+            assert store._db.execute(
+                "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (0,)
+            assert store._db.execute(
+                "SELECT COUNT(*) FROM graph_atoms WHERE token=?",
+                (owner_grant_key(*namespace.as_tuple).token,)).fetchone() == (0,)
+        port.finish_fence(scope, request_id="finish:owner-write-wrong",
+                          request_digest="sha256:" + "c" * 64)
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_first_owner_graph_commit_rejects_policy_expansion(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     pending, value) = _owner_issue_case(tmp_path)
+    namespace = policy.namespace
+    try:
+        metadata, epoch, scope = _owner_write_scope(
+            store, port, coordinator, namespace, "owner-write-policy")
+        expanded = dict(value, capabilities=["workbench.read", "workbench.write"])
+        wrong_operation = replace(
+            operation, grant_digest="sha256:" + canonical_digest(expanded),
+            request_digest=None)
+        wrong_pending = OwnerAuthorizationReceiptV1(
+            wrong_operation, "pending", "owner-issue-pending",
+            wrong_operation.expected_guard)
+        with store._lock:
+            store._db.execute("BEGIN IMMEDIATE")
+            with pytest.raises(AuthorityDenied, match="paired policy"):
+                coordinator._stage_first_owner_grant_locked(
+                    wrong_operation, wrong_pending, expanded,
+                    scope, metadata, epoch)
+            store._db.execute("ROLLBACK")
+            assert store._db.execute(
+                "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (0,)
+        port.finish_fence(scope, request_id="finish:owner-write-policy",
+                          request_digest="sha256:" + "d" * 64)
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_first_owner_claim_rejects_prior_committed_first_ingress(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     pending, value) = _owner_issue_case(tmp_path, first_ingress=True)
+    namespace = policy.namespace
+    try:
+        metadata, epoch, scope = _owner_write_scope(
+            store, port, coordinator, namespace, "owner-write-after-ingress")
+        assert metadata.graph_revision > 0 and epoch.revision > 0
+        assert store._db.execute(
+            "SELECT access_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?",
+            namespace.as_tuple).fetchone() in (None, (0,))
+        assert port.validate_fence(scope) == scope.permit
+        with store._lock:
+            store._db.execute("BEGIN IMMEDIATE")
+            with pytest.raises(UnavailableGuard, match="creation genesis"):
+                coordinator._stage_first_owner_grant_locked(
+                    operation, pending, value, scope, metadata, epoch)
+            store._db.execute("ROLLBACK")
+            assert store._db.execute(
+                "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (0,)
+            assert store._db.execute(
+                "SELECT COUNT(*) FROM graph_atoms WHERE token=?",
+                (owner_grant_key(*namespace.as_tuple).token,)).fetchone() == (0,)
+        port.finish_fence(scope, request_id="finish:owner-write-after-ingress",
+                          request_digest="sha256:" + "e" * 64)
+    finally:
+        store.close()
         authority_db.close()
 
 

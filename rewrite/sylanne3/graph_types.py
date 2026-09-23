@@ -3,12 +3,87 @@
 from dataclasses import dataclass, field
 import hashlib
 import json
+import re
 
 from .contracts import Event, canonical_json, json_object, nonempty
 
 
 OWNER_KINDS = frozenset({"persona", "relation", "scene", "event", "activity"})
 STORAGE_ROLES = frozenset({"source", "state", "projection", "cache"})
+OWNER_GRANT_TYPE = "d11.owner_grant.v1"
+_OWNER_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def validate_owner_grant_v1(value: dict) -> None:
+    """Validate the graph's durable grant record, not its Authority status."""
+    expected = {
+        "schema", "authority_id", "installation_id", "grant_id", "principal",
+        "ticket_id", "creation_operation_id", "creation_digest",
+        "issue_operation_id", "grant_revision", "state",
+        "scope", "issuer_ref", "capabilities", "purposes", "audiences",
+        "activation_generation", "graph_incarnation",
+    }
+    if type(value) is not dict or set(value) != expected:
+        raise ValueError("owner grant fields differ from v1 schema")
+    if value["schema"] != "sylanne3.graph.owner_grant.v1":
+        raise ValueError("unknown graph owner grant schema")
+    for name in ("authority_id", "installation_id", "grant_id", "ticket_id",
+                 "creation_operation_id", "issue_operation_id", "scope",
+                 "issuer_ref", "graph_incarnation"):
+        if type(value[name]) is not str or not value[name]:
+            raise ValueError(f"owner grant {name} is required")
+    for name in ("creation_digest",):
+        if type(value[name]) is not str or _OWNER_DIGEST.fullmatch(value[name]) is None:
+            raise ValueError(f"owner grant {name} must be SHA-256")
+    principal = value["principal"]
+    if (type(principal) is not dict or set(principal) != {
+            "identity_provider", "account_ref", "account_incarnation"}
+            or any(type(item) is not str or not item for item in principal.values())):
+        raise ValueError("owner grant requires a stable principal")
+    for name in ("capabilities", "purposes", "audiences"):
+        items = value[name]
+        if (type(items) is not list or not items
+                or any(type(item) is not str or not item for item in items)
+                or items != sorted(set(items))):
+            raise ValueError(f"owner grant {name} must be a sorted nonempty set")
+    if (value["grant_revision"] != 1 or type(value["grant_revision"]) is not int
+            or value["state"] != "pending_authority"
+            or type(value["activation_generation"]) is not int
+            or value["activation_generation"] < 1):
+        raise ValueError("first owner grant must remain pending at revision one")
+
+
+def owner_grant_key(bot: str, persona: str) -> "AtomKey":
+    return AtomKey(Owner("persona", bot, persona), OWNER_GRANT_TYPE, "primary")
+
+
+def owner_grant_spec() -> "TypeSpec":
+    """W01's reserved type, explicitly registered by the product catalogue."""
+    return TypeSpec(
+        OWNER_GRANT_TYPE, ("persona",), "state",
+        validate_owner_grant_v1, schema_version=1, writer_domain="d11",
+        schema_hash=hashlib.sha256(
+            b"sylanne3.graph.owner_grant.v1:strict:pending"
+        ).hexdigest(),
+    )
+
+
+def owner_grant_policy_digest_v1(value: dict, *, bot: str, persona: str) -> str:
+    """Bind claim-ticket policy to the grant's exact content permissions."""
+    validate_owner_grant_v1(value)
+    payload = {
+        "schema": "sylanne3.graph.owner_grant_policy.v1",
+        "namespace": [bot, persona],
+        "authority_id": value["authority_id"],
+        "installation_id": value["installation_id"],
+        "scope": value["scope"],
+        "issuer_ref": value["issuer_ref"],
+        "capabilities": value["capabilities"],
+        "purposes": value["purposes"],
+        "audiences": value["audiences"],
+        "activation_generation": value["activation_generation"],
+    }
+    return "sha256:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
