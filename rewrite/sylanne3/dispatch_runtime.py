@@ -620,7 +620,7 @@ class DispatchRuntime:
         self._assert_handoff_start(start, permit, request)
         try:
             # The configured adapter is contractually required to resolve the
-            # opaque payload_ref and verify its bytes against payload_digest
+            # opaque payload_ref and verify its D09 segment against payload_digest
             # before issuing the provider call.  No such capability means the
             # constructor fails closed.
             observation = self._platform.handoff(request, start)
