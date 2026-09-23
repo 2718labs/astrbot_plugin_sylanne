@@ -112,6 +112,7 @@ def test_context_owns_v2_worker_without_publishing_ready(
             def __init__(self, _store, _bootstrap, **kwargs):
                 assert kwargs["holder"] == "administrator"
                 assert isinstance(kwargs["content_fence_v2"], Port)
+                assert kwargs["owner_principal_resolver"] is owner_resolver
                 assert isinstance(kwargs["d02_issuer"], runtime_context.D02ResourceIssuer)
                 assert isinstance(kwargs["d11_issuer"], runtime_context.D11BudgetJobIssuer)
                 assert kwargs["d11_issuer"].resource_issuer is kwargs["d02_issuer"]
@@ -127,8 +128,10 @@ def test_context_owns_v2_worker_without_publishing_ready(
         monkeypatch.setattr(runtime_context, "ProductionGraphStore", Store)
         monkeypatch.setattr(runtime_context, "GraphCoordinator", Coordinator)
         domains = SimpleNamespace(complete=True, registrations={}, type_registry=object())
+        owner_resolver = lambda actor, namespace: None
         context = runtime_context.RuntimeContext(
             tmp_path / "data", package_root=tmp_path, dependencies=None, domains=domains,
+            owner_principal_resolver=owner_resolver,
         )
         assembled = installation(grant, Port, tmp_path, tmp_path / "data")
         health = await context.start_v2(assembled)
@@ -193,8 +196,8 @@ def test_namespace_provision_hold_preserves_failure_and_disables_ingress(
                 pass
 
         class Coordinator:
-            def __init__(self, *_args, **_kwargs):
-                pass
+            def __init__(self, *_args, **kwargs):
+                assert kwargs["owner_principal_resolver"] is None
 
             def register_provider(self, *_args):
                 pass

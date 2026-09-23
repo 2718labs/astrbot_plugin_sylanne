@@ -8,6 +8,7 @@ import inspect
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from .authority_service.v2_owner_contract import OwnerPrincipalV1
 from .contracts import StaleRead
 from .domain_registry import DomainRegistry, discover_domain_registry
 from .domains.d01 import ActiveRoleQualification
@@ -108,7 +109,10 @@ class RuntimeContext:
         dependencies: RuntimeDependencies | None,
         domains: DomainRegistry | None = None,
         authority_state: str = "unavailable",
+        owner_principal_resolver: Callable[[str, NamespaceId], OwnerPrincipalV1 | None] | None = None,
     ) -> None:
+        if owner_principal_resolver is not None and not callable(owner_principal_resolver):
+            raise TypeError("owner_principal_resolver must be callable")
         self._data_dir = Path(data_dir)
         self._package_root = (
             Path(package_root).resolve()
@@ -118,6 +122,7 @@ class RuntimeContext:
         self._dependencies = dependencies
         self._authority_state = authority_state
         self._domains = domains or discover_domain_registry()
+        self._owner_principal_resolver = owner_principal_resolver
         self._store: ProductionGraphStore | None = None
         self._coordinator: GraphCoordinator | None = None
         self._worker: GraphWorker | None = None
@@ -209,6 +214,7 @@ class RuntimeContext:
                     d02_issuer=d02_issuer,
                     d11_issuer=D11BudgetJobIssuer(
                         d02_issuer, installation.d11_signing_key),
+                    owner_principal_resolver=self._owner_principal_resolver,
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(

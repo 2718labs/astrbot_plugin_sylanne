@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Callable
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
+from .rewrite.sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
 from .rewrite.sylanne3.host import (
     AstrBotIngressError,
     AuthoritySelection,
@@ -18,7 +20,7 @@ from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_sche
 from .rewrite.sylanne3.host.authority_profile import AuthorityProfileUnavailable
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
-from .rewrite.sylanne3.runtime_contracts import canonical_digest
+from .rewrite.sylanne3.runtime_contracts import NamespaceId, canonical_digest
 from .rewrite.sylanne3.workbench_api.http_transport import CurrentOwnerPairingPort
 from .rewrite.sylanne3.workbench_api.onboarding import OnboardingPolicyResolver
 from .rewrite.sylanne3.workbench_api.owner_grant import CurrentOwnerGrantPort
@@ -44,7 +46,8 @@ class Sylanne3Plugin(Star):
                  workbench_pairing: CurrentOwnerPairingPort | None = None,
                  workbench_owner_grants: CurrentOwnerGrantPort | None = None,
                  workbench_onboarding: OnboardingPolicyResolver | None = None,
-                 workbench_origin: str | None = None) -> None:
+                 workbench_origin: str | None = None,
+                 owner_principal_resolver: Callable[[str, NamespaceId], OwnerPrincipalV1 | None] | None = None) -> None:
         super().__init__(context, config)
         try:
             self._enabled, self._authority_selection = _settings(config)
@@ -60,6 +63,7 @@ class Sylanne3Plugin(Star):
             workbench_pairing, workbench_owner_grants,
             workbench_onboarding, workbench_origin,
         )
+        self._owner_principal_resolver = owner_principal_resolver
 
     def _installation_status(self) -> tuple[str, str]:
         health = self.runtime_health
@@ -125,6 +129,7 @@ class Sylanne3Plugin(Star):
             self._runtime = RuntimeContext(
                 data_dir, package_root=PACKAGE_ROOT, dependencies=None,
                 domains=verified.registry,
+                owner_principal_resolver=self._owner_principal_resolver,
             )
             health = await self._runtime.start_v2(installation)
         except Exception:
