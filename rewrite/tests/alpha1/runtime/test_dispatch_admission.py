@@ -34,6 +34,7 @@ from sylanne3.runtime.dispatch_admission import (
     DispatchAdmissionReceiptV1, DispatchAdmissionV1, install_schema,
     load_admission,
 )
+from sylanne3.runtime.dispatch_candidate import dispatch_segment_payload_ref
 from sylanne3.runtime_contracts import (
     CheckReceipt, CommandEnvelope, DependencySet, DomainBundle, DomainProposal,
     NamespaceId, QueryEpoch, RUNTIME_SCHEMA, SourceQualification, VersionGuard,
@@ -141,6 +142,7 @@ class _TestAdmissionIssuer:
         self.schema = None
         self.grant = None
         self.batch = None
+        self.payload_ref_override = None
 
     def bind(self, values):
         self.intent, self.schema, self.grant, self.batch = values
@@ -156,7 +158,9 @@ class _TestAdmissionIssuer:
             "bot/persona", identity.operation_id, identity.activity_id,
             identity.effect_id, identity.attempt_id,
             canonical_digest({"command": identity.operation_id}),
-            "payload:one", segment["payload_digest"], "platform:test",
+            (self.payload_ref_override or dispatch_segment_payload_ref(
+                candidate.batch_ref, 0)),
+            segment["payload_digest"], "platform:test",
             grant.required_check_refs, 1, 1, 1, "content:one",
             batch["cancellation_epoch"],
             RecoveryConstraintFootprint(
@@ -534,6 +538,41 @@ def test_current_d03_d05_projection_preserves_admission_transaction_test(
         assert load_admission(reopened, authority.namespace, "admission:one") == stored
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("wrong_part", ("batch", "index"))
+def test_same_digest_cannot_admit_a_different_d09_payload_ref(tmp_path, wrong_part):
+    store, coordinator, authority, lease, bundle, issuer = _issuer_case(
+        tmp_path, with_projection=True)
+    batch_ref = next(
+        write.key.token
+        for proposal in bundle.proposals for write in proposal.typed_writes
+        if write.key.type_name == "d09.verified_segment_batch.v1"
+    )
+    if wrong_part == "batch":
+        key = AtomKey.from_token(batch_ref)
+        batch_ref = AtomKey(key.owner, key.type_name, key.name + "-other").token
+        index = 0
+    else:
+        index = 1
+    issuer.payload_ref_override = dispatch_segment_payload_ref(batch_ref, index)
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic - 0.01, monotonic, time.time() + 0.2,
+    )
+    with pytest.raises(UnavailableGuard, match="payload reference differs"):
+        coordinator._commit_domain_bundle_fenced(
+            bundle, lease, dispatch_clock_reading=reading)
+    assert issuer.request.payload_digest == issuer.batch["segments"][0]["payload_digest"]
+    with store._lock:
+        assert store._db.execute(
+            "SELECT 1 FROM graph_bundle_operations WHERE operation_id=?",
+            (bundle.envelope.identity.operation_id,),
+        ).fetchone() is None
+        assert load_admission(store._db, authority.namespace, "admission:one") is None
+    store.close()
 
 
 @pytest.mark.parametrize(

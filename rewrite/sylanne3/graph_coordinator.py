@@ -46,7 +46,8 @@ from .runtime.dispatch_admission import (
 )
 from .runtime.dispatch_admission_preflight import preflight_dispatch_admission
 from .runtime.dispatch_candidate import (
-    DispatchCandidateRecoveryV1, qualify_dispatch_candidate_sources,
+    DispatchCandidateRecoveryV1, dispatch_segment_payload_ref,
+    qualify_dispatch_candidate_sources,
     validate_dispatch_candidate_writes,
 )
 from .authority_service.v2_owner_contract import (
@@ -5273,6 +5274,9 @@ class GraphCoordinator:
 
         if type(request) is not DispatchRequest:
             raise UnavailableGuard("trusted issuer did not produce typed dispatch command")
+        if request.payload_ref != dispatch_segment_payload_ref(
+                candidate.batch_ref, request.segment_index):
+            raise UnavailableGuard("dispatch payload reference differs from D09 graph segment")
         preflight = preflight_dispatch_admission(
             schema, action, batch, request, admission.check_receipts,
             now_utc=now, trusted_check_verifier=lambda spec, receipt: (

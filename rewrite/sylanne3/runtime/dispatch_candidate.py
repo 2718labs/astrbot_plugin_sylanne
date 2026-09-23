@@ -20,6 +20,17 @@ _LINKED_TYPES = {
     "d09.verified_segment_batch.v1": "d09",
 }
 
+def dispatch_segment_payload_ref(batch_ref: str, index: int) -> str:
+    """Name one D09 graph segment without embedding its JSON atom token."""
+    if (type(batch_ref) is not str
+            or AtomKey.from_token(batch_ref).type_name != "d09.verified_segment_batch.v1"):
+        raise ValueError("payload reference requires a D09 verified batch atom")
+    if type(index) is not int or index < 0:
+        raise ValueError("segment index must be a nonnegative exact integer")
+    return "d09:" + canonical_digest({
+        "batch_ref": batch_ref, "segment_index": index,
+    })
+
 
 @dataclass(frozen=True)
 class DispatchCandidateEvidenceV1:
