@@ -11,8 +11,8 @@ import zipfile
 
 import pytest
 
-BUILDER_PATH = Path(__file__).resolve().parents[1] / "tools" / "build_plugin_package.py"
-VERIFIER_PATH = Path(__file__).resolve().parents[1] / "sylanne3" / "host" / "installed_package.py"
+BUILDER_PATH = Path(__file__).resolve().parents[3] / "tools" / "build_plugin_package.py"
+VERIFIER_PATH = Path(__file__).resolve().parents[3] / "sylanne3" / "host" / "installed_package.py"
 
 
 def _load_verifier():
