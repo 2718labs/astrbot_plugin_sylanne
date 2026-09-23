@@ -17,7 +17,7 @@ from .host.installed_package import verify_installed_package
 from .host.v2_installation import V2InstallationAssembly
 from .host.v2_fence_port import V2FenceOutcomeUnknown
 from .installation_policy import AdminInstallationPolicy
-from .runtime.issuers import D11BudgetGrantIssuer
+from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.restore_anchor import ExecutionJournalPort
 from .runtime_contracts import InstallationGrantV2, NamespaceId
 
@@ -180,10 +180,13 @@ class RuntimeContext:
                 if port.installation_grant != installation_grant:
                     raise RuntimeError("v2 port installation grant changed")
                 bootstrap = object()
+                d02_issuer = D02ResourceIssuer(installation.d02_signing_key)
                 coordinator = GraphCoordinator(
                     store, bootstrap, holder=installation_grant.administrator_holder,
                     content_fence_v2=port,
-                    d11_issuer=D11BudgetGrantIssuer(installation.d11_signing_key),
+                    d02_issuer=d02_issuer,
+                    d11_issuer=D11BudgetJobIssuer(
+                        d02_issuer, installation.d11_signing_key),
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(

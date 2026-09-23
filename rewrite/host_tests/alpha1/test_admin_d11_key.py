@@ -32,7 +32,8 @@ finally:
         sys.modules.pop("sylanne3.host", None)
 
 
-def _profile(root: Path, *, schema: int = 2, key: bytes | None = b"K" * 32) -> Path:
+def _profile(root: Path, *, schema: int = 2, key: bytes | None = b"K" * 32,
+             d02_key: bytes | None = b"D" * 32) -> Path:
     folder = root / "safe"
     folder.mkdir()
     payload = {
@@ -75,6 +76,8 @@ def _profile(root: Path, *, schema: int = 2, key: bytes | None = b"K" * 32) -> P
         (folder / name).write_bytes(b"test fixture")
     if key is not None:
         (folder / "d11-signing.key").write_bytes(key)
+    if d02_key is not None:
+        (folder / "d02-signing.key").write_bytes(d02_key)
     return folder
 
 
@@ -82,7 +85,9 @@ def test_signing_key_is_not_a_profile_json_field(tmp_path: Path) -> None:
     profile = _profile(tmp_path)
     payload = authority_profile._read_profile_json(profile / "profile.json")
     assert "d11_signing_key" not in payload
+    assert "d02_signing_key" not in payload
     assert "d11-signing.key" not in authority_profile._MATERIAL
+    assert "d02-signing.key" not in authority_profile._MATERIAL
     for selection in ("../safe", "safe/other", "safe\\other"):
         with pytest.raises(ValueError, match="profile identifier"):
             authority_profile.load_admin_d11_signing_key(selection)
@@ -99,7 +104,7 @@ def test_posix_extra_key_is_opened_under_pinned_dirfd_and_no_follow(tmp_path: Pa
     with patch.object(authority_profile, "_check_opened", side_effect=inspect):
         with authority_profile._opened_profile(profile, "Linux", signing_key=True) as files:
             assert authority_profile._read_fd_bounded(files["d11-signing.key"], 32) == b"K" * 32
-    assert checked[-1] == (False, True)
+    assert checked[-2:] == [(False, True), (False, True)]
     target = profile / "original.key"
     (profile / "d11-signing.key").rename(target)
     (profile / "d11-signing.key").symlink_to(target.name)
@@ -107,6 +112,30 @@ def test_posix_extra_key_is_opened_under_pinned_dirfd_and_no_follow(tmp_path: Pa
         with pytest.raises(OSError):
             with authority_profile._opened_profile(profile, "Linux", signing_key=True):
                 pass
+
+    (profile / "d11-signing.key").unlink()
+    target.rename(profile / "d11-signing.key")
+    d02 = profile / "d02-signing.key"
+    d02.rename(profile / "original-d02.key")
+    d02.symlink_to("original-d02.key")
+    with patch.object(authority_profile, "_check_opened", side_effect=inspect):
+        with pytest.raises(OSError):
+            with authority_profile._opened_profile(profile, "Linux", signing_key=True):
+                pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor traversal")
+def test_posix_bundle_requires_d02_key(tmp_path: Path) -> None:
+    profile = _profile(tmp_path, d02_key=None)
+    with patch.object(authority_profile, "_check_opened"):
+        with pytest.raises(FileNotFoundError):
+            authority_profile._load_installation_bundle_from_root(
+                "safe", tmp_path, "Linux")
+
+
+def test_d02_key_requires_exact_length() -> None:
+    with pytest.raises(ValueError, match="D02 signing key"):
+        authority_profile._checked_signing_key(b"D" * 31, "D02")
 
 
 @pytest.mark.parametrize("mode,gid,accepted", [
@@ -165,11 +194,13 @@ def test_posix_bundle_uses_one_pinned_profile_snapshot(tmp_path: Path) -> None:
         nonlocal opened_count
         opened_count += 1
         with opened_profile(profile_dir, system, signing_key=signing_key) as files:
-            assert signing_key and "d11-signing.key" in files
+            assert signing_key and {"d11-signing.key", "d02-signing.key"} <= files.keys()
             (profile / "profile.json").rename(profile / "original-profile.json")
             (profile / "profile.json").write_text("{}", encoding="utf-8")
             (profile / "d11-signing.key").rename(profile / "original-signing.key")
             (profile / "d11-signing.key").write_bytes(b"X" * 32)
+            (profile / "d02-signing.key").rename(profile / "original-d02.key")
+            (profile / "d02-signing.key").write_bytes(b"Y" * 32)
             yield files
 
     with patch.object(authority_profile, "_check_opened"), \
@@ -185,18 +216,31 @@ def test_posix_bundle_uses_one_pinned_profile_snapshot(tmp_path: Path) -> None:
     assert bundle.installation_policy.installation_id == "install-a"
     assert bundle.tls_profile.prepared_ssl_context is not None
     assert bundle.d11_signing_key == b"K" * 32
+    assert bundle.d02_signing_key == b"D" * 32
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows pinned handles")
 def test_windows_signing_key_reads_pinned_handle(tmp_path: Path) -> None:
     profile = _profile(tmp_path)
     path = profile / "d11-signing.key"
+    d02_path = profile / "d02-signing.key"
     with authority_profile._opened_windows_profile(profile, signing_key=True) as handles:
         assert authority_profile._read_windows_signing_key(handles[path]) == b"K" * 32
+        assert authority_profile._read_windows_signing_key(handles[d02_path]) == b"D" * 32
         with pytest.raises(OSError):
             path.rename(profile / "renamed.key")
         with pytest.raises(OSError):
             path.open("r+b")
+        with pytest.raises(OSError):
+            d02_path.open("r+b")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows pinned handles")
+def test_windows_bundle_requires_d02_key(tmp_path: Path) -> None:
+    profile = _profile(tmp_path, d02_key=None)
+    with pytest.raises(FileNotFoundError):
+        with authority_profile._opened_windows_profile(profile, signing_key=True):
+            pass
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows profile loader")
@@ -241,6 +285,9 @@ def test_windows_d11_key_receives_private_key_dacl_check(tmp_path: Path) -> None
     key_checks = [call for call in check.call_args_list
                   if call.args[0] == profile / "d11-signing.key"]
     assert len(key_checks) == 1 and key_checks[0].kwargs["key"] is True
+    d02_checks = [call for call in check.call_args_list
+                  if call.args[0] == profile / "d02-signing.key"]
+    assert len(d02_checks) == 1 and d02_checks[0].kwargs["key"] is True
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows administrator DACL")
@@ -291,8 +338,16 @@ def test_windows_bundle_reads_one_pinned_installation_snapshot(tmp_path: Path) -
     assert bundle.tls_profile.expected_authority_id == "authority:production"
     assert bundle.installation_policy.installation_id == "install-a"
     assert bundle.d11_signing_key == b"K" * 32
+    assert bundle.d02_signing_key == b"D" * 32
     with pytest.raises(FrozenInstanceError):
         bundle.d11_signing_key = b"other"
+    (profile / "d02-signing.key").write_bytes(b"D" * 31)
+    with patch.dict(sys.modules, {"sylanne3.host": _host_package}):
+        security = importlib.import_module("sylanne3.host.windows_profile_security")
+        with patch.object(security, "programdata_profile_root", return_value=tmp_path), \
+             patch.object(authority_profile, "_check_windows_handles"):
+            with pytest.raises(ValueError, match="D02 signing key"):
+                authority_profile.load_admin_installation_bundle("safe")
 
 
 def test_schema1_tls_profile_does_not_require_d11_key(tmp_path: Path) -> None:

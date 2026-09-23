@@ -22,7 +22,8 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
             administrator_holder="holder", manifest_digest=digest,
         )
         bundle = SimpleNamespace(
-            tls_profile=profile, installation_policy=policy, d11_signing_key=b"k" * 32,
+            tls_profile=profile, installation_policy=policy,
+            d11_signing_key=b"k" * 32, d02_signing_key=b"d" * 32,
         )
         grant = InstallationGrantV2(
             authority_id="authority", subject="mtls:sha256:peer",
@@ -48,6 +49,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(assembled.installation_grant, grant)
             self.assertIs(assembled.installation_policy, policy)
             self.assertEqual(assembled.d11_signing_key, b"k" * 32)
+            self.assertEqual(assembled.d02_signing_key, b"d" * 32)
             self.assertEqual(assembled.package_root, Path.cwd() / "package")
             self.assertEqual(assembled.data_dir, Path.cwd() / "data")
             self.assertEqual(assembled.available_cpu_features, frozenset({"avx2"}))
@@ -72,7 +74,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
                 expected_authority_id="authority", installation_id="install",
                 administrator_holder="holder", manifest_digest=digest,
             ),
-            d11_signing_key=b"k" * 32,
+            d11_signing_key=b"k" * 32, d02_signing_key=b"d" * 32,
         )
         grant = InstallationGrantV2(
             authority_id="authority", subject="mtls:sha256:peer",

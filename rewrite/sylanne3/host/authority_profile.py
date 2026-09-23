@@ -51,6 +51,7 @@ _GRANT_FIELDS = frozenset({
 _MATERIAL = ("trust-root.pem", "client-cert.pem", "client-key.pem")
 _D11_SIGNING_KEY = "d11-signing.key"
 _D11_SIGNING_KEY_BYTES = 32
+_D02_SIGNING_KEY = "d02-signing.key"
 _MAX_PROFILE_BYTES = 8192
 _MAX_MATERIAL_BYTES = 1_048_576
 _WIN_GENERIC_READ = 0x80000000
@@ -87,6 +88,7 @@ class AdminInstallationBundle:
     tls_profile: AuthorityTlsProfile
     installation_policy: AdminInstallationPolicy
     d11_signing_key: bytes
+    d02_signing_key: bytes
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -198,12 +200,15 @@ def _opened_profile(profile_dir: Path, system: str, *, signing_key: bool = False
             _check_opened(child, directory=True, key=False, system=system)
             current = child
         files: dict[str, int] = {}
-        names = ("profile.json",) + _MATERIAL + ((_D11_SIGNING_KEY,) if signing_key else ())
+        names = ("profile.json",) + _MATERIAL + ((
+            _D11_SIGNING_KEY, _D02_SIGNING_KEY,
+        ) if signing_key else ())
         for name in names:
             fd = os.open(name, file_flags, dir_fd=current)
             stack.callback(os.close, fd)
             _check_opened(fd, directory=False,
-                          key=name in {"client-key.pem", _D11_SIGNING_KEY}, system=system)
+                          key=name in {"client-key.pem", _D11_SIGNING_KEY,
+                                       _D02_SIGNING_KEY}, system=system)
             files[name] = fd
         yield files
 
@@ -276,7 +281,9 @@ def _opened_windows_profile(profile_dir: Path, *, signing_key: bool = False
     kernel.CloseHandle.restype = ctypes.c_int
     invalid = ctypes.c_void_p(-1).value
     directories = tuple(reversed(profile_dir.parents)) + (profile_dir,)
-    names = ("profile.json",) + _MATERIAL + ((_D11_SIGNING_KEY,) if signing_key else ())
+    names = ("profile.json",) + _MATERIAL + ((
+        _D11_SIGNING_KEY, _D02_SIGNING_KEY,
+    ) if signing_key else ())
     paths = directories + tuple(profile_dir / name for name in names)
     with ExitStack() as stack:
         handles: dict[Path, int] = {}
@@ -328,7 +335,9 @@ def _check_windows_handles(profile_dir: Path, handles: dict[Path, int]) -> None:
         import win32security  # type: ignore[import-not-found]
         runtime_user, runtime_sids = security_gate._runtime_token_sids(win32security)
         protected_root = profile_dir.parents[2]
-        key_paths = {profile_dir / "client-key.pem", profile_dir / _D11_SIGNING_KEY}
+        key_paths = {profile_dir / name for name in (
+            "client-key.pem", _D11_SIGNING_KEY, _D02_SIGNING_KEY,
+        )}
         for path, handle in handles.items():
             security_gate._check_security_descriptor(
                 path, runtime_user, runtime_sids,
@@ -585,9 +594,9 @@ def _read_windows_signing_key(handle: int) -> bytes:
     return bytes(buffer[:count.value])
 
 
-def _checked_signing_key(raw: bytes) -> bytes:
+def _checked_signing_key(raw: bytes, domain: str) -> bytes:
     if len(raw) != _D11_SIGNING_KEY_BYTES:
-        raise ValueError("administrator D11 signing key must be exactly 32 bytes")
+        raise ValueError(f"administrator {domain} signing key must be exactly 32 bytes")
     return raw
 
 
@@ -604,10 +613,13 @@ def _load_installation_bundle_from_root(
         policy = _policy_from_payload(payload)
         prepared = _prepared_ssl_context(files, system)
         profile = _profile_from_payload(profile_id, profile_dir, payload, prepared)
-        signing_key = _checked_signing_key(
-            _read_fd_bounded(files[_D11_SIGNING_KEY], _D11_SIGNING_KEY_BYTES)
+        d11_key = _checked_signing_key(
+            _read_fd_bounded(files[_D11_SIGNING_KEY], _D11_SIGNING_KEY_BYTES), "D11"
         )
-    return AdminInstallationBundle(profile, policy, signing_key)
+        d02_key = _checked_signing_key(
+            _read_fd_bounded(files[_D02_SIGNING_KEY], _D11_SIGNING_KEY_BYTES), "D02"
+        )
+    return AdminInstallationBundle(profile, policy, d11_key, d02_key)
 
 
 def _load_windows_installation_bundle(
@@ -622,14 +634,17 @@ def _load_windows_installation_bundle(
         policy = _policy_from_payload(payload)
         profile = _profile_from_payload(profile_id, profile_dir, payload)
         profile = replace(profile, prepared_ssl_context=profile.ssl_context())
-        signing_key = _checked_signing_key(
-            _read_windows_signing_key(handles[profile_dir / _D11_SIGNING_KEY])
+        d11_key = _checked_signing_key(
+            _read_windows_signing_key(handles[profile_dir / _D11_SIGNING_KEY]), "D11"
         )
-    return AdminInstallationBundle(profile, policy, signing_key)
+        d02_key = _checked_signing_key(
+            _read_windows_signing_key(handles[profile_dir / _D02_SIGNING_KEY]), "D02"
+        )
+    return AdminInstallationBundle(profile, policy, d11_key, d02_key)
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
-    """Load schema-2 TLS, policy and D11 key from one administrator snapshot."""
+    """Load schema-2 TLS, policy and D11/D02 keys from one administrator snapshot."""
     _check_profile_id(profile_id)
     system = platform.system()
     if system in {"Linux", "Darwin"}:

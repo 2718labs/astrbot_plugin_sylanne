@@ -26,6 +26,7 @@ class V2InstallationAssembly:
     installation_policy: AdminInstallationPolicy
     installation_grant: InstallationGrantV2
     d11_signing_key: bytes
+    d02_signing_key: bytes
     fence_port_factory: Callable[[], V2FencePort]
     package_root: Path
     data_dir: Path
@@ -104,7 +105,7 @@ async def assemble_v2_installation(
         return V2FencePort(request, profiles, grant)
 
     return V2InstallationAssembly(
-        policy, grant, bundle.d11_signing_key, make_fence_port,
+        policy, grant, bundle.d11_signing_key, bundle.d02_signing_key, make_fence_port,
         root, data, available_cpu_features,
     )
 

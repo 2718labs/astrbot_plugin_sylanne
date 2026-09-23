@@ -48,7 +48,7 @@ def installation(grant, port_factory, package_root, data_dir, *,
         "scheme-1", "operator-1", "policy-1", lease, root_grant,
     )
     return V2InstallationAssembly(
-        policy, grant, b"k" * 32, port_factory,
+        policy, grant, b"k" * 32, b"d" * 32, port_factory,
         package_root, data_dir, features,
     )
 
@@ -94,7 +94,9 @@ def test_context_owns_v2_worker_without_publishing_ready(
             def __init__(self, _store, _bootstrap, **kwargs):
                 assert kwargs["holder"] == "administrator"
                 assert isinstance(kwargs["content_fence_v2"], Port)
-                assert isinstance(kwargs["d11_issuer"], runtime_context.D11BudgetGrantIssuer)
+                assert isinstance(kwargs["d02_issuer"], runtime_context.D02ResourceIssuer)
+                assert isinstance(kwargs["d11_issuer"], runtime_context.D11BudgetJobIssuer)
+                assert kwargs["d11_issuer"].resource_issuer is kwargs["d02_issuer"]
                 self.bootstrap = _bootstrap
                 trace.append(("coordinator_open", get_ident()))
 
