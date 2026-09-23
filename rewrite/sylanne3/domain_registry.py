@@ -3,8 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from importlib import import_module
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from .graph_types import TypeRegistry, TypeSpec
+
+if TYPE_CHECKING:
+    from .domains.d04 import AffectScheme
 
 
 REQUIRED_DOMAINS = tuple(f"d{number:02d}" for number in range(1, 13))
@@ -66,14 +70,23 @@ def _concrete_specs(provider: object) -> tuple[TypeSpec, ...]:
     return tuple(converted)
 
 
-def discover_domain_registry() -> DomainRegistry:
-    """Build the current real catalogue and retain explicit gaps as a startup gate."""
+def discover_domain_registry(*, active_affect_scheme: AffectScheme | None = None) -> DomainRegistry:
+    """Build the catalogue, binding D04 only to a caller-supplied active scheme."""
+    if active_affect_scheme is not None:
+        from .domains.d04 import AffectScheme
+
+        if not isinstance(active_affect_scheme, AffectScheme):
+            raise TypeError("active_affect_scheme must be an AffectScheme")
     catalogue = TypeRegistry()
     registrations: dict[str, DomainRegistration] = {}
     unavailable: dict[str, str] = {}
     for domain, (module_name, class_name, proposal_schema) in _PROVIDERS.items():
         try:
-            provider = getattr(import_module(module_name, __package__), class_name)()
+            provider_class = getattr(import_module(module_name, __package__), class_name)
+            provider = (
+                provider_class(active_scheme=active_affect_scheme)
+                if domain == "d04" else provider_class()
+            )
             descriptor = provider.descriptor
             if not callable(getattr(provider, "validate", None)):
                 raise TypeError("provider has no proposal validator")
