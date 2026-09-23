@@ -116,15 +116,18 @@ function setupMarkup() {
   const stage = installation ? stageNames[installation.stage] : "未取得";
   const reason = installation ? (reasonNames[installation.reason] ?? "运行能力尚未齐备")
     : (installationProblem?.message ?? "正在读取宿主安装状态");
+  const creationReceipt = state.receipt?.phase === "role_initialized" ? state.receipt : null;
+  const sceneReceipt = state.receipt?.phase === "scene_bound" ? state.receipt : null;
+  const creationHold = ["role_initialization_unavailable", "role_initialization_policy_unavailable", "role_initialization_receipt_invalid", "authority_unavailable", "invalid_provider_response"].includes(state.problem?.code);
   const steps = [
     ["插件安装与运行", stage, reason],
     ["AstrBot 控制台", state.dashboardAuthenticated ? "已登录" : "登录失效", state.dashboardAuthenticated ? "已认证，可打开工作台和查看安装状态。" : "请重新登录 AstrBot 控制台。"],
     ["Sylanne Owner", state.sessionReady ? "已解锁" : "锁定", state.sessionReady ? "服务端已复核当前可撤销 Owner 会话；每次命令还会重新复核。" : "需使用已配对的安装身份和 Owner 签名完成登录。"],
-    ["角色初始化", "未核验", "当前能力目录不包含角色初始化回执；填写角色 ID 不会创建角色。"],
-    ["场景绑定", "未核验", "当前没有绑定成功回执；私聊或群聊不可据此视为已接通。"],
+    ["角色初始化", creationReceipt ? "已初始化" : creationHold ? "HOLD" : "未核验", creationReceipt ? `服务端已确认 ${creationReceipt.role_ref}。` : creationHold ? "服务端未确认初始化；请检查安装配置和可信资源目录。" : "尚无初始化收据；模型能力和预算引用需来自可信安装资料。"],
+    ["场景绑定", sceneReceipt ? "已绑定" : "未核验", sceneReceipt ? `服务端已确认 ${sceneReceipt.scene_ref}。` : "当前没有绑定成功回执；私聊或群聊不可据此视为已接通。"],
     ["验证对话", "未核验", "尚无真实对话和投递收据；不会自动向聊天场景发消息。"]
   ];
-  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${escapeHtml(detail)}</p></li>`).join("")}</ol>${ownerLoginMarkup()}<p class="setup-next">${state.sessionReady ? (state.role ? "可刷新能力目录；创建与绑定入口需服务端完成后才会开放。" : "填写已授权的角色范围后，可读取能力目录。") : "完成 Owner 签名登录后，工作台会重新核验会话；在此之前角色内容和操作保持锁定。"}</p><button class="quiet" data-command="retry-status">刷新安装状态</button><button class="quiet" data-command="retry-session">重新核验 Owner 会话</button></div>`;
+  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${escapeHtml(detail)}</p></li>`).join("")}</ol>${ownerLoginMarkup()}<p class="setup-next">${state.sessionReady ? (state.role ? "可提交角色初始化或场景绑定申请；只有服务端回执代表完成。" : "填写已授权的角色范围后，可读取能力目录。") : "完成 Owner 签名登录后，工作台会重新核验会话；在此之前角色内容和操作保持锁定。"}</p><button class="quiet" data-command="retry-status">刷新安装状态</button><button class="quiet" data-command="retry-session">重新核验 Owner 会话</button></div>`;
 }
 
 function render() {
@@ -155,6 +158,7 @@ function render() {
         <div class="workspace-grid"><section class="projection-panel">${body}</section>
           <aside class="inspector" aria-label="操作面板"><h2>操作</h2><p>操作由服务端能力、当前作用域和版本核验。页面不会直接改图或调用平台发送。</p>
           <form id="page-form">${formMarkup(page)}<button type="button" class="primary" data-command="page-action" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>${page[0] === "setup" ? "提交场景绑定" : page[3] === "read" ? "读取当前视图" : "提交给服务端"}</button></form>
+          ${page[0] === "setup" ? `<section class="owner-operation"><h3>角色初始化</h3><p>模型能力和预算目录不会由工作台推测。请从可信安装资料填写引用；服务端未配置或无法核验时会保持 HOLD。</p><form id="create-character-form"><label>角色名称<input name="display_name" required maxlength="80" /></label><label>初始化方案<select name="blueprint" required><option value="">请选择</option><option value="blank">空白</option><option value="example">示例</option></select></label><label>模型能力引用<input name="model_capability_ref" required autocomplete="off" placeholder="来自可信安装资料" /></label><label>预算引用<input name="budget_ref" required autocomplete="off" placeholder="来自可信安装资料" /></label><button type="button" class="primary" data-command="create-character" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>提交角色初始化</button></form></section>` : ""}
           <dl><dt>操作收据</dt><dd>${escapeHtml(state.receipt?.operation_id ?? "尚无")}</dd><dt>状态</dt><dd>${escapeHtml(state.receipt?.phase ?? statusTitle)}</dd></dl></aside>
         </div>
       </main>
@@ -316,6 +320,14 @@ async function command(action) {
     const form = document.querySelector("#page-form");
     try {
       const [nextAction, input] = workflowForPage(page[0], Object.fromEntries(new FormData(form).entries()));
+      return commandAction(nextAction, input);
+    } catch (error) {
+      Object.assign(state, applyProblem(state, { code: "invalid_input", message: error.message, retryable: false })); render(); return;
+    }
+  }
+  if (action === "create-character") {
+    try {
+      const [nextAction, input] = workflowForPage("role-init", Object.fromEntries(new FormData(document.querySelector("#create-character-form")).entries()));
       return commandAction(nextAction, input);
     } catch (error) {
       Object.assign(state, applyProblem(state, { code: "invalid_input", message: error.message, retryable: false })); render(); return;

@@ -16,12 +16,14 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], own
   let sessionRequests = 0;
   let statusRequests = 0;
   let pageFields = {};
+  let createFields = {};
   globalThis.document = {
     querySelector(selector) {
       if (selector === "#app") return app;
       if (selector === "#role-input") return { value: roleInput };
       if (selector === "#owner-login-form") return { id: "owner-login-form" };
       if (selector === "#page-form") return { id: "page-form" };
+      if (selector === "#create-character-form") return { id: "create-character-form" };
       if (selector === "#owner-signature") return { value: ownerSignature };
       return null;
     }
@@ -29,7 +31,11 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], own
   globalThis.location = { origin };
   globalThis.FormData = class {
     constructor(form) { this.form = form; }
-    entries() { return Object.entries(this.form.id === "owner-login-form" ? ownerFields : pageFields)[Symbol.iterator](); }
+    entries() {
+      const values = this.form.id === "owner-login-form" ? ownerFields
+        : this.form.id === "create-character-form" ? createFields : pageFields;
+      return Object.entries(values)[Symbol.iterator]();
+    }
   };
   globalThis.fetch = async (url, init) => {
     if (init.method === "GET") {
@@ -60,6 +66,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], own
     setRole(value) { roleInput = value; },
     setOwnerSignature(value) { ownerSignature = value; },
     setPageFields(value) { pageFields = value; },
+    setCreateFields(value) { createFields = value; },
     clickCommand(command) { return app.click({ target: { closest(selector) { return selector === "[data-command]" ? { dataset: { command } } : null; } } }); },
     clickView(view) { return app.click({ target: { closest(selector) { return selector === "[data-view]" ? { dataset: { view } } : null; } } }); },
     restore() {
@@ -326,5 +333,52 @@ test("Owner can explicitly submit a manually supplied scene binding with acknowl
     ui.requests[2].resolve({ status: "ready", projection: { views: [] } });
     await submitted;
     assert.match(ui.app.innerHTML, /scene_bound/);
+  } finally { ui.restore(); }
+});
+
+test("Owner can submit D01 creation using only explicit trusted references and receive server receipt", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("role-a");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    assert.match(ui.app.innerHTML, /模型能力和预算目录不会由工作台推测/);
+    assert.match(ui.app.innerHTML, /来自可信安装资料/);
+    ui.setCreateFields({ display_name: "Mira", blueprint: "blank", model_capability_ref: "capability:local:verified", budget_ref: "budget:local:verified" });
+    const submitted = ui.clickCommand("create-character");
+    const request = await ui.nextRequest(1);
+    assert.equal(request.payload.action, "create_character");
+    assert.equal(request.payload.scope, "role-a");
+    assert.match(request.payload.operation_id, /^[0-9a-f-]{36}$/i);
+    assert.deepEqual(request.payload.input, {
+      display_name: "Mira", blueprint: "blank",
+      model_capability_ref: "capability:local:verified", budget_ref: "budget:local:verified"
+    });
+    request.resolve({ status: "ready", receipt: { operation_id: request.payload.operation_id, phase: "role_initialized", role_ref: "persona:mira", owner_grant_revision: 1 } });
+    await ui.nextRequest(2);
+    ui.requests[2].resolve({ status: "ready", projection: { views: [] } });
+    await submitted;
+    assert.match(ui.app.innerHTML, /角色初始化.*已初始化.*persona:mira/s);
+    assert.match(ui.app.innerHTML, new RegExp(request.payload.operation_id));
+  } finally { ui.restore(); }
+});
+
+test("D01 creation stays HOLD when installed catalogue resolution is unavailable", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("role-a");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    ui.setCreateFields({ display_name: "Mira", blueprint: "example", model_capability_ref: "capability:from:install", budget_ref: "budget:from:install" });
+    const submitted = ui.clickCommand("create-character");
+    const request = await ui.nextRequest(1);
+    request.resolve({ status: "unavailable", problem: { code: "role_initialization_unavailable", retryable: true } });
+    await submitted;
+    assert.match(ui.app.innerHTML, /角色初始化.*HOLD.*服务端未确认初始化/);
+    assert.doesNotMatch(ui.app.innerHTML, /role_initialized/);
   } finally { ui.restore(); }
 });

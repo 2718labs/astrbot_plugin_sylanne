@@ -22,6 +22,20 @@ export function workflowForPage(page, values) {
       if (values.acknowledgement !== "on" && values.acknowledgement !== true) throw new Error("请确认场景引用和可见范围准确后再提交。");
       return [ACTIONS.bindScene, { scene_ref: sceneRef, visibility, acknowledgement: true }];
     }
+    case "role-init": {
+      const displayName = text(values.display_name);
+      const blueprint = text(values.blueprint);
+      const modelCapabilityRef = text(values.model_capability_ref);
+      const budgetRef = text(values.budget_ref);
+      if (!displayName || displayName.length > 80) throw new Error("名称需为 1 至 80 个字符。");
+      if (!["blank", "example"].includes(blueprint)) throw new Error("请选择服务端支持的初始化方案。");
+      const validRef = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$/;
+      if (!validRef.test(modelCapabilityRef) || !validRef.test(budgetRef)) throw new Error("请填写可信安装资料中的模型能力引用和预算引用。");
+      return [ACTIONS.createCharacter, {
+        display_name: displayName, blueprint,
+        model_capability_ref: modelCapabilityRef, budget_ref: budgetRef
+      }];
+    }
     case "creation": {
       const draft = objectJson(values.draft_json);
       return mode === "activate"

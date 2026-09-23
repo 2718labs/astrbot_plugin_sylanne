@@ -199,6 +199,18 @@ test("degraded server responses clear content and stale receipts", () => {
 });
 
 test("nine-page workflows map user inputs only to W10 action schemas", () => {
+  const [create, creation] = workflowForPage("role-init", {
+    display_name: "Mira", blueprint: "blank",
+    model_capability_ref: "capability:local:verified", budget_ref: "budget:local:verified"
+  });
+  assert.equal(create, ACTIONS.createCharacter);
+  assert.deepEqual(creation, {
+    display_name: "Mira", blueprint: "blank",
+    model_capability_ref: "capability:local:verified", budget_ref: "budget:local:verified"
+  });
+  assert.throws(() => workflowForPage("role-init", { display_name: "", blueprint: "blank", model_capability_ref: "capability:x", budget_ref: "budget:x" }), /名称/);
+  assert.throws(() => workflowForPage("role-init", { display_name: "Mira", blueprint: "invented", model_capability_ref: "capability:x", budget_ref: "budget:x" }), /方案/);
+  assert.throws(() => workflowForPage("role-init", { display_name: "Mira", blueprint: "blank", model_capability_ref: "", budget_ref: "budget:x" }), /可信安装资料/);
   const [bind, binding] = workflowForPage("setup", { scene_ref: `scene:conversation-v1:${"a".repeat(64)}`, visibility: "private", acknowledgement: "on" });
   assert.equal(bind, ACTIONS.bindScene);
   assert.deepEqual(binding, { scene_ref: `scene:conversation-v1:${"a".repeat(64)}`, visibility: "private", acknowledgement: true });
