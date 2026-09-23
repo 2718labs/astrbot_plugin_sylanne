@@ -80,6 +80,13 @@ pub extern "C" fn sylanne3_v2_supported_certificate_flags() -> u32 {
     }
 }
 
+/// Versioned mathematical capability of this ABI2 library. This concerns
+/// fixed-block interval bounds only, not product-level numerical admission.
+#[no_mangle]
+pub extern "C" fn sylanne3_v2_math_capabilities() -> u32 {
+    sylanne3_v2_supported_certificate_flags()
+}
+
 #[no_mangle]
 pub extern "C" fn sylanne3_v2_max_dimension() -> u32 {
     MAX_N as u32

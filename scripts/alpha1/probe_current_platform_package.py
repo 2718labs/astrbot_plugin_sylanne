@@ -64,12 +64,13 @@ def main() -> None:
                 "capabilities = library.capabilities",
                 "assert capabilities.abi_version == 2 and capabilities.diagnostic_only",
                 "assert not capabilities.numerically_certified",
+                "assert capabilities.supports_fixed_block_interval_math_v1",
                 "binding = library.production_binding",
                 "if binding is None: raise AssertionError('loaded native has no production binding')",
                 "expected = dict(manifest_sha256=sys.argv[2], native_sha256=sys.argv[3], os=sys.argv[4], arch=sys.argv[5], libc=json.loads(sys.argv[6]), abi_version=2)",
                 "for field, value in expected.items():",
                 "    if getattr(binding, field) != value: raise AssertionError(f'native binding {field} mismatch')",
-                "print(json.dumps({'abi_version': capabilities.abi_version, 'max_dimension': capabilities.max_dimension, 'diagnostic_only': capabilities.diagnostic_only, 'binding': expected}))",
+                "print(json.dumps({'abi_version': capabilities.abi_version, 'max_dimension': capabilities.max_dimension, 'fixed_block_interval_math_v1': capabilities.supports_fixed_block_interval_math_v1, 'numerically_certified': capabilities.numerically_certified, 'diagnostic_only': capabilities.diagnostic_only, 'binding': expected}))",
             )
         )
         loaded = subprocess.run(

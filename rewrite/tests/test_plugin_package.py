@@ -209,6 +209,10 @@ class PluginPackageTests(unittest.TestCase):
             self.assertEqual(manifest["platform"]["os"], "windows")
             self.assertEqual(manifest["platform"]["arch"], "x86_64")
             self.assertEqual(manifest["platform"]["abi_version"], 2)
+            self.assertEqual(manifest["native_math"], {
+                "contract": "abi2.fixed-block-interval.v1",
+                "capability_flags": 0x1,
+            })
             listed = {item["path"]: item for item in manifest["files"]}
             self.assertEqual(set(names), set(listed) | {"release-manifest.json"})
             for path, item in listed.items():
@@ -216,6 +220,34 @@ class PluginPackageTests(unittest.TestCase):
                 self.assertEqual(item["bytes"], len(content))
                 self.assertEqual(item["sha256"], hashlib.sha256(content).hexdigest())
         self.builder.verify_package(first)
+
+    def test_verifier_rejects_missing_or_changed_native_math_contract(self) -> None:
+        package = self.builder.build_package(
+            project_root=self.project,
+            target_os="windows",
+            target_arch="x86_64",
+            native_library=self._native(),
+            output_dir=self.base / "math-contract",
+            allow_dirty_dev_probe=True,
+        )
+        with zipfile.ZipFile(package) as source:
+            members = {name: source.read(name) for name in source.namelist()}
+        for native_math in (None, {"contract": "FULL_PRODUCTION_ADVANCE_V1", "capability_flags": 1}):
+            with self.subTest(native_math=native_math):
+                manifest = json.loads(members["release-manifest.json"])
+                if native_math is None:
+                    del manifest["native_math"]
+                else:
+                    manifest["native_math"] = native_math
+                forged = self.base / f"forged-math-{native_math is None}.zip"
+                with zipfile.ZipFile(forged, "w") as archive:
+                    for name, content in members.items():
+                        archive.writestr(
+                            name,
+                            json.dumps(manifest).encode() if name == "release-manifest.json" else content,
+                        )
+                with self.assertRaisesRegex(ValueError, "native math contract"):
+                    self.builder.verify_package(forged)
 
     def test_formal_build_rejects_dirty_source_but_dev_probe_records_it(self) -> None:
         (self.project / "main.py").write_text("VALUE = 2\n", encoding="utf-8")
@@ -577,6 +609,7 @@ class PluginPackageTests(unittest.TestCase):
                 self.assertEqual(manifest["platform"]["os"], target_os)
                 self.assertEqual(manifest["platform"]["arch"], target_arch)
                 self.assertEqual(manifest["platform"]["libc"], libc)
+                self.assertEqual(manifest["native_math"]["capability_flags"], 0x1)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import platform
 import re
 from typing import Callable
 
-from .abi2 import ABI2StepInput, ABI2StepResult, ABI_VERSION
+from .abi2 import ABI2StepInput, ABI2StepResult, ABI2_FIXED_BLOCK_INTERVAL_V1, ABI_VERSION
 
 
 MANIFEST_NAME = "release-manifest.json"
@@ -46,6 +46,7 @@ class NativeCapabilities:
     numerically_certified: bool = False
     supports_cancellation: bool = False
     diagnostic_only: bool = True
+    supports_fixed_block_interval_math_v1: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,12 @@ class ABI2NativeLibrary:
         maximum = library.sylanne3_v2_max_dimension
         maximum.argtypes = []
         maximum.restype = ctypes.c_uint32
+        try:
+            math_capabilities = library.sylanne3_v2_math_capabilities
+        except AttributeError as exc:
+            raise NativeIntegrityError("native ABI2 math capabilities export is missing") from exc
+        math_capabilities.argtypes = []
+        math_capabilities.restype = ctypes.c_uint32
         step = library.sylanne3_v2_step
         step.argtypes = [
             ctypes.POINTER(ABI2StepInput),
@@ -79,13 +86,19 @@ class ABI2NativeLibrary:
         step.restype = ctypes.c_int32
         abi = int(version())
         max_dimension = int(maximum())
+        math_flags = int(math_capabilities())
         if abi != ABI_VERSION:
             raise NativePlatformError(f"loaded native library reports ABI {abi}, expected ABI 2")
         if not 1 <= max_dimension <= 65_536:
             raise NativeIntegrityError("native maximum dimension is outside the ABI2 contract")
+        if math_flags & ~ABI2_FIXED_BLOCK_INTERVAL_V1:
+            raise NativeIntegrityError("native reports unsupported ABI2 math capabilities")
         self._library = library
         self._step = step
-        self.capabilities = NativeCapabilities(abi, max_dimension)
+        self.capabilities = NativeCapabilities(
+            abi, max_dimension,
+            supports_fixed_block_interval_math_v1=bool(math_flags & ABI2_FIXED_BLOCK_INTERVAL_V1),
+        )
         self._production_binding: NativeLoadBinding | None = None
 
     @property
@@ -177,6 +190,12 @@ def load_production_native(
     expected_filename = CANONICAL_LIBRARIES[os_name]
     if platform_entry.get("abi_version") != ABI_VERSION:
         raise NativePlatformError("production native package must provide ABI 2")
+    expected_math = {
+        "contract": "abi2.fixed-block-interval.v1",
+        "capability_flags": ABI2_FIXED_BLOCK_INTERVAL_V1,
+    }
+    if manifest.get("native_math") != expected_math:
+        raise NativeIntegrityError("release manifest native math contract is invalid")
     if platform_entry.get("os") != os_name or platform_entry.get("arch") != arch:
         raise NativePlatformError("native package OS/architecture does not match this runtime")
     if platform_entry.get("native_filename") != expected_filename:
@@ -230,7 +249,7 @@ def load_production_native(
         library = _cdll_factory(str(library_path))
     except OSError as exc:
         raise NativeLoadError(f"canonical native library could not be loaded: {exc}") from exc
-    return ABI2NativeLibrary._from_verified_package(
+    handle = ABI2NativeLibrary._from_verified_package(
         library,
         library_path,
         NativeLoadBinding(
@@ -242,3 +261,6 @@ def load_production_native(
             abi_version=ABI_VERSION,
         ),
     )
+    if not handle.capabilities.supports_fixed_block_interval_math_v1:
+        raise NativeIntegrityError("loaded native math capabilities disagree with release manifest")
+    return handle

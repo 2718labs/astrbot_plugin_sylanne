@@ -38,9 +38,10 @@ class _Symbol:
 
 
 class _Library:
-    def __init__(self, abi: int = 2, maximum: int = 65_536) -> None:
+    def __init__(self, abi: int = 2, maximum: int = 65_536, math_flags: int = 0x1) -> None:
         self.sylanne3_v2_abi_version = _Symbol(abi)
         self.sylanne3_v2_max_dimension = _Symbol(maximum)
+        self.sylanne3_v2_math_capabilities = _Symbol(math_flags)
         self.sylanne3_v2_step = _Symbol(0)
 
 
@@ -111,6 +112,10 @@ class NativeLoaderTests(unittest.TestCase):
         }
         manifest = {
             "schema_version": 1,
+            "native_math": {
+                "contract": "abi2.fixed-block-interval.v1",
+                "capability_flags": ABI2_FIXED_BLOCK_INTERVAL_V1,
+            },
             "platform": {
                 "os": target_os,
                 "arch": arch,
@@ -144,6 +149,7 @@ class NativeLoaderTests(unittest.TestCase):
         self.assertEqual(loaded, [expected_library.resolve()])
         self.assertEqual(kernel.capabilities.abi_version, 2)
         self.assertEqual(kernel.capabilities.max_dimension, 65_536)
+        self.assertTrue(kernel.capabilities.supports_fixed_block_interval_math_v1)
         self.assertFalse(kernel.capabilities.numerically_certified)
         self.assertFalse(kernel.capabilities.supports_cancellation)
         self.assertTrue(kernel.capabilities.diagnostic_only)
@@ -164,8 +170,45 @@ class NativeLoaderTests(unittest.TestCase):
     def test_direct_abi2_handle_has_no_production_binding(self) -> None:
         direct = ABI2NativeLibrary(_Library(), self.root / "unverified.dll")
         self.assertIsNone(direct.production_binding)
+        self.assertTrue(direct.capabilities.supports_fixed_block_interval_math_v1)
+        self.assertFalse(direct.capabilities.numerically_certified)
         with self.assertRaises(AttributeError):
             direct.production_binding = object()
+
+    def test_rejects_native_math_capability_disagreement(self) -> None:
+        trust_root, _ = self._package()
+        for flags in (0, 0x2):
+            with self.subTest(flags=flags), self.assertRaisesRegex(
+                NativeIntegrityError, "math capabilities"
+            ):
+                load_production_native(
+                    self.root,
+                    trusted_manifest_sha256=trust_root,
+                    _cdll_factory=lambda _, flags=flags: _Library(math_flags=flags),
+                )
+
+        missing_export = _Library()
+        del missing_export.sylanne3_v2_math_capabilities
+        with self.assertRaisesRegex(NativeIntegrityError, "math capabilities export"):
+            load_production_native(
+                self.root,
+                trusted_manifest_sha256=trust_root,
+                _cdll_factory=lambda _: missing_export,
+            )
+
+    def test_rejects_manifest_without_math_contract(self) -> None:
+        self._package()
+        manifest_path = self.root / "release-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        del manifest["native_math"]
+        raw = json.dumps(manifest).encode()
+        manifest_path.write_bytes(raw)
+        with self.assertRaisesRegex(NativeIntegrityError, "math contract"):
+            load_production_native(
+                self.root,
+                trusted_manifest_sha256=hashlib.sha256(raw).hexdigest(),
+                _cdll_factory=lambda _: self.fail("library must not be loaded"),
+            )
 
     def test_rejects_manifest_without_matching_external_trust_root(self) -> None:
         self._package()

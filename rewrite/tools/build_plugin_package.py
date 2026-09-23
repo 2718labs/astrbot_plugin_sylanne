@@ -21,6 +21,8 @@ import zipfile
 
 MANIFEST_PATH = "release-manifest.json"
 ABI_VERSION = 2
+ABI2_FIXED_BLOCK_INTERVAL_V1 = 0x1
+NATIVE_MATH_CONTRACT = "abi2.fixed-block-interval.v1"
 FORMAL_VERSION = "3.0.0-alpha1"
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 ROOT_FILE_ALLOWLIST = (
@@ -377,6 +379,10 @@ def _manifest(
             "sha256": _sha256(payload[native_path]),
             "bytes": len(payload[native_path]),
         },
+        "native_math": {
+            "contract": NATIVE_MATH_CONTRACT,
+            "capability_flags": ABI2_FIXED_BLOCK_INTERVAL_V1,
+        },
         "files": files,
     }
     if affect_scheme is not None:
@@ -514,6 +520,11 @@ def verify_package(package: Path | str) -> None:
                 raise ValueError("release-manifest.json is invalid") from exc
             if manifest.get("schema_version") != 1:
                 raise ValueError("ReleaseManifest schema is unsupported")
+            if manifest.get("native_math") != {
+                "contract": NATIVE_MATH_CONTRACT,
+                "capability_flags": ABI2_FIXED_BLOCK_INTERVAL_V1,
+            }:
+                raise ValueError("ReleaseManifest native math contract is invalid")
             entries = manifest.get("files")
             if not isinstance(entries, list):
                 raise ValueError("ReleaseManifest files must be a list")

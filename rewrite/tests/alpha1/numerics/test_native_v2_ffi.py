@@ -41,6 +41,8 @@ class NativeV2FFITests(unittest.TestCase):
         cls.library.sylanne3_v2_abi_version.restype = ctypes.c_uint32
         cls.library.sylanne3_v2_supported_certificate_flags.argtypes = []
         cls.library.sylanne3_v2_supported_certificate_flags.restype = ctypes.c_uint32
+        cls.library.sylanne3_v2_math_capabilities.argtypes = []
+        cls.library.sylanne3_v2_math_capabilities.restype = ctypes.c_uint32
         cls.library.sylanne3_v2_step.argtypes = [
             ctypes.POINTER(ABI2StepInput),
             ctypes.POINTER(ctypes.c_double),
@@ -165,6 +167,10 @@ class NativeV2FFITests(unittest.TestCase):
         self.assertEqual(self.library.sylanne3_v2_abi_version(), 2)
         self.assertEqual(
             self.library.sylanne3_v2_supported_certificate_flags(),
+            ABI2_FIXED_BLOCK_INTERVAL_V1,
+        )
+        self.assertEqual(
+            self.library.sylanne3_v2_math_capabilities(),
             ABI2_FIXED_BLOCK_INTERVAL_V1,
         )
         step, keepalive = self._coupled_linear_input()
