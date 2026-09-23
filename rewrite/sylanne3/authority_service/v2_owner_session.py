@@ -15,7 +15,7 @@ import json
 import re
 import secrets
 import sqlite3
-from typing import Callable
+from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
 from .contract import AuthorityUnavailable, identifier
@@ -139,6 +139,12 @@ class OwnerSessionLoginChallengeV1:
         return b"Sylanne3 Owner session login v1\n" + _canonical(self)
 
 
+class CurrentOwnerPairingSource(Protocol):
+    def require_current_owner_key_in_tx(
+            self, db: sqlite3.Connection, request: OwnerSessionLoginRequestV1,
+            public_key: bytes) -> None: ...
+
+
 def to_wire(value: OwnerSessionLoginRequestV1 | OwnerSessionLoginChallengeV1) -> dict[str, object]:
     if type(value) is OwnerSessionLoginRequestV1:
         return {"kind": "owner_session_login_request_v1", **asdict(value)}
@@ -188,11 +194,13 @@ class AuthorityV2OwnerSessionStore:
 
     def __init__(self, core: AuthorityServiceCore, *,
                  utc_clock: Callable[[], datetime] | None = None,
+                 current_pairing_source: CurrentOwnerPairingSource | None = None,
                  create: bool = False) -> None:
         if type(core) is not AuthorityServiceCore:
             raise TypeError("Owner sessions need an independent Authority core")
         self._core = core
         self._utc_clock = utc_clock
+        self._current_pairing_source = current_pairing_source
         with core._tx() as db:
             self._require_mode(db)
             if db.execute("SELECT name FROM sqlite_master WHERE name='authority_owner_credentials_v1'").fetchone() is None:
@@ -258,6 +266,9 @@ class AuthorityV2OwnerSessionStore:
              request.credential_id, request.credential_epoch),
         ).fetchone() is not None:
             raise AuthorityUnavailable("Owner credential is revoked")
+        if self._current_pairing_source is not None:
+            self._current_pairing_source.require_current_owner_key_in_tx(
+                db, request, key[2])
         return key[2]
 
     @staticmethod
@@ -433,6 +444,7 @@ class AuthorityV2OwnerSessionStore:
 
 
 __all__ = (
-    "AuthorityV2OwnerSessionStore", "OwnerSessionLoginChallengeV1",
+    "AuthorityV2OwnerSessionStore", "CurrentOwnerPairingSource",
+    "OwnerSessionLoginChallengeV1",
     "OwnerSessionLoginRequestV1", "from_wire", "to_wire",
 )

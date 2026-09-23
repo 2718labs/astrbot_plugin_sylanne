@@ -28,6 +28,7 @@ from ..authority_service.v2_owner_proof import (
     AuthorityV2OwnerProofStore, OwnerCredentialRegistrationV1,
     OwnerProofAcceptanceV1, OwnerProofRequestV1,
 )
+from ..authority_service.v2_owner_session import AuthorityV2OwnerSessionStore
 from ..runtime_contracts import NamespaceId
 
 
@@ -193,27 +194,34 @@ def compose_owner_deployment(
     namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
+    owner_sessions: AuthorityV2OwnerSessionStore | None = None,
 ) -> AuthorityRpcServer:
     """Compose the existing graph verifier, proof store and mTLS RPC server.
 
     The caller installs the returned server and TLS configuration separately.
     Missing trusted host identity prevents construction before schema changes.
-    Credential registration checks current pairing; beginning and accepting a
-    challenge each checks current login. First issue then requires the stored
-    signed proof through ``compose_local_owner_authority``.
+    Credential registration checks current pairing. With Owner sessions, key
+    login and final issue use the revocable Authority session store. The older
+    proof mode requires a separately verified current Dashboard login source.
     """
     verifier = OwnerDeploymentVerifier(identity, utc_clock)
+    if (owner_sessions is not None
+            and owner_sessions._current_pairing_source is not identity):
+        raise AuthorityUnavailable(
+            "Owner sessions require the current installation pairing source")
     proofs = AuthorityV2OwnerProofStore(
         core, utc_clock=utc_clock,
         pairing_verifier=verifier.pair_credential,
-        session_verifier=verifier.current_session,
+        session_verifier=verifier.current_session if owner_sessions is None else None,
         create=create_owner_schema,
     )
     return compose_local_owner_authority(
         core=core, v2_fences=v2_fences, graph_db_path=graph_db_path,
         utc_clock=utc_clock, first_claim_verifier=verifier.first_claim,
         claimant_verifier=None, owner_proofs=proofs,
-        current_claimant_verifier=verifier.current_claimant,
+        current_claimant_verifier=(verifier.current_claimant
+                                   if owner_sessions is None else None),
+        owner_sessions=owner_sessions,
         administrator_authorizer=administrator_authorizer,
         publisher_manifest_verifier=publisher_manifest_verifier,
         installations_v2=installations_v2,
