@@ -20,7 +20,7 @@ from sylanne3.workbench_api.http_transport import CurrentOwnerDashboardSessions
 from sylanne3.workbench_api.owner_session_resolver import BoundOwnerSessions
 
 
-NAMESPACE = NamespaceId("bot", "persona")
+NAMESPACE = NamespaceId("bot-alpha", "persona-alpha")
 PRINCIPAL = OwnerPrincipalV1("paired-idp", "owner-account", "incarnation-1")
 ORIGIN = "https://dashboard.local"
 TOKEN = "T" * 43
@@ -141,7 +141,7 @@ async def test_signed_login_binds_current_owner_facts_to_one_dashboard_user(inst
     assert paired.principal == PRINCIPAL and paired.guard == GUARD
     assert paired.session.actor_id == "owner-actor"
     assert paired.session.host_username == "dashboard-a"
-    assert paired.session.scope_capabilities["bot/persona"] == BINDING.capabilities
+    assert paired.session.scope_capabilities["bot-alpha/persona-alpha"] == BINDING.capabilities
     assert coordinator.reads == 2 and authority.described == 2
     assert await resolver.resolve_current_owner_session(
         username="dashboard-b", owner_session_token=token) is None

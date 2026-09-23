@@ -154,7 +154,7 @@ class BoundOwnerSessions:
                 and binding.principal == request.principal
                 and binding.actor == actor
                 and binding.namespace == self._namespace
-                and binding.scope == f"{self._namespace.bot_id}/{self._namespace.persona_id}"
+                and binding.scope == "bot/persona"
                 and binding.authorization_revision == guard.authorization_revision
                 and binding.authorization_head == guard.authorization_head
                 and binding.revocation_epoch == guard.minimum_revocation_epoch
