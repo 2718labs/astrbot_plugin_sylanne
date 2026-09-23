@@ -1,0 +1,107 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from sylanne3.contracts import Event, Scope
+from sylanne3.domains.d04 import AffectAxis, AffectCoupling, AffectProvider, AffectScheme, MoodField
+from sylanne3.domains.d06 import D06DomainAdapter, RecallIntent, RecollectionContext, SelectionTicket, TriggerKind
+from sylanne3.domains.d06.pipeline import D06MemoryPipeline, SearchPlan
+from sylanne3.graph_store import GraphStore
+from sylanne3.graph_types import AtomKey, GraphCandidate, GraphWrite, Owner, TypeRegistry
+from sylanne3.memory_repository import MemoryRepository
+from sylanne3.memory_reconstruction import DetailCue
+from sylanne3.memory_retrieval import MemoryQuery
+from sylanne3.memory_types import SourceRecord, register_memory_types, source_key
+from sylanne3.runtime_contracts import NamespaceId, SourceQualification
+
+
+class AffectivePipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.scheme = AffectScheme(
+            "d04.affect.scheme.v1", "scheme-1", "operator-1", "parameters-1",
+            "coupling-1", (AffectAxis("warmth", "normalized", "warmth"),), (),
+        )
+        self.coupling = AffectCoupling("recall", "coupling-1", "warmth", "warmth", 0, 0.5, 0.5)
+        registry = TypeRegistry()
+        register_memory_types(registry)
+        for spec in AffectProvider(active_scheme=self.scheme).type_specs():
+            registry.register(spec)
+        self.store = GraphStore(Path(self.tmp.name) / "memory.db", registry)
+        self.addCleanup(self.store.close)
+        self.repository = MemoryRepository(self.store, "bot", "persona")
+        self.pipeline = D06MemoryPipeline(D06DomainAdapter(NamespaceId("bot", "persona")), self.repository)
+        self.scope = Scope("bot", "persona", "session")
+        self.mood_key = AtomKey(Owner("persona", "bot", "persona"), "d04.mood_field.v1", "current")
+        self.source = SourceRecord("message-1", "I waited a long time", "user", "reported",
+                                   "reported", 1.0, 2.0, "family-1", ("owner",), ("context",))
+        self.repository.ingest(Event(self.scope, "ingest", 1, "ingest", {}), self.source)
+        self.qualification = self.pipeline.adapter.qualify_recall(
+            RecallIntent("ask", TriggerKind.EXPLICIT_PAST_REQUEST, "what happened?"))
+        self.refresh()
+
+    def refresh(self):
+        self.outcome = self.pipeline.retrieve_candidates(
+            self.qualification, "set", (SearchPlan("exact", MemoryQuery("source", ids=("message-1",)), 1),),
+            audience="owner", purpose="context", access_epoch=1, delete_epoch=1,
+        )
+        self.ticket = SelectionTicket("ticket", "activity", "set",
+                                      (self.outcome.candidates.items[0].candidate_id,), 1)
+
+    def mood(self, warmth, event_id):
+        mood = MoodField("mood-1", "scheme-1", (("warmth", warmth),),
+                         (source_key("bot", "persona", "message-1").token,),
+                         "parameters-1", "coupling-1", 2.0)
+        snapshot = self.store.graph_snapshot((self.mood_key,))
+        self.store.graph_commit(GraphCandidate(
+            Event(self.scope, event_id, 2, "mood", {}), snapshot.versions,
+            (GraphWrite(self.mood_key, {**mood.__dict__, "coordinates": [["warmth", warmth]],
+                                        "source_refs": list(mood.source_refs)}),), snapshot.epochs,
+        ))
+        result = self.store.graph_snapshot((self.mood_key,))
+        self.refresh()
+        return result
+
+    def prepare(self, snapshot):
+        return self.pipeline.prepare_affective_recollection(
+            self.outcome, self.ticket, RecollectionContext((), (), ()),
+            audience="owner", purpose="context", mood_snapshot=snapshot,
+            mood_key=self.mood_key, scheme=self.scheme, coupling=self.coupling,
+            source_qualification=SourceQualification(
+                (source_key("bot", "persona", "message-1").token,), "reported", 1.0, 2.0,
+                "external_report", "eligible", 0.6, "not_applicable"),
+            base_salience=(0.4, 0.6), base_tone=(-0.1, 0.1),
+            detail_cues=(DetailCue("waiting", (0, 8), 0.65),), temporal_focus=True,
+        )
+
+    def test_mood_changes_subjective_candidate_without_changing_literal_source(self):
+        warm = self.prepare(self.mood(0.8, "warm"))
+        guarded = self.prepare(self.mood(-0.8, "guarded"))
+        self.assertEqual(warm.source_fields, guarded.source_fields)
+        self.assertNotEqual(warm.subjective_tone, guarded.subjective_tone)
+        self.assertNotEqual(warm.subjective_weight, guarded.subjective_weight)
+        self.assertEqual(warm.status, "candidate_hold")
+
+    def test_withdrawal_and_stale_mood_stop_preparation(self):
+        old_mood = self.mood(0.8, "warm")
+        self.mood(-0.8, "guarded")
+        with self.assertRaisesRegex(RuntimeError, "epochs differ"):
+            self.prepare(old_mood)
+        current_mood = self.store.graph_snapshot((self.mood_key,))
+        self.repository.set_access(
+            Event(self.scope, "withdraw", 3, "withdraw", {}), "message-1",
+            audiences=("owner",), purposes=("context",), status="withdrawn", recorded_at=3,
+        )
+        with self.assertRaisesRegex(PermissionError, "no longer accessible"):
+            self.prepare(current_mood)
+
+    def test_ticket_must_select_a_source_in_the_retrieved_set(self):
+        snapshot = self.mood(0.5, "warm")
+        self.ticket = SelectionTicket("other", "activity", "set", ("absent",), 1)
+        with self.assertRaisesRegex(ValueError, "does not select"):
+            self.prepare(snapshot)
+
+
+if __name__ == "__main__":
+    unittest.main()

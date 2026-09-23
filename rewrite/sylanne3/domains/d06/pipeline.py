@@ -14,9 +14,14 @@ import math
 from ...graph_types import GraphVersion, NamespaceEpoch
 from ...memory_repository import MemoryRepository
 from ...memory_retrieval import MemoryBatch, MemoryQuery, MemoryRetriever
+from ...memory_retrieval import MemoryHit
+from ...memory_recollection_view import prepare_affective_recollection_view
+from ...memory_reconstruction import DetailCue, RecollectionReconstruction, reconstruct_recollection_candidate
 from ...memory_types import source_key
 from ...memory_types import access_key
-from ...runtime_contracts import NamespaceId
+from ...runtime_contracts import NamespaceId, SourceQualification
+from ...graph_types import AtomKey, GraphSnapshot
+from ..d04 import AffectCoupling, AffectScheme
 from . import (
     CandidateSet,
     D06DomainAdapter,
@@ -24,6 +29,8 @@ from . import (
     EncodingProposal,
     RecallQualification,
     RetrievalChannel,
+    RecollectionContext,
+    SelectionTicket,
 )
 
 
@@ -116,6 +123,83 @@ class D06MemoryPipeline:
         self.adapter = adapter
         self.repository = repository
         self.retriever = MemoryRetriever(repository)
+
+    def prepare_affective_recollection(
+        self,
+        outcome: RetrievalOutcome,
+        ticket: SelectionTicket,
+        context: RecollectionContext,
+        *,
+        audience: str,
+        purpose: str,
+        mood_snapshot: GraphSnapshot,
+        mood_key: AtomKey,
+        scheme: AffectScheme,
+        coupling: AffectCoupling,
+        source_qualification: SourceQualification,
+        base_salience: tuple[float, float],
+        base_tone: tuple[float, float],
+        detail_cues: tuple[DetailCue, ...],
+        then_meaning_refs: tuple[str, ...] = (),
+        temporal_focus: bool = False,
+    ) -> RecollectionReconstruction:
+        """Prepare one selected source as a mood-shaped C04 candidate.
+
+        The source and access are read again after retrieval. A final graph
+        snapshot checks the mood and every read version before returning.
+        Actual recollection and experience submission belong to C04/D11.
+        """
+        if outcome.status != "candidate" or outcome.candidates is None or outcome.epoch is None:
+            raise ValueError("a qualified D06 retrieval outcome is required")
+        if len(ticket.selected_candidate_ids) != 1:
+            raise ValueError("one D07 selected candidate is required")
+        if (mood_snapshot.epochs != (outcome.epoch,) or
+                (outcome.epoch.bot, outcome.epoch.persona) != self.adapter.namespace.as_tuple):
+            raise RuntimeError("D06 retrieval and D04 mood epochs differ")
+        selected = next((item for item in outcome.candidates.items
+                         if item.candidate_id == ticket.selected_candidate_ids[0]), None)
+        if selected is None:
+            raise ValueError("D07 ticket does not select a D06 candidate")
+        hit = next((hit for batch in outcome.batches for hit in batch.hits
+                    if isinstance(hit, MemoryHit) and hit.key == source_key(
+                        *self.adapter.namespace.as_tuple, selected.content_ref)), None)
+        if hit is None:
+            raise ValueError("selected source has no retrieval proof")
+        current_source, source_proof = self.repository.read_source_evidence(
+            selected.content_ref, audience=audience, purpose=purpose,
+        )
+        if current_source is None:
+            raise PermissionError("selected source is no longer accessible")
+        if source_proof.epochs != (outcome.epoch,) or current_source != hit.record:
+            raise RuntimeError("selected source changed after retrieval")
+        proof_by_key = {version.key: version for version in source_proof.versions}
+        if any(proof_by_key.get(version.key) != version for version in hit.proof_versions):
+            raise RuntimeError("selected source or access proof changed after retrieval")
+
+        view = prepare_affective_recollection_view(
+            ticket=ticket, candidates=outcome.candidates, hit=hit,
+            mood_snapshot=mood_snapshot, mood_key=mood_key,
+            scheme=scheme, coupling=coupling,
+            source_qualification=source_qualification,
+            base_salience=base_salience, base_tone=base_tone, purpose=purpose,
+        )
+        proposal = self.adapter.prepare_recollection(ticket, outcome.candidates, context)
+        result = reconstruct_recollection_candidate(
+            proposal=proposal, view=view, detail_cues=detail_cues,
+            then_meaning_refs=then_meaning_refs, temporal_focus=temporal_focus,
+        )
+        current = self.repository.store.graph_snapshot(
+            tuple(dict.fromkeys((*proof_by_key, mood_key)))
+        )
+        if (current.epochs != (outcome.epoch,) or
+                current.get(mood_key) != mood_snapshot.get(mood_key) or any(
+            current.get(version.key) is None or
+            current.get(version.key).revision != version.revision or
+            not current.get(version.key).valid
+            for version in (*source_proof.versions, *result.read_versions)
+        )):
+            raise RuntimeError("recollection source, access, or mood changed during preparation")
+        return result
 
     def prepare_association(
         self,
