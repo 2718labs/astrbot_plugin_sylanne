@@ -8,6 +8,7 @@ atomic with the business bundle that consumes it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import re
 from typing import Mapping
@@ -161,6 +162,29 @@ class BudgetReceipt:
         _amounts(self.unconfirmed)
 
 
+@dataclass(frozen=True)
+class BudgetReservation:
+    lease_id: str
+    operation_id: str
+    digest: str
+    ceiling: Mapping[str, int]
+    state: str = "reserved"
+
+    def __post_init__(self) -> None:
+        _identifier(self.lease_id, "lease_id")
+        _identifier(self.operation_id, "operation_id")
+        _digest(self.digest)
+        object.__setattr__(self, "ceiling", _amounts(self.ceiling, allow_empty=False))
+        if self.state != "reserved":
+            raise BudgetConflict("budget reservation is no longer settleable")
+
+
+@dataclass(frozen=True)
+class BudgetPrediction:
+    receipt: BudgetReceipt
+    receipt_json_sha256: str
+
+
 def install_schema(db) -> None:
     db.execute("""
         CREATE TABLE IF NOT EXISTS runtime_budget_leases(
@@ -251,6 +275,83 @@ def _receipt_from_json(value: str) -> BudgetReceipt:
     return BudgetReceipt(**json.loads(value))
 
 
+def _reserve_transition(lease: BudgetLease, ceiling: Mapping[str, int]) -> BudgetLease:
+    if lease.state != "active":
+        raise BudgetUnavailable("budget lease is inactive")
+    for dimension, amount in ceiling.items():
+        if amount > lease.available(dimension):
+            raise BudgetUnavailable("budget ceiling exceeds availability")
+    return BudgetLease(
+        lease.lease_id, lease.parent_id, lease.bot_id, lease.persona_id,
+        lease.currency, lease.limits, lease.used, _plus(lease.reserved, ceiling),
+        lease.unconfirmed, lease.version + 1, lease.state,
+    )
+
+
+def _settle_transition(
+    lease: BudgetLease, ceiling: Mapping[str, int], actual: Mapping[str, int] | None,
+    execution_revoked: bool,
+) -> tuple[BudgetLease, str, str | None, str]:
+    if actual is None:
+        used = lease.used
+        unconfirmed = _plus(lease.unconfirmed, ceiling)
+        status = "pending_confirmation"
+        actual_json = None
+        reservation_state = "unknown"
+    else:
+        charged = _amounts(actual)
+        for dimension, amount in charged.items():
+            if amount > ceiling.get(dimension, 0):
+                raise BudgetUnavailable("actual cost exceeds reserved ceiling")
+        if charged != ceiling and not execution_revoked:
+            raise BudgetUnavailable("unused reserved budget requires revoked execution authority")
+        used = _plus(lease.used, charged)
+        unconfirmed = lease.unconfirmed
+        status = "settled"
+        actual_json = _json(charged)
+        reservation_state = "settled"
+    updated = BudgetLease(
+        lease.lease_id, lease.parent_id, lease.bot_id, lease.persona_id,
+        lease.currency, lease.limits, used, _minus(lease.reserved, ceiling),
+        unconfirmed, lease.version + 1, lease.state,
+    )
+    return updated, status, actual_json, reservation_state
+
+
+def predict_budget_settlement(
+    lease: BudgetLease, operation_id: str, digest: str,
+    ceiling: Mapping[str, int], actual: Mapping[str, int] | None,
+    *, reservation: BudgetReservation | None = None,
+    inline_reserve: bool = False, execution_revoked: bool = False,
+) -> BudgetPrediction:
+    """Predict a fresh reserve/settle path from trusted, versioned input snapshots.
+
+    This performs no I/O and does not authenticate the snapshot or replace the
+    transaction's operation identity, issuer, and lease-version checks.
+    """
+    if not isinstance(lease, BudgetLease):
+        raise TypeError("lease must be BudgetLease")
+    _identifier(operation_id, "operation_id")
+    _digest(digest)
+    if not isinstance(execution_revoked, bool):
+        raise ValueError("execution_revoked must be boolean")
+    requested = _amounts(ceiling, allow_empty=False)
+    if inline_reserve:
+        if reservation is not None:
+            raise ValueError("inline reserve cannot reuse a reservation")
+        lease = _reserve_transition(lease, requested)
+    else:
+        if not isinstance(reservation, BudgetReservation):
+            raise BudgetConflict("no matching budget reservation")
+        if (reservation.lease_id, reservation.operation_id, reservation.digest, reservation.ceiling) != (
+            lease.lease_id, operation_id, digest, requested,
+        ):
+            raise BudgetConflict("budget reservation differs from the requested settlement")
+    updated, status, _, _ = _settle_transition(lease, requested, actual, execution_revoked)
+    receipt = _receipt(updated, status, operation_id, digest)
+    return BudgetPrediction(receipt, hashlib.sha256(_receipt_json(receipt).encode("utf-8")).hexdigest())
+
+
 def _prior(db, lease: BudgetLease, operation_id: str, phase: str,
            digest: str) -> BudgetReceipt | None:
     row = db.execute(
@@ -334,16 +435,7 @@ def reserve_budget(db, lease_id: str, operation_id: str, digest: str,
     prior = _prior(db, lease, operation_id, "reserve", digest)
     if prior is not None:
         return prior
-    if lease.state != "active":
-        raise BudgetUnavailable("budget lease is inactive")
-    for dimension, amount in requested.items():
-        if amount > lease.available(dimension):
-            raise BudgetUnavailable("budget ceiling exceeds availability")
-    updated = BudgetLease(
-        lease.lease_id, lease.parent_id, lease.bot_id, lease.persona_id,
-        lease.currency, lease.limits, lease.used, _plus(lease.reserved, requested),
-        lease.unconfirmed, lease.version + 1, lease.state,
-    )
+    updated = _reserve_transition(lease, requested)
     _save_lease(db, updated)
     db.execute(
         "INSERT INTO runtime_budget_reservations(lease_id,operation_id,digest,ceiling_json,"
@@ -375,30 +467,8 @@ def settle_budget(db, lease_id: str, operation_id: str, digest: str,
     if row[2] != "reserved":
         raise BudgetConflict("budget reservation is no longer settleable")
     ceiling = _amounts(json.loads(row[1]), allow_empty=False)
-    if actual is None:
-        used = lease.used
-        unconfirmed = _plus(lease.unconfirmed, ceiling)
-        status = "pending_confirmation"
-        actual_json = None
-        reservation_state = "unknown"
-    else:
-        charged = _amounts(actual)
-        for dimension, amount in charged.items():
-            if amount > ceiling.get(dimension, 0):
-                raise BudgetUnavailable("actual cost exceeds reserved ceiling")
-        if charged != ceiling and not execution_revoked:
-            raise BudgetUnavailable(
-                "unused reserved budget requires revoked execution authority"
-            )
-        used = _plus(lease.used, charged)
-        unconfirmed = lease.unconfirmed
-        status = "settled"
-        actual_json = _json(charged)
-        reservation_state = "settled"
-    updated = BudgetLease(
-        lease.lease_id, lease.parent_id, lease.bot_id, lease.persona_id,
-        lease.currency, lease.limits, used, _minus(lease.reserved, ceiling),
-        unconfirmed, lease.version + 1, lease.state,
+    updated, status, actual_json, reservation_state = _settle_transition(
+        lease, ceiling, actual, execution_revoked,
     )
     _save_lease(db, updated)
     db.execute(
@@ -507,7 +577,9 @@ def close_budget_lease(db, lease_id: str, operation_id: str, digest: str,
 
 
 __all__ = [
-    "BudgetConflict", "BudgetError", "BudgetLease", "BudgetReceipt",
+    "BudgetConflict", "BudgetError", "BudgetLease", "BudgetPrediction",
+    "BudgetReceipt", "BudgetReservation",
     "BudgetUnavailable", "close_budget_lease", "create_budget_lease", "get_budget_lease",
-    "install_schema", "reserve_budget", "resolve_unconfirmed", "settle_budget",
+    "install_schema", "predict_budget_settlement", "reserve_budget",
+    "resolve_unconfirmed", "settle_budget",
 ]

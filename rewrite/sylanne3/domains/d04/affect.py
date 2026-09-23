@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 
-from ...graph_types import AtomKey, GraphVersion, GraphWrite, Owner, TypeSpec
+from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeSpec
 from ...runtime_contracts import (
     CommandEnvelope,
     DependencySet,
@@ -618,6 +618,11 @@ class CorrectionResult:
 class AffectProvider:
     """Pure D04 semantics; persistence and numerical solving stay external."""
 
+    def __init__(self, *, active_scheme: AffectScheme | None = None) -> None:
+        if active_scheme is not None and not isinstance(active_scheme, AffectScheme):
+            raise TypeError("active_scheme must be an AffectScheme")
+        self._active_scheme = active_scheme
+
     @property
     def descriptor(self) -> ProviderDescriptor:
         return ProviderDescriptor(
@@ -1156,30 +1161,33 @@ class AffectProvider:
                 raise ValueError("recollection experience identity differs from its activity write")
             decoded_writes.append(decoded)
         if proposal.typed_writes:
-            if not isinstance(snapshot, AffectScheme):
+            scheme = snapshot if isinstance(snapshot, AffectScheme) else (
+                self._active_scheme if isinstance(snapshot, GraphSnapshot) else None
+            )
+            if scheme is None:
                 raise ValueError("active D04 scheme is required to validate typed writes")
             if (
-                proposal.envelope.version_guard.scheme_version != snapshot.scheme_version
-                or proposal.envelope.version_guard.operator_version != snapshot.operator_version
+                proposal.envelope.version_guard.scheme_version != scheme.scheme_version
+                or proposal.envelope.version_guard.operator_version != scheme.operator_version
             ):
                 raise ValueError("proposal guard versions differ from the active D04 scheme")
-            registered_axes = {axis.axis_id for axis in snapshot.axes}
+            registered_axes = {axis.axis_id for axis in scheme.axes}
             for decoded in decoded_writes:
                 if isinstance(decoded, (FeelingState, MoodField)):
                     if (
-                        decoded.basis_version != snapshot.scheme_version
-                        or decoded.parameter_version != snapshot.parameter_version
-                        or decoded.coupling_version != snapshot.coupling_version
+                        decoded.basis_version != scheme.scheme_version
+                        or decoded.parameter_version != scheme.parameter_version
+                        or decoded.coupling_version != scheme.coupling_version
                     ):
                         raise ValueError("D04 state versions differ from the active scheme versions")
-                    if isinstance(decoded, FeelingState) and decoded.operator_version != snapshot.operator_version:
+                    if isinstance(decoded, FeelingState) and decoded.operator_version != scheme.operator_version:
                         raise ValueError("D04 state versions differ from the active scheme versions")
                     if any(axis not in registered_axes for axis, _ in decoded.coordinates):
                         raise ValueError("D04 state uses an axis absent from the active scheme")
                 if isinstance(decoded, RegulationObservation):
                     if any(axis not in registered_axes for axis, _ in decoded.observed_effects):
                         raise ValueError("regulation observation uses an axis absent from the active scheme")
-                if isinstance(decoded, RecollectionExperience) and decoded.coupling_version != snapshot.coupling_version:
+                if isinstance(decoded, RecollectionExperience) and decoded.coupling_version != scheme.coupling_version:
                     raise ValueError("recollection experience coupling differs from the active scheme")
                 if isinstance(decoded, AppraisalBundle) and not set(decoded.source_refs) <= set(
                     proposal.envelope.source_qualification.source_refs

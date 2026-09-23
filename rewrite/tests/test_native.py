@@ -1,8 +1,17 @@
 from concurrent.futures import CancelledError
 import math
+from pathlib import Path
+import sys
 import threading
 import unittest
 from sylanne3.native import NativeKernel, AccuracyNotMet
+
+
+REFERENCE_LIBRARY = Path(__file__).resolve().parents[1] / "native" / "target" / "release" / (
+    "sylanne3_kernel.dll" if sys.platform == "win32" else
+    "libsylanne3_kernel.dylib" if sys.platform == "darwin" else
+    "libsylanne3_kernel.so"
+)
 
 
 def dense_solve(a, b):
@@ -22,7 +31,7 @@ def dense_solve(a, b):
 
 class NativeTests(unittest.TestCase):
     def setUp(self):
-        self.kernel = NativeKernel()
+        self.kernel = NativeKernel(REFERENCE_LIBRARY, developer_reference=True)
         self.kw = dict(mass=[2.,3.], recovery=[1.,2.], edges=[[0.,4.],[4.,0.]], previous=[1.,-2.], drive=[3.,1.], dt=.3)
 
     def solve(self, kw=None, budget=1):

@@ -948,6 +948,7 @@ class D06DomainAdapter:
         choice_ref: str,
         d02_settlement_ref: str,
         d11_cost_settlement_ref: str,
+        persistent_job_ref: str,
         outbox_ref: str,
     ) -> DomainBundle:
         """Build the complete C04 candidate without committing or claiming recall.
@@ -1023,10 +1024,13 @@ class D06DomainAdapter:
             (choice_ref, "choice_ref"),
             (d02_settlement_ref, "d02_settlement_ref"),
             (d11_cost_settlement_ref, "d11_cost_settlement_ref"),
+            (persistent_job_ref, "persistent_job_ref"),
             (outbox_ref, "outbox_ref"),
         ):
             _nonempty(ref, label)
             AtomKey.from_token(ref)
+        if AtomKey.from_token(persistent_job_ref).type_name != "runtime.job":
+            raise ValueError("persistent_job_ref must reference runtime.job")
 
         tokens_by_domain = {
             domain: {write.key.token for write in domain_proposal.typed_writes}
@@ -1036,7 +1040,7 @@ class D06DomainAdapter:
             "d07": {choice_ref, *context.now_interpretation_refs},
             "d04": {*context.feeling_experience_refs, *context.self_understanding_refs},
             "d02": {d02_settlement_ref},
-            "d11": {d11_cost_settlement_ref, outbox_ref},
+            "d11": {d11_cost_settlement_ref, persistent_job_ref, outbox_ref},
         }
         for domain, refs in required_tokens.items():
             absent = refs - tokens_by_domain[domain]
@@ -1082,7 +1086,8 @@ class D06DomainAdapter:
             dependencies=DependencySet(historical_provenance=tuple(dependencies)),
             contribution_keys=(f"recollection-activity:{ticket.activity_id}",),
             required_bundle_parts=(
-                "experience", "choice", "d02_settlement", "cost_settlement", "outbox",
+                "experience", "choice", "d02_settlement", "cost_settlement",
+                "persistent_job", "outbox",
             ),
         )
         return DomainBundle(
@@ -1093,7 +1098,7 @@ class D06DomainAdapter:
             (d02_settlement_ref,),
             (d11_cost_settlement_ref,),
             (f"d06:c04:{ticket.activity_id}",),
-            (),
+            (persistent_job_ref,),
             (outbox_ref,),
         )
 

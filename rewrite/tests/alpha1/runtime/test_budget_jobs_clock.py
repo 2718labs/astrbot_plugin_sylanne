@@ -1,4 +1,5 @@
 import sqlite3
+import hashlib
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -9,10 +10,12 @@ from sylanne3.runtime import install_schema as install_runtime_schema
 from sylanne3.runtime.budget import (
     BudgetConflict,
     BudgetLease,
+    BudgetReservation,
     BudgetUnavailable,
     close_budget_lease,
     create_budget_lease,
     get_budget_lease,
+    predict_budget_settlement,
     reserve_budget,
     resolve_unconfirmed,
     settle_budget,
@@ -97,6 +100,52 @@ class RuntimeBudgetJobsClockTests(unittest.TestCase):
         current = get_budget_lease(self.db, "parent")
         self.assertEqual(current.reserved["model_microusd"], 200)
         self.assertEqual(current.version, 2)
+
+    def test_inline_budget_prediction_matches_real_reserve_and_settle(self):
+        create_budget_lease(self.db, self.lease(), "create-parent", "a" * 64)
+        lease = get_budget_lease(self.db, "parent")
+        ceiling = {"model_microusd": 200, "model_tokens": 500}
+        before = self.db.total_changes
+        predicted = predict_budget_settlement(
+            lease, "call-inline", "b" * 64, ceiling, ceiling, inline_reserve=True,
+        )
+        self.assertEqual(self.db.total_changes, before)
+        reserve_budget(self.db, "parent", "call-inline", "b" * 64, ceiling)
+        actual = settle_budget(self.db, "parent", "call-inline", "b" * 64, ceiling)
+        stored_json = self.db.execute(
+            "SELECT receipt_json FROM runtime_budget_operations WHERE operation_id=? AND phase='settle'",
+            ("call-inline",),
+        ).fetchone()[0]
+        self.assertEqual(predicted.receipt, actual)
+        self.assertEqual(predicted.receipt_json_sha256, hashlib.sha256(stored_json.encode("utf-8")).hexdigest())
+
+    def test_pre_reserved_budget_prediction_matches_real_partial_settlement(self):
+        create_budget_lease(self.db, self.lease(), "create-parent", "a" * 64)
+        ceiling = {"model_microusd": 300}
+        reserve_budget(self.db, "parent", "call-reserved", "c" * 64, ceiling)
+        lease = get_budget_lease(self.db, "parent")
+        reservation = BudgetReservation("parent", "call-reserved", "c" * 64, ceiling)
+        before = self.db.total_changes
+        with self.assertRaises(BudgetUnavailable):
+            predict_budget_settlement(
+                lease, "call-reserved", "c" * 64, ceiling,
+                {"model_microusd": 125}, reservation=reservation,
+            )
+        predicted = predict_budget_settlement(
+            lease, "call-reserved", "c" * 64, ceiling,
+            {"model_microusd": 125}, reservation=reservation, execution_revoked=True,
+        )
+        self.assertEqual(self.db.total_changes, before)
+        actual = settle_budget(
+            self.db, "parent", "call-reserved", "c" * 64,
+            {"model_microusd": 125}, execution_revoked=True,
+        )
+        stored_json = self.db.execute(
+            "SELECT receipt_json FROM runtime_budget_operations WHERE operation_id=? AND phase='settle'",
+            ("call-reserved",),
+        ).fetchone()[0]
+        self.assertEqual(predicted.receipt, actual)
+        self.assertEqual(predicted.receipt_json_sha256, hashlib.sha256(stored_json.encode("utf-8")).hexdigest())
 
     def test_child_allocation_encumbers_parent_and_survives_restart(self):
         create_budget_lease(self.db, self.lease(), "create-parent", "a" * 64)

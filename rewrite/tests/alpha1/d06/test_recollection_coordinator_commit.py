@@ -154,6 +154,10 @@ class RecollectionCoordinatorCommitTests(unittest.TestCase):
                 Owner("activity", "bot", "persona", "activity-1"),
                 "runtime.cost_settlement", "cost-1",
             )
+            job = AtomKey(
+                Owner("activity", "bot", "persona", "activity-1"),
+                "runtime.job", "job-1",
+            )
             outbox = AtomKey(
                 Owner("activity", "bot", "persona", "activity-1"),
                 "runtime.outbox", "outbox-1",
@@ -180,11 +184,14 @@ class RecollectionCoordinatorCommitTests(unittest.TestCase):
                     )),
                     supporting("d04", (GraphWrite(feeling, {}),)),
                     supporting("d02", (GraphWrite(settlement, {}),)),
-                    supporting("d11", (GraphWrite(cost, {}), GraphWrite(outbox, {}))),
+                    supporting("d11", (
+                        GraphWrite(cost, {}), GraphWrite(job, {}), GraphWrite(outbox, {}),
+                    )),
                 ),
                 choice_ref=choice.token,
                 d02_settlement_ref=settlement.token,
                 d11_cost_settlement_ref=cost.token,
+                persistent_job_ref=job.token,
                 outbox_ref=outbox.token,
             )
             proposal = next(item for item in candidate_bundle.proposals if item.domain == "d06")

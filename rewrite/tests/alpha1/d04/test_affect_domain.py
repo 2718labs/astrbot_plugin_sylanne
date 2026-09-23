@@ -324,6 +324,13 @@ class ContinuousAffectTests(unittest.TestCase):
                 stored = store.graph_snapshot((write.key,)).atoms[0]
                 self.assertEqual(stored.value["evidence_weight_delta"], 0.0)
                 self.assertEqual(stored.value["memory_source_refs"], ["source:shared-evening"])
+                coordinator_snapshot = store.graph_snapshot((write.key,))
+                with self.assertRaisesRegex(ValueError, "active D04 scheme"):
+                    self.provider.validate(proposal, snapshot=coordinator_snapshot)
+                bound_provider = AffectProvider(active_scheme=self.scheme)
+                self.assertEqual(
+                    bound_provider.validate(proposal, snapshot=coordinator_snapshot), proposal,
+                )
             finally:
                 store.close()
 

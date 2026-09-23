@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import tempfile
 import threading
 import unittest
@@ -12,13 +13,21 @@ from sylanne3.engine import Engine, SemanticConflict
 from sylanne3.delivery import RecordingTransport, DeliveryFailed, dispatch
 
 
+REFERENCE_LIBRARY = Path(__file__).resolve().parents[1] / "native" / "target" / "release" / (
+    "sylanne3_kernel.dll" if sys.platform == "win32" else
+    "libsylanne3_kernel.dylib" if sys.platform == "darwin" else
+    "libsylanne3_kernel.so"
+)
+
+
 class EngineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(Path(self.tmp.name) / 'state.sqlite')
         self.scheduler = BoundedScheduler(workers=2, capacity=16, quantum=1)
         self.transport = RecordingTransport()
-        self.engine = Engine(self.store, self.scheduler, NativeKernel(), self.transport)
+        self.kernel = NativeKernel(REFERENCE_LIBRARY, developer_reference=True)
+        self.engine = Engine(self.store, self.scheduler, self.kernel, self.transport)
         self.scope = Scope('bot', 'alice', 'session')
 
     async def asyncTearDown(self):
@@ -79,7 +88,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 inner.calls += 1
                 raise RuntimeError('connection dropped after possible acceptance')
         sink = AcceptedThenBroken()
-        engine = Engine(self.store, self.scheduler, NativeKernel(), sink)
+        engine = Engine(self.store, self.scheduler, self.kernel, sink)
         result = await engine.handle(self.evidence())
         self.assertEqual(result.delivery_status, 'unknown')
         await engine.handle(self.evidence())
@@ -89,7 +98,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         class Rejected:
             async def send(inner, action):
                 raise DeliveryFailed('definitely rejected before acceptance')
-        result = await Engine(self.store, self.scheduler, NativeKernel(), Rejected()).handle(self.evidence())
+        result = await Engine(self.store, self.scheduler, self.kernel, Rejected()).handle(self.evidence())
         self.assertEqual(result.delivery_status, 'failed')
 
     async def test_cancel_after_send_entry_records_unknown(self):
@@ -98,7 +107,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             async def send(inner, action):
                 entered.set()
                 await asyncio.Event().wait()
-        engine = Engine(self.store, self.scheduler, NativeKernel(), Blocking())
+        engine = Engine(self.store, self.scheduler, self.kernel, Blocking())
         task = asyncio.create_task(engine.handle(self.evidence()))
         await entered.wait()
         task.cancel()
@@ -154,7 +163,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 return value
         self.store.close()
         self.store = SynchronizedStore(Path(self.tmp.name) / 'race.sqlite')
-        self.engine = Engine(self.store, self.scheduler, NativeKernel(), self.transport)
+        self.engine = Engine(self.store, self.scheduler, self.kernel, self.transport)
         results = await asyncio.gather(self.engine.prepare(self.evidence('a')),
                                        self.engine.prepare(self.evidence('b')))
         self.assertEqual(sorted(r.status for r in results), ['committed', 'stale'])
@@ -167,7 +176,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         self.store = Store(Path(self.tmp.name) / 'state.sqlite')
         sink = RecordingTransport()
-        engine = Engine(self.store, self.scheduler, NativeKernel(), sink)
+        engine = Engine(self.store, self.scheduler, self.kernel, sink)
         duplicate = await engine.handle(self.evidence())
         self.assertEqual(duplicate.status, 'duplicate')
         self.assertEqual(duplicate.action, first.action)
@@ -184,7 +193,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 return super().commit(candidate)
         self.store.close()
         self.store = DelayedClaimStore(Path(self.tmp.name) / 'claim-race.sqlite')
-        engine = Engine(self.store, self.scheduler, NativeKernel(), self.transport)
+        engine = Engine(self.store, self.scheduler, self.kernel, self.transport)
         task = asyncio.create_task(engine.handle(self.evidence()))
         self.assertTrue(await asyncio.to_thread(entered.wait, 5))
         task.cancel()
@@ -213,7 +222,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         path = Path(self.tmp.name) / f'prepare-cancel-{cancel_count}.sqlite'
         self.store = DelayedPrepareStore(path)
-        engine = Engine(self.store, self.scheduler, NativeKernel(), self.transport)
+        engine = Engine(self.store, self.scheduler, self.kernel, self.transport)
         task = asyncio.create_task(engine.handle(self.evidence()))
         await asyncio.to_thread(entered.wait, 5)
         try:

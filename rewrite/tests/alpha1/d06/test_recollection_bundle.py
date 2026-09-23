@@ -47,6 +47,7 @@ class RecollectionBundleTests(unittest.TestCase):
         self.feeling = self._key("activity", "activity-1", "d04.recollection_feeling.v1", "feeling-1")
         self.settlement = self._key("activity", "activity-1", "d02.settlement.v1", "settlement-1")
         self.cost = self._key("activity", "activity-1", "runtime.cost_settlement", "cost-1")
+        self.job = self._key("activity", "activity-1", "runtime.job", "job-1")
         self.outbox = self._key("activity", "activity-1", "runtime.outbox", "outbox-1")
         self.context = RecollectionContext(
             (self.interpretation.token,), (self.feeling.token,), (),
@@ -114,6 +115,7 @@ class RecollectionBundleTests(unittest.TestCase):
             self._proposal("d02", (GraphWrite(self.settlement, {"candidate": "resource-settlement"}),)),
             self._proposal("d11", (
                 GraphWrite(self.cost, {"candidate": "cost-settlement"}),
+                GraphWrite(self.job, {"candidate": "persistent-job"}),
                 GraphWrite(self.outbox, {"candidate": "outbox"}),
             )),
         )
@@ -128,12 +130,14 @@ class RecollectionBundleTests(unittest.TestCase):
             choice_ref=self.choice.token,
             d02_settlement_ref=self.settlement.token,
             d11_cost_settlement_ref=self.cost.token,
+            persistent_job_ref=self.job.token,
             outbox_ref=self.outbox.token,
         )
 
         self.assertEqual({proposal.domain for proposal in bundle.proposals}, {"d02", "d04", "d06", "d07", "d11"})
         self.assertEqual(bundle.choice_refs, (self.choice.token,))
         self.assertEqual(bundle.d11_cost_settlement_refs, (self.cost.token,))
+        self.assertEqual(bundle.persistent_job_refs, (self.job.token,))
         self.assertEqual(bundle.outbox_refs, (self.outbox.token,))
         self.assertEqual(len(bundle.experience_refs), 1)
         recollection = bundle.proposals[0].typed_writes[0]
@@ -154,10 +158,13 @@ class RecollectionBundleTests(unittest.TestCase):
                 choice_ref=self.choice.token,
                 d02_settlement_ref=self.settlement.token,
                 d11_cost_settlement_ref=self.cost.token,
+                persistent_job_ref=self.job.token,
                 outbox_ref=self.outbox.token,
             )
 
-        broken = (*proposals[:-1], self._proposal("d11", (GraphWrite(self.cost, {}),)))
+        broken = (*proposals[:-1], self._proposal("d11", (
+            GraphWrite(self.cost, {}), GraphWrite(self.outbox, {}),
+        )))
         with self.assertRaisesRegex(ValueError, "does not materialize required C04 refs"):
             self.domain.assemble_recollection_bundle(
                 self.envelope, self.ticket, self.candidates, self.context,
@@ -165,6 +172,7 @@ class RecollectionBundleTests(unittest.TestCase):
                 choice_ref=self.choice.token,
                 d02_settlement_ref=self.settlement.token,
                 d11_cost_settlement_ref=self.cost.token,
+                persistent_job_ref=self.job.token,
                 outbox_ref=self.outbox.token,
             )
 
@@ -186,6 +194,7 @@ class RecollectionBundleTests(unittest.TestCase):
                 choice_ref=self.choice.token,
                 d02_settlement_ref=self.settlement.token,
                 d11_cost_settlement_ref=self.cost.token,
+                persistent_job_ref=self.job.token,
                 outbox_ref=self.outbox.token,
             )
 
@@ -198,6 +207,7 @@ class RecollectionBundleTests(unittest.TestCase):
                 choice_ref=self.choice.token,
                 d02_settlement_ref=self.settlement.token,
                 d11_cost_settlement_ref=self.cost.token,
+                persistent_job_ref=self.job.token,
                 outbox_ref=self.outbox.token,
             )
 

@@ -217,6 +217,13 @@ def main() -> int:
             ensure_ascii=False,
         )
     )
+    if status == "FAIL":
+        for result in results:
+            if not result.get("passed", False):
+                print(f"[{result['name']}] failed", file=sys.stderr)
+                for stream in ("stdout", "stderr"):
+                    if result.get(stream):
+                        print(result[stream], file=sys.stderr)
     return 0 if status == "PASS" else 1
 
 

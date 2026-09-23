@@ -639,6 +639,9 @@ def test_recollection_support_is_consumable_by_d06_c04_without_placeholder_d07_w
         Owner("activity", "bot", "persona", "activity-r1"),
         "runtime.cost_settlement", "cost-1",
     )
+    job = AtomKey(
+        Owner("activity", "bot", "persona", "activity-r1"), "runtime.job", "job-1",
+    )
     outbox = AtomKey(
         Owner("activity", "bot", "persona", "activity-r1"), "runtime.outbox", "outbox-1",
     )
@@ -661,12 +664,14 @@ def test_recollection_support_is_consumable_by_d06_c04_without_placeholder_d07_w
             supporting("d02", (GraphWrite(settlement, {"candidate": "settlement"}),)),
             supporting("d11", (
                 GraphWrite(cost, {"candidate": "cost"}),
+                GraphWrite(job, {"candidate": "job"}),
                 GraphWrite(outbox, {"candidate": "outbox"}),
             )),
         ),
         choice_ref=choice.key.token,
         d02_settlement_ref=settlement.token,
         d11_cost_settlement_ref=cost.token,
+        persistent_job_ref=job.token,
         outbox_ref=outbox.token,
     )
 
