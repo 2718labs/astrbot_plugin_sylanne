@@ -101,7 +101,8 @@ class Graph:
     def read_first_scene_binding_proof_v2(self, **kwargs):
         self.calls += 1
         assert kwargs == {"namespace": NAMESPACE, "scene_ref": SCENE,
-                          "purpose": "workbench_user_action", "principal": PRINCIPAL}
+                          "purpose": "workbench_user_action", "principal": PRINCIPAL,
+                          "actor_id": SESSION.actor_id}
         return self.proof
 
 

@@ -158,7 +158,8 @@ class CurrentD03OnboardingResolver:
             return hold("current_graph_negative_proof_uninstalled")
         try:
             proof = read(namespace=namespace, scene_ref=scene_ref,
-                         purpose=purpose, principal=owner.principal)
+                         purpose=purpose, principal=owner.principal,
+                         actor_id=owner.actor_id)
         except (LookupError, PermissionError, ValueError):
             return hold("current_graph_negative_proof_unavailable")
         if (not isinstance(proof, CurrentFirstBindingProof)

@@ -2406,7 +2406,7 @@ class GraphCoordinator:
 
     def read_first_scene_binding_proof_v2(
         self, *, namespace: NamespaceId, scene_ref: str, purpose: str,
-        principal,
+        principal, actor_id: str,
     ):
         """Prove a complete first-binding absence with current Owner and D01 heads."""
         from .authority_service.contract import identifier
@@ -2425,8 +2425,11 @@ class GraphCoordinator:
             raise UnavailableGuard("first scene proof requires production v2 Owner")
         identifier(scene_ref, "scene_ref")
         identifier(purpose, "purpose")
+        identifier(actor_id, "actor_id")
         if not scene_ref.startswith("scene:"):
             raise ValueError("scene_ref must be a scene identity")
+        if self._current_owner_principal(actor_id, namespace) != principal:
+            raise UnavailableGuard("current Owner pairing differs")
         port = self.__content_fence_v2
         guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
         if not callable(guard_reader):
@@ -2449,7 +2452,7 @@ class GraphCoordinator:
         scope = FenceScope(namespace, target.authority_namespace, 1, "read",
                            attempt_id, permit, anchor, epoch, metadata.graph_revision)
         authority = AuthorityContext(
-            principal.account_ref, "d12", "first-scene-read", namespace,
+            actor_id, "d12", "first-scene-read", namespace,
             ("persona", "scene"), purpose, ("owner",), "owner-grant-v1", 1)
 
         def current_guard():
@@ -2510,7 +2513,8 @@ class GraphCoordinator:
                     result.valid_until, request)
             if port.validate_fence(scope) != permit:
                 raise UnavailableGuard("first scene read permit changed")
-            if current_guard() != guard or check_owner(guard) != owner:
+            if (self._current_owner_principal(actor_id, namespace) != principal
+                    or current_guard() != guard or check_owner(guard) != owner):
                 raise UnavailableGuard("first scene Owner head changed")
             with store._lock:
                 if self._v2_graph_stamp(namespace) != (metadata, epoch):
