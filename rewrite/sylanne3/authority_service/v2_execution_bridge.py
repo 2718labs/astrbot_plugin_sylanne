@@ -3,14 +3,15 @@
 The host service supplies an authenticated subject; Core's authorizer and D08
 verifier run before locks. The mTLS adapter exposes only prepared dispatch;
 this is not a platform send or a production RuntimeDependency.
-Only the `prepared` phase is implemented. The persistent v2-only Core seal
+Only the `prepared` phase is implemented. A locked observation can report its
+durable state, but cannot infer platform delivery or confirmation. The persistent v2-only Core seal
 gates legacy entrances; deletion and execution writers are frozen in a fixed
 order before each append or final Authority commit.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import json
 
@@ -22,9 +23,17 @@ from .v2_contract import (
     FencePermitV2, MutationReceiptV2, PendingMutationV2, canonical_bytes,
     decode_bytes, to_wire,
 )
-from .v2_execution_journal import AuthorityV2ExecutionJournal
+from .v2_execution_journal import AuthorityV2ExecutionJournal, VerifiedAppendV2
 from .v2_deletion_guard import AuthorityV2DeletionGuard
 from .v2_fence_store import AuthorityV2FenceStore
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedExecutionObservationV2:
+    """Verified local prepare state; no platform outcome is represented."""
+
+    append: VerifiedAppendV2 | None
+    result: tuple[MutationReceiptV2, FencePermitV2] | None
 
 
 class AuthorityV2ExecutionBridge:
@@ -297,6 +306,67 @@ class AuthorityV2ExecutionBridge:
                     db, receipt, subject=subject)
                 return receipt, updated
 
+    def observe_prepared(self, *, credential, subject: str,
+                         pending: PendingMutationV2) -> PreparedExecutionObservationV2:
+        """Read one prepare against both frozen journals and the Authority CAS.
+
+        An appended prepare means only that the service journal recorded it.
+        It never proves a platform send, observation, or settlement.
+        """
+        if type(pending) is not PendingMutationV2 or pending.phase != "prepared":
+            raise AuthorityUnavailable("only prepared dispatch observation is supported")
+        identifier(subject, "subject")
+        self.core._require(credential, "execution", self.namespace,
+                           pending.permit.holder)
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    raise AuthorityUnavailable("historical deletion closure blocks dispatch observation")
+                inspection = self.journal.inspect_expected(pending)
+                if inspection.following_count > 1:
+                    raise AuthorityUnavailable("extra execution append quarantines prepared observation")
+                with self.core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    self.fences._check_schema(db)
+                    self._check_deletion_locked(db, deletion_head)
+                    mutation = self._load_mutation_locked(db, pending, subject)
+                    kind, saved, receipt, updated = self.fences._decode_mutation_row(mutation)
+                    if kind != "execution" or saved != pending or mutation[5] == "null":
+                        raise AuthorityUnavailable("prepared mutation ledger is invalid")
+                    row = self.core._row(db, self.namespace)
+                    effect = db.execute(
+                        "SELECT state,conflict_keys_json,execution_seq FROM authority_effects "
+                        "WHERE namespace=? AND effect_id=?",
+                        (self.namespace, pending.permit.effect_id)).fetchone()
+                    if mutation[4] == "pending":
+                        self._check_core_owner(db, pending.permit)
+                        self._check_fence_locked(db, pending.permit, subject,
+                                                 pending=pending)
+                        if effect is not None:
+                            raise AuthorityUnavailable("pending prepare has conflicting effect history")
+                    elif mutation[4] == "committed":
+                        if (inspection.following_count != 1
+                                or effect != ("unresolved", mutation[5],
+                                              pending.expected_execution_seq)
+                                or self.core._anchor(db, self.namespace, row)
+                                != receipt.after_anchor):
+                            raise AuthorityUnavailable("committed prepare differs from Authority effect")
+                    elif mutation[4] == "cancelled_unappended":
+                        if (inspection.following_count != 0 or effect is not None
+                                or self.core._anchor(db, self.namespace, row)
+                                != receipt.after_anchor):
+                            raise AuthorityUnavailable("cancelled prepare has a journal append")
+                    else:
+                        raise AuthorityUnavailable("unknown prepared mutation state")
+                    if mutation[4] != "pending":
+                        fence = self.fences._row(db, pending.permit.operation_id)
+                        if (fence is None or fence[10] is not None
+                                or self.fences._permit(fence) != updated):
+                            raise AuthorityUnavailable("completed prepare fence differs")
+                    result = (receipt, updated) if receipt is not None else None
+                    return PreparedExecutionObservationV2(inspection.first_append, result)
+
     def execution_prepare(self, *, credential, subject: str,
                           permit: FencePermitV2, mutation_id: str,
                           footprint: RecoveryConstraintFootprint):
@@ -323,4 +393,4 @@ class AuthorityV2ExecutionBridge:
             credential=credential, subject=subject, pending=pending)
 
 
-__all__ = ["AuthorityV2ExecutionBridge"]
+__all__ = ["AuthorityV2ExecutionBridge", "PreparedExecutionObservationV2"]

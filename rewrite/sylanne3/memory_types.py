@@ -42,6 +42,11 @@ _INTERPRETATION_FIELDS = frozenset({
     "valid_to",
 })
 _ACCESS_FIELDS = frozenset({"source_id", "audiences", "purposes", "status", "recorded_at"})
+_EPISODE_FIELDS = frozenset({"episode_id", "source_refs", "event_ref"})
+_TRACE_FIELDS = frozenset({
+    "trace_id", "episode_ref", "perspective_ref", "then_feeling_refs",
+    "interpretation_refs", "detail_weights",
+})
 
 _SOURCE_SCHEMA_HASH = schema_hash({
     "type": "memory.source",
@@ -60,6 +65,14 @@ _INTERPRETATION_SCHEMA_HASH = schema_hash({
     "version": 1,
     "fields": sorted(_INTERPRETATION_FIELDS),
     "immutable": False,
+})
+_EPISODE_SCHEMA_HASH = schema_hash({
+    "type": "memory.episode.v1", "version": 1,
+    "fields": sorted(_EPISODE_FIELDS), "immutable": True,
+})
+_TRACE_SCHEMA_HASH = schema_hash({
+    "type": "memory.subjective_trace.v1", "version": 1,
+    "fields": sorted(_TRACE_FIELDS), "immutable": True,
 })
 
 
@@ -234,6 +247,66 @@ def interpretation_key(bot: str, persona: str, iid: str) -> AtomKey:
     return AtomKey(Owner("event", bot, persona, iid), "memory.interpretation", "current")
 
 
+def episode_key(bot: str, persona: str, episode_id: str) -> AtomKey:
+    return AtomKey(Owner("event", bot, persona, episode_id), "memory.episode.v1", "record")
+
+
+def subjective_trace_key(bot: str, persona: str, trace_id: str) -> AtomKey:
+    return AtomKey(Owner("event", bot, persona, trace_id), "memory.subjective_trace.v1", "record")
+
+
+def _graph_ref(value: object, label: str) -> AtomKey:
+    _text(value, label)
+    try:
+        return AtomKey.from_token(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a canonical graph atom token") from exc
+
+
+def _graph_ref_list(value: object, label: str, *, require_one: bool = False) -> tuple[AtomKey, ...]:
+    refs = _tuple_from_json(value, label)
+    _string_tuple(refs, label, require_one=require_one)
+    return tuple(_graph_ref(ref, label) for ref in refs)
+
+
+def validate_episode(value: object) -> None:
+    data = _exact_object(value, _EPISODE_FIELDS, "memory episode")
+    _text(data["episode_id"], "episode_id")
+    sources = _graph_ref_list(data["source_refs"], "source_refs", require_one=True)
+    if any(key.type_name != "memory.source" for key in sources):
+        raise ValueError("episode source_refs must reference memory.source")
+    event = _graph_ref(data["event_ref"], "event_ref")
+    if event.type_name != "d03.world_event" or event.owner.kind != "event":
+        raise ValueError("episode event_ref must reference a D03 world event")
+    if len({(key.owner.bot, key.owner.persona) for key in (*sources, event)}) != 1:
+        raise ValueError("episode references cross namespace")
+
+
+def validate_subjective_trace(value: object) -> None:
+    data = _exact_object(value, _TRACE_FIELDS, "subjective trace")
+    _text(data["trace_id"], "trace_id")
+    episode = _graph_ref(data["episode_ref"], "episode_ref")
+    if episode.type_name != "memory.episode.v1":
+        raise ValueError("trace episode_ref must reference a memory episode")
+    refs = (_graph_ref(data["perspective_ref"], "perspective_ref"),
+            *_graph_ref_list(data["then_feeling_refs"], "then_feeling_refs"),
+            *_graph_ref_list(data["interpretation_refs"], "interpretation_refs"))
+    if len({(key.owner.bot, key.owner.persona) for key in (episode, *refs)}) != 1:
+        raise ValueError("trace references cross namespace")
+    weights = _tuple_from_json(data["detail_weights"], "detail_weights")
+    seen = set()
+    for item in weights:
+        if type(item) is not list or len(item) != 2:
+            raise ValueError("each detail weight must be a two-item JSON array")
+        detail, weight = item
+        _text(detail, "detail", bounded=True)
+        if detail in seen:
+            raise ValueError("detail weights must be unique")
+        seen.add(detail)
+        if type(weight) not in (int, float) or not math.isfinite(weight) or not 0 <= weight <= 1:
+            raise ValueError("detail weight must be finite and between 0 and 1")
+
+
 def validate_access(value: object) -> None:
     data = _exact_object(value, _ACCESS_FIELDS, "memory access")
     _text(data["source_id"], "source_id")
@@ -267,4 +340,12 @@ def register_memory_types(registry: TypeRegistry) -> None:
     registry.register(TypeSpec(
         "memory.interpretation", ("event",), "state", _validate_interpretation,
         writer_domain="d06", schema_hash=_INTERPRETATION_SCHEMA_HASH,
+    ))
+    registry.register(TypeSpec(
+        "memory.episode.v1", ("event",), "source", validate_episode,
+        immutable=True, writer_domain="d06", schema_hash=_EPISODE_SCHEMA_HASH,
+    ))
+    registry.register(TypeSpec(
+        "memory.subjective_trace.v1", ("event",), "source", validate_subjective_trace,
+        immutable=True, writer_domain="d06", schema_hash=_TRACE_SCHEMA_HASH,
     ))

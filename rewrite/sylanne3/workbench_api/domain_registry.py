@@ -26,6 +26,7 @@ class ViewCatalogue:
 class _ViewDefinition:
     domain: str
     types: tuple[str, ...]
+    owner_kind: str
     fields: frozenset[str]
     projector: Callable[..., object]
 
@@ -65,11 +66,12 @@ class CurrentDomainViewRegistry:
             if not callable(projector):
                 unavailable[domain] = "no_field_projection_contract"
                 continue
-            types_by_name = {spec.name for spec in registration.type_specs}
+            specs_by_name = {spec.name: spec for spec in registration.type_specs}
             if not isinstance(contract, Mapping):
                 unavailable[domain] = "invalid_public_projection_contract"
                 continue
             validated: dict[str, _ViewDefinition] = {}
+            scope_denied = False
             try:
                 for view_name, definition in contract.items():
                     if not isinstance(definition, Mapping):
@@ -78,18 +80,27 @@ class CurrentDomainViewRegistry:
                     fields = frozenset(definition.get("fields", ()))
                     if (not isinstance(view_name, str) or not view_name or not names or not fields
                             or len(set(names)) != len(names)
-                            or any(not isinstance(name, str) or name not in types_by_name
+                            or any(not isinstance(name, str) or name not in specs_by_name
                                    for name in names)
                             or any(not isinstance(field, str) or not field or field == "atoms"
                                    for field in fields)
                             or view_name in definitions or view_name in validated):
                         raise ValueError
-                    validated[view_name] = _ViewDefinition(domain, names, fields, projector)
+                    owner_kinds = {kind for name in names
+                                   for kind in specs_by_name[name].owner_kinds}
+                    if len(owner_kinds) != 1:
+                        raise ValueError
+                    owner_kind = owner_kinds.pop()
+                    if owner_kind not in authority.owner_scope:
+                        scope_denied = True
+                        continue
+                    validated[view_name] = _ViewDefinition(domain, names, owner_kind, fields, projector)
             except (TypeError, ValueError):
                 unavailable[domain] = "invalid_public_projection_contract"
                 continue
             if not validated:
-                unavailable[domain] = "empty_public_projection_contract"
+                unavailable[domain] = ("owner_scope_denied" if scope_denied
+                                       else "empty_public_projection_contract")
                 continue
             definitions.update(validated)
         return definitions, unavailable
@@ -101,6 +112,11 @@ class CurrentDomainViewRegistry:
 
     def view_types(self, authority: AuthorityContext) -> Mapping[str, tuple[str, ...]]:
         return self.catalogue(authority).available
+
+    def view_owner_kind(self, authority: AuthorityContext, view_type: str) -> str | None:
+        definitions, _ = self._definitions(authority)
+        definition = definitions.get(view_type)
+        return definition.owner_kind if definition is not None else None
 
     def project_workbench(self, authority: AuthorityContext, view_type: str,
                           atoms: tuple[Mapping[str, Any], ...]) -> Mapping[str, Any]:

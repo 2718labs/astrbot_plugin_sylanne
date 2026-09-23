@@ -105,6 +105,49 @@ def test_prepared_commit_updates_head_effect_fence_and_receipt(tmp_path):
     journal.close()
 
 
+def test_locked_observation_tracks_prepare_without_platform_claim(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(tmp_path)
+    item = footprint()
+    permit = begin(core, fences, item)
+    pending = bridge.prepare_pending(credential="ok", subject="subject-a",
+                                     permit=permit, mutation_id="mutation-a",
+                                     footprint=item)
+    before = bridge.observe_prepared(credential="ok", subject="subject-a",
+                                     pending=pending)
+    assert before.append is None and before.result is None
+    bridge.append_pending(pending, credential="ok", subject="subject-a")
+    appended = bridge.observe_prepared(credential="ok", subject="subject-a",
+                                       pending=pending)
+    assert appended.append is not None and appended.result is None
+    assert appended.append.mutation_id == pending.mutation_id
+    receipt, updated = bridge.reconcile_mutation(
+        credential="ok", subject="subject-a", pending=pending)
+    committed = bridge.observe_prepared(credential="ok", subject="subject-a",
+                                        pending=pending)
+    assert committed.append == appended.append
+    assert committed.result == (receipt, updated)
+    assert bridge.observe_prepared(credential="ok", subject="subject-a",
+                                   pending=pending) == committed
+    core.close()
+    journal.close()
+
+
+def test_locked_observation_rejects_authority_effect_drift(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(tmp_path)
+    item = footprint()
+    permit = begin(core, fences, item)
+    receipt, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    core._db.execute("UPDATE authority_effects SET conflict_keys_json='[]' "
+                     "WHERE namespace='ns-a' AND effect_id='effect-a'")
+    with pytest.raises(AuthorityUnavailable, match="Authority effect"):
+        bridge.observe_prepared(credential="ok", subject="subject-a",
+                                pending=receipt.pending)
+    core.close()
+    journal.close()
+
+
 def test_deletion_head_drift_blocks_append_and_keeps_pending(tmp_path):
     core, fences, journal, bridge, _ = setup_service(tmp_path)
     item = footprint()
@@ -120,6 +163,9 @@ def test_deletion_head_drift_blocks_append_and_keeps_pending(tmp_path):
     with pytest.raises(AuthorityUnavailable, match="historical deletion closure"):
         bridge.reconcile_mutation(credential="ok", subject="subject-a",
                                   pending=pending, allow_cancel=True)
+    with pytest.raises(AuthorityUnavailable, match="historical deletion closure"):
+        bridge.observe_prepared(credential="ok", subject="subject-a",
+                                pending=pending)
     assert journal.verified_head().seq == 0
     assert fences.get_operation("operation-a", subject="subject-a",
                                 namespace="ns-a")[2] == pending
@@ -178,6 +224,9 @@ def test_zero_append_cancel_and_extra_append_quarantine(tmp_path):
         allow_cancel=True)
     assert receipt.durable_state == "cancelled_unappended"
     assert updated.revision == 1 and journal.verified_head().seq == 0
+    cancelled = bridge.observe_prepared(credential="ok", subject="subject-a",
+                                        pending=pending)
+    assert cancelled.append is None and cancelled.result == (receipt, updated)
     with pytest.raises(AuthorityUnavailable):
         bridge.append_pending(pending, credential="ok", subject="subject-a")
     core.close()
@@ -203,6 +252,9 @@ def test_zero_append_cancel_and_extra_append_quarantine(tmp_path):
     with pytest.raises(AuthorityUnavailable, match="extra"):
         bridge.reconcile_mutation(credential="ok", subject="subject-a",
                                   pending=pending)
+    with pytest.raises(AuthorityUnavailable, match="extra execution append"):
+        bridge.observe_prepared(credential="ok", subject="subject-a",
+                                pending=pending)
     assert fences.get_operation("operation-a", subject="subject-a", namespace="ns-a")[2] == pending
     assert core._db.execute("SELECT execution_seq FROM authority_namespaces WHERE namespace='ns-a'").fetchone() == (0,)
     core.close()

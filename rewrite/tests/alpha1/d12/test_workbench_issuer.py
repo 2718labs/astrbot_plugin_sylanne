@@ -21,9 +21,9 @@ SESSION = AuthenticatedSession(
 CONTEXT = RequestContext(origin_verified=True, csrf_verified=True, session_bound=True)
 
 
-def authority(*, purpose="workbench_view", audience=("owner",)):
+def authority(*, purpose="workbench_view", audience=("owner",), owner_scope=("persona", "event")):
     return AuthorityContext("actor", "d12", "capability", NamespaceId("bot", "persona"),
-                            ("persona",), purpose, audience, "policy", 4)
+                            owner_scope, purpose, audience, "policy", 4)
 
 
 class Resolver:
@@ -43,6 +43,8 @@ class Coordinator:
 
     def query(self, authority_context, lease, **kwargs):
         self.calls.append((authority_context, lease, kwargs))
+        if kwargs["owner_kind"] == "event" and isinstance(self.page, GraphPage):
+            return GraphPage(GraphSnapshot((), self.page.snapshot.epochs), None)
         return self.page
 
 
@@ -54,6 +56,9 @@ class Registry:
     def view_types(self, authority_context):
         self.calls.append(authority_context)
         return self.views
+
+    def view_owner_kind(self, authority_context, view_type):
+        return "event" if view_type == "memory" else "persona"
 
     def project_workbench(self, authority_context, view_type, atoms):
         return {"summary": f"{view_type}:{len(atoms)}"}
@@ -89,6 +94,52 @@ def test_character_view_uses_single_coordinator_snapshot_and_server_grant():
     assert resolver.calls[0]["scope"] == SCOPE
 
 
+def test_memory_view_reads_event_owned_graph_atoms_with_event_grant():
+    provider, coordinator, _ = issuer()
+    atom = GraphAtom(AtomKey(Owner("event", "bot", "persona", "source-1"),
+                             "memory.source", "record"), 2, {"source_id": "source-1"})
+    page = GraphPage(GraphSnapshot((atom,), (NamespaceEpoch("bot", "persona", 12),)), None)
+
+    def query(authority_context, lease, **kwargs):
+        coordinator.calls.append((authority_context, lease, kwargs))
+        return page
+
+    coordinator.query = query
+    provider._view_registry = Registry({"memory": ("memory.source",)})
+    answer = WorkbenchService(provider).handle(
+        request(view_type="memory"), session=SESSION, context=CONTEXT)
+    assert answer.status == "ready"
+    assert answer.projection["data"] == {"summary": "memory:1"}
+    assert answer.projection["snapshot_epoch"] == 12
+    assert coordinator.calls[0][2]["owner_kind"] == "event"
+
+
+def test_memory_view_without_event_scope_does_not_query_or_expose_atoms():
+    provider, coordinator, _ = issuer(
+        resolver_grant=CoordinatorGrant(SCOPE, authority(owner_scope=("persona",)), object()))
+    answer = WorkbenchService(provider).handle(
+        request(view_type="memory"), session=SESSION, context=CONTEXT)
+    assert answer.status == "unavailable"
+    assert answer.projection is None
+    assert not coordinator.calls
+
+
+def test_memory_view_rejects_mismatched_graph_owner_before_projection():
+    provider, coordinator, _ = issuer()
+    provider._view_registry = Registry({"memory": ("memory.source",)})
+
+    def query(authority_context, lease, **kwargs):
+        coordinator.calls.append((authority_context, lease, kwargs))
+        return coordinator.page
+
+    coordinator.query = query
+    answer = WorkbenchService(provider).handle(
+        request(view_type="memory"), session=SESSION, context=CONTEXT)
+    assert answer.status == "unavailable"
+    assert answer.problem["code"] == "invalid_graph_snapshot"
+    assert answer.projection is None
+
+
 def test_missing_or_mismatched_authority_never_queries_or_leaks_projection():
     provider, coordinator, _ = issuer(resolver_grant=None)
     # A resolver that returns no coordinator grant is a normal unavailable state.
@@ -121,6 +172,7 @@ def test_open_workspace_is_a_real_read_catalogue_without_a_durable_receipt():
     assert {entry["view_type"] for entry in answer.projection["views"]} == {"overview", "memory"}
     assert all(entry["status"] == "available" for entry in answer.projection["views"])
     assert len(coordinator.calls) == 2
+    assert {call[2]["owner_kind"] for call in coordinator.calls} == {"persona", "event"}
 
 
 def test_workspace_marks_each_unqueryable_registry_view_unavailable_without_content():
@@ -152,8 +204,8 @@ class PrivateProvider:
     pass
 
 
-def domain_registry(*, provider, domain="d01", spec_name="d01.public.v1"):
-    spec = TypeSpec(spec_name, ("persona",), "state", lambda value: None, writer_domain=domain,
+def domain_registry(*, provider, domain="d01", spec_name="d01.public.v1", owner_kind="persona"):
+    spec = TypeSpec(spec_name, (owner_kind,), "state", lambda value: None, writer_domain=domain,
                     schema_hash="0" * 64)
     types = TypeRegistry(); types.register(spec)
     registration = DomainRegistration(domain, provider, "schema", "1" * 64, (spec,))
@@ -163,11 +215,56 @@ def domain_registry(*, provider, domain="d01", spec_name="d01.public.v1"):
 def test_current_registry_exposes_only_provider_declared_public_projection_contracts():
     public = CurrentDomainViewRegistry(lambda: domain_registry(provider=PublicProvider()))
     assert public.view_types(authority()) == {"overview": ("d01.public.v1",)}
+    assert public.view_owner_kind(authority(), "overview") == "persona"
     assert public.project_workbench(authority(), "overview", ()) == {"summary": "overview"}
 
     private = CurrentDomainViewRegistry(lambda: domain_registry(provider=PrivateProvider()))
     assert private.view_types(authority()) == {}
     assert private.catalogue(authority()).unavailable_domains == {"d01": "no_public_projection_contract"}
+
+
+def test_current_registry_derives_event_owner_from_registered_type_and_scope():
+    class EventProvider:
+        workbench_view_contract = {"memory": {"types": ("memory.source",), "fields": ("count",)}}
+
+        @staticmethod
+        def project_workbench(view_type, atoms):
+            return {"count": len(atoms)}
+
+    current = CurrentDomainViewRegistry(lambda: domain_registry(
+        provider=EventProvider(), domain="d06", spec_name="memory.source", owner_kind="event"))
+    assert current.view_types(authority()) == {"memory": ("memory.source",)}
+    assert current.view_owner_kind(authority(), "memory") == "event"
+    assert current.view_types(authority(owner_scope=("persona",))) == {}
+    assert current.view_owner_kind(authority(owner_scope=("persona",)), "memory") is None
+    assert current.catalogue(authority(owner_scope=("persona",))).unavailable_domains == {
+        "d06": "owner_scope_denied"}
+
+
+def test_current_registry_rejects_view_that_mixes_owner_kinds():
+    class MixedProvider:
+        workbench_view_contract = {"memory": {
+            "types": ("memory.source", "d06.recollection.v1"), "fields": ("count",)}}
+
+        @staticmethod
+        def project_workbench(view_type, atoms):
+            return {"count": len(atoms)}
+
+    event_spec = TypeSpec("memory.source", ("event",), "source", lambda value: None,
+                          writer_domain="d06", schema_hash="0" * 64)
+    activity_spec = TypeSpec("d06.recollection.v1", ("activity",), "source",
+                             lambda value: None, writer_domain="d06", schema_hash="1" * 64)
+    types = TypeRegistry()
+    types.register(event_spec)
+    types.register(activity_spec)
+    registration = DomainRegistration("d06", MixedProvider(), "schema", "2" * 64,
+                                      (event_spec, activity_spec))
+    registry = DomainRegistry(MappingProxyType({"d06": registration}), MappingProxyType({}),
+                              types.freeze())
+    current = CurrentDomainViewRegistry(lambda: registry)
+    assert current.view_types(authority()) == {}
+    assert current.catalogue(authority()).unavailable_domains == {
+        "d06": "invalid_public_projection_contract"}
 
 
 def test_current_registry_rejects_undeclared_atom_type_even_if_it_exists_in_catalogue():

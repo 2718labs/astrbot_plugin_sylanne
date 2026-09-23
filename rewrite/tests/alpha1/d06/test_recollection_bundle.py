@@ -217,7 +217,10 @@ class RecollectionBundleTests(unittest.TestCase):
         self.assertEqual(provider.descriptor.provider_id, "d06.memory")
         self.assertEqual(
             {spec.name for spec in specs},
-            {"memory.source", "memory.access", "memory.interpretation", "d06.recollection.v1"},
+            {
+                "memory.source", "memory.access", "memory.interpretation",
+                "memory.episode.v1", "memory.subjective_trace.v1", "d06.recollection.v1",
+            },
         )
         registry = TypeRegistry()
         for spec in specs:

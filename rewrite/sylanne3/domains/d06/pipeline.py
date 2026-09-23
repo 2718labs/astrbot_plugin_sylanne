@@ -139,7 +139,10 @@ class D06MemoryPipeline:
         )
         if source_version is None:
             raise RuntimeError("source read proof does not contain the requested source")
-        if (source_ref, source_version.revision) not in context.read_versions:
+        if not any(
+            (ref, source_version.revision) in context.read_versions
+            for ref in (source_ref, source_version.key.token)
+        ):
             raise ValueError("encoding context must bind the committed source revision")
         proposal = self.adapter.prepare_encoding(source.source_id, context)
         return PreparedEncoding(source.source_id, proposal, proof.versions, epoch)

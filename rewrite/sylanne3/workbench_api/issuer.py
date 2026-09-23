@@ -40,6 +40,8 @@ class DomainViewRegistry(Protocol):
 
     def view_types(self, authority: AuthorityContext) -> Mapping[str, tuple[str, ...]]: ...
 
+    def view_owner_kind(self, authority: AuthorityContext, view_type: str) -> str | None: ...
+
     def project_workbench(self, authority: AuthorityContext, view_type: str,
                           atoms: tuple[Mapping[str, Any], ...]) -> Mapping[str, Any]: ...
 
@@ -74,9 +76,12 @@ class GraphWorkbenchIssuer:
         types = views.get(view_type)
         if types is None:
             return _unavailable("view_unsupported")
+        owner_kind = self._owner_kind(grant, view_type)
+        if owner_kind is None:
+            return _unavailable("view_unsupported")
         try:
             page = self._coordinator.query(grant.authority, grant.lease,
-                                           type_names=types, owner_kind="persona", limit=100)
+                                           type_names=types, owner_kind=owner_kind, limit=100)
         except PermissionError:
             raise
         except Exception:
@@ -87,6 +92,12 @@ class GraphWorkbenchIssuer:
         epoch = snapshot.epochs[0] if len(snapshot.epochs) == 1 else None
         if epoch is None:
             return _unavailable("incomplete_graph_snapshot")
+        if ((epoch.bot, epoch.persona) != grant.authority.namespace.as_tuple
+                or any(atom.key.owner.kind != owner_kind
+                       or (atom.key.owner.bot, atom.key.owner.persona)
+                       != grant.authority.namespace.as_tuple
+                       or atom.key.type_name not in types for atom in snapshot.atoms)):
+            return _unavailable("invalid_graph_snapshot")
         atoms = tuple({
             "type": atom.key.type_name,
             "name": atom.key.name,
@@ -126,15 +137,25 @@ class GraphWorkbenchIssuer:
             return _unavailable("domain_registry_unavailable")
         entries = []
         for name, types in sorted(views.items()):
+            owner_kind = self._owner_kind(grant, name)
+            if owner_kind is None:
+                entries.append({"view_type": name, "status": "unavailable"})
+                continue
             try:
                 page = self._coordinator.query(grant.authority, grant.lease, type_names=types,
-                                               owner_kind="persona", limit=1)
+                                               owner_kind=owner_kind, limit=1)
             except PermissionError:
                 raise
             except Exception:
                 entries.append({"view_type": name, "status": "unavailable"})
                 continue
-            if not isinstance(page, GraphPage) or len(page.snapshot.epochs) != 1:
+            if (not isinstance(page, GraphPage) or len(page.snapshot.epochs) != 1
+                    or page.snapshot.epochs[0].bot != grant.authority.namespace.bot_id
+                    or page.snapshot.epochs[0].persona != grant.authority.namespace.persona_id
+                    or any(atom.key.owner.kind != owner_kind
+                           or atom.key.type_name not in types
+                           or (atom.key.owner.bot, atom.key.owner.persona)
+                           != grant.authority.namespace.as_tuple for atom in page.snapshot.atoms)):
                 entries.append({"view_type": name, "status": "unavailable"})
                 continue
             epoch = page.snapshot.epochs[0]
@@ -168,6 +189,18 @@ class GraphWorkbenchIssuer:
                 return None
             checked[name] = types
         return checked
+
+    def _owner_kind(self, grant: CoordinatorGrant, view_type: str) -> str | None:
+        resolver = getattr(self._view_registry, "view_owner_kind", None)
+        if not callable(resolver):
+            return None
+        try:
+            owner_kind = resolver(grant.authority, view_type)
+        except Exception:
+            return None
+        if not isinstance(owner_kind, str) or owner_kind not in grant.authority.owner_scope:
+            return None
+        return owner_kind
 
     def _unavailable_domains(self, grant: CoordinatorGrant) -> tuple[Mapping[str, str], ...]:
         catalogue = getattr(self._view_registry, "catalogue", None)

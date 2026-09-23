@@ -16,6 +16,7 @@ from .rewrite.sylanne3.host import (
 )
 from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
 from .rewrite.sylanne3.host.authority_profile import AuthorityProfileUnavailable
+from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
 from .rewrite.sylanne3.runtime_contracts import canonical_digest
 
@@ -46,6 +47,8 @@ class Sylanne3Plugin(Star):
             self._config_valid = False
         self._runtime: RuntimeContext | None = None
         self.runtime_health = RuntimeHealth("limited", ("not_started",))
+        self._workbench = WorkbenchHostMount()
+        self._workbench.register(context)
 
     async def initialize(self) -> None:
         if not self._config_valid:
@@ -137,6 +140,7 @@ class Sylanne3Plugin(Star):
             logger.error("Sylanne 3 startup blocked: v2 graph unavailable")
 
     async def terminate(self) -> None:
+        self._workbench.close()
         if self._runtime is not None:
             self.runtime_health = await self._runtime.stop()
             self._runtime = None

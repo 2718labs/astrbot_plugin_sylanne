@@ -14,7 +14,10 @@ import hashlib
 import json
 import math
 
-from ...memory_types import SourceRecord, register_memory_types, source_key
+from ...memory_types import (
+    SourceRecord, episode_key, register_memory_types, source_key,
+    subjective_trace_key, validate_episode, validate_subjective_trace,
+)
 from ...memory_types import access_key, validate_access
 from ...memory_retrieval import MemoryBatch
 from ...graph_types import AtomKey, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec
@@ -532,6 +535,33 @@ class D06DomainProvider:
             if spec.writer_domain != "d06":
                 raise ValueError("D06 proposal contains a non-D06 graph write")
             registry.validate(write.key, write.value)
+        encoding = {write.key.type_name: write for write in proposal.typed_writes
+                    if write.key.type_name in {"memory.episode.v1", "memory.subjective_trace.v1"}}
+        if encoding:
+            if (len(proposal.typed_writes) != 2
+                    or set(encoding) != {"memory.episode.v1", "memory.subjective_trace.v1"}):
+                raise ValueError("C02 must include exactly one episode and one trace")
+            episode = encoding["memory.episode.v1"]
+            trace = encoding["memory.subjective_trace.v1"]
+            source_refs = tuple(AtomKey.from_token(token) for token in episode.value["source_refs"])
+            if (len(source_refs) != 1
+                    or proposal.envelope.source_qualification.source_refs != (source_refs[0].token,)
+                    or trace.value["episode_ref"] != episode.key.token):
+                raise ValueError("C02 episode, trace and qualified source do not agree")
+            source = source_refs[0]
+            access = access_key(source.owner.bot, source.owner.persona, source.owner.subject)
+            required = (source, access, *(AtomKey.from_token(token) for token in (
+                episode.value["event_ref"], trace.value["perspective_ref"],
+                *trace.value["then_feeling_refs"], *trace.value["interpretation_refs"],
+            )))
+            reads = {ref.key: ref for ref in proposal.envelope.version_guard.read_versions}
+            historical = set(proposal.dependencies.historical_provenance)
+            if (len(reads) != len(proposal.envelope.version_guard.read_versions)
+                    or any(reads.get(key) is None or reads[key].revision <= 0
+                           or reads[key] not in historical for key in required)
+                    or any(reads.get(write.key) != GraphVersion(write.key, 0)
+                           or write.dependencies for write in (episode, trace))):
+                raise ValueError("C02 lacks complete committed provenance or absence proofs")
         return proposal
 
 
@@ -726,14 +756,17 @@ class D06DomainAdapter:
         _nonempty(source_ref, "source_ref")
         if not isinstance(context, EncodingContext):
             raise TypeError("context must be EncodingContext")
-        identity = {
-            "source_ref": source_ref,
-            "event_ref": context.event_ref,
-            "perspective_ref": context.perspective_ref,
+        episode_id = _stable_id("episode", {
+            "source_ref": source_ref, "event_ref": context.event_ref,
             "read_versions": context.read_versions,
-        }
-        episode_id = _stable_id("episode", identity)
-        trace_id = _stable_id("trace", {**identity, "details": context.detail_weights})
+        })
+        trace_id = _stable_id("trace", {
+            "episode_id": episode_id,
+            "perspective_ref": context.perspective_ref,
+            "then_feeling_refs": context.then_feeling_refs,
+            "interpretation_refs": context.interpretation_refs,
+            "details": context.detail_weights,
+        })
         return EncodingProposal(
             MemoryEpisodeCandidate(episode_id, (source_ref,), context.event_ref),
             SubjectiveTraceCandidate(
@@ -745,6 +778,112 @@ class D06DomainAdapter:
                 context.detail_weights,
             ),
             context.read_versions,
+        )
+
+    def compile_encoding(self, envelope: CommandEnvelope, prepared: object) -> DomainProposal:
+        """Compile a proof-bound C02 candidate; only GraphCoordinator may admit it."""
+        from .pipeline import PreparedEncoding
+
+        if not isinstance(envelope, CommandEnvelope):
+            raise TypeError("envelope must be CommandEnvelope")
+        if not isinstance(prepared, PreparedEncoding) or prepared.status != "candidate":
+            raise TypeError("prepared must be a D06 candidate encoding")
+        if envelope.authority.issuer_domain != "d06" or envelope.authority.namespace != self.namespace:
+            raise ValueError("C02 requires D06 authority in the encoding namespace")
+        if (prepared.epoch.bot, prepared.epoch.persona) != self.namespace.as_tuple:
+            raise ValueError("prepared encoding crosses namespace")
+        proposal = prepared.proposal
+        if proposal.status != "proposal" or proposal.episode.source_refs != (prepared.source_ref,):
+            raise ValueError("encoding proposal does not match the authorized source")
+        if proposal.trace.episode_ref != proposal.episode.episode_id:
+            raise ValueError("subjective trace does not name the proposed episode")
+        source = source_key(*self.namespace.as_tuple, prepared.source_ref)
+        access = access_key(*self.namespace.as_tuple, prepared.source_ref)
+        if (envelope.source_qualification.source_refs != (source.token,)
+                or source.token not in envelope.input_refs):
+            raise ValueError("C02 envelope does not qualify the source")
+        guarded = {version.key: version for version in envelope.version_guard.read_versions}
+        proof = {version.key: version for version in prepared.proof_versions}
+        if (len(guarded) != len(envelope.version_guard.read_versions)
+                or len(proof) != len(prepared.proof_versions)):
+            raise ValueError("C02 read proofs must not repeat keys")
+        if source not in proof or access not in proof:
+            raise ValueError("C02 requires committed source and access proofs")
+        if any(version.revision <= 0 or guarded.get(key) != version
+               for key, version in proof.items()):
+            raise ValueError("C02 source proof differs from guarded committed versions")
+
+        def graph_ref(token: str, label: str, allowed_types: frozenset[str]) -> AtomKey:
+            key = AtomKey.from_token(token)
+            if (NamespaceId.from_key(key) != self.namespace
+                    or key.type_name not in allowed_types):
+                raise ValueError(f"{label} is not an allowed same-namespace graph reference")
+            if key not in guarded or guarded[key].revision <= 0:
+                raise ValueError(f"{label} lacks a committed read proof")
+            return key
+
+        event = graph_ref(proposal.episode.event_ref, "event_ref", frozenset({"d03.world_event"}))
+        perspective = graph_ref(
+            proposal.trace.perspective_ref, "perspective_ref",
+            frozenset({"d03.role_binding", "d03.entity_anchor"}),
+        )
+        feelings = tuple(graph_ref(
+            ref, "then_feeling_ref", frozenset({"d04.feeling_state.v1", "d04.appraisal_bundle.v1"})
+        )
+                         for ref in proposal.trace.then_feeling_refs)
+        interpretations = tuple(graph_ref(
+            ref, "interpretation_ref",
+            frozenset({"d07.current_interpretation.v1", "d07.belief_revision.v1"}),
+        )
+                                for ref in proposal.trace.interpretation_refs)
+        required = (source, event, perspective, *feelings, *interpretations)
+        context_versions: dict[AtomKey, int] = {}
+        for ref, revision in proposal.read_versions:
+            key = source if ref in {prepared.source_ref, source.token} else AtomKey.from_token(ref)
+            if key in context_versions or NamespaceId.from_key(key) != self.namespace:
+                raise ValueError("encoding read_versions repeat or cross namespace")
+            context_versions[key] = revision
+            if guarded.get(key) != GraphVersion(key, revision) or revision <= 0:
+                raise ValueError("encoding read_versions differ from committed guard")
+        if not set(required).issubset(context_versions):
+            raise ValueError("encoding context lacks required read_versions")
+
+        episode = episode_key(*self.namespace.as_tuple, proposal.episode.episode_id)
+        trace = subjective_trace_key(*self.namespace.as_tuple, proposal.trace.trace_id)
+        if (guarded.get(episode) != GraphVersion(episode, 0)
+                or guarded.get(trace) != GraphVersion(trace, 0)):
+            raise ValueError("C02 requires revision-0 episode and trace proofs")
+        episode_value = {
+            "episode_id": proposal.episode.episode_id,
+            "source_refs": [source.token],
+            "event_ref": event.token,
+        }
+        trace_value = {
+            "trace_id": proposal.trace.trace_id,
+            "episode_ref": episode.token,
+            "perspective_ref": perspective.token,
+            "then_feeling_refs": [key.token for key in feelings],
+            "interpretation_refs": [key.token for key in interpretations],
+            "detail_weights": [[detail, float(weight)] for detail, weight in proposal.trace.detail_weights],
+        }
+        validate_episode(episode_value)
+        validate_subjective_trace(trace_value)
+        writes = (
+            GraphWrite(episode, episode_value),
+            GraphWrite(trace, trace_value),
+        )
+        historical = tuple(dict.fromkeys((
+            *prepared.proof_versions,
+            *(guarded[key] for key in (event, perspective, *feelings, *interpretations)),
+        )))
+        return self.wrap_runtime_proposal(
+            envelope,
+            typed_writes=writes,
+            dependencies=DependencySet(
+                historical_provenance=historical,
+            ),
+            contribution_keys=(f"encoding:{trace.token}",),
+            required_bundle_parts=(),
         )
 
     def wrap_runtime_proposal(
