@@ -3,7 +3,7 @@
 The chat-facing value is only a bounded profile identifier. Deployment owns
 the endpoint, expected TLS server identity, Authority ID, trust root and client
 credential. POSIX material is opened through verified descriptors before TLS
-consumes it. Windows remains unavailable until its handle-level gate is wired.
+consumes it. Windows keeps checked handles pinned while OpenSSL reads paths.
 """
 
 from __future__ import annotations
@@ -22,15 +22,35 @@ import ssl
 import stat
 from typing import Iterator
 
+from ..installation_policy import AdminInstallationPolicy
+from ..runtime.budget import BudgetLease
+from ..runtime_contracts import NamespaceId
 from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 
 
 _PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
-_PROFILE_FIELDS = frozenset({
+_PROFILE_FIELDS_V1 = frozenset({
     "schema", "host", "port", "server_name", "expected_authority_id",
 })
+_PROFILE_FIELDS_V2 = _PROFILE_FIELDS_V1 | {"installation_policy"}
+_INSTALLATION_FIELDS = frozenset({
+    "namespace", "authority_namespace", "installation_id", "manifest_digest",
+    "administrator_holder", "expected_authority_id", "catalogue_hash",
+    "scheme_version", "operator_version", "policy_version", "root_lease",
+    "root_grant",
+})
+_LEASE_FIELDS = frozenset({
+    "lease_id", "parent_id", "bot_id", "persona_id", "currency", "limits",
+    "used", "reserved", "unconfirmed", "version", "state",
+})
+_GRANT_FIELDS = frozenset({
+    "grant_id", "version", "bot_id", "persona_id", "lease_id", "currency",
+    "max_ceiling", "allowed_work_kinds", "valid_until_utc", "policy_ref",
+})
 _MATERIAL = ("trust-root.pem", "client-cert.pem", "client-key.pem")
+_D11_SIGNING_KEY = "d11-signing.key"
+_D11_SIGNING_KEY_BYTES = 32
 _MAX_PROFILE_BYTES = 8192
 _MAX_MATERIAL_BYTES = 1_048_576
 _WIN_GENERIC_READ = 0x80000000
@@ -147,7 +167,8 @@ def _check_opened(fd: int, *, directory: bool, key: bool, system: str) -> None:
 
 
 @contextmanager
-def _opened_profile(profile_dir: Path, system: str) -> Iterator[dict[str, int]]:
+def _opened_profile(profile_dir: Path, system: str, *, signing_key: bool = False
+                    ) -> Iterator[dict[str, int]]:
     """Pin every path component and consumed file before inspecting either."""
     if not profile_dir.is_absolute() or os.open not in os.supports_dir_fd:
         raise AuthorityProfileUnavailable("POSIX directory-descriptor traversal is unavailable")
@@ -168,10 +189,12 @@ def _opened_profile(profile_dir: Path, system: str) -> Iterator[dict[str, int]]:
             _check_opened(child, directory=True, key=False, system=system)
             current = child
         files: dict[str, int] = {}
-        for name in ("profile.json",) + _MATERIAL:
+        names = ("profile.json",) + _MATERIAL + ((_D11_SIGNING_KEY,) if signing_key else ())
+        for name in names:
             fd = os.open(name, file_flags, dir_fd=current)
             stack.callback(os.close, fd)
-            _check_opened(fd, directory=False, key=name == "client-key.pem", system=system)
+            _check_opened(fd, directory=False,
+                          key=name in {"client-key.pem", _D11_SIGNING_KEY}, system=system)
             files[name] = fd
         yield files
 
@@ -221,7 +244,8 @@ def _prepared_ssl_context(files: dict[str, int], system: str) -> ssl.SSLContext:
 
 
 @contextmanager
-def _opened_windows_profile(profile_dir: Path) -> Iterator[dict[Path, int]]:
+def _opened_windows_profile(profile_dir: Path, *, signing_key: bool = False
+                            ) -> Iterator[dict[Path, int]]:
     """Pin the whole path while pathname-only OpenSSL loads the same objects.
 
     FILE_SHARE_READ denies write/delete opens, including rename, until all
@@ -243,7 +267,8 @@ def _opened_windows_profile(profile_dir: Path) -> Iterator[dict[Path, int]]:
     kernel.CloseHandle.restype = ctypes.c_int
     invalid = ctypes.c_void_p(-1).value
     directories = tuple(reversed(profile_dir.parents)) + (profile_dir,)
-    paths = directories + tuple(profile_dir / name for name in ("profile.json",) + _MATERIAL)
+    names = ("profile.json",) + _MATERIAL + ((_D11_SIGNING_KEY,) if signing_key else ())
+    paths = directories + tuple(profile_dir / name for name in names)
     with ExitStack() as stack:
         handles: dict[Path, int] = {}
         for path in paths:
@@ -294,12 +319,12 @@ def _check_windows_handles(profile_dir: Path, handles: dict[Path, int]) -> None:
         import win32security  # type: ignore[import-not-found]
         runtime_user, runtime_sids = security_gate._runtime_token_sids(win32security)
         protected_root = profile_dir.parents[2]
-        key_path = profile_dir / "client-key.pem"
+        key_paths = {profile_dir / "client-key.pem", profile_dir / _D11_SIGNING_KEY}
         for path, handle in handles.items():
             security_gate._check_security_descriptor(
                 path, runtime_user, runtime_sids,
                 _HandleSecurityView(win32security, handle),
-                key=path == key_path,
+                key=path in key_paths,
                 protected=path == protected_root or protected_root in path.parents,
             )
     except PermissionError:
@@ -340,7 +365,10 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs)
     except UnicodeError as exc:
         raise ValueError("authority profile is not UTF-8") from exc
-    if not isinstance(value, dict) or set(value) != _PROFILE_FIELDS:
+    if (not isinstance(value, dict) or type(value.get("schema")) is not int
+            or value["schema"] not in {1, 2}
+            or set(value) != (_PROFILE_FIELDS_V1 if value["schema"] == 1
+                              else _PROFILE_FIELDS_V2)):
         raise ValueError("authority profile schema is invalid")
     return value
 
@@ -361,10 +389,12 @@ def _endpoint_name(value: object) -> str:
 def _profile_from_payload(profile_id: str, profile_dir: Path,
                           payload: dict[str, object],
                           prepared: ssl.SSLContext | None = None) -> AuthorityTlsProfile:
-    if payload["schema"] != 1 or type(payload["schema"]) is not int:
+    if type(payload["schema"]) is not int or payload["schema"] not in {1, 2}:
         raise ValueError("authority profile schema is invalid")
     if type(payload["port"]) is not int or not 1 <= payload["port"] <= 65535:
         raise ValueError("authority profile port is invalid")
+    if payload["schema"] == 2:
+        _policy_from_payload(payload)
     authority_id = payload["expected_authority_id"]
     if not isinstance(authority_id, str):
         raise ValueError("expected Authority identity is invalid")
@@ -378,6 +408,53 @@ def _profile_from_payload(profile_id: str, profile_dir: Path,
         client_certificate=profile_dir / "client-cert.pem",
         client_private_key=profile_dir / "client-key.pem",
         prepared_ssl_context=prepared,
+    )
+
+
+def _exact_object(value: object, expected: frozenset[str], name: str) -> dict[str, object]:
+    if type(value) is not dict or set(value) != expected:
+        raise ValueError(f"{name} schema is invalid")
+    return value
+
+
+def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
+    """Parse schema 2 after the enclosing profile passed its trusted read gate."""
+    from ..runtime.issuers import BudgetLeaseGrant
+
+    if (type(payload.get("schema")) is not int or payload["schema"] != 2
+            or set(payload) != _PROFILE_FIELDS_V2):
+        raise ValueError("administrator installation policy requires profile schema 2")
+    values = _exact_object(payload["installation_policy"], _INSTALLATION_FIELDS,
+                           "installation policy")
+    namespace = _exact_object(values["namespace"], frozenset({"bot_id", "persona_id"}),
+                              "installation namespace")
+    lease = _exact_object(values["root_lease"], _LEASE_FIELDS, "root lease")
+    grant = _exact_object(values["root_grant"], _GRANT_FIELDS, "root grant")
+    if values["expected_authority_id"] != payload["expected_authority_id"]:
+        raise ValueError("installation Authority identity differs from TLS profile")
+    if type(lease["version"]) is not int or type(grant["version"]) is not int:
+        raise ValueError("root budget version must be an exact integer")
+    if (type(lease["limits"]) is not dict or not lease["limits"]
+            or any(type(value) is not int or value <= 0
+                   for value in lease["limits"].values())):
+        raise ValueError("root lease requires explicit positive limits")
+    if type(grant["allowed_work_kinds"]) is not list:
+        raise ValueError("root grant work kinds must be a list")
+    return AdminInstallationPolicy(
+        namespace=NamespaceId(**namespace),
+        authority_namespace=values["authority_namespace"],
+        installation_id=values["installation_id"],
+        manifest_digest=values["manifest_digest"],
+        administrator_holder=values["administrator_holder"],
+        expected_authority_id=values["expected_authority_id"],
+        catalogue_hash=values["catalogue_hash"],
+        scheme_version=values["scheme_version"],
+        operator_version=values["operator_version"],
+        policy_version=values["policy_version"],
+        root_lease=BudgetLease(**lease),
+        root_grant=BudgetLeaseGrant(**{
+            **grant, "allowed_work_kinds": tuple(grant["allowed_work_kinds"]),
+        }),
     )
 
 
@@ -452,4 +529,84 @@ def build_admin_authority_transport(profile_id: str) -> MtlsAuthorityTransport:
     return _build_transport_from_root(profile_id, root)
 
 
-__all__ = ("AuthorityProfileUnavailable", "build_admin_authority_transport")
+def load_admin_installation_policy(profile_id: str) -> AdminInstallationPolicy:
+    """Read schema-2 policy only through the real administrator profile gate.
+
+    This returns a value, not an authorization capability. Callers must still
+    match the separately authenticated Authority installation and namespace.
+    """
+    _check_profile_id(profile_id)
+    system = platform.system()
+    if system in {"Linux", "Darwin"}:
+        if os.name != "posix":
+            raise AuthorityProfileUnavailable("POSIX directory-descriptor traversal is unavailable")
+        if os.geteuid() == 0:
+            raise AuthorityProfileUnavailable("Authority client must run without administrator identity")
+        root = (Path("/etc/sylanne/client/profiles") if system == "Linux" else
+                Path("/Library/Application Support/Sylanne/client/profiles"))
+        with _opened_profile(root / profile_id, system) as files:
+            payload = _read_profile_json(files["profile.json"])
+            return _policy_from_payload(payload)
+    if system == "Windows":
+        from .windows_profile_security import programdata_profile_root
+
+        profile_dir = programdata_profile_root() / profile_id
+        with _opened_windows_profile(profile_dir) as handles:
+            _check_windows_handles(profile_dir, handles)
+            payload = _read_profile_json(profile_dir / "profile.json")
+            return _policy_from_payload(payload)
+    raise AuthorityProfileUnavailable("unsupported Authority profile platform")
+
+
+def _read_windows_signing_key(handle: int) -> bytes:
+    """Read the pinned object itself; reopening its pathname would break the gate."""
+    if os.name != "nt":
+        raise AuthorityProfileUnavailable("Windows signing-key handle is unavailable")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.ReadFile.argtypes = (
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
+    )
+    kernel.ReadFile.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(_D11_SIGNING_KEY_BYTES + 1)
+    count = ctypes.c_uint32()
+    if not kernel.ReadFile(ctypes.c_void_p(handle), buffer, len(buffer),
+                           ctypes.byref(count), None):
+        raise AuthorityProfileUnavailable("Windows signing-key handle read failed")
+    return bytes(buffer[:count.value])
+
+
+def load_admin_d11_signing_key(profile_id: str) -> bytes:
+    """Read a schema-2 installation's separate 32-byte administrator D11 key."""
+    _check_profile_id(profile_id)
+    system = platform.system()
+    if system in {"Linux", "Darwin"}:
+        if os.name != "posix":
+            raise AuthorityProfileUnavailable("POSIX directory-descriptor traversal is unavailable")
+        if os.geteuid() == 0:
+            raise AuthorityProfileUnavailable("Authority client must run without administrator identity")
+        root = (Path("/etc/sylanne/client/profiles") if system == "Linux" else
+                Path("/Library/Application Support/Sylanne/client/profiles"))
+        with _opened_profile(root / profile_id, system, signing_key=True) as files:
+            _policy_from_payload(_read_profile_json(files["profile.json"]))
+            raw = _read_fd_bounded(files[_D11_SIGNING_KEY], _D11_SIGNING_KEY_BYTES)
+    elif system == "Windows":
+        from .windows_profile_security import programdata_profile_root
+
+        profile_dir = programdata_profile_root() / profile_id
+        with _opened_windows_profile(profile_dir, signing_key=True) as handles:
+            _check_windows_handles(profile_dir, handles)
+            _policy_from_payload(_read_profile_json(profile_dir / "profile.json"))
+            raw = _read_windows_signing_key(handles[profile_dir / _D11_SIGNING_KEY])
+    else:
+        raise AuthorityProfileUnavailable("unsupported Authority profile platform")
+    if len(raw) != _D11_SIGNING_KEY_BYTES:
+        raise ValueError("administrator D11 signing key must be exactly 32 bytes")
+    return raw
+
+
+__all__ = (
+    "AdminInstallationPolicy", "AuthorityProfileUnavailable",
+    "build_admin_authority_transport", "load_admin_installation_policy",
+    "load_admin_d11_signing_key",
+)
