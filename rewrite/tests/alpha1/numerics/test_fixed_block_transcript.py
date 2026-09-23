@@ -235,6 +235,59 @@ class FixedBlockTranscriptTests(unittest.TestCase):
                 self.assertLessEqual(error, endpoint_bound)
         self.assertTrue(all(0.0 <= value <= 4.0 for value in transcript.output))
 
+    def test_24d_high_latent_state_has_package_bound_interval_certificate(self) -> None:
+        candidate = build_d04_engineering_candidate()
+        previous = (4.0, 2.0, 1.0) * 8
+        block = FixedBlockStep(
+            candidate.k, candidate.r, candidate.j, candidate.a, candidate.alpha,
+            previous, (0.0,) * 24, previous, 1.0 / 8.0, 0.0, 80, 1e-10,
+        )
+        transcript = run_fixed_block_math(self.handle, block)
+        self.assertEqual(transcript.bounds.certificate_flags, 1)
+        self.assertEqual(transcript.bounds.status, 0)
+        self.assertEqual(len(transcript.output), 24)
+
+        # Eight disjoint, identical chains make an independent 3D Decimal
+        # fixed point sufficient to check the complete 24D Euclidean bound.
+        with localcontext() as context:
+            context.prec = 80
+            d = Decimal
+            x = (d(4), d(2), d(1))
+            y = (x[0] - d("0.1"), x[1] - d("0.01"), x[2] - d("0.001"))
+            h = d(1) / d(8)
+            rates = (d(1), d(1) / d(8), d(1) / d(64))
+            k = ((d(9) / d(8), -d(1) / d(8), d(0)),
+                 (-d(1) / d(8), d(5) / d(4), -d(1) / d(8)),
+                 (d(0), -d(1) / d(8), d(9) / d(8)))
+            ln_two = d(2).ln()
+
+            def log_cosh(value: Decimal) -> Decimal:
+                magnitude = abs(value)
+                return magnitude + (d(1) + (-d(2) * magnitude).exp()).ln() - ln_two
+
+            for _ in range(150):
+                midpoint = tuple((left + right) / d(2) for left, right in zip(x, y))
+                gradient = tuple(
+                    sum(k[index][column] * midpoint[column] for column in range(3))
+                    + d(1) / d(4) * (
+                        (log_cosh(y[index]) - log_cosh(x[index])) / (y[index] - x[index])
+                    )
+                    for index in range(3)
+                )
+                next_y = tuple(x[index] - h * rates[index] * gradient[index]
+                               for index in range(3))
+                if max(abs(next_y[index] - y[index]) for index in range(3)) < d("1e-60"):
+                    y = next_y
+                    break
+                y = next_y
+            else:
+                self.fail("independent 24D high-state reference did not converge")
+
+            error = sum((d.from_float(actual) - y[index % 3]) ** 2
+                        for index, actual in enumerate(transcript.output)).sqrt()
+            self.assertLessEqual(error, d.from_float(transcript.bounds.iteration_error))
+            self.assertLess(error, d("1e-12"))
+
     def test_direct_handle_and_incomplete_block_do_not_emit_transcript(self) -> None:
         direct = ABI2NativeLibrary(ctypes.CDLL(str(self.native_asset)), self.native_asset)
         with self.assertRaisesRegex(ABI2ResultError, "package-bound"):
