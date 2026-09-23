@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from sylanne3.runtime_contracts import NamespaceId
+from sylanne3.workbench_api.d01_onboarding import VerifiedBudgetLease, VerifiedModelCapability
 from sylanne3.workbench_api.local_creation_catalogue import LocalCreationCatalogue
 
 
@@ -16,13 +17,19 @@ class HostChecks:
         self.budget = budget
         self.seen = []
 
-    def is_current_model_capability_available(self, *, namespace, capability_ref):
+    def resolve_current_model_capability(self, *, namespace, capability_ref):
         self.seen.append(("model", namespace, capability_ref))
-        return self.model and capability_ref == "model:local-current"
+        if self.model and capability_ref == "model:local-current":
+            return VerifiedModelCapability(namespace, capability_ref, "provider/model", 3,
+                                           "sha256:" + "a" * 64)
+        return None
 
-    def is_current_budget_available(self, *, namespace, budget_ref):
+    def resolve_current_budget_lease(self, *, namespace, budget_ref):
         self.seen.append(("budget", namespace, budget_ref))
-        return self.budget and budget_ref == "budget:local-current"
+        if self.budget and budget_ref == "budget:local-current":
+            return VerifiedBudgetLease(namespace, budget_ref, "lease:current", 2,
+                                       "sha256:" + "b" * 64)
+        return None
 
 
 def package_root(tmp_path: Path) -> Path:
@@ -54,6 +61,8 @@ def test_resolves_manifest_bound_chinese_persona_preset(tmp_path):
     assert resources is not None
     assert resources.blocks[0].claim == "倾向先听清对方的意思，再给出回应。"
     assert resources.values[0].rule_id == "careful-listening"
+    assert resources.model.resource_ref == "provider/model"
+    assert resources.budget.lease_ref == "lease:current"
     assert checks.seen == [
         ("model", NAMESPACE, "model:local-current"),
         ("budget", NAMESPACE, "budget:local-current"),
@@ -76,6 +85,7 @@ def test_rejects_unknown_blueprint_and_unavailable_host_model_or_budget(tmp_path
     assert resolve(cat, budget="budget:browser-invented") is None
     assert checks.seen == [
         ("model", NAMESPACE, "model:browser-invented"),
+        ("budget", NAMESPACE, "budget:local-current"),
         ("model", NAMESPACE, "model:local-current"),
         ("budget", NAMESPACE, "budget:browser-invented"),
     ]

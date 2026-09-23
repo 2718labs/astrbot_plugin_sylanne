@@ -8,7 +8,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Plain
 from astrbot.api.platform import MessageType
 
-from ..runtime_contracts import NamespaceId
+from .identity import astrbot_namespace
 from .ingress import HostIngressEnvelope, SourceLineage
 
 
@@ -72,7 +72,7 @@ async def build_astrbot_ingress(event: AstrMessageEvent, context) -> HostIngress
     known_occurred_at = float(occurred_at)
     if not known_occurred_at > 0 or known_occurred_at > learned_at:
         known_occurred_at = None
-    namespace = NamespaceId(_canonical(platform_id, self_id), persona_id)
+    namespace = astrbot_namespace(platform_id, self_id, persona_id)
     platform_ref = _canonical(platform_id, platform_name, self_id)
     conversation_ref = _canonical(umo, conversation_id)
     sender_ref = _canonical(platform_id, sender_id)

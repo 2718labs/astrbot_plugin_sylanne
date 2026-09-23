@@ -5,6 +5,7 @@ from sylanne3.domains.d01 import PersonaBlock, ValueRule
 from sylanne3.runtime_contracts import NamespaceId
 from sylanne3.workbench_api.d01_onboarding import (
     CurrentD01OnboardingResolver, CurrentOwnerIdentity, VerifiedCreationResources,
+    VerifiedModelCapability, VerifiedBudgetLease,
 )
 from sylanne3.workbench_api.service import AuthenticatedSession
 
@@ -47,8 +48,13 @@ class Catalogue:
             return None
         return VerifiedCreationResources(
             namespace, blueprint_ref, model_capability_ref, budget_ref, 1,
+            "sha256:" + "c" * 64,
             (PersonaBlock("value-1", "value", "关心别人", "growth"),),
             (ValueRule("honesty", "诚实", ("conversation",), (), ()),),
+            VerifiedModelCapability(namespace, model_capability_ref, "provider/model", 3,
+                                    "sha256:" + "a" * 64),
+            VerifiedBudgetLease(namespace, budget_ref, "lease:current", 2,
+                                "sha256:" + "b" * 64),
         )
 
 
@@ -74,6 +80,8 @@ def test_trusted_local_selection_builds_authored_plan_with_stable_retry_id():
     assert first.plan.blocks[1].claim == "关心别人"
     assert first.plan.values[0].rule_id == "honesty"
     assert first.principal == PRINCIPAL
+    assert first.resources.model.resource_ref == "provider/model"
+    assert first.resources.budget.lease_ref == "lease:current"
     assert resolve(resolver).plan.plan_id != first.plan.plan_id
 
 
@@ -121,3 +129,50 @@ def test_revoke_in_progress_holds_creation():
     resolver = CurrentD01OnboardingResolver(
         namespaces=Namespaces(), owners=RevokingOwner(), catalogue=Catalogue())
     assert resolve(resolver) is None
+
+
+def test_committed_replay_uses_owner_pairing_without_current_resource_catalogue():
+    class UnavailableCatalogue:
+        def resolve_current_resources(self, **_kwargs):
+            raise AssertionError("committed replay must not select new resources")
+
+    class ReplayGraph:
+        def replay_committed_role_initialization_v2(self, **kwargs):
+            assert kwargs == {
+                "namespace": NAMESPACE, "operation_id": operation_id,
+                "request_digest": DIGEST, "principal": PRINCIPAL,
+            }
+            return "original-receipt"
+
+    operation_id = str(uuid4())
+    resolver = CurrentD01OnboardingResolver(
+        namespaces=Namespaces(), owners=Owners(), catalogue=UnavailableCatalogue())
+    assert resolver.replay_committed_create_character(
+        coordinator=ReplayGraph(), session=SESSION, scope=SCOPE,
+        purpose="workbench_user_action", audience="owner",
+        operation_id=operation_id, request_digest=DIGEST,
+    ) == "original-receipt"
+
+
+def test_missing_current_model_can_reject_original_pending_intent_with_owner():
+    class UnavailableCatalogue:
+        def resolve_current_resources(self, **_kwargs):
+            return None
+
+    class PendingGraph:
+        def reject_unresolvable_role_initialization_v2(self, **kwargs):
+            assert kwargs == {
+                "namespace": NAMESPACE, "operation_id": operation_id,
+                "request_digest": DIGEST, "principal": PRINCIPAL,
+            }
+            return True
+
+    operation_id = str(uuid4())
+    resolver = CurrentD01OnboardingResolver(
+        namespaces=Namespaces(), owners=Owners(), catalogue=UnavailableCatalogue())
+    assert resolve(resolver, operation_id=operation_id) is None
+    assert resolver.reject_unresolvable_create_character(
+        coordinator=PendingGraph(), session=SESSION, scope=SCOPE,
+        purpose="workbench_user_action", audience="owner",
+        operation_id=operation_id, request_digest=DIGEST,
+    )

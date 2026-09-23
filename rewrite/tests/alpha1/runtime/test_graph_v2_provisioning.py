@@ -345,8 +345,10 @@ def _owner_issue_case(tmp_path, *, first_ingress=False, return_bootstrap=False,
     registry.register(owner_grant_spec())
     if role_types:
         from sylanne3.domains.d01 import PersonaDomain
+        from sylanne3.runtime.role_resources import role_resources_spec
         for spec in PersonaDomain().type_specs():
             registry.register(spec)
+        registry.register(role_resources_spec())
     if scene_types:
         from sylanne3.domains.d03 import ContextProvider
         for spec in ContextProvider().type_specs():

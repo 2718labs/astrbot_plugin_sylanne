@@ -1,6 +1,6 @@
 """An independently checked Owner session reaches the real graph."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 from types import SimpleNamespace
 from uuid import uuid4
@@ -15,12 +15,17 @@ from sylanne3.graph_types import TypeRegistry, owner_grant_policy_digest_v1
 from sylanne3.graph_worker import GraphWorker
 from sylanne3.host.workbench_mount import WorkbenchHostMount
 from sylanne3.runtime_context import RuntimeContext
+from sylanne3.runtime.budget import get_budget_lease
+from sylanne3.runtime.role_resources import role_resources_spec
 from sylanne3.runtime_contracts import canonical_digest
 from sylanne3.workbench_api.http_transport import (
     SYLANNE_OWNER_SESSION_COOKIE, COMMAND_ROUTE, SESSION_ROUTE,
     VerifiedOwnerPairing,
 )
 from sylanne3.workbench_api.onboarding import TrustedCreateCharacter
+from sylanne3.workbench_api.d01_onboarding import (
+    VerifiedBudgetLease, VerifiedCreationResources, VerifiedModelCapability,
+)
 from sylanne3.workbench_api.service import AuthenticatedSession
 
 
@@ -54,6 +59,7 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         registry = TypeRegistry()
         for spec in PersonaDomain().type_specs():
             registry.register(spec)
+        registry.register(role_resources_spec())
         return registry
 
     monkeypatch.setattr(owner_case, "TypeRegistry", role_registry)
@@ -71,6 +77,7 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             authority_namespace=owner_case.AUTH_NS)
         creation = coordinator.provision_namespace_v2(
             bootstrap, policy, operation_id="owner-creation")
+        budget_lease = get_budget_lease(resources[0]._db, creation.root_lease_id)
         expected.update(operation_id=creation.operation_id,
                         digest="sha256:" + creation.input_digest)
         _, tickets = compose()
@@ -155,6 +162,16 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
                         request_digest="sha256:" + "d" * 64)
 
         class Onboarding:
+            def replay_committed_create_character(
+                    self, *, coordinator, session, scope, purpose, audience,
+                    operation_id, request_digest):
+                if (session != owner_session or scope != "bot/persona"
+                        or purpose != "workbench_user_action" or audience != "owner"):
+                    return None
+                return coordinator.replay_committed_role_initialization_v2(
+                    namespace=owner_case.ROLE, operation_id=operation_id,
+                    request_digest=request_digest, principal=principal)
+
             def resolve_create_character(self, *, session, scope, purpose, audience,
                                          operation_id, request_digest, input_data):
                 if (session != owner_session or scope != "bot/persona"
@@ -166,7 +183,17 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
                     return None
                 return TrustedCreateCharacter(
                     session.actor_id, session.session_id, scope, operation_id,
-                    request_digest, plan, principal)
+                    request_digest, plan, principal,
+                    VerifiedCreationResources(
+                        plan.namespace, "blank", "model:one", "budget:one", 1,
+                        "sha256:" + "c" * 64, plan.blocks[1:], plan.values,
+                        VerifiedModelCapability(plan.namespace, "model:one", "provider/model", 1,
+                                                "sha256:" + "a" * 64),
+                        VerifiedBudgetLease(
+                            plan.namespace, "budget:one", budget_lease.lease_id,
+                            budget_lease.version,
+                            "sha256:" + canonical_digest(asdict(budget_lease))),
+                    ))
 
             def resolve_bind_scene(self, **_):
                 return None
@@ -215,6 +242,13 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         assert receipt["owner_grant_revision"] == 1
         assert resources[0]._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_receipts_v1").fetchone() == (1,)
+        resources[0]._db.execute(
+            "UPDATE runtime_budget_leases SET version=version+1 WHERE lease_id=?",
+            (budget_lease.lease_id,))
+        with bind_request_context(_Request(body, token=token)):
+            replayed = await command()
+        assert replayed.status_code == 200
+        assert json.loads(replayed.body)["receipt"] == receipt
         pairing.current = False
         with bind_request_context(_Request(body, token=token)):
             denied = await command()

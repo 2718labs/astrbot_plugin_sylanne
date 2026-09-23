@@ -21,6 +21,8 @@ from sylanne3.graph_coordinator import (
 )
 from sylanne3.authority_service.v2_clock import IngressClockSampleV2
 from sylanne3.host.v2_fence_port import VerifiedIngressClockV2
+from sylanne3.host.identity import astrbot_namespace
+from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import AtomKey, GraphCandidate, GraphVersion, GraphWrite, Owner
 from sylanne3.memory_repository import MemoryRepository
@@ -48,10 +50,13 @@ from test_dispatch_candidate_graph import (
 )
 
 
-def _qualified_bundle(coordinator, authority, lease, providers, *, projection_keys=()):
+def _qualified_bundle(coordinator, authority, lease, providers, *,
+                      projection_keys=(), scene_ref="scene:one"):
     """Use actual D06 source/access graph versions for the source check."""
-    source = source_key("bot", "persona", "source-1")
-    access = access_key("bot", "persona", "source-1")
+    bot, persona = authority.namespace.as_tuple
+    audience = authority.audience[0]
+    source = source_key(bot, persona, "source-1")
+    access = access_key(bot, persona, "source-1")
     _schema, intent, _batch, _request, _receipts, grant = _candidates(
         source_ref=source.token, include_grant=True)
     identity = replace(intent.identity, canonical_input_digest=canonical_digest({
@@ -73,6 +78,7 @@ def _qualified_bundle(coordinator, authority, lease, providers, *, projection_ke
     valid_until = time.time() + 3600
     grant = replace(
         grant, required_check_refs=refs, valid_until=valid_until,
+        audiences=(audience,),
         segment_grants=tuple(replace(segment, required_check_refs=refs,
                                      valid_until=valid_until)
                              for segment in grant.segment_grants),
@@ -80,18 +86,18 @@ def _qualified_bundle(coordinator, authority, lease, providers, *, projection_ke
     use = ClaimUse("claim:one", 0, 5, ClaimKind.EXTERNAL_FACT)
     claims = (ExpressionClaim(
         "claim:one", "Hello", ClaimKind.EXTERNAL_FACT, (source.token,),
-        ("entity:user",), ("expression",), "disclosure:one",
+        (audience,), ("expression",), "disclosure:one",
     ),)
     expression = D09ExpressionProvider()
     blueprint = expression.prepare_blueprint(
-        grant, "scene:one", 1, claims, now=1.0).blueprint
+        grant, scene_ref, 1, claims, now=1.0).blueprint
     assert blueprint is not None
     batch = expression.build_verified_batch_v1(
         grant, blueprint,
         (SegmentCandidate("segment:one", "effect:one", "Hello", (use,),
                           ("answer",), (), 0.0),), now=1.0,
     )
-    owner = Owner("activity", "bot", "persona", identity.activity_id)
+    owner = Owner("activity", bot, persona, identity.activity_id)
     values = (
         ("d08.action_intent.v1", intent.action_id, intent),
         ("d08.action_schema.v1", schema.schema_ref, schema),
@@ -143,6 +149,10 @@ class _TestAdmissionIssuer:
         self.grant = None
         self.batch = None
         self.payload_ref_override = None
+        self.namespace = NamespaceId("bot", "persona")
+        self.audience = "entity:user"
+        self.astrbot_route = False
+        self.platform_name_override = None
 
     def bind(self, values):
         self.intent, self.schema, self.grant, self.batch = values
@@ -154,8 +164,9 @@ class _TestAdmissionIssuer:
             self.intent, self.schema, self.grant, self.batch)
         segment = batch["segments"][0]
         identity = intent.identity
+        namespace = "/".join(self.namespace.as_tuple)
         request = DispatchRequest(
-            "bot/persona", identity.operation_id, identity.activity_id,
+            namespace, identity.operation_id, identity.activity_id,
             identity.effect_id, identity.attempt_id,
             canonical_digest({"command": identity.operation_id}),
             (self.payload_ref_override or dispatch_segment_payload_ref(
@@ -164,7 +175,7 @@ class _TestAdmissionIssuer:
             grant.required_check_refs, 1, 1, 1, "content:one",
             batch["cancellation_epoch"],
             RecoveryConstraintFootprint(
-                "bot/persona", identity.activity_id, identity.effect_id,
+                namespace, identity.activity_id, identity.effect_id,
                 communication_action=grant.communication_action_id,
                 contact_id=grant.contact_id, segment_id=segment["segment_id"],
                 budgets=(BudgetConstraint("parent", "0", "1", "1"),),
@@ -177,7 +188,7 @@ class _TestAdmissionIssuer:
             if spec.check_kind == "source_grant":
                 receipt = D06DomainProvider.provide_required_check(
                     intent, SourceGrantRead(
-                        snapshot, ("entity:user",), "expression", True, True),
+                        snapshot, (self.audience,), "expression", True, True),
                     valid_until=batch["valid_until"],
                 )
             else:
@@ -189,7 +200,7 @@ class _TestAdmissionIssuer:
             receipts.append(receipt)
         lease = get_budget_lease(db, "parent")
         admission = DispatchAdmissionV1(
-            namespace="bot/persona", graph_incarnation=graph_incarnation,
+            namespace=namespace, graph_incarnation=graph_incarnation,
             activity_id=identity.activity_id, effect_id=identity.effect_id,
             attempt_id=identity.attempt_id, operation_id=identity.operation_id,
             dispatch_generation=1, admission_ref="admission:one",
@@ -202,11 +213,15 @@ class _TestAdmissionIssuer:
             required_checks_schema_version="d08.required_check_spec.v1",
             grant_digest=candidate.grant_digest, batch_digest=candidate.batch_digest,
             segment_index=0, payload_digest=segment["payload_digest"],
-            account_ref="account:test", destination_ref="destination:test",
+            account_ref=(json.dumps(["platform-1",
+                                     self.platform_name_override or "aiocqhttp", "bot-1"],
+                                    separators=(",", ":"))
+                         if self.astrbot_route else "account:test"),
+            destination_ref=self.audience if self.astrbot_route else "destination:test",
             scene_ref=batch["scene_ref"], owner_head_ref="owner:test",
             role_ref="role:test", binding_ref="binding:test",
             object_ref=intent.target_ref, action_ref=intent.action_id,
-            purpose=intent.purpose, audience=("entity:user",),
+            purpose=intent.purpose, audience=(self.audience,),
             graph_reads=tuple((item.key.token, item.revision)
                               for item in snapshot.versions),
             query_epoch=snapshot.epochs[0].revision, access_epoch=0, delete_epoch=0,
@@ -364,7 +379,22 @@ def test_committed_candidate_does_not_create_admission_without_issuer(tmp_path):
 
 
 def _issuer_case(tmp_path, *, with_projection=False,
-                 boundary_effect="allow", conflicting_allow=False):
+                 boundary_effect="allow", conflicting_allow=False,
+                 astrbot_route=False, astrbot_scene_override=None,
+                 astrbot_platform_name_override=None):
+    namespace = (astrbot_namespace("platform-1", "bot-1", "persona")
+                 if astrbot_route else NamespaceId("bot", "persona"))
+    bot, persona = namespace.as_tuple
+    audience = (json.dumps(["platform-1:FriendMessage:123456", "conversation-1"],
+                           separators=(",", ":"))
+                if astrbot_route else "entity:user")
+    platform_ref = json.dumps(["platform-1", "aiocqhttp", "bot-1"],
+                              separators=(",", ":"))
+    scene_ref = (
+        astrbot_scene_override or scene_ref_for_conversation(
+            namespace, platform_ref, audience)
+        if astrbot_route else "scene:one"
+    )
     if with_projection:
         registry, providers = _registry()
         for provider in (ContextProvider(), RelationshipProvider()):
@@ -374,52 +404,51 @@ def _issuer_case(tmp_path, *, with_projection=False,
         seed = object()
         seed_coordinator = GraphCoordinator(
             store, seed, d02_issuer=_Resources(), d11_issuer=_Budget())
-        namespace = NamespaceId("bot", "persona")
         for kind, version in (("scheme", "scheme-1"), ("operator", "operator-1"),
                               ("policy", "policy-1"), ("activation", 1)):
             seed_coordinator.set_guard_version(seed, namespace, kind, "current", version)
         with store._lock:
             create_budget_lease(store._db, BudgetLease(
-                "parent", None, "bot", "persona", "USD", {"cpu_ms": 10},
+                "parent", None, bot, persona, "USD", {"cpu_ms": 10},
                 {}, {}, {}, 1, "active"), "install-parent", "0" * 64)
-        MemoryRepository(store, "bot", "persona").ingest(
-            Event(Scope("bot", "persona", "session"), "source-ingress", 1.0, "ingress", {}),
+        MemoryRepository(store, bot, persona).ingest(
+            Event(Scope(bot, persona, "session"), "source-ingress", 1.0, "ingress", {}),
             SourceRecord("source-1", "Hello", "alice", "observed", "confirmed",
-                         1.0, 2.0, "family-1", ("entity:user",), ("expression",)),
+                         1.0, 2.0, "family-1", (audience,), ("expression",)),
         )
-        source_ref = source_key("bot", "persona", "source-1").token
+        source_ref = source_key(bot, persona, "source-1").token
         role = RoleBinding(
             "binding:test", "persona:persona", "role:test", "entity:user", None,
-            "scene:one", "scene:one", "private", ("norm:test",), 0.0, None,
+            scene_ref, scene_ref, "private", ("norm:test",), 0.0, None,
             1, (source_ref,), 1, "active",
         )
         boundary = BoundaryRule(
             "boundary:test", "persona:persona", "entity:user", "message",
-            "entity:user", "scene:one",
+            audience, scene_ref,
             "allow" if boundary_effect == "none" else boundary_effect,
             "runtime_policy", (source_ref,),
             (), (), 0.0, None, 1, "owner", (), "active",
         )
         writes = [
-            GraphWrite(AtomKey(Owner("scene", "bot", "persona", "scene:one"),
+            GraphWrite(AtomKey(Owner("scene", bot, persona, scene_ref),
                                "d03.role_binding", role.role_binding_id), _json(asdict(role))),
         ]
         if boundary_effect != "none":
             writes.append(GraphWrite(
-                AtomKey(Owner("relation", "bot", "persona", "entity:user"),
+                AtomKey(Owner("relation", bot, persona, "entity:user"),
                         "d05.boundary_rule", boundary.rule_id), _json(asdict(boundary))))
         if conflicting_allow:
             second = replace(boundary, rule_id="boundary:second")
             writes.append(GraphWrite(
-                AtomKey(Owner("relation", "bot", "persona", "entity:user"),
+                AtomKey(Owner("relation", bot, persona, "entity:user"),
                         "d05.boundary_rule", second.rule_id), _json(asdict(second))))
         writes = tuple(writes)
         epoch = GraphStore.graph_epoch(
-            store, "bot", "persona",
+            store, bot, persona,
             _capability=seed_coordinator._GraphCoordinator__graph_capability)
         GraphStore.graph_commit(
             store, GraphCandidate(
-                Event(Scope("bot", "persona", "test-domain-seed"),
+                Event(Scope(bot, persona, "test-domain-seed"),
                       "seed-current-projections", 2.0, "domain_seed", {}),
                 tuple(GraphVersion(write.key, 0) for write in writes), writes, (epoch,),
             ), _capability=seed_coordinator._GraphCoordinator__graph_capability,
@@ -428,6 +457,10 @@ def _issuer_case(tmp_path, *, with_projection=False,
         store, _old, _authority, _lease, providers, _registry_unused = _ready(tmp_path)
     bootstrap = object()
     issuer = _TestAdmissionIssuer()
+    issuer.namespace = namespace
+    issuer.audience = audience
+    issuer.astrbot_route = astrbot_route
+    issuer.platform_name_override = astrbot_platform_name_override
     budget = _ClockBudget()
     issuer.budget = budget
     coordinator = GraphCoordinator(
@@ -451,7 +484,6 @@ def _issuer_case(tmp_path, *, with_projection=False,
         bootstrap, "d11", D11RuntimeProvider(),
         D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
     )
-    namespace = NamespaceId("bot", "persona")
     lease, capability = coordinator.grant(
         bootstrap, actor="host", issuer_domain="d06", namespace=namespace,
         domains=("d06", "d08", "d09", "d11", "d03", "d05")
@@ -464,11 +496,12 @@ def _issuer_case(tmp_path, *, with_projection=False,
         "host", "d06", capability, namespace,
         ("event", "activity", "scene", "relation") if with_projection
         else ("event", "activity"),
-        "expression", ("entity:user",), "policy-1", 1,
+        "expression", (audience,), "policy-1", 1,
     )
     bundle, values = _qualified_bundle(
         coordinator, authority, lease, providers,
         projection_keys=tuple(write.key for write in writes) if with_projection else (),
+        scene_ref=scene_ref,
     )
     issuer.bind(values)
     return store, coordinator, authority, lease, bundle, issuer
@@ -532,12 +565,70 @@ def test_current_d03_d05_projection_preserves_admission_transaction_test(
         stored = load_admission(store._db, authority.namespace, "admission:one")
     assert stored is not None and stored.admission == issuer.admission
     assert stored.graph_epoch == committed.invalidated_epochs[0].revision
+    # The fixture admission uses abstract account/destination strings. It
+    # proves D11 persistence, but cannot authorize an AstrBot UMO route.
+    with pytest.raises(UnavailableGuard, match="route"):
+        coordinator.get_dispatch_text_segment(authority, lease, issuer.request)
+    with pytest.raises(UnavailableGuard, match="admission differs"):
+        coordinator.get_dispatch_text_segment(
+            authority, lease, replace(issuer.request, payload_ref="d09:wrong"))
     store.close()
     reopened = sqlite3.connect(tmp_path / "candidate.db")
     try:
         assert load_admission(reopened, authority.namespace, "admission:one") == stored
     finally:
         reopened.close()
+
+
+def test_committed_astrbot_text_segment_uses_exact_batch_and_route(tmp_path):
+    store, coordinator, authority, lease, bundle, issuer = _issuer_case(
+        tmp_path, with_projection=True, astrbot_route=True)
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic - 0.01, monotonic, time.time() + 0.2,
+    )
+    assert coordinator._commit_domain_bundle_fenced(
+        bundle, lease, dispatch_clock_reading=reading).status == "committed"
+    segment = coordinator.get_dispatch_text_segment(authority, lease, issuer.request)
+    assert segment.body == "Hello"
+    assert segment.media_refs == ()
+    assert segment.claim_uses == (
+        ClaimUse("claim:one", 0, 5, ClaimKind.EXTERNAL_FACT),)
+    assert (segment.platform_id, segment.platform_name, segment.self_id,
+            segment.umo, segment.conversation_id, segment.scene_ref) == (
+        "platform-1", "aiocqhttp", "bot-1",
+        "platform-1:FriendMessage:123456", "conversation-1",
+        issuer.admission.scene_ref)
+    with pytest.raises(UnavailableGuard, match="admission differs"):
+        coordinator.get_dispatch_text_segment(
+            authority, lease, replace(issuer.request, segment_index=1,
+                                      segment_count=2))
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("scene_override", "platform_name_override"),
+    (("scene:arbitrary-same-platform", None), (None, "wrong-platform-name")),
+)
+def test_committed_astrbot_text_rejects_unbound_same_platform_scene(
+        tmp_path, scene_override, platform_name_override):
+    store, coordinator, authority, lease, bundle, issuer = _issuer_case(
+        tmp_path, with_projection=True, astrbot_route=True,
+        astrbot_scene_override=scene_override,
+        astrbot_platform_name_override=platform_name_override)
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic - 0.01, monotonic, time.time() + 0.2,
+    )
+    assert coordinator._commit_domain_bundle_fenced(
+        bundle, lease, dispatch_clock_reading=reading).status == "committed"
+    with pytest.raises(UnavailableGuard, match="scene differs"):
+        coordinator.get_dispatch_text_segment(authority, lease, issuer.request)
+    store.close()
 
 
 @pytest.mark.parametrize("wrong_part", ("batch", "index"))

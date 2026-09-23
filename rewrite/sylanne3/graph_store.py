@@ -244,6 +244,18 @@ class GraphStore(Store):
                 requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
                 graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
                 PRIMARY KEY(bot,persona));
+            CREATE TABLE IF NOT EXISTS graph_role_init_request_proofs_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+                input_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona),
+                FOREIGN KEY(bot,persona) REFERENCES graph_role_init_intents_v1(bot,persona));
+            CREATE TRIGGER IF NOT EXISTS graph_role_init_request_proof_no_update_v1
+                BEFORE UPDATE ON graph_role_init_request_proofs_v1
+                BEGIN SELECT RAISE(ABORT, 'role request proof is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_role_init_request_proof_no_delete_v1
+                BEFORE DELETE ON graph_role_init_request_proofs_v1
+                BEGIN SELECT RAISE(ABORT, 'role request proof is immutable'); END;
             CREATE TABLE IF NOT EXISTS graph_role_init_receipts_v1 (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 operation_id TEXT NOT NULL, input_digest TEXT NOT NULL,
@@ -421,6 +433,33 @@ class GraphStore(Store):
             "SELECT name,owner_kinds,storage_role,immutable,schema_version "
             "FROM graph_type_catalog ORDER BY name"
         ).fetchall())
+        authority = tuple(self._db.execute(
+            "SELECT name,writer_domain,schema_hash FROM graph_type_authority ORDER BY name"
+        ).fetchall())
+        expected_authority = tuple((spec.name, spec.writer_domain or "",
+                                    spec.schema_hash or "") for spec in self._registry.specs)
+        new_type = "runtime.role_resources.v1"
+        catalog_addition = next((row for row in expected if row[0] == new_type), None)
+        authority_addition = next((row for row in expected_authority
+                                   if row[0] == new_type), None)
+        if (catalog_addition is not None and authority_addition is not None
+                and actual == tuple(row for row in expected if row[0] != new_type)
+                and authority == tuple(row for row in expected_authority
+                                       if row[0] != new_type)
+                and not self._db.execute(
+                    "SELECT 1 FROM graph_atoms WHERE type_name=? LIMIT 1",
+                    (new_type,),
+                ).fetchone()):
+            self._db.execute(
+                "INSERT INTO graph_type_catalog"
+                "(name,owner_kinds,storage_role,immutable,schema_version) "
+                "VALUES(?,?,?,?,?)", catalog_addition)
+            self._db.execute(
+                "INSERT INTO graph_type_authority"
+                "(name,writer_domain,schema_hash) VALUES(?,?,?)",
+                authority_addition)
+            actual = expected
+            authority = expected_authority
         if actual and actual != expected:
             raise ValueError("graph type catalog does not match this registry")
         if not actual:
@@ -428,11 +467,6 @@ class GraphStore(Store):
                 "INSERT INTO graph_type_catalog(name,owner_kinds,storage_role,immutable,schema_version) "
                 "VALUES(?,?,?,?,?)", expected
             )
-        authority = tuple(self._db.execute(
-            "SELECT name,writer_domain,schema_hash FROM graph_type_authority ORDER BY name"
-        ).fetchall())
-        expected_authority = tuple((spec.name, spec.writer_domain or "",
-                                    spec.schema_hash or "") for spec in self._registry.specs)
         if authority and authority != expected_authority:
             raise ValueError("graph type authority catalogue does not match this registry; migration required")
         if not authority:

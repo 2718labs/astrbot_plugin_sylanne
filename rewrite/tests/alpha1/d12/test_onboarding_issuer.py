@@ -20,6 +20,9 @@ from sylanne3.workbench_api import (
     AsyncGraphWorkbenchService, AuthenticatedSession, GraphWorkbenchIssuer, RequestContext,
     TrustedBindScene, TrustedCreateCharacter, WorkbenchService,
 )
+from sylanne3.workbench_api.d01_onboarding import (
+    VerifiedBudgetLease, VerifiedCreationResources, VerifiedModelCapability,
+)
 
 
 SCOPE = "bot/persona"
@@ -68,6 +71,14 @@ class Policy:
             "another-session" if self.tamper else kwargs["session"].session_id,
             kwargs["scope"], kwargs["operation_id"], kwargs["request_digest"],
             PLAN, PRINCIPAL,
+            VerifiedCreationResources(
+                PLAN.namespace, "d01.persona.warm-listener.v1", "host/model",
+                "host/budget", 1, "sha256:" + "c" * 64, PLAN.blocks, PLAN.values,
+                VerifiedModelCapability(PLAN.namespace, "host/model", "provider/model", 1,
+                                        "sha256:" + "a" * 64),
+                VerifiedBudgetLease(PLAN.namespace, "host/budget", "lease:one", 1,
+                                    "sha256:" + "b" * 64),
+            ),
         )
 
 
@@ -108,7 +119,50 @@ def test_create_uses_server_policy_and_exact_graph_receipt():
     assert len(policy.calls) == 1 and len(graph.calls) == 1
     assert graph.calls[0]["plan"] is PLAN
     assert graph.calls[0]["principal"] is PRINCIPAL
+    assert graph.calls[0]["resources"].model.resource_ref == "provider/model"
+    assert graph.calls[0]["resources"].budget.lease_ref == "lease:one"
     assert graph.calls[0]["request_digest"] == policy.calls[0]["request_digest"]
+
+
+def test_committed_replay_returns_original_receipt_without_new_creation():
+    class ReplayOnly:
+        def replay_committed_create_character(self, **kwargs):
+            return RoleInitializationReceiptV1(
+                PLAN.namespace, kwargs["operation_id"], kwargs["request_digest"],
+                "sha256:" + "1" * 64, PLAN.plan_id, PLAN.head_id,
+                "owner-grant", 1, "sha256:" + "2" * 64,
+                "graph-incarnation", 2, 2, "role-write", "finish-role",
+                "sha256:" + "3" * 64,
+            )
+
+        def resolve_create_character(self, **_kwargs):
+            raise AssertionError("committed replay must not reselect resources")
+
+    graph = Graph()
+    service = WorkbenchService(GraphWorkbenchIssuer(
+        graph, Grants(), Views(), ReplayOnly()))
+    payload = command()
+    answer = service.handle(payload, session=SESSION, context=CONTEXT)
+    assert answer.status == "ready"
+    assert answer.receipt["head_id"] == PLAN.head_id
+    assert graph.calls == []
+
+
+def test_missing_current_resource_terminates_proven_pending_attempt():
+    class Missing:
+        def resolve_create_character(self, **_kwargs):
+            return None
+
+        def reject_unresolvable_create_character(self, **_kwargs):
+            return True
+
+    graph = Graph()
+    answer = WorkbenchService(GraphWorkbenchIssuer(
+        graph, Grants(), Views(), Missing())).handle(
+            command(), session=SESSION, context=CONTEXT)
+    assert answer.status == "unavailable"
+    assert answer.problem["code"] == "role_initialization_terminal_rejected_no_commit"
+    assert graph.calls == []
 
 
 def test_unknown_well_formed_blueprint_reaches_resolver_and_holds():

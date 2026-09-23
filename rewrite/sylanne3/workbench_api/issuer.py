@@ -17,6 +17,7 @@ from ..domains.d03.context import RoleBinding, RoleBindingResolution
 from ..runtime_contracts import AuthorityContext, DomainProposal
 from .domain_registry import PROJECTION_CONTEXT_V1
 from .onboarding import OnboardingPolicyResolver, TrustedBindScene, TrustedCreateCharacter
+from .d01_onboarding import VerifiedCreationResources
 from .service import AuthenticatedSession, request_digest
 
 
@@ -280,24 +281,49 @@ class GraphWorkbenchIssuer:
             "action": "create_character", "scope": scope, "purpose": purpose,
             "audience": audience, "operation_id": operation_id, "input": input_data,
         })
-        resolved = resolver.resolve_create_character(
-            session=session, scope=scope, purpose=purpose, audience=audience,
-            operation_id=operation_id, request_digest=digest, input_data=input_data,
-        )
-        if (not isinstance(resolved, TrustedCreateCharacter)
-                or resolved.actor_id != session.actor_id
-                or resolved.session_id != session.session_id
-                or resolved.scope != scope or resolved.operation_id != operation_id
-                or resolved.request_digest != digest):
-            return _unavailable("role_initialization_policy_unavailable")
-        result = commit(namespace=resolved.plan.namespace, operation_id=operation_id,
-                        request_digest=digest, plan=resolved.plan,
-                        principal=resolved.principal)
+        replay = getattr(resolver, "replay_committed_create_character", None)
+        result = (replay(
+            coordinator=self._coordinator, session=session, scope=scope,
+            purpose=purpose, audience=audience, operation_id=operation_id,
+            request_digest=digest,
+        ) if callable(replay) else None)
+        if result is None:
+            resolved = resolver.resolve_create_character(
+                session=session, scope=scope, purpose=purpose, audience=audience,
+                operation_id=operation_id, request_digest=digest, input_data=input_data,
+            )
+            if resolved is None:
+                reject = getattr(resolver, "reject_unresolvable_create_character", None)
+                if callable(reject) and reject(
+                        coordinator=self._coordinator, session=session, scope=scope,
+                        purpose=purpose, audience=audience, operation_id=operation_id,
+                        request_digest=digest):
+                    return _unavailable("role_initialization_terminal_rejected_no_commit")
+            if (not isinstance(resolved, TrustedCreateCharacter)
+                    or resolved.actor_id != session.actor_id
+                    or resolved.session_id != session.session_id
+                    or resolved.scope != scope or resolved.operation_id != operation_id
+                    or resolved.request_digest != digest
+                    or type(resolved.resources) is not VerifiedCreationResources):
+                return _unavailable("role_initialization_policy_unavailable")
+            result = commit(namespace=resolved.plan.namespace, operation_id=operation_id,
+                            request_digest=digest, plan=resolved.plan,
+                            principal=resolved.principal, resources=resolved.resources)
+            expected_namespace = resolved.plan.namespace
+            expected_plan_id = resolved.plan.plan_id
+            expected_head_id = resolved.plan.head_id
+        else:
+            if not isinstance(result, RoleInitializationReceiptV1):
+                return _unavailable("role_initialization_receipt_invalid")
+            expected_namespace = result.namespace
+            expected_plan_id = result.plan_id
+            expected_head_id = result.head_id
         if (not isinstance(result, RoleInitializationReceiptV1)
-                or result.namespace != resolved.plan.namespace
+                or result.namespace != expected_namespace
                 or result.operation_id != operation_id or result.request_digest != digest
-                or result.plan_id != resolved.plan.plan_id
-                or result.head_id != resolved.plan.head_id
+                or result.plan_id != expected_plan_id
+                or result.head_id != expected_head_id
+                or scope != f"{result.namespace.bot_id}/{result.namespace.persona_id}"
                 or result.owner_grant_revision < 1):
             return _unavailable("role_initialization_receipt_invalid")
         return {"status": "ready", "receipt": {

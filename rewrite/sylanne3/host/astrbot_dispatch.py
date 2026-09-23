@@ -11,18 +11,23 @@ import asyncio
 from concurrent.futures import Future
 from dataclasses import dataclass
 import hashlib
+import json
 from threading import Lock
 from typing import Protocol
 
-from astrbot.api.event import MessageChain
 from astrbot.api.star import Context
+from astrbot.api.platform import MessageType
 from astrbot.core.platform.message_session import MessageSession
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
 
 from ..dispatch_runtime import (
     DispatchBlocked, DispatchRequest, DispatchUnavailable, HandoffStartReceipt,
     HandoffUncertain, PlatformCapabilityDescriptor, PlatformObservation,
 )
 from ..domains.d09 import ClaimUse, segment_payload_digest
+from ..runtime_contracts import NamespaceId
+from .current_scene import verify_current_host_scene
+from .scene_candidates import ObservedSceneCandidate
 
 
 @dataclass(frozen=True)
@@ -34,12 +39,37 @@ class ResolvedTextPayload:
     claim_uses: tuple[ClaimUse, ...]
     namespace: str
     platform_id: str
+    platform_name: str
     self_id: str
     umo: str
+    conversation_id: str
+    scene_ref: str
 
 
 class TextPayloadResolver(Protocol):
-    def resolve(self, payload_ref: str) -> ResolvedTextPayload: ...
+    def resolve(self, request: DispatchRequest) -> ResolvedTextPayload: ...
+
+
+class GraphTextPayloadResolver:
+    """Resolve only a committed D11 admission and its exact D09 graph segment."""
+
+    def __init__(self, coordinator, authority, lease: object) -> None:
+        self._coordinator = coordinator
+        self._authority = authority
+        self._lease = lease
+
+    def resolve(self, request: DispatchRequest) -> ResolvedTextPayload:
+        segment = self._coordinator.get_dispatch_text_segment(
+            self._authority, self._lease, request,
+        )
+        if segment is None:
+            raise DispatchBlocked("committed dispatch text segment is absent")
+        return ResolvedTextPayload(
+            segment.body.encode("utf-8"), segment.media_refs,
+            segment.claim_uses, request.namespace,
+            segment.platform_id, segment.platform_name, segment.self_id,
+            segment.umo, segment.conversation_id, segment.scene_ref,
+        )
 
 
 class AstrBotTextPlatformCapability:
@@ -101,7 +131,7 @@ class AstrBotTextPlatformCapability:
         if running_loop is self._loop:
             raise DispatchUnavailable("synchronous handoff cannot wait on the AstrBot host loop")
 
-        resolved = self._resolver.resolve(request.payload_ref)
+        resolved = self._resolver.resolve(request)
         if not isinstance(resolved, ResolvedTextPayload):
             raise DispatchBlocked("trusted resolver returned an invalid payload")
         if (resolved.namespace != request.namespace
@@ -123,8 +153,23 @@ class AstrBotTextPlatformCapability:
             raise DispatchBlocked("resolved D09 segment metadata is invalid") from exc
         if digest != request.payload_digest:
             raise DispatchBlocked("dispatch payload digest differs")
-        if not text or session.platform_id != self._platform_id or not session.session_id:
+        if (not text or session.platform_id != self._platform_id
+                or session.message_type not in {MessageType.FRIEND_MESSAGE, MessageType.GROUP_MESSAGE}
+                or not session.session_id.isascii() or not session.session_id.isdigit()):
             raise DispatchBlocked("empty text or cross-platform session")
+        namespace_parts = request.namespace.split("/", 1)
+        if len(namespace_parts) != 2 or not all(namespace_parts):
+            raise DispatchBlocked("dispatch namespace has no AstrBot bot and persona")
+        namespace = NamespaceId(*namespace_parts)
+        candidate = ObservedSceneCandidate(
+            namespace,
+            json.dumps([resolved.platform_id, resolved.platform_name, resolved.self_id],
+                       ensure_ascii=True, separators=(",", ":")),
+            json.dumps([resolved.umo, resolved.conversation_id],
+                       ensure_ascii=True, separators=(",", ":")),
+            "group" if session.message_type == MessageType.GROUP_MESSAGE else "private",
+            resolved.scene_ref,
+        )
         # The resolver's self_id binds the UMO to the installed bot identity;
         # AstrBot's UMO itself contains only platform id, type and session id.
         observation_ref = "astrbot:handoff:" + hashlib.sha256(
@@ -136,7 +181,7 @@ class AstrBotTextPlatformCapability:
             self._attempted.add(request.operation_id)
             try:
                 future = asyncio.run_coroutine_threadsafe(
-                    self._send(resolved.umo, text), self._loop,
+                    self._send(session, text, candidate), self._loop,
                 )
             except Exception as exc:
                 raise HandoffUncertain(observation_ref) from exc
@@ -154,8 +199,44 @@ class AstrBotTextPlatformCapability:
             "handed_off" if matched else "failed", observation_ref, None,
         )
 
-    async def _send(self, umo: str, text: str) -> bool:
-        return await self._context.send_message(umo, MessageChain().message(text))
+    async def _send(
+        self, session: MessageSession, text: str, candidate: ObservedSceneCandidate,
+    ) -> bool:
+        if await verify_current_host_scene(self._context, candidate) is None:
+            return False
+        # Context.send_message selects only the platform instance. OneBot may
+        # have multiple accounts on that instance, so every action specifies
+        # and revalidates the original account before the external handoff.
+        matching = [
+            platform for platform in self._context.platform_manager.platform_insts
+            if platform.meta().id == self._platform_id
+        ]
+        if len(matching) != 1:
+            return False
+        adapter = self._context.get_platform_inst(self._platform_id)
+        if (adapter is not matching[0] or not isinstance(adapter, AiocqhttpAdapter)
+                or adapter.meta().id != self._platform_id
+                or adapter.meta().name != "aiocqhttp"):
+            return False
+        action = (
+            "send_group_msg" if session.message_type == MessageType.GROUP_MESSAGE
+            else "send_private_msg"
+        )
+        destination = (
+            "group_id" if session.message_type == MessageType.GROUP_MESSAGE
+            else "user_id"
+        )
+        receipt = await adapter.bot.call_action(
+            action, self_id=self._self_id,
+            **{destination: int(session.session_id)},
+            message=[{"type": "text", "data": {"text": text}}],
+        )
+        if (not isinstance(receipt, dict) or type(receipt.get("message_id")) is not int
+                or receipt["message_id"] <= 0):
+            # The API call may have reached OneBot. An absent or malformed
+            # receipt cannot prove failure and must keep this operation unknown.
+            raise ValueError("OneBot send receipt lacks a valid message_id")
+        return True
 
     def _forget_done(self, operation_id: str, future: Future[bool]) -> None:
         with self._lock:
@@ -168,4 +249,7 @@ class AstrBotTextPlatformCapability:
         raise DispatchUnavailable("AstrBot Context has no original-send query")
 
 
-__all__ = ("AstrBotTextPlatformCapability", "ResolvedTextPayload", "TextPayloadResolver")
+__all__ = (
+    "AstrBotTextPlatformCapability", "GraphTextPayloadResolver",
+    "ResolvedTextPayload", "TextPayloadResolver",
+)

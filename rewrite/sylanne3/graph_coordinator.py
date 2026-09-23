@@ -46,7 +46,8 @@ from .runtime.dispatch_admission import (
 )
 from .runtime.dispatch_admission_preflight import preflight_dispatch_admission
 from .runtime.dispatch_candidate import (
-    DispatchCandidateRecoveryV1, dispatch_segment_payload_ref,
+    DispatchCandidateRecoveryV1,
+    dispatch_segment_payload_ref,
     qualify_dispatch_candidate_sources,
     validate_dispatch_candidate_writes,
 )
@@ -1575,9 +1576,203 @@ class GraphCoordinator:
             port.finish_fence(scope, request_id=rejection[5],
                               request_digest=rejection[6])
 
+    def reject_unresolvable_role_initialization_v2(
+            self, *, namespace: NamespaceId, operation_id: str,
+            request_digest: str, principal: OwnerPrincipalV1) -> bool:
+        """Finish an original pending fence only when no first-role write is proven."""
+        from .authority_service.v2_contract import FencePermitV2
+        from .authority_service.v2_owner_contract import OwnerGraphCommitProofV1
+
+        if (type(namespace) is not NamespaceId or type(principal) is not OwnerPrincipalV1
+                or type(operation_id) is not str or not operation_id
+                or type(request_digest) is not str or not request_digest):
+            raise TypeError("pending role recovery requires typed Owner identity")
+        store = self.__store
+        port = self.__content_fence_v2
+        if not isinstance(store, ProductionGraphStore) or port is None:
+            raise UnavailableGuard("pending role graph is unavailable")
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            db = store._db
+            intent = db.execute(
+                "SELECT operation_id,input_digest,fence_attempt_id,"
+                "requirements_json,anchor_json,graph_revision,graph_epoch "
+                "FROM graph_role_init_intents_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            if intent is None:
+                return False
+            request_proof = db.execute(
+                "SELECT operation_id,request_digest,input_digest "
+                "FROM graph_role_init_request_proofs_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            saved = db.execute(
+                "SELECT 1 FROM graph_role_init_receipts_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            rejection = db.execute(
+                "SELECT 1 FROM graph_role_init_rejections_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            grant_key = owner_grant_key(*namespace.as_tuple)
+            grant_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (grant_key.token,),
+            ).fetchone()
+            owner_proof_row = db.execute(
+                "SELECT operation_id,request_digest,grant_id,grant_digest,"
+                "graph_incarnation,graph_access_epoch,graph_epoch,"
+                "graph_receipt_digest,proof_json "
+                "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            business_atom = db.execute(
+                "SELECT 1 FROM graph_atoms WHERE bot=? AND persona=? AND type_name IN "
+                "('d01.persona_plan.v1','d01.persona_activation.v1',"
+                "'runtime.role_resources.v1') LIMIT 1", namespace.as_tuple,
+            ).fetchone()
+        if request_proof is None:
+            raise UnavailableGuard("pending role has no original request proof")
+        if (intent[0] != operation_id
+                or request_proof != (operation_id, request_digest, intent[1])):
+            raise AuthorityDenied("pending role request identity differs")
+        if saved is not None or rejection is not None or business_atom is not None:
+            raise UnavailableGuard("pending role business outcome is not proven absent")
+        if (metadata.graph_revision, epoch.revision) != intent[5:7]:
+            raise UnavailableGuard("pending role graph stamp changed")
+        target = metadata.requirements
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if (target.namespace != namespace or not self._anchor_matches(target, anchor)
+                or intent[3] != canonical_json(asdict(target))
+                or intent[4] != canonical_json(asdict(anchor))
+                or grant_row is None or grant_row[0] != 1 or grant_row[2] != 1
+                or owner_proof_row is None):
+            raise UnavailableGuard("pending role recovery identity differs")
+        grant = GraphAtom(grant_key, 1, json.loads(grant_row[1]), True)
+        validate_owner_grant_v1(grant.value)
+        proof = OwnerGraphCommitProofV1(
+            namespace, owner_proof_row[0], owner_proof_row[1],
+            owner_proof_row[2], owner_proof_row[3], owner_proof_row[4],
+            1, owner_proof_row[5], owner_proof_row[6], owner_proof_row[7])
+        if (owner_proof_row[8] != canonical_json(asdict(proof))
+                or grant_row[1] != canonical_json(grant.value)
+                or grant.value["principal"] != asdict(principal)
+                or grant.value["grant_id"] != proof.grant_id
+                or "sha256:" + canonical_digest(grant.value) != proof.grant_digest
+                or grant.value["issue_operation_id"] != proof.operation_id
+                or grant.value["graph_incarnation"] != proof.graph_incarnation
+                or target.graph_incarnation != proof.graph_incarnation):
+            raise AuthorityDenied("pending role Owner principal differs")
+        attempt_id = intent[2]
+        permit, state = port.get_fence_operation(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            operation_id=attempt_id)
+        if (type(permit) is not FencePermitV2 or state != "active"
+                or permit.operation_id != attempt_id or permit.operation != "write"
+                or permit.holder != self.__holder
+                or permit.subject != port.installation_grant.subject
+                or permit.authority_id != target.authority_id
+                or permit.namespace != target.authority_namespace
+                or permit.generation != 1 or permit.pinned_anchor != anchor):
+            raise UnavailableGuard("pending role original fence differs")
+        self._reject_owner_graph_write_v2(
+            kind="role_init", namespace=namespace, operation_id=operation_id,
+            input_digest=intent[1], attempt_id=attempt_id, metadata=metadata,
+            epoch=epoch, anchor=anchor, permit=permit, intent=intent)
+        return True
+
+    def replay_committed_role_initialization_v2(
+            self, *, namespace: NamespaceId, operation_id: str,
+            request_digest: str, principal: OwnerPrincipalV1):
+        """Recover an already committed first role from its original graph atoms."""
+        from .domains.d01 import (
+            PersonaPlan, _persona_block, _value_rule,
+        )
+        from .graph_types import Owner
+        from .runtime.role_resources import (
+            read_role_resources, role_resources_key,
+        )
+        from .workbench_api.d01_onboarding import (
+            VerifiedBudgetLease, VerifiedCreationResources, VerifiedModelCapability,
+        )
+
+        if (type(namespace) is not NamespaceId or type(principal) is not OwnerPrincipalV1
+                or type(operation_id) is not str or not operation_id
+                or type(request_digest) is not str):
+            raise TypeError("committed role replay requires typed Owner identity")
+        store = self.__store
+        if not isinstance(store, ProductionGraphStore):
+            raise UnavailableGuard("committed role graph is unavailable")
+        with store._lock:
+            row = store._db.execute(
+                "SELECT receipt_json FROM graph_role_init_receipts_v1 "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                payload = json.loads(row[0])
+                receipt = RoleInitializationReceiptV1(
+                    **{**payload, "namespace": NamespaceId(**payload["namespace"])})
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("committed role receipt is invalid") from exc
+            if (receipt.operation_id != operation_id
+                    or receipt.request_digest != request_digest):
+                raise AuthorityDenied("committed role request identity differs")
+            plan_key = AtomKey(
+                Owner("persona", *namespace.as_tuple),
+                "d01.persona_plan.v1", receipt.plan_id)
+            resource_key = role_resources_key(namespace, receipt.plan_id)
+            plan_row = store._db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (plan_key.token,),
+            ).fetchone()
+            resource_row = store._db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (resource_key.token,),
+            ).fetchone()
+        if plan_row is None or resource_row is None:
+            raise UnavailableGuard("committed role atoms are incomplete")
+        try:
+            plan_value = json.loads(plan_row[1])
+            store._registry.validate(plan_key, plan_value)
+            plan = PersonaPlan(
+                plan_value["plan_id"], NamespaceId(**plan_value["namespace"]),
+                plan_value["version"],
+                tuple(_persona_block(item) for item in plan_value["blocks"]),
+                tuple(_value_rule(item) for item in plan_value["values"]),
+                plan_value["authored"],
+            )
+            selected = read_role_resources(
+                GraphAtom(resource_key, resource_row[0], json.loads(resource_row[1]),
+                          bool(resource_row[2])),
+                namespace=namespace, plan_id=receipt.plan_id,
+                head_id=receipt.head_id,
+            )
+            resources = VerifiedCreationResources(
+                namespace, selected.blueprint_ref, selected.model_capability_ref,
+                selected.budget_ref, plan.version, selected.blueprint_digest,
+                plan.blocks[1:], plan.values,
+                VerifiedModelCapability(
+                    namespace, selected.model_capability_ref,
+                    selected.model_resource_ref, selected.model_revision,
+                    selected.model_digest),
+                VerifiedBudgetLease(
+                    namespace, selected.budget_ref, selected.budget_lease_ref,
+                    selected.budget_version, selected.budget_digest),
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("committed role graph atoms are invalid") from exc
+        return self.commit_role_initialization_v2(
+            namespace=namespace, operation_id=operation_id, plan=plan,
+            principal=principal, request_digest=request_digest,
+            resources=resources)
+
     def commit_role_initialization_v2(self, *, namespace: NamespaceId,
                                       operation_id: str, plan, principal,
-                                      request_digest: str):
+                                      request_digest: str, resources):
         """Install one authored D01 plan and active head after committed Owner issue.
 
         This internal GraphWorker operation is not an Owner login endpoint. Its
@@ -1591,7 +1786,14 @@ class GraphCoordinator:
             canonical_digest as owner_contract_digest,
         )
         from .domains.d01 import PersonaDomain, PersonaPlan, _activation_key
+        from .runtime.budget import BudgetError
+        from .runtime.role_resources import (
+            ROLE_RESOURCES_TYPE, RoleRuntimeResourcesV1, role_resources_write,
+        )
         from .runtime.restore_anchor import RestoreAnchor
+        from .workbench_api.d01_onboarding import (
+            VerifiedBudgetLease, VerifiedCreationResources, VerifiedModelCapability,
+        )
 
         if (not isinstance(self.__store, ProductionGraphStore)
                 or self.__content_fence_v2 is None):
@@ -1607,6 +1809,18 @@ class GraphCoordinator:
             raise ValueError("full role creation request digest is required")
         if plan.namespace != namespace or plan.authored is not True:
             raise AuthorityDenied("role plan is not an authored plan for this namespace")
+        if (type(resources) is not VerifiedCreationResources
+                or resources.namespace != namespace
+                or type(resources.model) is not VerifiedModelCapability
+                or resources.model.namespace != namespace
+                or resources.model.capability_ref != resources.model_capability_ref
+                or type(resources.budget) is not VerifiedBudgetLease
+                or resources.budget.namespace != namespace
+                or resources.budget.budget_ref != resources.budget_ref
+                or resources.blueprint_version != plan.version
+                or plan.blocks[1:] != resources.blocks
+                or plan.values != resources.values):
+            raise AuthorityDenied("verified creation resources differ from authored plan")
         port = self.__content_fence_v2
         guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
         if not callable(guard_reader):
@@ -1614,6 +1828,36 @@ class GraphCoordinator:
         store = self.__store
         domain = PersonaDomain()
         plan_write = domain.plan_write(plan)
+        resource_value = RoleRuntimeResourcesV1(
+            namespace.bot_id, namespace.persona_id, operation_id,
+            plan.plan_id, plan.head_id, resources.blueprint_ref,
+            resources.blueprint_digest, resources.model.capability_ref,
+            resources.model.resource_ref, resources.model.revision,
+            resources.model.digest, resources.budget.budget_ref,
+            resources.budget.lease_ref, resources.budget.version,
+            resources.budget.digest,
+        )
+        resource_write = role_resources_write(resource_value)
+
+        def check_creation_budget(db):
+            try:
+                lease = get_budget_lease(db, resources.budget.lease_ref)
+            except BudgetError as exc:
+                raise AuthorityDenied("verified creation budget lease is unavailable") from exc
+            if (lease.lease_id != resources.budget.lease_ref
+                    or (lease.bot_id, lease.persona_id) != namespace.as_tuple
+                    or lease.state != "active"
+                    or lease.version != resources.budget.version
+                    or "sha256:" + canonical_digest(asdict(lease)) != resources.budget.digest):
+                raise AuthorityDenied("verified creation budget lease changed")
+
+        try:
+            spec = store._registry.spec(ROLE_RESOURCES_TYPE)
+            if spec.writer_domain != "d11":
+                raise UnavailableGuard("D11 role resource graph type is unavailable")
+            store._registry.validate(resource_write.key, resource_write.value)
+        except (KeyError, ValueError, TypeError) as exc:
+            raise UnavailableGuard("D11 role resource graph type is unavailable") from exc
         activation_key = _activation_key(namespace)
         grant_key = owner_grant_key(*namespace.as_tuple)
         with store._lock:
@@ -1686,6 +1930,7 @@ class GraphCoordinator:
             "namespace": list(namespace.as_tuple), "operation_id": operation_id,
             "request_digest": request_digest,
             "plan": asdict(plan), "principal": asdict(principal),
+            "resources": asdict(resource_value),
             "owner_proof": asdict(proof),
         })
         attempt_id = "role-write-" + canonical_digest({
@@ -1699,6 +1944,10 @@ class GraphCoordinator:
         identity = (operation_id, input_digest, attempt_id,
                     canonical_json(asdict(target)), canonical_json(asdict(anchor)))
         if intent is not None and intent[:5] != identity:
+            if saved is None and rejection is None:
+                self.reject_unresolvable_role_initialization_v2(
+                    namespace=namespace, operation_id=operation_id,
+                    request_digest=request_digest, principal=principal)
             raise AuthorityDenied("role initialization identity differs")
         if (saved is None) != (intent is None) and saved is not None:
             raise UnavailableGuard("role receipt lacks original intent")
@@ -1762,12 +2011,17 @@ class GraphCoordinator:
                     "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
                     (activation_key.token,),
                 ).fetchone()
+                resource_row = store._db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (resource_write.key.token,),
+                ).fetchone()
                 committed_guard = OwnerAuthorizationGuardV1(
                     target.authority_id, grant.value["installation_id"], namespace,
                     1, receipt.owner_authorization_head, 0, 0)
                 expected_activation = domain.activation_write(
                     plan, grant, committed_guard)
                 if (plan_row != (1, canonical_json(plan_write.value), 1)
+                        or resource_row != (1, canonical_json(resource_write.value), 1)
                         or activation_row != (
                             1, canonical_json(expected_activation.value), 1)):
                     raise UnavailableGuard("durable role graph atoms differ")
@@ -1794,13 +2048,51 @@ class GraphCoordinator:
         if (intent is not None and
                 (metadata.graph_revision, epoch.revision) != intent[5:7]):
             raise UnavailableGuard("uncommitted role graph stamp changed")
+        try:
+            with store._lock:
+                check_creation_budget(store._db)
+        except AuthorityDenied:
+            if intent is None:
+                raise
+            if (metadata.graph_revision, epoch.revision) != intent[5:7]:
+                raise UnavailableGuard("uncommitted role graph stamp changed")
+            with store._lock:
+                db = store._db
+                if (db.execute(
+                        "SELECT 1 FROM graph_role_init_receipts_v1 "
+                        "WHERE bot=? AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                ).fetchone() is not None or db.execute(
+                        "SELECT 1 FROM graph_atoms WHERE token IN (?,?,?) LIMIT 1",
+                        (plan_write.key.token, activation_key.token,
+                         resource_write.key.token),
+                ).fetchone() is not None):
+                    raise UnavailableGuard("role write outcome is not proven absent")
+            observed, state = port.get_fence_operation(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                operation_id=attempt_id)
+            if (type(observed) is not FencePermitV2 or state != "active"
+                    or observed.operation_id != attempt_id
+                    or observed.operation != "write"
+                    or observed.holder != self.__holder
+                    or observed.subject != port.installation_grant.subject
+                    or observed.authority_id != target.authority_id
+                    or observed.namespace != target.authority_namespace
+                    or observed.generation != 1 or observed.pinned_anchor != anchor):
+                raise UnavailableGuard("original role fence cannot prove no commit")
+            self._reject_owner_graph_write_v2(
+                kind="role_init", namespace=namespace, operation_id=operation_id,
+                input_digest=input_digest, attempt_id=attempt_id, metadata=metadata,
+                epoch=epoch, anchor=anchor, permit=observed, intent=intent)
+            raise
         if (metadata.graph_revision != 1 or epoch.revision != proof.graph_epoch
                 or proof.graph_epoch != 1):
             raise UnavailableGuard("role initialization requires first Owner graph head")
         with store._lock:
             if (store._db.execute(
-                    "SELECT 1 FROM graph_atoms WHERE token IN (?,?) LIMIT 1",
-                    (plan_write.key.token, activation_key.token)).fetchone() is not None):
+                    "SELECT 1 FROM graph_atoms WHERE token IN (?,?,?) LIMIT 1",
+                    (plan_write.key.token, activation_key.token,
+                     resource_write.key.token)).fetchone() is not None):
                 raise UnavailableGuard("initial role atoms already exist")
         if intent is None:
             with store._lock:
@@ -1816,6 +2108,12 @@ class GraphCoordinator:
                         "VALUES(?,?,?,?,?,?,?,?,?)",
                         namespace.as_tuple + identity + (
                             metadata.graph_revision, epoch.revision),
+                    )
+                    db.execute(
+                        "INSERT INTO graph_role_init_request_proofs_v1"
+                        "(bot,persona,operation_id,request_digest,input_digest) "
+                        "VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + (operation_id, request_digest, input_digest),
                     )
                     db.execute("COMMIT")
                 except BaseException:
@@ -1866,6 +2164,10 @@ class GraphCoordinator:
             raise
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("role write permit changed")
+        class _CreationBudgetChangedNoCommit(Exception):
+            pass
+
+        budget_denial = None
         with store._lock:
             db = store._db
             db.execute("BEGIN IMMEDIATE")
@@ -1889,6 +2191,11 @@ class GraphCoordinator:
                 ).fetchone()
                 if current_grant != grant_row or current_access != (1, 0):
                     raise StaleRead("Owner grant changed before role initialization")
+                try:
+                    check_creation_budget(db)
+                except AuthorityDenied as exc:
+                    budget_denial = exc
+                    raise _CreationBudgetChangedNoCommit from exc
                 activation_write = domain.activation_write(plan, grant, guard)
                 candidate = GraphCandidate(
                     Event(Scope(*namespace.as_tuple, "d01-role-initialization"),
@@ -1898,8 +2205,9 @@ class GraphCoordinator:
                               "authorization_head": guard.authorization_head,
                           }),
                     (GraphVersion(grant_key, 1), GraphVersion(plan_write.key, 0),
-                     GraphVersion(activation_key, 0)),
-                    (plan_write, activation_write), (epoch,),
+                     GraphVersion(activation_key, 0),
+                     GraphVersion(resource_write.key, 0)),
+                    (plan_write, activation_write, resource_write), (epoch,),
                 )
                 graph_receipt = GraphStore._graph_commit_in_transaction(
                     store, candidate, _capability=self.__graph_capability)
@@ -1907,8 +2215,9 @@ class GraphCoordinator:
                         or graph_receipt.epoch.revision != epoch.revision + 1
                         or graph_receipt.revisions != (
                             GraphVersion(plan_write.key, 1),
-                            GraphVersion(activation_key, 1))):
-                    raise UnavailableGuard("role graph transaction did not commit both atoms")
+                            GraphVersion(activation_key, 1),
+                            GraphVersion(resource_write.key, 1))):
+                    raise UnavailableGuard("role graph transaction did not commit all atoms")
                 store.cas_graph_recovery_metadata(
                     metadata, target, _capability=self.__graph_capability)
                 finish_id = "finish:" + attempt_id
@@ -1938,10 +2247,19 @@ class GraphCoordinator:
                         receipt.graph_epoch, finish_id, finish_digest),
                 )
                 db.execute("COMMIT")
+            except _CreationBudgetChangedNoCommit:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
             except BaseException:
                 if db.in_transaction:
                     db.execute("ROLLBACK")
                 raise
+        if budget_denial is not None:
+            self._reject_owner_graph_write_v2(
+                kind="role_init", namespace=namespace, operation_id=operation_id,
+                input_digest=input_digest, attempt_id=attempt_id, metadata=metadata,
+                epoch=epoch, anchor=anchor, permit=permit, intent=intent)
+            raise budget_denial
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("committed role write permit changed")
         with store._lock:
@@ -5165,6 +5483,127 @@ class GraphCoordinator:
                 self._admit_content(authority.namespace,
                                     authority.activation_generation, "read")
                 return reader()
+
+    def get_dispatch_text_segment(self, authority: AuthorityContext,
+                                  lease: object, request):
+        """Read one D09 body through its committed D11 admission and graph fence.
+
+        The route is limited to the AstrBot ingress identity profile. This
+        read is content provenance, not a current host send permit.
+        """
+        from .dispatch_runtime import DispatchRequest
+
+        if type(request) is not DispatchRequest or request.namespace != "/".join(
+                authority.namespace.as_tuple):
+            raise ValueError("dispatch request namespace differs")
+        self._authorize(lease, authority, frozenset({"d08", "d09", "d11"}))
+        reader = lambda: self._get_dispatch_text_segment_locked(
+            authority.namespace, request)
+        if (isinstance(self.__store, ProductionGraphStore)
+                and self.__content_fence_v2 is not None):
+            return self._read_v2(authority, reader)
+        with self._content_fence(authority.namespace,
+                                 authority.activation_generation, "read"):
+            with self.__store._lock:
+                self._admit_content(authority.namespace,
+                                    authority.activation_generation, "read")
+                return reader()
+
+    def _get_dispatch_text_segment_locked(self, namespace, request):
+        from .domains.d09 import ClaimKind, ClaimUse, D09ExpressionProvider
+        from .runtime.dispatch_candidate import GraphDispatchTextSegmentV1
+
+        db = self.__store._db
+        row = db.execute(
+            "SELECT admission_ref FROM graph_dispatch_admissions "
+            "WHERE bot=? AND persona=? AND operation_id=? AND effect_id=?",
+            namespace.as_tuple + (request.operation_id, request.effect_id),
+        ).fetchone() if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='graph_dispatch_admissions'"
+        ).fetchone() else None
+        if row is None:
+            return None
+        receipt = load_admission(db, namespace, row[0])
+        candidate = self._get_dispatch_candidate_evidence_locked(
+            namespace, request.operation_id)
+        if receipt is None or candidate is None:
+            raise UnavailableGuard("dispatch admission or candidate is absent")
+        admission = receipt.admission
+        evidence = candidate.evidence
+        if (evidence.status != "source_qualified"
+                or admission.request_digest != canonical_digest(request)
+                or admission.candidate_digest != evidence.digest
+                or admission.batch_digest != evidence.batch_digest
+                or admission.segment_index != request.segment_index
+                or admission.payload_digest != request.payload_digest
+                or admission.dispatch_generation != request.dispatch_generation
+                or admission.graph_incarnation != (
+                    candidate.graph_incarnation or "nonproduction-graphstore")
+                or receipt.graph_epoch != candidate.graph_epoch
+                or request.payload_ref != dispatch_segment_payload_ref(
+                    evidence.batch_ref, request.segment_index)):
+            raise UnavailableGuard("dispatch text admission differs from graph candidate")
+        batch_ref, batch_revision = candidate.write_versions[3]
+        batch_row = db.execute(
+            "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
+            "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
+            (batch_ref, batch_revision) + namespace.as_tuple + (
+                request.activity_id, request.operation_id),
+        ).fetchone()
+        if batch_row is None or batch_row[1] != 1:
+            raise UnavailableGuard("committed D09 batch is unavailable")
+        batch = json.loads(batch_row[0])
+        next(spec for spec in D09ExpressionProvider.register_types()
+             if spec.name == "d09.verified_segment_batch.v1").validator(batch)
+        index = request.segment_index
+        if (type(index) is not int or not 0 <= index < len(batch["segments"])
+                or batch_ref != evidence.batch_ref
+                or batch["batch_digest"] != evidence.batch_digest
+                or batch["scene_ref"] != admission.scene_ref
+                or tuple(batch["audiences"]) != admission.audience
+                or len(admission.audience) != 1):
+            raise UnavailableGuard("D09 batch scope differs from dispatch admission")
+        segment = batch["segments"][index]
+        if (segment["effect_id"] != request.effect_id
+                or segment["payload_digest"] != request.payload_digest
+                or segment["segment_authorization_ref"] != request.segment_authorization_ref
+                or batch["grant_manifest_digest"] != request.segment_manifest_digest
+                or len(batch["segments"]) != request.segment_count):
+            raise UnavailableGuard("D09 text segment differs from dispatch command")
+        # Ingress freezes platform_ref=[platform_id,platform_name,self_id] and
+        # conversation_ref=[UMO,conversation_id]. Rebuild its bot and scene.
+        try:
+            account = json.loads(admission.account_ref)
+            route = json.loads(admission.audience[0])
+        except (TypeError, ValueError) as exc:
+            raise UnavailableGuard("AstrBot route encoding is unavailable") from exc
+        from .host.identity import astrbot_namespace
+
+        if (type(account) is not list or len(account) != 3
+                or type(route) is not list or len(route) != 2
+                or any(type(item) is not str or not item for item in (*account, *route))
+                or admission.destination_ref != admission.audience[0]
+                or json.dumps(account, ensure_ascii=True, separators=(",", ":"))
+                != admission.account_ref
+                or json.dumps(route, ensure_ascii=True, separators=(",", ":")) != admission.audience[0]):
+            raise UnavailableGuard("dispatch route is not bound to AstrBot ingress")
+        if astrbot_namespace(account[0], account[2], "route-check").bot_id != namespace.bot_id:
+            raise UnavailableGuard("dispatch account differs from AstrBot graph namespace")
+        from .runtime.first_ingress_v2 import scene_ref_for_conversation
+
+        if scene_ref_for_conversation(
+                namespace, admission.account_ref, admission.destination_ref,
+        ) != admission.scene_ref:
+            raise UnavailableGuard("dispatch scene differs from AstrBot ingress")
+        uses = tuple(ClaimUse(item["claim_ref"], item["start"], item["end"],
+                              ClaimKind(item["asserted_as"]))
+                     for item in segment["claim_uses"])
+        return GraphDispatchTextSegmentV1(
+            segment["body"], tuple(segment["media_refs"]), uses,
+            account[0], account[1], account[2], route[0], route[1],
+            admission.scene_ref,
+        )
 
     @staticmethod
     def _dispatch_clock_upper(reading) -> float:

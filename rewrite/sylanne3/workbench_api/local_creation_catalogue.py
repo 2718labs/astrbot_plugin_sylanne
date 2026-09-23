@@ -9,7 +9,9 @@ from typing import Protocol
 
 from ..domains.d01 import PersonaBlock, ValueRule
 from ..runtime_contracts import NamespaceId
-from .d01_onboarding import VerifiedCreationResources
+from .d01_onboarding import (
+    VerifiedBudgetLease, VerifiedCreationResources, VerifiedModelCapability,
+)
 
 
 _PRESET_PATH = "resources/catalogue/d01-onboarding-presets.json"
@@ -17,15 +19,15 @@ _PRESET_SCHEMA = "sylanne.d01.onboarding-presets.v1"
 
 
 class HostModelCapabilityChecker(Protocol):
-    def is_current_model_capability_available(
+    def resolve_current_model_capability(
         self, *, namespace: NamespaceId, capability_ref: str,
-    ) -> bool: ...
+    ) -> VerifiedModelCapability | None: ...
 
 
 class HostBudgetChecker(Protocol):
-    def is_current_budget_available(
+    def resolve_current_budget_lease(
         self, *, namespace: NamespaceId, budget_ref: str,
-    ) -> bool: ...
+    ) -> VerifiedBudgetLease | None: ...
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -82,10 +84,16 @@ class LocalCreationCatalogue:
                         if isinstance(item, dict) and item.get("blueprint_ref") == blueprint_ref]
             if len(selected) != 1:
                 return None
-            if (not self._models.is_current_model_capability_available(
-                    namespace=namespace, capability_ref=model_capability_ref)
-                    or not self._budgets.is_current_budget_available(
-                        namespace=namespace, budget_ref=budget_ref)):
+            model = self._models.resolve_current_model_capability(
+                namespace=namespace, capability_ref=model_capability_ref)
+            budget = self._budgets.resolve_current_budget_lease(
+                namespace=namespace, budget_ref=budget_ref)
+            if (not isinstance(model, VerifiedModelCapability)
+                    or model.namespace != namespace
+                    or model.capability_ref != model_capability_ref
+                    or not isinstance(budget, VerifiedBudgetLease)
+                    or budget.namespace != namespace
+                    or budget.budget_ref != budget_ref):
                 return None
             preset = selected[0]
             if set(preset) != {"blueprint_ref", "version", "label", "description", "blocks", "values"}:
@@ -102,7 +110,8 @@ class LocalCreationCatalogue:
             ) for item in preset["values"])
             return VerifiedCreationResources(
                 namespace, blueprint_ref, model_capability_ref, budget_ref,
-                preset["version"], blocks, values,
+                preset["version"], "sha256:" + sha256(asset).hexdigest(),
+                blocks, values, model, budget,
             )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError,
                 TypeError, KeyError, AttributeError):

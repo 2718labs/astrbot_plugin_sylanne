@@ -96,7 +96,8 @@ class D11RuntimeTypeTests(unittest.TestCase):
         self.assertEqual(D11_PROPOSAL_SCHEMA, "d11.runtime.proposal.v1")
         self.assertEqual(len(D11_PROPOSAL_SCHEMA_HASH), 64)
         provider = D11RuntimeProvider()
-        self.assertEqual(provider.register_types(), tuple(spec.name for spec in specs))
+        self.assertEqual(provider.register_types(),
+                         tuple(spec.name for spec in specs) + ("runtime.role_resources.v1",))
         self.assertEqual(provider.descriptor.provider_id, "d11.runtime")
         registry = TypeRegistry()
         for spec in specs:

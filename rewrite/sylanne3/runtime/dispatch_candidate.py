@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, replace
 
 from ..domains.d06 import D06DomainProvider, SourceGrantRead
 from ..domains.d08 import ActionIntent, ActionSchema, ActionSchemaRecord, GoalExecutionProvider
-from ..domains.d09 import D09ExpressionProvider
+from ..domains.d09 import ClaimUse, D09ExpressionProvider
 from ..graph_types import GraphWrite
 from ..memory_types import access_key, source_key
 from ..graph_types import AtomKey, GraphSnapshot, GraphVersion
@@ -68,6 +68,21 @@ class DispatchCandidateRecoveryV1:
     graph_epoch: int
     graph_incarnation: str | None
     graph_revision: int | None
+
+
+@dataclass(frozen=True)
+class GraphDispatchTextSegmentV1:
+    """One committed D09 text segment with a proven AstrBot route."""
+
+    body: str
+    media_refs: tuple[str, ...]
+    claim_uses: tuple[ClaimUse, ...]
+    platform_id: str
+    platform_name: str
+    self_id: str
+    umo: str
+    conversation_id: str
+    scene_ref: str
 
 
 def validate_dispatch_candidate_writes(
@@ -225,5 +240,6 @@ def qualify_dispatch_candidate_sources(
 
 __all__ = [
     "DispatchCandidateEvidenceV1", "DispatchCandidateRecoveryV1",
+    "GraphDispatchTextSegmentV1", "dispatch_segment_payload_ref",
     "qualify_dispatch_candidate_sources", "validate_dispatch_candidate_writes",
 ]

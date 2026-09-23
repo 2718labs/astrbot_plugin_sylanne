@@ -29,6 +29,7 @@ from sylanne3.runtime_contracts import (
 from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
 
 from test_graph_v2_provisioning import _owner_issue_case
+from test_role_initialization_v2 import _resources
 
 
 def _scene_case(tmp_path, *, owner_capabilities=None,
@@ -67,7 +68,8 @@ def _scene_case(tmp_path, *, owner_capabilities=None,
     role_request_digest = "sha256:" + canonical_digest({"role": "first"})
     role_receipt = coordinator.commit_role_initialization_v2(
         namespace=policy.namespace, operation_id="role-init-1", plan=plan,
-        principal=operation.principal, request_digest=role_request_digest)
+        principal=operation.principal, request_digest=role_request_digest,
+        resources=_resources(store, policy.namespace, plan))
     d03 = ContextProvider()
     d03.compile_scheme({
         "schema": "d03.context.scheme.v1",

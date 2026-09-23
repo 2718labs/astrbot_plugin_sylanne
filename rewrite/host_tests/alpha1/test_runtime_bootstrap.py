@@ -42,6 +42,8 @@ from sylanne3.host.authority_client import AuthorityClient, AuthoritySelection
 from sylanne3.host.d06_ingress import ingress_source_identity
 from sylanne3.host.ingress_assembler import ingress_content_fingerprint
 from sylanne3.host.scene_candidates import SceneCandidateCatalog
+from sylanne3.host.identity import astrbot_namespace
+from sylanne3.runtime.budget import BudgetLease
 from sylanne3.runtime.ingress_contracts import CommittedIngressReplay
 from sylanne3.runtime_contracts import (
     AuthorityContext,
@@ -318,8 +320,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_event_maps_to_bounded_namespace_and_source_identity(self) -> None:
         envelope = await build_astrbot_ingress(Event(), _IngressContext())
-        self.assertEqual(envelope.namespace.persona_id, "persona-1")
-        self.assertIn("adapter-1", envelope.namespace.bot_id)
+        self.assertEqual(envelope.namespace, astrbot_namespace("adapter-1", "bot-1", "persona-1"))
         self.assertIn("conversation-1", envelope.conversation_ref)
         self.assertIn("sender-1", envelope.sender_ref)
         self.assertEqual(envelope.message_id, "message-1")
@@ -328,6 +329,37 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(envelope.lineage.content_reality, "external_report")
         self.assertEqual(envelope.lineage.evidence_eligibility, "reported_claim")
         self.assertEqual(len(envelope.lineage.source_ref), 64)
+
+    async def test_astrbot_namespace_is_stable_and_accepted_by_budget_and_dispatch_id_shapes(self) -> None:
+        first = astrbot_namespace("adapter-1", "bot-1", "persona-1")
+        self.assertEqual(first.bot_id, "astrbot-bot:" + canonical_digest({
+            "schema": "sylanne.astrbot.namespace.v1",
+            "platform_id": "adapter-1", "self_id": "bot-1",
+        }))
+        self.assertEqual(first.persona_id, "astrbot-persona:" + canonical_digest({
+            "schema": "sylanne.astrbot.namespace.v1", "persona_id": "persona-1",
+        }))
+        self.assertEqual(first, astrbot_namespace("adapter-1", "bot-1", "persona-1"))
+        self.assertNotEqual(first.bot_id, astrbot_namespace("adapter-2", "bot-1", "persona-1").bot_id)
+        self.assertNotEqual(first.bot_id, astrbot_namespace("adapter-1", "bot-2", "persona-1").bot_id)
+        self.assertNotEqual(first.persona_id, astrbot_namespace("adapter-1", "bot-1", "persona-2").persona_id)
+        self.assertEqual(first.persona_id, astrbot_namespace("adapter-2", "bot-2", "persona-1").persona_id)
+        for identifier in first.as_tuple:
+            self.assertLessEqual(len(identifier), 128)
+            self.assertRegex(identifier, r"\A[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+            self.assertRegex(identifier, r"\A[A-Za-z0-9][A-Za-z0-9._:/@#=+-]{0,255}\Z")
+        lease = BudgetLease(
+            lease_id="lease-1", parent_id=None, bot_id=first.bot_id,
+            persona_id=first.persona_id, currency="USD", limits={"tokens": 1},
+            used={}, reserved={}, unconfirmed={}, version=1, state="active",
+        )
+        self.assertEqual((lease.bot_id, lease.persona_id), first.as_tuple)
+        for bad in (None, 1, "", " ", "[%None]"):
+            for index in range(3):
+                values = ["adapter-1", "bot-1", "persona-1"]
+                values[index] = bad
+                with self.subTest(bad=bad, index=index), self.assertRaises(ValueError):
+                    astrbot_namespace(*values)
 
     async def test_future_platform_time_is_unknown_and_receive_time_is_not_fabricated(self) -> None:
         future = time.time() + 3600

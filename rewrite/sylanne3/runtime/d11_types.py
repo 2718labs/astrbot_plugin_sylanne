@@ -21,6 +21,7 @@ from ..runtime_contracts import (
 )
 from .budget import get_budget_lease
 from .jobs import PersistentJob, get_job
+from .role_resources import role_resources_spec
 
 
 D11_PROPOSAL_SCHEMA = "d11.runtime.proposal.v1"
@@ -462,7 +463,7 @@ class D11RuntimeProvider:
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
-        return graph_type_specs()
+        return graph_type_specs() + (role_resources_spec(),)
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())
