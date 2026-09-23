@@ -11,7 +11,9 @@ from sylanne3.graph_types import AtomKey, GraphCandidate, GraphWrite, Owner, Typ
 from sylanne3.memory_repository import MemoryRepository
 from sylanne3.memory_reconstruction import DetailCue
 from sylanne3.memory_retrieval import MemoryQuery
-from sylanne3.memory_types import SourceRecord, register_memory_types, source_key
+from sylanne3.memory_types import (
+    SourceRecord, episode_key, register_memory_types, source_key, subjective_trace_key,
+)
 from sylanne3.runtime_contracts import NamespaceId, SourceQualification
 
 
@@ -101,6 +103,36 @@ class AffectivePipelineTests(unittest.TestCase):
         self.ticket = SelectionTicket("other", "activity", "set", ("absent",), 1)
         with self.assertRaisesRegex(ValueError, "does not select"):
             self.prepare(snapshot)
+
+    def test_committed_encoding_evidence_tracks_source_access_without_fabricating_baseline(self):
+        episode = episode_key("bot", "persona", "episode-1")
+        trace = subjective_trace_key("bot", "persona", "trace-1")
+        feeling = AtomKey(Owner("persona", "bot", "persona"), "d04.feeling_state.v1", "current")
+        event = AtomKey(Owner("event", "bot", "persona", "event-1"), "d03.world_event", "current")
+        perspective = AtomKey(Owner("scene", "bot", "persona", "scene-1"), "d03.role_binding", "current")
+        prior = self.store.graph_snapshot((episode, trace))
+        self.store.graph_commit(GraphCandidate(
+            Event(self.scope, "encoding", 2, "encoding", {}), prior.versions, (
+                GraphWrite(episode, {"episode_id": "episode-1", "source_refs": [
+                    source_key("bot", "persona", "message-1").token], "event_ref": event.token}),
+                GraphWrite(trace, {"trace_id": "trace-1", "episode_ref": episode.token,
+                                   "perspective_ref": perspective.token,
+                                   "then_feeling_refs": [feeling.token],
+                                   "interpretation_refs": [], "detail_weights": [["waiting", 0.8]]}),
+            ), prior.epochs,
+        ))
+        evidence = self.pipeline.read_committed_encoding(
+            "message-1", "trace-1", audience="owner", purpose="context")
+        self.assertEqual(evidence.then_feeling_refs, (feeling.token,))
+        self.assertEqual(evidence.detail_weights, (("waiting", 0.8),))
+        self.assertFalse(hasattr(evidence, "base_salience"))
+        self.repository.set_access(
+            Event(self.scope, "withdraw", 3, "withdraw", {}), "message-1",
+            audiences=("owner",), purposes=("context",), status="withdrawn", recorded_at=3,
+        )
+        with self.assertRaisesRegex(PermissionError, "unavailable"):
+            self.pipeline.read_committed_encoding(
+                "message-1", "trace-1", audience="owner", purpose="context")
 
 
 if __name__ == "__main__":
