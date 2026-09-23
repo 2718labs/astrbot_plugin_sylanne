@@ -696,8 +696,12 @@ class AuthorityRpcServer:
                 acceptance = proofs.get_accepted_for_operation(
                     transport_credential=credential, operation=operation)
                 return {"acceptance": None if acceptance is None else proof_to_wire(acceptance)}
-            if method == "get_current_owner_guard_for_fence" and set(command) == {
-                    "namespace", "permit"}:
+            if method == "get_current_owner_guard_for_fence":
+                base_fields = {"namespace", "permit"}
+                owner_fields = {"owner_actor_id", "owner_session_token",
+                                "owner_session_request"}
+                if set(command) not in (base_fields, base_fields | owner_fields):
+                    raise AuthorityUnavailable("owner guard command fields differ")
                 namespace = identifier(command["namespace"], "namespace")
                 service = self._bound_v2_service(
                     credential, profile_id, manifest_digest, namespace)
@@ -711,12 +715,22 @@ class AuthorityRpcServer:
                         or permit.operation not in {"read", "write"}
                         or permit.namespace != namespace or permit.subject != subject):
                     raise AuthorityUnavailable("owner guard read requires a content fence")
+                owner_kwargs = {}
+                if owner_fields <= set(command):
+                    actor = identifier(command["owner_actor_id"], "owner_actor_id")
+                    session_kwargs = self._owner_session_kwargs(
+                        command, namespace, installed.installation_id)
+                    owner_kwargs = {
+                        "owner_actor_id": actor,
+                        "owner_session_token": session_kwargs["session_token"],
+                        "owner_session_request": session_kwargs["session_request"],
+                    }
                 current = service.validate_fence(
                     credential=credential, subject=subject, permit=permit)
                 guard = tickets.get_current_guard(
                     credential=credential, authority_namespace=namespace,
                     installation_id=installed.installation_id,
-                    subject=subject, permit=current)
+                    subject=subject, permit=current, **owner_kwargs)
                 if guard is not None and (
                     type(guard) is not OwnerAuthorizationGuardV1
                     or guard.authority_id != self._authority_id()

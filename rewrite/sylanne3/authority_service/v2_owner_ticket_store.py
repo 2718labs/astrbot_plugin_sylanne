@@ -705,7 +705,10 @@ class AuthorityV2OwnerTicketStore:
 
     def get_current_guard(self, *, credential: object,
                           authority_namespace: str, installation_id: str,
-                          subject: str, permit: FencePermitV2
+                          subject: str, permit: FencePermitV2,
+                          owner_actor_id: str | None = None,
+                          owner_session_token: str | None = None,
+                          owner_session_request: OwnerSessionLoginRequestV1 | None = None,
                           ) -> OwnerAuthorizationGuardV1 | None:
         """Read only the current control head under a live read/write fence.
 
@@ -717,6 +720,12 @@ class AuthorityV2OwnerTicketStore:
         identifier(authority_namespace, "authority_namespace")
         identifier(installation_id, "installation_id")
         identifier(subject, "subject")
+        signed = any(value is not None for value in (
+            owner_actor_id, owner_session_token, owner_session_request))
+        if signed and (type(owner_actor_id) is not str or not owner_actor_id
+                       or type(owner_session_token) is not str or not owner_session_token
+                       or type(owner_session_request) is not OwnerSessionLoginRequestV1):
+            raise AuthorityUnavailable("Owner actor and session fields must be paired")
         if (type(permit) is not FencePermitV2
                 or permit.operation not in {"read", "write"}
                 or permit.namespace != authority_namespace
@@ -756,6 +765,37 @@ class AuthorityV2OwnerTicketStore:
                     or guard.installation_id != installation_id
                     or namespace_ref(guard.namespace) != authority_namespace):
                 raise AuthorityUnavailable("owner guard installation identity differs")
+            if signed:
+                request = owner_session_request
+                sessions = self._owner_sessions
+                source = (sessions._current_pairing_source
+                          if sessions is not None else None)
+                from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
+
+                if (permit.operation != "read" or guard is None
+                        or type(sessions) is not AuthorityV2OwnerSessionStore
+                        or type(source) is not AuthorityOwnerPairingSource
+                        or source._core is not self._core
+                        or request.audience != "owner"
+                        or request.authority_id != permit.authority_id
+                        or request.authority_namespace != authority_namespace
+                        or request.installation_id != installation_id
+                        or guard.authority_id != request.authority_id
+                        or guard.installation_id != request.installation_id):
+                    raise AuthorityUnavailable("Owner session guard identity differs")
+                sessions.require_current_in_tx(
+                    db, token=owner_session_token, request=request)
+                source.require_current_actor_in_tx(
+                    db, authority_namespace=authority_namespace,
+                    installation_id=installation_id, actor_id=owner_actor_id,
+                    principal=request.principal)
+                row = db.execute(
+                    "SELECT issue_operation_id FROM authority_owner_authorization_heads_v1 "
+                    "WHERE authority_namespace=?", (authority_namespace,)).fetchone()
+                pending = (self._checked_pending(db, authority_namespace, row[0])
+                           if row is not None else None)
+                if pending is None or pending[0].principal != request.principal:
+                    raise AuthorityUnavailable("Owner session differs from current grant")
             return guard
 
 

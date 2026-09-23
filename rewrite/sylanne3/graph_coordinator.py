@@ -498,6 +498,7 @@ class GraphCoordinator:
         self.__leases: dict[_AuthorityLease, tuple[str, str, str, NamespaceId, frozenset[str],
                                                   frozenset[str], int]] = {}
         self.__owner_leases: dict[_AuthorityLease, OwnerLeaseBindingV1] = {}
+        self.__owner_session_proofs: dict[_AuthorityLease, tuple[str, object]] = {}
         self.__providers: dict[str, tuple[object, str, str]] = {}
 
     def _content_fence(self, namespace: NamespaceId, generation: int,
@@ -538,7 +539,8 @@ class GraphCoordinator:
     def _read_v2(self, authority: AuthorityContext, reader, *,
                  owner_principal=None,
                  owner_binding: OwnerLeaseBindingV1 | None = None,
-                 owner_view: bool = False):
+                 owner_view: bool = False,
+                 owner_session_proof: tuple[str, object] | None = None):
         """Keep every Authority RPC outside the business graph lock."""
         if owner_view and owner_principal is None:
             raise ValueError("Owner view requires an expected principal")
@@ -568,7 +570,8 @@ class GraphCoordinator:
                     raise UnavailableGuard("v2 read permit changed")
                 if owner_principal is not None or owner_binding is not None:
                     observed_guard, observed_owner = self._owner_binding_in_fence(
-                        authority, scope, owner_principal, owner_binding)
+                        authority, scope, owner_principal, owner_binding,
+                        owner_session_proof)
                 with store._lock:
                     if self._v2_graph_stamp(namespace) != (metadata, epoch):
                         raise UnavailableGuard("v2 graph recovery stamp changed")
@@ -577,7 +580,8 @@ class GraphCoordinator:
                     raise UnavailableGuard("v2 read permit changed")
                 if owner_principal is not None or owner_binding is not None:
                     current_guard, _ = self._owner_binding_in_fence(
-                        authority, scope, owner_principal, observed_owner)
+                        authority, scope, owner_principal, observed_owner,
+                        owner_session_proof)
                     if current_guard != observed_guard:
                         raise UnavailableGuard("Owner Authority guard changed during read")
                 with store._lock:
@@ -3044,7 +3048,9 @@ class GraphCoordinator:
     def grant_current_owner(self, bootstrap: object, *, actor: str,
                             namespace: NamespaceId, domains: tuple[str, ...],
                             purpose: str, audience: str,
-                            activation_generation: int
+                            activation_generation: int,
+                            owner_session_token: str | None = None,
+                            owner_session_request: object | None = None,
                             ) -> tuple[AuthorityContext, object, OwnerLeaseBindingV1]:
         """Mint a D12 read lease only from a trusted paired principal and live heads."""
         self._admin(bootstrap)
@@ -3054,6 +3060,8 @@ class GraphCoordinator:
             raise UnavailableGuard("current Owner principal resolver is unavailable")
         if not purpose or not audience:
             raise ValueError("Owner read requires purpose and audience")
+        proof = self._owner_session_proof(
+            actor, owner_session_token, owner_session_request)
         principal = self._current_owner_principal(actor, namespace)
         lease, ref = self._grant_registered(
             actor=actor, issuer_domain="d12", namespace=namespace,
@@ -3066,11 +3074,13 @@ class GraphCoordinator:
             binding = self._read_v2(
                 authority,
                 lambda: self._owner_graph_binding_locked(authority, principal),
-                owner_principal=principal)
+                owner_principal=principal, owner_session_proof=proof)
         except BaseException:
             del self.__leases[lease]
             raise
         self.__owner_leases[lease] = binding
+        if proof is not None:
+            self.__owner_session_proofs[lease] = proof
         return authority, lease, binding
 
     def release_current_owner_lease(self, bootstrap: object, lease: object) -> None:
@@ -3079,12 +3089,15 @@ class GraphCoordinator:
         if lease not in self.__owner_leases:
             raise AuthorityDenied("current Owner lease required")
         del self.__owner_leases[lease]
+        self.__owner_session_proofs.pop(lease, None)
         del self.__leases[lease]
 
     def read_current_owner_view(self, bootstrap: object, *, actor: str,
                                 namespace: NamespaceId, purpose: str,
                                 audience: str,
-                                expected_principal: OwnerPrincipalV1
+                                expected_principal: OwnerPrincipalV1,
+                                owner_session_token: str | None = None,
+                                owner_session_request: object | None = None,
                                 ) -> CurrentOwnerViewV1:
         """Project current Owner heads without minting a process lease."""
         self._admin(bootstrap)
@@ -3096,6 +3109,8 @@ class GraphCoordinator:
             raise UnavailableGuard("expected Owner principal is unavailable")
         if not isinstance(namespace, NamespaceId):
             raise TypeError("namespace must be NamespaceId")
+        proof = self._owner_session_proof(
+            actor, owner_session_token, owner_session_request)
         with self.__store._lock:
             metadata, _ = self._v2_graph_stamp(namespace)
         authority = AuthorityContext(
@@ -3104,7 +3119,20 @@ class GraphCoordinator:
             metadata.requirements.activation_generation)
         return self._read_v2(
             authority, lambda: None, owner_principal=expected_principal,
-            owner_view=True)
+            owner_view=True, owner_session_proof=proof)
+
+    @staticmethod
+    def _owner_session_proof(actor: str, token: str | None,
+                             request: object | None) -> tuple[str, object] | None:
+        from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
+
+        if token is None and request is None:
+            return None
+        if (type(token) is not str or not token
+                or type(request) is not OwnerSessionLoginRequestV1
+                or type(actor) is not str or not actor):
+            raise UnavailableGuard("Owner signed session proof is unavailable")
+        return token, request
 
     def _current_owner_principal(self, actor: str, namespace: NamespaceId):
         from .authority_service.v2_owner_contract import OwnerPrincipalV1
@@ -3192,7 +3220,8 @@ class GraphCoordinator:
 
     def _owner_binding_in_fence(self, authority: AuthorityContext,
                                 scope: FenceScope, principal,
-                                expected: OwnerLeaseBindingV1 | None
+                                expected: OwnerLeaseBindingV1 | None,
+                                owner_session_proof: tuple[str, object] | None = None,
                                 ) -> tuple[OwnerAuthorizationGuardV1, OwnerLeaseBindingV1]:
         port = self.__content_fence_v2
         if (principal is None and expected is None):
@@ -3204,9 +3233,19 @@ class GraphCoordinator:
         reader = getattr(port, "get_current_owner_guard_for_fence", None)
         if not callable(reader):
             raise UnavailableGuard("current Owner guard fence port is unavailable")
+        proof_args = {}
+        if owner_session_proof is not None:
+            token, request = owner_session_proof
+            if request.principal != paired:
+                raise UnavailableGuard("Owner signed session principal differs")
+            proof_args = {
+                "owner_actor_id": authority.actor,
+                "owner_session_token": token,
+                "owner_session_request": request,
+            }
         guarded = reader(
             namespace=authority.namespace, authority_namespace=scope.authority_namespace,
-            permit=scope.permit)
+            permit=scope.permit, **proof_args)
         if (type(guarded) is not tuple or len(guarded) != 2
                 or type(guarded[0]) is not OwnerAuthorizationGuardV1
                 or guarded[1] != scope.permit):
@@ -4737,7 +4776,8 @@ class GraphCoordinator:
         if isinstance(self.__store, ProductionGraphStore) and self.__content_fence_v2 is not None:
             return self._read_v2(authority, lambda: GraphStore.graph_snapshot(
                 self.__store, keys, _capability=self.__graph_capability),
-                owner_binding=self.__owner_leases.get(lease))
+                owner_binding=self.__owner_leases.get(lease),
+                owner_session_proof=self.__owner_session_proofs.get(lease))
         with self._content_fence(authority.namespace, authority.activation_generation, "read"):
             store = self.__store
             with store._lock:
@@ -4761,7 +4801,8 @@ class GraphCoordinator:
             return self._read_v2(authority, lambda: GraphStore.graph_query(
                 self.__store, *authority.namespace.as_tuple, type_names=type_names,
                 owner_kind=owner_kind, _capability=self.__graph_capability, **filters),
-                owner_binding=self.__owner_leases.get(lease))
+                owner_binding=self.__owner_leases.get(lease),
+                owner_session_proof=self.__owner_session_proofs.get(lease))
         with self._content_fence(authority.namespace, authority.activation_generation, "read"):
             store = self.__store
             with store._lock:

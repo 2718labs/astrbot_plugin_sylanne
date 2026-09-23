@@ -11,6 +11,7 @@ from sylanne3.authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerGraphCommitProofV1, OwnerPrincipalV1,
     canonical_digest as owner_contract_digest,
 )
+from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.contracts import canonical_json
 from sylanne3.graph_coordinator import (
     GraphCoordinator, UnavailableGuard, namespace_ref,
@@ -33,6 +34,10 @@ from sylanne3.workbench_api import AsyncGraphWorkbenchService, RequestContext
 
 NAMESPACE = NamespaceId("bot", "persona")
 PRINCIPAL = OwnerPrincipalV1("owner-idp", "account", "incarnation")
+OWNER_TOKEN = "T" * 43
+OWNER_REQUEST = OwnerSessionLoginRequestV1(
+    "authority", namespace_ref(NAMESPACE), "installation", PRINCIPAL,
+    "credential", 1, "owner", "https://dashboard.local")
 
 
 class OwnerReadPort:
@@ -45,6 +50,7 @@ class OwnerReadPort:
         self.finishes = 0
         self.on_guard_read = None
         self.installation_grant = SimpleNamespace(installation_id="installation")
+        self.session_current = True
 
     def _outside_graph(self):
         assert not self.graph._lock._is_owned()
@@ -72,10 +78,16 @@ class OwnerReadPort:
         return self.active
 
     def get_current_owner_guard_for_fence(
-            self, *, namespace, authority_namespace, permit):
+            self, *, namespace, authority_namespace, permit,
+            owner_actor_id=None, owner_session_token=None, owner_session_request=None):
         self._outside_graph()
         assert namespace == NAMESPACE and authority_namespace == self.anchor.namespace
         assert permit is self.active
+        if owner_session_token is not None:
+            assert (owner_actor_id, owner_session_token, owner_session_request) == (
+                "owner-session", OWNER_TOKEN, OWNER_REQUEST)
+            if not self.session_current:
+                raise RuntimeError("Owner session revoked")
         self.guard_reads += 1
         if self.on_guard_read is not None:
             self.on_guard_read(self.guard_reads)
@@ -224,7 +236,7 @@ def test_owner_read_requires_resolved_principal_and_current_heads(owner_graph):
 
 
 def test_workbench_port_issues_real_current_owner_lease(owner_graph):
-    _, coordinator, bootstrap, _, key, _ = owner_graph
+    _, coordinator, bootstrap, owner_guard, key, _ = owner_graph
     subject = GraphCurrentOwnerGrantPort(
         coordinator, bootstrap, namespace=NAMESPACE,
         activation_generation=1, domains=("d11",))
@@ -238,14 +250,20 @@ def test_workbench_port_issues_real_current_owner_lease(owner_graph):
         {"bot/persona": frozenset({"workbench.read"})},
         {"bot/persona": frozenset({"owner"})},
         {"bot/persona": frozenset({"workbench_view"})},
+        owner_session_token=OWNER_TOKEN, owner_session_request=OWNER_REQUEST,
     )
     with subject.request_scope():
+        assert subject.resolve_current_owner(
+            actor_id="owner-session", scope="bot/persona",
+            purpose="workbench_view", audience="owner") is None
         assert subject.resolve_current_owner(
             actor_id="owner-session", scope="other/persona",
             purpose="workbench_view", audience="owner") is None
         current = subject.resolve_current_owner(
             actor_id="owner-session", scope="bot/persona",
-            purpose="workbench_view", audience="owner")
+            purpose="workbench_view", audience="owner",
+            owner_session_token=OWNER_TOKEN,
+            owner_session_request=OWNER_REQUEST)
         assert current is not None
         assert current.scope == "bot/persona" and current.grant_id == "grant-1"
         assert current.grant.authority.namespace == NAMESPACE
@@ -255,6 +273,12 @@ def test_workbench_port_issues_real_current_owner_lease(owner_graph):
         assert coordinator.query(
             current.grant.authority, current.grant.lease,
             type_names=(key.type_name,), owner_kind="persona")
+        owner_guard.session_current = False
+        with pytest.raises(UnavailableGuard, match="content authority"):
+            coordinator.query(
+                current.grant.authority, current.grant.lease,
+                type_names=(key.type_name,), owner_kind="persona")
+        owner_guard.session_current = True
         with pytest.raises(PermissionError, match="host bootstrap"):
             coordinator.release_current_owner_lease(object(), current.grant.lease)
     assert len(coordinator._GraphCoordinator__leases) == 0
@@ -275,7 +299,9 @@ def test_workbench_port_denies_wrong_actor_pairing_and_revoke(owner_graph):
     subject = GraphCurrentOwnerGrantPort(
         coordinator, bootstrap, namespace=NAMESPACE,
         activation_generation=1, domains=("d11",))
-    request = dict(scope="bot/persona", purpose="workbench_view", audience="owner")
+    request = dict(
+        scope="bot/persona", purpose="workbench_view", audience="owner",
+        owner_session_token=OWNER_TOKEN, owner_session_request=OWNER_REQUEST)
     with subject.request_scope():
         assert subject.resolve_current_owner(actor_id="dashboard-admin", **request) is None
         pairing["principal"] = OwnerPrincipalV1("owner-idp", "other", "incarnation")
@@ -288,7 +314,7 @@ def test_workbench_port_denies_wrong_actor_pairing_and_revoke(owner_graph):
 
 @pytest.mark.asyncio
 async def test_async_workbench_releases_owner_lease_after_each_read_and_exception(owner_graph):
-    _, coordinator, bootstrap, _, key, _ = owner_graph
+    _, coordinator, bootstrap, owner_guard, key, _ = owner_graph
     port = GraphCurrentOwnerGrantPort(
         coordinator, bootstrap, namespace=NAMESPACE,
         activation_generation=1, domains=("d11",))
@@ -298,6 +324,7 @@ async def test_async_workbench_releases_owner_lease_after_each_read_and_exceptio
         {"bot/persona": frozenset({"workbench.read"})},
         {"bot/persona": frozenset({"owner"})},
         {"bot/persona": frozenset({"workbench_view"})},
+        owner_session_token=OWNER_TOKEN, owner_session_request=OWNER_REQUEST,
     )
 
     class Views:
@@ -328,6 +355,14 @@ async def test_async_workbench_releases_owner_lease_after_each_read_and_exceptio
             assert answer.status == "ready"
             assert len(coordinator._GraphCoordinator__leases) == 0
             assert len(coordinator._GraphCoordinator__owner_leases) == 0
+
+        owner_guard.session_current = False
+        revoked = await service.handle(
+            payload, session=session, context=RequestContext(True, True, True))
+        assert revoked.status == "unavailable"
+        assert revoked.problem["code"] == "authority_unavailable"
+        assert len(coordinator._GraphCoordinator__leases) == 0
+        owner_guard.session_current = True
 
         class RaisingResolver(DurableOwnerGrantResolver):
             def resolve(self, **kwargs):

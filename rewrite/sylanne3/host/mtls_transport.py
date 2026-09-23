@@ -1252,6 +1252,9 @@ class MtlsAuthorityTransport:
     async def v2_get_current_owner_guard_for_fence(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, permit: FencePermitV2,
+        owner_actor_id: str | None = None,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
     ) -> tuple[OwnerAuthorizationGuardV1 | None, FencePermitV2]:
         if (type(permit) is not FencePermitV2
                 or permit.operation not in {"read", "write"}
@@ -1259,9 +1262,21 @@ class MtlsAuthorityTransport:
                 or permit.subject != handshake.installation_identity_ref
                 or permit.authority_id != handshake.installation_authority_id):
             raise RuntimeError("owner guard read requires this installation's content fence")
+        owner_fields = {}
+        if any(value is not None for value in (
+                owner_actor_id, owner_session_token, owner_session_request)):
+            if (type(owner_actor_id) is not str or not owner_actor_id
+                    or owner_session_token is None or owner_session_request is None):
+                raise RuntimeError("Owner guard actor and session fields must be paired")
+            owner_fields = {
+                "owner_actor_id": identifier(owner_actor_id, "owner_actor_id"),
+                **self._owner_issue_session_fields(
+                    handshake, namespace, owner_session_token,
+                    owner_session_request),
+            }
         response = await self._content_rpc(
             request, handshake, "get_current_owner_guard_for_fence",
-            {"namespace": namespace, "permit": to_wire(permit)},
+            {"namespace": namespace, "permit": to_wire(permit), **owner_fields},
             protocol=AUTHORITY_V2_PROTOCOL)
         if (type(response) is not dict
                 or set(response) != {"guard", "permit", "channel_binding_sha256"}

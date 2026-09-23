@@ -22,6 +22,9 @@ from sylanne3.authority_service.v2_owner_contract import (
     to_wire,
 )
 from sylanne3.authority_service.v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from sylanne3.authority_service.v2_owner_session import (
+    OwnerSessionLoginRequestV1, to_wire as session_to_wire,
+)
 from sylanne3.graph_coordinator import namespace_ref
 from sylanne3.host.authority_client import (
     AUTHORITY_PROTOCOL, AuthorityHandshake, AuthorityProvisioningRequest,
@@ -229,3 +232,52 @@ async def test_transport_rejects_guard_bound_to_different_permit(owner_rpc, tmp_
     with pytest.raises(RuntimeError, match="permit changed"):
         await transport.v2_get_current_owner_guard_for_fence(
             request, handshake, namespace=AUTH_NS, permit=permit)
+
+
+@pytest.mark.asyncio
+async def test_transport_sends_owner_guard_session_fields_as_one_group(owner_rpc, tmp_path):
+    server, _, _ = owner_rpc
+    claimant = paired(server, CLAIMANT)
+    genesis = claimant("namespace_genesis", {
+        "namespace": asdict(ROLE), "request_id": "signed-guard-genesis"})
+    permit_wire = claimant("begin_fence", {
+        "namespace": AUTH_NS, "holder": "holder-owner", "operation": "read",
+        "operation_id": "signed-guard-read", "expected_anchor": genesis["anchor"],
+    })["permit"]
+    permit = from_wire(permit_wire)
+    handshake = AuthorityHandshake(
+        "paired", server._authority_id(),
+        "mtls:sha256:" + CLAIMANT.certificate_sha256, "e" * 64, True)
+    profile = AuthorityTlsProfile(
+        "installed", "localhost", 443, "localhost", server._authority_id(),
+        tmp_path / "ca.pem", tmp_path / "client.pem", tmp_path / "client.key")
+    transport = MtlsAuthorityTransport({"installed": profile})
+    request = AuthorityProvisioningRequest(
+        AUTHORITY_PROTOCOL, "installed", "astrbot_plugin_sylanne", "4.28.1",
+        tmp_path, tmp_path, PublisherPackageIdentity("c" * 64))
+    session = OwnerSessionLoginRequestV1(
+        server._authority_id(), AUTH_NS, "installation-owner",
+        OwnerPrincipalV1("provider", "account", "incarnation"),
+        "owner-key", 1, "owner", "https://dashboard.local")
+    token = "T" * 43
+
+    async def capture(_request, _handshake, method, command, *, protocol):
+        assert method == "get_current_owner_guard_for_fence"
+        assert protocol == AUTHORITY_V2_PROTOCOL
+        assert command == {
+            "namespace": AUTH_NS, "permit": permit_wire,
+            "owner_actor_id": "owner-actor", "owner_session_token": token,
+            "owner_session_request": session_to_wire(session),
+        }
+        return {"guard": None, "permit": permit_wire,
+                "channel_binding_sha256": handshake.channel_binding_sha256}
+
+    transport._content_rpc = capture
+    assert await transport.v2_get_current_owner_guard_for_fence(
+        request, handshake, namespace=AUTH_NS, permit=permit,
+        owner_actor_id="owner-actor", owner_session_token=token,
+        owner_session_request=session) == (None, permit)
+    with pytest.raises(RuntimeError, match="must be paired"):
+        await transport.v2_get_current_owner_guard_for_fence(
+            request, handshake, namespace=AUTH_NS, permit=permit,
+            owner_actor_id="owner-actor")

@@ -678,16 +678,26 @@ class V2FencePort:
     def get_current_owner_guard_for_fence(
         self, *, namespace: NamespaceId, authority_namespace: str,
         permit: FencePermitV2,
+        owner_actor_id: str | None = None,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
     ) -> tuple[OwnerAuthorizationGuardV1 | None, FencePermitV2]:
         return self._submit(self._with_session_repair(
             lambda: self._get_current_owner_guard_for_fence(
-                namespace, authority_namespace, permit)))
+                namespace, authority_namespace, permit, owner_actor_id,
+                owner_session_token, owner_session_request)))
 
     async def _get_current_owner_guard_for_fence(
         self, namespace: NamespaceId, authority_namespace: str,
         permit: FencePermitV2,
+        owner_actor_id: str | None,
+        owner_session_token: str | None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None,
     ) -> tuple[OwnerAuthorizationGuardV1 | None, FencePermitV2]:
         await self._mapped(namespace, authority_namespace)
+        if owner_session_request is not None:
+            self._owner_session_identity(
+                namespace, authority_namespace, owner_session_request)
         handshake, grant = self._identity()
         if (type(permit) is not FencePermitV2
                 or permit.operation not in {"read", "write"}
@@ -697,7 +707,9 @@ class V2FencePort:
             raise RuntimeError("v2 owner guard read permit identity mismatch")
         guard, current = await self._transport.v2_get_current_owner_guard_for_fence(
             self._request, handshake, namespace=authority_namespace,
-            permit=permit)
+            permit=permit, owner_actor_id=owner_actor_id,
+            owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
         if current != permit:
             raise RuntimeError("v2 owner guard read permit changed")
         if guard is not None and (

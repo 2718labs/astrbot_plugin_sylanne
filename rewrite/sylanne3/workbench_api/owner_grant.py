@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Iterator, Protocol
 
 from ..contracts import StaleRead
+from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..graph_coordinator import GraphCoordinator, UnavailableGuard
 from ..runtime_contracts import NamespaceId
 from .issuer import CoordinatorGrant
@@ -69,7 +70,10 @@ class CurrentOwnerGrantPort(Protocol):
     """
 
     def resolve_current_owner(self, *, actor_id: str, scope: str,
-                              purpose: str, audience: str) -> CurrentOwnerGrant | None: ...
+                              purpose: str, audience: str,
+                              owner_session_token: str | None = None,
+                              owner_session_request: OwnerSessionLoginRequestV1 | None = None
+                              ) -> CurrentOwnerGrant | None: ...
 
 
 class GraphCurrentOwnerGrantPort:
@@ -116,17 +120,24 @@ class GraphCurrentOwnerGrantPort:
                 self._request_leases.reset(token)
 
     def resolve_current_owner(self, *, actor_id: str, scope: str,
-                              purpose: str, audience: str) -> CurrentOwnerGrant | None:
+                              purpose: str, audience: str,
+                              owner_session_token: str | None = None,
+                              owner_session_request: OwnerSessionLoginRequestV1 | None = None
+                              ) -> CurrentOwnerGrant | None:
         leases = self._request_leases.get()
         if leases is None:
             return None
-        if (scope != self._scope or not actor_id or not purpose or not audience):
+        if (scope != self._scope or not actor_id or not purpose or not audience
+                or type(owner_session_token) is not str or not owner_session_token
+                or type(owner_session_request) is not OwnerSessionLoginRequestV1):
             return None
         try:
             authority, lease, binding = self._coordinator.grant_current_owner(
                 self._bootstrap, actor=actor_id, namespace=self._namespace,
                 domains=self._domains, purpose=purpose, audience=audience,
                 activation_generation=self._activation_generation,
+                owner_session_token=owner_session_token,
+                owner_session_request=owner_session_request,
             )
         except (PermissionError, UnavailableGuard, StaleRead):
             return None
@@ -164,10 +175,15 @@ class DurableOwnerGrantResolver:
             return None
         if self._port is None:
             return None
+        session_proof = {}
+        if isinstance(self._port, GraphCurrentOwnerGrantPort):
+            session_proof = {
+                "owner_session_token": session.owner_session_token,
+                "owner_session_request": session.owner_session_request,
+            }
         current = self._port.resolve_current_owner(
             actor_id=session.actor_id, scope=scope, purpose=purpose,
-            audience=audience,
-        )
+            audience=audience, **session_proof)
         if not isinstance(current, CurrentOwnerGrant):
             return None
         grant = current.grant

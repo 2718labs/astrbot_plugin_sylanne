@@ -7,12 +7,14 @@ binding was performed and does not accept actor/capability claims from JSON.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 import json
 import re
 from typing import Any, Mapping, Protocol
 from uuid import UUID
+
+from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 
 
 D12_SCHEMA = "d12.contract.v1"
@@ -68,6 +70,9 @@ class AuthenticatedSession:
     scope_audiences: Mapping[str, frozenset[str]]
     scope_purposes: Mapping[str, frozenset[str]]
     host_username: str | None = None
+    owner_session_token: str | None = field(default=None, repr=False)
+    owner_session_request: OwnerSessionLoginRequestV1 | None = field(
+        default=None, repr=False)
 
     def allows(self, scope: str, capability: str, purpose: str, audience: str) -> bool:
         return (capability in self.scope_capabilities.get(scope, frozenset())

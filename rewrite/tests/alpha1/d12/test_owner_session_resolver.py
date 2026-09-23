@@ -96,10 +96,12 @@ class Coordinator:
         self.reads = 0
 
     def read_current_owner_view(self, bootstrap, *, actor, namespace, purpose,
-                                audience, expected_principal):
+                                audience, expected_principal,
+                                owner_session_token, owner_session_request):
         assert bootstrap is self.bootstrap
         assert (actor, namespace, purpose, audience, expected_principal) == (
             "owner-actor", NAMESPACE, "workbench_view", "owner", PRINCIPAL)
+        assert (owner_session_token, owner_session_request) == (TOKEN, REQUEST)
         self.reads += 1
         return self.view
 
@@ -141,6 +143,9 @@ async def test_signed_login_binds_current_owner_facts_to_one_dashboard_user(inst
     assert paired.principal == PRINCIPAL and paired.guard == GUARD
     assert paired.session.actor_id == "owner-actor"
     assert paired.session.host_username == "dashboard-a"
+    assert paired.session.owner_session_token == TOKEN
+    assert paired.session.owner_session_request == REQUEST
+    assert TOKEN not in repr(paired.session)
     assert paired.session.scope_capabilities["bot-alpha/persona-alpha"] == BINDING.capabilities
     assert coordinator.reads == 2 and authority.described == 2
     assert await resolver.resolve_current_owner_session(

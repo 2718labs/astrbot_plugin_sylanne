@@ -129,7 +129,9 @@ class BoundOwnerSessions:
                 and request.dashboard_origin == self._origin
                 and request.audience == "owner")
 
-    async def _current_view(self, principal: OwnerPrincipalV1) -> tuple[str, CurrentOwnerViewV1]:
+    async def _current_view(self, principal: OwnerPrincipalV1, *, token: str,
+                            request: OwnerSessionLoginRequestV1
+                            ) -> tuple[str, CurrentOwnerViewV1]:
         def read(coordinator: object) -> tuple[str, CurrentOwnerViewV1]:
             actor = self._owner_actor(principal, self._namespace)
             if type(actor) is not str or not actor:
@@ -137,7 +139,8 @@ class BoundOwnerSessions:
             view = coordinator.read_current_owner_view(
                 self._bootstrap, actor=actor, namespace=self._namespace,
                 purpose="workbench_view", audience="owner",
-                expected_principal=principal)
+                expected_principal=principal, owner_session_token=token,
+                owner_session_request=request)
             return actor, view
 
         return await self._worker.call(read)
@@ -215,7 +218,8 @@ class BoundOwnerSessions:
                 token=token)
             if described != challenge.request or not self._request_matches(described):
                 raise RuntimeError("accepted Owner session identity differs")
-            actor, view = await self._current_view(described.principal)
+            actor, view = await self._current_view(
+                described.principal, token=token, request=described)
             if not self._view_matches(described, actor, view):
                 raise RuntimeError("accepted Owner session differs from current graph grant")
             key = self._key(token)
@@ -246,7 +250,9 @@ class BoundOwnerSessions:
         if binding is None or binding.username != username:
             return None
         try:
-            actor, view = await self._current_view(binding.request.principal)
+            actor, view = await self._current_view(
+                binding.request.principal, token=owner_session_token,
+                request=binding.request)
             if actor != binding.actor_id or not self._view_matches(binding.request, actor, view):
                 return None
             described = await asyncio.to_thread(
@@ -265,7 +271,9 @@ class BoundOwnerSessions:
         session = AuthenticatedSession(
             binding.actor_id, binding.session_id,
             {scope: graph.capabilities}, {scope: graph.audiences},
-            {scope: graph.purposes}, host_username=binding.username)
+            {scope: graph.purposes}, host_username=binding.username,
+            owner_session_token=owner_session_token,
+            owner_session_request=binding.request)
         return VerifiedOwnerPairing(session, described.principal, view.authority_guard)
 
     async def revoke_bound_session(self, *, username: str, owner_session_token: str) -> bool:
