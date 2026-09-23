@@ -11,6 +11,25 @@ permissions:
   contents: read
 
 jobs:
+  w11-workbench:
+    name: W11 source and packaged assets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Check and test W11 client
+        working-directory: webui-src
+        run: |
+          npm run check
+          npm test
+      - name: Verify packaged resources match W11 source
+        run: python scripts/alpha1/verify_delivery_assets.py --workbench-only
+
   alpha1-components:
     name: Alpha1 components (${{ matrix.os }}, Python 3.11)
     runs-on: ${{ matrix.os }}

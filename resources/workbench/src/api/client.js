@@ -1,5 +1,8 @@
 import { makeRequest } from "./contract.js";
 
+// AstrBot 4.28.1 mounts plugin extension routes below /api/v1.
+export const DEFAULT_WORKBENCH_API_BASE = "/api/v1/plugins/extensions/astrbot_plugin_sylanne/workbench/v1";
+
 export class WorkbenchApiError extends Error {
   constructor(message, { code = "network_unavailable", status = 0, retryable = true, detail } = {}) {
     super(message);
@@ -12,7 +15,7 @@ export class WorkbenchApiError extends Error {
 }
 
 export class WorkbenchApi {
-  constructor({ baseUrl = "/api/workbench/v1", csrfToken = globalThis.SYLANNE_WORKBENCH_CSRF_TOKEN, fetchImpl = fetch } = {}) {
+  constructor({ baseUrl = DEFAULT_WORKBENCH_API_BASE, csrfToken = globalThis.SYLANNE_WORKBENCH_CSRF_TOKEN, fetchImpl = fetch } = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.csrfToken = typeof csrfToken === "string" && csrfToken ? csrfToken : null;
     this.fetchImpl = fetchImpl;
@@ -46,7 +49,7 @@ export class WorkbenchApi {
     let body = null;
     try { body = await response.json(); } catch { /* protocol error below */ }
     if (!response.ok) {
-      const problem = body?.error ?? {};
+      const problem = body?.problem ?? {};
       throw new WorkbenchApiError(problem.message ?? "服务拒绝了此操作。", {
         code: problem.code ?? "request_rejected", status: response.status,
         retryable: Boolean(problem.retryable), detail: problem

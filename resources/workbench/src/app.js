@@ -1,5 +1,5 @@
 import { ACTIONS, VIEW_TYPES } from "./api/contract.js";
-import { WorkbenchApi, WorkbenchApiError } from "./api/client.js";
+import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "./api/client.js";
 import { applyProblem, applyResponse, initialState, switchRole } from "./state.js";
 import { needsFreshProjection, workflowForPage } from "./workflows.js";
 
@@ -16,8 +16,9 @@ const pages = [
 ];
 
 const state = initialState();
-const api = new WorkbenchApi({ baseUrl: globalThis.SYLANNE_WORKBENCH_API_BASE ?? "/api/workbench/v1" });
+const api = new WorkbenchApi({ baseUrl: globalThis.SYLANNE_WORKBENCH_API_BASE ?? DEFAULT_WORKBENCH_API_BASE });
 const app = document.querySelector("#app");
+let requestEpoch = 0;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
@@ -78,15 +79,15 @@ function render() {
 }
 
 async function loadView() {
+  const epoch = ++requestEpoch;
   if (!state.role) { Object.assign(state, applyProblem(state, { code: "role_required", message: "请选择角色范围后再请求投影。" })); render(); return; }
-  const epoch = state.roleEpoch;
   state.status = "loading"; state.problem = null; render();
   try {
     const result = await api.readView({ scope: state.role, viewType: VIEW_TYPES[state.view] });
-    if (epoch !== state.roleEpoch) return;
+    if (epoch !== requestEpoch) return;
     Object.assign(state, applyResponse(state, result));
   } catch (error) {
-    if (epoch !== state.roleEpoch) return;
+    if (epoch !== requestEpoch) return;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
   render();
@@ -126,18 +127,26 @@ async function command(action) {
 
 async function commandAction(action, input, purpose = "workbench_user_action") {
   if (!state.role) return loadView();
+  const epoch = ++requestEpoch;
   state.status = "loading"; state.problem = null; render();
   try {
     const result = await api.command(action, { scope: state.role, purpose, input });
+    if (epoch !== requestEpoch) return;
     Object.assign(state, applyResponse(state, result));
-    if (result.status === "ready" && needsFreshProjection(action)) await loadView();
-  } catch (error) { Object.assign(state, applyProblem(state, normalizeError(error))); }
+    if (result.status === "ready" && needsFreshProjection(action)) return loadView();
+  } catch (error) {
+    if (epoch !== requestEpoch) return;
+    Object.assign(state, applyProblem(state, normalizeError(error)));
+  }
   render();
 }
 
 app.addEventListener("click", async (event) => {
   const view = event.target.closest("[data-view]")?.dataset.view;
-  if (view) { state.view = view; render(); await loadView(); return; }
+  if (view) {
+    if (view !== state.view) { state.view = view; state.projection = null; }
+    await loadView(); return;
+  }
   const action = event.target.closest("[data-command]")?.dataset.command;
   if (action) await command(action);
 });
