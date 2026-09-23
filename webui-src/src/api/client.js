@@ -19,12 +19,17 @@ export class WorkbenchApi {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.csrfToken = null;
     this.sessionRequest = null;
+    this.sessionGeneration = 0;
     this.fetchImpl = fetchImpl;
   }
 
   get hasSession() { return Boolean(this.csrfToken); }
 
-  clearSession() { this.csrfToken = null; }
+  clearSession() {
+    this.csrfToken = null;
+    this.sessionRequest = null;
+    ++this.sessionGeneration;
+  }
 
   async installationStatus() {
     let response;
@@ -48,30 +53,37 @@ export class WorkbenchApi {
   async openSession() {
     if (this.csrfToken) return;
     if (!this.sessionRequest) {
-      this.sessionRequest = this.#openSession().finally(() => { this.sessionRequest = null; });
+      const generation = this.sessionGeneration;
+      const request = this.#openSession(generation).finally(() => {
+        if (this.sessionRequest === request) this.sessionRequest = null;
+      });
+      this.sessionRequest = request;
     }
     return this.sessionRequest;
   }
 
-  async #openSession() {
+  async #openSession(generation) {
     let response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}/session`, {
         method: "GET", credentials: "same-origin", headers: { accept: "application/json" }
       });
     } catch (error) {
-      this.clearSession();
+      if (generation === this.sessionGeneration) this.clearSession();
       throw new WorkbenchApiError("无法连接工作台会话。请检查连接后重试。", { detail: error });
     }
     const body = await this.#readBody(response);
     if (!response.ok) {
-      this.clearSession();
+      if (generation === this.sessionGeneration) this.clearSession();
       throw this.#responseError(response, body, "工作台会话尚未建立。请先登录并完成 Owner 配对，然后重试。");
     }
     if (body?.status !== "ready" || body.dashboard_session !== "authenticated" ||
         body.owner_session !== "unlocked" || typeof body.csrf_token !== "string" || !body.csrf_token) {
-      this.clearSession();
+      if (generation === this.sessionGeneration) this.clearSession();
       throw new WorkbenchApiError("工作台会话响应无效。请重新核验连接。", { code: "invalid_session", retryable: true });
+    }
+    if (generation !== this.sessionGeneration) {
+      throw new WorkbenchApiError("Owner 会话在核验期间已切换。", { code: "session_changed", retryable: true });
     }
     this.csrfToken = body.csrf_token;
   }
@@ -87,6 +99,51 @@ export class WorkbenchApi {
       purpose,
       input: { view_type: viewType, cursor, page_size: 50 }
     });
+  }
+
+  async ownerChallenge(request) {
+    const body = await this.#ownerPost("/owner/challenge", { request });
+    if (body?.schema_version !== "sylanne.owner-login.v1" ||
+        body.challenge?.kind !== "owner_session_login_challenge_v1" ||
+        body.challenge.request?.kind !== "owner_session_login_request_v1" ||
+        typeof body.signing_payload_base64 !== "string" || !body.signing_payload_base64) {
+      throw new WorkbenchApiError("Owner 挑战响应无效。", { code: "invalid_owner_challenge", retryable: false });
+    }
+    return { challenge: body.challenge, signingPayloadBase64: body.signing_payload_base64 };
+  }
+
+  async ownerComplete(challenge, signatureBase64) {
+    const body = await this.#ownerPost("/owner/complete", {
+      challenge, signature_base64: signatureBase64
+    });
+    if (body?.status !== "authenticated" || body.owner_session !== "unlocked") {
+      throw new WorkbenchApiError("Owner 登录结果无效。", { code: "invalid_owner_login", retryable: false });
+    }
+    this.clearSession();
+  }
+
+  async ownerLogout() {
+    this.clearSession();
+    const body = await this.#ownerPost("/owner/logout", {});
+    if (body?.status !== "ok" || body.owner_session !== "locked") {
+      throw new WorkbenchApiError("Owner 退出结果无效。", { code: "invalid_owner_logout", retryable: false });
+    }
+  }
+
+  async #ownerPost(path, payload) {
+    let response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(payload)
+      });
+    } catch (error) {
+      throw new WorkbenchApiError("无法连接 Owner 登录服务。", { detail: error });
+    }
+    const body = await this.#readBody(response);
+    if (!response.ok) throw this.#responseError(response, body, "Owner 登录请求未通过核验。");
+    return body;
   }
 
   async #post(path, payload) {

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ACTIONS, D12_SCHEMA_VERSION, makeRequest } from "../../../../webui-src/src/api/contract.js";
+import { ACTIONS, D12_SCHEMA_VERSION, makeOwnerLoginRequest, makeRequest } from "../../../../webui-src/src/api/contract.js";
 import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "../../../../webui-src/src/api/client.js";
 import { applyProblem, applyResponse, initialState, switchRole, VIEW_STATES } from "../../../../webui-src/src/state.js";
 import { needsFreshProjection, workflowForPage } from "../../../../webui-src/src/workflows.js";
@@ -36,6 +36,58 @@ test("installation status uses the host session without opening Owner session", 
   assert.equal(api.hasSession, false);
 });
 
+test("Owner login request uses the registered installation fields and exact browser Origin", () => {
+  const values = {
+    authority_id: "authority-a", authority_namespace: "authority-ns", installation_id: "install-a",
+    identity_provider: "local", account_ref: "owner-a", account_incarnation: "first",
+    credential_id: "key-a", credential_epoch: "2"
+  };
+  const request = makeOwnerLoginRequest(values, "https://localhost:6185");
+  assert.deepEqual(request, {
+    kind: "owner_session_login_request_v1", schema: "sylanne3.authority.owner-session.v1",
+    authority_id: "authority-a", authority_namespace: "authority-ns", installation_id: "install-a",
+    principal: { identity_provider: "local", account_ref: "owner-a", account_incarnation: "first" },
+    credential_id: "key-a", credential_epoch: 2, audience: "owner",
+    dashboard_origin: "https://localhost:6185"
+  });
+  assert.throws(() => makeOwnerLoginRequest({ ...values, credential_epoch: "0" }, "https://localhost:6185"));
+  assert.throws(() => makeOwnerLoginRequest(values, "http://localhost:6185"), /HTTPS/);
+});
+
+test("Owner challenge, completion, and logout use the host cookie without an unlocked CSRF", async () => {
+  const requested = [];
+  const challenge = { kind: "owner_session_login_challenge_v1", request: { kind: "owner_session_login_request_v1" } };
+  const api = new WorkbenchApi({ fetchImpl: async (url, init) => {
+    requested.push({ url, init });
+    const body = url.endsWith("/owner/challenge")
+      ? { schema_version: "sylanne.owner-login.v1", challenge, signing_payload_base64: "cGF5bG9hZA==" }
+      : url.endsWith("/owner/complete")
+        ? { status: "authenticated", owner_session: "unlocked" }
+        : { status: "ok", owner_session: "locked" };
+    return { ok: true, status: 200, json: async () => body };
+  } });
+  const request = { kind: "owner_session_login_request_v1" };
+  assert.deepEqual(await api.ownerChallenge(request), { challenge, signingPayloadBase64: "cGF5bG9hZA==" });
+  await api.ownerComplete(challenge, "c2lnbmF0dXJl");
+  await api.ownerLogout();
+  assert.deepEqual(requested.map(({ url }) => url), [
+    `${DEFAULT_WORKBENCH_API_BASE}/owner/challenge`,
+    `${DEFAULT_WORKBENCH_API_BASE}/owner/complete`,
+    `${DEFAULT_WORKBENCH_API_BASE}/owner/logout`
+  ]);
+  for (const { init } of requested) {
+    assert.equal(init.method, "POST");
+    assert.equal(init.credentials, "same-origin");
+    assert.equal(init.headers["content-type"], "application/json");
+    assert.equal(init.headers["x-csrf-token"], undefined);
+    assert.equal(init.headers.origin, undefined);
+  }
+  assert.deepEqual(JSON.parse(requested[0].init.body), { request });
+  assert.deepEqual(JSON.parse(requested[1].init.body), { challenge, signature_base64: "c2lnbmF0dXJl" });
+  assert.deepEqual(JSON.parse(requested[2].init.body), {});
+  assert.equal(api.hasSession, false);
+});
+
 test("client displays a D12 problem from an HTTP error", async () => {
   const api = new WorkbenchApi({ fetchImpl: async (_url, init) => init.method === "GET"
     ? { ok: true, json: async () => ({ status: "ready", dashboard_session: "authenticated", owner_session: "unlocked", csrf_token: "server-issued" }) }
@@ -61,6 +113,26 @@ test("locked Owner session prevents POST and can be retried after login", async 
   paired = true;
   await api.command(ACTIONS.openWorkspace, { scope: "role-1" });
   assert.deepEqual(requests, ["GET", "GET", "POST"]);
+});
+
+test("a session response arriving after Owner logout cannot restore the old CSRF token", async () => {
+  let finishOld;
+  let calls = 0;
+  const api = new WorkbenchApi({ fetchImpl: async () => {
+    ++calls;
+    if (calls === 1) return new Promise((resolve) => { finishOld = resolve; });
+    return { ok: true, json: async () => ({ status: "ready", dashboard_session: "authenticated",
+      owner_session: "unlocked", csrf_token: "new-session" }) };
+  } });
+  const oldRequest = api.openSession();
+  api.clearSession();
+  const newRequest = api.openSession();
+  finishOld({ ok: true, json: async () => ({ status: "ready", dashboard_session: "authenticated",
+    owner_session: "unlocked", csrf_token: "old-session" }) });
+  await assert.rejects(oldRequest, (error) => error.code === "session_changed");
+  await newRequest;
+  assert.equal(calls, 2);
+  assert.equal(api.csrfToken, "new-session");
 });
 
 test("expired CSRF clears in-memory token and the next attempt gets a new one", async () => {

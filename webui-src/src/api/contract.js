@@ -44,3 +44,43 @@ export function makeRequest(action, { scope, purpose, audience = "owner", input 
 export function isSafeAction(action) {
   return Object.values(ACTIONS).includes(action);
 }
+
+const OWNER_SESSION_SCHEMA = "sylanne3.authority.owner-session.v1";
+
+export function makeOwnerLoginRequest(values, dashboardOrigin) {
+  const fields = [
+    "authority_id", "authority_namespace", "installation_id",
+    "identity_provider", "account_ref", "account_incarnation", "credential_id"
+  ];
+  const request = {};
+  for (const field of fields) {
+    const value = values[field];
+    if (typeof value !== "string" || !value.trim()) {
+      throw new Error(`请从已配对的本机安装记录填写 ${field}。`);
+    }
+    request[field] = value.trim();
+  }
+  const epoch = Number(values.credential_epoch);
+  if (!Number.isSafeInteger(epoch) || epoch < 1 || String(epoch) !== String(values.credential_epoch).trim()) {
+    throw new Error("请填写已登记的正整数 credential_epoch。");
+  }
+  if (typeof dashboardOrigin !== "string" || !/^https:\/\/[^/]+$/.test(dashboardOrigin)) {
+    throw new Error("Owner 登录需要受信 HTTPS 工作台地址。");
+  }
+  return {
+    kind: "owner_session_login_request_v1",
+    schema: OWNER_SESSION_SCHEMA,
+    authority_id: request.authority_id,
+    authority_namespace: request.authority_namespace,
+    installation_id: request.installation_id,
+    principal: {
+      identity_provider: request.identity_provider,
+      account_ref: request.account_ref,
+      account_incarnation: request.account_incarnation
+    },
+    credential_id: request.credential_id,
+    credential_epoch: epoch,
+    audience: "owner",
+    dashboard_origin: dashboardOrigin
+  };
+}
