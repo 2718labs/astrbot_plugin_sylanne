@@ -16,12 +16,17 @@ import time
 from typing import Callable
 
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime_journal import (
+    BudgetConstraint, QuotaOccupancy, RecoveryConstraintFootprint,
+    ReservationConstraint,
+)
 from ..runtime_contracts import InstallationGrantV2, NamespaceBootstrapV2, NamespaceId
 from .core import AuthorityServiceCore
 from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, ContentPermit, identifier
 from .v2_clock import AuthorityClockReadingV2, IngressClockSampleV2
 from .v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire
 from .v2_fence_service import AuthorityV2FenceService
+from .v2_execution_bridge import AuthorityV2ExecutionBridge
 
 
 _MAX_SESSIONS = 256
@@ -165,6 +170,12 @@ class AuthorityRpcServer:
         self._administrator_authorizer = administrator_authorizer
         self._publisher_manifest_verifier = publisher_manifest_verifier
         self._v2_fences = services
+        self._v2_execution = {
+            namespace: AuthorityV2ExecutionBridge(
+                core=core, fences=service.fences, journal=service.execution,
+                namespace=namespace, deletion=service.deletion,
+            ) for namespace, service in services.items()
+        }
         installed = dict(installations_v2 or {})
         if any(type(key) is not tuple or len(key) != 2
                or type(key[0]) is not str or len(key[0]) != 64
@@ -397,6 +408,29 @@ class AuthorityRpcServer:
             raise AuthorityUnavailable("namespace unavailable")
         return self._v2_service(namespace)
 
+    @staticmethod
+    def _dispatch_footprint(value: object) -> RecoveryConstraintFootprint:
+        if type(value) is not dict:
+            raise ValueError("invalid dispatch footprint")
+        fields = RecoveryConstraintFootprint.__dataclass_fields__
+        if set(value) != set(fields):
+            raise ValueError("invalid dispatch footprint fields")
+        shaped = dict(value)
+        for name in ("conflict_keys", "object_gate_keys"):
+            if type(shaped[name]) is not list:
+                raise ValueError("invalid dispatch footprint identifiers")
+            shaped[name] = tuple(shaped[name])
+        for name, kind in (("quota_occupancies", QuotaOccupancy),
+                           ("reservations", ReservationConstraint),
+                           ("budgets", BudgetConstraint)):
+            if type(shaped[name]) is not list or any(type(item) is not list for item in shaped[name]):
+                raise ValueError("invalid dispatch footprint constraints")
+            shaped[name] = tuple(kind(*item) for item in shaped[name])
+        result = RecoveryConstraintFootprint(**shaped)
+        if json.loads(result._json()) != value:
+            raise ValueError("noncanonical dispatch footprint")
+        return result
+
     def _v2_command(self, method: str, credential: MtlsPeerCredential,
                     profile_id: str, manifest_digest: str,
                     command: object) -> dict[str, object]:
@@ -404,6 +438,31 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method == "begin_dispatch_fence" and set(command) == {
+                    "namespace", "holder", "operation_id", "expected_anchor",
+                    "effect_id", "command_digest", "footprint"}:
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, command["namespace"])
+                anchor = self._anchor_from_command({"anchor": command["expected_anchor"]})
+                footprint = self._dispatch_footprint(command["footprint"])
+                permit = service.begin_fence(
+                    credential=credential, subject=subject, holder=command["holder"],
+                    operation="dispatch", operation_id=command["operation_id"],
+                    expected_anchor=anchor, effect_id=command["effect_id"],
+                    command_digest=command["command_digest"], footprint=footprint)
+                return {"permit": to_wire(permit)}
+            if method == "execution_prepare" and set(command) == {
+                    "permit", "mutation_id", "footprint"}:
+                permit = from_wire(command["permit"])
+                if type(permit) is not FencePermitV2 or permit.operation != "dispatch":
+                    raise AuthorityUnavailable("dispatch permit required")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, permit.namespace)
+                footprint = self._dispatch_footprint(command["footprint"])
+                receipt, updated = self._v2_execution[permit.namespace].execution_prepare(
+                    credential=credential, subject=subject, permit=permit,
+                    mutation_id=command["mutation_id"], footprint=footprint)
+                return {"receipt": to_wire(receipt), "permit": to_wire(updated)}
             if method == "current_anchor" and set(command) == {"namespace"}:
                 service = self._bound_v2_service(
                     credential, profile_id, manifest_digest, command["namespace"])

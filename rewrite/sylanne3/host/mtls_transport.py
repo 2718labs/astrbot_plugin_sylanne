@@ -20,8 +20,10 @@ from typing import Mapping
 from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
-    FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
+    FencePermitV2, MutationReceiptV2, SCHEMA as AUTHORITY_V2_PROTOCOL,
+    from_wire, to_wire,
 )
+from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import (
@@ -685,6 +687,73 @@ class MtlsAuthorityTransport:
             operation="read", operation_id=operation_id,
             expected_anchor=expected_anchor,
         )
+
+    async def v2_begin_dispatch_fence(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, holder: str, operation_id: str,
+        expected_anchor: RestoreAnchor, effect_id: str, command_digest: str,
+        footprint: RecoveryConstraintFootprint,
+    ) -> FencePermitV2:
+        if type(footprint) is not RecoveryConstraintFootprint or type(expected_anchor) is not RestoreAnchor:
+            raise TypeError("dispatch footprint and anchor are required")
+        response = await self._content_rpc(
+            request, handshake, "begin_dispatch_fence", {
+                "namespace": namespace, "holder": holder, "operation_id": operation_id,
+                "expected_anchor": asdict(expected_anchor), "effect_id": effect_id,
+                "command_digest": command_digest, "footprint": json.loads(footprint._json()),
+            }, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"permit", "channel_binding_sha256"} or response[
+                "channel_binding_sha256"] != handshake.channel_binding_sha256:
+            raise RuntimeError("authority v2 dispatch permit response is invalid")
+        try:
+            permit = from_wire(response["permit"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority v2 dispatch permit response is invalid") from exc
+        expected_footprint_digest = "sha256:" + hashlib.sha256(footprint._json().encode()).hexdigest()
+        if (type(permit) is not FencePermitV2 or permit.operation != "dispatch"
+                or permit.namespace != namespace or permit.holder != holder
+                or permit.operation_id != operation_id or permit.effect_id != effect_id
+                or permit.command_digest != command_digest
+                or permit.footprint_digest != expected_footprint_digest
+                or permit.pinned_anchor != expected_anchor
+                or permit.authority_id != handshake.installation_authority_id
+                or permit.subject != handshake.installation_identity_ref):
+            raise RuntimeError("authority v2 dispatch permit binding is invalid")
+        return permit
+
+    async def v2_execution_prepare(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, permit: FencePermitV2, mutation_id: str,
+        footprint: RecoveryConstraintFootprint,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        if (type(permit) is not FencePermitV2 or permit.operation != "dispatch"
+                or type(footprint) is not RecoveryConstraintFootprint):
+            raise TypeError("dispatch permit and footprint are required")
+        response = await self._content_rpc(
+            request, handshake, "execution_prepare", {
+                "permit": to_wire(permit), "mutation_id": mutation_id,
+                "footprint": json.loads(footprint._json()),
+            }, protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"receipt", "permit", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority v2 prepared receipt response is invalid")
+        try:
+            receipt = from_wire(response["receipt"])
+            updated = from_wire(response["permit"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority v2 prepared receipt response is invalid") from exc
+        if (type(receipt) is not MutationReceiptV2 or type(updated) is not FencePermitV2
+                or receipt.durable_state != "committed"
+                or receipt.pending.phase != "prepared"
+                or receipt.pending.permit != permit
+                or receipt.pending.mutation_id != mutation_id
+                or updated.pinned_anchor != receipt.after_anchor
+                or updated.revision != receipt.updated_revision
+                or updated.operation_id != permit.operation_id
+                or updated.subject != handshake.installation_identity_ref
+                or updated.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority v2 prepared receipt binding is invalid")
+        return receipt, updated
 
     async def v2_get_content_fence_operation(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

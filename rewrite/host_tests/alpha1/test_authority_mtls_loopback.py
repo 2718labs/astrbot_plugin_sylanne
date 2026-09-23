@@ -45,6 +45,7 @@ from sylanne3.host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTrans
 if not hasattr(_host_package, "__file__"):
     sys.modules.pop("sylanne3.host", None)
 from sylanne3.runtime.deletion import DeletionJournal
+from sylanne3.runtime_journal import RecoveryConstraintFootprint
 from sylanne3.runtime_contracts import NamespaceId, NamespaceRuntimeState
 
 
@@ -293,7 +294,8 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
 
             def core_authorizer(candidate, action, namespace, holder):
                 return (candidate in peers.values() and namespace == "ns:role"
-                        and action in {"install", "seal_v2_only", "current", "read", "write"}
+                        and action in {"install", "seal_v2_only", "current", "read", "write",
+                                       "dispatch", "execution"}
                         and (holder is None or holder == "host:one"))
 
             core = AuthorityServiceCore(
@@ -301,7 +303,7 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 deletion_verifier=lambda ns, before, current, phase:
                     current == initial_deletion and phase == "clear",
                 execution_verifier=lambda ns, before, current, phase:
-                    current == JournalHead("execution", 0, "genesis"),
+                    execution.verified_head() == current,
                 effect_verifier=lambda *args: True,
                 dispatch_verifier=lambda *args: True, create=True)
             listener = None
@@ -455,6 +457,53 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(RuntimeError, "unavailable"):
                     await first.v2_validate_fence(
                         first_request, first_handshake, write_permit)
+
+                footprint = RecoveryConstraintFootprint(
+                    namespace="ns:role", activity_id="activity-a", effect_id="effect-a",
+                    conflict_keys=("resource-a",),
+                )
+                dispatch = await first.v2_begin_dispatch_fence(
+                    first_request, first_handshake, namespace="ns:role",
+                    holder="host:one", operation_id="dispatch-a",
+                    expected_anchor=anchor, effect_id="effect-a",
+                    command_digest="sha256:" + "d" * 64, footprint=footprint)
+                self.assertEqual(dispatch.subject, permit.subject)
+                content_rpc = first._content_rpc
+
+                async def lose_prepared_response(*args, **kwargs):
+                    response = await content_rpc(*args, **kwargs)
+                    if args[2] == "execution_prepare":
+                        raise RuntimeError("authority transport unavailable")
+                    return response
+
+                first._content_rpc = lose_prepared_response
+                with self.assertRaisesRegex(RuntimeError, "transport unavailable"):
+                    await first.v2_execution_prepare(
+                        first_request, first_handshake, permit=dispatch,
+                        mutation_id="mutation-a", footprint=footprint)
+                first._content_rpc = content_rpc
+                self.assertEqual(execution.verified_head().seq, 1)
+                await first.close()
+                first_handshake = await first.handshake(
+                    first_request, protocol=AUTHORITY_V2_PROTOCOL)
+                receipt, updated = await first.v2_execution_prepare(
+                    first_request, first_handshake, permit=dispatch,
+                    mutation_id="mutation-a", footprint=footprint)
+                self.assertEqual(receipt.durable_state, "committed")
+                self.assertEqual(updated.revision, 1)
+                self.assertEqual(execution.verified_head().seq, 1)
+                self.assertEqual((receipt, updated), await first.v2_execution_prepare(
+                    first_request, first_handshake, permit=dispatch,
+                    mutation_id="mutation-a", footprint=footprint))
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await first.v2_execution_prepare(
+                        first_request, first_handshake, permit=dispatch,
+                        mutation_id="mutation-a",
+                        footprint=replace(footprint, conflict_keys=("resource-b",)))
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await second.v2_execution_prepare(
+                        second_request, second_handshake, permit=dispatch,
+                        mutation_id="mutation-a", footprint=footprint)
 
                 legacy, legacy_request = client("client", "legacy")
                 legacy_handshake = await legacy.handshake(legacy_request)

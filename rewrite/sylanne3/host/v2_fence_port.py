@@ -13,7 +13,9 @@ from typing import Awaitable, Callable, Coroutine, Mapping, TypeVar
 
 from ..authority_service.contract import CONTENT_OPERATIONS, identifier
 from ..authority_service.v2_clock import IngressClockSampleV2
-from ..authority_service.v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL
+from ..authority_service.v2_contract import (
+    FencePermitV2, MutationReceiptV2, SCHEMA as AUTHORITY_V2_PROTOCOL,
+)
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import (
     FenceScope, InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
@@ -424,6 +426,95 @@ class V2FencePort:
         if permit.subject != grant.subject or permit.generation != generation:
             raise RuntimeError("v2 permit installation or generation mismatch")
         return permit
+
+    def begin_dispatch_fence(
+        self, *, namespace: NamespaceId, authority_namespace: str, holder: str,
+        generation: int, operation_id: str, expected_anchor: RestoreAnchor,
+        effect_id: str, command_digest: str, footprint: RecoveryConstraintFootprint,
+    ) -> FencePermitV2:
+        """Begin one effect-bound dispatch fence; the port sends no platform command."""
+        with self._lock:
+            self.recover_pending_finish()
+            self.recover_pending_begin()
+            try:
+                return self._submit(self._with_session_repair(lambda: self._begin_dispatch_fence(
+                    namespace, authority_namespace, holder, generation, operation_id,
+                    expected_anchor, effect_id, command_digest, footprint)))
+            except RuntimeError as exc:
+                if isinstance(exc, V2FenceOutcomeUnknown) or str(exc) in _REPAIRABLE_ERRORS:
+                    raise V2FenceOutcomeUnknown(
+                        "v2 dispatch begin outcome unknown for operation_id=" + operation_id
+                        + "; retry only with the original operation_id and footprint") from exc
+                raise
+
+    async def _begin_dispatch_fence(
+        self, namespace: NamespaceId, authority_namespace: str, holder: str,
+        generation: int, operation_id: str, expected_anchor: RestoreAnchor,
+        effect_id: str, command_digest: str, footprint: RecoveryConstraintFootprint,
+    ) -> FencePermitV2:
+        identifier(operation_id, "operation_id")
+        if (type(expected_anchor) is not RestoreAnchor
+                or expected_anchor.namespace != authority_namespace
+                or expected_anchor.activation_generation != generation
+                or type(footprint) is not RecoveryConstraintFootprint
+                or footprint.namespace != authority_namespace
+                or footprint.effect_id != effect_id):
+            raise ValueError("v2 dispatch identity is invalid")
+        observed = await self._mapped(namespace, authority_namespace)
+        if (observed.holder != holder or observed.generation != generation
+                or observed.anchor != expected_anchor):
+            raise RuntimeError("v2 dispatch activation or anchor changed")
+        handshake, grant = self._identity()
+        permit = await self._transport.v2_begin_dispatch_fence(
+            self._request, handshake, namespace=authority_namespace, holder=holder,
+            operation_id=operation_id, expected_anchor=expected_anchor,
+            effect_id=effect_id, command_digest=command_digest, footprint=footprint)
+        if permit.subject != grant.subject or permit.generation != generation:
+            raise RuntimeError("v2 dispatch permit installation or generation mismatch")
+        return permit
+
+    def execution_prepare(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        permit: FencePermitV2, mutation_id: str,
+        footprint: RecoveryConstraintFootprint,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        """Record only the durable prepared phase, never a platform send."""
+        with self._lock:
+            try:
+                return self._submit(self._with_session_repair(lambda: self._execution_prepare(
+                    namespace, authority_namespace, permit, mutation_id, footprint)))
+            except RuntimeError as exc:
+                if isinstance(exc, V2FenceOutcomeUnknown) or str(exc) in _REPAIRABLE_ERRORS:
+                    raise V2FenceOutcomeUnknown(
+                        "v2 prepared outcome unknown for mutation_id=" + mutation_id
+                        + "; retry only with the original permit and footprint") from exc
+                raise
+
+    async def _execution_prepare(
+        self, namespace: NamespaceId, authority_namespace: str,
+        permit: FencePermitV2, mutation_id: str,
+        footprint: RecoveryConstraintFootprint,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        identifier(mutation_id, "mutation_id")
+        if (type(namespace) is not NamespaceId or type(permit) is not FencePermitV2
+                or permit.operation != "dispatch" or permit.namespace != authority_namespace
+                or type(footprint) is not RecoveryConstraintFootprint
+                or footprint.namespace != authority_namespace
+                or footprint.effect_id != permit.effect_id):
+            raise ValueError("v2 prepared dispatch identity is invalid")
+        handshake, grant = self._identity()
+        # A lost response can leave a durable pending marker. Bootstrap still proves
+        # the installed mapping while its state is RECOVERING and anchor is absent.
+        observed = await self._transport.v2_namespace_bootstrap(
+            self._request, handshake, namespace)
+        if (observed.authority_namespace != authority_namespace
+                or observed.authority_id != grant.authority_id
+                or permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject):
+            raise RuntimeError("v2 prepared dispatch mapping changed")
+        return await self._transport.v2_execution_prepare(
+            self._request, handshake, permit=permit,
+            mutation_id=mutation_id, footprint=footprint)
 
     def validate_fence(self, scope: FenceScope) -> FencePermitV2:
         return self._submit(self._with_session_repair(lambda: self._validate_fence(scope)))

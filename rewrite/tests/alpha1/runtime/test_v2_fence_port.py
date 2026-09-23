@@ -17,7 +17,9 @@ installed_stub = "sylanne3.host" not in sys.modules
 if installed_stub:
     sys.modules["sylanne3.host"] = host_package
 
-from sylanne3.authority_service.v2_contract import FencePermitV2
+from sylanne3.authority_service.v2_contract import (
+    FencePermitV2, MutationReceiptV2, PendingMutationV2,
+)
 from sylanne3.graph_types import NamespaceEpoch
 from sylanne3.host.authority_client import (
     AUTHORITY_PROTOCOL, AuthorityHandshake, AuthorityProvisioningRequest,
@@ -26,6 +28,7 @@ from sylanne3.host.authority_client import (
 from sylanne3.host.mtls_transport import AuthorityTlsProfile
 from sylanne3.host.v2_fence_port import V2FenceOutcomeUnknown, V2FencePort
 from sylanne3.runtime.restore_anchor import RestoreAnchor
+from sylanne3.runtime_journal import RecoveryConstraintFootprint
 from sylanne3.runtime_contracts import (
     FenceScope, InstallationGrantV2, NamespaceBootstrapV2, NamespaceId,
     NamespaceRuntimeState,
@@ -71,6 +74,8 @@ class ControlledMtlsTransport:
         self.begin_ids = []
         self.finish_requests = []
         self.finished = None
+        self.prepare_calls = []
+        self.lose_prepare_once = False
 
     def _on_owner_loop(self):
         loop = asyncio.get_running_loop()
@@ -144,6 +149,34 @@ class ControlledMtlsTransport:
         assert permit == self.permit
         return permit
 
+    async def v2_begin_dispatch_fence(self, request, handshake, *, namespace, holder,
+                                      operation_id, expected_anchor, effect_id,
+                                      command_digest, footprint):
+        self._on_owner_loop()
+        import hashlib
+        return FencePermitV2(
+            "authority-a", namespace, "subject-a", holder, 1, "dispatch",
+            operation_id, "a" * 32, 1, 0, expected_anchor, effect_id,
+            command_digest, "sha256:" + hashlib.sha256(footprint._json().encode()).hexdigest(),
+        )
+
+    async def v2_execution_prepare(self, request, handshake, *, permit,
+                                   mutation_id, footprint):
+        self._on_owner_loop()
+        self.prepare_calls.append((permit, mutation_id, footprint))
+        pending = PendingMutationV2(
+            permit, mutation_id, "sha256:" + "a" * 64, "prepared",
+            permit.pinned_anchor, "append-a", "sha256:" + "e" * 64,
+        )
+        after = replace(permit.pinned_anchor, execution_seq=1,
+                        execution_digest=pending.expected_append_digest, proof="proof-next")
+        result = (MutationReceiptV2(pending, after, 1, "committed"),
+                  replace(permit, revision=1, pinned_anchor=after))
+        if self.lose_prepare_once:
+            self.lose_prepare_once = False
+            raise RuntimeError("authority transport unavailable")
+        return result
+
     async def v2_finish_fence(self, request, handshake, permit, *, request_id, request_digest):
         self._on_owner_loop()
         self.finish_requests.append((request_id, request_digest))
@@ -209,6 +242,25 @@ def test_content_fence_round_trip_and_mapping(port):
         adapter.begin_fence(namespace=NAMESPACE, authority_namespace="ns-a",
                             holder="holder-a", generation=1, operation="dispatch",
                             operation_id="dispatch-a", expected_anchor=ANCHOR)
+
+
+def test_dispatch_worker_replays_only_original_prepared_request(port):
+    adapter, transport = port
+    footprint = RecoveryConstraintFootprint(
+        "ns-a", "activity-a", "effect-a", conflict_keys=("resource-a",))
+    permit = adapter.begin_dispatch_fence(
+        namespace=NAMESPACE, authority_namespace="ns-a", holder="holder-a",
+        generation=1, operation_id="dispatch-a", expected_anchor=ANCHOR,
+        effect_id="effect-a", command_digest="sha256:" + "d" * 64,
+        footprint=footprint)
+    transport.lose_prepare_once = True
+    receipt, updated = adapter.execution_prepare(
+        namespace=NAMESPACE, authority_namespace="ns-a", permit=permit,
+        mutation_id="mutation-a", footprint=footprint)
+    assert receipt.durable_state == "committed" and updated.revision == 1
+    assert transport.prepare_calls == [(permit, "mutation-a", footprint)] * 2
+    assert transport.handshakes == 2
+    assert transport.thread_id != get_ident()
 
 
 def test_namespace_genesis_retries_same_request_id_after_session_expiry(port):

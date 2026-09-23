@@ -3,7 +3,8 @@
 The installed service supplies an authenticated subject and owns both journal
 files. Fixed nesting is deletion writer guard, execution writer guard, then a
 short transaction on Core's Authority DB. No graph or business callback runs
-inside those guards. This has no RPC or production RuntimeDependency wiring.
+inside those guards. The mTLS adapter exposes bounded v2 methods; this has no
+production RuntimeDependency wiring.
 """
 
 from __future__ import annotations

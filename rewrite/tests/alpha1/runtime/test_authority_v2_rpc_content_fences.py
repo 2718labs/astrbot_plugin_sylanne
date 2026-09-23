@@ -1,4 +1,6 @@
-"""The v2 RPC exposes only authenticated, non-dispatch content fences."""
+"""Keep v2 content fences separate from authenticated prepared dispatch."""
+
+import json
 
 import pytest
 
@@ -14,6 +16,7 @@ from sylanne3.authority_service.v2_execution_journal import AuthorityV2Execution
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.runtime.deletion import DeletionJournal
+from sylanne3.runtime_journal import RecoveryConstraintFootprint
 from sylanne3.runtime_contracts import NamespaceId
 
 
@@ -187,3 +190,63 @@ def test_dispatch_shaped_permit_is_rejected_by_remote_lifecycle(rpc):
             "request_digest": "sha256:" + "d" * 64,
         })
     assert call("validate_fence", {"permit": content_permit})["permit"] == content_permit
+
+
+def test_prepared_dispatch_rpc_retries_exact_mutation_and_rejects_other_peer(rpc):
+    call = paired(rpc, _PEER_A, b"channel-a")
+    other = paired(rpc, _PEER_B, b"channel-b")
+    anchor = call("current_anchor", {"namespace": "ns-a"})
+    anchor.pop("channel_binding_sha256")
+    footprint = RecoveryConstraintFootprint(
+        namespace="ns-a", activity_id="activity-a", effect_id="effect-a",
+        conflict_keys=("resource-a",),
+    )
+    command = {
+        "namespace": "ns-a", "holder": "holder-a", "operation_id": "dispatch-a",
+        "expected_anchor": anchor, "effect_id": "effect-a",
+        "command_digest": "sha256:" + "d" * 64,
+        "footprint": json.loads(footprint._json()),
+    }
+    permit = call("begin_dispatch_fence", command)["permit"]
+    assert call("begin_dispatch_fence", command)["permit"] == permit
+    with pytest.raises(RuntimeError, match="authority unavailable"):
+        call("begin_dispatch_fence", {
+            **command, "command_digest": "sha256:" + "e" * 64,
+        })
+    with pytest.raises(RuntimeError, match="authority unavailable"):
+        call("begin_dispatch_fence", {**command, "namespace": "ns-other"})
+    with pytest.raises(RuntimeError, match="authority unavailable"):
+        other("begin_dispatch_fence", command)
+    prepare = {"permit": permit, "mutation_id": "mutation-a",
+               "footprint": command["footprint"]}
+    first = call("execution_prepare", prepare)
+    assert from_wire(first["receipt"]).durable_state == "committed"
+    assert from_wire(first["permit"]).revision == 1
+    assert call("execution_prepare", prepare) == first
+    assert rpc._v2_fences["ns-a"].execution.verified_head().seq == 1
+    with pytest.raises(RuntimeError, match="authority unavailable"):
+        call("execution_prepare", {**prepare, "mutation_id": "mutation-b"})
+    with pytest.raises(RuntimeError, match="authority unavailable"):
+        other("execution_prepare", prepare)
+
+
+def test_dispatch_rpc_rechecks_d08_and_rejects_unshaped_footprint(rpc):
+    call = paired(rpc, _PEER_A, b"channel-a")
+    anchor = call("current_anchor", {"namespace": "ns-a"})
+    anchor.pop("channel_binding_sha256")
+    footprint = RecoveryConstraintFootprint(
+        namespace="ns-a", activity_id="activity-a", effect_id="effect-a")
+    command = {
+        "namespace": "ns-a", "holder": "holder-a", "operation_id": "dispatch-a",
+        "expected_anchor": anchor, "effect_id": "effect-a",
+        "command_digest": "sha256:" + "d" * 64,
+        "footprint": json.loads(footprint._json()),
+    }
+    with pytest.raises(RuntimeError, match="authority unavailable"):
+        call("begin_dispatch_fence", {
+            **command, "footprint": {**command["footprint"], "unknown": "field"},
+        })
+    rpc._core._dispatch_verifier = lambda *args: False
+    with pytest.raises(RuntimeError, match="authority unavailable"):
+        call("begin_dispatch_fence", command)
+    assert rpc._v2_fences["ns-a"].execution.verified_head().seq == 0

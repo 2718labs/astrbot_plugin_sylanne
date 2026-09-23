@@ -1,7 +1,8 @@
 """Internal B2.2 prepared-dispatch journal/Authority transaction bridge.
 
 The host service supplies an authenticated subject; Core's authorizer and D08
-verifier run before locks. This is not an RPC or a production RuntimeDependency.
+verifier run before locks. The mTLS adapter exposes only prepared dispatch;
+this is not a platform send or a production RuntimeDependency.
 Only the `prepared` phase is implemented. The persistent v2-only Core seal
 gates legacy entrances; deletion and execution writers are frozen in a fixed
 order before each append or final Authority commit.
