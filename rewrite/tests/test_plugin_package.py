@@ -77,6 +77,20 @@ class PluginPackageTests(unittest.TestCase):
             "release_eligibility": "READY",
             "declared_domains": [f"d{number:02d}" for number in range(1, 13)],
             "missing_domain_exports": [],
+            "domain_capabilities": {"d04": ["d04.affect.scheme.v1"]},
+        }
+        affect_scheme = {
+            "schema": "d04.affect.scheme.v1",
+            "scheme_version": "fixture:scheme:1",
+            "operator_version": "fixture:operator:1",
+            "parameter_version": "fixture:parameter:1",
+            "coupling_version": "fixture:coupling:1",
+            "axes": [{
+                "axis_id": "fixture:axis:1",
+                "unit": "normalized",
+                "meaning": "synthetic package-builder test axis",
+            }],
+            "parameter_bounds": [],
         }
         migrations = {
             "legacy_data_policy": "registered_migrators",
@@ -86,6 +100,7 @@ class PluginPackageTests(unittest.TestCase):
         files = {
             "resources/workbench/index.html": b"<main>Sylanne</main>\n",
             "resources/catalogue/current.json": json.dumps(catalogue).encode() + b"\n",
+            "resources/catalogue/d04-affect-scheme.json": json.dumps(affect_scheme).encode() + b"\n",
             "resources/migrations/v1.json": json.dumps(migrations).encode() + b"\n",
             "THIRD_PARTY_NOTICES": b"No bundled third-party runtime assets.\n",
             "SBOM.spdx.json": b'{"spdxVersion":"SPDX-2.3"}\n',
@@ -156,6 +171,7 @@ class PluginPackageTests(unittest.TestCase):
             self.assertEqual(manifest["package_version"], "3.0.0-dev.1")
             self.assertEqual(manifest["source"]["dirty"], True)
             self.assertEqual(manifest["build_mode"], "dev-probe")
+            self.assertNotIn("affect_scheme", manifest)
             self.assertEqual(manifest["platform"]["os"], "windows")
             self.assertEqual(manifest["platform"]["arch"], "x86_64")
             self.assertEqual(manifest["platform"]["abi_version"], 2)
@@ -252,11 +268,16 @@ class PluginPackageTests(unittest.TestCase):
         self.assertEqual(manifest["platform"]["libc"], "glibc")
         self.assertEqual(manifest["platform"]["cpu_features"], ["neon"])
         self.assertEqual(manifest["platform"]["abi_version"], 2)
+        binding = manifest["affect_scheme"]
+        self.assertEqual(binding["path"], "resources/catalogue/d04-affect-scheme.json")
+        self.assertEqual(binding["catalogue_capability"], "d04.affect.scheme.v1")
+        self.assertEqual(binding["scheme_version"], "fixture:scheme:1")
         paths = {entry["path"] for entry in manifest["files"]}
         self.assertTrue(
             {
                 "resources/workbench/index.html",
                 "resources/catalogue/current.json",
+                "resources/catalogue/d04-affect-scheme.json",
                 "resources/migrations/v1.json",
                 "THIRD_PARTY_NOTICES",
                 "SBOM.spdx.json",
@@ -341,6 +362,78 @@ class PluginPackageTests(unittest.TestCase):
                 native_library=self._native(),
                 output_dir=self.base / "preview-formal",
             )
+
+    def test_formal_build_requires_strict_d04_asset_and_binding(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        asset_path = self.project / "resources/catalogue/d04-affect-scheme.json"
+        original = asset_path.read_bytes()
+        asset_path.write_bytes(original.replace(b'"schema":', b'"schema":"duplicate", "schema":'))
+        _run_git(self.project, "add", ".")
+        _run_git(self.project, "commit", "--quiet", "-m", "duplicate D04 field")
+        with self.assertRaisesRegex(ValueError, "duplicate JSON field"):
+            self.builder.build_package(
+                project_root=self.project,
+                target_os="windows",
+                target_arch="x86_64",
+                native_library=self._native(),
+                output_dir=self.base / "duplicate-d04",
+            )
+
+    def test_formal_build_holds_when_d04_asset_is_absent(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        (self.project / "resources/catalogue/d04-affect-scheme.json").unlink()
+        _run_git(self.project, "add", "-A")
+        _run_git(self.project, "commit", "--quiet", "-m", "without D04 scheme")
+        with self.assertRaisesRegex(RuntimeError, "requires a D04 affect scheme asset"):
+            self.builder.build_package(
+                project_root=self.project,
+                target_os="windows",
+                target_arch="x86_64",
+                native_library=self._native(),
+                output_dir=self.base / "missing-d04",
+            )
+
+    def test_formal_verifier_rejects_missing_or_mismatched_d04_binding(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        package = self.builder.build_package(
+            project_root=self.project,
+            target_os="windows",
+            target_arch="x86_64",
+            native_library=self._native(),
+            output_dir=self.base / "bound-formal",
+        )
+        with zipfile.ZipFile(package) as source:
+            members = {name: source.read(name) for name in source.namelist()}
+        manifest = json.loads(members["release-manifest.json"])
+        del manifest["affect_scheme"]
+        members["release-manifest.json"] = json.dumps(manifest).encode("utf-8")
+        missing = self.base / "missing-d04-binding.zip"
+        with zipfile.ZipFile(missing, "w") as archive:
+            for name, content in members.items():
+                archive.writestr(name, content)
+        with self.assertRaisesRegex(ValueError, "D04 manifest binding"):
+            self.builder.verify_package(missing)
+
+        manifest["affect_scheme"] = {
+            "path": "resources/catalogue/d04-affect-scheme.json",
+            "sha256": "0" * 64,
+            "bytes": 1,
+            "catalogue_capability": "d04.affect.scheme.v1",
+            "scheme_version": "fixture:scheme:1",
+            "operator_version": "fixture:operator:1",
+            "parameter_version": "fixture:parameter:1",
+            "coupling_version": "fixture:coupling:1",
+        }
+        members["release-manifest.json"] = json.dumps(manifest).encode("utf-8")
+        mismatched = self.base / "mismatched-d04-binding.zip"
+        with zipfile.ZipFile(mismatched, "w") as archive:
+            for name, content in members.items():
+                archive.writestr(name, content)
+        with self.assertRaisesRegex(ValueError, "D04 manifest binding"):
+            self.builder.verify_package(mismatched)
 
     def test_verifier_rejects_formal_archive_with_candidate_resources(self) -> None:
         self._set_formal_version()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -70,6 +71,94 @@ _FORBIDDEN_RESOURCE_NAMES = frozenset(
 _VERSION_PATTERN = re.compile(
     r'^version\s*:\s*["\']?([^\s"\']+)["\']?\s*$', re.MULTILINE
 )
+_D04_ASSET_PATH = "resources/catalogue/d04-affect-scheme.json"
+_D04_CATALOGUE_CAPABILITY = "d04.affect.scheme.v1"
+_D04_VERSION_FIELDS = (
+    "scheme_version", "operator_version", "parameter_version", "coupling_version",
+)
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON field: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-JSON numeric constant: {value}")
+
+
+def _strict_json_object(content: bytes, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(
+            content,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{label} is not strict JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _d04_binding(payload: dict[str, bytes]) -> dict[str, object]:
+    """Validate D04 asset structure and construct its file-list binding."""
+    content = payload.get(_D04_ASSET_PATH)
+    if content is None:
+        raise RuntimeError("formal alpha1 requires a D04 affect scheme asset")
+    data = _strict_json_object(content, "D04 affect scheme asset")
+    if set(data) != {"schema", *_D04_VERSION_FIELDS, "axes", "parameter_bounds"}:
+        raise ValueError("D04 affect scheme asset fields are invalid")
+    if data.get("schema") != _D04_CATALOGUE_CAPABILITY:
+        raise ValueError("D04 affect scheme schema is invalid")
+    versions = {name: data.get(name) for name in _D04_VERSION_FIELDS}
+    if any(not isinstance(value, str) or not value for value in versions.values()):
+        raise ValueError("D04 affect scheme versions must be nonempty strings")
+
+    axes = data.get("axes")
+    if (not isinstance(axes, list) or not axes
+            or any(not isinstance(axis, dict)
+                   or set(axis) != {"axis_id", "unit", "meaning"}
+                   or any(not isinstance(axis.get(field), str) or not axis[field]
+                          for field in ("axis_id", "unit", "meaning"))
+                   or axis.get("unit") != "normalized"
+                   for axis in axes)
+            or len({axis["axis_id"] for axis in axes}) != len(axes)):
+        raise ValueError("D04 affect scheme axes are invalid")
+
+    bounds = data.get("parameter_bounds")
+    if not isinstance(bounds, list):
+        raise ValueError("D04 affect scheme parameter bounds are invalid")
+    bound_names: set[str] = set()
+    for item in bounds:
+        if (not isinstance(item, list) or len(item) != 3
+                or not isinstance(item[0], str) or not item[0]
+                or type(item[1]) not in (int, float)
+                or type(item[2]) not in (int, float)
+                or not math.isfinite(item[1]) or not math.isfinite(item[2])
+                or item[1] > item[2] or item[0] in bound_names):
+            raise ValueError("D04 affect scheme parameter bounds are invalid")
+        bound_names.add(item[0])
+
+    catalogue = _strict_json_object(
+        payload.get("resources/catalogue/current.json", b""), "type catalogue",
+    )
+    capabilities = catalogue.get("domain_capabilities")
+    if (not isinstance(capabilities, dict)
+            or not isinstance(capabilities.get("d04"), list)
+            or _D04_CATALOGUE_CAPABILITY not in capabilities["d04"]):
+        raise ValueError("type catalogue does not declare the D04 scheme capability")
+    return {
+        "path": _D04_ASSET_PATH,
+        "sha256": _sha256(content),
+        "bytes": len(content),
+        "catalogue_capability": _D04_CATALOGUE_CAPABILITY,
+        **versions,
+    }
 
 
 def _sha256(content: bytes) -> str:
@@ -216,8 +305,12 @@ def _validate_formal_resources(payload: dict[str, bytes]) -> None:
     """Reject candidate-only catalogues and migration placeholders in formal ZIPs."""
 
     try:
-        catalogue = json.loads(payload["resources/catalogue/current.json"])
-        migration = json.loads(payload["resources/migrations/v1.json"])
+        catalogue = _strict_json_object(
+            payload["resources/catalogue/current.json"], "type catalogue",
+        )
+        migration = _strict_json_object(
+            payload["resources/migrations/v1.json"], "migration catalogue",
+        )
     except (KeyError, ValueError, UnicodeDecodeError) as exc:
         raise RuntimeError("formal alpha1 requires complete catalogue and migration resources") from exc
     required_domains = {f"d{number:02d}" for number in range(1, 13)}
@@ -260,12 +353,13 @@ def _manifest(
     payload: dict[str, bytes],
     native_path: str,
     formal: bool,
+    affect_scheme: dict[str, object] | None = None,
 ) -> dict[str, object]:
     files = [
         {"path": path, "sha256": _sha256(content), "bytes": len(content)}
         for path, content in sorted(payload.items())
     ]
-    return {
+    manifest = {
         "schema_version": 1,
         "package_version": version,
         "build_mode": "formal-alpha1" if formal else "dev-probe",
@@ -285,6 +379,9 @@ def _manifest(
         },
         "files": files,
     }
+    if affect_scheme is not None:
+        manifest["affect_scheme"] = affect_scheme
+    return manifest
 
 
 def build_package(
@@ -341,6 +438,7 @@ def build_package(
             f"formal alpha1 requires metadata version {FORMAL_VERSION!r}; found {version!r}"
         )
     payload = _read_allowlisted_payload(root, formal=formal)
+    affect_scheme = _d04_binding(payload) if formal else None
     native_path = (
         f"rewrite/sylanne3/_native/{target_os}-{target_arch}/{canonical_native}"
     )
@@ -358,6 +456,7 @@ def build_package(
         payload=payload,
         native_path=native_path,
         formal=formal,
+        affect_scheme=affect_scheme,
     )
     manifest_bytes = (
         json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -408,10 +507,12 @@ def verify_package(package: Path | str) -> None:
             if names.count(MANIFEST_PATH) != 1:
                 raise ValueError("ZIP must contain exactly one release-manifest.json")
             try:
-                manifest = json.loads(archive.read(MANIFEST_PATH))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                manifest = _strict_json_object(
+                    archive.read(MANIFEST_PATH), "release-manifest.json",
+                )
+            except ValueError as exc:
                 raise ValueError("release-manifest.json is invalid") from exc
-            if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+            if manifest.get("schema_version") != 1:
                 raise ValueError("ReleaseManifest schema is unsupported")
             entries = manifest.get("files")
             if not isinstance(entries, list):
@@ -466,16 +567,28 @@ def verify_package(package: Path | str) -> None:
                         "source, release resources, notices, and SBOM"
                     )
                 try:
-                    _validate_formal_resources(
-                        {
-                            member: archive.read(member)
-                            for member in (
-                                "resources/catalogue/current.json",
-                                "resources/migrations/v1.json",
-                            )
-                            if member in listed
-                        }
-                    )
+                    resources = {
+                        member: archive.read(member)
+                        for member in (
+                            "resources/catalogue/current.json",
+                            "resources/migrations/v1.json",
+                            _D04_ASSET_PATH,
+                        )
+                        if member in listed
+                    }
+                    _validate_formal_resources(resources)
+                    expected_binding = _d04_binding(resources)
+                    binding = manifest.get("affect_scheme")
+                    asset_entry = listed.get(_D04_ASSET_PATH)
+                    if (not isinstance(binding, dict)
+                            or set(binding) != set(expected_binding)
+                            or binding != expected_binding
+                            or asset_entry is None
+                            or type(binding.get("bytes")) is not int
+                            or not isinstance(binding.get("sha256"), str)
+                            or any(binding.get(field) != asset_entry.get(field)
+                                   for field in ("path", "sha256", "bytes"))):
+                        raise ValueError("formal alpha1 D04 manifest binding is invalid")
                 except RuntimeError as exc:
                     raise ValueError(str(exc)) from exc
 
