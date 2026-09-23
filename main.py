@@ -22,6 +22,7 @@ from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, Scen
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
 from .rewrite.sylanne3.runtime_contracts import NamespaceId, canonical_digest
+from .rewrite.sylanne3.workbench_api.current_onboarding import CurrentOnboardingResolver
 from .rewrite.sylanne3.workbench_api.http_transport import CurrentOwnerPairingPort
 from .rewrite.sylanne3.workbench_api.onboarding import OnboardingPolicyResolver
 from .rewrite.sylanne3.workbench_api.owner_grant import CurrentOwnerGrantPort
@@ -182,6 +183,8 @@ class Sylanne3Plugin(Star):
             health = self._runtime.health
         pairing, grants, onboarding, origin = self._workbench_dependencies
         origin = origin or installation.workbench_origin
+        if onboarding is None and pairing is None and grants is None and origin is not None:
+            onboarding = CurrentOnboardingResolver()
         if onboarding is not None and origin is not None:
             try:
                 transport = self._runtime.workbench_transport(

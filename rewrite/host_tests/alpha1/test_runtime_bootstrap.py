@@ -936,10 +936,6 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 proposal_schema_hash="b" * 64,
             )},
         )
-        onboarding = types.SimpleNamespace(
-            resolve_create_character=lambda **_kwargs: None,
-            resolve_bind_scene=lambda **_kwargs: None,
-        )
         with tempfile.TemporaryDirectory() as directory:
             data_dir = await asyncio.to_thread(Path(directory).resolve)
             installation = installation_module.V2InstallationAssembly(
@@ -949,7 +945,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             )
             with patch.object(StarTools, "get_data_dir", return_value=data_dir), \
                     patch.object(module, "assemble_v2_installation",
-                                 new=AsyncMock(return_value=installation)), \
+                                 new=AsyncMock(return_value=installation)) as assemble, \
                     patch.object(module, "load_verified_affect_scheme",
                                  return_value=types.SimpleNamespace(registry=domains)), \
                     patch.object(runtime_module, "verify_installed_package",
@@ -964,7 +960,6 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                             None, None, None, None, None, None),
                     {"enabled": True, "authority_profile": "installed",
                      "workbench_origin": "https://untrusted-config.example"},
-                    workbench_onboarding=onboarding,
                 )
                 try:
                     await plugin.initialize()
@@ -985,6 +980,18 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                         plugin._workbench._transport._config.origin,
                         "https://profile.example",
                     )
+                    onboarding = plugin._workbench._transport._service._onboarding
+                    self.assertIsInstance(onboarding, module.CurrentOnboardingResolver)
+                    self.assertIsNone(onboarding.resolve_create_character(
+                        session=None, scope="bot/persona", purpose="workbench_user_action",
+                        audience="owner", operation_id="creation", request_digest="digest",
+                        input_data={},
+                    ))
+                    self.assertIsNone(onboarding.resolve_bind_scene(
+                        coordinator=object(), session=None, scope="bot/persona",
+                        purpose="workbench_user_action", audience="owner",
+                        operation_id="binding", request_digest="digest", input_data={},
+                    ))
                     self.assertFalse(plugin._workbench._transport._origin_allowed(
                         types.SimpleNamespace(headers={
                             "origin": "https://untrusted-config.example",
@@ -1029,6 +1036,38 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                         lambda graph: sessions._owner_actor(principal, namespace)))
                 finally:
                     await plugin.terminate()
+
+                assemble.return_value = replace(installation, workbench_origin=None)
+                without_origin = module.Sylanne3Plugin(
+                    Context(asyncio.Queue(), {}, None, None, None, None,
+                            None, None, None, None, None, None),
+                    {"enabled": True, "authority_profile": "installed",
+                     "workbench_origin": "https://untrusted-config.example"},
+                )
+                try:
+                    await without_origin.initialize()
+                    self.assertEqual(without_origin.runtime_health.status, "limited")
+                    self.assertIsNone(without_origin._workbench._owner_sessions)
+                    self.assertIsNone(without_origin._workbench._transport)
+                finally:
+                    await without_origin.terminate()
+
+                assemble.return_value = replace(
+                    installation,
+                    installation_grant=replace(grant, installation_id="wrong-installation"),
+                )
+                wrong_installation = module.Sylanne3Plugin(
+                    Context(asyncio.Queue(), {}, None, None, None, None,
+                            None, None, None, None, None, None),
+                    {"enabled": True, "authority_profile": "installed"},
+                )
+                try:
+                    await wrong_installation.initialize()
+                    self.assertEqual(wrong_installation.runtime_health.status, "blocked")
+                    self.assertIsNone(wrong_installation._workbench._owner_sessions)
+                    self.assertIsNone(wrong_installation._workbench._transport)
+                finally:
+                    await wrong_installation.terminate()
 
     async def test_namespace_provision_hold_keeps_host_blocked(self) -> None:
         module = load_plugin_module()
