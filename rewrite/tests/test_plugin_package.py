@@ -128,6 +128,8 @@ class PluginPackageTests(unittest.TestCase):
         }
         diagonal = {"rows": 1, "cols": 1, "offsets": [0, 1],
                     "indices": [0], "values": [1.0]}
+        zero = {"rows": 1, "cols": 1, "offsets": [0, 0],
+                "indices": [], "values": []}
         operator = {
             "schema": "d04.fixed-block-operator.v1",
             "affect_schema": affect_scheme["schema"],
@@ -135,7 +137,7 @@ class PluginPackageTests(unittest.TestCase):
                 "scheme_version", "operator_version", "parameter_version", "coupling_version")},
             "axis_ids": [axis["axis_id"] for axis in affect_scheme["axes"]],
             "parameter_bounds": affect_scheme["parameter_bounds"],
-            "operator": {"k": diagonal, "r": diagonal, "j": diagonal,
+            "operator": {"k": diagonal, "r": diagonal, "j": zero,
                          "a": diagonal, "alpha": [1.0]},
         }
         migrations = {
@@ -509,6 +511,51 @@ class PluginPackageTests(unittest.TestCase):
                 project_root=self.project, target_os="windows", target_arch="x86_64",
                 native_library=self._native(), output_dir=self.base / "mismatched-operator",
             )
+
+    def test_d04_operator_structural_preflight_rejects_invalid_matrices(self) -> None:
+        self._add_formal_assets()
+        scheme_path = self.project / "resources/catalogue/d04-affect-scheme.json"
+        operator_path = self.project / "resources/catalogue/d04-fixed-block-operator.json"
+        scheme = json.loads(scheme_path.read_bytes())
+        operator = json.loads(operator_path.read_bytes())
+        scheme["axes"].append({"axis_id": "fixture:axis:2", "unit": "normalized",
+                               "meaning": "second synthetic axis"})
+        operator["axis_ids"].append("fixture:axis:2")
+        diagonal = {"rows": 2, "cols": 2, "offsets": [0, 1, 2],
+                    "indices": [0, 1], "values": [1.0, 1.0]}
+        skew = {"rows": 2, "cols": 2, "offsets": [0, 1, 2],
+                "indices": [1, 0], "values": [0.1, -0.1]}
+        operator["operator"].update(k=diagonal, r=diagonal, j=skew,
+                                    a={"rows": 0, "cols": 2, "offsets": [0],
+                                       "indices": [], "values": []}, alpha=[])
+        payload = {
+            "resources/catalogue/d04-affect-scheme.json": json.dumps(scheme).encode(),
+            "resources/catalogue/d04-fixed-block-operator.json": json.dumps(operator).encode(),
+        }
+        self.builder._d04_operator_binding(payload)
+        variants = (
+            ("negative K", "positive diagonal-dominance", {"k": {**diagonal, "values": [-1.0, 1.0]}}),
+            ("singular R", "positive diagonal-dominance", {"r": {**diagonal, "values": [0.0, 1.0]}}),
+            ("asymmetric K", "not symmetric", {"k": {"rows": 2, "cols": 2,
+                "offsets": [0, 2, 3], "indices": [0, 1, 1], "values": [2.0, 0.25, 2.0]}}),
+            ("invalid J", "not skew-symmetric", {"j": diagonal}),
+            ("duplicate CSR", "strictly ordered", {"k": {"rows": 2, "cols": 2,
+                "offsets": [0, 2, 3], "indices": [0, 0, 1], "values": [0.5, 0.5, 1.0]}}),
+            ("negative alpha", "A/alpha dimensions", {"alpha": [-1.0],
+                "a": {"rows": 1, "cols": 2, "offsets": [0, 1],
+                      "indices": [0], "values": [1.0]}}),
+        )
+        for label, error, changes in variants:
+            with self.subTest(label=label):
+                mutated = json.loads(json.dumps(operator))
+                mutated["operator"].update(changes)
+                payload["resources/catalogue/d04-fixed-block-operator.json"] = json.dumps(mutated).encode()
+                with self.assertRaisesRegex(ValueError, error):
+                    self.builder._d04_operator_binding(payload)
+        operator["operator"]["k"]["values"][0] = float("nan")
+        payload["resources/catalogue/d04-fixed-block-operator.json"] = json.dumps(operator).encode()
+        with self.assertRaisesRegex(ValueError, "not strict JSON"):
+            self.builder._d04_operator_binding(payload)
 
     def test_package_rejects_stale_workbench_resource(self) -> None:
         self._set_formal_version()

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from astrbot.dashboard.api.plugins import _match_registered_web_api
 
-from rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
+from rewrite.sylanne3.host.workbench_mount import STATUS_ROUTE, WorkbenchHostMount
 from rewrite.sylanne3.workbench_api.http_transport import (
     ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, SESSION_ROUTE,
 )
@@ -29,7 +29,7 @@ def test_host_mount_serves_packaged_assets_without_promoting_dashboard_admin_to_
     mount = WorkbenchHostMount()
     with patch("astrbot.api.web.request", SimpleNamespace(username="dashboard-admin")):
         mount.register(context)
-        assert len(context.registered_web_apis) == 4
+        assert len(context.registered_web_apis) == 5
         assert context.registered_web_apis[0][0] == COMMAND_ROUTE
         matched = _match_registered_web_api(
             context.registered_web_apis, COMMAND_ROUTE, "POST",
@@ -58,12 +58,42 @@ def test_host_mount_serves_packaged_assets_without_promoting_dashboard_admin_to_
         session, _ = _match_registered_web_api(
             context.registered_web_apis, SESSION_ROUTE, "GET")
         assert json.loads(asyncio.run(session()).body)["problem"]["code"] == "authority_unavailable"
+        install, _ = _match_registered_web_api(context.registered_web_apis, STATUS_ROUTE, "GET")
+        assert json.loads(asyncio.run(install()).body)["problem"]["code"] == "runtime_unavailable"
         assert asyncio.run(asset(asset="v1/commands")).status_code == 404
         assert asyncio.run(asset(asset="workbench-manifest.json")).status_code == 404
         assert asyncio.run(asset(asset="../metadata.yaml")).status_code == 404
         mount.close()
         assert json.loads(asyncio.run(handler()).body)["problem"]["code"] == "host_stopped"
         assert asyncio.run(page()).status_code == 503
+
+
+def test_installation_stage_is_readable_without_owner_but_only_exposes_safe_codes():
+    health = ["enrollment_required", "authority_profile"]
+    context = _Context()
+    mount = WorkbenchHostMount(lambda: tuple(health))
+    request = SimpleNamespace(username="dashboard-admin")
+    with patch("astrbot.api.web.request", request):
+        mount.register(context)
+        handler, _ = _match_registered_web_api(context.registered_web_apis, STATUS_ROUTE, "GET")
+        response = asyncio.run(handler())
+        assert response.status_code == 200
+        assert json.loads(response.body) == {
+            "schema_version": "sylanne.install-status.v1",
+            "runtime_stage": "enrollment_required", "reason_code": "authority_profile",
+        }
+        assert response.headers["cache-control"] == "no-store"
+        for reason in ("owner_guard", "active_role", "scene_binding", "dispatch",
+                       "product_ingress", "installed_package", "graph_worker",
+                       "domain_registry", "v2_fence_recovery"):
+            health[:] = ["limited", reason]
+            assert json.loads(asyncio.run(handler()).body)["reason_code"] == reason
+        health[:] = ["limited", "private-path-or-secret"]
+        assert json.loads(asyncio.run(handler()).body)["reason_code"] == "runtime_unavailable"
+        health[:] = ["ready", "none"]
+        assert json.loads(asyncio.run(handler()).body)["runtime_stage"] == "ready"
+        request.username = None
+        assert asyncio.run(handler()).status_code == 401
 
 
 def test_direct_call_without_host_authenticated_user_is_denied():

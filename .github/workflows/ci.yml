@@ -60,7 +60,9 @@ jobs:
           rustup default stable
 
       - name: Install component test tools
-        run: python -m pip install pytest pytest-asyncio ruff
+        run: |
+          python -m pip install pytest pytest-asyncio ruff
+          python -m pip install -r requirements-authority.txt
 
       - name: Compile and lint the alpha1 source
         run: |

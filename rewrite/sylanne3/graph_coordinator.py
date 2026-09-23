@@ -40,7 +40,8 @@ from .runtime.jobs import (
 )
 from .runtime.d11_types import reconcile_runtime_write
 from .runtime.dispatch_candidate import (
-    DispatchCandidateRecoveryV1, validate_dispatch_candidate_writes,
+    DispatchCandidateRecoveryV1, qualify_dispatch_candidate_sources,
+    validate_dispatch_candidate_writes,
 )
 
 
@@ -384,6 +385,31 @@ class _AuthorityLease:
     marker: object
 
 
+@dataclass(frozen=True, slots=True)
+class OwnerLeaseBindingV1:
+    """One process lease pinned to the committed graph and Authority heads."""
+
+    principal: object
+    actor: str
+    namespace: NamespaceId
+    purpose: str
+    audience: str
+    grant_id: str
+    scope: str
+    issuer_ref: str
+    capabilities: frozenset[str]
+    purposes: frozenset[str]
+    audiences: frozenset[str]
+    grant_digest: str
+    grant_revision: int
+    access_epoch: int
+    delete_epoch: int
+    graph_incarnation: str
+    authorization_head: str
+    authorization_revision: int
+    revocation_epoch: int
+
+
 class GraphCoordinator:
     """One in-process authority over a GraphStore's business SQLite connection.
 
@@ -399,7 +425,8 @@ class GraphCoordinator:
                  snapshot_requirements=None, holder=None, content_fence=None,
                  content_fence_v2: ContentFencePortV2 | None = None,
                  closure_verifier=None, d02_issuer=None, d11_issuer=None,
-                 ingress_policy=None, ingress_clock=None):
+                 ingress_policy=None, ingress_clock=None,
+                 owner_principal_resolver=None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -435,6 +462,10 @@ class GraphCoordinator:
         if ingress_clock is not None and not callable(ingress_clock):
             raise TypeError("ingress_clock must be callable")
         self.__ingress_clock = ingress_clock
+        if (owner_principal_resolver is not None
+                and not callable(owner_principal_resolver)):
+            raise TypeError("owner_principal_resolver must be callable")
+        self.__owner_principal_resolver = owner_principal_resolver
         self.__ingress_clock_bindings: dict[
             tuple[NamespaceId, str, int], _IngressClockBinding] = {}
         self.__graph_capability = object()
@@ -444,6 +475,7 @@ class GraphCoordinator:
             store._coordinator_capability = self.__graph_capability
         self.__leases: dict[_AuthorityLease, tuple[str, str, str, NamespaceId, frozenset[str],
                                                   frozenset[str], int]] = {}
+        self.__owner_leases: dict[_AuthorityLease, OwnerLeaseBindingV1] = {}
         self.__providers: dict[str, tuple[object, str, str]] = {}
 
     def _content_fence(self, namespace: NamespaceId, generation: int,
@@ -481,7 +513,9 @@ class GraphCoordinator:
             store, *namespace.as_tuple, _capability=self.__graph_capability)
         return metadata, epoch
 
-    def _read_v2(self, authority: AuthorityContext, reader):
+    def _read_v2(self, authority: AuthorityContext, reader, *,
+                 owner_principal=None,
+                 owner_binding: OwnerLeaseBindingV1 | None = None):
         """Keep every Authority RPC outside the business graph lock."""
         store = self.__store
         namespace = authority.namespace
@@ -507,12 +541,18 @@ class GraphCoordinator:
             try:
                 if port.validate_fence(scope) != permit:
                     raise UnavailableGuard("v2 read permit changed")
+                if owner_principal is not None or owner_binding is not None:
+                    observed_owner = self._owner_binding_in_fence(
+                        authority, scope, owner_principal, owner_binding)
                 with store._lock:
                     if self._v2_graph_stamp(namespace) != (metadata, epoch):
                         raise UnavailableGuard("v2 graph recovery stamp changed")
                     result = reader()
                 if port.validate_fence(scope) != permit:
                     raise UnavailableGuard("v2 read permit changed")
+                if owner_principal is not None or owner_binding is not None:
+                    self._owner_binding_in_fence(
+                        authority, scope, owner_principal, observed_owner)
                 with store._lock:
                     if self._v2_graph_stamp(namespace) != (metadata, epoch):
                         raise UnavailableGuard("v2 graph recovery stamp changed")
@@ -1859,7 +1899,7 @@ class GraphCoordinator:
                           request_digest=finish_digest)
         return receipt
 
-    def _scene_binding_state_locked(self, namespace, guard, prior):
+    def _scene_binding_state_locked(self, namespace, guard, prior=None):
         """Read the complete current D01 head and D03 binding query at one epoch."""
         from .domains.d01 import PersonaDomain, _activation_key
         from .domains.d03 import RoleBinding
@@ -1935,10 +1975,12 @@ class GraphCoordinator:
             versions.append(GraphVersion(key, revision))
             bindings.append(binding)
         query = QueryEpoch(namespace, "d03.role_binding", epoch.revision)
-        if (prior.query_epoch != query
+        if (prior is not None and (prior.query_epoch != query
                 or len(prior.read_versions) != len(versions)
-                or set(prior.read_versions) != set(versions)):
+                or set(prior.read_versions) != set(versions))):
             raise StaleRead("D03 negative query versions or epoch changed")
+        if prior is None:
+            return role, tuple(bindings), epoch, tuple(versions)
         return role, tuple(bindings), epoch
 
     def commit_scene_binding_v2(self, *, namespace: NamespaceId,
@@ -2361,6 +2403,126 @@ class GraphCoordinator:
     def read_active_role_v2(self, *, namespace: NamespaceId):
         """Read the current D01 head under one paired Authority read fence."""
         return self._read_active_scene_v2(namespace, None)[0]
+
+    def read_first_scene_binding_proof_v2(
+        self, *, namespace: NamespaceId, scene_ref: str, purpose: str,
+        principal,
+    ):
+        """Prove a complete first-binding absence with current Owner and D01 heads."""
+        from .authority_service.contract import identifier
+        from .authority_service.v2_owner_contract import (
+            OwnerAuthorizationGuardV1, OwnerPrincipalV1,
+        )
+        from .domains.d03 import (
+            ContextProvider, RoleBindingRequest, RoleBindingResolution,
+        )
+        from .runtime_contracts import QueryEpoch
+        from .workbench_api.d03_onboarding import CurrentFirstBindingProof
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None or type(namespace) is not NamespaceId
+                or type(principal) is not OwnerPrincipalV1):
+            raise UnavailableGuard("first scene proof requires production v2 Owner")
+        identifier(scene_ref, "scene_ref")
+        identifier(purpose, "purpose")
+        if not scene_ref.startswith("scene:"):
+            raise ValueError("scene_ref must be a scene identity")
+        port = self.__content_fence_v2
+        guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
+        if not callable(guard_reader):
+            raise UnavailableGuard("current Owner guard fence port is unavailable")
+        store = self.__store
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        if target.namespace != namespace or target.activation_generation != 1:
+            raise UnavailableGuard("first scene recovery identity differs")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("first scene recovery anchor differs")
+        attempt_id = "scene-negative-read-" + secrets.token_hex(16)
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=1, operation="read",
+            operation_id=attempt_id, expected_anchor=anchor)
+        scope = FenceScope(namespace, target.authority_namespace, 1, "read",
+                           attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        authority = AuthorityContext(
+            principal.account_ref, "d12", "first-scene-read", namespace,
+            ("persona", "scene"), purpose, ("owner",), "owner-grant-v1", 1)
+
+        def current_guard():
+            guarded = guard_reader(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                permit=permit)
+            if (type(guarded) is not tuple or len(guarded) != 2
+                    or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                    or guarded[1] != permit):
+                raise UnavailableGuard("current Owner guard is unavailable")
+            return guarded[0]
+
+        def check_owner(guard):
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("first scene graph stamp changed")
+                binding = self._owner_graph_binding_locked(authority, principal)
+            if (guard.authority_id != anchor.authority_id
+                    or guard.installation_id
+                    != port.installation_grant.installation_id
+                    or guard.namespace != namespace
+                    or guard.authorization_revision != binding.authorization_revision
+                    or guard.authorization_head != binding.authorization_head
+                    or guard.minimum_revocation_revision != 0
+                    or guard.minimum_revocation_epoch != binding.revocation_epoch
+                    or guard.pending_revoke_operation_id is not None):
+                raise UnavailableGuard("first scene Owner head changed")
+            return binding
+
+        try:
+            guard = current_guard()
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("first scene read permit changed")
+            owner = check_owner(guard)
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("first scene graph stamp changed")
+                role, bindings, current_epoch, versions = (
+                    self._scene_binding_state_locked(namespace, guard))
+                if current_epoch != epoch:
+                    raise StaleRead("first scene query epoch changed")
+                # First binding means no valid binding atom for this scene,
+                # including one that is currently out of its effective window.
+                if any(item.scene_ref == scene_ref for item in bindings):
+                    raise AuthorityDenied("scene already has a valid D03 binding")
+                request = RoleBindingRequest(
+                    f"persona:{namespace.persona_id}", None, None, scene_ref,
+                    "bind_scene", purpose, time.time(), True)
+                result = ContextProvider().resolve_role_binding(
+                    request, bindings)
+                if result.status != "no_applicable_binding":
+                    raise UnavailableGuard("first scene D03 query is incomplete")
+                prior = RoleBindingResolution(
+                    result.status, result.matched_bindings,
+                    result.applicable_norm_refs, result.missing_items,
+                    versions, QueryEpoch(namespace, "d03.role_binding", epoch.revision),
+                    result.valid_until, request)
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("first scene read permit changed")
+            if current_guard() != guard or check_owner(guard) != owner:
+                raise UnavailableGuard("first scene Owner head changed")
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("first scene graph stamp changed after read")
+            return CurrentFirstBindingProof(role, prior, guard)
+        finally:
+            port.finish_fence(
+                scope, request_id="finish:" + attempt_id,
+                request_digest="sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_first_scene_read",
+                }))
 
     def read_active_scene_v2(self, *, namespace: NamespaceId, scene_ref: str):
         """Read current D01 head and one scene binding at the same graph epoch."""
@@ -2795,6 +2957,18 @@ class GraphCoordinator:
               activation_generation: int,
               operation_id: str | None = None) -> tuple[object, str]:
         self._admin(bootstrap)
+        if (issuer_domain == "d12"
+                and isinstance(self.__store, ProductionGraphStore)):
+            raise UnavailableGuard("D12 requires a current Owner graph lease")
+        return self._grant_registered(
+            actor=actor, issuer_domain=issuer_domain, namespace=namespace,
+            domains=domains, activation_generation=activation_generation,
+            operation_id=operation_id)
+
+    def _grant_registered(self, *, actor: str, issuer_domain: str,
+                          namespace: NamespaceId, domains: tuple[str, ...],
+                          activation_generation: int,
+                          operation_id: str | None = None) -> tuple[object, str]:
         if not actor or not issuer_domain or not isinstance(namespace, NamespaceId):
             raise ValueError("invalid authority grant")
         domain_set = frozenset(domains)
@@ -2816,6 +2990,167 @@ class GraphCoordinator:
         self.__leases[lease] = (ref, actor, issuer_domain, namespace, domain_set,
                                 owners, activation_generation)
         return lease, ref
+
+    def grant_current_owner(self, bootstrap: object, *, actor: str,
+                            namespace: NamespaceId, domains: tuple[str, ...],
+                            purpose: str, audience: str,
+                            activation_generation: int
+                            ) -> tuple[AuthorityContext, object, OwnerLeaseBindingV1]:
+        """Mint a D12 read lease only from a trusted paired principal and live heads."""
+        self._admin(bootstrap)
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__owner_principal_resolver is None):
+            raise UnavailableGuard("current Owner principal resolver is unavailable")
+        if not purpose or not audience:
+            raise ValueError("Owner read requires purpose and audience")
+        principal = self._current_owner_principal(actor, namespace)
+        lease, ref = self._grant_registered(
+            actor=actor, issuer_domain="d12", namespace=namespace,
+            domains=domains, activation_generation=activation_generation)
+        owner_scope = tuple(sorted(self.__leases[lease][5]))
+        authority = AuthorityContext(
+            actor, "d12", ref, namespace, owner_scope, purpose,
+            (audience,), "owner-grant-v1", activation_generation)
+        try:
+            binding = self._read_v2(
+                authority,
+                lambda: self._owner_graph_binding_locked(authority, principal),
+                owner_principal=principal)
+        except BaseException:
+            del self.__leases[lease]
+            raise
+        self.__owner_leases[lease] = binding
+        return authority, lease, binding
+
+    def _current_owner_principal(self, actor: str, namespace: NamespaceId):
+        from .authority_service.v2_owner_contract import OwnerPrincipalV1
+
+        if self.__owner_principal_resolver is None:
+            raise UnavailableGuard("current Owner pairing is unavailable")
+        try:
+            principal = self.__owner_principal_resolver(actor, namespace)
+        except Exception as exc:
+            raise UnavailableGuard("current Owner pairing is unavailable") from exc
+        if type(principal) is not OwnerPrincipalV1:
+            raise UnavailableGuard("current Owner pairing is unavailable")
+        return principal
+
+    def _owner_graph_binding_locked(self, authority: AuthorityContext,
+                                    principal) -> OwnerLeaseBindingV1:
+        """Resolve the graph ACL and its independently finalized issue proof."""
+        from .authority_service.v2_owner_contract import (
+            OwnerGraphCommitProofV1, OwnerPrincipalV1,
+            canonical_digest as owner_contract_digest,
+        )
+
+        if type(principal) is not OwnerPrincipalV1:
+            raise UnavailableGuard("trusted Owner principal is unavailable")
+        store = self.__store
+        namespace = authority.namespace
+        metadata, graph_epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        db = store._db
+        atom = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (owner_grant_key(*namespace.as_tuple).token,),
+        ).fetchone()
+        proof_row = db.execute(
+            "SELECT operation_id,request_digest,grant_id,grant_digest,"
+            "graph_incarnation,graph_access_epoch,graph_epoch,"
+            "graph_receipt_digest,proof_json "
+            "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()
+        epochs = db.execute(
+            "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        if (atom is None or atom[0] != 1 or atom[2] != 1
+                or proof_row is None or epochs is None):
+            raise UnavailableGuard("current Owner graph grant is unavailable")
+        try:
+            grant = json.loads(atom[1])
+            validate_owner_grant_v1(grant)
+            proof = OwnerGraphCommitProofV1(
+                namespace, proof_row[0], proof_row[1], proof_row[2],
+                proof_row[3], proof_row[4], 1, proof_row[5],
+                proof_row[6], proof_row[7])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("durable Owner graph grant is invalid") from exc
+        if (atom[1] != canonical_json(grant)
+                or proof_row[8] != canonical_json(asdict(proof))
+                or "sha256:" + canonical_digest(grant) != proof.grant_digest
+                or grant["grant_id"] != proof.grant_id
+                or grant["issue_operation_id"] != proof.operation_id
+                or grant["principal"] != asdict(principal)
+                or grant["graph_incarnation"] != proof.graph_incarnation
+                or grant["graph_incarnation"] != target.graph_incarnation
+                or grant["authority_id"] != target.authority_id
+                or grant["installation_id"]
+                != self.__content_fence_v2.installation_grant.installation_id
+                or grant["activation_generation"] != authority.activation_generation
+                or grant["scope"] != "bot/persona"
+                or target.namespace != namespace
+                or target.activation_generation != authority.activation_generation
+                or proof.graph_access_epoch > epochs[0]
+                or proof.graph_epoch > graph_epoch.revision
+                or "workbench.read" not in grant["capabilities"]
+                or authority.purpose not in grant["purposes"]
+                or not set(authority.audience).issubset(grant["audiences"])):
+            raise AuthorityDenied("Owner graph grant does not authorize this read")
+        return OwnerLeaseBindingV1(
+            principal, authority.actor, namespace, authority.purpose,
+            authority.audience[0], grant["grant_id"], grant["scope"],
+            grant["issuer_ref"], frozenset(grant["capabilities"]),
+            frozenset(grant["purposes"]), frozenset(grant["audiences"]),
+            proof.grant_digest, 1, epochs[0], epochs[1], proof.graph_incarnation,
+            owner_contract_digest(proof), 1, 0)
+
+    def _owner_binding_in_fence(self, authority: AuthorityContext,
+                                scope: FenceScope, principal,
+                                expected: OwnerLeaseBindingV1 | None
+                                ) -> OwnerLeaseBindingV1:
+        from .authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
+
+        port = self.__content_fence_v2
+        if (principal is None and expected is None):
+            raise UnavailableGuard("Owner lease has no paired principal")
+        paired = self._current_owner_principal(
+            authority.actor, authority.namespace)
+        if paired != (expected.principal if expected is not None else principal):
+            raise UnavailableGuard("Owner pairing changed")
+        reader = getattr(port, "get_current_owner_guard_for_fence", None)
+        if not callable(reader):
+            raise UnavailableGuard("current Owner guard fence port is unavailable")
+        guarded = reader(
+            namespace=authority.namespace, authority_namespace=scope.authority_namespace,
+            permit=scope.permit)
+        if (type(guarded) is not tuple or len(guarded) != 2
+                or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                or guarded[1] != scope.permit):
+            raise UnavailableGuard("current Owner Authority head is unavailable")
+        guard = guarded[0]
+        if expected is not None:
+            principal = expected.principal
+        with self.__store._lock:
+            metadata, epoch = self._v2_graph_stamp(authority.namespace)
+            if (metadata.graph_revision != scope.graph_revision
+                    or epoch != scope.graph_epoch):
+                raise StaleRead("Owner graph stamp changed under read fence")
+            current = self._owner_graph_binding_locked(authority, principal)
+        if (guard.authority_id != scope.pinned_anchor.authority_id
+                or guard.installation_id
+                != self.__content_fence_v2.installation_grant.installation_id
+                or guard.namespace != authority.namespace
+                or guard.authorization_revision != current.authorization_revision
+                or guard.authorization_head != current.authorization_head
+                or guard.minimum_revocation_revision != 0
+                or guard.minimum_revocation_epoch != current.revocation_epoch
+                or guard.pending_revoke_operation_id is not None
+                or (expected is not None and current != expected)):
+            raise UnavailableGuard("Owner lease differs from current grant or revoke head")
+        return current
 
     def _admin(self, bootstrap: object) -> None:
         if bootstrap is not self.__bootstrap:
@@ -2893,7 +3228,7 @@ class GraphCoordinator:
                 raise
 
     def _authorize(self, lease: object, authority: AuthorityContext,
-                   domains: frozenset[str]) -> None:
+                   domains: frozenset[str], *, owner_read: bool = False) -> None:
         try:
             ref, actor, issuer_domain, namespace, allowed, owner_scope, generation = self.__leases[lease]
         except (KeyError, TypeError):
@@ -2905,12 +3240,16 @@ class GraphCoordinator:
                 or not set(authority.owner_scope).issubset(owner_scope)
                 or not domains.issubset(allowed)):
             raise AuthorityDenied("authority assertion does not match process grant")
-        if (issuer_domain == "d12" and isinstance(self.__store, ProductionGraphStore)
-                and self.__content_fence_v2 is not None):
-            # A host bootstrap can mint process leases. W01 has not yet bound a
-            # lease to a current, committed Authority Owner guard in the same
-            # read fence; keeping D12 closed prevents bootstrap impersonation.
-            raise UnavailableGuard("durable Owner grant resolution is unavailable")
+        if (issuer_domain == "d12"
+                and isinstance(self.__store, ProductionGraphStore)):
+            binding = self.__owner_leases.get(lease)
+            if (not owner_read or binding is None
+                    or binding.actor != authority.actor
+                    or binding.namespace != authority.namespace
+                    or binding.purpose != authority.purpose
+                    or authority.audience != (binding.audience,)
+                    or authority.provider_policy_ref != "owner-grant-v1"):
+                raise UnavailableGuard("current Owner graph read lease is unavailable")
 
     @staticmethod
     def _version(db, namespace: NamespaceId, kind: str, ref: str) -> str:
@@ -4184,10 +4523,11 @@ class GraphCoordinator:
             raise AuthorityDenied("read key is outside authorized namespace or owner scope")
         domains = frozenset(self.__store._registry.spec(key.type_name).writer_domain
                             for key in keys)
-        self._authorize(lease, authority, domains)
+        self._authorize(lease, authority, domains, owner_read=True)
         if isinstance(self.__store, ProductionGraphStore) and self.__content_fence_v2 is not None:
             return self._read_v2(authority, lambda: GraphStore.graph_snapshot(
-                self.__store, keys, _capability=self.__graph_capability))
+                self.__store, keys, _capability=self.__graph_capability),
+                owner_binding=self.__owner_leases.get(lease))
         with self._content_fence(authority.namespace, authority.activation_generation, "read"):
             store = self.__store
             with store._lock:
@@ -4206,11 +4546,12 @@ class GraphCoordinator:
             raise AuthorityDenied("ordinary content query cannot include invalid atoms")
         domains = frozenset(self.__store._registry.spec(name).writer_domain
                             for name in type_names)
-        self._authorize(lease, authority, domains)
+        self._authorize(lease, authority, domains, owner_read=True)
         if isinstance(self.__store, ProductionGraphStore) and self.__content_fence_v2 is not None:
             return self._read_v2(authority, lambda: GraphStore.graph_query(
                 self.__store, *authority.namespace.as_tuple, type_names=type_names,
-                owner_kind=owner_kind, _capability=self.__graph_capability, **filters))
+                owner_kind=owner_kind, _capability=self.__graph_capability, **filters),
+                owner_binding=self.__owner_leases.get(lease))
         with self._content_fence(authority.namespace, authority.activation_generation, "read"):
             store = self.__store
             with store._lock:
@@ -4268,7 +4609,7 @@ class GraphCoordinator:
         if data is None:
             return None
         if (type(data) is not dict or data.get("schema") != "sylanne.d11.dispatch_candidate.v1"
-                or data.get("status") != "source_hold"
+                or data.get("status") not in {"source_hold", "source_qualified"}
                 or type(data.get("refs")) is not list or len(data["refs"]) != 4):
             raise UnavailableGuard("durable dispatch candidate receipt is invalid")
         event = db.execute(
@@ -4317,6 +4658,38 @@ class GraphCoordinator:
             delete_epoch=data.get("delete_epoch"),
             query_epoch=data.get("query_epoch"),
         )
+        if candidate is not None and data["status"] == "source_qualified":
+            read_versions = GraphStore._version_rows(event[2])
+            if (data.get("graph_epoch") != candidate.query_epoch + 1
+                    or type(data.get("source_audience")) is not list
+                    or type(data.get("source_proof_versions")) is not list):
+                raise UnavailableGuard("dispatch source proof graph epoch differs")
+            atoms = []
+            for read in read_versions:
+                if read.revision == 0:
+                    atoms.append(GraphAtom(read.key, 0, {}, False))
+                    continue
+                history = db.execute(
+                    "SELECT value,valid FROM graph_history WHERE token=? AND revision=?",
+                    (read.key.token, read.revision),
+                ).fetchone()
+                if history is None:
+                    raise UnavailableGuard("dispatch source proof history is unavailable")
+                atoms.append(GraphAtom(read.key, read.revision, json.loads(history[0]),
+                                       bool(history[1])))
+            candidate = qualify_dispatch_candidate_sources(
+                candidate, action, GraphSnapshot(tuple(atoms), (
+                    NamespaceEpoch(*namespace.as_tuple, candidate.query_epoch),)),
+                audience=tuple(data["source_audience"]),
+                batch_audiences=tuple(typed_writes[3][1].value["audiences"]),
+                current_barrier_confirmed=True,
+                valid_until=typed_writes[3][1].value["valid_until"],
+            )
+            if (candidate.status != "source_qualified"
+                    or [list(item) for item in candidate.source_proof_versions]
+                    != data["source_proof_versions"]
+                    or candidate.source_proof_digest != data.get("source_proof_digest")):
+                raise UnavailableGuard("dispatch source proof differs from graph history")
         if candidate is None or candidate.digest != data.get("digest"):
             raise UnavailableGuard("dispatch candidate digest differs")
         if isinstance(store, ProductionGraphStore):
@@ -4926,6 +5299,7 @@ class GraphCoordinator:
         result: list[CommitReceipt] = []
         runtime_admissions: list[RuntimeAdmission] = []
         product_advances: list[dict] = []
+        qualified_dispatch_candidates = []
 
         def guard(db):
             if v2_write is not None:
@@ -4972,6 +5346,26 @@ class GraphCoordinator:
                             access.value.get("audiences", ()))
                         or envelope.authority.purpose not in access.value.get("purposes", ())):
                     raise AuthorityDenied("source access no longer covers this use")
+            if (dispatch_candidate is not None
+                    and len(envelope.version_guard.query_epochs) == 1
+                    and envelope.version_guard.query_epochs[0].scope_ref == "all"):
+                from .domains.d08 import GoalExecutionProvider
+
+                action_write = next(write for write in writes
+                                    if write.key.type_name == "d08.action_intent.v1")
+                action = next(spec for spec in GoalExecutionProvider().register_types()
+                              if spec.name == "d08.action_intent.v1").validator(
+                                  action_write.value)
+                qualified_dispatch_candidates.append(qualify_dispatch_candidate_sources(
+                    dispatch_candidate, action, snapshot,
+                    audience=envelope.authority.audience,
+                    batch_audiences=tuple(next(write.value["audiences"] for write in writes
+                                               if write.key.type_name ==
+                                               "d09.verified_segment_batch.v1")),
+                    current_barrier_confirmed=True,
+                    valid_until=next(write.value["valid_until"] for write in writes
+                                     if write.key.type_name == "d09.verified_segment_batch.v1"),
+                ))
             for proposal in bundle.proposals:
                 provider = self.__providers[proposal.domain][0]
                 # Providers may return approval or the exact unchanged proposal.
@@ -5058,6 +5452,8 @@ class GraphCoordinator:
             data = {"commit_seq": seq, "ledger_refs": list(ledger_refs),
                     "outbox_refs": list(bundle.outbox_refs)}
             if dispatch_candidate is not None:
+                candidate_evidence = (qualified_dispatch_candidates[0]
+                                      if qualified_dispatch_candidates else dispatch_candidate)
                 versions = {item.key.token: item.revision
                             for item in graph_receipt.revisions}
                 refs = (dispatch_candidate.action_ref,
@@ -5068,14 +5464,18 @@ class GraphCoordinator:
                     raise UnavailableGuard("dispatch candidate lacks same-commit graph versions")
                 data["dispatch_candidate"] = {
                     "schema": "sylanne.d11.dispatch_candidate.v1",
-                    "status": "source_hold",
-                    "digest": dispatch_candidate.digest,
+                    "status": candidate_evidence.status,
+                    "digest": candidate_evidence.digest,
                     "refs": [[ref, versions[ref]] for ref in refs],
                     "graph_epoch": graph_receipt.epoch.revision,
                     "source_refs": list(dispatch_candidate.source_refs),
                     "access_epoch": dispatch_candidate.access_epoch,
                     "delete_epoch": dispatch_candidate.delete_epoch,
                     "query_epoch": dispatch_candidate.query_epoch,
+                    "source_audience": list(candidate_evidence.source_audience),
+                    "source_proof_versions": [list(item) for item in
+                                              candidate_evidence.source_proof_versions],
+                    "source_proof_digest": candidate_evidence.source_proof_digest,
                     "graph_incarnation": (
                         v2_write[0].requirements.graph_incarnation
                         if v2_write is not None else None),
@@ -5186,5 +5586,5 @@ __all__ = [
     "GraphCoordinator", "AuthorityDenied", "UnavailableGuard",
     "FirstIngressOutcomeUnknown", "namespace_ref",
     "BudgetAdmission", "JobBinding", "RuntimeAdmission", "ScheduleAdmission",
-    "budget_operation_digest",
+    "OwnerLeaseBindingV1", "budget_operation_digest",
 ]

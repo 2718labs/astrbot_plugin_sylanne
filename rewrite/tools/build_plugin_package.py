@@ -165,7 +165,7 @@ def _d04_binding(payload: dict[str, bytes]) -> dict[str, object]:
 
 
 def _d04_operator_binding(payload: dict[str, bytes]) -> dict[str, object]:
-    """Bind one complete fixed-block operator to the packaged D04 scheme."""
+    """Bind a structurally admissible block; this does not certify numerical accuracy."""
     content = payload.get(_D04_OPERATOR_PATH)
     if content is None:
         raise RuntimeError("formal alpha1 requires a D04 fixed-block operator asset")
@@ -184,7 +184,7 @@ def _d04_operator_binding(payload: dict[str, bytes]) -> dict[str, object]:
     if not isinstance(block, dict) or set(block) != {"k", "r", "j", "a", "alpha"}:
         raise ValueError("D04 fixed-block operator is incomplete")
 
-    def matrix(value: object) -> tuple[int, int]:
+    def matrix(value: object) -> tuple[int, int, list[dict[int, float]]]:
         if not isinstance(value, dict) or set(value) != {"rows", "cols", "offsets", "indices", "values"}:
             raise ValueError("D04 fixed-block matrix is incomplete")
         rows, cols = value["rows"], value["cols"]
@@ -199,12 +199,38 @@ def _d04_operator_binding(payload: dict[str, bytes]) -> dict[str, object]:
                 or any(type(item) is not int or not 0 <= item < cols for item in indices)
                 or any(type(item) not in (int, float) or not math.isfinite(item) for item in values)):
             raise ValueError("D04 fixed-block matrix is invalid")
-        return rows, cols
+        sparse_rows: list[dict[int, float]] = []
+        for row in range(rows):
+            start, end = offsets[row], offsets[row + 1]
+            columns = indices[start:end]
+            if any(left >= right for left, right in zip(columns, columns[1:])):
+                raise ValueError("D04 fixed-block CSR columns must be strictly ordered")
+            sparse_rows.append(dict(zip(columns, values[start:end])))
+        return rows, cols, sparse_rows
 
     n = len(scheme["axes"])
-    if any(matrix(block[name]) != (n, n) for name in ("k", "r", "j")):
+    state_matrices = {name: matrix(block[name]) for name in ("k", "r", "j")}
+    if any(shape[:2] != (n, n) for shape in state_matrices.values()):
         raise ValueError("D04 fixed-block state dimensions differ from affect axes")
-    a_rows, a_cols = matrix(block["a"])
+    for name in ("k", "r"):
+        rows = state_matrices[name][2]
+        for row, entries in enumerate(rows):
+            try:
+                off_diagonal = math.fsum(abs(value) for col, value in entries.items() if col != row)
+            except OverflowError as exc:
+                raise ValueError(f"D04 fixed-block {name.upper()} row magnitude overflows") from exc
+            lower_bound = entries.get(row, 0.0) - math.nextafter(off_diagonal, math.inf)
+            if not math.isfinite(lower_bound) or lower_bound <= 0:
+                raise ValueError(f"D04 fixed-block {name.upper()} lacks a positive diagonal-dominance witness")
+            for col, value in entries.items():
+                if rows[col].get(row, 0.0) != value:
+                    raise ValueError(f"D04 fixed-block {name.upper()} is not symmetric")
+    skew_rows = state_matrices["j"][2]
+    for row, entries in enumerate(skew_rows):
+        for col, value in entries.items():
+            if (row == col and value != 0.0) or skew_rows[col].get(row, 0.0) != -value:
+                raise ValueError("D04 fixed-block J is not skew-symmetric")
+    a_rows, a_cols, _ = matrix(block["a"])
     alpha = block["alpha"]
     if (a_cols != n or not isinstance(alpha, list) or len(alpha) != a_rows
             or any(type(item) not in (int, float) or not math.isfinite(item) or item < 0

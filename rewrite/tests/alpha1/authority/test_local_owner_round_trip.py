@@ -27,6 +27,7 @@ from sylanne3.authority_service.v2_owner_contract import (
 )
 from sylanne3.graph_coordinator import GraphCoordinator, namespace_ref
 from sylanne3.graph_store import ProductionGraphStore, TypeRegistry
+from sylanne3.graph_worker import GraphWorker
 from sylanne3.graph_types import owner_grant_policy_digest_v1, owner_grant_spec
 from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime.issuers import build_runtime_issuers
@@ -35,6 +36,7 @@ from sylanne3.host.authority_client import (
 )
 from sylanne3.host.mtls_transport import AuthorityTlsProfile
 from sylanne3.host.v2_fence_port import V2FencePort
+from sylanne3.host.owner_issue_orchestration import FirstOwnerIssueOrchestrator
 from sylanne3.runtime_contracts import InstallationGrantV2, NamespaceId, canonical_digest
 
 
@@ -311,7 +313,7 @@ def test_local_graph_to_authority_owner_issue_replay_and_tamper(tmp_path):
             resource.close()
 
 
-def test_owner_issue_round_trip_over_real_loopback_mtls(tmp_path):
+def test_owner_issue_round_trip_over_real_loopback_mtls(tmp_path, monkeypatch):
     from rewrite.host_tests.alpha1.test_authority_mtls_loopback import (
         AuthorityMtlsLoopbackTests,
     )
@@ -360,44 +362,81 @@ def test_owner_issue_round_trip_over_real_loopback_mtls(tmp_path):
 
         client_port = fence_port("client", client_peer, "installation")
         admin_port = fence_port("second", admin_peer, "installation-admin")
-        _, d11 = build_runtime_issuers(b"issuer-key-" * 4)
-        coordinator = GraphCoordinator(
-            resources[0], bootstrap, holder="administrator",
-            content_fence_v2=client_port, d11_issuer=d11)
         policy = replace(
             policy_for(resources[0]), authority_namespace=AUTH_NS,
             expected_authority_id=authority_id, manifest_digest="c" * 64)
-        creation = coordinator.provision_namespace_v2(
-            bootstrap, policy, operation_id="owner-creation")
-        expected.update(operation_id=creation.operation_id,
-                        digest="sha256:" + creation.input_digest)
-        ticket, operation, value = _owner_issue(creation, authority_id, principal)
-        with pytest.raises(RuntimeError):
-            client_port.register_owner_ticket(
-                namespace=ROLE, authority_namespace=AUTH_NS, ticket=ticket)
-        assert admin_port.register_owner_ticket(
-            namespace=ROLE, authority_namespace=AUTH_NS, ticket=ticket) == ticket
-        with pytest.raises(RuntimeError):
-            admin_port.reserve_owner_issue(
-                namespace=ROLE, authority_namespace=AUTH_NS, operation=operation)
-        pending = client_port.reserve_owner_issue(
-            namespace=ROLE, authority_namespace=AUTH_NS, operation=operation)
-        assert pending.phase == "pending"
-        proof = coordinator.commit_first_owner_grant_v2(
-            bootstrap, namespace=ROLE, operation_id=operation.operation_id,
-            grant_value=value)
-        committed = client_port.finalize_owner_issue(
-            namespace=ROLE, authority_namespace=AUTH_NS,
-            operation=operation, proof=proof)
-        assert committed.phase == "committed"
-        assert client_port.finalize_owner_issue(
-            namespace=ROLE, authority_namespace=AUTH_NS,
-            operation=operation, proof=proof) == committed
-        with pytest.raises(RuntimeError):
-            client_port.finalize_owner_issue(
-                namespace=ROLE, authority_namespace=AUTH_NS,
-                operation=operation,
-                proof=replace(proof, graph_receipt_digest="sha256:" + "f" * 64))
+        _, d11 = build_runtime_issuers(b"issuer-key-" * 4)
+
+        async def scenario():
+            registry = TypeRegistry()
+            registry.register(owner_grant_spec())
+            worker = await GraphWorker.start(
+                lambda: ProductionGraphStore(tmp_path / "business.db", registry),
+                lambda store, port: GraphCoordinator(
+                    store, bootstrap, holder="administrator",
+                    content_fence_v2=port, d11_issuer=d11),
+                fence_port_factory=lambda: fence_port(
+                    "client", client_peer, "installation"))
+            try:
+                creation = await worker.call(
+                    lambda graph: graph.provision_namespace_v2(
+                        bootstrap, policy, operation_id="owner-creation"))
+                expected.update(operation_id=creation.operation_id,
+                                digest="sha256:" + creation.input_digest)
+                ticket, operation, value = _owner_issue(
+                    creation, authority_id, principal)
+                with pytest.raises(RuntimeError):
+                    await asyncio.to_thread(
+                        client_port.register_owner_ticket,
+                        namespace=ROLE, authority_namespace=AUTH_NS, ticket=ticket)
+                with pytest.raises(RuntimeError):
+                    await asyncio.to_thread(
+                        admin_port.reserve_owner_issue,
+                        namespace=ROLE, authority_namespace=AUTH_NS,
+                        operation=operation)
+
+                def graph_commit(graph, operation_id, grant_value):
+                    return graph.commit_first_owner_grant_v2(
+                        bootstrap, namespace=ROLE, operation_id=operation_id,
+                        grant_value=grant_value)
+
+                orchestrator = FirstOwnerIssueOrchestrator(
+                    namespace=ROLE, graph_worker=worker,
+                    graph_commit=graph_commit, registration_port=admin_port,
+                    claimant_port=client_port)
+                original_finalize = client_port.finalize_owner_issue
+
+                def lost_final_response(**kwargs):
+                    original_finalize(**kwargs)
+                    raise RuntimeError("simulated lost Authority response")
+
+                monkeypatch.setattr(client_port, "finalize_owner_issue",
+                                    lost_final_response)
+                with pytest.raises(RuntimeError, match="simulated lost"):
+                    await orchestrator.issue(ticket=ticket, operation=operation,
+                                             grant_value=value)
+                monkeypatch.setattr(client_port, "finalize_owner_issue",
+                                    original_finalize)
+                committed = await orchestrator.issue(
+                    ticket=ticket, operation=operation, grant_value=value)
+                assert committed.phase == "committed"
+                proof = await worker.call(
+                    graph_commit, operation.operation_id, value)
+                assert await asyncio.to_thread(
+                    client_port.finalize_owner_issue,
+                    namespace=ROLE, authority_namespace=AUTH_NS,
+                    operation=operation, proof=proof) == committed
+                with pytest.raises(RuntimeError):
+                    await asyncio.to_thread(
+                        client_port.finalize_owner_issue,
+                        namespace=ROLE, authority_namespace=AUTH_NS,
+                        operation=operation,
+                        proof=replace(proof,
+                                      graph_receipt_digest="sha256:" + "f" * 64))
+            finally:
+                await worker.close()
+
+        asyncio.run(scenario())
     finally:
         if admin_port is not None:
             admin_port.close()

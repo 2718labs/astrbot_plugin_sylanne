@@ -21,6 +21,10 @@ from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
 )
+from ..authority_service.v2_owner_proof import (
+    OwnerCredentialRegistrationV1, OwnerProofAcceptanceV1,
+    OwnerProofChallengeV1, OwnerProofRequestV1,
+)
 from ..authority_service.v2_execution_bridge import HandoffStartV2
 from ..graph_coordinator import namespace_ref
 from ..runtime.restore_anchor import RestoreAnchor
@@ -340,6 +344,92 @@ class V2FencePort:
                 or value.authority_id != grant.authority_id
                 or (not pairing and value.installation_id != grant.installation_id)):
             raise RuntimeError("v2 owner identity mismatch")
+
+    def register_owner_credential(self, *, namespace: NamespaceId,
+                                  authority_namespace: str,
+                                  registration: OwnerCredentialRegistrationV1,
+                                  rotation_signature: bytes | None = None,
+                                  ) -> OwnerCredentialRegistrationV1:
+        return self._submit(self._with_session_repair(lambda: self._register_owner_credential(
+            namespace, authority_namespace, registration, rotation_signature)))
+
+    async def _register_owner_credential(self, namespace: NamespaceId,
+                                         authority_namespace: str,
+                                         registration: OwnerCredentialRegistrationV1,
+                                         rotation_signature: bytes | None,
+                                         ) -> OwnerCredentialRegistrationV1:
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        if (type(registration) is not OwnerCredentialRegistrationV1
+                or registration.authority_id != grant.authority_id
+                or registration.authority_namespace != authority_namespace
+                or registration.installation_id != grant.installation_id):
+            raise RuntimeError("v2 Owner credential identity mismatch")
+        return await self._transport.v2_register_owner_credential(
+            self._request, handshake, namespace=authority_namespace,
+            registration=registration, rotation_signature=rotation_signature)
+
+    def begin_owner_proof(self, *, namespace: NamespaceId,
+                          authority_namespace: str, request: OwnerProofRequestV1,
+                          operation: OwnerAuthorizationOperationV1,
+                          ) -> OwnerProofChallengeV1:
+        return self._submit(self._with_session_repair(lambda: self._begin_owner_proof(
+            namespace, authority_namespace, request, operation)))
+
+    async def _begin_owner_proof(self, namespace: NamespaceId,
+                                 authority_namespace: str, request: OwnerProofRequestV1,
+                                 operation: OwnerAuthorizationOperationV1,
+                                 ) -> OwnerProofChallengeV1:
+        await self._mapped(namespace, authority_namespace)
+        self._owner_identity(namespace, authority_namespace, operation)
+        handshake, grant = self._identity()
+        if (type(request) is not OwnerProofRequestV1
+                or request.authority_namespace != authority_namespace
+                or request.installation_id != grant.installation_id):
+            raise RuntimeError("v2 Owner proof identity mismatch")
+        request.assert_matches_operation(operation)
+        return await self._transport.v2_begin_owner_proof(
+            self._request, handshake, namespace=authority_namespace,
+            proof_request=request, operation=operation)
+
+    def accept_owner_proof(self, *, namespace: NamespaceId,
+                           authority_namespace: str, challenge: OwnerProofChallengeV1,
+                           signature: bytes) -> OwnerProofAcceptanceV1:
+        return self._submit(self._with_session_repair(lambda: self._accept_owner_proof(
+            namespace, authority_namespace, challenge, signature)))
+
+    async def _accept_owner_proof(self, namespace: NamespaceId,
+                                  authority_namespace: str,
+                                  challenge: OwnerProofChallengeV1,
+                                  signature: bytes) -> OwnerProofAcceptanceV1:
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        if (type(challenge) is not OwnerProofChallengeV1
+                or challenge.request.authority_id != grant.authority_id
+                or challenge.request.authority_namespace != authority_namespace
+                or challenge.request.installation_id != grant.installation_id):
+            raise RuntimeError("v2 Owner challenge identity mismatch")
+        return await self._transport.v2_accept_owner_proof(
+            self._request, handshake, namespace=authority_namespace,
+            challenge=challenge, signature=signature)
+
+    def get_owner_proof(self, *, namespace: NamespaceId,
+                        authority_namespace: str,
+                        operation: OwnerAuthorizationOperationV1,
+                        ) -> OwnerProofAcceptanceV1 | None:
+        return self._submit(self._with_session_repair(lambda: self._get_owner_proof(
+            namespace, authority_namespace, operation)))
+
+    async def _get_owner_proof(self, namespace: NamespaceId,
+                               authority_namespace: str,
+                               operation: OwnerAuthorizationOperationV1,
+                               ) -> OwnerProofAcceptanceV1 | None:
+        await self._mapped(namespace, authority_namespace)
+        self._owner_identity(namespace, authority_namespace, operation)
+        handshake, _ = self._identity()
+        return await self._transport.v2_get_owner_proof(
+            self._request, handshake, namespace=authority_namespace,
+            operation=operation)
 
     def register_owner_ticket(self, *, namespace: NamespaceId,
                               authority_namespace: str,

@@ -36,6 +36,11 @@ from .v2_owner_contract import (
     from_wire as owner_from_wire, to_wire as owner_to_wire,
 )
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from .v2_owner_proof import (
+    AuthorityV2OwnerProofStore, OwnerCredentialRegistrationV1,
+    OwnerProofChallengeV1, OwnerProofRequestV1,
+    from_wire as proof_from_wire, to_wire as proof_to_wire,
+)
 from ..graph_coordinator import namespace_ref
 
 
@@ -153,6 +158,7 @@ class AuthorityRpcServer:
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
         v2_owner_tickets: AuthorityV2OwnerTicketStore | None = None,
+        v2_owner_proofs: AuthorityV2OwnerProofStore | None = None,
         v2_final_handoff_authorizers: Mapping[str, Callable] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
@@ -187,6 +193,11 @@ class AuthorityRpcServer:
                      or v2_owner_tickets._core is not core)):
             raise TypeError("v2 owner tickets must use the same Authority core")
         self._v2_owner_tickets = v2_owner_tickets
+        if (v2_owner_proofs is not None
+                and (type(v2_owner_proofs) is not AuthorityV2OwnerProofStore
+                     or v2_owner_proofs._core is not core)):
+            raise TypeError("v2 Owner proofs must use the same Authority core")
+        self._v2_owner_proofs = v2_owner_proofs
         handoff_authorizers = dict(v2_final_handoff_authorizers or {})
         if any(namespace not in services or not callable(callback)
                for namespace, callback in handoff_authorizers.items()):
@@ -460,6 +471,86 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method in {"register_owner_credential_v1", "begin_owner_proof_v1",
+                          "accept_owner_proof_v1", "get_owner_proof_v1"}:
+                namespace = identifier(command.get("namespace"), "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                proofs = self._v2_owner_proofs
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                if proofs is None or installed is None:
+                    raise AuthorityUnavailable("Owner proof service is unavailable")
+                required = {
+                    "register_owner_credential_v1": {"namespace", "registration", "rotation_signature"},
+                    "begin_owner_proof_v1": {"namespace", "request", "operation"},
+                    "accept_owner_proof_v1": {"namespace", "challenge", "signature"},
+                    "get_owner_proof_v1": {"namespace", "operation"},
+                }[method]
+                if set(command) != required:
+                    raise AuthorityUnavailable("Owner proof command fields differ")
+
+                def proof_value(field: str, expected: type):
+                    raw = command[field]
+                    decoded = proof_from_wire(raw)
+                    if type(decoded) is not expected or proof_to_wire(decoded) != raw:
+                        raise AuthorityUnavailable("Owner proof command is not canonical")
+                    return decoded
+
+                def owner_operation() -> OwnerAuthorizationOperationV1:
+                    raw = command["operation"]
+                    decoded = owner_from_wire(raw)
+                    if (type(decoded) is not OwnerAuthorizationOperationV1
+                            or owner_to_wire(decoded) != raw
+                            or decoded.authority_id != self._authority_id()
+                            or decoded.installation_id != installed.installation_id
+                            or namespace_ref(decoded.namespace) != namespace
+                            or self._namespace_bindings_v2.get((
+                                credential.certificate_sha256, profile_id,
+                                decoded.namespace)) != namespace):
+                        raise AuthorityUnavailable("Owner proof operation identity differs")
+                    return decoded
+
+                if method == "register_owner_credential_v1":
+                    registration = proof_value("registration", OwnerCredentialRegistrationV1)
+                    if (registration.authority_id != self._authority_id()
+                            or registration.authority_namespace != namespace
+                            or registration.installation_id != installed.installation_id):
+                        raise AuthorityUnavailable("Owner credential identity differs")
+                    signature_hex = command["rotation_signature"]
+                    if signature_hex is not None:
+                        signature = self._owner_proof_signature(signature_hex)
+                    else:
+                        signature = None
+                    registered = proofs.register_credential(
+                        transport_credential=credential, registration=registration,
+                        rotation_signature=signature)
+                    return {"registration": proof_to_wire(registered)}
+                if method == "begin_owner_proof_v1":
+                    operation = owner_operation()
+                    request = proof_value("request", OwnerProofRequestV1)
+                    if request.installation_id != installed.installation_id:
+                        raise AuthorityUnavailable("Owner proof installation differs")
+                    challenge = proofs.begin_challenge(
+                        transport_credential=credential, request=request,
+                        operation=operation)
+                    return {"challenge": proof_to_wire(challenge)}
+                if method == "accept_owner_proof_v1":
+                    challenge = proof_value("challenge", OwnerProofChallengeV1)
+                    request = challenge.request
+                    if (request.authority_id != self._authority_id()
+                            or request.authority_namespace != namespace
+                            or request.installation_id != installed.installation_id):
+                        raise AuthorityUnavailable("Owner challenge identity differs")
+                    signature = self._owner_proof_signature(command["signature"])
+                    acceptance = proofs.accept_proof(
+                        transport_credential=credential,
+                        challenge=challenge, signature=signature)
+                    return {"acceptance": proof_to_wire(acceptance)}
+                operation = owner_operation()
+                acceptance = proofs.get_accepted_for_operation(
+                    transport_credential=credential, operation=operation)
+                return {"acceptance": None if acceptance is None else proof_to_wire(acceptance)}
             if method == "get_current_owner_guard_for_fence" and set(command) == {
                     "namespace", "permit"}:
                 namespace = identifier(command["namespace"], "namespace")
@@ -699,6 +790,13 @@ class AuthorityRpcServer:
         except (AuthorityUnavailable, TypeError, ValueError) as exc:
             raise RuntimeError("authority unavailable") from exc
         raise RuntimeError("authority unavailable")
+
+    @staticmethod
+    def _owner_proof_signature(value: object) -> bytes:
+        if (type(value) is not str or len(value) != 128
+                or any(char not in "0123456789abcdef" for char in value)):
+            raise AuthorityUnavailable("Owner signature encoding differs")
+        return bytes.fromhex(value)
 
     def _dispatch(self, method, request, credential, channel_binding: bytes, *,
                   handshake_binding: str | None = None,

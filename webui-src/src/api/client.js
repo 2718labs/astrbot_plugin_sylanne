@@ -26,6 +26,25 @@ export class WorkbenchApi {
 
   clearSession() { this.csrfToken = null; }
 
+  async installationStatus() {
+    let response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}/status`, {
+        method: "GET", credentials: "same-origin", headers: { accept: "application/json" }
+      });
+    } catch (error) {
+      throw new WorkbenchApiError("无法读取安装状态。请检查连接后重试。", { detail: error });
+    }
+    const body = await this.#readBody(response);
+    if (!response.ok) throw this.#responseError(response, body, "安装状态暂不可用。");
+    if (body?.schema_version !== "sylanne.install-status.v1" ||
+        !["limited", "blocked", "enrollment_required", "ready", "stopped"].includes(body.runtime_stage) ||
+        typeof body.reason_code !== "string") {
+      throw new WorkbenchApiError("安装状态响应无效。", { code: "invalid_status", retryable: true });
+    }
+    return { stage: body.runtime_stage, reason: body.reason_code };
+  }
+
   async openSession() {
     if (this.csrfToken) return;
     if (!this.sessionRequest) {

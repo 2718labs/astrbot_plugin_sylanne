@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import _ctypes
 from dataclasses import FrozenInstanceError, replace
+from decimal import Decimal, localcontext
 import hashlib
 import json
 from pathlib import Path
@@ -25,6 +26,7 @@ from sylanne3.native_runtime import (
     run_fixed_block_math,
 )
 from sylanne3.domains.d04 import AffectAxis, AffectScheme
+from sylanne3.native_runtime.d04_engineering_scheme import build_d04_engineering_candidate
 from sylanne3.native_runtime.loader import _runtime_target
 
 
@@ -173,6 +175,65 @@ class FixedBlockTranscriptTests(unittest.TestCase):
         self.assertNotEqual(transcript.input_sha256, replace(block, previous_error=2e-4).digest())
         with self.assertRaises(FrozenInstanceError):
             transcript.output = (0.0, 0.0)
+
+    def test_24d_engineering_candidate_interval_contains_independent_reference(self) -> None:
+        candidate = build_d04_engineering_candidate()
+        previous = (0.5, 0.25, 0.125) + (0.0,) * 21
+        drive = (0.0, 0.0625, 0.0) + (0.0,) * 21
+        block = FixedBlockStep(
+            candidate.k, candidate.r, candidate.j, candidate.a, candidate.alpha,
+            previous, drive, previous, 1.0 / 256.0, 0.0, 64, 1e-5,
+        )
+        transcript = run_fixed_block_math(self.handle, block)
+        self.assertEqual(transcript.bounds.certificate_flags, 1)
+        self.assertTrue(self.handle.capabilities.diagnostic_only)
+        self.assertFalse(self.handle.capabilities.numerically_certified)
+        self.assertLessEqual(transcript.bounds.q_upper, 0.8)
+
+        # Independent high-precision AVF fixed point for the active three-node chain.
+        # The other seven chains have zero state and drive and remain exactly zero.
+        with localcontext() as context:
+            context.prec = 80
+            d = Decimal
+            x = tuple(d(str(value)) for value in previous[:3])
+            u = tuple(d(str(value)) for value in drive[:3])
+            h = d(1) / d(256)
+            rates = (d(1), d(1) / d(8), d(1) / d(64))
+            k = ((d(9) / d(8), -d(1) / d(8), d(0)),
+                 (-d(1) / d(8), d(5) / d(4), -d(1) / d(8)),
+                 (d(0), -d(1) / d(8), d(9) / d(8)))
+
+            def log_cosh(value: Decimal) -> Decimal:
+                return ((value.exp() + (-value).exp()) / d(2)).ln()
+
+            y = x
+            for _ in range(100):
+                midpoint = tuple((x[index] + y[index]) / d(2) for index in range(3))
+                gradient = tuple(
+                    sum(k[index][col] * midpoint[col] for col in range(3))
+                    + d(1) / d(4) * (
+                        (log_cosh(y[index]) - log_cosh(x[index])) / (y[index] - x[index])
+                        if y[index] != x[index]
+                        else (x[index].exp() - (-x[index]).exp())
+                             / (x[index].exp() + (-x[index]).exp())
+                    )
+                    for index in range(3)
+                )
+                next_y = tuple(x[index] + h * (u[index] - rates[index] * gradient[index])
+                               for index in range(3))
+                if max(abs(next_y[index] - y[index]) for index in range(3)) < d("1e-60"):
+                    y = next_y
+                    break
+                y = next_y
+            else:
+                self.fail("independent high-precision AVF reference did not converge")
+            reference = y + (d(0),) * 21
+            endpoint_bound = d.from_float(transcript.bounds.iteration_error) + d("1e-55")
+            for actual, expected in zip(transcript.output, reference):
+                error = abs(d.from_float(actual) - expected)
+                self.assertLess(error, d("1e-12"))
+                self.assertLessEqual(error, endpoint_bound)
+        self.assertTrue(all(0.0 <= value <= 4.0 for value in transcript.output))
 
     def test_direct_handle_and_incomplete_block_do_not_emit_transcript(self) -> None:
         direct = ABI2NativeLibrary(ctypes.CDLL(str(self.native_asset)), self.native_asset)

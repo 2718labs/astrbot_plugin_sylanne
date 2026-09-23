@@ -22,6 +22,7 @@ from .v2_fence_service import AuthorityV2FenceService
 from .v2_fence_store import AuthorityV2FenceStore
 from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from .v2_owner_proof import AuthorityV2OwnerProofStore
 from ..runtime_contracts import NamespaceId
 
 
@@ -31,13 +32,14 @@ def compose_local_owner_authority(
     graph_db_path: str | Path,
     utc_clock: Callable[[], datetime],
     first_claim_verifier: Callable[[object, OwnerClaimTicketV1, str], bool],
-    claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1], bool],
+    claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1], bool] | None,
     administrator_authorizer: Callable[[object, str, str, str | None], bool],
     publisher_manifest_verifier: Callable[[str, str, str, str], bool],
     installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2],
     namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
+    owner_proofs: AuthorityV2OwnerProofStore | None = None,
 ) -> AuthorityRpcServer:
     """Build the independent local Authority endpoint from trusted install config.
 
@@ -54,10 +56,22 @@ def compose_local_owner_authority(
             for namespace, service in services.items())):
         raise AuthorityUnavailable("trusted v2 fence services are required")
     if (not callable(utc_clock) or not callable(first_claim_verifier)
-            or not callable(claimant_verifier)
             or not callable(administrator_authorizer)
             or not callable(publisher_manifest_verifier)):
         raise AuthorityUnavailable("trusted Authority callbacks are required")
+    if owner_proofs is None:
+        if not callable(claimant_verifier):
+            raise AuthorityUnavailable("trusted Owner claimant verifier is required")
+        verified_claimant = claimant_verifier
+    else:
+        if (type(owner_proofs) is not AuthorityV2OwnerProofStore
+                or owner_proofs._core is not core or claimant_verifier is not None):
+            raise AuthorityUnavailable("Owner proof must be the sole claimant verifier")
+
+        def verified_claimant(credential: object,
+                             operation: OwnerAuthorizationOperationV1) -> bool:
+            return owner_proofs.get_accepted_for_operation(
+                transport_credential=credential, operation=operation) is not None
     if not installations_v2 or not namespace_bindings_v2:
         raise AuthorityUnavailable("installed peer and namespace bindings are required")
     if set(namespace_bindings_v2.values()) != set(services):
@@ -95,12 +109,13 @@ def compose_local_owner_authority(
     owner_tickets = AuthorityV2OwnerTicketStore(
         core, utc_clock=utc_clock,
         first_claim_verifier=first_claim_verifier,
-        claimant_verifier=claimant_verifier,
+        claimant_verifier=verified_claimant,
         graph_commit_verifier=graph_verifier,
         create=create_owner_schema,
     )
     return AuthorityRpcServer(
         core, v2_fences=services, v2_owner_tickets=owner_tickets,
+        v2_owner_proofs=owner_proofs,
         administrator_authorizer=administrator_authorizer,
         publisher_manifest_verifier=publisher_manifest_verifier,
         installations_v2=installations_v2,

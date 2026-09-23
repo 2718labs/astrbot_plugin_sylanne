@@ -20,6 +20,8 @@ const state = initialState();
 const api = new WorkbenchApi({ baseUrl: globalThis.SYLANNE_WORKBENCH_API_BASE ?? DEFAULT_WORKBENCH_API_BASE });
 const app = document.querySelector("#app");
 let requestEpoch = 0;
+let installation = null;
+let installationProblem = null;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
@@ -54,13 +56,37 @@ function hasVerifiedCatalogue() {
 }
 
 function setupMarkup() {
+  const stageNames = { limited: "能力受限", blocked: "启动受阻", enrollment_required: "需要登记", ready: "运行就绪", stopped: "已停止" };
+  const reasonNames = {
+    none: "无", not_started: "尚未启动", disabled: "插件未启用", configuration: "配置无效",
+    data_dir: "数据目录不可用", authority_profile: "需要管理员登记 Authority",
+    authority_profile_verification: "Authority 核验不可用",
+    authority_profile_integrity: "Authority 资料无效",
+    installation_verification: "安装核验失败",
+    affect_scheme_verification: "感受方案核验失败",
+    runtime_bootstrap: "运行时启动失败", namespace_activation: "命名空间启用失败",
+    installed_package: "安装包未通过正式版本核验，请使用完整的正式安装包。",
+    graph_worker: "图工作进程未能启动，请检查宿主诊断。",
+    domain_registry: "领域模块未齐备，请检查安装包。",
+    v2_fence_recovery: "Authority 操作结果待恢复，请检查宿主诊断后再继续。",
+    product_ingress: "对话入口尚未接通，当前不能验证真实对话。",
+    owner_guard: "Owner 授权尚未核验，需先完成 Owner 配对与授权。",
+    active_role: "当前活跃角色尚未确认，需完成角色初始化并取得服务端确认。",
+    scene_binding: "场景尚未绑定，需在宿主侧完成绑定并取得回执。",
+    dispatch: "行动与投递出口尚未接通，当前不能发送消息。",
+    runtime_unavailable: "运行状态暂不可用"
+  };
+  const stage = installation ? stageNames[installation.stage] : "未取得";
+  const reason = installation ? (reasonNames[installation.reason] ?? "运行能力尚未齐备")
+    : (installationProblem?.message ?? "正在读取宿主安装状态");
   const steps = [
+    ["插件安装与运行", stage, reason],
     ["宿主与工作台会话", state.sessionReady ? "已核验" : "未核验", state.sessionReady ? "服务端已签发当前会话令牌；角色能力仍以实际目录为准。" : "请登录宿主并完成 Owner 配对，然后重新核验连接。"],
     ["角色初始化", "未核验", "当前能力目录不包含角色初始化回执；填写角色 ID 不会创建角色。"],
     ["场景绑定", "未核验", "当前没有绑定成功回执；私聊或群聊不可据此视为已接通。"],
     ["验证对话", "未核验", "尚无真实对话和投递收据；不会自动向聊天场景发消息。"]
   ];
-  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${detail}</p></li>`).join("")}</ol><p class="setup-next">${state.role ? "可刷新能力目录；创建与绑定入口需服务端完成后才会开放。" : "先从宿主取得已授权的角色范围；当前浏览器不能自行签发角色。"}</p><button class="quiet" data-command="retry-session">重新核验工作台会话</button></div>`;
+  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${escapeHtml(detail)}</p></li>`).join("")}</ol><p class="setup-next">${state.role ? "可刷新能力目录；创建与绑定入口需服务端完成后才会开放。" : "先从宿主取得已授权的角色范围；当前浏览器不能自行签发角色。"}</p><button class="quiet" data-command="retry-status">刷新安装状态</button><button class="quiet" data-command="retry-session">重新核验工作台会话</button></div>`;
 }
 
 function render() {
@@ -134,6 +160,7 @@ async function command(action) {
     Object.assign(state, switchRole(state, value)); render(); await loadView(); return;
   }
   if (action === "retry-session") return verifySession(true);
+  if (action === "retry-status") return verifyInstallationStatus();
   if (action === "refresh") return loadView();
   if (action === "open-workspace") return commandAction(ACTIONS.openWorkspace, { client_protocol: "d12.contract.v1" }, "workbench_view");
   if (action === "page-action") {
@@ -193,6 +220,17 @@ async function verifySession(refreshRole = false) {
   render();
 }
 
+async function verifyInstallationStatus() {
+  try {
+    installation = await api.installationStatus();
+    installationProblem = null;
+  } catch (error) {
+    installation = null;
+    installationProblem = normalizeError(error);
+  }
+  render();
+}
+
 app.addEventListener("click", async (event) => {
   const view = event.target.closest("[data-view]")?.dataset.view;
   if (view) {
@@ -209,4 +247,5 @@ app.addEventListener("keydown", (event) => {
 });
 
 render();
+void verifyInstallationStatus();
 void verifySession();

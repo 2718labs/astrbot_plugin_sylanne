@@ -1,14 +1,15 @@
-"""Durable D08/D09 candidate linkage; source qualification remains HOLD."""
+"""Durable D08/D09 candidate linkage and graph-backed D06 source proof."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
-from ..domains.d08 import ActionSchema, ActionSchemaRecord, GoalExecutionProvider
+from ..domains.d06 import D06DomainProvider, SourceGrantRead
+from ..domains.d08 import ActionIntent, ActionSchema, ActionSchemaRecord, GoalExecutionProvider
 from ..domains.d09 import D09ExpressionProvider
 from ..graph_types import GraphWrite
 from ..memory_types import access_key, source_key
-from ..graph_types import AtomKey, GraphVersion
+from ..graph_types import AtomKey, GraphSnapshot, GraphVersion
 from ..runtime_contracts import NamespaceId, OperationIdentity, canonical_digest
 
 
@@ -40,6 +41,9 @@ class DispatchCandidateEvidenceV1:
     delete_epoch: int
     query_epoch: int
     status: str = "source_hold"
+    source_audience: tuple[str, ...] = ()
+    source_proof_versions: tuple[tuple[str, int], ...] = ()
+    source_proof_digest: str | None = None
 
     @property
     def digest(self) -> str:
@@ -166,7 +170,49 @@ def validate_dispatch_candidate_writes(
     )
 
 
+def qualify_dispatch_candidate_sources(
+    candidate: DispatchCandidateEvidenceV1, intent: ActionIntent,
+    snapshot: GraphSnapshot, *, audience: tuple[str, ...],
+    batch_audiences: tuple[str, ...], current_barrier_confirmed: bool,
+    valid_until: float,
+) -> DispatchCandidateEvidenceV1:
+    """Promote only a complete, pinned D06 source-grant check from this graph read."""
+    if (candidate.status != "source_hold" or len(snapshot.epochs) != 1
+            or candidate.query_epoch != snapshot.epochs[0].revision
+            or audience != batch_audiences
+            or not current_barrier_confirmed):
+        return candidate
+    reads = {item.key.token: item.revision for item in snapshot.versions}
+    if (len(reads) != len(snapshot.versions)
+            or any(reads.get(ref) != version
+                   for ref, version in (*candidate.source_read_versions,
+                                        *candidate.access_read_versions))):
+        return candidate
+    try:
+        check = D06DomainProvider.provide_required_check(
+            intent, SourceGrantRead(snapshot, audience, "expression", True, True),
+            valid_until=valid_until,
+        )
+    except (TypeError, ValueError):
+        return candidate
+    if (check.result, check.coverage) != ("pass", "full"):
+        return candidate
+    atoms = {atom.key.token: atom for atom in snapshot.atoms}
+    proof = []
+    for item in check.input_versions:
+        atom = atoms.get(item.ref)
+        if atom is None or atom.key.type_name not in {"memory.source", "memory.access"}:
+            return candidate
+        proof.append((item.ref, item.version, canonical_digest(atom.value)))
+    return replace(
+        candidate, status="source_qualified",
+        source_audience=audience,
+        source_proof_versions=tuple((ref, revision) for ref, revision, _ in proof),
+        source_proof_digest=canonical_digest(proof),
+    )
+
+
 __all__ = [
     "DispatchCandidateEvidenceV1", "DispatchCandidateRecoveryV1",
-    "validate_dispatch_candidate_writes",
+    "qualify_dispatch_candidate_sources", "validate_dispatch_candidate_writes",
 ]

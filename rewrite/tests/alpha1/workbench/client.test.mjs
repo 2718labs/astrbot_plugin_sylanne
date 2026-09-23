@@ -24,6 +24,18 @@ test("client posts to the AstrBot plugin extension route with host cookie and CS
   assert.equal(requested[1].init.headers["x-csrf-token"], "server-issued");
 });
 
+test("installation status uses the host session without opening Owner session", async () => {
+  const requested = [];
+  const api = new WorkbenchApi({ fetchImpl: async (url, init) => {
+    requested.push({ url, init });
+    return { ok: true, json: async () => ({ schema_version: "sylanne.install-status.v1", runtime_stage: "enrollment_required", reason_code: "authority_profile" }) };
+  } });
+  assert.deepEqual(await api.installationStatus(), { stage: "enrollment_required", reason: "authority_profile" });
+  assert.equal(requested[0].url, `${DEFAULT_WORKBENCH_API_BASE}/status`);
+  assert.equal(requested[0].init.credentials, "same-origin");
+  assert.equal(api.hasSession, false);
+});
+
 test("client displays a D12 problem from an HTTP error", async () => {
   const api = new WorkbenchApi({ fetchImpl: async (_url, init) => init.method === "GET"
     ? { ok: true, json: async () => ({ status: "ready", csrf_token: "server-issued" }) }

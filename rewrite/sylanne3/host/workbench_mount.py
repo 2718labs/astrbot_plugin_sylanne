@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..workbench_api.http_transport import (
     ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, SESSION_ROUTE,
@@ -17,6 +17,16 @@ _WORKBENCH_ROOT = Path(__file__).resolve().parents[3] / "resources" / "workbench
 _CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                   ".css": "text/css; charset=utf-8"}
 _STATIC_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+STATUS_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/status"
+_RUNTIME_STAGES = {"limited", "blocked", "enrollment_required", "ready", "stopped"}
+_REASON_CODES = {
+    "none", "not_started", "disabled", "configuration", "data_dir", "authority_profile",
+    "authority_profile_verification", "authority_profile_integrity",
+    "installation_verification", "affect_scheme_verification", "runtime_bootstrap",
+    "namespace_activation", "installed_package", "graph_worker", "domain_registry",
+    "v2_fence_recovery", "product_ingress", "owner_guard", "active_role",
+    "scene_binding", "dispatch", "runtime_unavailable",
+}
 
 
 def _packaged_assets() -> dict[str, str]:
@@ -53,8 +63,9 @@ def _asset_file(relative: str, assets: dict[str, str]) -> Path | None:
 class WorkbenchHostMount:
     """One host route whose handler fails closed across plugin reloads."""
 
-    def __init__(self) -> None:
+    def __init__(self, status_provider: Callable[[], tuple[str, str]] | None = None) -> None:
         self._transport: WorkbenchHttpTransport | None = None
+        self._status_provider = status_provider
         self._closed = False
 
     def attach_transport(self, transport: WorkbenchHttpTransport) -> None:
@@ -138,6 +149,31 @@ class WorkbenchHostMount:
             status_code = result.pop("http_status", 200)
             return json_response(result, status_code=status_code, headers=_STATIC_HEADERS)
 
+        async def status():
+            if self._closed:
+                return json_response(_unavailable("host_stopped"), status_code=503,
+                                     headers=_STATIC_HEADERS)
+            if not isinstance(request.username, str) or not request.username:
+                return json_response(
+                    {"status": "unauthorized", "problem": {"code": "host_session_missing",
+                     "retryable": False}}, status_code=401, headers=_STATIC_HEADERS)
+            if self._status_provider is None:
+                return json_response(_unavailable("runtime_unavailable"), status_code=503,
+                                     headers=_STATIC_HEADERS)
+            try:
+                stage, reason = self._status_provider()
+            except Exception:
+                return json_response(_unavailable("runtime_unavailable"), status_code=503,
+                                     headers=_STATIC_HEADERS)
+            if stage not in _RUNTIME_STAGES:
+                stage = "blocked"
+                reason = "runtime_unavailable"
+            if reason not in _REASON_CODES:
+                reason = "runtime_unavailable"
+            return json_response(
+                {"schema_version": "sylanne.install-status.v1", "runtime_stage": stage,
+                 "reason_code": reason}, headers=_STATIC_HEADERS)
+
         context.register_web_api(
             COMMAND_ROUTE, command, ["POST"], "Sylanne D12 authenticated command",
         )
@@ -148,12 +184,16 @@ class WorkbenchHostMount:
             SESSION_ROUTE, session, ["GET"], "Sylanne D12 paired Owner session",
         )
         context.register_web_api(
+            STATUS_ROUTE, status, ["GET"], "Sylanne installation stage",
+        )
+        context.register_web_api(
             ASSET_ROUTE, static, ["GET"], "Sylanne W11 authenticated static assets",
         )
 
     def close(self) -> None:
         self._closed = True
         self._transport = None
+        self._status_provider = None
 
 
 def _unavailable(code: str) -> dict[str, object]:

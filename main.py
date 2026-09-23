@@ -54,12 +54,17 @@ class Sylanne3Plugin(Star):
             self._config_valid = False
         self._runtime: RuntimeContext | None = None
         self.runtime_health = RuntimeHealth("limited", ("not_started",))
-        self._workbench = WorkbenchHostMount()
+        self._workbench = WorkbenchHostMount(self._installation_status)
         self._workbench.register(context)
         self._workbench_dependencies = (
             workbench_pairing, workbench_owner_grants,
             workbench_onboarding, workbench_origin,
         )
+
+    def _installation_status(self) -> tuple[str, str]:
+        health = self.runtime_health
+        return health.status, (health.missing_capabilities[0]
+                               if health.missing_capabilities else "none")
 
     async def initialize(self) -> None:
         if not self._config_valid:

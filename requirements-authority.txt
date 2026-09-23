@@ -1,0 +1,2 @@
+# Sylanne Authority runs as a separate trusted service from the AstrBot plugin.
+cryptography==50.0.1

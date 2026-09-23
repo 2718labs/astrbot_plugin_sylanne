@@ -28,6 +28,11 @@ from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
     from_wire as owner_from_wire, to_wire as owner_to_wire,
 )
+from ..authority_service.v2_owner_proof import (
+    OwnerCredentialRegistrationV1, OwnerProofAcceptanceV1,
+    OwnerProofChallengeV1, OwnerProofRequestV1,
+    from_wire as proof_from_wire, to_wire as proof_to_wire,
+)
 from ..authority_service.v2_execution_bridge import HandoffStartV2
 from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
@@ -850,6 +855,110 @@ class MtlsAuthorityTransport:
                 or owner_to_wire(result) != response[field]):
             raise RuntimeError("authority owner response is invalid")
         return result
+
+    @staticmethod
+    def _owner_proof_result(response: dict[str, object], handshake: AuthorityHandshake,
+                            field: str, expected_type: type):
+        if (type(response) is not dict
+                or set(response) != {field, "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("Authority Owner proof response is invalid")
+        try:
+            value = proof_from_wire(response[field])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Authority Owner proof response is invalid") from exc
+        if type(value) is not expected_type or proof_to_wire(value) != response[field]:
+            raise RuntimeError("Authority Owner proof response is invalid")
+        return value
+
+    async def v2_register_owner_credential(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, registration: OwnerCredentialRegistrationV1,
+        rotation_signature: bytes | None = None,
+    ) -> OwnerCredentialRegistrationV1:
+        if type(registration) is not OwnerCredentialRegistrationV1:
+            raise TypeError("Owner credential registration is required")
+        if (rotation_signature is not None
+                and (type(rotation_signature) is not bytes or len(rotation_signature) != 64)):
+            raise ValueError("Owner rotation signature must contain 64 bytes")
+        response = await self._content_rpc(
+            request, handshake, "register_owner_credential_v1",
+            {"namespace": namespace, "registration": proof_to_wire(registration),
+             "rotation_signature": (None if rotation_signature is None
+                                    else rotation_signature.hex())},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        result = self._owner_proof_result(
+            response, handshake, "registration", OwnerCredentialRegistrationV1)
+        if (result != registration
+                or result.authority_id != handshake.installation_authority_id
+                or result.authority_namespace != namespace):
+            raise RuntimeError("Authority Owner credential binding differs")
+        return result
+
+    async def v2_begin_owner_proof(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, proof_request: OwnerProofRequestV1,
+        operation: OwnerAuthorizationOperationV1,
+    ) -> OwnerProofChallengeV1:
+        if (type(proof_request) is not OwnerProofRequestV1
+                or type(operation) is not OwnerAuthorizationOperationV1):
+            raise TypeError("Owner proof request and operation are required")
+        proof_request.assert_matches_operation(operation)
+        response = await self._content_rpc(
+            request, handshake, "begin_owner_proof_v1",
+            {"namespace": namespace, "request": proof_to_wire(proof_request),
+             "operation": owner_to_wire(operation)}, protocol=AUTHORITY_V2_PROTOCOL)
+        challenge = self._owner_proof_result(
+            response, handshake, "challenge", OwnerProofChallengeV1)
+        if (challenge.request != proof_request or challenge.request.authority_id
+                != handshake.installation_authority_id
+                or challenge.request.authority_namespace != namespace):
+            raise RuntimeError("Authority Owner challenge binding differs")
+        return challenge
+
+    async def v2_accept_owner_proof(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, challenge: OwnerProofChallengeV1, signature: bytes,
+    ) -> OwnerProofAcceptanceV1:
+        if (type(challenge) is not OwnerProofChallengeV1
+                or type(signature) is not bytes or len(signature) != 64):
+            raise TypeError("Owner challenge and Ed25519 signature are required")
+        response = await self._content_rpc(
+            request, handshake, "accept_owner_proof_v1",
+            {"namespace": namespace, "challenge": proof_to_wire(challenge),
+             "signature": signature.hex()}, protocol=AUTHORITY_V2_PROTOCOL)
+        acceptance = self._owner_proof_result(
+            response, handshake, "acceptance", OwnerProofAcceptanceV1)
+        if (acceptance.challenge != challenge
+                or acceptance.signature_digest != "sha256:"
+                + hashlib.sha256(signature).hexdigest()
+                or challenge.request.authority_id != handshake.installation_authority_id
+                or challenge.request.authority_namespace != namespace):
+            raise RuntimeError("Authority Owner acceptance binding differs")
+        return acceptance
+
+    async def v2_get_owner_proof(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation: OwnerAuthorizationOperationV1,
+    ) -> OwnerProofAcceptanceV1 | None:
+        if type(operation) is not OwnerAuthorizationOperationV1:
+            raise TypeError("Owner operation is required")
+        response = await self._content_rpc(
+            request, handshake, "get_owner_proof_v1",
+            {"namespace": namespace, "operation": owner_to_wire(operation)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"acceptance", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("Authority Owner proof response is invalid")
+        if response["acceptance"] is None:
+            return None
+        acceptance = self._owner_proof_result(
+            response, handshake, "acceptance", OwnerProofAcceptanceV1)
+        acceptance.challenge.request.assert_matches_operation(operation)
+        if (operation.authority_id != handshake.installation_authority_id
+                or acceptance.challenge.request.authority_namespace != namespace):
+            raise RuntimeError("Authority Owner proof binding differs")
+        return acceptance
 
     async def v2_register_owner_ticket(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
