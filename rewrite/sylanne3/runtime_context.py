@@ -11,7 +11,7 @@ from typing import Awaitable, Callable
 from .domain_registry import DomainRegistry, discover_domain_registry
 from .graph_coordinator import (
     FirstIngressOutcomeUnknown, GraphCoordinator, IngressClockSample,
-    IngressIssuancePolicy,
+    IngressIssuancePolicy, UnavailableGuard,
 )
 from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
@@ -242,7 +242,24 @@ class RuntimeContext:
         async with self._lock:
             if self._worker is None or self._v2_provision is None:
                 raise RuntimeError("v2 graph worker is unavailable")
-            receipt = await self._worker.call(self._v2_provision, operation_id)
+            try:
+                receipt = await self._worker.call(self._v2_provision, operation_id)
+            except V2FenceOutcomeUnknown as exc:
+                self.health = RuntimeHealth(
+                    "blocked", ("v2_fence_recovery",), str(exc),
+                )
+                raise
+            except UnavailableGuard as exc:
+                self.health = RuntimeHealth(
+                    "blocked", ("namespace_activation",), str(exc),
+                )
+                raise
+            except Exception:
+                self.health = RuntimeHealth(
+                    "blocked", ("namespace_activation",),
+                    "installed namespace provisioning failed",
+                )
+                raise
             self._v2_namespace_provisioned = True
             missing = ["dispatch"]
             if self._v2_ingress is None:

@@ -17,6 +17,7 @@ if installed_stub:
     sys.modules["sylanne3.host"] = host_package
 
 from sylanne3 import runtime_context
+from sylanne3.graph_coordinator import UnavailableGuard
 from sylanne3.domain_registry import discover_domain_registry
 from sylanne3.domains.d04 import AffectAxis, AffectScheme
 from sylanne3.host.installed_package import InstalledPackageVerification
@@ -25,7 +26,7 @@ from sylanne3.host.v2_fence_port import V2FenceOutcomeUnknown
 from sylanne3.installation_policy import AdminInstallationPolicy
 from sylanne3.runtime.budget import BudgetLease
 from sylanne3.runtime.issuers import BudgetLeaseGrant
-from sylanne3.runtime_contracts import InstallationGrantV2, NamespaceId
+from sylanne3.runtime_contracts import InstallationGrantV2, NamespaceId, canonical_digest
 
 if installed_stub:
     del sys.modules["sylanne3.host"]
@@ -51,6 +52,23 @@ def installation(grant, port_factory, package_root, data_dir, *,
         policy, grant, b"k" * 32, b"d" * 32, port_factory,
         package_root, data_dir, features,
     )
+
+
+def test_installed_policy_yields_stable_bounded_namespace_operation_id(tmp_path):
+    grant = InstallationGrantV2(
+        "authority", "subject", "administrator", "installation",
+        "a" * 64, "publisher-trust", "2", "b" * 64,
+    )
+    policy = installation(grant, object, tmp_path, tmp_path / "data").installation_policy
+    restored = replace(policy)
+    operation_id = "namespace-provision:" + canonical_digest(policy.digest_payload())
+    assert operation_id == (
+        "namespace-provision:" + canonical_digest(restored.digest_payload())
+    )
+    assert len(operation_id) <= 128
+    assert policy.digest_payload()["namespace"] == {
+        "bot_id": "bot", "persona_id": "persona",
+    }
 
 
 @pytest.mark.parametrize("unresolved_fence", [False, True])
@@ -139,6 +157,65 @@ def test_context_owns_v2_worker_without_publishing_ready(
         ]
         assert len({thread for _, thread in trace}) == 1
         assert trace[0][1] != get_ident()
+
+    asyncio.run(scenario())
+
+
+def test_namespace_provision_hold_preserves_failure_and_disables_ingress(
+    tmp_path, monkeypatch,
+):
+    async def scenario():
+        grant = InstallationGrantV2(
+            "authority", "subject", "administrator", "installation",
+            "a" * 64, "publisher-trust", "2", "b" * 64,
+        )
+        monkeypatch.setattr(
+            runtime_context, "verify_installed_package",
+            lambda root, digest, *, available_cpu_features:
+                InstalledPackageVerification(
+                    True, "verified", digest, "3.0.0-alpha1", "formal-alpha1",
+                ),
+        )
+
+        class Store:
+            def __init__(self, *_):
+                pass
+
+            def close(self):
+                pass
+
+        class Port:
+            installation_grant = grant
+
+            def close(self):
+                pass
+
+        class Coordinator:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def register_provider(self, *_args):
+                pass
+
+            def provision_namespace_v2(self, _bootstrap, _policy, *, operation_id):
+                raise UnavailableGuard("v2 provisioning write fence unavailable; HOLD pending exact attempt")
+
+        monkeypatch.setattr(runtime_context, "ProductionGraphStore", Store)
+        monkeypatch.setattr(runtime_context, "GraphCoordinator", Coordinator)
+        domains = SimpleNamespace(complete=True, registrations={}, type_registry=object())
+        context = runtime_context.RuntimeContext(
+            tmp_path / "data", package_root=tmp_path, dependencies=None, domains=domains,
+        )
+        assembled = installation(grant, Port, tmp_path, tmp_path / "data")
+        assert (await context.start_v2(assembled)).missing_capabilities == (
+            "namespace_activation",)
+        with pytest.raises(UnavailableGuard, match="HOLD pending exact attempt"):
+            await context.provision_installed_namespace("fixed-operation-id")
+        assert context.health.status == "blocked"
+        assert context.health.missing_capabilities == ("namespace_activation",)
+        assert "HOLD pending exact attempt" in context.health.detail
+        assert not context._v2_namespace_provisioned
+        assert (await context.stop()).status == "stopped"
 
     asyncio.run(scenario())
 

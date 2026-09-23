@@ -17,6 +17,7 @@ from .rewrite.sylanne3.host import (
 from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
 from .rewrite.sylanne3.host.authority_profile import AuthorityProfileUnavailable
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
+from .rewrite.sylanne3.runtime_contracts import canonical_digest
 
 
 PLUGIN_NAME = "astrbot_plugin_sylanne"
@@ -111,8 +112,24 @@ class Sylanne3Plugin(Star):
             self.runtime_health = RuntimeHealth("blocked", ("runtime_bootstrap",))
             logger.error("Sylanne 3 startup blocked: v2 graph bootstrap failed")
             return
+        if health.status == "limited" and health.missing_capabilities == ("namespace_activation",):
+            try:
+                operation_id = (
+                    "namespace-provision:"
+                    + canonical_digest(installation.installation_policy.digest_payload())
+                )
+                await self._runtime.provision_installed_namespace(operation_id)
+            except Exception:
+                failed = self._runtime.health
+                self.runtime_health = (
+                    failed if failed.status == "blocked"
+                    else RuntimeHealth("blocked", ("namespace_activation",))
+                )
+                logger.error("Sylanne 3 startup blocked: namespace provisioning failed")
+                return
+            health = self._runtime.health
         if health.status == "limited":
-            self.runtime_health = RuntimeHealth("limited", health.missing_capabilities)
+            self.runtime_health = health
         else:
             self.runtime_health = RuntimeHealth(
                 "blocked", health.missing_capabilities or ("runtime_bootstrap",),

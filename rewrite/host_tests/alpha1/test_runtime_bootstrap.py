@@ -660,8 +660,14 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         module = load_plugin_module()
         order = []
         registry = object()
+        policy = types.SimpleNamespace(
+            manifest_digest="a" * 64,
+            namespace=NamespaceId("bot", "persona"),
+            digest_payload=lambda: {"installation_id": "installation-1", "namespace": {
+                "bot_id": "bot", "persona_id": "persona"}},
+        )
         installation = types.SimpleNamespace(
-            installation_policy=types.SimpleNamespace(manifest_digest="a" * 64),
+            installation_policy=policy,
             available_cpu_features=frozenset({"avx2"}),
         )
 
@@ -690,7 +696,9 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 return RuntimeHealth("limited", ("namespace_activation",), "internal path")
 
             async def provision_installed_namespace(self, operation_id):
-                self_outer.fail("startup must not provision")
+                order.append(("provision", operation_id))
+                self.health = RuntimeHealth("limited", ("product_ingress", "dispatch"))
+                return object()
 
         self_outer = self
         with tempfile.TemporaryDirectory() as directory:
@@ -704,17 +712,69 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                     {"enabled": True, "authority_profile": "installed"},
                 )
                 await plugin.initialize()
-            self.assertEqual(order, ["installation", "scheme", "context", "start_v2"])
+            self.assertEqual(order[:4], ["installation", "scheme", "context", "start_v2"])
+            self.assertEqual(order[4], (
+                "provision", "namespace-provision:" + canonical_digest(policy.digest_payload()),
+            ))
             self.assertEqual(plugin._runtime.arguments, (
                 resolved_dir, module.PACKAGE_ROOT, None, registry,
             ))
             self.assertEqual(plugin.runtime_health.status, "limited")
-            self.assertEqual(plugin.runtime_health.missing_capabilities, ("namespace_activation",))
+            self.assertEqual(plugin.runtime_health.missing_capabilities,
+                             ("product_ingress", "dispatch"))
             self.assertEqual(plugin.runtime_health.detail, "")
             event = Event()
             await plugin.ingress(event)
             self.assertFalse(event.is_stopped())
             self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())
+
+    async def test_namespace_provision_hold_keeps_host_blocked(self) -> None:
+        module = load_plugin_module()
+        policy = types.SimpleNamespace(
+            manifest_digest="a" * 64,
+            namespace=NamespaceId("bot", "persona"),
+            digest_payload=lambda: {"installation_id": "installation-1"},
+        )
+        installation = types.SimpleNamespace(
+            installation_policy=policy, available_cpu_features=None,
+        )
+        operation_ids = []
+
+        class ControlledRuntime:
+            def __init__(self, data_dir, *, package_root, dependencies, domains):
+                pass
+
+            async def start_v2(self, assembled):
+                return RuntimeHealth("limited", ("namespace_activation",))
+
+            async def provision_installed_namespace(self, operation_id):
+                operation_ids.append(operation_id)
+                self.health = RuntimeHealth(
+                    "blocked", ("namespace_activation",), "HOLD pending exact attempt",
+                )
+                raise RuntimeError("HOLD pending exact attempt")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(StarTools, "get_data_dir", return_value=Path(directory)), \
+                    patch.object(module, "assemble_v2_installation",
+                                 new=AsyncMock(return_value=installation)), \
+                    patch.object(module, "load_verified_affect_scheme",
+                                 return_value=types.SimpleNamespace(registry=object())), \
+                    patch.object(module, "RuntimeContext", ControlledRuntime):
+                plugin = module.Sylanne3Plugin(
+                    Context(asyncio.Queue(), {}, None, None, None, None,
+                            None, None, None, None, None, None),
+                    {"enabled": True},
+                )
+                await plugin.initialize()
+                first_id = operation_ids[0]
+                await plugin.initialize()
+                self.assertEqual(operation_ids, [first_id, first_id])
+                self.assertEqual(plugin.runtime_health.status, "blocked")
+                self.assertEqual(plugin.runtime_health.detail, "HOLD pending exact attempt")
+                event = Event()
+                await plugin.ingress(event)
+                self.assertFalse(event.is_stopped())
 
     async def test_d04_verification_failure_blocks_before_runtime_without_leaking_detail(self) -> None:
         module = load_plugin_module()
