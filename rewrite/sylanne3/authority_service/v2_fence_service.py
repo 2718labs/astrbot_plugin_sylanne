@@ -12,6 +12,7 @@ from contextlib import contextmanager
 import hashlib
 
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime_contracts import NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState
 from ..runtime_journal import RecoveryConstraintFootprint
 from .contract import AuthorityUnavailable, identifier
 from .core import AuthorityServiceCore
@@ -86,6 +87,62 @@ class AuthorityV2FenceService:
         self.core._require(credential, "current", self.namespace)
         with self._frozen() as (db, deletion_head, execution_head, _):
             return self._current_locked(db, deletion_head, execution_head)
+
+    def namespace_bootstrap(self, *, credential, subject: str,
+                            namespace_id: NamespaceId) -> NamespaceBootstrapV2:
+        """Observe one administrator-bound namespace; this is no content permit.
+
+        The RPC caller supplies NamespaceId from its administrator-owned mapping,
+        never from an untrusted authority namespace claim.
+        """
+        identifier(subject, "subject")
+        if type(namespace_id) is not NamespaceId:
+            raise TypeError("namespace_id must be NamespaceId")
+        self.core._require(credential, "current", self.namespace)
+        with self._frozen() as (db, deletion_head, execution_head, deletion_history):
+            self._require_mode(db)
+            self.fences._check_schema(db)
+            authority_id = self.core._id(db)
+            if not db.execute(
+                    "SELECT 1 FROM authority_namespaces WHERE namespace=?",
+                    (self.namespace,)).fetchone():
+                return NamespaceBootstrapV2(
+                    authority_id, namespace_id, self.namespace, None, 0, "unbound",
+                    NamespaceRuntimeState.UNBOUND, None, ("not_registered",))
+
+            row = self.core._row(db, self.namespace)
+            heads_match = (
+                row[6:9] == (deletion_head.journal_id, deletion_head.seq,
+                             deletion_head.digest)
+                and row[10:13] == (execution_head.journal_id, execution_head.seq,
+                                   execution_head.digest)
+            )
+            blockers = []
+            if row[2] != "active" or row[0] is None or row[1] == 0 or row[3] is not None or row[4] is not None:
+                blockers.append("activation_unsettled")
+            if not heads_match:
+                blockers.append("journal_head_mismatch")
+            if row[9] != "clear":
+                blockers.append("deletion_barrier")
+            if deletion_history:
+                blockers.append("deletion_history")
+            if db.execute(
+                    "SELECT 1 FROM authority_v2_fences WHERE namespace=? "
+                    "AND pending IS NOT NULL LIMIT 1",
+                    (self.namespace,)).fetchone():
+                blockers.append("pending_fence")
+            if db.execute(
+                    "SELECT 1 FROM authority_v2_mutations WHERE namespace=? "
+                    "AND state='pending' LIMIT 1", (self.namespace,)).fetchone():
+                blockers.append("pending_mutation")
+            anchor = self.core._anchor(db, self.namespace, row) if heads_match else None
+            state = (NamespaceRuntimeState.QUARANTINED
+                     if "deletion_barrier" in blockers or "deletion_history" in blockers
+                     else NamespaceRuntimeState.RECOVERING if blockers
+                     else NamespaceRuntimeState.ACTIVE)
+            return NamespaceBootstrapV2(
+                authority_id, namespace_id, self.namespace, row[0], row[1], row[2],
+                state, anchor, tuple(blockers))
 
     def begin_fence(self, *, credential, subject: str, holder: str,
                     operation: str, operation_id: str,
