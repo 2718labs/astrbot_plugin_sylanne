@@ -14,6 +14,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -34,6 +35,9 @@ _PROFILE_FIELDS_V1 = frozenset({
     "schema", "host", "port", "server_name", "expected_authority_id",
 })
 _PROFILE_FIELDS_V2 = _PROFILE_FIELDS_V1 | {"installation_policy"}
+_INGRESS_CLOCK_FIELDS = frozenset({
+    "source_id", "max_utc_error_seconds", "max_round_trip_seconds",
+})
 _INSTALLATION_FIELDS = frozenset({
     "namespace", "authority_namespace", "installation_id", "manifest_digest",
     "administrator_holder", "expected_authority_id", "catalogue_hash",
@@ -82,6 +86,24 @@ class AuthorityProfileUnavailable(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class AdminIngressClockPolicy:
+    """Administrator-provided clock bounds for a future real ingress."""
+
+    source_id: str
+    max_utc_error_seconds: float
+    max_round_trip_seconds: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_id, str) or not self.source_id.strip():
+            raise ValueError("ingress clock source_id must be non-empty")
+        for name in ("max_utc_error_seconds", "max_round_trip_seconds"):
+            value = getattr(self, name)
+            if (type(value) not in {int, float} or value <= 0
+                    or type(value) is float and not math.isfinite(value)):
+                raise ValueError(f"ingress clock {name} must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
 class AdminInstallationBundle:
     """One verified installation snapshot for Authority client assembly."""
 
@@ -89,6 +111,7 @@ class AdminInstallationBundle:
     installation_policy: AdminInstallationPolicy
     d11_signing_key: bytes
     d02_signing_key: bytes
+    ingress_clock: AdminIngressClockPolicy | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -385,8 +408,9 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
         raise ValueError("authority profile is not UTF-8") from exc
     if (not isinstance(value, dict) or type(value.get("schema")) is not int
             or value["schema"] not in {1, 2}
-            or set(value) != (_PROFILE_FIELDS_V1 if value["schema"] == 1
-                              else _PROFILE_FIELDS_V2)):
+            or (set(value) != _PROFILE_FIELDS_V1 if value["schema"] == 1 else
+                set(value) not in {_PROFILE_FIELDS_V2,
+                                   _PROFILE_FIELDS_V2 | {"ingress_clock"}})):
         raise ValueError("authority profile schema is invalid")
     return value
 
@@ -435,13 +459,25 @@ def _exact_object(value: object, expected: frozenset[str], name: str) -> dict[st
     return value
 
 
+def _ingress_clock_from_payload(payload: dict[str, object]) -> AdminIngressClockPolicy | None:
+    if "ingress_clock" not in payload:
+        return None
+    if payload.get("schema") != 2:
+        raise ValueError("ingress clock requires profile schema 2")
+    values = _exact_object(payload["ingress_clock"], _INGRESS_CLOCK_FIELDS,
+                           "ingress clock")
+    return AdminIngressClockPolicy(**values)
+
+
 def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     """Parse schema 2 after the enclosing profile passed its trusted read gate."""
     from ..runtime.issuers import BudgetLeaseGrant
 
     if (type(payload.get("schema")) is not int or payload["schema"] != 2
-            or set(payload) != _PROFILE_FIELDS_V2):
+            or set(payload) not in {_PROFILE_FIELDS_V2,
+                                    _PROFILE_FIELDS_V2 | {"ingress_clock"}}):
         raise ValueError("administrator installation policy requires profile schema 2")
+    _ingress_clock_from_payload(payload)
     values = _exact_object(payload["installation_policy"], _INSTALLATION_FIELDS,
                            "installation policy")
     namespace = _exact_object(values["namespace"], frozenset({"bot_id", "persona_id"}),
@@ -619,7 +655,8 @@ def _load_installation_bundle_from_root(
         d02_key = _checked_signing_key(
             _read_fd_bounded(files[_D02_SIGNING_KEY], _D11_SIGNING_KEY_BYTES), "D02"
         )
-    return AdminInstallationBundle(profile, policy, d11_key, d02_key)
+    return AdminInstallationBundle(profile, policy, d11_key, d02_key,
+                                   _ingress_clock_from_payload(payload))
 
 
 def _load_windows_installation_bundle(
@@ -640,7 +677,8 @@ def _load_windows_installation_bundle(
         d02_key = _checked_signing_key(
             _read_windows_signing_key(handles[profile_dir / _D02_SIGNING_KEY]), "D02"
         )
-    return AdminInstallationBundle(profile, policy, d11_key, d02_key)
+    return AdminInstallationBundle(profile, policy, d11_key, d02_key,
+                                   _ingress_clock_from_payload(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -692,7 +730,8 @@ def load_admin_d11_signing_key(profile_id: str) -> bytes:
 
 
 __all__ = (
-    "AdminInstallationBundle", "AdminInstallationPolicy", "AuthorityProfileUnavailable",
+    "AdminIngressClockPolicy", "AdminInstallationBundle", "AdminInstallationPolicy",
+    "AuthorityProfileUnavailable",
     "build_admin_authority_transport", "load_admin_installation_policy",
     "load_admin_d11_signing_key", "load_admin_installation_bundle",
 )

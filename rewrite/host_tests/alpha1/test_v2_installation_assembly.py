@@ -24,6 +24,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
         bundle = SimpleNamespace(
             tls_profile=profile, installation_policy=policy,
             d11_signing_key=b"k" * 32, d02_signing_key=b"d" * 32,
+            ingress_clock=None,
         )
         grant = InstallationGrantV2(
             authority_id="authority", subject="mtls:sha256:peer",

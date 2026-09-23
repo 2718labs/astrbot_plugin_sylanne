@@ -13,7 +13,7 @@ from .authority_client import (
     AUTHORITY_PROTOCOL, AuthorityClient, AuthorityProvisioningRequest,
     AuthoritySelection, PublisherPackageIdentity,
 )
-from .authority_profile import load_admin_installation_bundle
+from .authority_profile import AdminIngressClockPolicy, load_admin_installation_bundle
 from .installed_package import verify_installed_package
 from .mtls_transport import MtlsAuthorityTransport
 from .v2_fence_port import V2FencePort
@@ -31,6 +31,7 @@ class V2InstallationAssembly:
     package_root: Path
     data_dir: Path
     available_cpu_features: frozenset[str] | None = None
+    ingress_clock: AdminIngressClockPolicy | None = None
 
 
 async def assemble_v2_installation(
@@ -106,7 +107,7 @@ async def assemble_v2_installation(
 
     return V2InstallationAssembly(
         policy, grant, bundle.d11_signing_key, bundle.d02_signing_key, make_fence_port,
-        root, data, available_cpu_features,
+        root, data, available_cpu_features, bundle.ingress_clock,
     )
 
 
