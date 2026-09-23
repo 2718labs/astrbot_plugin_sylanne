@@ -1028,8 +1028,23 @@ class GraphCoordinator:
                 or expected_epoch.revision != provision.graph_epoch
                 or provision.graph_revision != 0 or provision.graph_epoch != 0):
             raise UnavailableGuard("first Owner claim requires creation genesis")
+        # The active Owner write fence excludes another live namespace fence.
+        # A terminal first-message rejection has no graph/business effect;
+        # unresolved attempts still block Owner genesis.
+        if store._db.execute(
+                "SELECT 1 FROM graph_first_ingress_intents_v2 AS i "
+                "LEFT JOIN graph_first_ingress_rejections_v2 AS r "
+                "ON r.bot=i.bot AND r.persona=i.persona "
+                "AND r.operation_id=i.operation_id "
+                "WHERE i.bot=? AND i.persona=? AND "
+                "(r.status IS NULL OR r.status!='rejected_no_commit' "
+                "OR r.graph_revision!=i.graph_revision "
+                "OR r.graph_epoch!=i.graph_epoch "
+                "OR r.finish_request_id!='abort:'||i.fence_attempt_id) LIMIT 1",
+                namespace.as_tuple).fetchone() is not None:
+            raise UnavailableGuard("first Owner claim follows unresolved ingress")
         for table in (
-                "graph_first_ingress_intents_v2", "graph_bundle_intents_v2",
+                "graph_bundle_intents_v2",
                 "graph_bundle_operations", "graph_product_advances",
                 "graph_events", "graph_atoms"):
             if store._db.execute(
@@ -3497,6 +3512,113 @@ class GraphCoordinator:
             raise AuthorityDenied("bundle reference crosses namespace")
         return key
 
+    def _first_ingress_boundary_locked(self, namespace: NamespaceId,
+                                       guard: OwnerAuthorizationGuardV1,
+                                       scene_ref: str, visibility: str,
+                                       at_time: float) -> None:
+        """Require the current Owner, active role, and fenced scene graph heads."""
+        from .authority_service.v2_owner_contract import (
+            OwnerGraphCommitProofV1, canonical_digest as owner_contract_digest,
+        )
+        from .domains.d03 import RoleBinding, RoleBindingRequest
+
+        db = self.__store._db
+        proof_row = db.execute(
+            "SELECT operation_id,request_digest,grant_id,grant_digest,"
+            "graph_incarnation,graph_access_epoch,graph_epoch,"
+            "graph_receipt_digest,proof_json "
+            "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()
+        epochs = db.execute(
+            "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        if proof_row is None or epochs != (1, 0):
+            raise UnavailableGuard("first ingress current Owner proof is absent")
+        proof = OwnerGraphCommitProofV1(
+            namespace, proof_row[0], proof_row[1], proof_row[2],
+            proof_row[3], proof_row[4], 1, proof_row[5], proof_row[6],
+            proof_row[7],
+        )
+        grant_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (owner_grant_key(*namespace.as_tuple).token,),
+        ).fetchone()
+        if grant_row is None or grant_row[0] != 1 or grant_row[2] != 1:
+            raise UnavailableGuard("first ingress current Owner grant is absent")
+        grant = json.loads(grant_row[1])
+        validate_owner_grant_v1(grant)
+        metadata, _ = self._v2_graph_stamp(namespace)
+        if (proof_row[8] != canonical_json(asdict(proof))
+                or grant_row[1] != canonical_json(grant)
+                or "sha256:" + canonical_digest(grant) != proof.grant_digest
+                or grant["grant_id"] != proof.grant_id
+                or grant["issue_operation_id"] != proof.operation_id
+                or grant["graph_incarnation"] != proof.graph_incarnation
+                or proof.graph_incarnation != metadata.requirements.graph_incarnation
+                or proof.graph_access_epoch != epochs[0]
+                or guard.namespace != namespace
+                or guard.authority_id != grant["authority_id"]
+                or guard.installation_id
+                != self.__content_fence_v2.installation_grant.installation_id
+                or guard.installation_id != grant["installation_id"]
+                or guard.authorization_revision != 1
+                or guard.authorization_head != owner_contract_digest(proof)
+                or guard.minimum_revocation_revision != 0
+                or guard.minimum_revocation_epoch != 0
+                or guard.pending_revoke_operation_id is not None):
+            raise UnavailableGuard("first ingress current Owner head differs")
+        role, _, _, _ = self._scene_binding_state_locked(namespace, guard)
+        rows = db.execute(
+            "SELECT token,revision,value FROM graph_atoms WHERE bot=? AND persona=? "
+            "AND owner_kind='scene' AND subject=? "
+            "AND type_name='d03.role_binding' AND valid=1",
+            namespace.as_tuple + (scene_ref,),
+        ).fetchall()
+        if len(rows) != 1:
+            raise UnavailableGuard("first ingress current scene binding is absent")
+        token, revision, encoded = rows[0]
+        key = AtomKey.from_token(token)
+        value = json.loads(encoded)
+        try:
+            binding = RoleBinding(**{
+                **value, "norm_refs": tuple(value["norm_refs"]),
+                "source_refs": tuple(value["source_refs"]),
+            })
+            request = RoleBindingRequest(
+                f"persona:{namespace.persona_id}", None, None, scene_ref,
+                "message", "context", at_time, True)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("first ingress current scene binding is invalid") from exc
+        if (key.name != binding.role_binding_id
+                or key.owner.subject != scene_ref
+                or revision != binding.binding_version
+                or binding.scene_ref != scene_ref
+                or binding.scope_selector != "scene"
+                or binding.visibility_scope != visibility
+                or not binding.applies_to(request)):
+            raise AuthorityDenied("first ingress scene does not admit this conversation")
+        receipt_row = db.execute(
+            "SELECT r.receipt_json FROM graph_history AS h "
+            "JOIN graph_scene_binding_receipts_v1 AS r "
+            "ON r.bot=h.event_bot AND r.persona=h.event_persona "
+            "AND r.operation_id=h.event_id "
+            "WHERE h.token=? AND h.revision=? "
+            "AND h.event_session='d03-scene-binding'",
+            (token, revision),
+        ).fetchone()
+        if receipt_row is None:
+            raise UnavailableGuard("first ingress scene lacks fenced binding receipt")
+        scene_receipt = json.loads(receipt_row[0])
+        if (scene_receipt.get("scene_ref") != scene_ref
+                or scene_receipt.get("binding_id") != binding.role_binding_id
+                or scene_receipt.get("role_head_id") != role.head_id
+                or scene_receipt.get("owner_grant_id") != proof.grant_id
+                or scene_receipt.get("owner_authorization_head")
+                != guard.authorization_head):
+            raise UnavailableGuard("first ingress scene receipt differs from current heads")
+
     def commit_first_ingress_v2(self, bootstrap: object, host: IngressHostFacts,
                                 installation_policy, clock_policy,
                                 encoding_policy) -> CommitReceipt:
@@ -3510,7 +3632,8 @@ class GraphCoordinator:
         from .runtime.d11_types import runtime_job_key, runtime_outbox_key
         from .runtime.first_ingress_bundle import build_first_ingress_bundle
         from .runtime.first_ingress_v2 import (
-            finish_digest, ingress_ids, policy_identity, trusted_upper,
+            finish_digest, ingress_ids, policy_identity,
+            scene_ref_for_conversation, trusted_upper,
         )
         from .runtime.issuers import (
             D02ResourceIssuer, D11BudgetJobIssuer, ResourceQuote,
@@ -3541,6 +3664,8 @@ class GraphCoordinator:
         policy = installation_policy
         if namespace != policy.namespace or host.lineage.source_ref == "":
             raise AuthorityDenied("first ingress namespace or source differs")
+        scene_ref = scene_ref_for_conversation(
+            namespace, host.platform_ref, host.conversation_ref)
         source_identity, activity_id, operation_id, job_id, outbox_id, idem = (
             ingress_ids(host.lineage.source_ref))
         fingerprint = ingress_host_fingerprint(host)
@@ -3793,6 +3918,22 @@ class GraphCoordinator:
             anchor, epoch, metadata.graph_revision)
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("first ingress write permit changed")
+        guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
+        try:
+            if not callable(guard_reader):
+                raise UnavailableGuard("first ingress current Owner guard is unavailable")
+            guarded = guard_reader(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                permit=permit)
+            if (type(guarded) is not tuple or len(guarded) != 2
+                    or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                    or guarded[1] != permit):
+                raise UnavailableGuard("first ingress current Owner guard is unavailable")
+            owner_guard = guarded[0]
+        except Exception:
+            self._reject_first_ingress_v2(
+                namespace, operation_id, row, permit, scope)
+            raise
 
         actor = policy.administrator_holder
         lease, capability_ref = self.grant(
@@ -3850,6 +3991,9 @@ class GraphCoordinator:
                         db, grant.lease_id)
                     if current_grant != grant:
                         raise AuthorityDenied("root grant changed before ingress")
+                    self._first_ingress_boundary_locked(
+                        namespace, owner_guard, scene_ref, host.visibility,
+                        trusted_upper(reading))
                     budget = get_budget_lease(db, grant.lease_id)
                     if budget.state != "active" or any(
                             amount > budget.limits.get(name, 0)

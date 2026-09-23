@@ -1,75 +1,54 @@
 """Atomic first ingress uses the signed genesis grant and one business commit."""
 
 from dataclasses import replace
+import json
 import sqlite3
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from sylanne3.domains.d06 import D06DomainProvider
+from sylanne3.authority_service.v2_owner_contract import (
+    OwnerAuthorizationGuardV1, canonical_digest as owner_contract_digest,
+)
 from sylanne3.graph_coordinator import (
-    FirstIngressOutcomeUnknown, GraphCoordinator, IngressHostFacts,
+    AuthorityDenied, FirstIngressOutcomeUnknown, GraphCoordinator, IngressHostFacts,
     IngressLineage, UnavailableGuard,
 )
 from sylanne3.graph_store import ProductionGraphStore
-from sylanne3.graph_types import TypeRegistry
+from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
 from sylanne3.host.authority_profile import (
     AdminIngressClockPolicy, AdminIngressEncodingPolicy,
 )
-from sylanne3.runtime.d11_types import (
-    D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
-    D11RuntimeProvider, graph_type_specs,
-)
 from sylanne3.runtime.issuers import build_runtime_issuers
 
-from test_graph_v2_provisioning import AuthorityPort, policy_for
+from test_graph_v2_provisioning import AuthorityPort, _owner_issue_case
+from test_scene_binding_v2 import _scene_case
 
 
-@pytest.fixture
-def ingress_system(tmp_path):
-    registry = TypeRegistry()
-    for spec in D06DomainProvider.type_specs() + graph_type_specs():
-        registry.register(spec)
-    store = ProductionGraphStore(tmp_path / "business.db", registry)
-    authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
-    port = AuthorityPort(store, authority_db)
-    d02, d11 = build_runtime_issuers(b"first-ingress-test-signing-key-32")
-    bootstrap = object()
-    coordinator = GraphCoordinator(
-        store, bootstrap, holder="administrator", content_fence_v2=port,
-        d02_issuer=d02, d11_issuer=d11)
-    d06 = D06DomainProvider()
-    coordinator.register_provider(
-        bootstrap, "d06", d06, "d06.contract.v1",
-        d06.descriptor.request_schema_hash)
-    coordinator.register_provider(
-        bootstrap, "d11", D11RuntimeProvider(),
-        D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH)
-    original = policy_for(store)
-    policy = replace(original, root_grant=replace(
-        original.root_grant,
-        allowed_work_kinds=("d06.encode_source",)))
-    coordinator.provision_namespace_v2(
-        bootstrap, policy, operation_id="install-persona")
-    source_ref = "b" * 64
+def _ingress_inputs(namespace):
     host = IngressHostFacts(
-        policy.namespace, "platform", "conversation", "sender", "message",
+        namespace, "platform", "conversation", "sender", "message",
         "hello", 10.0, time.time(), "private",
-        IngressLineage(source_ref, "reported", "platform",
+        IngressLineage("b" * 64, "reported", "platform",
                        "external_report", "reported_claim", "not_applicable"))
     clock = AdminIngressClockPolicy("authority", 1.0, 1.0)
     encoding = AdminIngressEncodingPolicy(
         120.0, {"cpu_ms": 20}, "snapshot-1", "resource-1",
         "character-1")
+    return host, clock, encoding
 
-    def read_clock(_):
-        port.outside_graph_lock()
-        return SimpleNamespace(
-            utc_upper_bound_seconds=time.time() + 0.01,
-            monotonic_after_seconds=time.monotonic())
 
-    port.read_ingress_clock = read_clock
+@pytest.fixture
+def ingress_system(tmp_path):
+    (store, authority_db, port, coordinator, namespace, principal,
+     proposal, prior, request_digest, _key, policy, bootstrap) = _scene_case(
+         tmp_path, enable_ingress=True)
+    coordinator.commit_scene_binding_v2(
+        namespace=namespace, operation_id="scene-bind-1", proposal=proposal,
+        prior=prior, principal=principal, request_digest=request_digest)
+    host, clock, encoding = _ingress_inputs(namespace)
+
     try:
         yield store, coordinator, bootstrap, port, policy, clock, encoding, host
     finally:
@@ -83,6 +62,95 @@ def count(db, table):
             (table,)).fetchone() is None:
         return 0
     return db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def test_scene_identity_separates_platform_account_and_conversation():
+    from sylanne3.runtime_contracts import NamespaceId
+
+    namespace = NamespaceId("bot", "persona")
+    scene = scene_ref_for_conversation(namespace, "platform", "conversation")
+    assert scene.startswith("scene:conversation-v1:")
+    assert scene != scene_ref_for_conversation(
+        namespace, "other-platform", "conversation")
+    assert scene != scene_ref_for_conversation(
+        NamespaceId("other-bot", "persona"), "platform", "conversation")
+    assert scene != scene_ref_for_conversation(
+        namespace, "platform", "other-conversation")
+
+
+def test_ingress_requires_current_d01_role(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     pending, grant_value, bootstrap) = _owner_issue_case(
+         tmp_path, first_ingress=True, role_types=True, scene_types=True,
+         return_bootstrap=True)
+    try:
+        port.pending_owner = pending
+        proof = coordinator.commit_first_owner_grant_v2(
+            bootstrap, namespace=policy.namespace,
+            operation_id=operation.operation_id, grant_value=grant_value)
+        guard = OwnerAuthorizationGuardV1(
+            "authority", "installation", policy.namespace, 1,
+            owner_contract_digest(proof), 0, 0)
+        port.get_current_owner_guard_for_fence = lambda **kw: (
+            guard, kw["permit"])
+        host, clock, encoding = _ingress_inputs(policy.namespace)
+        with pytest.raises(UnavailableGuard, match="active D01 role head is absent"):
+            coordinator.commit_first_ingress_v2(
+                bootstrap, host, policy, clock, encoding)
+        assert count(store._db, "graph_bundle_operations") == 0
+        assert count(store._db, "ingress_first_observations") == 0
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_ingress_requires_fenced_scene_binding(tmp_path):
+    (store, authority_db, _port, coordinator, namespace, _principal,
+     _proposal, _prior, _request_digest, _key, policy, bootstrap) = (
+         _scene_case(tmp_path, enable_ingress=True))
+    try:
+        host, clock, encoding = _ingress_inputs(namespace)
+        with pytest.raises(UnavailableGuard, match="current scene binding is absent"):
+            coordinator.commit_first_ingress_v2(
+                bootstrap, host, policy, clock, encoding)
+        assert count(store._db, "graph_bundle_operations") == 0
+        assert count(store._db, "ingress_first_observations") == 0
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_ingress_rejects_revoked_scene_binding(ingress_system):
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = (
+        ingress_system)
+    scene_ref = scene_ref_for_conversation(
+        policy.namespace, host.platform_ref, host.conversation_ref)
+    row = store._db.execute(
+        "SELECT token,value FROM graph_atoms WHERE bot=? AND persona=? "
+        "AND owner_kind='scene' AND subject=? AND type_name='d03.role_binding'",
+        policy.namespace.as_tuple + (scene_ref,),
+    ).fetchone()
+    value = json.loads(row[1])
+    value["status"] = "revoked"
+    store._db.execute(
+        "UPDATE graph_atoms SET value=? WHERE token=?",
+        (json.dumps(value, sort_keys=True, separators=(",", ":")), row[0]),
+    )
+    with pytest.raises(AuthorityDenied, match="scene does not admit"):
+        coordinator.commit_first_ingress_v2(
+            bootstrap, host, policy, clock, encoding)
+    assert count(store._db, "graph_bundle_operations") == 0
+    assert count(store._db, "ingress_first_observations") == 0
+
+
+def test_ingress_scene_must_match_host_platform_account(ingress_system):
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = (
+        ingress_system)
+    with pytest.raises(UnavailableGuard, match="current scene binding is absent"):
+        coordinator.commit_first_ingress_v2(
+            bootstrap, replace(host, platform_ref="other-platform"),
+            policy, clock, encoding)
+    assert count(store._db, "graph_bundle_operations") == 0
 
 
 def test_first_ingress_commits_and_replays_exact_receipt(ingress_system):
@@ -100,7 +168,7 @@ def test_first_ingress_commits_and_replays_exact_receipt(ingress_system):
     assert count(store._db, "runtime_budget_reservations") == 1
     assert count(store._db, "runtime_jobs") == 1
     assert count(store._db, "graph_bundle_outbox") == 1
-    assert len([item for item in port.finishes if item[0] == "write"]) == 2
+    assert len([item for item in port.finishes if item[0] == "write"]) == 5
 
 
 def test_changed_content_does_not_reuse_first_ingress_operation(ingress_system):
@@ -171,14 +239,14 @@ def test_lost_finish_replays_durable_business_receipt_after_restart(
     ).fetchone()[0]
     assert count(store._db, "graph_bundle_operations") == 1
     store.close()
-    reopened = ProductionGraphStore(tmp_path / "business.db", store._registry)
-    authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
+    reopened = ProductionGraphStore(tmp_path / "owner-business.db", store._registry)
+    authority_db = sqlite3.connect(tmp_path / "owner-authority.db", isolation_level=None)
     next_port = AuthorityPort(reopened, authority_db)
     next_port.anchors.update(port.anchors)
     next_port.read_ingress_clock = lambda _: SimpleNamespace(
         utc_upper_bound_seconds=time.time() + 0.01,
         monotonic_after_seconds=time.monotonic())
-    d02, d11 = build_runtime_issuers(b"first-ingress-test-signing-key-32")
+    d02, d11 = build_runtime_issuers(b"issuer-key-" * 4)
     next_bootstrap = object()
     next_coordinator = GraphCoordinator(
         reopened, next_bootstrap, holder="administrator",

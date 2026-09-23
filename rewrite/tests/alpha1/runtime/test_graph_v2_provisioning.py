@@ -19,7 +19,8 @@ from sylanne3.authority_service.v2_owner_contract import (
 )
 from sylanne3.graph_coordinator import (
     AuthorityDenied, BudgetAdmission, GraphCoordinator, RuntimeAdmission,
-    IngressHostFacts, IngressLineage, UnavailableGuard,
+    FirstIngressOutcomeUnknown, IngressHostFacts, IngressLineage,
+    UnavailableGuard,
 )
 from sylanne3.graph_store import ProductionGraphStore
 from sylanne3.graph_types import (
@@ -375,20 +376,9 @@ def _owner_issue_case(tmp_path, *, first_ingress=False, return_bootstrap=False,
     creation = coordinator.provision_namespace_v2(
         bootstrap, policy, operation_id="owner-creation")
     if first_ingress:
-        host = IngressHostFacts(
-            policy.namespace, "platform", "conversation", "sender", "message",
-            "hello", 10.0, time.time(), "private",
-            IngressLineage("b" * 64, "reported", "platform",
-                           "external_report", "reported_claim", "not_applicable"))
-        clock = AdminIngressClockPolicy("authority", 1.0, 1.0)
-        encoding = AdminIngressEncodingPolicy(
-            120.0, {"cpu_ms": 20}, "snapshot-1", "resource-1", "character-1")
         port.read_ingress_clock = lambda _: SimpleNamespace(
             utc_upper_bound_seconds=time.time() + 0.01,
             monotonic_after_seconds=time.monotonic())
-        ingress_receipt = coordinator.commit_first_ingress_v2(
-            bootstrap, host, policy, clock, encoding)
-        assert ingress_receipt.status == "committed"
     principal = OwnerPrincipalV1("paired-idp", "account", "incarnation-1")
     ticket = OwnerClaimTicketV1(
         "authority", "installation", policy.namespace, principal, "ticket-1",
@@ -696,31 +686,62 @@ def test_first_owner_graph_commit_rejects_policy_expansion(tmp_path):
         authority_db.close()
 
 
-def test_first_owner_claim_rejects_prior_committed_first_ingress(tmp_path):
+def test_first_ingress_rejects_before_owner_claim(tmp_path):
     (store, authority_db, port, coordinator, policy, operation,
-     pending, value) = _owner_issue_case(tmp_path, first_ingress=True)
+     pending, value, bootstrap) = _owner_issue_case(
+         tmp_path, first_ingress=True, return_bootstrap=True)
     namespace = policy.namespace
     try:
-        metadata, epoch, scope = _owner_write_scope(
-            store, port, coordinator, namespace, "owner-write-after-ingress")
-        assert metadata.graph_revision > 0 and epoch.revision > 0
+        host = IngressHostFacts(
+            namespace, "platform", "conversation", "sender", "message",
+            "hello", 10.0, time.time(), "private",
+            IngressLineage("b" * 64, "reported", "platform",
+                           "external_report", "reported_claim", "not_applicable"))
+        clock = AdminIngressClockPolicy("authority", 1.0, 1.0)
+        encoding = AdminIngressEncodingPolicy(
+            120.0, {"cpu_ms": 20}, "snapshot-1", "resource-1", "character-1")
+        with pytest.raises(UnavailableGuard, match="current Owner guard"):
+            coordinator.commit_first_ingress_v2(
+                bootstrap, host, policy, clock, encoding)
         assert store._db.execute(
-            "SELECT access_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?",
-            namespace.as_tuple).fetchone() in (None, (0,))
-        assert port.validate_fence(scope) == scope.permit
-        with store._lock:
-            store._db.execute("BEGIN IMMEDIATE")
-            with pytest.raises(UnavailableGuard, match="creation genesis"):
-                coordinator._stage_first_owner_grant_locked(
-                    operation, pending, value, scope, metadata, epoch)
-            store._db.execute("ROLLBACK")
-            assert store._db.execute(
-                "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (0,)
-            assert store._db.execute(
-                "SELECT COUNT(*) FROM graph_atoms WHERE token=?",
-                (owner_grant_key(*namespace.as_tuple).token,)).fetchone() == (0,)
-        port.finish_fence(scope, request_id="finish:owner-write-after-ingress",
-                          request_digest="sha256:" + "e" * 64)
+            "SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
+        port.pending_owner = pending
+        assert coordinator.commit_first_owner_grant_v2(
+            bootstrap, namespace=namespace,
+            operation_id=operation.operation_id, grant_value=value).grant_id == (
+                "first-owner")
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_unresolved_first_ingress_fence_blocks_owner_claim(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     pending, value, bootstrap) = _owner_issue_case(
+         tmp_path, first_ingress=True, return_bootstrap=True)
+    namespace = policy.namespace
+    try:
+        host = IngressHostFacts(
+            namespace, "platform", "conversation", "sender", "message",
+            "hello", 10.0, time.time(), "private",
+            IngressLineage("c" * 64, "reported", "platform",
+                           "external_report", "reported_claim", "not_applicable"))
+        clock = AdminIngressClockPolicy("authority", 1.0, 1.0)
+        encoding = AdminIngressEncodingPolicy(
+            120.0, {"cpu_ms": 20}, "snapshot-1", "resource-1", "character-1")
+        port.lose_begin_after_durable = True
+        with pytest.raises(FirstIngressOutcomeUnknown, match="begin outcome unknown"):
+            coordinator.commit_first_ingress_v2(
+                bootstrap, host, policy, clock, encoding)
+        port.pending_owner = pending
+        with pytest.raises(AuthorityUnavailable, match="active v2 fence"):
+            coordinator.commit_first_owner_grant_v2(
+                bootstrap, namespace=namespace,
+                operation_id=operation.operation_id, grant_value=value)
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (0,)
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_bundle_operations").fetchone() == (0,)
     finally:
         store.close()
         authority_db.close()

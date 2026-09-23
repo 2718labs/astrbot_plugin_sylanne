@@ -8,7 +8,22 @@ import math
 import time
 
 from ..contracts import canonical_json
-from ..runtime_contracts import canonical_digest
+from ..runtime_contracts import NamespaceId, canonical_digest
+
+
+def scene_ref_for_conversation(namespace: NamespaceId, platform_ref: str,
+                               conversation_ref: str) -> str:
+    """Name the D03 scene for one bot account and platform conversation."""
+    if type(namespace) is not NamespaceId:
+        raise TypeError("scene namespace must be NamespaceId")
+    if any(type(value) is not str or not value for value in
+           (platform_ref, conversation_ref)):
+        raise ValueError("scene platform and conversation identities are required")
+    return "scene:conversation-v1:" + canonical_digest({
+        "namespace": list(namespace.as_tuple),
+        "platform_ref": platform_ref,
+        "conversation_ref": conversation_ref,
+    })
 
 
 def ingress_ids(source_ref: str) -> tuple[str, str, str, str, str, str]:

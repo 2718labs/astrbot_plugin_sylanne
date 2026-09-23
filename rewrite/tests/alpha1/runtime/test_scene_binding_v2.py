@@ -26,15 +26,21 @@ from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, OperationIdentity, QueryEpoch,
     SourceQualification, VersionGuard, canonical_digest,
 )
+from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
 
 from test_graph_v2_provisioning import _owner_issue_case
 
 
-def _scene_case(tmp_path, *, owner_capabilities=None):
+def _scene_case(tmp_path, *, owner_capabilities=None,
+                enable_ingress=False):
     (store, authority_db, port, coordinator, policy, operation,
      pending, grant_value, bootstrap) = _owner_issue_case(
-        tmp_path, return_bootstrap=True, role_types=True, scene_types=True,
+        tmp_path, first_ingress=enable_ingress, return_bootstrap=True,
+        role_types=True, scene_types=True,
         owner_capabilities=owner_capabilities)
+    scene_ref = (scene_ref_for_conversation(
+        policy.namespace, "platform", "conversation")
+        if enable_ingress else "scene:private")
     port.pending_owner = pending
     proof = coordinator.commit_first_owner_grant_v2(
         bootstrap, namespace=policy.namespace,
@@ -87,17 +93,17 @@ def _scene_case(tmp_path, *, owner_capabilities=None):
         GraphSnapshot(tuple(atoms), (NamespaceEpoch(*namespace.as_tuple, 2),)),
         namespace=namespace, current_guard=guard)
     request = RoleBindingRequest(
-        f"persona:{namespace.persona_id}", None, None, "scene:private",
+        f"persona:{namespace.persona_id}", None, None, scene_ref,
         "bind_scene", "respond", 2.0, True)
     prior = RoleBindingResolution(
         "no_applicable_binding", (), (), (), (),
         QueryEpoch(namespace, "d03.role_binding", 2), None, request)
     binding = RoleBinding(
         "binding:private", f"persona:{namespace.persona_id}", "companion",
-        None, None, "scene:private", "scene", "private", ("norm:care",),
+        None, None, scene_ref, "scene", "private", ("norm:care",),
         1.0, None, 10, ("source:role",), 1, "active")
     key = AtomKey(
-        Owner("scene", *namespace.as_tuple, "scene:private"),
+        Owner("scene", *namespace.as_tuple, scene_ref),
         "d03.role_binding", binding.role_binding_id)
     version_guard = VersionGuard(
         active_role.read_versions + (GraphVersion(key, 0),),
@@ -126,8 +132,9 @@ def _scene_case(tmp_path, *, owner_capabilities=None):
         "model_ref": "model:one", "budget_ref": "budget:root",
     })
     assert role_receipt.graph_epoch == 2
-    return (store, authority_db, port, coordinator, namespace, operation.principal,
-            proposal, prior, request_digest, key)
+    result = (store, authority_db, port, coordinator, namespace,
+              operation.principal, proposal, prior, request_digest, key)
+    return result + (policy, bootstrap) if enable_ingress else result
 
 
 @pytest.mark.parametrize("lose_finish,bad_identity", [(False, False), (True, False),
