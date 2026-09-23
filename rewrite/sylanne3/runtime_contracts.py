@@ -617,6 +617,45 @@ class DomainProposal:
 
 
 @dataclass(frozen=True)
+class ProductAdvanceEvidenceV1:
+    """Candidate-bound numeric evidence; the coordinator must verify its issuer."""
+
+    schema: str
+    feeling_ref: str
+    mood_ref: str
+    parent_operation_id: str
+    replay_key: str
+    from_cursor: float
+    to_cursor: float
+    candidate_digest: str
+    numeric_input_digest: str
+    numeric_output_digest: str
+    native_manifest_sha256: str
+    native_sha256: str
+    previous_error_bound: float
+    next_error_bound: float
+
+    def __post_init__(self) -> None:
+        if self.schema != "d11.product_advance_candidate.v1":
+            raise ValueError("unknown product advance candidate schema")
+        for name, type_name in (("feeling_ref", "d04.feeling_state.v1"),
+                                ("mood_ref", "d04.mood_field.v1")):
+            key = AtomKey.from_token(_nonempty(getattr(self, name), name))
+            if key.type_name != type_name:
+                raise ValueError(f"{name} has the wrong D04 graph type")
+        for name in ("parent_operation_id", "replay_key"):
+            _nonempty(getattr(self, name), name)
+        for name in ("candidate_digest", "numeric_input_digest",
+                     "numeric_output_digest", "native_manifest_sha256", "native_sha256"):
+            _digest(getattr(self, name), name)
+        for name in ("from_cursor", "to_cursor", "previous_error_bound", "next_error_bound"):
+            object.__setattr__(self, name, _finite(getattr(self, name), name))
+        if (self.to_cursor <= self.from_cursor or self.previous_error_bound < 0
+                or self.next_error_bound < 0):
+            raise ValueError("product advance interval and error bounds must be positive")
+
+
+@dataclass(frozen=True)
 class DomainBundle:
     """Complete candidate bundle; construction does not confer validation authority."""
     envelope: CommandEnvelope
@@ -628,10 +667,14 @@ class DomainBundle:
     idempotency_keys: tuple[str, ...]
     persistent_job_refs: tuple[str, ...]
     outbox_refs: tuple[str, ...]
+    product_advance: ProductAdvanceEvidenceV1 | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.envelope, CommandEnvelope):
             raise TypeError("envelope must be CommandEnvelope")
+        if self.product_advance is not None and not isinstance(
+                self.product_advance, ProductAdvanceEvidenceV1):
+            raise TypeError("product_advance must be typed product evidence")
         proposals = _typed_tuple(self.proposals, DomainProposal, "proposals")
         if any(item.envelope != self.envelope for item in proposals):
             raise ValueError("bundle proposals must share the exact bundle envelope and operation")
@@ -652,7 +695,15 @@ class DomainBundle:
     @property
     def digest(self) -> str:
         """Digest the complete immutable bundle for idempotency/conflict checks."""
-
+        if self.product_advance is None:
+            # Existing operations keep their original digest across this optional
+            # contract addition, so an uncertain old commit remains queryable.
+            legacy = {
+                "$type": f"{type(self).__module__}.{type(self).__qualname__}",
+                **{field.name: getattr(self, field.name) for field in fields(self)
+                   if field.name != "product_advance"},
+            }
+            return canonical_digest(legacy)
         return canonical_digest(self)
 
 
@@ -770,6 +821,7 @@ __all__ = [
     "FenceScope", "ContentFencePortV2",
     "VersionedRef", "QueryEpoch",
     "OperationIdentity", "AuthorityContext", "VersionGuard", "SourceQualification", "DependencySet",
-    "CommandEnvelope", "DomainProposal", "DomainBundle", "CommitReceipt", "ProviderDescriptor",
+    "CommandEnvelope", "DomainProposal", "ProductAdvanceEvidenceV1", "DomainBundle",
+    "CommitReceipt", "ProviderDescriptor",
     "CheckReceipt", "DomainProvider", "canonical_serialize", "canonical_digest", "schema_hash",
 ]

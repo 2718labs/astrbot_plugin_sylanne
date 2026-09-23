@@ -22,7 +22,7 @@ from .graph_types import AtomKey, GraphCandidate, GraphSnapshot, GraphAtom, Grap
 from .memory_types import access_key, source_key
 from .runtime_contracts import (
     AuthorityContext, CommitReceipt, ContentFencePortV2, DomainBundle, FenceScope,
-    NamespaceId, canonical_digest,
+    NamespaceId, ProductAdvanceEvidenceV1, canonical_digest,
 )
 from .runtime.restore_anchor import (
     ExecutionJournalPort, SnapshotRequirements, validate_restore,
@@ -378,6 +378,8 @@ class GraphCoordinator:
         self.__closure_verifier = closure_verifier
         self.__d02_issuer = d02_issuer
         self.__d11_issuer = d11_issuer
+        # No product numeric issuer is installed in alpha1. A DTO is never a permit.
+        self.__product_advance_issuer = None
         if ingress_policy is not None and not callable(ingress_policy):
             raise TypeError("ingress_policy must be callable")
         self.__ingress_policy = ingress_policy
@@ -2513,6 +2515,120 @@ class GraphCoordinator:
                 tuple(data["ledger_refs"]), tuple(data["outbox_refs"]),
             )
 
+    def _check_product_advance(self, db, bundle: DomainBundle,
+                               snapshot: GraphSnapshot, writes: tuple) -> dict | None:
+        """Bind an advance to current D04 state before any business write."""
+        if not isinstance(self.__store, ProductionGraphStore):
+            if bundle.product_advance is not None:
+                raise UnavailableGuard("product advance evidence requires production graph authority")
+            return None
+        state_items = tuple(write for write in writes if write.key.type_name in {
+            "d04.feeling_state.v1", "d04.mood_field.v1"})
+        state_writes = {write.key.type_name: write for write in state_items}
+        if len(state_writes) != len(state_items):
+            raise AuthorityDenied("multiple D04 state writes of the same type")
+        advance = False
+        for write in state_writes.values():
+            current = snapshot.get(write.key)
+            if current is None:
+                raise StaleRead("D04 write key is absent from the complete read set")
+            if current.revision == 0:
+                # Initial state creation has no preceding numerical interval.
+                continue
+            if not current.valid:
+                raise StaleRead("D04 state is invalid")
+            old, new = current.value, write.value
+            if new["revision"] != old["revision"] + 1:
+                raise StaleRead("D04 state revision is not the next revision")
+            if new["cursor"] < old["cursor"]:
+                raise StaleRead("D04 state cursor moved backwards")
+            if new["cursor"] == old["cursor"]:
+                semantic_fields = ({"meaning_refs", "interpretation_refs",
+                                    "active_driver_refs", "historical_source_refs", "revision"}
+                                   if write.key.type_name == "d04.feeling_state.v1"
+                                   else {"source_refs", "revision"})
+                if any(new.get(name) != old.get(name)
+                       for name in set(old) | set(new) if name not in semantic_fields):
+                    raise AuthorityDenied("same-cursor D04 correction changed numerical state")
+            else:
+                advance = True
+        evidence = bundle.product_advance
+        if not advance:
+            if evidence is not None:
+                raise AuthorityDenied("product advance evidence has no existing interval to advance")
+            if bundle.envelope.identity.phase == "d11.product_advance_candidate.v1":
+                raise AuthorityDenied("product advance phase has no numerical interval")
+            return None
+        if evidence is None:
+            raise UnavailableGuard("D04 time advance requires product numeric evidence")
+        if (type(evidence) is not ProductAdvanceEvidenceV1
+                or bundle.envelope.identity.phase != "d11.product_advance_candidate.v1"
+                or set(state_writes) != {"d04.feeling_state.v1", "d04.mood_field.v1"}):
+            raise AuthorityDenied("product advance requires one feeling and one mood write")
+        feeling = state_writes["d04.feeling_state.v1"]
+        mood = state_writes["d04.mood_field.v1"]
+        if (feeling.key.token != evidence.feeling_ref
+                or mood.key.token != evidence.mood_ref):
+            raise AuthorityDenied("product advance refs differ from D04 writes")
+        old_feeling, old_mood = snapshot.get(feeling.key), snapshot.get(mood.key)
+        if (old_feeling is None or old_mood is None
+                or not old_feeling.valid or not old_mood.valid
+                or old_feeling.revision == 0 or old_mood.revision == 0
+                or old_feeling.value["cursor"] != evidence.from_cursor
+                or old_mood.value["cursor"] != evidence.from_cursor
+                or feeling.value["cursor"] != evidence.to_cursor
+                or mood.value["cursor"] != evidence.to_cursor
+                or feeling.value["process_id"] != old_feeling.value["process_id"]
+                or mood.value["mood_id"] != old_mood.value["mood_id"]):
+            raise StaleRead("product advance does not follow the current joint state")
+        candidate_digest = canonical_digest({
+            "schema": "sylanne.d04.product.advance.candidate.v1",
+            "feeling": {"ref": feeling.key.token, "value": feeling.value},
+            "mood": {"ref": mood.key.token, "value": mood.value},
+        })
+        if evidence.candidate_digest != candidate_digest:
+            raise AuthorityDenied("product evidence does not bind the exact D04 writes")
+        namespace = bundle.envelope.authority.namespace
+        parent = db.execute(
+            "SELECT process_id,feeling_ref,mood_ref,to_cursor,next_error_bound "
+            "FROM graph_product_advances WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (evidence.parent_operation_id,),
+        ).fetchone()
+        if (parent is None or parent[0] != old_feeling.value["process_id"]
+                or (parent[1], parent[2]) != (evidence.feeling_ref, evidence.mood_ref)
+                or parent[3] != evidence.from_cursor
+                or parent[4] != evidence.previous_error_bound):
+            raise StaleRead("product advance has no matching committed error predecessor")
+        parent_event = db.execute(
+            "SELECT e.revisions FROM graph_events e JOIN graph_bundle_operations b "
+            "ON b.bot=e.bot AND b.persona=e.persona AND b.activity_id=e.session "
+            "AND b.operation_id=e.event_id WHERE b.bot=? AND b.persona=? "
+            "AND b.operation_id=?", namespace.as_tuple + (evidence.parent_operation_id,),
+        ).fetchone()
+        if parent_event is None:
+            raise StaleRead("product advance parent graph receipt is missing")
+        parent_versions = dict(json.loads(parent_event[0]))
+        if (parent_versions.get(evidence.feeling_ref) != old_feeling.revision
+                or parent_versions.get(evidence.mood_ref) != old_mood.revision):
+            raise StaleRead("product advance parent is not the current joint state")
+        conflict = db.execute(
+            "SELECT 1 FROM graph_product_advances WHERE bot=? AND persona=? "
+            "AND process_id=? AND (replay_key=? OR "
+            "(from_cursor<? AND to_cursor>?)) LIMIT 1",
+            namespace.as_tuple + (old_feeling.value["process_id"], evidence.replay_key,
+                                  evidence.to_cursor, evidence.from_cursor),
+        ).fetchone()
+        if conflict is not None:
+            raise EventConflict("product advance replay or interval already committed")
+        issuer = self.__product_advance_issuer
+        if issuer is None:
+            raise UnavailableGuard("trusted product numeric issuer is unavailable")
+        # Future issuer verification must be a local, pure check; FFI runs outside
+        # this transaction and binds the complete joint input/output digests.
+        if issuer.verify(evidence, bundle) is not True:
+            raise AuthorityDenied("product numeric issuer did not verify evidence")
+        return {**asdict(evidence), "process_id": old_feeling.value["process_id"]}
+
     def commit_domain_bundle(self, bundle: DomainBundle, lease: object) -> CommitReceipt:
         if not isinstance(bundle, DomainBundle):
             raise TypeError("bundle must be DomainBundle")
@@ -2950,6 +3066,7 @@ class GraphCoordinator:
                       "domain_bundle", {"bundle_digest": digest})
         result: list[CommitReceipt] = []
         runtime_admissions: list[RuntimeAdmission] = []
+        product_advances: list[dict] = []
 
         def guard(db):
             if v2_write is not None:
@@ -2978,6 +3095,9 @@ class GraphCoordinator:
                 return
             snapshot = self._check_guard(
                 db, bundle, ingress_deadline_check=ingress_deadline_check)
+            product_advance = self._check_product_advance(db, bundle, snapshot, writes)
+            if product_advance is not None:
+                product_advances.append(product_advance)
             for source in envelope.source_qualification.source_refs:
                 key = self._parse_ref(source, namespace)
                 if key in new_sources:
@@ -3078,12 +3198,31 @@ class GraphCoordinator:
                                 for ref in refs)
             data = {"commit_seq": seq, "ledger_refs": list(ledger_refs),
                     "outbox_refs": list(bundle.outbox_refs)}
+            if product_advances:
+                data["product_advance_candidate"] = product_advances[0]
             db.execute(
                 "INSERT INTO graph_bundle_operations(bot,persona,operation_id,digest,"
                 "activity_id,effect_id,commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
                 namespace.as_tuple + (identity.operation_id, digest, identity.activity_id,
                                       identity.effect_id, seq, canonical_json(data)),
             )
+            if product_advances:
+                advance = product_advances[0]
+                db.execute(
+                    "INSERT INTO graph_product_advances"
+                    "(bot,persona,operation_id,process_id,feeling_ref,mood_ref,"
+                    "parent_operation_id,replay_key,from_cursor,to_cursor,candidate_digest,"
+                    "numeric_input_digest,numeric_output_digest,native_manifest_sha256,"
+                    "native_sha256,previous_error_bound,next_error_bound) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (
+                        identity.operation_id, advance["process_id"], advance["feeling_ref"],
+                        advance["mood_ref"], advance["parent_operation_id"], advance["replay_key"],
+                        advance["from_cursor"], advance["to_cursor"], advance["candidate_digest"],
+                        advance["numeric_input_digest"], advance["numeric_output_digest"],
+                        advance["native_manifest_sha256"], advance["native_sha256"],
+                        advance["previous_error_bound"], advance["next_error_bound"]),
+                )
             for kind, refs in part_refs:
                 for ref in refs:
                     db.execute(

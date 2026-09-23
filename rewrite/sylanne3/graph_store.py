@@ -141,6 +141,22 @@ class GraphStore(Store):
                 activity_id TEXT NOT NULL, effect_id TEXT,
                 commit_seq INTEGER NOT NULL, receipt_json TEXT NOT NULL,
                 PRIMARY KEY(bot, persona, operation_id));
+            CREATE TABLE IF NOT EXISTS graph_product_advances (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, process_id TEXT NOT NULL,
+                feeling_ref TEXT NOT NULL, mood_ref TEXT NOT NULL,
+                parent_operation_id TEXT NOT NULL, replay_key TEXT NOT NULL,
+                from_cursor REAL NOT NULL, to_cursor REAL NOT NULL,
+                candidate_digest TEXT NOT NULL, numeric_input_digest TEXT NOT NULL,
+                numeric_output_digest TEXT NOT NULL,
+                native_manifest_sha256 TEXT NOT NULL, native_sha256 TEXT NOT NULL,
+                previous_error_bound REAL NOT NULL, next_error_bound REAL NOT NULL,
+                PRIMARY KEY(bot, persona, operation_id),
+                UNIQUE(bot, persona, process_id, replay_key),
+                FOREIGN KEY(bot, persona, operation_id)
+                    REFERENCES graph_bundle_operations(bot, persona, operation_id));
+            CREATE INDEX IF NOT EXISTS graph_product_advances_interval
+                ON graph_product_advances(bot, persona, process_id, from_cursor, to_cursor);
             CREATE TABLE IF NOT EXISTS graph_bundle_sequence (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 last_seq INTEGER NOT NULL,
