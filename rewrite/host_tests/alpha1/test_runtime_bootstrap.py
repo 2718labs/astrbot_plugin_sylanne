@@ -642,8 +642,8 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(module, "build_admin_authority_transport", return_value=transport) as load, \
                     patch.object(module, "AuthorityClient") as client_class:
                 client = client_class.return_value
-                client.status = AsyncMock(return_value=types.SimpleNamespace(state="paired"))
-                client.capability_grant = AsyncMock(return_value=None)
+                client.status_v2 = AsyncMock(return_value=types.SimpleNamespace(state="paired"))
+                client.installation_grant_v2 = AsyncMock(return_value=None)
                 plugin = module.Sylanne3Plugin(
                     Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None, None),
                     {"enabled": True, "authority_profile": "installed"},
@@ -651,7 +651,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 await plugin.initialize()
             load.assert_called_once_with("installed")
             self.assertIs(client_class.call_args.kwargs["transport"], transport)
-            client.capability_grant.assert_awaited_once()
+            client.installation_grant_v2.assert_awaited_once()
             self.assertEqual(plugin.runtime_health.status, "blocked")
             self.assertIn("external_runtime_authorities", plugin.runtime_health.missing_capabilities)
             self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())

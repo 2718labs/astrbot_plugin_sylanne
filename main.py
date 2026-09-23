@@ -92,17 +92,20 @@ class Sylanne3Plugin(Star):
             data_dir=data_dir,
             transport=transport,
         )
-        authority_status = await authority.status()
-        # A capability grant contains only authenticated facts. Production
-        # RuntimeDependencies still require local adapters and a real ingress
-        # handler, none of which may be synthesized by this plugin.
+        authority_status = await authority.status_v2()
+        # The v2 grant proves this paired installation only. It carries no
+        # namespace activation or content permission. RuntimeDependencies and
+        # all twelve domains still need their production adapters.
         if authority_status.state == "paired":
-            await authority.capability_grant()
+            installation = await authority.installation_grant_v2()
+            authority_state = "paired" if installation is not None else "unavailable"
+        else:
+            authority_state = authority_status.state
         self._runtime = RuntimeContext(
             data_dir,
             package_root=PACKAGE_ROOT,
             dependencies=None,
-            authority_state=authority_status.state,
+            authority_state=authority_state,
         )
         self.runtime_health = await self._runtime.start()
         if self.runtime_health.status == "enrollment_required":

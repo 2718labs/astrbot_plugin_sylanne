@@ -7,6 +7,9 @@ from pathlib import Path
 import re
 from typing import Protocol
 
+from ..authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
+from ..runtime_contracts import InstallationGrantV2
+
 
 AUTHORITY_PROTOCOL = "sylanne3.authority.v1"
 REQUIRED_AUTHORITY_CAPABILITIES = frozenset(
@@ -159,13 +162,19 @@ class AuthorityTransport(Protocol):
     configuration is outside this trust boundary.
     """
 
-    async def handshake(self, request: AuthorityProvisioningRequest) -> AuthorityHandshake: ...
+    async def handshake(
+        self, request: AuthorityProvisioningRequest, *, protocol: str = AUTHORITY_PROTOCOL,
+    ) -> AuthorityHandshake: ...
 
     async def capability_grant(
         self,
         request: AuthorityProvisioningRequest,
         handshake: AuthorityHandshake,
     ) -> AuthorityEnrollmentGrant | AuthorityCapabilityGrant: ...
+
+    async def installation_grant_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+    ) -> InstallationGrantV2: ...
 
 
 class AuthorityClient:
@@ -189,6 +198,8 @@ class AuthorityClient:
         self._transport = transport
         self._request: AuthorityProvisioningRequest | None = None
         self._handshake: AuthorityHandshake | None = None
+        self._v2_request: AuthorityProvisioningRequest | None = None
+        self._v2_handshake: AuthorityHandshake | None = None
 
     def _build_request(self) -> AuthorityProvisioningRequest:
         manifest_path = self._package_root / "release-manifest.json"
@@ -224,6 +235,57 @@ class AuthorityClient:
         self._request = request
         self._handshake = handshake
         return AuthorityClientStatus("paired", handshake.installation_authority_id)
+
+    async def status_v2(self) -> AuthorityClientStatus:
+        """Pair this installation using the v2 protocol on its authenticated channel."""
+        self._v2_request = None
+        self._v2_handshake = None
+        if self._transport is None:
+            return AuthorityClientStatus(
+                "enrollment_required",
+                detail="install and pair a Sylanne Authority companion service",
+            )
+        try:
+            request = await asyncio.to_thread(self._build_request)
+            handshake = await self._transport.handshake(
+                request, protocol=AUTHORITY_V2_PROTOCOL,
+            )
+        except Exception:
+            return AuthorityClientStatus("unavailable", detail="authority v2 handshake failed")
+        if not isinstance(handshake, AuthorityHandshake) or not handshake.valid_pairing():
+            return AuthorityClientStatus(
+                "enrollment_required",
+                detail="authority profile is not paired or publisher package is not trusted",
+            )
+        self._v2_request = request
+        self._v2_handshake = handshake
+        return AuthorityClientStatus("paired", handshake.installation_authority_id)
+
+    async def installation_grant_v2(self) -> InstallationGrantV2 | None:
+        """Return v2 installation facts only; no namespace activation is implied."""
+        if self._transport is None:
+            return None
+        if self._v2_request is None or self._v2_handshake is None:
+            if (await self.status_v2()).state != "paired":
+                return None
+        assert self._v2_request is not None and self._v2_handshake is not None
+        try:
+            current_request = await asyncio.to_thread(self._build_request)
+            if current_request != self._v2_request:
+                return None
+            grant = await self._transport.installation_grant_v2(
+                self._v2_request, self._v2_handshake,
+            )
+        except Exception:
+            return None
+        if not isinstance(grant, InstallationGrantV2):
+            return None
+        return grant if (
+            grant.authority_id == self._v2_handshake.installation_authority_id
+            and grant.subject == self._v2_handshake.installation_identity_ref
+            and grant.manifest_digest == self._v2_request.publisher_package.manifest_sha256
+            and grant.channel_binding_sha256 == self._v2_handshake.channel_binding_sha256
+        ) else None
 
     async def capability_grant(self) -> AuthorityCapabilityGrant | None:
         """Return a complete runtime grant; enrollment-only facts remain blocked."""
