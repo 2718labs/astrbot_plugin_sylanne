@@ -7,6 +7,7 @@ import pytest
 from sylanne3.contracts import StaleRead
 from sylanne3.graph_store import GraphRecoveryMetadataV2, GraphStore
 from sylanne3.graph_types import TypeRegistry
+from sylanne3.runtime.budget import BudgetLease, create_budget_lease
 from sylanne3.runtime_contracts import NamespaceId, SnapshotRequirementsV2
 
 
@@ -122,6 +123,94 @@ def test_unowned_legacy_clock_row_blocks_empty_namespace_genesis(tmp_path):
             store.graph_recovery_metadata(NAMESPACE, _capability=capability)
         with pytest.raises(RuntimeError, match="unsealed"):
             store.install_graph_recovery_genesis(requirements(), _capability=capability)
+        assert store._db.execute("SELECT COUNT(*) FROM graph_recovery_metadata_v2").fetchone() == (0,)
+    finally:
+        store.close()
+
+
+def test_locked_genesis_requires_capability_and_existing_transaction(tmp_path):
+    capability = object()
+    store = open_store(tmp_path / "business.db", capability)
+    try:
+        with pytest.raises(PermissionError):
+            store._install_graph_recovery_genesis_locked(requirements())
+        with pytest.raises(RuntimeError, match="active SQL transaction"):
+            store._install_graph_recovery_genesis_locked(
+                requirements(), _capability=capability)
+        assert store.graph_recovery_metadata(NAMESPACE, _capability=capability) is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("invalid_head", [
+    {"activation_generation": 0},
+    {"revocation_epoch": 1},
+    {"deletion_seq": 1, "deletion_digest": "sha256:" + "a" * 64},
+    {"execution_seq": 1, "execution_digest": "sha256:" + "b" * 64},
+])
+def test_locked_genesis_requires_active_zero_heads(tmp_path, invalid_head):
+    capability = object()
+    store = open_store(tmp_path / "business.db", capability)
+    try:
+        with store._lock:
+            store._db.execute("BEGIN IMMEDIATE")
+            try:
+                with pytest.raises(ValueError, match="zero-head"):
+                    store._install_graph_recovery_genesis_locked(
+                        requirements(**invalid_head), _capability=capability)
+            finally:
+                store._db.execute("ROLLBACK")
+        assert store._db.execute("SELECT COUNT(*) FROM graph_recovery_metadata_v2").fetchone() == (0,)
+    finally:
+        store.close()
+
+
+def test_locked_genesis_rolls_back_with_guard_and_budget_rows(tmp_path):
+    capability = object()
+    store = open_store(tmp_path / "business.db", capability)
+    try:
+        with pytest.raises(RuntimeError, match="simulated provisioning failure"):
+            with store._lock:
+                store._db.execute("BEGIN IMMEDIATE")
+                try:
+                    installed = store._install_graph_recovery_genesis_locked(
+                        requirements(), _capability=capability)
+                    assert installed == GraphRecoveryMetadataV2(requirements(), 0)
+                    store._db.execute(
+                        "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                        "VALUES(?,?,?,?,?)",
+                        (*NAMESPACE.as_tuple, "activation", "current", "1"))
+                    lease = BudgetLease(
+                        "lease-a", None, *NAMESPACE.as_tuple, "USD",
+                        {"cpu_ms": 100}, {}, {}, {}, 1, "active")
+                    create_budget_lease(store._db, lease, "budget-create-a", "a" * 64)
+                    raise RuntimeError("simulated provisioning failure")
+                except BaseException:
+                    store._db.execute("ROLLBACK")
+                    raise
+        assert store.graph_recovery_metadata(NAMESPACE, _capability=capability) is None
+        for table in ("graph_recovery_metadata_v2", "graph_guard_versions",
+                      "runtime_budget_leases", "runtime_budget_operations"):
+            assert store._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+    finally:
+        store.close()
+
+
+def test_locked_genesis_still_rejects_legacy_history(tmp_path):
+    capability = object()
+    store = open_store(tmp_path / "business.db", capability)
+    try:
+        store._db.execute(
+            "INSERT INTO atoms(bot,persona,session,name,revision,value) "
+            "VALUES(?,?,?,?,?,?)", (*NAMESPACE.as_tuple, "session", "x", 1, "{}"))
+        with store._lock:
+            store._db.execute("BEGIN IMMEDIATE")
+            try:
+                with pytest.raises(RuntimeError, match="unsealed"):
+                    store._install_graph_recovery_genesis_locked(
+                        requirements(), _capability=capability)
+            finally:
+                store._db.execute("ROLLBACK")
         assert store._db.execute("SELECT COUNT(*) FROM graph_recovery_metadata_v2").fetchone() == (0,)
     finally:
         store.close()

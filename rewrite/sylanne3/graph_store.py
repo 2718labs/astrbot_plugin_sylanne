@@ -321,8 +321,8 @@ class GraphStore(Store):
                 raise RuntimeError("namespace has unsealed business state")
             return self._decode_recovery(row, namespace)
 
-    def install_graph_recovery_genesis(self, requirements, *, _capability=None):
-        """Install explicit zero-head metadata only for an empty namespace."""
+    def _install_graph_recovery_genesis_locked(self, requirements, *, _capability=None):
+        """Stage genesis in the caller's existing business SQL transaction."""
         self._require_recovery_capability(_capability)
         encoded = self._recovery_payload(requirements)
         if (requirements.activation_generation == 0 or requirements.revocation_epoch != 0
@@ -330,23 +330,34 @@ class GraphStore(Store):
             raise ValueError("graph genesis requires an active zero-head snapshot")
         with self._lock:
             self._ensure_open()
+            if not self._db.in_transaction:
+                raise RuntimeError("graph genesis requires an active SQL transaction")
+            if self._recovery_row(requirements.namespace) is not None:
+                raise StaleRead("graph recovery metadata already installed")
+            if self._has_namespace_history(requirements.namespace):
+                raise RuntimeError("namespace has unsealed business state")
+            self._db.execute(
+                "INSERT INTO graph_recovery_metadata_v2"
+                "(bot,persona,schema,requirements_json,graph_revision) "
+                "VALUES(?,?,?,?,0)",
+                requirements.namespace.as_tuple + (requirements.schema, encoded),
+            )
+            return GraphRecoveryMetadataV2(requirements, 0)
+
+    def install_graph_recovery_genesis(self, requirements, *, _capability=None):
+        """Install explicit zero-head metadata only for an empty namespace."""
+        self._require_recovery_capability(_capability)
+        with self._lock:
+            self._ensure_open()
             self._db.execute("BEGIN IMMEDIATE")
             try:
-                if self._recovery_row(requirements.namespace) is not None:
-                    raise StaleRead("graph recovery metadata already installed")
-                if self._has_namespace_history(requirements.namespace):
-                    raise RuntimeError("namespace has unsealed business state")
-                self._db.execute(
-                    "INSERT INTO graph_recovery_metadata_v2"
-                    "(bot,persona,schema,requirements_json,graph_revision) "
-                    "VALUES(?,?,?,?,0)",
-                    requirements.namespace.as_tuple + (requirements.schema, encoded),
-                )
+                result = self._install_graph_recovery_genesis_locked(
+                    requirements, _capability=_capability)
                 self._db.execute("COMMIT")
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
-        return GraphRecoveryMetadataV2(requirements, 0)
+        return result
 
     def cas_graph_recovery_metadata(self, expected, replacement, *, _capability=None):
         """Advance the namespace commit stamp inside the caller's SQL transaction."""
