@@ -44,6 +44,7 @@ class DomainRegistry:
     unavailable: object
     type_registry: TypeRegistry
     required_domains: tuple[str, ...] = REQUIRED_DOMAINS
+    active_affect_scheme: AffectScheme | None = None
 
     @property
     def complete(self) -> bool:
@@ -99,12 +100,15 @@ def discover_domain_registry(*, active_affect_scheme: AffectScheme | None = None
             registrations[domain] = DomainRegistration(
                 domain, provider, proposal_schema, proposal_hash, specs
             )
+            if domain == "d04" and active_affect_scheme is None:
+                unavailable[domain] = "active D04 scheme is required for a complete registry"
         except Exception as exc:
             unavailable[domain] = f"{type(exc).__name__}: {exc}"
     return DomainRegistry(
         MappingProxyType(registrations),
         MappingProxyType(unavailable),
         catalogue.freeze(),
+        active_affect_scheme=active_affect_scheme,
     )
 
 

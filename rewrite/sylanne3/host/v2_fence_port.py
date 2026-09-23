@@ -286,6 +286,7 @@ class V2FencePort:
         generation: int, operation: str, operation_id: str, expected_anchor: RestoreAnchor,
         effect_id: str | None = None, command_digest: str | None = None,
         footprint: RecoveryConstraintFootprint | None = None,
+        retain_on_unknown: bool = False,
     ) -> FencePermitV2:
         with self._lock:
             self.recover_pending_finish()
@@ -297,7 +298,7 @@ class V2FencePort:
             except RuntimeError as exc:
                 if not isinstance(exc, V2FenceOutcomeUnknown) and str(exc) not in _REPAIRABLE_ERRORS:
                     raise
-                if operation in _CONTENT_OPERATIONS and all(
+                if not retain_on_unknown and operation in _CONTENT_OPERATIONS and all(
                     value is None for value in (effect_id, command_digest, footprint)
                 ):
                     self._pending_begin = _PendingBegin(

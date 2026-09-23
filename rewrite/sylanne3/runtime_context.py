@@ -14,7 +14,10 @@ from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
 from .host.installed_package import verify_installed_package
+from .host.v2_installation import V2InstallationAssembly
 from .host.v2_fence_port import V2FenceOutcomeUnknown
+from .installation_policy import AdminInstallationPolicy
+from .runtime.issuers import D11BudgetGrantIssuer
 from .runtime.restore_anchor import ExecutionJournalPort
 from .runtime_contracts import InstallationGrantV2, NamespaceId
 
@@ -103,6 +106,7 @@ class RuntimeContext:
         self._store: ProductionGraphStore | None = None
         self._coordinator: GraphCoordinator | None = None
         self._worker: GraphWorker | None = None
+        self._v2_provision: Callable | None = None
         self._ingress_handler: Callable[
             [HostIngressEnvelope, GraphCoordinator], Awaitable[IngressReceipt]
         ] | None = None
@@ -111,8 +115,7 @@ class RuntimeContext:
 
     async def start_v2(
         self,
-        installation_grant: InstallationGrantV2,
-        fence_port_factory: Callable,
+        installation: V2InstallationAssembly,
         *,
         capacity: int = 8,
     ) -> RuntimeHealth:
@@ -127,13 +130,34 @@ class RuntimeContext:
             if not self._domains.complete:
                 self.health = RuntimeHealth("blocked", ("domain_registry",))
                 return self.health
-            if type(installation_grant) is not InstallationGrantV2:
-                self.health = RuntimeHealth("blocked", ("installation_grant",))
+            if type(installation) is not V2InstallationAssembly:
+                self.health = RuntimeHealth("blocked", ("v2_installation",))
                 return self.health
+            installation_grant = installation.installation_grant
+            policy = installation.installation_policy
+            if (type(policy) is not AdminInstallationPolicy
+                    or type(installation_grant) is not InstallationGrantV2
+                    or not installation.package_root.is_absolute()
+                    or not installation.data_dir.is_absolute()
+                    or installation.package_root != self._package_root
+                    or installation.data_dir != self._data_dir
+                    or installation_grant.authority_id != policy.expected_authority_id
+                    or installation_grant.installation_id != policy.installation_id
+                    or installation_grant.administrator_holder != policy.administrator_holder
+                    or installation_grant.manifest_digest != policy.manifest_digest):
+                self.health = RuntimeHealth("blocked", ("v2_installation",))
+                return self.health
+            if isinstance(self._domains, DomainRegistry):
+                scheme = self._domains.active_affect_scheme
+                if (scheme is None or policy.scheme_version != scheme.scheme_version
+                        or policy.operator_version != scheme.operator_version):
+                    self.health = RuntimeHealth("blocked", ("affect_scheme",))
+                    return self.health
             package = await asyncio.to_thread(
                 verify_installed_package,
                 self._package_root,
-                installation_grant.manifest_digest,
+                policy.manifest_digest,
+                available_cpu_features=installation.available_cpu_features,
             )
             if not package.verified or package.build_mode != "formal-alpha1":
                 self.health = RuntimeHealth(
@@ -149,13 +173,17 @@ class RuntimeContext:
                     self._data_dir / "sylanne3.sqlite3", self._domains.type_registry,
                 )
 
+            provision = None
+
             def make_coordinator(store, port):
-                if port.installation_grant() != installation_grant:
+                nonlocal provision
+                if port.installation_grant != installation_grant:
                     raise RuntimeError("v2 port installation grant changed")
                 bootstrap = object()
                 coordinator = GraphCoordinator(
                     store, bootstrap, holder=installation_grant.administrator_holder,
                     content_fence_v2=port,
+                    d11_issuer=D11BudgetGrantIssuer(installation.d11_signing_key),
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(
@@ -163,23 +191,39 @@ class RuntimeContext:
                         registration.proposal_schema,
                         registration.proposal_schema_hash,
                     )
+                provision = lambda graph, operation_id: graph.provision_namespace_v2(
+                    bootstrap, policy, operation_id=operation_id,
+                )
                 return coordinator
 
             try:
                 self._worker = await GraphWorker.start(
                     make_store, make_coordinator,
-                    fence_port_factory=fence_port_factory, capacity=capacity,
+                    fence_port_factory=installation.fence_port_factory, capacity=capacity,
                 )
             except Exception:
                 self.health = RuntimeHealth(
                     "blocked", ("graph_worker",), "v2 graph worker could not initialize",
                 )
                 return self.health
+            self._v2_provision = provision
             self.health = RuntimeHealth(
                 "limited", ("namespace_activation",),
                 "v2 graph worker started; namespace admission is pending",
             )
             return self.health
+
+    async def provision_installed_namespace(self, operation_id: str):
+        """Provision the installed administrator namespace on its graph worker."""
+        async with self._lock:
+            if self._worker is None or self._v2_provision is None:
+                raise RuntimeError("v2 graph worker is unavailable")
+            receipt = await self._worker.call(self._v2_provision, operation_id)
+            self.health = RuntimeHealth(
+                "limited", ("product_ingress", "dispatch"),
+                "installed namespace provisioned; product ingress and dispatch are pending",
+            )
+            return receipt
 
     async def start(self) -> RuntimeHealth:
         async with self._lock:
@@ -318,6 +362,7 @@ class RuntimeContext:
                 return self.health
             self.health = RuntimeHealth("draining")
             worker, self._worker = self._worker, None
+            self._v2_provision = None
             store, self._store = self._store, None
             self._coordinator = None
             self._ingress_handler = None

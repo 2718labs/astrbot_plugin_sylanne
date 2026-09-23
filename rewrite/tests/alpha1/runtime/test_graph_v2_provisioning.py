@@ -1,6 +1,7 @@
 """Administrator namespace genesis uses one fenced, atomic business write."""
 
 from dataclasses import replace
+import shutil
 import sqlite3
 import time
 
@@ -36,6 +37,8 @@ class AuthorityPort:
         self.validations = []
         self.finishes = []
         self.lose_finish_after_durable = False
+        self.lose_begin_after_durable = False
+        self.lose_genesis_after_durable = False
 
     def outside_graph_lock(self):
         assert not self.store._lock._is_owned()
@@ -48,9 +51,13 @@ class AuthorityPort:
             "deletion:" + namespace.persona_id, 0, "genesis",
             "execution:" + namespace.persona_id, 0, "genesis", 0,
             "authority-proof"))
-        return NamespaceBootstrapV2(
+        result = NamespaceBootstrapV2(
             "authority", namespace, anchor.namespace, "administrator", 1,
             "active", NamespaceRuntimeState.ACTIVE, anchor, ())
+        if self.lose_genesis_after_durable:
+            self.lose_genesis_after_durable = False
+            raise RuntimeError("genesis response lost")
+        return result
 
     def current_anchor(self, *, namespace, authority_namespace):
         self.outside_graph_lock()
@@ -72,9 +79,13 @@ class AuthorityPort:
         assert expected_anchor == self.anchors[namespace]
         assert expected_anchor.namespace == authority_namespace
         assert generation == 1
-        return self.fences.begin_fence(
+        permit = self.fences.begin_fence(
             subject="subject", holder=holder, operation=operation,
             operation_id=operation_id, current_anchor=expected_anchor)
+        if operation == "write" and self.lose_begin_after_durable:
+            self.lose_begin_after_durable = False
+            raise RuntimeError("begin response lost")
+        return permit
 
     def validate_fence(self, scope):
         self.outside_graph_lock()
@@ -136,7 +147,8 @@ def row_counts(store):
         for table in (
             "graph_recovery_metadata_v2", "graph_guard_versions",
             "runtime_budget_leases", "runtime_budget_operations",
-            "runtime_budget_grants", "graph_namespace_provisioning_v2")}
+            "runtime_budget_grants", "graph_namespace_provisioning_v2",
+            "graph_namespace_provision_intents_v2")}
 
 
 def test_genesis_uses_d11_grant_capability_without_d02(tmp_path):
@@ -168,7 +180,8 @@ def test_success_stages_recovery_guards_real_budget_and_reconcilable_receipt(sys
     assert row_counts(store) == {
         "graph_recovery_metadata_v2": 1, "graph_guard_versions": 4,
         "runtime_budget_leases": 1, "runtime_budget_operations": 1,
-        "runtime_budget_grants": 1, "graph_namespace_provisioning_v2": 1}
+        "runtime_budget_grants": 1, "graph_namespace_provisioning_v2": 1,
+        "graph_namespace_provision_intents_v2": 1}
     metadata = store.graph_recovery_metadata(
         policy.namespace, _capability=store._coordinator_capability)
     assert metadata.requirements.graph_incarnation == receipt.graph_incarnation
@@ -188,7 +201,7 @@ def test_success_stages_recovery_guards_real_budget_and_reconcilable_receipt(sys
     assert port.validations == ["write", "write", "read", "read"]
 
 
-def test_issuer_failure_rolls_back_all_business_rows(system):
+def test_issuer_failure_rolls_back_genesis_but_keeps_exact_intent_and_fence(system):
     store, coordinator, bootstrap, port, d11 = system
     def unavailable(*_args):
         raise RuntimeError("issuer unavailable")
@@ -196,8 +209,16 @@ def test_issuer_failure_rolls_back_all_business_rows(system):
     with pytest.raises(RuntimeError, match="issuer unavailable"):
         coordinator.provision_namespace_v2(
             bootstrap, policy_for(store), operation_id="install-persona")
-    assert all(count == 0 for count in row_counts(store).values())
-    assert len(port.finishes) == 1
+    counts = row_counts(store)
+    assert counts["graph_namespace_provision_intents_v2"] == 1
+    assert all(count == 0 for table, count in counts.items()
+               if table != "graph_namespace_provision_intents_v2")
+    assert not port.finishes
+    intent = coordinator._provision_intent_row(store._db, policy_for(store).namespace)
+    _, state = port.get_fence_operation(
+        namespace=intent.namespace, authority_namespace="opaque:persona",
+        operation_id=intent.fence_attempt_id)
+    assert state == "active"
 
 
 def test_same_business_id_with_different_policy_digest_is_rejected(system):
@@ -262,10 +283,12 @@ def test_competing_authority_write_fence_leaves_business_db_empty(system):
         subject="subject", holder="administrator", operation="write",
         operation_id="foreign-active", current_anchor=anchor)
     try:
-        with pytest.raises(RuntimeError, match="active v2 fence"):
+        with pytest.raises(UnavailableGuard, match="HOLD"):
             coordinator.provision_namespace_v2(
                 bootstrap, policy, operation_id="install-persona")
-        assert all(count == 0 for count in row_counts(store).values())
+        assert row_counts(store)["graph_namespace_provision_intents_v2"] == 1
+        assert row_counts(store)["graph_namespace_provisioning_v2"] == 0
+        assert row_counts(store)["runtime_budget_leases"] == 0
     finally:
         port.fences.finish_fence(
             foreign, subject="subject", current_anchor=anchor,
@@ -360,3 +383,212 @@ def test_mismatched_authority_permit_cannot_finish_old_active_fence(system):
             bootstrap, policy, operation_id="install-persona")
     assert not port.finishes
     assert row_counts(store)["runtime_budget_leases"] == 1
+
+
+def test_cold_restart_after_unknown_begin_replays_exact_attempt(system, tmp_path):
+    store, coordinator, bootstrap, port, d11 = system
+    policy = policy_for(store)
+    port.lose_begin_after_durable = True
+    with pytest.raises(UnavailableGuard, match="HOLD"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    intent = coordinator._provision_intent_row(store._db, policy.namespace)
+    assert intent.anchor_json is not None
+    assert row_counts(store)["graph_namespace_provisioning_v2"] == 0
+    _, state = port.get_fence_operation(
+        namespace=policy.namespace, authority_namespace=policy.authority_namespace,
+        operation_id=intent.fence_attempt_id)
+    assert state == "active"
+    anchor = port.anchors[policy.namespace]
+
+    store.close()
+    port.fences._db.close()
+    reopened = ProductionGraphStore(tmp_path / "business.db", TypeRegistry())
+    authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
+    next_port = AuthorityPort(reopened, authority_db)
+    next_port.anchors[policy.namespace] = anchor
+    next_bootstrap = object()
+    next_coordinator = GraphCoordinator(
+        reopened, next_bootstrap, holder="administrator",
+        content_fence_v2=next_port, d11_issuer=d11)
+    try:
+        receipt = next_coordinator.provision_namespace_v2(
+            next_bootstrap, policy, operation_id="install-persona")
+        assert receipt.fence_attempt_id == intent.fence_attempt_id
+        assert receipt.graph_incarnation == intent.graph_incarnation
+        assert not next_port.genesis_requests
+        assert row_counts(reopened)["graph_namespace_provisioning_v2"] == 1
+    finally:
+        reopened.close()
+        authority_db.close()
+
+
+def test_d11_rollback_cold_restart_keeps_active_attempt(system, tmp_path):
+    store, coordinator, bootstrap, port, d11 = system
+    policy = policy_for(store)
+    original = d11.issue_budget_grant
+    d11.issue_budget_grant = lambda *_: (_ for _ in ()).throw(RuntimeError("D11 fail"))
+    with pytest.raises(RuntimeError, match="D11 fail"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    intent = coordinator._provision_intent_row(store._db, policy.namespace)
+    anchor = port.anchors[policy.namespace]
+    assert not port.finishes
+    d11.issue_budget_grant = original
+
+    store.close()
+    port.fences._db.close()
+    reopened = ProductionGraphStore(tmp_path / "business.db", TypeRegistry())
+    authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
+    next_port = AuthorityPort(reopened, authority_db)
+    next_port.anchors[policy.namespace] = anchor
+    next_bootstrap = object()
+    next_coordinator = GraphCoordinator(
+        reopened, next_bootstrap, holder="administrator",
+        content_fence_v2=next_port, d11_issuer=d11)
+    try:
+        receipt = next_coordinator.provision_namespace_v2(
+            next_bootstrap, policy, operation_id="install-persona")
+        assert receipt.fence_attempt_id == intent.fence_attempt_id
+        assert not next_port.genesis_requests
+    finally:
+        reopened.close()
+        authority_db.close()
+
+
+def test_subject_and_authority_namespace_change_reject_before_rpc(system):
+    store, coordinator, bootstrap, port, _ = system
+    policy = policy_for(store)
+    port.lose_begin_after_durable = True
+    with pytest.raises(UnavailableGuard, match="HOLD"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    initial_calls = len(port.genesis_requests)
+    port.installation_grant = replace(port.installation_grant, subject="other-subject")
+    with pytest.raises(AuthorityDenied, match="identity differs"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    port.installation_grant = replace(port.installation_grant, subject="subject")
+    with pytest.raises(AuthorityDenied, match="identity differs"):
+        coordinator.provision_namespace_v2(
+            bootstrap, replace(policy, authority_namespace="opaque:other"),
+            operation_id="install-persona")
+    assert len(port.genesis_requests) == initial_calls
+
+
+def test_finished_fence_without_business_receipt_holds(system):
+    store, coordinator, bootstrap, port, _ = system
+    policy = policy_for(store)
+    port.lose_begin_after_durable = True
+    with pytest.raises(UnavailableGuard, match="HOLD"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    intent = coordinator._provision_intent_row(store._db, policy.namespace)
+    anchor = port.anchors[policy.namespace]
+    permit, state = port.get_fence_operation(
+        namespace=policy.namespace, authority_namespace=policy.authority_namespace,
+        operation_id=intent.fence_attempt_id)
+    assert state == "active"
+    port.fences.finish_fence(
+        permit, subject="subject", current_anchor=anchor,
+        request_id="external-finish", request_digest="sha256:" + "b" * 64)
+    with pytest.raises(UnavailableGuard, match="HOLD"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    assert not port.finishes
+    assert row_counts(store)["graph_namespace_provisioning_v2"] == 0
+
+
+def test_lost_genesis_response_retries_same_request(system):
+    store, coordinator, bootstrap, port, _ = system
+    policy = policy_for(store)
+    port.lose_genesis_after_durable = True
+    with pytest.raises(RuntimeError, match="genesis response lost"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    intent = coordinator._provision_intent_row(store._db, policy.namespace)
+    assert intent.anchor_json is None
+    assert port.genesis_requests == [(policy.namespace, intent.genesis_request_id)]
+    receipt = coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="install-persona")
+    assert receipt.fence_attempt_id == intent.fence_attempt_id
+    assert port.genesis_requests == [
+        (policy.namespace, intent.genesis_request_id)] * 2
+
+
+@pytest.mark.parametrize("column,wrong_id", [
+    ("genesis_request_id", "namespace-genesis-" + "f" * 48),
+    ("fence_attempt_id", "provision-write-" + "f" * 48),
+    ("graph_incarnation", "graph:" + "f" * 64),
+])
+def test_corrupt_persisted_attempt_identity_holds_before_authority_rpc(
+        system, column, wrong_id):
+    store, coordinator, bootstrap, port, _ = system
+    policy = policy_for(store)
+    port.lose_genesis_after_durable = True
+    with pytest.raises(RuntimeError, match="genesis response lost"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    initial_calls = len(port.genesis_requests)
+    store._db.execute("DROP TRIGGER graph_namespace_provision_intent_anchor_once_v2")
+    store._db.execute(
+        f"UPDATE graph_namespace_provision_intents_v2 SET {column}=? "
+        "WHERE bot=? AND persona=?", (wrong_id,) + policy.namespace.as_tuple)
+    with pytest.raises(UnavailableGuard, match="intent is invalid"):
+        coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="install-persona")
+    assert len(port.genesis_requests) == initial_calls
+    assert row_counts(store)["graph_namespace_provisioning_v2"] == 0
+
+
+def test_legacy_receipt_without_intent_reconciles_without_backfill(system):
+    store, coordinator, bootstrap, port, _ = system
+    policy = policy_for(store)
+    receipt = coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="install-persona")
+    store._db.execute("DROP TRIGGER graph_namespace_provision_intent_no_delete_v2")
+    store._db.execute("DELETE FROM graph_namespace_provision_intents_v2")
+    assert coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="install-persona") == receipt
+    assert coordinator._provision_intent_row(store._db, policy.namespace) is None
+    assert len(port.genesis_requests) == 1
+
+
+def test_restored_pre_intent_business_db_reuses_finished_attempt_and_holds(
+        system, tmp_path):
+    store, coordinator, bootstrap, port, d11 = system
+    policy = policy_for(store)
+    before_path = tmp_path / "business-before.db"
+    before = sqlite3.connect(before_path)
+    store._db.backup(before)
+    before.close()
+    receipt = coordinator.provision_namespace_v2(
+        bootstrap, policy, operation_id="install-persona")
+    first_intent = coordinator._provision_intent_row(store._db, policy.namespace)
+    anchor = port.anchors[policy.namespace]
+
+    store.close()
+    port.fences._db.close()
+    shutil.copyfile(before_path, tmp_path / "business.db")
+    reopened = ProductionGraphStore(tmp_path / "business.db", TypeRegistry())
+    authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
+    next_port = AuthorityPort(reopened, authority_db)
+    next_port.anchors[policy.namespace] = anchor
+    next_bootstrap = object()
+    next_coordinator = GraphCoordinator(
+        reopened, next_bootstrap, holder="administrator",
+        content_fence_v2=next_port, d11_issuer=d11)
+    try:
+        with pytest.raises(UnavailableGuard, match="HOLD"):
+            next_coordinator.provision_namespace_v2(
+                next_bootstrap, policy, operation_id="install-persona")
+        restored = next_coordinator._provision_intent_row(reopened._db, policy.namespace)
+        assert restored.genesis_request_id == first_intent.genesis_request_id
+        assert restored.fence_attempt_id == receipt.fence_attempt_id
+        assert restored.graph_incarnation == receipt.graph_incarnation
+        assert row_counts(reopened)["runtime_budget_leases"] == 0
+        assert row_counts(reopened)["graph_namespace_provisioning_v2"] == 0
+        assert not next_port.finishes
+    finally:
+        reopened.close()
+        authority_db.close()

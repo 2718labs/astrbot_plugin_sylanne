@@ -1,4 +1,3 @@
-from .astrbot import AstrBotIngressError, build_astrbot_ingress
 from .authority_client import (
     AuthorityCapabilityGrant,
     AuthorityClient,
@@ -25,6 +24,16 @@ from .d06_ingress import (
     build_d06_ingress_handler,
     source_admission_from_host,
 )
+from .v2_installation import V2InstallationAssembly, assemble_v2_installation
+
+
+def __getattr__(name: str):
+    if name in {"AstrBotIngressError", "build_astrbot_ingress"}:
+        from .astrbot import AstrBotIngressError, build_astrbot_ingress
+
+        return {"AstrBotIngressError": AstrBotIngressError,
+                "build_astrbot_ingress": build_astrbot_ingress}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = (
     "AstrBotIngressError",
@@ -35,6 +44,7 @@ __all__ = (
     "AuthoritySelection",
     "AuthorityTlsProfile",
     "AuthorizedIngressCommit",
+    "V2InstallationAssembly",
     "HostIngressEnvelope",
     "IngressReceipt",
     "IngressBundleAssembler",
@@ -50,6 +60,7 @@ __all__ = (
     "TrustedIngressIssuer",
     "build_astrbot_ingress",
     "build_d06_ingress_handler",
+    "assemble_v2_installation",
     "source_admission_from_host",
     "ingress_content_fingerprint",
 )

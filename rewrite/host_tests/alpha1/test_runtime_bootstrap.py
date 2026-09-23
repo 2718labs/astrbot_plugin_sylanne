@@ -23,6 +23,7 @@ from astrbot.core.star.filter.event_message_type import EventMessageTypeFilter
 from astrbot.core.star.star_handler import star_handlers_registry
 
 from sylanne3.domain_registry import REQUIRED_DOMAINS, discover_domain_registry
+from sylanne3.domains.d04 import AffectAxis, AffectScheme
 from sylanne3.domains.d06 import D06DomainProvider
 from sylanne3.graph_coordinator import (
     GraphCoordinator, IngressClockSample, IngressIssuancePolicy,
@@ -58,6 +59,14 @@ from sylanne3.runtime_context import RuntimeContext, RuntimeDependencies, Runtim
 
 ROOT = Path(__file__).resolve().parents[3]
 MODULE = "data.plugins.sylanne3_alpha1.main"
+
+
+def registry_with_test_affect_scheme():
+    return discover_domain_registry(active_affect_scheme=AffectScheme(
+        "d04.affect.scheme.v1", "test-scheme", "test-operator",
+        "test-parameters", "test-coupling",
+        (AffectAxis("care", "normalized", "care for another"),), (),
+    ))
 
 
 def controlled_ingress_policy(namespace: NamespaceId, policy_ref: str) -> IngressIssuancePolicy:
@@ -145,11 +154,15 @@ class _IngressContext:
 
 
 class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
-    def test_default_catalogue_registers_all_twelve_real_domain_providers(self) -> None:
+    def test_default_catalogue_registers_types_but_requires_an_active_d04_scheme(self) -> None:
         registry = discover_domain_registry()
         self.assertEqual(set(registry.required_domains), set(REQUIRED_DOMAINS))
-        self.assertTrue(registry.complete)
-        self.assertEqual(dict(registry.unavailable), {})
+        self.assertEqual(set(registry.registrations), set(REQUIRED_DOMAINS))
+        self.assertFalse(registry.complete)
+        self.assertEqual(
+            dict(registry.unavailable),
+            {"d04": "active D04 scheme is required for a complete registry"},
+        )
         self.assertIn("d12", registry.registrations)
         self.assertTrue(registry.type_registry.specs)
         self.assertTrue(all(spec.writer_domain for spec in registry.type_registry.specs))
@@ -197,7 +210,10 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 ingress_clock=controlled_ingress_clock,
                 ingress_handler_factory=lambda coordinator, bootstrap: ingress,
             )
-            context = RuntimeContext(root / "data", package_root=root, dependencies=dependencies)
+            context = RuntimeContext(
+                root / "data", package_root=root, dependencies=dependencies,
+                domains=registry_with_test_affect_scheme(),
+            )
             await context.start()
             self.assertEqual(context.health.status, "blocked")
             self.assertIn("package_manifest", context.health.missing_capabilities)
@@ -244,7 +260,10 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 ingress_clock=controlled_ingress_clock,
                 ingress_handler_factory=factory,
             )
-            context = RuntimeContext(root / "data", package_root=root, dependencies=dependencies)
+            context = RuntimeContext(
+                root / "data", package_root=root, dependencies=dependencies,
+                domains=registry_with_test_affect_scheme(),
+            )
             self.assertEqual((await context.start()).status, "blocked")
             self.assertEqual(context.health.missing_capabilities, ("ingress_handler",))
             self.assertEqual(len(seen), 1)
@@ -252,13 +271,17 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await context.handle_ingress(await build_astrbot_ingress(Event(), _IngressContext())), IngressReceipt("unavailable"))
 
             missing_factory = replace(dependencies, ingress_handler_factory=None)
-            blocked = RuntimeContext(root / "other", package_root=root, dependencies=missing_factory)
+            blocked = RuntimeContext(
+                root / "other", package_root=root, dependencies=missing_factory,
+                domains=registry_with_test_affect_scheme(),
+            )
             self.assertEqual((await blocked.start()).missing_capabilities, ("ingress_handler_factory",))
             self.assertFalse((root / "other" / "sylanne3.sqlite3").exists())
 
             missing_policy = replace(dependencies, ingress_policy=None)
             blocked_policy = RuntimeContext(
-                root / "without-policy", package_root=root, dependencies=missing_policy
+                root / "without-policy", package_root=root, dependencies=missing_policy,
+                domains=registry_with_test_affect_scheme(),
             )
             self.assertEqual(
                 (await blocked_policy.start()).missing_capabilities,
@@ -268,7 +291,8 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
             missing_clock = replace(dependencies, ingress_clock=None)
             blocked_clock = RuntimeContext(
-                root / "without-clock", package_root=root, dependencies=missing_clock
+                root / "without-clock", package_root=root, dependencies=missing_clock,
+                domains=registry_with_test_affect_scheme(),
             )
             self.assertEqual(
                 (await blocked_clock.start()).missing_capabilities,

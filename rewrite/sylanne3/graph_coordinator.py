@@ -142,6 +142,18 @@ class NamespaceProvisionReceiptV2:
 
 
 @dataclass(frozen=True)
+class _NamespaceProvisionIntentV2:
+    namespace: NamespaceId
+    operation_id: str
+    digest: str
+    identity_json: str
+    genesis_request_id: str
+    fence_attempt_id: str
+    graph_incarnation: str
+    anchor_json: str | None
+
+
+@dataclass(frozen=True)
 class IngressIssuancePolicy:
     """Installation-owned, bounded inputs to first D06 encoding admission."""
 
@@ -466,6 +478,129 @@ class GraphCoordinator:
         ).fetchone()
 
     @staticmethod
+    def _provision_intent_row(db, namespace: NamespaceId):
+        row = db.execute(
+            "SELECT operation_id,digest,identity_json,genesis_request_id,"
+            "fence_attempt_id,graph_incarnation,anchor_json "
+            "FROM graph_namespace_provision_intents_v2 WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()
+        if row is None:
+            return None
+        intent = _NamespaceProvisionIntentV2(namespace, *row)
+        try:
+            expected = GraphCoordinator._fixed_provision_ids(
+                intent.identity_json, intent.operation_id, intent.digest)
+            if (intent.genesis_request_id, intent.fence_attempt_id,
+                    intent.graph_incarnation) != expected:
+                raise ValueError("provisioning attempt IDs differ")
+            if (intent.anchor_json is not None
+                    and canonical_json(json.loads(intent.anchor_json))
+                    != intent.anchor_json):
+                raise ValueError("provisioning anchor is noncanonical")
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("durable v2 provisioning intent is invalid") from exc
+        return intent
+
+    @staticmethod
+    def _fixed_provision_ids(identity_json, operation_id, digest):
+        identity = json.loads(identity_json)
+        if type(identity) is not dict or canonical_json(identity) != identity_json:
+            raise ValueError("noncanonical provisioning identity")
+        base = {
+            "identity": identity, "operation_id": operation_id,
+            "input_digest": digest,
+        }
+        def fixed_id(domain):
+            return canonical_digest({"domain": domain, **base})
+        return (
+            "namespace-genesis-" + fixed_id("genesis")[:48],
+            "provision-write-" + fixed_id("write")[:48],
+            "graph:" + fixed_id("incarnation"),
+        )
+
+    @staticmethod
+    def _check_provision_intent(intent, operation_id, digest, identity_json):
+        if (intent.operation_id != operation_id or intent.digest != digest
+                or intent.identity_json != identity_json):
+            raise AuthorityDenied("namespace provisioning identity differs")
+
+    def _ensure_provision_intent(self, policy, grant, operation_id, digest):
+        store = self.__store
+        namespace = policy.namespace
+        identity_json = canonical_json({
+            "policy": policy.digest_payload(), "authority_id": grant.authority_id,
+            "subject": grant.subject, "holder": grant.administrator_holder,
+            "installation_id": grant.installation_id,
+            "authority_namespace": policy.authority_namespace,
+        })
+        with store._lock:
+            store._ensure_open()
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                intent = self._provision_intent_row(db, namespace)
+                if intent is None:
+                    if (self._provision_row(db, namespace) is not None
+                            or store._recovery_row(namespace) is not None
+                            or store._has_namespace_history(namespace)
+                            or GraphStore.graph_epoch(
+                                store, *namespace.as_tuple,
+                                _capability=self.__graph_capability).revision != 0):
+                        raise UnavailableGuard("namespace has unsealed business history")
+                    genesis_id, attempt_id, incarnation = self._fixed_provision_ids(
+                        identity_json, operation_id, digest)
+                    intent = _NamespaceProvisionIntentV2(
+                        namespace, operation_id, digest, identity_json,
+                        genesis_id, attempt_id, incarnation, None)
+                    db.execute(
+                        "INSERT INTO graph_namespace_provision_intents_v2"
+                        "(bot,persona,operation_id,digest,identity_json,"
+                        "genesis_request_id,fence_attempt_id,graph_incarnation,anchor_json)"
+                        " VALUES(?,?,?,?,?,?,?,?,NULL)",
+                        namespace.as_tuple + (
+                            intent.operation_id, intent.digest, intent.identity_json,
+                            intent.genesis_request_id, intent.fence_attempt_id,
+                            intent.graph_incarnation))
+                self._check_provision_intent(intent, operation_id, digest, identity_json)
+                if self._provision_row(db, namespace) is None:
+                    if (store._recovery_row(namespace) is not None
+                            or store._has_namespace_history(
+                                namespace, provision_intent=(operation_id, digest))
+                            or GraphStore.graph_epoch(
+                                store, *namespace.as_tuple,
+                                _capability=self.__graph_capability).revision != 0):
+                        raise UnavailableGuard("namespace has unsealed business history")
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        return intent, identity_json
+
+    def _persist_provision_anchor(self, intent, anchor, identity_json):
+        store = self.__store
+        encoded = canonical_json(asdict(anchor))
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._provision_intent_row(db, intent.namespace)
+                self._check_provision_intent(
+                    current, intent.operation_id, intent.digest, identity_json)
+                if current.anchor_json is None:
+                    db.execute(
+                        "UPDATE graph_namespace_provision_intents_v2 SET anchor_json=? "
+                        "WHERE bot=? AND persona=? AND anchor_json IS NULL",
+                        (encoded,) + intent.namespace.as_tuple)
+                elif current.anchor_json != encoded:
+                    raise UnavailableGuard("v2 provisioning genesis anchor differs")
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        return self._provision_intent_row(store._db, intent.namespace)
+
+    @staticmethod
     def _decode_provision_receipt(row) -> NamespaceProvisionReceiptV2:
         try:
             data = json.loads(row[2])
@@ -492,6 +627,13 @@ class GraphCoordinator:
         if row[0] != operation_id or row[1] != digest:
             raise AuthorityDenied("namespace provisioning identity differs")
         receipt = self._decode_provision_receipt(row)
+        intent = self._provision_intent_row(store._db, namespace)
+        if (intent is not None and (
+                intent.operation_id != operation_id or intent.digest != digest
+                or intent.fence_attempt_id != receipt.fence_attempt_id
+                or intent.graph_incarnation != receipt.graph_incarnation
+                or intent.anchor_json is None)):
+            raise UnavailableGuard("durable v2 provisioning intent differs from receipt")
         metadata, epoch = self._v2_graph_stamp(namespace)
         target = metadata.requirements
         if (receipt.namespace != namespace
@@ -517,6 +659,9 @@ class GraphCoordinator:
         except (TypeError, ValueError) as exc:
             raise UnavailableGuard("durable v2 provisioning permit is invalid") from exc
         if (type(permit) is not FencePermitV2 or permit.operation_id != receipt.fence_attempt_id
+                or (intent is not None and intent.anchor_json != canonical_json(
+                    asdict(permit.pinned_anchor)))
+                or permit.subject != self.__content_fence_v2.installation_grant.subject
                 or permit.authority_id != target.authority_id
                 or permit.namespace != target.authority_namespace
                 or permit.generation != target.activation_generation
@@ -695,46 +840,65 @@ class GraphCoordinator:
             source_grant.valid_until_utc, source_grant.policy_ref,
         )
         with store._lock:
-            store._ensure_open()
             row = self._provision_row(store._db, namespace)
-            if row is not None:
-                if row[:2] != (operation_id, digest):
-                    raise AuthorityDenied("namespace provisioning identity differs")
-            elif (store._recovery_row(namespace) is not None
-                  or store._has_namespace_history(namespace)):
-                raise UnavailableGuard("namespace has unsealed business history")
         if row is not None:
+            if row[:2] != (operation_id, digest):
+                raise AuthorityDenied("namespace provisioning identity differs")
             return self._reconcile_provision_v2(policy, operation_id, digest)
+        intent, identity_json = self._ensure_provision_intent(
+            policy, grant, operation_id, digest)
 
-        request_id = "namespace-genesis-" + canonical_digest({
-            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
-            "input_digest": digest,
-        })[:48]
-        observed = port.provision_namespace(namespace=namespace, request_id=request_id)
-        if (type(observed) is not NamespaceBootstrapV2
-                or observed.namespace != namespace
-                or observed.authority_id != policy.expected_authority_id
-                or observed.authority_namespace != policy.authority_namespace
-                or observed.holder != self.__holder
-                or observed.state is not NamespaceRuntimeState.ACTIVE
-                or observed.phase != "active" or observed.generation != 1
-                or observed.anchor is None or observed.blocking_reasons):
-            raise UnavailableGuard("Authority v2 namespace genesis is not active")
-        anchor = port.current_anchor(
-            namespace=namespace, authority_namespace=observed.authority_namespace)
-        if anchor != observed.anchor:
+        if intent.anchor_json is None:
+            observed = port.provision_namespace(
+                namespace=namespace, request_id=intent.genesis_request_id)
+            if (type(observed) is not NamespaceBootstrapV2
+                    or observed.namespace != namespace
+                    or observed.authority_id != policy.expected_authority_id
+                    or observed.authority_namespace != policy.authority_namespace
+                    or observed.holder != self.__holder
+                    or observed.state is not NamespaceRuntimeState.ACTIVE
+                    or observed.phase != "active" or observed.generation != 1
+                    or observed.anchor is None or observed.blocking_reasons):
+                raise UnavailableGuard("Authority v2 namespace genesis is not active")
+            anchor = observed.anchor
+            current_anchor = port.current_anchor(
+                namespace=namespace, authority_namespace=policy.authority_namespace)
+            if current_anchor != anchor:
+                raise UnavailableGuard("Authority v2 current anchor differs from genesis")
+            intent = self._persist_provision_anchor(intent, anchor, identity_json)
+        else:
+            from .runtime.restore_anchor import RestoreAnchor
+            try:
+                data = json.loads(intent.anchor_json)
+                if (type(data) is not dict
+                        or set(data) != {field.name for field in fields(RestoreAnchor)}):
+                    raise ValueError("invalid anchor fields")
+                anchor = RestoreAnchor(**data)
+            except (TypeError, ValueError) as exc:
+                raise UnavailableGuard("durable v2 provisioning anchor is invalid") from exc
+        current_anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=policy.authority_namespace)
+        if (anchor != current_anchor or anchor.authority_id != policy.expected_authority_id
+                or anchor.namespace != policy.authority_namespace
+                or anchor.activation_generation != 1 or anchor.deletion_seq != 0
+                or anchor.execution_seq != 0 or anchor.revocation_epoch != 0):
             raise UnavailableGuard("Authority v2 current anchor differs from genesis")
         with store._lock:
             epoch = GraphStore.graph_epoch(
                 store, *namespace.as_tuple, _capability=self.__graph_capability)
             if epoch.revision != 0:
                 raise UnavailableGuard("namespace graph has a prior epoch")
-        attempt_id = "provision-write-" + secrets.token_hex(16)
-        permit = port.begin_fence(
-            namespace=namespace, authority_namespace=observed.authority_namespace,
-            holder=self.__holder, generation=1, operation="write",
-            operation_id=attempt_id, expected_anchor=anchor)
-        scope = FenceScope(namespace, observed.authority_namespace, 1, "write",
+        attempt_id = intent.fence_attempt_id
+        try:
+            permit = port.begin_fence(
+                namespace=namespace, authority_namespace=policy.authority_namespace,
+                holder=self.__holder, generation=1, operation="write",
+                operation_id=attempt_id, expected_anchor=anchor,
+                retain_on_unknown=True)
+        except Exception as exc:
+            raise UnavailableGuard(
+                "v2 provisioning write fence unavailable; HOLD pending exact attempt") from exc
+        scope = FenceScope(namespace, policy.authority_namespace, 1, "write",
                            attempt_id, permit, anchor, epoch, 0)
         finish_id = "finish:" + attempt_id
         finish_digest = "sha256:" + canonical_digest({
@@ -742,80 +906,80 @@ class GraphCoordinator:
             "action": "finish_namespace_provision",
             "business_operation_id": operation_id, "input_digest": digest,
         })
-        try:
-            if port.validate_fence(scope) != permit:
-                raise UnavailableGuard("v2 provisioning write permit changed")
-            requirements = SnapshotRequirementsV2(
-                namespace, anchor.authority_id, anchor.namespace,
-                anchor.activation_generation, anchor.deletion_journal_id,
-                anchor.deletion_seq, anchor.deletion_digest,
-                anchor.execution_journal_id, anchor.execution_seq,
-                anchor.execution_digest, anchor.revocation_epoch,
-                "graph:" + secrets.token_hex(16),
-            )
-            with store._lock:
-                store._ensure_open()
-                db = store._db
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    if self._provision_row(db, namespace) is not None:
-                        raise UnavailableGuard("namespace provisioned concurrently; retry reconciliation")
-                    if GraphStore.graph_epoch(
-                            store, *namespace.as_tuple,
-                            _capability=self.__graph_capability) != epoch:
-                        raise UnavailableGuard("namespace graph epoch changed")
-                    store._install_graph_recovery_genesis_locked(
-                        requirements, _capability=self.__graph_capability)
-                    for kind, version in (("scheme", policy.scheme_version),
-                                          ("operator", policy.operator_version),
-                                          ("policy", policy.policy_version),
-                                          ("activation", "1")):
-                        db.execute(
-                            "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
-                            "VALUES(?,?,?,?,?)",
-                            namespace.as_tuple + (kind, "current", str(version)),
-                        )
-                    create_budget_lease(
-                        db, root_lease,
-                        "root-budget-" + canonical_digest({
-                            "namespace": list(namespace.as_tuple),
-                            "operation_id": operation_id,
-                        })[:48], digest)
-                    install_issuer_schema(db)
-                    grant_signature = self.__d11_issuer.issue_budget_grant(
-                        db, root_grant)
-                    receipt = NamespaceProvisionReceiptV2(
-                        namespace, operation_id, digest, policy.installation_id,
-                        policy.manifest_digest, anchor.authority_id,
-                        anchor.namespace, 1, requirements.graph_incarnation,
-                        0, epoch.revision, policy.catalogue_hash,
-                        str(policy.scheme_version), str(policy.operator_version),
-                        str(policy.policy_version), policy.root_lease.lease_id,
-                        policy.root_grant.grant_id, policy.root_grant.version,
-                        grant_signature, attempt_id, finish_id, finish_digest,
-                        to_wire(permit),
-                    )
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("v2 provisioning write permit changed")
+        requirements = SnapshotRequirementsV2(
+            namespace, anchor.authority_id, anchor.namespace,
+            anchor.activation_generation, anchor.deletion_journal_id,
+            anchor.deletion_seq, anchor.deletion_digest,
+            anchor.execution_journal_id, anchor.execution_seq,
+            anchor.execution_digest, anchor.revocation_epoch,
+            intent.graph_incarnation,
+        )
+        with store._lock:
+            store._ensure_open()
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                current_intent = self._provision_intent_row(db, namespace)
+                self._check_provision_intent(
+                    current_intent, operation_id, digest, identity_json)
+                if current_intent != intent or self._provision_row(db, namespace) is not None:
+                    raise UnavailableGuard("namespace provisioned concurrently; retry reconciliation")
+                if GraphStore.graph_epoch(
+                        store, *namespace.as_tuple,
+                        _capability=self.__graph_capability) != epoch:
+                    raise UnavailableGuard("namespace graph epoch changed")
+                store._install_graph_recovery_genesis_locked(
+                    requirements, _capability=self.__graph_capability,
+                    provision_intent=(operation_id, digest))
+                for kind, version in (("scheme", policy.scheme_version),
+                                      ("operator", policy.operator_version),
+                                      ("policy", policy.policy_version),
+                                      ("activation", "1")):
                     db.execute(
-                        "INSERT INTO graph_namespace_provisioning_v2"
-                        "(bot,persona,operation_id,digest,receipt_json) VALUES(?,?,?,?,?)",
-                        namespace.as_tuple + (operation_id, digest,
-                                              canonical_json(asdict(receipt))),
+                        "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                        "VALUES(?,?,?,?,?)",
+                        namespace.as_tuple + (kind, "current", str(version)),
                     )
-                    db.execute("COMMIT")
-                except BaseException:
-                    db.execute("ROLLBACK")
-                    raise
-            if port.validate_fence(scope) != permit:
-                raise UnavailableGuard("v2 provisioning write permit changed after commit")
-            with store._lock:
-                if self._verify_provision_receipt(policy, operation_id, digest)[0] != receipt:
-                    raise UnavailableGuard("v2 provisioning state changed after commit")
-            return receipt
-        finally:
-            # A failed or uncertain finish must propagate: the business receipt
-            # does not by itself prove the independent Authority fence finished.
-            port.finish_fence(scope, request_id=finish_id,
-                              request_digest=finish_digest)
+                create_budget_lease(
+                    db, root_lease,
+                    "root-budget-" + canonical_digest({
+                        "namespace": list(namespace.as_tuple),
+                        "operation_id": operation_id,
+                    })[:48], digest)
+                install_issuer_schema(db)
+                grant_signature = self.__d11_issuer.issue_budget_grant(
+                    db, root_grant)
+                receipt = NamespaceProvisionReceiptV2(
+                    namespace, operation_id, digest, policy.installation_id,
+                    policy.manifest_digest, anchor.authority_id,
+                    anchor.namespace, 1, requirements.graph_incarnation,
+                    0, epoch.revision, policy.catalogue_hash,
+                    str(policy.scheme_version), str(policy.operator_version),
+                    str(policy.policy_version), policy.root_lease.lease_id,
+                    policy.root_grant.grant_id, policy.root_grant.version,
+                    grant_signature, attempt_id, finish_id, finish_digest,
+                    to_wire(permit),
+                )
+                db.execute(
+                    "INSERT INTO graph_namespace_provisioning_v2"
+                    "(bot,persona,operation_id,digest,receipt_json) VALUES(?,?,?,?,?)",
+                    namespace.as_tuple + (operation_id, digest,
+                                          canonical_json(asdict(receipt))),
+                )
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("v2 provisioning write permit changed after commit")
+        with store._lock:
+            if self._verify_provision_receipt(policy, operation_id, digest)[0] != receipt:
+                raise UnavailableGuard("v2 provisioning state changed after commit")
+        port.finish_fence(scope, request_id=finish_id,
+                          request_digest=finish_digest)
+        return receipt
 
     def _admit_content(self, namespace: NamespaceId, generation: int,
                        operation: str, refs: tuple[str, ...] = ()) -> None:

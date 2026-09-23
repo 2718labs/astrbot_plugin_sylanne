@@ -326,6 +326,51 @@ def test_lost_begin_response_is_reclaimed_before_new_operation_id(port):
     adapter.finish_fence(scope, request_id="finish-next", request_digest="sha256:" + "d" * 64)
 
 
+def test_retained_unknown_begin_retries_same_operation_without_auto_finish(port):
+    adapter, transport = port
+    adapter._timeout = 0.05
+    transport.lose_begin_response_once = True
+    with pytest.raises(V2FenceOutcomeUnknown, match="result unknown"):
+        adapter.begin_fence(
+            namespace=NAMESPACE, authority_namespace="ns-a", holder="holder-a", generation=1,
+            operation="read", operation_id="retained-read", expected_anchor=ANCHOR,
+            retain_on_unknown=True,
+        )
+    assert adapter._pending_begin is None
+    adapter._timeout = 21
+    adapter.recover_pending_begin()
+    assert transport.finish_requests == []
+
+    permit = adapter.begin_fence(
+        namespace=NAMESPACE, authority_namespace="ns-a", holder="holder-a", generation=1,
+        operation="read", operation_id="retained-read", expected_anchor=ANCHOR,
+        retain_on_unknown=True,
+    )
+    assert transport.begin_ids == ["retained-read", "retained-read"]
+    assert transport.permit == permit
+    assert transport.finish_requests == []
+    scope = FenceScope(NAMESPACE, "ns-a", 1, "read", "retained-read", permit, ANCHOR,
+                       NamespaceEpoch("bot-a", "persona-a", 0), 0)
+    adapter.finish_fence(scope, request_id="finish-retained", request_digest="sha256:" + "d" * 64)
+
+
+def test_retained_unknown_begin_is_not_finished_on_close(port):
+    adapter, transport = port
+    adapter._timeout = 0.05
+    transport.lose_begin_response_once = True
+    with pytest.raises(V2FenceOutcomeUnknown, match="result unknown"):
+        adapter.begin_fence(
+            namespace=NAMESPACE, authority_namespace="ns-a", holder="holder-a", generation=1,
+            operation="read", operation_id="retained-on-close", expected_anchor=ANCHOR,
+            retain_on_unknown=True,
+        )
+    adapter._timeout = 21
+    adapter.close()
+    assert transport.closed
+    assert transport.finish_requests == []
+    assert transport.permit is not None
+
+
 def test_second_transport_loss_after_begin_commit_blocks_new_id_until_recovered(port):
     adapter, transport = port
     transport.expire_begin_once = True

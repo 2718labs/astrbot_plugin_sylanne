@@ -183,6 +183,28 @@ class GraphStore(Store):
                 operation_id TEXT NOT NULL, digest TEXT NOT NULL,
                 receipt_json TEXT NOT NULL,
                 PRIMARY KEY(bot,persona));
+            CREATE TABLE IF NOT EXISTS graph_namespace_provision_intents_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, digest TEXT NOT NULL,
+                identity_json TEXT NOT NULL, genesis_request_id TEXT NOT NULL,
+                fence_attempt_id TEXT NOT NULL, graph_incarnation TEXT NOT NULL,
+                anchor_json TEXT,
+                PRIMARY KEY(bot,persona),
+                UNIQUE(genesis_request_id), UNIQUE(fence_attempt_id),
+                UNIQUE(graph_incarnation));
+            CREATE TRIGGER IF NOT EXISTS graph_namespace_provision_intent_no_delete_v2
+                BEFORE DELETE ON graph_namespace_provision_intents_v2
+                BEGIN SELECT RAISE(ABORT, 'provisioning intent is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_namespace_provision_intent_anchor_once_v2
+                BEFORE UPDATE ON graph_namespace_provision_intents_v2
+                WHEN OLD.anchor_json IS NOT NULL OR NEW.anchor_json IS NULL
+                  OR NEW.bot != OLD.bot OR NEW.persona != OLD.persona
+                  OR NEW.operation_id != OLD.operation_id OR NEW.digest != OLD.digest
+                  OR NEW.identity_json != OLD.identity_json
+                  OR NEW.genesis_request_id != OLD.genesis_request_id
+                  OR NEW.fence_attempt_id != OLD.fence_attempt_id
+                  OR NEW.graph_incarnation != OLD.graph_incarnation
+                BEGIN SELECT RAISE(ABORT, 'provisioning intent is immutable'); END;
         """)
 
     @staticmethod
@@ -280,7 +302,7 @@ class GraphStore(Store):
             namespace.as_tuple,
         ).fetchone()
 
-    def _has_namespace_history(self, namespace):
+    def _has_namespace_history(self, namespace, *, provision_intent=None):
         """Reject history in this namespace and unowned legacy records.
 
         Some old tables omit namespace columns but carry a lease, quote or
@@ -330,6 +352,13 @@ class GraphStore(Store):
         }
         for (table,) in self._db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+            if table == "graph_namespace_provision_intents_v2" and provision_intent is not None:
+                row = self._db.execute(
+                    "SELECT operation_id,digest FROM graph_namespace_provision_intents_v2 "
+                    "WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
+                if row != provision_intent:
+                    return True
+                continue
             if table in {"graph_recovery_metadata_v2", "graph_type_catalog",
                          "graph_type_authority"}:
                 continue
@@ -439,7 +468,8 @@ class GraphStore(Store):
                 raise RuntimeError("namespace has unsealed business state")
             return self._decode_recovery(row, namespace)
 
-    def _install_graph_recovery_genesis_locked(self, requirements, *, _capability=None):
+    def _install_graph_recovery_genesis_locked(self, requirements, *,
+                                               _capability=None, provision_intent=None):
         """Stage genesis in the caller's existing business SQL transaction."""
         self._require_recovery_capability(_capability)
         encoded = self._recovery_payload(requirements)
@@ -452,7 +482,8 @@ class GraphStore(Store):
                 raise RuntimeError("graph genesis requires an active SQL transaction")
             if self._recovery_row(requirements.namespace) is not None:
                 raise StaleRead("graph recovery metadata already installed")
-            if self._has_namespace_history(requirements.namespace):
+            if self._has_namespace_history(
+                    requirements.namespace, provision_intent=provision_intent):
                 raise RuntimeError("namespace has unsealed business state")
             self._db.execute(
                 "INSERT INTO graph_recovery_metadata_v2"
