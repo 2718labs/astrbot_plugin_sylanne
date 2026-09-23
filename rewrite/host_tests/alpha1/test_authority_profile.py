@@ -153,7 +153,6 @@ def test_schema2_policy_is_complete_bounded_and_immutable(tmp_path: Path) -> Non
     lambda p: p["installation_policy"]["root_lease"].update({"parent_id": "parent"}),
     lambda p: p["installation_policy"]["root_lease"].update({"limits": {"tokens": 0}}),
     lambda p: p["installation_policy"]["root_grant"].update({"max_ceiling": {"tokens": 1001}}),
-    lambda p: p["installation_policy"]["root_grant"].update({"valid_until_utc": 1}),
     lambda p: p["installation_policy"]["root_grant"].update({"bot_id": "other"}),
     lambda p: p["installation_policy"]["root_grant"].update({"version": True}),
 ])
@@ -162,6 +161,13 @@ def test_schema2_policy_rejects_untrusted_or_inconsistent_content(mutate) -> Non
     mutate(payload)
     with pytest.raises((TypeError, ValueError)):
         authority_profile._policy_from_payload(payload)
+
+
+def test_schema2_policy_can_reload_an_expired_historical_grant() -> None:
+    payload = _schema2_payload()
+    payload["installation_policy"]["root_grant"]["valid_until_utc"] = 1
+    policy = authority_profile._policy_from_payload(payload)
+    assert policy.root_grant.valid_until_utc == 1
 
 
 def test_schema2_nested_duplicate_and_oversize_rejected(tmp_path: Path) -> None:
