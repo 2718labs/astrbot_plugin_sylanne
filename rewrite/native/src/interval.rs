@@ -184,8 +184,9 @@ impl Interval {
     /// Analytic enclosure of `exp(self)` for finite `self` within `[-2, 2]`.
     ///
     /// Each endpoint uses the degree-25 Taylor polynomial at zero. The Lagrange
-    /// remainder is bounded by `9 * 2^26 / 26!`: `e < 3` follows from
-    /// `n! >= 2^(n-1)` for `n >= 2`, hence `e^|x| < 9` on this domain. Every
+    /// remainder is bounded by `27 * (9/4)^26 / 26!`: `e < 3` follows from
+    /// `n! >= 2^(n-1)` for `n >= 2`, hence `e^|x| < 27` on `|x| <= 9/4 < 3`.
+    /// The public domain is narrower than this internal remainder domain. Every
     /// polynomial and remainder operation goes through outward interval
     /// arithmetic; no platform exponential is used.
     pub(crate) fn exp(self) -> Result<Self, IntervalError> {
@@ -202,18 +203,19 @@ impl Interval {
         Self::from_validated_bounds(lower.lower.max(0.0), upper.upper)
     }
 
-    /// Analytic enclosure of `tanh(self)` for finite `self` within `[-1, 1]`.
+    /// Analytic enclosure of `tanh(self)` for finite `self` within `[-17/4, 17/4]`.
     ///
     /// For a nonnegative endpoint this evaluates
-    /// `(1 - exp(-2x)) / (1 + exp(-2x))` using the certified exponential above;
+    /// `(1 - exp(-2x)) / (1 + exp(-2x))`. The exponential is range-reduced by
+    /// an exact division by four and recovered by four interval products;
     /// oddness handles negative endpoints. No platform hyperbolic function is
     /// used.
     pub(crate) fn tanh(self) -> Result<Self, IntervalError> {
         require_environment()?;
         if !self.lower.is_finite()
             || !self.upper.is_finite()
-            || self.lower < -1.0
-            || self.upper > 1.0
+            || self.lower < -17.0 / 4.0
+            || self.upper > 17.0 / 4.0
         {
             return Err(IntervalError::UnsupportedTranscendental);
         }
@@ -222,18 +224,19 @@ impl Interval {
         Self::from_validated_bounds(lower.lower.max(-1.0), upper.upper.min(1.0))
     }
 
-    /// Analytic enclosure of `ln(cosh(self))` on finite `self` within `[-1, 1]`.
+    /// Analytic enclosure of `ln(cosh(self))` on finite `self` within
+    /// `[-17/4, 17/4]`.
     ///
-    /// `cosh(x) - 1` is first enclosed using certified exponentials, then
-    /// `log1p(v) = 2 * atanh(v / (2 + v))` is evaluated for `v in [0, 1]`.
-    /// The positive atanh tail is bounded by a geometric series with an explicit
-    /// denominator. No platform logarithm or hyperbolic function is used.
+    /// For `|x| <= 1`, the original `log1p(cosh(x)-1)` path avoids cancellation
+    /// at zero. Above one, `|x| + log1p(exp(-2|x|)) - log(2)` keeps the
+    /// logarithm argument at most one. The positive atanh tail in `log1p` is
+    /// bounded by a geometric series. No platform logarithm is used.
     pub(crate) fn log_cosh(self) -> Result<Self, IntervalError> {
         require_environment()?;
         if !self.lower.is_finite()
             || !self.upper.is_finite()
-            || self.lower < -1.0
-            || self.upper > 1.0
+            || self.lower < -17.0 / 4.0
+            || self.upper > 17.0 / 4.0
         {
             return Err(IntervalError::UnsupportedTranscendental);
         }
@@ -267,13 +270,24 @@ impl Interval {
     }
 
     fn exp_remainder_bound() -> Result<f64, IntervalError> {
-        let mut remainder = Self::point(9.0)?;
+        let mut remainder = Self::point(27.0)?;
         for denominator in 1..=26 {
             remainder = remainder
-                .mul(Self::point(2.0)?)?
+                .mul(Self::point(9.0 / 4.0)?)?
                 .div(Self::point(denominator as f64)?)?;
         }
         Ok(remainder.upper)
+    }
+
+    /// Enclose exp(value) for `|value| <= 17/2`. The interval division also
+    /// handles subnormal inputs where scaling by four could lose precision.
+    fn exp_range_reduced_scalar(value: f64) -> Result<Self, IntervalError> {
+        let quarter = Self::point(value)?.div(Self::point(4.0)?)?;
+        let reduced = Self::from_validated_bounds(
+            Self::exp_scalar(quarter.lower)?.lower,
+            Self::exp_scalar(quarter.upper)?.upper,
+        )?;
+        reduced.mul(reduced)?.mul(reduced)?.mul(reduced)
     }
 
     fn tanh_scalar(value: f64) -> Result<Self, IntervalError> {
@@ -283,7 +297,7 @@ impl Interval {
 
         let magnitude = value.abs();
         // Multiplication by two is exact throughout the admitted domain.
-        let exponential = Self::exp_scalar(-2.0 * magnitude)?;
+        let exponential = Self::exp_range_reduced_scalar(-2.0 * magnitude)?;
         let one = Self::point(1.0)?;
         let numerator = one.sub(exponential)?;
         let denominator = one.add(exponential)?;
@@ -300,6 +314,13 @@ impl Interval {
     fn log_cosh_nonnegative_scalar(value: f64) -> Result<Self, IntervalError> {
         if value == 0.0 {
             return Self::point(0.0);
+        }
+
+        if value > 1.0 {
+            let exponential = Self::exp_range_reduced_scalar(-2.0 * value)?;
+            let correction = Self::log1p_nonnegative(exponential)?;
+            let log_two = Self::log1p_nonnegative_scalar(1.0)?;
+            return Self::point(value)?.add(correction)?.sub(log_two);
         }
 
         let positive = Self::exp_scalar(value)?;
@@ -604,7 +625,7 @@ mod tests {
         let zero = Interval::point(0.0).unwrap().tanh().unwrap();
         assert_contains(zero, 0.0);
 
-        for value in [-1.0_f64, -0.5, -0.125, 0.125, 0.5, 1.0] {
+        for value in [-4.0_f64, -1.0, -0.5, -0.125, 0.125, 0.5, 1.0, 4.0] {
             let enclosure = Interval::point(value).unwrap().tanh().unwrap();
             assert_contains(enclosure, value.tanh());
             assert!(enclosure.upper() - enclosure.lower() < 1.0e-11);
@@ -621,7 +642,7 @@ mod tests {
         let zero = Interval::point(0.0).unwrap().log_cosh().unwrap();
         assert_contains(zero, 0.0);
 
-        for value in [-1.0_f64, -0.5, 0.5, 1.0] {
+        for value in [-4.0_f64, -1.0, -0.5, 0.5, 1.0, 4.0] {
             let enclosure = Interval::point(value).unwrap().log_cosh().unwrap();
             let oracle = value.cosh().ln();
             assert_contains(enclosure, oracle);
@@ -631,6 +652,9 @@ mod tests {
         let crossing = Interval::new(-0.75, 0.25).unwrap().log_cosh().unwrap();
         assert_contains(crossing, 0.0);
         assert_contains(crossing, 0.75_f64.cosh().ln());
+        let wide_crossing = Interval::new(-4.0, 3.0).unwrap().log_cosh().unwrap();
+        assert_contains(wide_crossing, 0.0);
+        assert_contains(wide_crossing, 4.0_f64.cosh().ln());
     }
 
     #[test]
@@ -641,7 +665,7 @@ mod tests {
                 Err(IntervalError::UnsupportedTranscendental)
             );
         }
-        for value in [next_up(1.0), -next_up(1.0), f64::INFINITY] {
+        for value in [next_up(17.0 / 4.0), -next_up(17.0 / 4.0), f64::INFINITY] {
             let interval = Interval::point(value).unwrap();
             assert_eq!(
                 interval.tanh(),
@@ -661,13 +685,19 @@ mod tests {
         for index in 0..=512 {
             let x = -2.0 + 4.0 * (index as f64) / 512.0;
             assert_contains(Interval::point(x).unwrap().exp().unwrap(), x.exp());
-            if (-1.0..=1.0).contains(&x) {
-                assert_contains(Interval::point(x).unwrap().tanh().unwrap(), x.tanh());
-                assert_contains(
-                    Interval::point(x).unwrap().log_cosh().unwrap(),
-                    x.cosh().ln(),
-                );
-            }
+            assert_contains(Interval::point(x).unwrap().tanh().unwrap(), x.tanh());
+            assert_contains(
+                Interval::point(x).unwrap().log_cosh().unwrap(),
+                x.cosh().ln(),
+            );
+        }
+        for index in 0..=256 {
+            let x = -4.0 + 8.0 * (index as f64) / 256.0;
+            assert_contains(Interval::point(x).unwrap().tanh().unwrap(), x.tanh());
+            assert_contains(
+                Interval::point(x).unwrap().log_cosh().unwrap(),
+                x.cosh().ln(),
+            );
         }
 
         for x in [f64::from_bits(1), -f64::from_bits(1)] {

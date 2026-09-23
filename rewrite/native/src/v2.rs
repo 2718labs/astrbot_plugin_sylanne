@@ -889,10 +889,10 @@ mod tests {
         assert!((out[0] - (lo + hi) / 2.0).abs() < 1e-12);
         assert!(result.energy_after < result.energy_before);
         assert!(result.energy_balance_defect.abs() < 1e-12);
-        assert_eq!(result.certificate_flags, 0);
+        assert_eq!(result.certificate_flags, ABI2_FIXED_BLOCK_INTERVAL_V1);
 
-        // The verifier encloses the nonlinear AVF quotient over the entire
-        // endpoint segment; with an honest wider tolerance it can certify it.
+        // The independent log-cosh secant also certifies at the tight tolerance;
+        // the wider tolerance remains an admitted fixed-block call.
         input.tolerance = 1e-2;
         input.max_iterations = 20;
         input.iterate = current.as_ptr();

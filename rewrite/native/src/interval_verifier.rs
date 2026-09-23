@@ -209,13 +209,23 @@ pub(crate) fn verify_joint_step(
             ax[row].lower().min(ay[row].lower()),
             ax[row].upper().max(ay[row].upper()),
         )?;
-        if hull.lower() < -1.0 || hull.upper() > 1.0 {
+        if hull.lower() < -17.0 / 4.0 || hull.upper() > 17.0 / 4.0 {
             return Err(VerifierError::NonlinearArgumentOutOfRange);
         }
-        // The AVF quotient equals the integral mean of tanh along the segment
-        // between A*x and A*y. Monotonicity puts that mean inside tanh(hull),
-        // including the coincident and near-coincident cases without subtraction.
-        let quotient = finite_interval(hull.tanh()?)?;
+        // The AVF quotient is the integral mean of tanh on this segment.
+        // Its monotone hull remains sound at coincident arguments; when the
+        // endpoint difference excludes zero, intersect it with the independently
+        // enclosed log-cosh secant to make useful tight step certificates.
+        let mut quotient = finite_interval(hull.tanh()?)?;
+        let difference = finite_interval(ay[row].sub(ax[row])?)?;
+        if difference.lower() > 0.0 || difference.upper() < 0.0 {
+            let energy_difference = finite_interval(ay[row].log_cosh()?.sub(ax[row].log_cosh()?)?)?;
+            let secant = finite_interval(energy_difference.div(difference)?)?;
+            quotient = Interval::new(
+                quotient.lower().max(secant.lower()),
+                quotient.upper().min(secant.upper()),
+            )?;
+        }
         let coefficient = finite_interval(Interval::point(input.alpha[row])?.mul(quotient)?)?;
         for position in input.a.row_range(row) {
             let column = input.a.indices[position] as usize;
@@ -395,7 +405,7 @@ pub(crate) fn verify_joint_error_bounds(
     let mut gradient_at_x = matvec(input.k, &x)?;
     let ax = matvec(input.a, &x)?;
     for row in 0..input.a.rows {
-        if ax[row].lower() < -1.0 || ax[row].upper() > 1.0 {
+        if ax[row].lower() < -17.0 / 4.0 || ax[row].upper() > 17.0 / 4.0 {
             return Err(VerifierError::NonlinearArgumentOutOfRange);
         }
         let coefficient =
@@ -610,7 +620,7 @@ fn energy(
     }
     let mut total = Interval::point(0.5)?.mul(quadratic)?;
     for row in 0..a.rows {
-        if a_state[row].lower() < -1.0 || a_state[row].upper() > 1.0 {
+        if a_state[row].lower() < -17.0 / 4.0 || a_state[row].upper() > 17.0 / 4.0 {
             return Err(VerifierError::NonlinearArgumentOutOfRange);
         }
         let nonlinear = Interval::point(alpha[row])?.mul(a_state[row].log_cosh()?)?;
@@ -745,6 +755,30 @@ mod tests {
         contains(avf_work, energy_after - energy_before);
         assert!(envelope.operator_bounds.k_coercivity_lower > 0.0);
         assert!(envelope.operator_bounds.r_coercivity_lower > 0.0);
+    }
+
+    #[test]
+    fn nonlinear_energy_and_gradient_cover_four_unit_latent_state() {
+        let values = [1.0];
+        let input = JointVerificationInput {
+            k: scalar_matrix(&values),
+            r: scalar_matrix(&values),
+            j: SparseMatrix::new(1, 1, &[0, 0], &[], &[]),
+            a: scalar_matrix(&values),
+            alpha: &[0.25],
+            x: &[4.0],
+            y: &[3.9],
+            h: 0.02,
+            drive: &[0.0],
+        };
+        let envelope = verify_joint_step(&input).unwrap();
+        let exact_before = 0.5 * 4.0 * 4.0 + 0.25 * 4.0_f64.cosh().ln();
+        let exact_after = 0.5 * 3.9 * 3.9 + 0.25 * 3.9_f64.cosh().ln();
+        let midpoint_gradient = 3.95 + 0.25 * (4.0_f64.cosh().ln() - 3.9_f64.cosh().ln()) / 0.1;
+        contains(envelope.energy_before, exact_before);
+        contains(envelope.energy_after, exact_after);
+        contains(envelope.energy_difference, exact_after - exact_before);
+        contains(envelope.gradient[0], midpoint_gradient);
     }
 
     #[test]
@@ -1087,8 +1121,8 @@ mod tests {
             j: empty,
             a: scalar_matrix(&a_values),
             alpha: &[0.1],
-            x: &[2.0],
-            y: &[2.0],
+            x: &[5.0],
+            y: &[5.0],
             h: 0.1,
             drive: &[0.0],
         };
