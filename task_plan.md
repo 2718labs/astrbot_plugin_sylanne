@@ -6,7 +6,7 @@
 - Workspace: `G:\Sylanne`; branch: `codex/embodiment-3-rewrite`.
 - New implementation lives in `rewrite/`; no import of `sylanne_alpha`, `v2core`, `_engine`, or old `v3core` is permitted there.
 - Subsequent user instruction retires old interfaces and core; the new root plugin is the sole entry. Legacy reference is Git history, not a runtime fallback.
-- User permits a compressed release ZIP of approximately 10 MB. Treat this as acceptable distribution capacity, not a minimum size or permission for unbounded runtime costs; measure actual package contents and sizes at packaging acceptance.
+- Measure the actual compressed and extracted release package, including required modules, native kernel, workbench and resources. Package size is not evidence of runtime cost or product acceptance.
 - User requested further design depth beyond the twelve-system outline. Candidate mechanism design is in docs/architecture/embodiment-3-mechanisms.md; this design turn does not implement those future capabilities or claim their acceptance.
 - Further design continuation adds docs/architecture/embodiment-3-ecosystem.md. User explicitly requires a redesigned memory module, research-grounded mechanisms, speed/quality tradeoffs and when recall should occur: see embodiment-3-memory.md and embodiment-3-memory-theory.md in the same directory. These are design proposals; theory transfer and performance require implementation and controlled evaluation.
 
