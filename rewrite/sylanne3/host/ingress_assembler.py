@@ -6,16 +6,8 @@ from typing import Protocol
 
 from ..domains.d06 import D06DomainAdapter, SourceAdmission, SourceAdmissionProposal
 from ..graph_coordinator import GraphCoordinator
-from ..memory_types import access_key, source_key
-from ..runtime.d11_types import (
-    D11_PROPOSAL_SCHEMA,
-    D11_PROPOSAL_SCHEMA_HASH,
-    RuntimeOutboxValue,
-    job_graph_write,
-    outbox_graph_write,
-    runtime_job_key,
-    runtime_outbox_key,
-)
+from ..runtime.d11_types import runtime_job_key, runtime_outbox_key
+from ..runtime.first_ingress_bundle import build_first_ingress_bundle
 from ..runtime.ingress_contracts import (
     CanonicalIngressObservation,
     CommittedIngressReplay,
@@ -23,12 +15,6 @@ from ..runtime.ingress_contracts import (
     IngressObservationContext,
 )
 from ..runtime.jobs import PersistentJob
-from ..runtime_contracts import (
-    DependencySet,
-    DomainBundle,
-    DomainProposal,
-    canonical_digest,
-)
 from .d06_ingress import (
     AuthorizedIngressCommit, ingress_content_fingerprint, ingress_source_identity,
 )
@@ -291,71 +277,14 @@ class LocalIngressAssembler:
             or command.authority.purpose != "context"
             or command.authority.audience != (envelope.conversation_ref,)
             or not {"event", "activity"}.issubset(command.authority.owner_scope)
-            or command.identity.activity_id != activity_id
-            or command.identity.operation_id != operation_id
-            or command.identity.effect_id is not None
-            or command.source_qualification != canonical_candidate.qualification
-            or command.input_refs != canonical_candidate.qualification.source_refs
         ):
             raise ValueError("trusted ingress authorization changed host identity or scope")
         if authorization.lease is not session.lease:
             raise ValueError("trusted ingress authorization changed coordinator lease")
-
-        source = source_key(*envelope.namespace.as_tuple, canonical_admission.source_id)
-        access = access_key(*envelope.namespace.as_tuple, canonical_admission.source_id)
-        expected_keys = {source, access, job_key, outbox_key}
-        reads = {item.key: item for item in command.version_guard.read_versions}
-        if set(reads) != expected_keys or any(item.revision != 0 for item in reads.values()):
-            raise ValueError("first ingress requires complete revision-0 source/runtime proofs")
-
-        job = authorization.job
-        if (
-            job.job_id != job_id
-            or job.operation_id != operation_id
-            or job.activity_id != activity_id
-            or job.effect_id is not None
-            or (job.bot_id, job.persona_id) != envelope.namespace.as_tuple
-            or job.phase != "queued"
-            or job.work_kind != "d06.encode_source"
-            or job.budget_ref != command.parent_budget_lease_ref
-        ):
-            raise ValueError("D11 issuer job differs from ingress encoding work")
-
-        adapter = D06DomainAdapter(envelope.namespace)
-        d06_proposal = adapter.compile_source_ingress(command, canonical_admission)
-        job_write = job_graph_write(job)
-        outbox_value = RuntimeOutboxValue(
-            envelope.namespace.bot_id,
-            envelope.namespace.persona_id,
-            activity_id,
-            operation_id,
-            None,
-            outbox_id,
-            job_id,
-            job_key.token,
-            request.payload_ref,
-            request.idempotency_key,
-            "pending",
-            command.authority.activation_generation,
-        )
-        outbox_write = outbox_graph_write(outbox_value, job_key)
-        d11_proposal = DomainProposal(
-            "d11",
-            D11_PROPOSAL_SCHEMA,
-            D11_PROPOSAL_SCHEMA_HASH,
-            command,
-            (job_write, outbox_write),
-            DependencySet(current_invalidation=(reads[job_key],)),
-            ("source-encoding:" + digest,),
-            (),
-        )
-        bundle = DomainBundle(
-            command,
-            (d06_proposal, d11_proposal),
-            (), (), (), (),
-            (request.idempotency_key,),
-            (job_key.token,),
-            (outbox_key.token,),
+        bundle = build_first_ingress_bundle(
+            command, authorization.job, canonical_admission,
+            source_identity=digest, payload_ref=request.payload_ref,
+            idempotency_key=request.idempotency_key,
         )
         sealed_digest = await self._observation_authority.seal_bundle(
             observation_context, session, observation, bundle.digest
