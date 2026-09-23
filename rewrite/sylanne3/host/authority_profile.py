@@ -21,7 +21,8 @@ import platform
 import re
 import ssl
 import stat
-from typing import Iterator
+from types import MappingProxyType
+from typing import Iterator, Mapping
 
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.budget import BudgetLease
@@ -38,6 +39,11 @@ _PROFILE_FIELDS_V2 = _PROFILE_FIELDS_V1 | {"installation_policy"}
 _INGRESS_CLOCK_FIELDS = frozenset({
     "source_id", "max_utc_error_seconds", "max_round_trip_seconds",
 })
+_INGRESS_ENCODING_FIELDS = frozenset({
+    "deadline_after_seconds", "quote_ceiling", "snapshot_ref", "resource_ref",
+    "character_interval_ref",
+})
+_RESOURCE_DIMENSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 _INSTALLATION_FIELDS = frozenset({
     "namespace", "authority_namespace", "installation_id", "manifest_digest",
     "administrator_holder", "expected_authority_id", "catalogue_hash",
@@ -104,6 +110,43 @@ class AdminIngressClockPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class AdminIngressEncodingPolicy:
+    """Administrator bounds and provenance for a future source encoder."""
+
+    deadline_after_seconds: float
+    quote_ceiling: Mapping[str, int]
+    snapshot_ref: str
+    resource_ref: str
+    character_interval_ref: str
+
+    def __post_init__(self) -> None:
+        from ..runtime.issuers import MAX_DIMENSIONS, MAX_QUANTITY
+
+        deadline = self.deadline_after_seconds
+        try:
+            valid_deadline = (type(deadline) in {int, float} and deadline > 0
+                              and math.isfinite(deadline))
+        except OverflowError:
+            valid_deadline = False
+        if not valid_deadline:
+            raise ValueError("ingress encoding deadline must be finite and positive")
+        ceiling = self.quote_ceiling
+        if not isinstance(ceiling, Mapping) or not 0 < len(ceiling) <= MAX_DIMENSIONS:
+            raise ValueError("ingress encoding quote ceiling must be nonempty and bounded")
+        snapshot: dict[str, int] = {}
+        for name, amount in ceiling.items():
+            if (type(name) is not str or _RESOURCE_DIMENSION.fullmatch(name) is None
+                    or type(amount) is not int or not 0 < amount <= MAX_QUANTITY):
+                raise ValueError("ingress encoding quote ceiling contains an invalid amount")
+            snapshot[name] = amount
+        object.__setattr__(self, "quote_ceiling", MappingProxyType(snapshot))
+        for name in ("snapshot_ref", "resource_ref", "character_interval_ref"):
+            value = getattr(self, name)
+            if type(value) is not str or not value.strip():
+                raise ValueError(f"ingress encoding {name} must be nonempty")
+
+
+@dataclass(frozen=True, slots=True)
 class AdminInstallationBundle:
     """One verified installation snapshot for Authority client assembly."""
 
@@ -112,6 +155,7 @@ class AdminInstallationBundle:
     d11_signing_key: bytes
     d02_signing_key: bytes
     ingress_clock: AdminIngressClockPolicy | None = None
+    ingress_encoding: AdminIngressEncodingPolicy | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -409,10 +453,15 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
     if (not isinstance(value, dict) or type(value.get("schema")) is not int
             or value["schema"] not in {1, 2}
             or (set(value) != _PROFILE_FIELDS_V1 if value["schema"] == 1 else
-                set(value) not in {_PROFILE_FIELDS_V2,
-                                   _PROFILE_FIELDS_V2 | {"ingress_clock"}})):
+                not _valid_schema2_fields(value))):
         raise ValueError("authority profile schema is invalid")
     return value
+
+
+def _valid_schema2_fields(payload: dict[str, object]) -> bool:
+    return _PROFILE_FIELDS_V2 <= set(payload) <= (
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding"}
+    )
 
 
 def _endpoint_name(value: object) -> str:
@@ -469,15 +518,27 @@ def _ingress_clock_from_payload(payload: dict[str, object]) -> AdminIngressClock
     return AdminIngressClockPolicy(**values)
 
 
+def _ingress_encoding_from_payload(payload: dict[str, object]) -> AdminIngressEncodingPolicy | None:
+    if "ingress_encoding" not in payload:
+        return None
+    if type(payload.get("schema")) is not int or payload["schema"] != 2:
+        raise ValueError("ingress encoding requires profile schema 2")
+    values = _exact_object(payload["ingress_encoding"], _INGRESS_ENCODING_FIELDS,
+                           "ingress encoding")
+    if type(values["quote_ceiling"]) is not dict:
+        raise ValueError("ingress encoding quote ceiling must be an object")
+    return AdminIngressEncodingPolicy(**values)
+
+
 def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     """Parse schema 2 after the enclosing profile passed its trusted read gate."""
     from ..runtime.issuers import BudgetLeaseGrant
 
     if (type(payload.get("schema")) is not int or payload["schema"] != 2
-            or set(payload) not in {_PROFILE_FIELDS_V2,
-                                    _PROFILE_FIELDS_V2 | {"ingress_clock"}}):
+            or not _valid_schema2_fields(payload)):
         raise ValueError("administrator installation policy requires profile schema 2")
     _ingress_clock_from_payload(payload)
+    _ingress_encoding_from_payload(payload)
     values = _exact_object(payload["installation_policy"], _INSTALLATION_FIELDS,
                            "installation policy")
     namespace = _exact_object(values["namespace"], frozenset({"bot_id", "persona_id"}),
@@ -656,7 +717,8 @@ def _load_installation_bundle_from_root(
             _read_fd_bounded(files[_D02_SIGNING_KEY], _D11_SIGNING_KEY_BYTES), "D02"
         )
     return AdminInstallationBundle(profile, policy, d11_key, d02_key,
-                                   _ingress_clock_from_payload(payload))
+                                   _ingress_clock_from_payload(payload),
+                                   _ingress_encoding_from_payload(payload))
 
 
 def _load_windows_installation_bundle(
@@ -678,7 +740,8 @@ def _load_windows_installation_bundle(
             _read_windows_signing_key(handles[profile_dir / _D02_SIGNING_KEY]), "D02"
         )
     return AdminInstallationBundle(profile, policy, d11_key, d02_key,
-                                   _ingress_clock_from_payload(payload))
+                                   _ingress_clock_from_payload(payload),
+                                   _ingress_encoding_from_payload(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -730,7 +793,8 @@ def load_admin_d11_signing_key(profile_id: str) -> bytes:
 
 
 __all__ = (
-    "AdminIngressClockPolicy", "AdminInstallationBundle", "AdminInstallationPolicy",
+    "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminInstallationBundle",
+    "AdminInstallationPolicy",
     "AuthorityProfileUnavailable",
     "build_admin_authority_transport", "load_admin_installation_policy",
     "load_admin_d11_signing_key", "load_admin_installation_bundle",
