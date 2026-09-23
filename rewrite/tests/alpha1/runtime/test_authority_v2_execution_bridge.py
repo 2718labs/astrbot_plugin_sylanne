@@ -13,7 +13,7 @@ from sylanne3.authority_service.v2_execution_journal import AuthorityV2Execution
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.authority_service.v2_contract import (
-    ExecutionBindingV1, canonical_bytes, decode_bytes,
+    ExecutionBindingV1, PendingMutationV2, canonical_bytes, decode_bytes,
 )
 from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime_journal import (
@@ -158,6 +158,74 @@ def test_claim_advances_same_operation_and_replays_after_restart(tmp_path):
     core.close()
     journal.close()
 
+
+def test_completed_claim_replay_rejects_journal_only_following_append(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(tmp_path)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    binding = execution_binding(permit, item)
+    claimed, updated = bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding)
+    draft = PendingMutationV2(
+        permit=updated, mutation_id="mutation-extra",
+        request_digest="sha256:" + "c" * 64, phase="prepared",
+        before_anchor=claimed.after_anchor, expected_append_id="append-extra",
+        expected_append_digest="sha256:" + "0" * 64)
+    journal.append_once(replace(
+        draft, expected_append_digest=journal.expected_digest(draft)))
+    assert journal.verified_head().seq == 3
+    assert authority_anchor(core).execution_seq == 2
+    with pytest.raises(AuthorityUnavailable, match="execution journal differs"):
+        bridge.execution_claim(
+            credential="ok", subject="subject-a",
+            prepared_receipt=prepared, binding=binding)
+    with pytest.raises(AuthorityUnavailable, match="execution journal differs"):
+        bridge.reconcile_mutation(
+            credential="ok", subject="subject-a", pending=claimed.pending)
+    core.close()
+    journal.close()
+
+
+def test_completed_claim_replay_allows_later_authority_committed_append(tmp_path):
+    core, fences, journal, bridge, _ = setup_service(tmp_path)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    binding = execution_binding(permit, item)
+    claimed = bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding)
+    claimed_receipt, claimed_permit = claimed
+    fences.finish_fence(
+        claimed_permit, subject="subject-a",
+        current_anchor=claimed_receipt.after_anchor,
+        request_id="finish-a", request_digest="sha256:" + "f" * 64)
+    later_footprint = replace(
+        item, effect_id="effect-b", conflict_keys=("resource-b",))
+    later_permit = fences.begin_fence(
+        subject="subject-a", holder="holder-a", operation="dispatch",
+        current_anchor=authority_anchor(core), operation_id="operation-b",
+        effect_id="effect-b", command_digest="sha256:" + "a" * 64,
+        footprint_digest="sha256:" + hashlib.sha256(
+            later_footprint._json().encode()).hexdigest())
+    bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=later_permit,
+        mutation_id="mutation-b", footprint=later_footprint)
+    assert journal.verified_head().seq == authority_anchor(core).execution_seq == 3
+    assert bridge.execution_claim(
+        credential="ok", subject="subject-a",
+        prepared_receipt=prepared, binding=binding) == claimed
+    assert bridge.reconcile_mutation(
+        credential="ok", subject="subject-a",
+        pending=claimed_receipt.pending) == claimed
+    core.close()
+    journal.close()
 
 def test_claim_pending_recovers_one_append_without_platform_handoff(tmp_path):
     core, fences, journal, bridge, _ = setup_service(tmp_path)

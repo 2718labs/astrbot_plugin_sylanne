@@ -65,6 +65,11 @@ class AuthorityV2ExecutionBridge:
         if row[6:9] != (head.journal_id, head.seq, head.digest) or row[9] != "clear":
             raise AuthorityUnavailable("deletion journal changed or is not settled")
 
+    def _check_execution_head_locked(self, db, head):
+        row = self.core._row(db, self.namespace)
+        if row[10:13] != (head.journal_id, head.seq, head.digest):
+            raise AuthorityUnavailable("execution journal differs from Authority head")
+
     @staticmethod
     def _require_v2_mode_locked(db) -> None:
         mode = db.execute(
@@ -274,7 +279,9 @@ class AuthorityV2ExecutionBridge:
                         raise AuthorityUnavailable("claim footprint differs from prepare")
                     existing = self.fences.mutation_locked(db, pending.mutation_id)
                     if existing is not None:
-                        self._load_mutation_locked(db, pending, subject)
+                        saved = self._load_mutation_locked(db, pending, subject)
+                        if self._completed_result(saved) is not None:
+                            self._check_execution_head_locked(db, inspection.verified_head)
                         return pending
                     if inspection.following_count != 1:
                         raise AuthorityUnavailable("prepared append is no longer current")
@@ -335,12 +342,14 @@ class AuthorityV2ExecutionBridge:
                   raise AuthorityUnavailable("historical deletion closure blocks dispatch recovery")
               inspection = None
               inspection_error = None
+              verified_head = None
               try:
                   inspection = self.journal.inspect_expected(pending)
+                  verified_head = inspection.verified_head
               except AuthorityUnavailable as exc:
                   # Completed idempotent retries can outlive later appends.
                   # Still require an independently verified full chain.
-                  self.journal.verified_head()
+                  verified_head = self.journal.verified_head()
                   inspection_error = exc
               with self.core._tx() as db:
                 self._require_v2_mode_locked(db)
@@ -358,6 +367,7 @@ class AuthorityV2ExecutionBridge:
                         raise AuthorityUnavailable("claim lost original prepared receipt or footprint")
                 completed = self._completed_result(mutation)
                 if completed is not None:
+                    self._check_execution_head_locked(db, verified_head)
                     return completed
                 if inspection_error is not None:
                     raise inspection_error
