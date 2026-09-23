@@ -1,0 +1,11 @@
+{
+  "name": "sylanne-workbench-client",
+  "private": true,
+  "version": "0.0.0-dev",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "node --check src/app.js && node --check src/api/client.js && node --check src/state.js && node --check src/workflows.js",
+    "test": "node --test ../rewrite/tests/alpha1/workbench/*.test.mjs"
+  }
+}

@@ -1,6 +1,7 @@
 # Build artifacts
 output/
 dist/
+.playwright-cli/
 Sylanne-embodiment.zip
 test_output.txt
 

@@ -11,6 +11,56 @@ permissions:
   contents: read
 
 jobs:
+  alpha1-components:
+    name: Alpha1 components (${{ matrix.os }}, Python 3.11)
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONPATH: rewrite
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, target_os: linux, target_arch: x86_64}
+          - {os: ubuntu-24.04-arm, target_os: linux, target_arch: aarch64}
+          - {os: windows-2025, target_os: windows, target_arch: x86_64}
+          - {os: macos-15, target_os: macos, target_arch: aarch64}
+          - {os: macos-15-intel, target_os: macos, target_arch: x86_64}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Verify runner OS and CPU
+        run: python -c "from rewrite.sylanne3.native_runtime.loader import _runtime_target; actual = _runtime_target()[:2]; expected = ('${{ matrix.target_os }}', '${{ matrix.target_arch }}'); assert actual == expected, (actual, expected)"
+
+      - name: Select stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Install component test tools
+        run: python -m pip install pytest pytest-asyncio ruff
+
+      - name: Compile and lint the alpha1 source
+        run: |
+          python -m compileall -q main.py rewrite/sylanne3
+          python -m ruff check main.py rewrite
+
+      - name: Test native core
+        run: |
+          cargo fmt --check --manifest-path rewrite/native/Cargo.toml
+          cargo test --manifest-path rewrite/native/Cargo.toml
+
+      - name: Build and load this platform's dev-probe package
+        run: |
+          cargo build --release --manifest-path rewrite/native/Cargo.toml
+          python scripts/alpha1/probe_current_platform_package.py
+
+      - name: Test alpha1 contracts and package builder
+        run: python -m pytest -q rewrite/tests/alpha1 rewrite/tests/test_plugin_package.py
+
   core-native:
     name: Core/native (${{ matrix.os }}, Python 3.13)
     runs-on: ${{ matrix.os }}
@@ -42,16 +92,26 @@ jobs:
   astrbot-sdk:
     name: AstrBot 4.28.1 SDK (${{ matrix.os }}, Python 3.13)
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONPATH: rewrite
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - {os: ubuntu-24.04, target_os: linux, target_arch: x86_64}
+          - {os: ubuntu-24.04-arm, target_os: linux, target_arch: aarch64}
+          - {os: windows-2025, target_os: windows, target_arch: x86_64}
+          - {os: macos-15, target_os: macos, target_arch: aarch64}
+          - {os: macos-15-intel, target_os: macos, target_arch: x86_64}
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+
+      - name: Verify runner OS and CPU
+        run: python -c "from rewrite.sylanne3.native_runtime.loader import _runtime_target; actual = _runtime_target()[:2]; expected = ('${{ matrix.target_os }}', '${{ matrix.target_arch }}'); assert actual == expected, (actual, expected)"
 
       - name: Select stable Rust toolchain
         run: |
@@ -65,6 +125,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install "AstrBot==4.28.1"
+          python -m pip install pytest pytest-asyncio
 
       - name: Verify AstrBot host adapter
         run: python rewrite/tools/verify_host.py
+
+      - name: Verify alpha1 host ingress and startup gates
+        run: python -m pytest -q rewrite/host_tests/alpha1

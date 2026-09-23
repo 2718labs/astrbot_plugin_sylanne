@@ -1,17 +1,28 @@
-"""Bounded ctypes bridge. No fallback; error bounds certify only A*x=b.
+"""Explicit ABI1 developer reference bridge plus the production ABI2 loader.
 
-Native calls run synchronously in scheduler-owned workers. Cancellation is checked
-on both sides of each call. Each call is capped at 64 sweeps over at most 256
-variables. ctypes owns disjoint input/output allocations with exact ABI lengths.
+ABI1 remains available only for its historical linear reference tests. Product
+code must use ``load_production_native`` which validates the packaged ABI2 asset.
 """
 from concurrent.futures import CancelledError
 import ctypes
 from dataclasses import dataclass
 import math
 from pathlib import Path
-import sys
 import threading
 from .contracts import StepResult
+from .native_runtime import (
+    ABI2CSR,
+    ABI2NativeLibrary,
+    ABI2StepInput,
+    ABI2StepResult,
+    DiagnosticStepResult,
+    NativeCapabilities,
+    NativeIntegrityError,
+    NativeLoadError,
+    NativePlatformError,
+    diagnostic_step_result,
+    load_production_native,
+)
 
 
 class AccuracyNotMet(ArithmeticError):
@@ -42,16 +53,11 @@ def _vector(values, n, name):
 
 
 class NativeKernel:
-    def __init__(self, library_path=None):
-        if library_path is None:
-            filename = ('sylanne3_kernel.dll' if sys.platform == 'win32' else
-                        'libsylanne3_kernel.dylib' if sys.platform == 'darwin' else
-                        'libsylanne3_kernel.so')
-            root = Path(__file__).resolve().parents[1] / 'native' / 'target'
-            library_path = next((root / kind / filename for kind in ('release','debug')
-                                 if (root / kind / filename).is_file()), None)
-            if library_path is None:
-                raise FileNotFoundError('Build rewrite/native using cargo build --release')
+    """ABI1 linear reference kernel; never a production fallback."""
+
+    def __init__(self, library_path, *, developer_reference=False):
+        if developer_reference is not True:
+            raise RuntimeError('ABI1 is available only as an explicit developer reference')
         self._library = ctypes.CDLL(str(Path(library_path).resolve()))
         version = self._library.sylanne3_abi_version
         version.argtypes = []

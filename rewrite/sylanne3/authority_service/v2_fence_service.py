@@ -1,0 +1,177 @@
+"""Internal v2-only protected anchor reads and exclusive fence issuance.
+
+The installed service supplies an authenticated subject and owns both journal
+files. Fixed nesting is deletion writer guard, execution writer guard, then a
+short transaction on Core's Authority DB. No graph or business callback runs
+inside those guards. This has no RPC or production RuntimeDependency wiring.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+import hashlib
+
+from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime_journal import RecoveryConstraintFootprint
+from .contract import AuthorityUnavailable, identifier
+from .core import AuthorityServiceCore
+from .local_bridge import constraint_keys_from_footprint
+from .v2_contract import FencePermitV2
+from .v2_deletion_guard import AuthorityV2DeletionGuard
+from .v2_execution_journal import AuthorityV2ExecutionJournal
+from .v2_fence_store import AuthorityV2FenceStore
+
+
+class AuthorityV2FenceService:
+    def __init__(self, *, core: AuthorityServiceCore,
+                 fences: AuthorityV2FenceStore,
+                 deletion: AuthorityV2DeletionGuard,
+                 execution: AuthorityV2ExecutionJournal,
+                 namespace: str):
+        identifier(namespace, "namespace")
+        if (type(core) is not AuthorityServiceCore
+                or type(fences) is not AuthorityV2FenceStore
+                or type(deletion) is not AuthorityV2DeletionGuard
+                or type(execution) is not AuthorityV2ExecutionJournal
+                or core._db is not fences._db or core._lock is not fences._lock
+                or execution.namespace != namespace):
+            raise AuthorityUnavailable("v2 protected fence requires one service DB/lock and namespace")
+        self.core, self.fences = core, fences
+        self.deletion, self.execution = deletion, execution
+        self.namespace = namespace
+        # Pre-seal Core still verifies journals while holding its DB lock.
+        # Reject here before this service can take journal guards and invert it.
+        with core._tx() as db:
+            self._require_mode(db)
+
+    @staticmethod
+    def _require_mode(db):
+        if db.execute("SELECT value FROM authority_meta WHERE key='service_mode'").fetchone() != ("v2-only",):
+            raise AuthorityUnavailable("v2 protected read requires persistent v2-only mode")
+        AuthorityServiceCore._require_no_deletion_migration(db)
+
+    def _current_locked(self, db, deletion_head, execution_head, *, holder: str | None = None,
+                        generation: int | None = None,
+                        require_clear: bool = True) -> RestoreAnchor:
+        self._require_mode(db)
+        self.fences._check_schema(db)
+        row = self.core._row(db, self.namespace)
+        if (row[2] != "active" or row[3] is not None or row[4] is not None
+                or row[0] is None or (require_clear and row[9] != "clear")
+                or (holder is not None and row[0] != holder)
+                or (generation is not None and row[1] != generation)):
+            raise AuthorityUnavailable("v2 namespace is not settled under expected owner")
+        if (row[6:9] != (deletion_head.journal_id, deletion_head.seq, deletion_head.digest)
+                or row[10:13] != (execution_head.journal_id, execution_head.seq,
+                                   execution_head.digest)):
+            raise AuthorityUnavailable("Authority is behind or differs from an independent journal")
+        if db.execute("SELECT 1 FROM authority_v2_fences WHERE namespace=? AND pending IS NOT NULL LIMIT 1",
+                      (self.namespace,)).fetchone():
+            raise AuthorityUnavailable("namespace has a pending v2 mutation")
+        return self.core._anchor(db, self.namespace, row)
+
+    @contextmanager
+    def _frozen(self):
+        with self.deletion.freeze_writes():
+            with self.execution.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                deletion_history = self.deletion.has_deletion_history(self.namespace)
+                execution_head = self.execution.verified_head()
+                with self.core._tx() as db:
+                    yield db, deletion_head, execution_head, deletion_history
+
+    def current_anchor(self, *, credential, subject: str) -> RestoreAnchor:
+        """Protected, fully verified read; subject is authenticated by the host."""
+        identifier(subject, "subject")
+        self.core._require(credential, "current", self.namespace)
+        with self._frozen() as (db, deletion_head, execution_head, _):
+            return self._current_locked(db, deletion_head, execution_head)
+
+    def begin_fence(self, *, credential, subject: str, holder: str,
+                    operation: str, operation_id: str,
+                    expected_anchor: RestoreAnchor,
+                    effect_id: str | None = None,
+                    command_digest: str | None = None,
+                    footprint: RecoveryConstraintFootprint | None = None) -> FencePermitV2:
+        """Issue only against the exact caller-seen full anchor and live owner."""
+        identifier(subject, "subject")
+        identifier(holder, "holder")
+        identifier(operation_id, "operation_id")
+        if type(expected_anchor) is not RestoreAnchor or expected_anchor.namespace != self.namespace:
+            raise AuthorityUnavailable("expected full v2 anchor is required")
+        self.core._require(credential, operation, self.namespace, holder)
+        footprint_digest = None
+        if operation == "dispatch":
+            if (type(footprint) is not RecoveryConstraintFootprint
+                    or footprint.namespace != self.namespace
+                    or footprint.effect_id != effect_id):
+                raise AuthorityUnavailable("dispatch requires exact service-verified footprint")
+            keys = constraint_keys_from_footprint(footprint)
+            try:
+                verified = self.core._dispatch_verifier(self.namespace, effect_id, keys)
+            except Exception as exc:
+                raise AuthorityUnavailable("D08 dispatch verification unavailable") from exc
+            if verified is not True:
+                raise AuthorityUnavailable("D08 dispatch verification denied")
+            footprint_digest = "sha256:" + hashlib.sha256(footprint._json().encode()).hexdigest()
+        elif any(value is not None for value in (effect_id, command_digest, footprint)):
+            raise AuthorityUnavailable("effect binding requires dispatch")
+        with self._frozen() as (db, deletion_head, execution_head, deletion_history):
+            anchor = self._current_locked(
+                db, deletion_head, execution_head, holder=holder,
+                generation=expected_anchor.activation_generation)
+            if anchor != expected_anchor:
+                raise AuthorityUnavailable("full v2 anchor changed before fence issuance")
+            if deletion_history:
+                raise AuthorityUnavailable("historical deletion closure blocks content fence")
+            if operation == "dispatch":
+                if db.execute("SELECT 1 FROM authority_effects WHERE namespace=? AND effect_id=?",
+                              (self.namespace, effect_id)).fetchone():
+                    raise AuthorityUnavailable("dispatch effect already has history")
+            return self.fences.begin_fence_locked(
+                db, subject=subject, holder=holder, operation=operation,
+                current_anchor=anchor, operation_id=operation_id,
+                effect_id=effect_id, command_digest=command_digest,
+                footprint_digest=footprint_digest)
+
+    def _require_permit(self, *, credential, subject: str,
+                        permit: FencePermitV2) -> None:
+        """Authenticate before taking journal guards; the host supplies subject."""
+        identifier(subject, "subject")
+        if (type(permit) is not FencePermitV2
+                or permit.namespace != self.namespace or permit.subject != subject):
+            raise AuthorityUnavailable("v2 fence subject or namespace mismatch")
+        self.core._require(credential, permit.operation, self.namespace, permit.holder)
+
+    def validate_fence(self, *, credential, subject: str,
+                       permit: FencePermitV2) -> FencePermitV2:
+        """Validate a live permit against both frozen journals and Authority."""
+        self._require_permit(credential=credential, subject=subject, permit=permit)
+        with self._frozen() as (db, deletion_head, execution_head, deletion_history):
+            anchor = self._current_locked(
+                db, deletion_head, execution_head, holder=permit.holder,
+                generation=permit.generation)
+            if deletion_history:
+                raise AuthorityUnavailable("historical deletion closure blocks content fence")
+            if anchor != permit.pinned_anchor:
+                raise AuthorityUnavailable("v2 fence pinned anchor changed")
+            return self.fences.validate_fence_locked(
+                db, permit, subject=subject, current_anchor=anchor)
+
+    def finish_fence(self, *, credential, subject: str,
+                     permit: FencePermitV2, request_id: str,
+                     request_digest: str) -> None:
+        """Finish under both writer guards; exact completed retries return no permit."""
+        self._require_permit(credential=credential, subject=subject, permit=permit)
+        with self._frozen() as (db, deletion_head, execution_head, deletion_history):
+            anchor = self._current_locked(
+                db, deletion_head, execution_head, holder=permit.holder,
+                generation=permit.generation)
+            if deletion_history:
+                raise AuthorityUnavailable("historical deletion closure blocks content fence")
+            self.fences.finish_fence_locked(
+                db, permit, subject=subject, current_anchor=anchor,
+                request_id=request_id, request_digest=request_digest)
+
+
+__all__ = ["AuthorityV2FenceService"]

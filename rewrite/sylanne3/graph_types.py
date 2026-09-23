@@ -1,6 +1,7 @@
 """Typed graph values and registry for the phase 5b graph contract."""
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 
 from .contracts import Event, canonical_json, json_object, nonempty
@@ -73,6 +74,8 @@ class TypeSpec:
     validator: object = field(compare=False, repr=False)
     immutable: bool = False
     schema_version: int = 1
+    writer_domain: str | None = None
+    schema_hash: str | None = None
 
     def __post_init__(self):
         nonempty(self.name, "type name")
@@ -87,6 +90,12 @@ class TypeSpec:
             raise TypeError("immutable must be bool")
         if type(self.schema_version) is not int or self.schema_version < 1:
             raise ValueError("schema_version must be a positive exact integer")
+        if self.writer_domain is not None:
+            nonempty(self.writer_domain, "writer_domain")
+        if self.schema_hash is not None:
+            if (type(self.schema_hash) is not str or len(self.schema_hash) != 64
+                    or any(ch not in "0123456789abcdef" for ch in self.schema_hash)):
+                raise ValueError("schema_hash must be a lowercase SHA-256 digest")
         object.__setattr__(self, "owner_kinds", kinds)
 
 
@@ -128,6 +137,13 @@ class TypeRegistry:
     @property
     def specs(self) -> tuple[TypeSpec, ...]:
         return tuple(self._specs[name] for name in sorted(self._specs))
+
+    @property
+    def catalogue_hash(self) -> str:
+        rows = [[spec.name, list(spec.owner_kinds), spec.storage_role,
+                 spec.immutable, spec.schema_version, spec.writer_domain,
+                 spec.schema_hash] for spec in self.specs]
+        return hashlib.sha256(canonical_json(rows).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

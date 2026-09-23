@@ -1,7 +1,7 @@
 name: astrbot_plugin_sylanne
-display_name: Sylanne 3 Development Adapter
-desc: "显式 /sylanne3 命令的隔离开发适配器，默认关闭。"
-short_desc: "Sylanne 3 隔离开发入口"
+display_name: Sylanne 3 Development Candidate
+desc: "Sylanne 3 开发候选。启用前需管理员安装 Authority 配置档；未完成完整运行时装配时保持阻塞，不处理消息。"
+short_desc: "需管理员 Authority 入驻；完整运行时就绪前保持阻塞。"
 version: "3.0.0-dev.1"
 author: 2718-labs
 license: AGPL-3.0-or-later

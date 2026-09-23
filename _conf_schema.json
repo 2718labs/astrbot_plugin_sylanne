@@ -1,24 +1,14 @@
 {
   "enabled": {
-    "description": "启用 Sylanne 3 隔离开发命令",
+    "description": "启用 Sylanne 3 完整运行时",
     "type": "bool",
     "default": false,
-    "hint": "默认关闭。开启后仅处理显式 /sylanne3 命令。"
+    "hint": "默认关闭。启用后监听平台全部消息；只有运行时状态为 ready 且身份与权限校验通过时才会处理消息。"
   },
-  "capacity": {
-    "description": "并发请求容量",
-    "type": "int",
-    "default": 8,
-    "minimum": 1,
-    "maximum": 64,
-    "hint": "允许 1 到 64 个正在处理的命令；超限立即返回繁忙。"
-  },
-  "timeout": {
-    "description": "模型提议与平台发送超时（秒）",
-    "type": "float",
-    "default": 30.0,
-    "minimum": 1.0,
-    "maximum": 120.0,
-    "hint": "允许 1 到 120 秒；发送超时按未知接收状态处理。"
+  "authority_profile": {
+    "description": "管理员 Authority 配置档 ID",
+    "type": "string",
+    "default": "default",
+    "hint": "仅填写已由系统管理员预先安装的配置档标识符：1–64 个字符，以字母或数字开头，其余可用字母、数字、点、下划线或连字符。服务器地址、CA、客户端密钥及 Authority 身份由管理员在主机上配置，不要填入聊天插件配置。"
   }
 }

@@ -17,6 +17,7 @@ from .graph_types import (
     TypeRegistry,
 )
 from .store import Store
+from .runtime import install_schema as install_runtime_schema
 
 
 class GraphStore(Store):
@@ -31,6 +32,7 @@ class GraphStore(Store):
             try:
                 self._create_graph_schema()
                 self._db.execute("BEGIN IMMEDIATE")
+                install_runtime_schema(self._db)
                 self._check_catalog()
                 self._db.execute("COMMIT")
             except BaseException:
@@ -100,6 +102,56 @@ class GraphStore(Store):
                 PRIMARY KEY(token, revision),
                 FOREIGN KEY(event_bot, event_persona, event_session, event_id)
                     REFERENCES graph_events(bot, persona, session, event_id));
+            CREATE TABLE IF NOT EXISTS graph_type_authority (
+                name TEXT PRIMARY KEY,
+                writer_domain TEXT NOT NULL,
+                schema_hash TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS graph_authority_epochs (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                access_epoch INTEGER NOT NULL DEFAULT 0,
+                delete_epoch INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(bot, persona));
+            CREATE TABLE IF NOT EXISTS graph_guard_versions (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                kind TEXT NOT NULL, ref TEXT NOT NULL, version TEXT NOT NULL,
+                PRIMARY KEY(bot, persona, kind, ref));
+            CREATE TABLE IF NOT EXISTS graph_bundle_operations (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, digest TEXT NOT NULL,
+                activity_id TEXT NOT NULL, effect_id TEXT,
+                commit_seq INTEGER NOT NULL, receipt_json TEXT NOT NULL,
+                PRIMARY KEY(bot, persona, operation_id));
+            CREATE TABLE IF NOT EXISTS graph_bundle_sequence (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                last_seq INTEGER NOT NULL,
+                PRIMARY KEY(bot, persona));
+            CREATE TABLE IF NOT EXISTS graph_bundle_refs (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, ref_kind TEXT NOT NULL,
+                ref TEXT NOT NULL,
+                PRIMARY KEY(bot, persona, ref_kind, ref),
+                FOREIGN KEY(bot,persona,operation_id)
+                    REFERENCES graph_bundle_operations(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_bundle_outbox (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                outbox_ref TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK(phase IN ('pending','claimed','cancelled')),
+                PRIMARY KEY(bot,persona,outbox_ref),
+                FOREIGN KEY(bot,persona,operation_id)
+                    REFERENCES graph_bundle_operations(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_outbox_jobs (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                outbox_ref TEXT NOT NULL, job_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,outbox_ref),
+                FOREIGN KEY(job_id) REFERENCES runtime_jobs(job_id));
+            CREATE TABLE IF NOT EXISTS graph_dependency_edges (
+                dependent_token TEXT NOT NULL, dependency_token TEXT NOT NULL,
+                dependency_revision INTEGER NOT NULL,
+                edge_kind TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                PRIMARY KEY(dependent_token,dependency_token,edge_kind,operation_id));
         """)
 
     @staticmethod
@@ -125,6 +177,23 @@ class GraphStore(Store):
                 "INSERT INTO graph_type_catalog(name,owner_kinds,storage_role,immutable,schema_version) "
                 "VALUES(?,?,?,?,?)", expected
             )
+        authority = tuple(self._db.execute(
+            "SELECT name,writer_domain,schema_hash FROM graph_type_authority ORDER BY name"
+        ).fetchall())
+        expected_authority = tuple((spec.name, spec.writer_domain or "",
+                                    spec.schema_hash or "") for spec in self._registry.specs)
+        if authority and authority != expected_authority:
+            raise ValueError("graph type authority catalogue does not match this registry; migration required")
+        if not authority:
+            # Existing nonempty graphs have no writer provenance. Only a separate
+            # reviewed migration may grant their types production write authority.
+            count = self._db.execute("SELECT COUNT(*) FROM graph_atoms").fetchone()[0]
+            if count and any(spec.writer_domain for spec in self._registry.specs):
+                raise ValueError("legacy graph requires explicit writer-authority migration")
+            self._db.executemany(
+                "INSERT INTO graph_type_authority(name,writer_domain,schema_hash) VALUES(?,?,?)",
+                expected_authority,
+            )
 
     def _validate_key(self, key: AtomKey):
         if not isinstance(key, AtomKey):
@@ -140,7 +209,13 @@ class GraphStore(Store):
     def _namespace(key: AtomKey):
         return key.owner.bot, key.owner.persona
 
-    def graph_epoch(self, bot, persona):
+    def _require_coordinator(self, capability):
+        if isinstance(self, ProductionGraphStore) and (
+                capability is None or capability is not getattr(self, "_coordinator_capability", None)):
+            raise PermissionError("production graph access requires GraphCoordinator")
+
+    def graph_epoch(self, bot, persona, *, _capability=None):
+        self._require_coordinator(_capability)
         nonempty(bot, "bot")
         nonempty(persona, "persona")
         with self._lock:
@@ -150,7 +225,8 @@ class GraphStore(Store):
             ).fetchone()
             return NamespaceEpoch(bot, persona, row[0] if row else 0)
 
-    def graph_snapshot(self, keys):
+    def graph_snapshot(self, keys, *, _capability=None):
+        self._require_coordinator(_capability)
         keys = tuple(keys)
         if len(set(keys)) != len(keys):
             raise ValueError("duplicate graph snapshot keys")
@@ -183,12 +259,14 @@ class GraphStore(Store):
                 self._db.execute("ROLLBACK")
                 raise
 
+
     @staticmethod
     def _version_rows(encoded):
         return tuple(GraphVersion(AtomKey.from_token(token), revision)
                      for token, revision in json.loads(encoded))
 
-    def graph_event_receipt(self, event):
+    def graph_event_receipt(self, event, *, _capability=None):
+        self._require_coordinator(_capability)
         if not isinstance(event, Event):
             raise TypeError('event must be Event')
         digest = event.digest
@@ -208,7 +286,8 @@ class GraphStore(Store):
 
     def graph_query(self, bot, persona, *, type_names=(), owner_kind=None,
                     subject=None, after=None, limit=100, expected_epoch=None,
-                    include_invalid=False):
+                    include_invalid=False, _capability=None):
+        self._require_coordinator(_capability)
         nonempty(bot, 'bot')
         nonempty(persona, 'persona')
         if type(limit) is not int or not 1 <= limit <= 512:
@@ -250,7 +329,7 @@ class GraphStore(Store):
             self._ensure_open()
             self._db.execute('BEGIN')
             try:
-                epoch = self.graph_epoch(bot, persona)
+                epoch = GraphStore.graph_epoch(self, bot, persona, _capability=_capability)
                 if expected_epoch is not None and epoch != expected_epoch:
                     raise StaleRead('query namespace changed between pages')
                 rows = self._db.execute(
@@ -324,7 +403,9 @@ class GraphStore(Store):
         if visited != len(nodes):
             raise ValueError("instantaneous dependency cycle")
 
-    def graph_commit(self, candidate: GraphCandidate):
+    def graph_commit(self, candidate: GraphCandidate, *, _guard=None, _receipt_hook=None,
+                     _capability=None):
+        self._require_coordinator(_capability)
         if not isinstance(candidate, GraphCandidate):
             raise TypeError("candidate must be GraphCandidate")
         event = candidate.event
@@ -372,6 +453,8 @@ class GraphStore(Store):
             self._ensure_open()
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                if _guard is not None:
+                    _guard(self._db)
                 prior = self._db.execute(
                     "SELECT digest,revisions,invalidated,epoch_revision FROM graph_events "
                     "WHERE bot=? AND persona=? AND session=? AND event_id=?", scope_key
@@ -384,6 +467,8 @@ class GraphStore(Store):
                         self._version_rows(prior[2]),
                         NamespaceEpoch(namespace[0], namespace[1], prior[3]),
                     )
+                    if _receipt_hook is not None:
+                        _receipt_hook(self._db, receipt)
                     self._db.execute("COMMIT")
                     return receipt
 
@@ -534,11 +619,47 @@ class GraphStore(Store):
                         "ON CONFLICT(bot,persona) DO UPDATE SET revision=excluded.revision",
                         namespace + (new_epoch,),
                     )
-                self._db.execute("COMMIT")
-                return GraphReceipt(
+                receipt = GraphReceipt(
                     "committed", revisions, invalidated,
                     NamespaceEpoch(namespace[0], namespace[1], new_epoch),
                 )
+                if _receipt_hook is not None:
+                    _receipt_hook(self._db, receipt)
+                self._db.execute("COMMIT")
+                return receipt
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
+
+
+class ProductionGraphStore(GraphStore):
+    """Production-facing class that closes legacy untyped and direct graph APIs.
+
+    Host setup keeps the store private and passes domain code a coordinator.
+    Python module internals remain part of the trusted computing base.
+    """
+
+    @staticmethod
+    def _deny():
+        raise PermissionError("production graph access requires GraphCoordinator")
+
+    def snapshot(self, *args, **kwargs):
+        self._deny()
+
+    def commit(self, *args, **kwargs):
+        self._deny()
+
+    def graph_snapshot(self, *args, **kwargs):
+        self._deny()
+
+    def graph_epoch(self, *args, **kwargs):
+        self._deny()
+
+    def graph_query(self, *args, **kwargs):
+        self._deny()
+
+    def graph_event_receipt(self, *args, **kwargs):
+        self._deny()
+
+    def graph_commit(self, *args, **kwargs):
+        self._deny()

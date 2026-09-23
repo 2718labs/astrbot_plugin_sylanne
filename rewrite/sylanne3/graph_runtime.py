@@ -6,6 +6,7 @@ import threading
 from .contracts import CapacityExceeded, Event
 from .delivery import _finish
 from .graph_types import GraphCandidate
+from .graph_store import ProductionGraphStore
 from .operators import OperatorPlan
 
 
@@ -43,6 +44,8 @@ class GraphRuntime:
     """
 
     def __init__(self, store, scheduler, capacity=8):
+        if isinstance(store, ProductionGraphStore):
+            raise PermissionError("production graph runtime requires GraphCoordinator admission")
         if type(capacity) is not int or capacity < 1:
             raise ValueError('capacity must be a positive integer')
         self.store, self.scheduler = store, scheduler

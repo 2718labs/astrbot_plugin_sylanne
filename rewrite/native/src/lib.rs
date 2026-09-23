@@ -2,6 +2,14 @@
 //! linear system only, never the temporal discretization error.
 use std::slice;
 
+// Arithmetic foundation only; ABI2 certificates stay disabled until the
+// independent nonlinear verifier and strict-build evidence are complete.
+#[allow(dead_code)]
+mod interval;
+#[allow(dead_code)]
+mod interval_verifier;
+mod v2;
+
 #[no_mangle]
 pub extern "C" fn sylanne3_abi_version() -> u32 {
     1

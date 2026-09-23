@@ -350,3 +350,137 @@ class RecallPolicy:
             recall_experience=experience,
             action_authorized=False,
         )
+
+
+@dataclass(frozen=True)
+class ContinuationEstimate:
+    """Inputs to the MEM-07 optional-frontier continuation decision."""
+
+    policy_version: str
+    policy_scope: str
+    frontier_id: str
+    evidence_gain: float | None
+    latency_cost: float | None
+    call_cost: float | None
+    context_interference: float | None
+    weights: tuple[float, float, float, float]
+    threshold: float
+    no_progress_count: int
+    budget_admitted: bool
+    deadline_admitted: bool
+    permission_admitted: bool
+    entry_admitted: bool
+    mandatory_outstanding: bool
+
+    def __post_init__(self):
+        for name in ("policy_version", "policy_scope", "frontier_id"):
+            _nonempty(getattr(self, name), name)
+        for name in ("evidence_gain", "latency_cost", "call_cost", "context_interference"):
+            value = getattr(self, name)
+            if value is not None:
+                _unit_interval(value, name)
+        if type(self.weights) is not tuple or len(self.weights) != 4:
+            raise TypeError("weights must be a four-item tuple")
+        normalized = tuple(_unit_interval(value, "weight") for value in self.weights)
+        if not math.isclose(sum(normalized), 1.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("weights must sum to 1")
+        object.__setattr__(self, "weights", normalized)
+        object.__setattr__(self, "threshold", _unit_interval(self.threshold, "threshold"))
+        _count(self.no_progress_count, "no_progress_count")
+        for name in (
+            "budget_admitted",
+            "deadline_admitted",
+            "permission_admitted",
+            "entry_admitted",
+            "mandatory_outstanding",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be bool")
+
+
+@dataclass(frozen=True)
+class ContinuationReceipt:
+    policy_version: str
+    policy_scope: str
+    frontier_id: str
+    estimates: tuple[float | None, float | None, float | None, float | None]
+    weights: tuple[float, float, float, float]
+    threshold: float
+    net_value: float | None
+    no_progress_count: int
+    decision: str
+    stop_reason: str | None
+    missing_prerequisites: tuple[str, ...]
+    request_complete: bool = False
+
+
+def evaluate_continuation(estimate: ContinuationEstimate) -> ContinuationReceipt:
+    """Evaluate one optional C03 frontier without weakening mandatory checks."""
+
+    if not isinstance(estimate, ContinuationEstimate):
+        raise TypeError("estimate must be ContinuationEstimate")
+    values = (
+        estimate.evidence_gain,
+        estimate.latency_cost,
+        estimate.call_cost,
+        estimate.context_interference,
+    )
+    missing = tuple(
+        name for name, value in zip(
+            ("evidence_gain", "latency_cost", "call_cost", "context_interference"),
+            values,
+        ) if value is None
+    )
+    net_value = None
+    if not missing:
+        gain, latency, call, interference = values
+        net_value = (
+            estimate.weights[0] * gain
+            - estimate.weights[1] * latency
+            - estimate.weights[2] * call
+            - estimate.weights[3] * interference
+        )
+
+    admission = {
+        "budget": estimate.budget_admitted,
+        "deadline": estimate.deadline_admitted,
+        "permission": estimate.permission_admitted,
+        "entry": estimate.entry_admitted,
+    }
+    failed_admission = tuple(name for name, allowed in admission.items() if not allowed)
+    missing_prerequisites = tuple(dict.fromkeys(missing + failed_admission))
+    if missing:
+        decision, stop_reason = "stop", "unknown_cost"
+    elif estimate.mandatory_outstanding:
+        decision, stop_reason = "stop", "mandatory_outstanding"
+    elif estimate.no_progress_count >= 2:
+        decision, stop_reason = "stop", "no_progress"
+    elif failed_admission:
+        decision, stop_reason = "stop", "admission_failed"
+    elif net_value is not None and net_value > estimate.threshold:
+        decision, stop_reason = "continue", None
+    else:
+        decision, stop_reason = "stop", "net_value_not_above_threshold"
+    return ContinuationReceipt(
+        estimate.policy_version,
+        estimate.policy_scope,
+        estimate.frontier_id,
+        values,
+        estimate.weights,
+        estimate.threshold,
+        net_value,
+        estimate.no_progress_count,
+        decision,
+        stop_reason,
+        missing_prerequisites,
+        False,
+    )
+
+
+def _unit_interval(value, label):
+    if type(value) not in (int, float) or isinstance(value, bool) or not math.isfinite(value):
+        raise ValueError(f"{label} must be finite")
+    value = float(value)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{label} must be between 0 and 1")
+    return value

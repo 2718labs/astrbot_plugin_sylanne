@@ -6,6 +6,7 @@ from typing import Self
 
 from .contracts import json_object, nonempty
 from .graph_types import AtomKey, Owner, TypeRegistry, TypeSpec
+from .runtime_contracts import schema_hash
 
 
 _SOURCE_KINDS = frozenset({"observed", "reported", "authored", "internal", "simulated"})
@@ -41,6 +42,25 @@ _INTERPRETATION_FIELDS = frozenset({
     "valid_to",
 })
 _ACCESS_FIELDS = frozenset({"source_id", "audiences", "purposes", "status", "recorded_at"})
+
+_SOURCE_SCHEMA_HASH = schema_hash({
+    "type": "memory.source",
+    "version": 1,
+    "fields": sorted(_SOURCE_FIELDS),
+    "immutable": True,
+})
+_ACCESS_SCHEMA_HASH = schema_hash({
+    "type": "memory.access",
+    "version": 1,
+    "fields": sorted(_ACCESS_FIELDS),
+    "immutable": False,
+})
+_INTERPRETATION_SCHEMA_HASH = schema_hash({
+    "type": "memory.interpretation",
+    "version": 1,
+    "fields": sorted(_INTERPRETATION_FIELDS),
+    "immutable": False,
+})
 
 
 def _enum(value: object, allowed: frozenset[str], label: str) -> None:
@@ -237,11 +257,14 @@ def register_memory_types(registry: TypeRegistry) -> None:
     if not isinstance(registry, TypeRegistry):
         raise TypeError("registry must be TypeRegistry")
     registry.register(TypeSpec(
-        "memory.source", ("event",), "source", _validate_source, immutable=True
+        "memory.source", ("event",), "source", _validate_source,
+        immutable=True, writer_domain="d06", schema_hash=_SOURCE_SCHEMA_HASH,
     ))
     registry.register(TypeSpec(
-        "memory.access", ("event",), "state", validate_access
+        "memory.access", ("event",), "state", validate_access,
+        writer_domain="d06", schema_hash=_ACCESS_SCHEMA_HASH,
     ))
     registry.register(TypeSpec(
-        "memory.interpretation", ("event",), "state", _validate_interpretation
+        "memory.interpretation", ("event",), "state", _validate_interpretation,
+        writer_domain="d06", schema_hash=_INTERPRETATION_SCHEMA_HASH,
     ))

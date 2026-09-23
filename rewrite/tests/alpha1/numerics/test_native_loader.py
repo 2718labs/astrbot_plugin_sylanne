@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import tempfile
+import unittest
+from unittest import mock
+
+from sylanne3.native_runtime import (
+    ABI2ResultError,
+    ABI2StepResult,
+    NativeIntegrityError,
+    NativePlatformError,
+    diagnostic_step_result,
+    load_production_native,
+)
+from sylanne3.native import NativeKernel
+
+
+class _Symbol:
+    def __init__(self, value: int) -> None:
+        self.value = value
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self) -> int:
+        return self.value
+
+
+class _Library:
+    def __init__(self, abi: int = 2, maximum: int = 65_536) -> None:
+        self.sylanne3_v2_abi_version = _Symbol(abi)
+        self.sylanne3_v2_max_dimension = _Symbol(maximum)
+        self.sylanne3_v2_step = _Symbol(0)
+
+
+def _runtime_platform() -> tuple[str, str]:
+    system = platform.system().lower()
+    os_name = {"windows": "windows", "linux": "linux", "darwin": "macos"}[system]
+    machine = platform.machine().lower()
+    arch = {
+        "amd64": "x86_64",
+        "x86_64": "x86_64",
+        "arm64": "aarch64",
+        "aarch64": "aarch64",
+    }[machine]
+    return os_name, arch
+
+
+class NativeLoaderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+
+    def _package(self, *, abi: int = 2, os_name: str | None = None, arch: str | None = None) -> tuple[str, Path]:
+        actual_os, actual_arch = _runtime_platform()
+        arch = arch or actual_arch
+        target_os = os_name or actual_os
+        filename = {
+            "windows": "sylanne3_kernel.dll",
+            "linux": "libsylanne3_kernel.so",
+            "macos": "libsylanne3_kernel.dylib",
+        }[target_os]
+        relative = f"rewrite/sylanne3/_native/{target_os}-{arch}/{filename}"
+        library = self.root / Path(relative)
+        library.parent.mkdir(parents=True)
+        content = b"native-abi2"
+        library.write_bytes(content)
+        libc = None
+        if target_os == "linux":
+            if actual_os == "linux":
+                family = platform.libc_ver()[0].strip().lower()
+                libc = "glibc" if family in {"glibc", "gnu libc"} else family
+            else:
+                libc = "glibc"
+        native_entry = {
+            "path": relative,
+            "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        manifest = {
+            "schema_version": 1,
+            "platform": {
+                "os": target_os,
+                "arch": arch,
+                "abi_version": abi,
+                "native_filename": filename,
+                "libc": libc,
+                "cpu_features": [],
+            },
+            "native": native_entry,
+            "files": [native_entry],
+        }
+        raw = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        manifest_path = self.root / "release-manifest.json"
+        manifest_path.write_bytes(raw)
+        return hashlib.sha256(raw).hexdigest(), library
+
+    def test_loads_only_manifest_bound_canonical_abi2_asset(self) -> None:
+        trust_root, expected_library = self._package()
+        loaded: list[Path] = []
+
+        def load(path: str):
+            loaded.append(Path(path))
+            return _Library()
+
+        kernel = load_production_native(
+            self.root,
+            trusted_manifest_sha256=trust_root,
+            _cdll_factory=load,
+        )
+
+        self.assertEqual(loaded, [expected_library.resolve()])
+        self.assertEqual(kernel.capabilities.abi_version, 2)
+        self.assertEqual(kernel.capabilities.max_dimension, 65_536)
+        self.assertFalse(kernel.capabilities.numerically_certified)
+        self.assertFalse(kernel.capabilities.supports_cancellation)
+        self.assertTrue(kernel.capabilities.diagnostic_only)
+
+    def test_rejects_manifest_without_matching_external_trust_root(self) -> None:
+        self._package()
+        with self.assertRaisesRegex(NativeIntegrityError, "manifest trust root"):
+            load_production_native(
+                self.root,
+                trusted_manifest_sha256="0" * 64,
+                _cdll_factory=lambda _: self.fail("library must not be loaded"),
+            )
+
+    def test_rejects_wrong_platform_or_abi_before_loading(self) -> None:
+        current_os, _ = _runtime_platform()
+        wrong_os = "linux" if current_os != "linux" else "windows"
+        trust_root, _ = self._package(os_name=wrong_os)
+        with self.assertRaises(NativePlatformError):
+            load_production_native(
+                self.root,
+                trusted_manifest_sha256=trust_root,
+                _cdll_factory=lambda _: self.fail("library must not be loaded"),
+            )
+
+        self.root.joinpath("release-manifest.json").unlink()
+        trust_root, _ = self._package(abi=1)
+        with self.assertRaisesRegex(NativePlatformError, "ABI 2"):
+            load_production_native(
+                self.root,
+                trusted_manifest_sha256=trust_root,
+                _cdll_factory=lambda _: self.fail("library must not be loaded"),
+            )
+
+    def test_rejects_platform_combination_outside_release_matrix(self) -> None:
+        trust_root, _ = self._package(os_name="windows", arch="aarch64")
+        with mock.patch("platform.system", return_value="Windows"), mock.patch(
+            "platform.machine", return_value="ARM64"
+        ), self.assertRaisesRegex(NativePlatformError, "unsupported runtime platform"):
+            load_production_native(
+                self.root,
+                trusted_manifest_sha256=trust_root,
+                _cdll_factory=lambda _: self.fail("library must not be loaded"),
+            )
+
+    def test_rejects_native_bytes_changed_after_manifest(self) -> None:
+        trust_root, library = self._package()
+        library.write_bytes(b"tampered!!!")
+        with self.assertRaisesRegex(NativeIntegrityError, "native SHA256"):
+            load_production_native(
+                self.root,
+                trusted_manifest_sha256=trust_root,
+                _cdll_factory=lambda _: self.fail("library must not be loaded"),
+            )
+
+    def test_rejects_symlinked_native_even_when_bytes_match(self) -> None:
+        trust_root, library = self._package()
+        external = self.root / "external-native.dll"
+        external.write_bytes(library.read_bytes())
+        library.unlink()
+        try:
+            os.symlink(external, library)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+        with self.assertRaisesRegex(NativeIntegrityError, "symlink"):
+            load_production_native(
+                self.root,
+                trusted_manifest_sha256=trust_root,
+                _cdll_factory=lambda _: self.fail("library must not be loaded"),
+            )
+
+    def test_step_result_is_diagnostic_and_rejects_claimed_certificate(self) -> None:
+        raw = ABI2StepResult()
+        raw.struct_size = __import__("ctypes").sizeof(ABI2StepResult)
+        raw.abi_version = 2
+        raw.status = 0
+        raw.iterations = 3
+        raw.certificate_flags = 0
+        raw.residual = 1e-9
+        result = diagnostic_step_result(raw)
+        self.assertFalse(result.certified)
+        self.assertEqual(result.certificate_flags, 0)
+        self.assertEqual(result.residual, 1e-9)
+
+        raw.certificate_flags = 1
+        with self.assertRaisesRegex(ABI2ResultError, "certificate flags"):
+            diagnostic_step_result(raw)
+
+    def test_abi1_reference_requires_explicit_library_and_developer_opt_in(self) -> None:
+        with self.assertRaisesRegex(TypeError, "library_path"):
+            NativeKernel()
+        with self.assertRaisesRegex(RuntimeError, "developer reference"):
+            NativeKernel(self.root / "reference.dll")
+
+
+if __name__ == "__main__":
+    unittest.main()
