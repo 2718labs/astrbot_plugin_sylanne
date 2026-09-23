@@ -17,6 +17,8 @@ from sylanne3.domains.d09 import (
 from sylanne3.graph_coordinator import (
     GraphCoordinator, UnavailableGuard, budget_operation_digest,
 )
+from sylanne3.authority_service.v2_clock import IngressClockSampleV2
+from sylanne3.host.v2_fence_port import VerifiedIngressClockV2
 from sylanne3.graph_types import AtomKey, GraphWrite, Owner
 from sylanne3.memory_types import access_key, source_key
 from sylanne3.runtime.budget import get_budget_lease
@@ -126,6 +128,7 @@ class _TestAdmissionIssuer:
     def __init__(self):
         self.request = None
         self.admission = None
+        self.last_now_utc = None
         self.intent = None
         self.schema = None
         self.grant = None
@@ -136,6 +139,7 @@ class _TestAdmissionIssuer:
 
     def issue_dispatch_admission(self, bundle, snapshot, candidate, db, *,
                                  graph_incarnation, now_utc):
+        self.last_now_utc = now_utc
         intent, schema, grant, batch = (
             self.intent, self.schema, self.grant, self.batch)
         segment = batch["segments"][0]
@@ -227,6 +231,15 @@ class _TestAdmissionIssuer:
     def verify_journal_constraints(self, request, admission):
         return (request is self.request and admission is self.admission
                 and request.footprint.effect_id == admission.effect_id)
+
+
+class _ClockBudget(_Budget):
+    def __init__(self):
+        self.last_now_utc = None
+
+    def admit_runtime(self, bundle, db, *, now_utc=None):
+        self.last_now_utc = now_utc
+        return super().admit_runtime(bundle, db, now_utc=now_utc)
 
 
 def _admission():
@@ -342,8 +355,10 @@ def _issuer_case(tmp_path):
     store, _old, _authority, _lease, providers, _registry = _ready(tmp_path)
     bootstrap = object()
     issuer = _TestAdmissionIssuer()
+    budget = _ClockBudget()
+    issuer.budget = budget
     coordinator = GraphCoordinator(
-        store, bootstrap, d02_issuer=_Resources(), d11_issuer=_Budget(),
+        store, bootstrap, d02_issuer=_Resources(), d11_issuer=budget,
         dispatch_admission_issuer=issuer,
     )
     for domain, provider in zip(("d06", "d08", "d09"), providers):
@@ -373,13 +388,22 @@ def _issuer_case(tmp_path):
 
 
 def test_same_graph_transaction_persists_test_issuer_admission(tmp_path):
-    """The internal path accepts a test clock; no production issuer is installed."""
+    """The graph hook advances a paired reading during the same transaction."""
     store, coordinator, authority, lease, bundle, issuer = _issuer_case(tmp_path)
     namespace = authority.namespace
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic - 0.01, monotonic, time.time() + 0.2,
+    )
     committed = coordinator._commit_domain_bundle_fenced(
-        bundle, lease, now_utc=2.0,  # explicit test clock at the internal seam
+        bundle, lease, dispatch_clock_reading=reading,
     )
     assert committed.status == "committed"
+    assert issuer.last_now_utc >= reading.utc_upper_bound_seconds
+    assert issuer.budget.last_now_utc >= reading.utc_upper_bound_seconds
+    assert issuer.last_now_utc >= issuer.budget.last_now_utc
     with store._lock:
         row = store._db.execute(
             "SELECT receipt_json FROM graph_bundle_operations WHERE operation_id=?",
@@ -398,6 +422,24 @@ def test_same_graph_transaction_persists_test_issuer_admission(tmp_path):
         assert load_admission(reopened, namespace, "admission:one") == stored
     finally:
         reopened.close()
+
+
+def test_unqualified_dispatch_clock_rolls_back_graph_and_budget(tmp_path):
+    store, coordinator, authority, lease, bundle, _issuer = _issuer_case(tmp_path)
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic, monotonic + 100, time.time() + 0.2,
+    )
+    with pytest.raises(UnavailableGuard, match="paired dispatch admission clock"):
+        coordinator._commit_domain_bundle_fenced(
+            bundle, lease, dispatch_clock_reading=reading,
+        )
+    with store._lock:
+        assert store._db.execute("SELECT 1 FROM graph_bundle_operations").fetchone() is None
+        assert store._db.execute("SELECT 1 FROM runtime_budget_reservations").fetchone() is None
+    store.close()
 
 
 def test_public_bundle_without_trusted_admission_clock_rolls_back(tmp_path):

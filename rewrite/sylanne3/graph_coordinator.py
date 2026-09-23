@@ -433,7 +433,7 @@ class GraphCoordinator:
                  closure_verifier=None, d02_issuer=None, d11_issuer=None,
                  ingress_policy=None, ingress_clock=None,
                  owner_principal_resolver=None,
-                 dispatch_admission_issuer=None):
+                 dispatch_admission_issuer=None, dispatch_clock_policy=None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -464,6 +464,7 @@ class GraphCoordinator:
         # Installed by trusted host composition only.  A missing issuer leaves
         # D08/D09 candidates in HOLD; caller receipt strings are never enough.
         self.__dispatch_admission_issuer = dispatch_admission_issuer
+        self.__dispatch_clock_policy = dispatch_clock_policy
         # No product numeric issuer is installed in alpha1. A DTO is never a permit.
         self.__product_advance_issuer = None
         if ingress_policy is not None and not callable(ingress_policy):
@@ -4880,9 +4881,22 @@ class GraphCoordinator:
                                     authority.activation_generation, "read")
                 return reader()
 
+    @staticmethod
+    def _dispatch_clock_upper(reading) -> float:
+        from .host.v2_fence_port import VerifiedIngressClockV2
+        from .runtime.first_ingress_v2 import trusted_upper
+
+        if type(reading) is not VerifiedIngressClockV2:
+            raise UnavailableGuard("paired dispatch admission clock is unqualified")
+        try:
+            return trusted_upper(reading)
+        except ValueError as exc:
+            raise UnavailableGuard("paired dispatch admission clock is unqualified") from exc
+
     def _issue_dispatch_admission(self, db, bundle, snapshot, candidate,
                                   action, schema, grant, batch, *,
-                                  graph_receipt, v2_write, now_utc):
+                                  graph_receipt, v2_write, now_utc,
+                                  clock_reading=None):
         """Fail closed unless a host issuer supplies and proves every current fact.
 
         This is called from the graph receipt hook, after D11's reservation,
@@ -4919,6 +4933,12 @@ class GraphCoordinator:
                 or type(issued[1]) is not DispatchAdmissionV1):
             raise UnavailableGuard("trusted issuer did not produce typed dispatch admission")
         request, admission = issued
+        if isinstance(self.__store, ProductionGraphStore):
+            policy = self.__dispatch_clock_policy
+            if (clock_reading is None or policy is None
+                    or admission.clock_policy_ref != policy.source_id
+                    or admission.clock_policy_digest != canonical_digest(asdict(policy))):
+                raise UnavailableGuard("dispatch admission clock evidence differs")
         from .dispatch_runtime import DispatchRequest
 
         if type(request) is not DispatchRequest:
@@ -5187,6 +5207,19 @@ class GraphCoordinator:
                 bundle, lease, v2_read=True))
         if saved is not None:
             raise UnavailableGuard("v2 bundle fence exists without business receipt")
+        dispatch_clock_reading = None
+        if (self.__dispatch_admission_issuer is not None
+                and any(write.key.type_name == "d09.verified_segment_batch.v1"
+                        for proposal in bundle.proposals for write in proposal.typed_writes)):
+            from .host.authority_profile import AdminIngressClockPolicy
+
+            if type(self.__dispatch_clock_policy) is not AdminIngressClockPolicy:
+                raise UnavailableGuard("dispatch admission clock policy is unavailable")
+            try:
+                dispatch_clock_reading = port.read_ingress_clock(
+                    self.__dispatch_clock_policy)
+            except Exception as exc:
+                raise UnavailableGuard("paired dispatch admission clock is unavailable") from exc
         permit = port.begin_fence(
             namespace=namespace, authority_namespace=target.authority_namespace,
             holder=self.__holder, generation=target.activation_generation,
@@ -5208,7 +5241,8 @@ class GraphCoordinator:
             receipt = self._commit_domain_bundle_fenced(
                 bundle, lease, v2_write=(metadata, epoch, finish_id,
                                          finish_digest, canonical_json(to_wire(permit))),
-                v2_transaction_state=transaction_state)
+                v2_transaction_state=transaction_state,
+                dispatch_clock_reading=dispatch_clock_reading)
         except Exception:
             if transaction_state["phase"] in {"before_transaction", "rolled_back"}:
                 rejection = self._record_rejected_bundle_v2(
@@ -5334,6 +5368,7 @@ class GraphCoordinator:
                                      v2_write=None, v2_transaction_state=None,
                                      in_transaction: bool = False,
                                      now_utc: float | None = None,
+                                     dispatch_clock_reading=None,
                                      ingress_deadline_check=None) -> CommitReceipt:
         """Join a caller-owned graph transaction when ``in_transaction`` is set.
 
@@ -5552,7 +5587,9 @@ class GraphCoordinator:
                 if validated is not True and validated != proposal:
                     raise AuthorityDenied("domain validation did not approve proposal")
             runtime_admissions.append(self._admit_runtime_bundle(
-                db, bundle, now_utc=now_utc))
+                db, bundle, now_utc=(
+                    self._dispatch_clock_upper(dispatch_clock_reading)
+                    if dispatch_clock_reading is not None else now_utc)))
             for proposal in bundle.proposals:
                 for write in proposal.typed_writes:
                     if write.key.type_name.startswith("runtime."):
@@ -5682,7 +5719,10 @@ class GraphCoordinator:
                             linked["d08.communication_intent_grant.v1"]),
                         linked["d09.verified_segment_batch.v1"],
                         graph_receipt=graph_receipt, v2_write=v2_write,
-                        now_utc=now_utc,
+                        now_utc=(
+                            self._dispatch_clock_upper(dispatch_clock_reading)
+                            if dispatch_clock_reading is not None else now_utc),
+                        clock_reading=dispatch_clock_reading,
                     )
                     data["dispatch_admission"] = {
                         "schema": admission_receipt.admission.schema,
