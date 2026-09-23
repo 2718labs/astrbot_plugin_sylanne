@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import json
 
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState
@@ -143,6 +144,86 @@ class AuthorityV2FenceService:
             return NamespaceBootstrapV2(
                 authority_id, namespace_id, self.namespace, row[0], row[1], row[2],
                 state, anchor, tuple(blockers))
+
+    def activate_namespace(self, *, credential, subject: str, holder: str,
+                           namespace_id: NamespaceId, request_id: str) -> NamespaceBootstrapV2:
+        """Administrator-authorized, idempotent genesis for an empty namespace."""
+        identifier(subject, "subject")
+        identifier(holder, "holder")
+        identifier(request_id, "request_id")
+        if type(namespace_id) is not NamespaceId:
+            raise TypeError("namespace_id must be NamespaceId")
+        self.core._require(credential, "namespace_genesis", self.namespace, holder)
+        request_key = f"v2_namespace_genesis_request:{request_id}"
+        request = json.dumps(
+            (self.namespace, namespace_id.bot_id, namespace_id.persona_id, subject, holder),
+            separators=(",", ":"), ensure_ascii=True)
+        with self._frozen() as (db, deletion_head, execution_head, deletion_history):
+            self._require_mode(db)
+            self.fences._check_schema(db)
+            deletion_kind, _, deletion_meta = self.deletion._check_schema()
+            if deletion_kind == "v2" and deletion_meta["namespace"] != self.namespace:
+                raise AuthorityUnavailable("v2 deletion journal belongs to another namespace")
+            saved = db.execute(
+                "SELECT value FROM authority_meta WHERE key=?", (request_key,)).fetchone()
+            if saved is not None and saved[0] != request:
+                raise AuthorityUnavailable("namespace genesis request ID reused with different parameters")
+            if db.execute(
+                    "SELECT 1 FROM authority_v2_fences WHERE namespace=? AND state='active' LIMIT 1",
+                    (self.namespace,)).fetchone():
+                raise AuthorityUnavailable("active v2 fence blocks namespace genesis")
+            if db.execute(
+                    "SELECT 1 FROM authority_v2_mutations WHERE namespace=? AND state='pending' LIMIT 1",
+                    (self.namespace,)).fetchone():
+                raise AuthorityUnavailable("pending v2 mutation blocks namespace genesis")
+
+            existing = db.execute(
+                "SELECT 1 FROM authority_namespaces WHERE namespace=?", (self.namespace,)).fetchone()
+            if saved is None:
+                if (deletion_head.seq != 0 or execution_head.seq != 0 or deletion_history):
+                    raise AuthorityUnavailable("namespace genesis requires empty independent journals")
+                if existing or db.execute(
+                        "SELECT 1 FROM authority_events WHERE namespace=? LIMIT 1",
+                        (self.namespace,)).fetchone():
+                    raise AuthorityUnavailable("namespace already has Authority history")
+                if db.execute(
+                        "SELECT 1 FROM authority_v2_fences WHERE namespace=? LIMIT 1",
+                        (self.namespace,)).fetchone():
+                    raise AuthorityUnavailable("namespace already has v2 fence history")
+                if db.execute(
+                        "SELECT 1 FROM authority_v2_mutations WHERE namespace=? LIMIT 1",
+                        (self.namespace,)).fetchone():
+                    raise AuthorityUnavailable("namespace already has v2 mutation history")
+                if db.execute(
+                        "SELECT 1 FROM authority_v2_epochs WHERE namespace=? LIMIT 1",
+                        (self.namespace,)).fetchone():
+                    raise AuthorityUnavailable("namespace already has v2 fence epoch")
+                if db.execute(
+                        "SELECT 1 FROM authority_namespaces WHERE namespace!=? "
+                        "AND deletion_journal_id=? LIMIT 1",
+                        (self.namespace, deletion_head.journal_id)).fetchone():
+                    raise AuthorityUnavailable("deletion journal already belongs to another namespace")
+                if db.execute(
+                        "SELECT 1 FROM authority_namespaces WHERE namespace!=? "
+                        "AND execution_journal_id=? LIMIT 1",
+                        (self.namespace, execution_head.journal_id)).fetchone():
+                    raise AuthorityUnavailable("execution journal already belongs to another namespace")
+                db.execute(
+                    "INSERT INTO authority_namespaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self.namespace, holder, 1, "active", None, None, 0,
+                     deletion_head.journal_id, 0, deletion_head.digest, "clear",
+                     execution_head.journal_id, 0, execution_head.digest,
+                     self.core._new_nonce()))
+                self.core._event(db, self.namespace, "v2_namespace_genesis", 1, request)
+                db.execute("INSERT INTO authority_meta(key,value) VALUES(?,?)", (request_key, request))
+            elif not existing or deletion_history:
+                raise AuthorityUnavailable("namespace genesis no longer has a clear activation")
+
+            anchor = self._current_locked(
+                db, deletion_head, execution_head, holder=holder, generation=1)
+            return NamespaceBootstrapV2(
+                anchor.authority_id, namespace_id, self.namespace, holder, 1, "active",
+                NamespaceRuntimeState.ACTIVE, anchor, ())
 
     def begin_fence(self, *, credential, subject: str, holder: str,
                     operation: str, operation_id: str,
