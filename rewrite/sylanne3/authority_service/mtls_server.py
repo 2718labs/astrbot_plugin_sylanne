@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import secrets
 import ssl
 import threading
@@ -18,6 +19,7 @@ from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import InstallationGrantV2, NamespaceBootstrapV2, NamespaceId
 from .core import AuthorityServiceCore
 from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, ContentPermit, identifier
+from .v2_clock import AuthorityClockReadingV2, IngressClockSampleV2
 from .v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire
 from .v2_fence_service import AuthorityV2FenceService
 
@@ -58,6 +60,17 @@ class AdministratorInstallationV2:
     publisher_policy_ref: str
     service_capability_version: str
     manifest_digest: str
+    source_id: str | None = None
+    max_utc_error_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_id is None and self.max_utc_error_seconds is None:
+            return
+        if (type(self.source_id) is not str or not self.source_id.strip()
+                or type(self.max_utc_error_seconds) not in {int, float}
+                or not math.isfinite(self.max_utc_error_seconds)
+                or self.max_utc_error_seconds <= 0):
+            raise ValueError("administrator clock registration is invalid")
 
 
 @dataclass(frozen=True)
@@ -126,6 +139,7 @@ class AuthorityRpcServer:
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
+        clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
         max_inflight_dispatches: int = _MAX_INFLIGHT_DISPATCHES,
     ) -> None:
         if not isinstance(core, AuthorityServiceCore):
@@ -160,6 +174,9 @@ class AuthorityRpcServer:
                for key, value in installed.items()):
             raise TypeError("administrator v2 installations are invalid")
         self._installations_v2 = installed
+        if clock_provider is not None and not callable(clock_provider):
+            raise TypeError("administrator clock provider must be callable")
+        self._clock_provider = clock_provider
         bindings = dict(namespace_bindings_v2 or {})
         if any(type(key) is not tuple or len(key) != 3
                or (key[0], key[1]) not in installed
@@ -485,6 +502,32 @@ class AuthorityRpcServer:
                 service_capability_version=installed.service_capability_version,
                 channel_binding_sha256=binding,
             ))
+        if method == "ingress_clock_sample_v2":
+            if wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict or command:
+                raise RuntimeError("authority unavailable")
+            installed = self._installations_v2.get((peer, wire.profile_id))
+            if (installed is None or installed.manifest_digest != wire.manifest_sha256
+                    or installed.source_id is None or self._clock_provider is None):
+                raise RuntimeError("authority unavailable")
+            try:
+                reading = self._clock_provider()
+                if (type(reading) is not AuthorityClockReadingV2
+                        or reading.source_id != installed.source_id
+                        or reading.healthy is not True
+                        or reading.utc_error_seconds > installed.max_utc_error_seconds):
+                    raise RuntimeError("authority unavailable")
+                sample = IngressClockSampleV2(
+                    authority_id=self._authority_id(),
+                    installation_id=installed.installation_id,
+                    source_id=reading.source_id,
+                    utc_seconds=reading.utc_seconds,
+                    monotonic_seconds=reading.monotonic_seconds,
+                    epoch=reading.epoch,
+                    utc_error_seconds=reading.utc_error_seconds,
+                )
+            except Exception as exc:
+                raise RuntimeError("authority unavailable") from exc
+            return {**asdict(sample), "channel_binding_sha256": binding}
         if method in {"namespace_bootstrap", "namespace_genesis"}:
             if (wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict
                     or set(command) != ({"namespace"} if method == "namespace_bootstrap"

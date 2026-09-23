@@ -18,6 +18,7 @@ import ssl
 from typing import Mapping
 
 from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit
+from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
     FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
 )
@@ -386,6 +387,37 @@ class MtlsAuthorityTransport:
                 or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
             raise RuntimeError("authority v2 installation grant binding is invalid")
         return grant
+
+    async def ingress_clock_sample_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        installation_id: str,
+    ) -> IngressClockSampleV2:
+        """Read one server clock sample from the paired v2 TLS session."""
+        if not handshake.valid_pairing() or not isinstance(installation_id, str) or not installation_id:
+            raise RuntimeError("authority v2 clock request is invalid")
+        response = await self._content_rpc(
+            request, handshake, "ingress_clock_sample_v2", {},
+            protocol=AUTHORITY_V2_PROTOCOL,
+        )
+        if (type(response) is not dict
+                or set(response) != set(IngressClockSampleV2.__dataclass_fields__) | {
+                    "channel_binding_sha256"
+                }
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority v2 clock response is invalid")
+        try:
+            sample = IngressClockSampleV2(**{
+                key: value for key, value in response.items()
+                if key != "channel_binding_sha256"
+            })
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority v2 clock response is invalid") from exc
+        profile = self.profile_for(request.profile_id)
+        if (sample.authority_id != profile.expected_authority_id
+                or sample.authority_id != handshake.installation_authority_id
+                or sample.installation_id != installation_id):
+            raise RuntimeError("authority v2 clock response is invalid")
+        return sample
 
     async def v2_namespace_bootstrap(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
