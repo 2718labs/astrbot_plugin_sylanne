@@ -6,24 +6,63 @@ import { applyProblem, applyResponse, initialState, switchRole, VIEW_STATES } fr
 import { needsFreshProjection, workflowForPage } from "../../../../webui-src/src/workflows.js";
 
 test("client posts to the AstrBot plugin extension route with host cookie and CSRF", async () => {
-  let requested;
-  const api = new WorkbenchApi({ csrfToken: "server-issued", fetchImpl: async (url, init) => {
-    requested = { url, init };
-    return { ok: true, json: async () => ({ status: "unavailable", problem: { code: "provider_unavailable" } }) };
+  const requested = [];
+  const api = new WorkbenchApi({ fetchImpl: async (url, init) => {
+    requested.push({ url, init });
+    return { ok: true, json: async () => init.method === "GET"
+      ? { status: "ready", csrf_token: "server-issued" }
+      : { status: "unavailable", problem: { code: "provider_unavailable" } } };
   } });
   await api.command(ACTIONS.openWorkspace, { scope: "role-1", purpose: "workbench_view", input: { client_protocol: D12_SCHEMA_VERSION } });
   assert.equal(DEFAULT_WORKBENCH_API_BASE, "/api/v1/plugins/extensions/astrbot_plugin_sylanne/workbench/v1");
-  assert.equal(requested.url, `${DEFAULT_WORKBENCH_API_BASE}/commands`);
-  assert.equal(requested.init.credentials, "same-origin");
-  assert.equal(requested.init.headers["x-csrf-token"], "server-issued");
+  assert.equal(requested[0].url, `${DEFAULT_WORKBENCH_API_BASE}/session`);
+  assert.equal(requested[0].init.method, "GET");
+  assert.equal(requested[0].init.credentials, "same-origin");
+  assert.equal(requested[0].init.headers.origin, undefined);
+  assert.equal(requested[1].url, `${DEFAULT_WORKBENCH_API_BASE}/commands`);
+  assert.equal(requested[1].init.credentials, "same-origin");
+  assert.equal(requested[1].init.headers["x-csrf-token"], "server-issued");
 });
 
 test("client displays a D12 problem from an HTTP error", async () => {
-  const api = new WorkbenchApi({ csrfToken: "server-issued", fetchImpl: async () => ({
-    ok: false, status: 403, json: async () => ({ status: "unauthorized", problem: { code: "csrf_denied", message: "防跨站校验未通过。", retryable: false } })
-  }) });
+  const api = new WorkbenchApi({ fetchImpl: async (_url, init) => init.method === "GET"
+    ? { ok: true, json: async () => ({ status: "ready", csrf_token: "server-issued" }) }
+    : { ok: false, status: 403, json: async () => ({ status: "unauthorized", problem: { code: "csrf_denied", message: "防跨站校验未通过。", retryable: false } }) } });
   await assert.rejects(api.command(ACTIONS.openWorkspace, { scope: "role-1", purpose: "workbench_view" }),
     (error) => error instanceof WorkbenchApiError && error.status === 403 && error.code === "csrf_denied" && error.message === "防跨站校验未通过。");
+  assert.equal(api.hasSession, false);
+});
+
+test("unpaired session prevents POST and can be retried after pairing", async () => {
+  let paired = false;
+  const requests = [];
+  const api = new WorkbenchApi({ fetchImpl: async (_url, init) => {
+    requests.push(init.method);
+    if (init.method === "GET") return paired
+      ? { ok: true, json: async () => ({ status: "ready", csrf_token: "fresh" }) }
+      : { ok: false, status: 401, json: async () => ({ status: "unauthorized", problem: { code: "session_unbound", message: "工作台会话未建立。" } }) };
+    assert.equal(init.headers["x-csrf-token"], "fresh");
+    return { ok: true, json: async () => ({ status: "ready", projection: {} }) };
+  } });
+  await assert.rejects(api.command(ACTIONS.openWorkspace, { scope: "role-1" }), (error) => error.code === "session_unbound");
+  assert.deepEqual(requests, ["GET"]);
+  paired = true;
+  await api.command(ACTIONS.openWorkspace, { scope: "role-1" });
+  assert.deepEqual(requests, ["GET", "GET", "POST"]);
+});
+
+test("expired CSRF clears in-memory token and the next attempt gets a new one", async () => {
+  let issues = 0;
+  const api = new WorkbenchApi({ fetchImpl: async (_url, init) => {
+    if (init.method === "GET") return { ok: true, json: async () => ({ status: "ready", csrf_token: `token-${++issues}` }) };
+    if (issues === 1) return { ok: false, status: 403, json: async () => ({ status: "unauthorized", problem: { code: "csrf_denied" } }) };
+    assert.equal(init.headers["x-csrf-token"], "token-2");
+    return { ok: true, json: async () => ({ status: "ready", projection: {} }) };
+  } });
+  await assert.rejects(api.command(ACTIONS.openWorkspace, { scope: "role-1" }), (error) => error.code === "csrf_denied");
+  assert.equal(api.hasSession, false);
+  await api.command(ACTIONS.openWorkspace, { scope: "role-1" });
+  assert.equal(issues, 2);
 });
 
 test("D12 command request declares contract, scoped action, and an operation id", () => {

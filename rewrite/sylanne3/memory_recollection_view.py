@@ -22,6 +22,8 @@ class AffectiveRecollectionView:
     assertion_status: str
     subjective_salience: tuple[float, float]
     subjective_tone: tuple[float, float]
+    base_salience: tuple[float, float]
+    base_tone: tuple[float, float]
     mood_ref: str
     coupling_version: str
     read_versions: tuple[GraphVersion, ...]
@@ -104,9 +106,16 @@ def prepare_affective_recollection_view(
     if influence.evidence_weight_delta != 0:
         raise ValueError("mood must not change source evidence weight")
     return AffectiveRecollectionView(
-        hit.key.token, hit.record.text, hit.record.source_kind,
-        hit.record.assertion_status, influence.salience_interval,
-        influence.tone_interval, mood_key.token, coupling.version,
-        tuple(dict.fromkeys((*hit.proof_versions, GraphVersion(mood_key, mood_atom.revision)))),
-        mood_snapshot.epochs[0],
+        source_ref=hit.key.token,
+        source_text=hit.record.text,
+        source_kind=hit.record.source_kind,
+        assertion_status=hit.record.assertion_status,
+        subjective_salience=influence.salience_interval,
+        subjective_tone=influence.tone_interval,
+        base_salience=base_salience,
+        base_tone=base_tone,
+        mood_ref=mood_key.token,
+        coupling_version=coupling.version,
+        read_versions=tuple(dict.fromkeys((*hit.proof_versions, GraphVersion(mood_key, mood_atom.revision)))),
+        epoch=mood_snapshot.epochs[0],
     )

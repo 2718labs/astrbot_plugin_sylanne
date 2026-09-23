@@ -54,14 +54,13 @@ function hasVerifiedCatalogue() {
 }
 
 function setupMarkup() {
-  const connected = hasVerifiedCatalogue();
   const steps = [
-    ["宿主与工作台会话", connected ? "已核验" : "未核验", connected ? "服务端已返回当前作用域的能力目录。" : "登录宿主后仍需由服务端绑定工作台会话和防跨站令牌。"],
+    ["宿主与工作台会话", state.sessionReady ? "已核验" : "未核验", state.sessionReady ? "服务端已签发当前会话令牌；角色能力仍以实际目录为准。" : "请登录宿主并完成 Owner 配对，然后重新核验连接。"],
     ["角色初始化", "未核验", "当前能力目录不包含角色初始化回执；填写角色 ID 不会创建角色。"],
     ["场景绑定", "未核验", "当前没有绑定成功回执；私聊或群聊不可据此视为已接通。"],
     ["验证对话", "未核验", "尚无真实对话和投递收据；不会自动向聊天场景发消息。"]
   ];
-  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${detail}</p></li>`).join("")}</ol><p class="setup-next">${state.role ? "可刷新能力目录；创建与绑定入口需服务端完成后才会开放。" : "先从宿主取得已授权的角色范围；当前浏览器不能自行签发角色。"}</p></div>`;
+  return `<div class="setup-guide"><h2>首次使用进度</h2><p>每一步都以服务端实际状态或回执为准。</p><ol class="setup-steps">${steps.map(([label, status, detail]) => `<li><strong>${label}</strong><span>${status}</span><p>${detail}</p></li>`).join("")}</ol><p class="setup-next">${state.role ? "可刷新能力目录；创建与绑定入口需服务端完成后才会开放。" : "先从宿主取得已授权的角色范围；当前浏览器不能自行签发角色。"}</p><button class="quiet" data-command="retry-session">重新核验工作台会话</button></div>`;
 }
 
 function render() {
@@ -69,7 +68,7 @@ function render() {
   const [statusTitle, statusDetail] = state.view === "setup" && hasVerifiedCatalogue()
     ? ["工作台会话已核验", "角色初始化、场景绑定与验证对话仍需各自的真实回执。"]
     : statusCopy(state.status, state.problem);
-  const sessionVerified = state.view === "setup" ? hasVerifiedCatalogue() : state.status === "ready";
+  const sessionVerified = state.sessionReady;
   const body = state.view === "setup" ? setupMarkup() : state.projection
     ? `<pre class="projection" aria-label="服务返回的权限过滤投影">${escapeHtml(JSON.stringify(state.projection, null, 2))}</pre>`
     : `<section class="empty-state" aria-live="polite"><div class="empty-mark" aria-hidden="true">◇</div><h2>${statusTitle}</h2><p>${statusDetail}</p><button class="primary" data-command="refresh" ${state.role ? "" : "disabled"}>重新请求投影</button></section>`;
@@ -107,9 +106,11 @@ async function loadView() {
       ? await api.command(ACTIONS.openWorkspace, { scope: state.role, purpose: "workbench_view", input: { client_protocol: "d12.contract.v1" } })
       : await api.readView({ scope: state.role, viewType: VIEW_TYPES[state.view] });
     if (epoch !== requestEpoch) return;
+    state.sessionReady = api.hasSession;
     Object.assign(state, applyResponse(state, result));
   } catch (error) {
     if (epoch !== requestEpoch) return;
+    state.sessionReady = api.hasSession;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
   render();
@@ -132,6 +133,7 @@ async function command(action) {
     const value = document.querySelector("#role-input")?.value.trim();
     Object.assign(state, switchRole(state, value)); render(); await loadView(); return;
   }
+  if (action === "retry-session") return verifySession(true);
   if (action === "refresh") return loadView();
   if (action === "open-workspace") return commandAction(ACTIONS.openWorkspace, { client_protocol: "d12.contract.v1" }, "workbench_view");
   if (action === "page-action") {
@@ -154,10 +156,38 @@ async function commandAction(action, input, purpose = "workbench_user_action") {
   try {
     const result = await api.command(action, { scope: state.role, purpose, input });
     if (epoch !== requestEpoch) return;
+    state.sessionReady = api.hasSession;
     Object.assign(state, applyResponse(state, result));
     if (result.status === "ready" && needsFreshProjection(action)) return loadView();
   } catch (error) {
     if (epoch !== requestEpoch) return;
+    state.sessionReady = api.hasSession;
+    Object.assign(state, applyProblem(state, normalizeError(error)));
+  }
+  render();
+}
+
+async function verifySession(refreshRole = false) {
+  if (refreshRole) {
+    ++requestEpoch;
+    api.clearSession();
+    state.sessionReady = false;
+    state.projection = null;
+    state.receipt = null;
+    state.status = "loading";
+    state.problem = null;
+    render();
+  }
+  try {
+    await api.openSession();
+    state.sessionReady = true;
+    if (refreshRole && state.role) return loadView();
+    if (!state.role) {
+      state.status = "unavailable";
+      state.problem = { code: "role_required", message: "会话已核验。填写已授权的角色范围后可读取能力目录。" };
+    }
+  } catch (error) {
+    state.sessionReady = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
   render();
@@ -179,3 +209,4 @@ app.addEventListener("keydown", (event) => {
 });
 
 render();
+void verifySession();

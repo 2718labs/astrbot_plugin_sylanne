@@ -10,8 +10,13 @@ import pytest
 
 from sylanne3.workbench_api.http_transport import (
     ASTRBOT_DASHBOARD_JWT_COOKIE, BoundCsrfTokens, BoundDashboardSessions,
-    ASSET_ROUTE, COMMAND_ROUTE, TransportConfig, WorkbenchHttpTransport,
+    ASSET_ROUTE, COMMAND_ROUTE, CurrentOwnerDashboardSessions, TransportConfig,
+    VerifiedOwnerPairing, WorkbenchHttpTransport, _credential_digest,
 )
+from sylanne3.authority_service.v2_owner_contract import (
+    OwnerAuthorizationGuardV1, OwnerPrincipalV1,
+)
+from sylanne3.runtime_contracts import NamespaceId
 from sylanne3.workbench_api.service import AuthenticatedSession, WorkbenchService
 
 
@@ -19,9 +24,12 @@ SCOPE = "bot/persona"
 
 
 class Request:
-    def __init__(self, body: bytes, *, username="dashboard-user", origin="https://dashboard.local", csrf="token", content_type="application/json", length=None, jwt="host-jwt"):
+    def __init__(self, body: bytes, *, username="dashboard-user", origin="https://dashboard.local", csrf="token", content_type="application/json", length=None, jwt="host-jwt", referer=None, fetch_site=None):
         self._body = body; self.username = username; self.content_type = content_type
-        self.headers = {"origin": origin, "x-csrf-token": csrf}
+        self.headers = {"x-csrf-token": csrf}
+        if origin is not None: self.headers["origin"] = origin
+        if referer is not None: self.headers["referer"] = referer
+        if fetch_site is not None: self.headers["sec-fetch-site"] = fetch_site
         self.cookies = {ASTRBOT_DASHBOARD_JWT_COOKIE: jwt} if jwt else {}
         if length is not None: self.headers["content-length"] = length
     async def body(self): return self._body
@@ -188,3 +196,49 @@ async def test_real_host_bound_session_and_csrf_pairing_fails_closed(tmp_path):
     assert (await subject.command(Request(payload(), csrf=csrf_token, jwt=None)))["problem"]["code"] == "session_unbound"
     assert (await subject.command(Request(payload(), csrf=csrf_token, jwt="other-jwt")))["problem"]["code"] == "session_unbound"
     assert (await subject.command(Request(payload(), csrf="token")))["problem"]["code"] == "csrf_denied"
+
+
+@pytest.mark.asyncio
+async def test_current_owner_pairing_keeps_dashboard_and_owner_identities_separate(tmp_path):
+    owner = AuthenticatedSession(
+        "owner:independent-account", "owner-session",
+        {SCOPE: frozenset({"workbench.read"})},
+        {SCOPE: frozenset({"owner"})},
+        {SCOPE: frozenset({"workbench_view"})},
+        host_username="dashboard-user")
+    guard = OwnerAuthorizationGuardV1(
+        "authority", "installation", NamespaceId("bot", "persona"),
+        1, "sha256:" + "a" * 64, 0, 0)
+
+    class Pairing:
+        current = True
+
+        def resolve_current_pairing(self, *, username, dashboard_jwt_digest):
+            if (self.current and username == "dashboard-user"
+                    and dashboard_jwt_digest == _credential_digest("host-jwt")):
+                return VerifiedOwnerPairing(
+                    owner, OwnerPrincipalV1("paired-idp", "account", "incarnation"),
+                    guard)
+            return None
+
+    pairing, csrf = Pairing(), BoundCsrfTokens()
+    subject = WorkbenchHttpTransport(
+        WorkbenchService(), CurrentOwnerDashboardSessions(pairing), csrf,
+        TransportConfig("https://dashboard.local", tmp_path))
+    assert (await subject.open_session(Request(b"", origin=None)))["problem"]["code"] == "origin_denied"
+    assert (await subject.open_session(Request(
+        b"", origin=None, referer="https://evil.invalid/page")))["problem"]["code"] == "origin_denied"
+    opened = await subject.open_session(Request(
+        b"", origin=None, referer="https://dashboard.local/workbench"))
+    assert opened["status"] == "ready"
+    first_tab_token = opened["csrf_token"]
+    opened_again = await subject.open_session(Request(
+        b"", origin=None, fetch_site="same-origin"))
+    assert opened_again["status"] == "ready"
+    token = opened_again["csrf_token"]
+    assert token != first_tab_token
+    assert (await subject.command(Request(payload(), csrf=first_tab_token)))["problem"]["code"] == "provider_unavailable"
+    assert (await subject.command(Request(payload(), origin=None, csrf=token)))["problem"]["code"] == "origin_denied"
+    assert (await subject.command(Request(payload(), csrf=token)))["problem"]["code"] == "provider_unavailable"
+    pairing.current = False
+    assert (await subject.command(Request(payload(), csrf=token)))["problem"]["code"] == "session_unbound"

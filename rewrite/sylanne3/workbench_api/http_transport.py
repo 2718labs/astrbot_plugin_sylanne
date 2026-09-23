@@ -13,13 +13,18 @@ import json
 from pathlib import Path
 import secrets
 from typing import Any, Awaitable, Mapping, Protocol
+from urllib.parse import urlsplit
 
+from ..authority_service.v2_owner_contract import (
+    OwnerAuthorizationGuardV1, OwnerPrincipalV1,
+)
 from .service import ApiResponse, AuthenticatedSession, RequestContext
 
 
 MAX_JSON_BYTES = 64 * 1024
 PLUGIN_ROUTE_PREFIX = "/astrbot_plugin_sylanne/workbench"
 COMMAND_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/commands"
+SESSION_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/session"
 ASSET_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/<path:asset>"
 ASTRBOT_DASHBOARD_JWT_COOKIE = "astrbot_dashboard_jwt"
 
@@ -27,7 +32,60 @@ ASTRBOT_DASHBOARD_JWT_COOKIE = "astrbot_dashboard_jwt"
 class SessionResolver(Protocol):
     """Resolve a W09-issued session from the host-authenticated username."""
 
-    def resolve(self, *, username: str, session_hint: str | None) -> AuthenticatedSession | None: ...
+    def resolve(self, *, username: str, session_hint: str | None
+                ) -> AuthenticatedSession | None | Awaitable[AuthenticatedSession | None]: ...
+
+
+@dataclass(frozen=True)
+class VerifiedOwnerPairing:
+    """One current, independently verified Owner binding for a dashboard login."""
+
+    session: AuthenticatedSession
+    principal: OwnerPrincipalV1
+    guard: OwnerAuthorizationGuardV1
+
+
+class CurrentOwnerPairingPort(Protocol):
+    """Trusted installation port; query pairing and Authority guard on every request."""
+
+    def resolve_current_pairing(self, *, username: str, dashboard_jwt_digest: str
+                                ) -> VerifiedOwnerPairing | None | Awaitable[VerifiedOwnerPairing | None]: ...
+
+
+class CurrentOwnerDashboardSessions:
+    """Bind AstrBot's authenticated host identity to a fresh external Owner."""
+
+    def __init__(self, pairing: CurrentOwnerPairingPort) -> None:
+        if not callable(getattr(pairing, "resolve_current_pairing", None)):
+            raise TypeError("a trusted current Owner pairing port is required")
+        self._pairing = pairing
+
+    async def resolve(self, *, username: str,
+                      session_hint: str | None) -> AuthenticatedSession | None:
+        if (not isinstance(username, str) or not username
+                or not isinstance(session_hint, str) or not session_hint):
+            return None
+        paired = self._pairing.resolve_current_pairing(
+            username=username, dashboard_jwt_digest=session_hint)
+        if inspect.isawaitable(paired):
+            paired = await paired
+        if not isinstance(paired, VerifiedOwnerPairing):
+            return None
+        session, principal, guard = paired.session, paired.principal, paired.guard
+        if (not isinstance(session, AuthenticatedSession)
+                or type(principal) is not OwnerPrincipalV1
+                or type(guard) is not OwnerAuthorizationGuardV1
+                or guard.authorization_revision < 1
+                or guard.pending_revoke_operation_id is not None
+                or session.host_username != username
+                or not session.actor_id or not session.session_id):
+            return None
+        scope = f"{guard.namespace.bot_id}/{guard.namespace.persona_id}"
+        if (set(session.scope_capabilities) != {scope}
+                or set(session.scope_audiences) != {scope}
+                or set(session.scope_purposes) != {scope}):
+            return None
+        return session
 
 
 class CsrfValidator(Protocol):
@@ -66,8 +124,9 @@ class BoundDashboardSessions:
                                              session: AuthenticatedSession) -> None:
         if not isinstance(username, str) or not username or not isinstance(dashboard_jwt, str) or not dashboard_jwt:
             raise ValueError("trusted dashboard identity and JWT are required")
-        if session.actor_id != username:
-            raise ValueError("session actor must match the host-authenticated username")
+        if session.host_username not in (None, username) or (
+                session.host_username is None and session.actor_id != username):
+            raise ValueError("session host identity must match the authenticated username")
         self._entries[(username, _credential_digest(dashboard_jwt))] = session
 
     def revoke(self, *, username: str, dashboard_jwt: str) -> None:
@@ -83,19 +142,26 @@ class BoundCsrfTokens:
     """Server-issued per-session CSRF tokens; raw values are never persisted."""
 
     def __init__(self) -> None:
-        self._tokens: dict[str, str] = {}
+        self._tokens: dict[str, list[str]] = {}
 
     def issue(self, *, session: AuthenticatedSession) -> str:
         token = secrets.token_urlsafe(32)
-        self._tokens[session.session_id] = _credential_digest(token)
+        # Each open workbench tab gets its own token. Keep recent tabs usable
+        # without retaining an unlimited number of tokens for one session.
+        tokens = self._tokens.setdefault(session.session_id, [])
+        tokens.append(_credential_digest(token))
+        del tokens[:-32]
         return token
 
     def revoke(self, *, session: AuthenticatedSession) -> None:
         self._tokens.pop(session.session_id, None)
 
     def validate(self, *, session: AuthenticatedSession, token: str) -> bool:
-        expected = self._tokens.get(session.session_id)
-        return isinstance(token, str) and expected is not None and hmac.compare_digest(expected, _credential_digest(token))
+        if not isinstance(token, str):
+            return False
+        received = _credential_digest(token)
+        return any(hmac.compare_digest(expected, received)
+                   for expected in self._tokens.get(session.session_id, ()))
 
 
 def _credential_digest(value: str) -> str:
@@ -125,7 +191,7 @@ class WorkbenchHttpTransport:
 
     async def command(self, request: PluginRequest) -> dict[str, Any]:
         """Handle a mounted POST only after host session, Origin and CSRF checks."""
-        session = self._bound_session(request)
+        session = await self._bound_session(request)
         if not isinstance(request.username, str) or not request.username:
             return self._error("unauthorized", "host_session_missing", "AstrBot 未提供已认证会话。", 401)
         if session is None:
@@ -159,7 +225,21 @@ class WorkbenchHttpTransport:
             response = await response
         return response.as_dict()
 
-    def _bound_session(self, request: PluginRequest) -> AuthenticatedSession | None:
+    async def open_session(self, request: PluginRequest) -> dict[str, Any]:
+        """Issue a CSRF token only after a current trusted Owner pairing."""
+        session = await self._bound_session(request)
+        if not isinstance(request.username, str) or not request.username:
+            return self._error("unauthorized", "host_session_missing", "AstrBot 未提供已认证会话。", 401)
+        if session is None:
+            return self._error("unauthorized", "session_unbound", "工作台会话未建立。", 401)
+        if not self._session_origin_allowed(request):
+            return self._error("unauthorized", "origin_denied", "请求来源未获允许。", 403)
+        issue = getattr(self._csrf, "issue", None)
+        if not callable(issue):
+            return self._error("unavailable", "csrf_unavailable", "防跨站令牌不可用。", 503)
+        return {"status": "ready", "csrf_token": issue(session=session)}
+
+    async def _bound_session(self, request: PluginRequest) -> AuthenticatedSession | None:
         # Only the dashboard's authenticated username plus its own cookie can
         # select a W09-issued session. Neither JSON nor a request header can.
         username = request.username
@@ -168,12 +248,29 @@ class WorkbenchHttpTransport:
         host_cookie = request.cookies.get(ASTRBOT_DASHBOARD_JWT_COOKIE)
         if not isinstance(host_cookie, str) or not host_cookie:
             return None
-        session = self._sessions.resolve(username=username, session_hint=_credential_digest(host_cookie))
-        return session if session is not None and session.actor_id == username else None
+        session = self._sessions.resolve(
+            username=username, session_hint=_credential_digest(host_cookie))
+        if inspect.isawaitable(session):
+            session = await session
+        return session if isinstance(session, AuthenticatedSession) and (
+            session.host_username == username or (
+                session.host_username is None and session.actor_id == username)) else None
 
     def _origin_allowed(self, request: PluginRequest) -> bool:
         origin = request.headers.get("origin")
         return isinstance(origin, str) and hmac.compare_digest(origin, self._config.origin)
+
+    def _session_origin_allowed(self, request: PluginRequest) -> bool:
+        # Same-origin GET fetches commonly omit Origin. A present Origin must
+        # match; otherwise use the browser's Referrer or Fetch Metadata.
+        if request.headers.get("origin") is not None:
+            return self._origin_allowed(request)
+        referer = request.headers.get("referer")
+        if isinstance(referer, str) and referer:
+            parsed = urlsplit(referer)
+            return hmac.compare_digest(
+                f"{parsed.scheme}://{parsed.netloc}", self._config.origin)
+        return request.headers.get("sec-fetch-site") == "same-origin"
 
     def asset_path(self, asset: str) -> Path | None:
         """Resolve a static asset beneath the immutable workbench asset root."""
@@ -212,7 +309,7 @@ class WorkbenchHttpTransport:
         async def serve_asset(asset: str):
             if not isinstance(request.username, str) or not request.username:
                 return error_response("unauthorized", "host_session_missing", "AstrBot 未提供已认证会话。", 401)
-            if self._bound_session(request) is None:
+            if await self._bound_session(request) is None:
                 return error_response("unauthorized", "session_unbound", "工作台会话未建立。", 401)
             # Fetching images/scripts cannot supply a CSRF header. The host
             # session is required; any supplied Origin must match our origin.

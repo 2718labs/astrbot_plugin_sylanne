@@ -39,6 +39,9 @@ from .runtime.jobs import (
     PersistentJob, acquire_job, cancel_job, create_job, get_job,
 )
 from .runtime.d11_types import reconcile_runtime_write
+from .runtime.dispatch_candidate import (
+    DispatchCandidateRecoveryV1, validate_dispatch_candidate_writes,
+)
 
 
 @dataclass(frozen=True)
@@ -4231,6 +4234,102 @@ class GraphCoordinator:
         with self._content_fence(authority.namespace, authority.activation_generation, "read"):
             return self._get_operation_fenced(authority, operation_id)
 
+    def get_dispatch_candidate_evidence(self, authority: AuthorityContext,
+                                        lease: object, operation_id: str):
+        """Rebuild a source-HOLD candidate from committed historical graph atoms."""
+        if not isinstance(authority, AuthorityContext) or not operation_id:
+            raise ValueError("authority and operation ID are required")
+        self._authorize(lease, authority, frozenset({"d08", "d09"}))
+        reader = lambda: self._get_dispatch_candidate_evidence_locked(
+            authority.namespace, operation_id)
+        if (isinstance(self.__store, ProductionGraphStore)
+                and self.__content_fence_v2 is not None):
+            return self._read_v2(authority, reader)
+        with self._content_fence(authority.namespace, authority.activation_generation, "read"):
+            with self.__store._lock:
+                self._admit_content(authority.namespace,
+                                    authority.activation_generation, "read")
+                return reader()
+
+    def _get_dispatch_candidate_evidence_locked(self, namespace, operation_id):
+        from .domains.d08 import GoalExecutionProvider
+        from .graph_types import AtomKey, GraphWrite
+
+        store = self.__store
+        db = store._db
+        row = db.execute(
+            "SELECT activity_id,effect_id,receipt_json FROM graph_bundle_operations "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        data = json.loads(row[2]).get("dispatch_candidate")
+        if data is None:
+            return None
+        if (type(data) is not dict or data.get("schema") != "sylanne.d11.dispatch_candidate.v1"
+                or data.get("status") != "source_hold"
+                or type(data.get("refs")) is not list or len(data["refs"]) != 4):
+            raise UnavailableGuard("durable dispatch candidate receipt is invalid")
+        event = db.execute(
+            "SELECT revisions,epoch_revision,reads FROM graph_events WHERE bot=? "
+            "AND persona=? AND session=? AND event_id=?",
+            namespace.as_tuple + (row[0], operation_id),
+        ).fetchone()
+        if event is None or event[1] != data.get("graph_epoch"):
+            raise UnavailableGuard("dispatch candidate graph event is missing")
+        revisions = {item.key.token: item.revision
+                     for item in GraphStore._version_rows(event[0])}
+        typed_writes = []
+        for position, item in enumerate(data["refs"]):
+            if (type(item) is not list or len(item) != 2
+                    or type(item[0]) is not str or type(item[1]) is not int
+                    or item[1] < 1 or revisions.get(item[0]) != item[1]):
+                raise UnavailableGuard("dispatch candidate write version differs")
+            key = AtomKey.from_token(item[0])
+            expected_type = (
+                "d08.action_intent.v1", "d08.action_schema.v1",
+                "d08.communication_intent_grant.v1", "d09.verified_segment_batch.v1",
+            )[position]
+            if key.type_name != expected_type:
+                raise UnavailableGuard("dispatch candidate graph type differs")
+            history = db.execute(
+                "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
+                "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
+                (item[0], item[1]) + namespace.as_tuple + (row[0], operation_id),
+            ).fetchone()
+            if history is None or history[1] != 1:
+                raise UnavailableGuard("dispatch candidate history is unavailable")
+            typed_writes.append(("d09" if position == 3 else "d08",
+                                 GraphWrite(key, json.loads(history[0]))))
+        action = next(spec for spec in GoalExecutionProvider().register_types()
+                      if spec.name == "d08.action_intent.v1").validator(
+                          typed_writes[0][1].value)
+        if (action.identity.operation_id != operation_id
+                or action.identity.activity_id != row[0]
+                or action.identity.effect_id != row[1]):
+            raise UnavailableGuard("dispatch candidate operation identity differs")
+        candidate = validate_dispatch_candidate_writes(
+            tuple(typed_writes), namespace=namespace, identity=action.identity,
+            read_versions=GraphStore._version_rows(event[2]),
+            source_refs=tuple(data.get("source_refs", ())),
+            access_epoch=data.get("access_epoch"),
+            delete_epoch=data.get("delete_epoch"),
+            query_epoch=data.get("query_epoch"),
+        )
+        if candidate is None or candidate.digest != data.get("digest"):
+            raise UnavailableGuard("dispatch candidate digest differs")
+        if isinstance(store, ProductionGraphStore):
+            metadata = self._v2_graph_stamp(namespace)[0]
+            if (data.get("graph_incarnation") != metadata.requirements.graph_incarnation
+                    or type(data.get("graph_revision")) is not int
+                    or data["graph_revision"] > metadata.graph_revision):
+                raise UnavailableGuard("dispatch candidate recovery stamp differs")
+        return DispatchCandidateRecoveryV1(
+            candidate, tuple((ref, revision) for ref, revision in data["refs"]),
+            data["graph_epoch"], data["graph_incarnation"], data["graph_revision"],
+        )
+
     def _get_operation_fenced(self, authority: AuthorityContext,
                               operation_id: str, *, v2: bool = False) -> CommitReceipt | None:
         namespace = authority.namespace
@@ -4699,6 +4798,17 @@ class GraphCoordinator:
         self._authorize(lease, envelope.authority, domains)
         store = self.__store
         writes = tuple(write for proposal in bundle.proposals for write in proposal.typed_writes)
+        dispatch_candidate = validate_dispatch_candidate_writes(
+            tuple((proposal.domain, write) for proposal in bundle.proposals
+                  for write in proposal.typed_writes),
+            namespace=namespace, identity=envelope.identity,
+            read_versions=envelope.version_guard.read_versions,
+            source_refs=envelope.source_qualification.source_refs,
+            access_epoch=envelope.version_guard.access_epoch,
+            delete_epoch=envelope.version_guard.delete_epoch,
+            query_epoch=envelope.version_guard.query_epochs[0].revision
+            if len(envelope.version_guard.query_epochs) == 1 else -1,
+        )
         if len({write.key for write in writes}) != len(writes):
             raise ValueError("duplicate writes across proposals")
         read_map = {item.key: item.revision for item in envelope.version_guard.read_versions}
@@ -4947,6 +5057,32 @@ class GraphCoordinator:
                                 for ref in refs)
             data = {"commit_seq": seq, "ledger_refs": list(ledger_refs),
                     "outbox_refs": list(bundle.outbox_refs)}
+            if dispatch_candidate is not None:
+                versions = {item.key.token: item.revision
+                            for item in graph_receipt.revisions}
+                refs = (dispatch_candidate.action_ref,
+                        dispatch_candidate.schema_ref,
+                        dispatch_candidate.grant_ref,
+                        dispatch_candidate.batch_ref)
+                if any(versions.get(ref, 0) < 1 for ref in refs):
+                    raise UnavailableGuard("dispatch candidate lacks same-commit graph versions")
+                data["dispatch_candidate"] = {
+                    "schema": "sylanne.d11.dispatch_candidate.v1",
+                    "status": "source_hold",
+                    "digest": dispatch_candidate.digest,
+                    "refs": [[ref, versions[ref]] for ref in refs],
+                    "graph_epoch": graph_receipt.epoch.revision,
+                    "source_refs": list(dispatch_candidate.source_refs),
+                    "access_epoch": dispatch_candidate.access_epoch,
+                    "delete_epoch": dispatch_candidate.delete_epoch,
+                    "query_epoch": dispatch_candidate.query_epoch,
+                    "graph_incarnation": (
+                        v2_write[0].requirements.graph_incarnation
+                        if v2_write is not None else None),
+                    "graph_revision": (
+                        v2_write[0].graph_revision + 1
+                        if v2_write is not None else None),
+                }
             if product_advances:
                 data["product_advance_candidate"] = product_advances[0]
             db.execute(

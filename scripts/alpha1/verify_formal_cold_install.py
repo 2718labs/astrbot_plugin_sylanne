@@ -41,7 +41,7 @@ def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> 
             run_dir = temporary / "cold-run"
             run_dir.mkdir()
             code = "\n".join((
-                "import json, os, sys",
+                "import hashlib, json, os, sys",
                 "from pathlib import Path",
                 "root = Path(sys.argv[1]).resolve()",
                 "assert sys.flags.isolated and sys.flags.no_site",
@@ -53,10 +53,21 @@ def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> 
                 "installed = verify_installed_package(root, sys.argv[2])",
                 "assert installed.verified and installed.build_mode == 'formal-alpha1', installed",
                 "scheme = load_verified_affect_scheme(root, sys.argv[2])",
+                "manifest = json.loads((root / 'release-manifest.json').read_bytes())",
+                "relative = 'resources/catalogue/d04-fixed-block-operator.json'",
+                "operator_bytes = (root / relative).read_bytes()",
+                "operator_sha = hashlib.sha256(operator_bytes).hexdigest()",
+                "entry = next((row for row in manifest['files'] if row['path'] == relative), None)",
+                "claim = manifest.get('fixed_block_operator')",
+                "assert entry is not None and isinstance(claim, dict)",
+                "assert all(claim.get(key) == entry.get(key) for key in ('path', 'sha256', 'bytes'))",
+                "assert claim['sha256'] == operator_sha and claim['bytes'] == len(operator_bytes)",
+                "assert claim['affect_scheme_sha256'] == scheme.asset_sha256",
+                "assert all(claim[name] == getattr(scheme.scheme, name) for name in ('scheme_version', 'operator_version', 'parameter_version', 'coupling_version'))",
                 "native = load_production_native(root, trusted_manifest_sha256=sys.argv[2])",
                 "assert Path(native.path).resolve().is_relative_to(root)",
                 "assert all(Path(module.__file__).resolve().is_relative_to(root) for name, module in sys.modules.items() if (name == 'rewrite' or name.startswith('rewrite.')) and getattr(module, '__file__', None))",
-                "print(json.dumps({'manifest_sha256': sys.argv[2], 'scheme_sha256': scheme.asset_sha256, 'catalogue_hash': scheme.registry.type_registry.catalogue_hash, 'abi_version': native.capabilities.abi_version}))",
+                "print(json.dumps({'manifest_sha256': sys.argv[2], 'scheme_sha256': scheme.asset_sha256, 'operator_sha256': operator_sha, 'catalogue_hash': scheme.registry.type_registry.catalogue_hash, 'abi_version': native.capabilities.abi_version, 'd04_product_certified': False}))",
             ))
             environment = {
                 name: value for name, value in os.environ.items()

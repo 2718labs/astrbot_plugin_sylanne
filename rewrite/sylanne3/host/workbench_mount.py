@@ -7,7 +7,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..workbench_api.http_transport import ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, WorkbenchHttpTransport
+from ..workbench_api.http_transport import (
+    ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, SESSION_ROUTE,
+    WorkbenchHttpTransport,
+)
 
 
 _WORKBENCH_ROOT = Path(__file__).resolve().parents[3] / "resources" / "workbench"
@@ -53,6 +56,13 @@ class WorkbenchHostMount:
     def __init__(self) -> None:
         self._transport: WorkbenchHttpTransport | None = None
         self._closed = False
+
+    def attach_transport(self, transport: WorkbenchHttpTransport) -> None:
+        if self._closed or self._transport is not None:
+            raise RuntimeError("workbench mount is closed or already attached")
+        if not isinstance(transport, WorkbenchHttpTransport):
+            raise TypeError("trusted D12 transport is required")
+        self._transport = transport
 
     def register(self, context: Any) -> None:
         """Register authenticated, read-only assets and the POST command seam."""
@@ -112,11 +122,30 @@ class WorkbenchHostMount:
                     )
             return json_response(result, status_code=status_code, headers=headers)
 
+        async def session():
+            if self._closed:
+                return json_response(_unavailable("host_stopped"), status_code=503,
+                                     headers=_STATIC_HEADERS)
+            if not isinstance(request.username, str) or not request.username:
+                return json_response(
+                    {"status": "unauthorized", "problem": {"code": "host_session_missing",
+                     "retryable": False}}, status_code=401, headers=_STATIC_HEADERS)
+            transport = self._transport
+            if transport is None:
+                return json_response(_unavailable("authority_unavailable"), status_code=503,
+                                     headers=_STATIC_HEADERS)
+            result = await transport.open_session(request)
+            status_code = result.pop("http_status", 200)
+            return json_response(result, status_code=status_code, headers=_STATIC_HEADERS)
+
         context.register_web_api(
             COMMAND_ROUTE, command, ["POST"], "Sylanne D12 authenticated command",
         )
         context.register_web_api(
             PLUGIN_ROUTE_PREFIX, static, ["GET"], "Sylanne W11 authenticated workbench",
+        )
+        context.register_web_api(
+            SESSION_ROUTE, session, ["GET"], "Sylanne D12 paired Owner session",
         )
         context.register_web_api(
             ASSET_ROUTE, static, ["GET"], "Sylanne W11 authenticated static assets",

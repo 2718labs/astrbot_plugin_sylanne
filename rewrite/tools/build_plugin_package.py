@@ -74,6 +74,7 @@ _VERSION_PATTERN = re.compile(
     r'^version\s*:\s*["\']?([^\s"\']+)["\']?\s*$', re.MULTILINE
 )
 _D04_ASSET_PATH = "resources/catalogue/d04-affect-scheme.json"
+_D04_OPERATOR_PATH = "resources/catalogue/d04-fixed-block-operator.json"
 _D04_CATALOGUE_CAPABILITY = "d04.affect.scheme.v1"
 _D04_VERSION_FIELDS = (
     "scheme_version", "operator_version", "parameter_version", "coupling_version",
@@ -161,6 +162,57 @@ def _d04_binding(payload: dict[str, bytes]) -> dict[str, object]:
         "catalogue_capability": _D04_CATALOGUE_CAPABILITY,
         **versions,
     }
+
+
+def _d04_operator_binding(payload: dict[str, bytes]) -> dict[str, object]:
+    """Bind one complete fixed-block operator to the packaged D04 scheme."""
+    content = payload.get(_D04_OPERATOR_PATH)
+    if content is None:
+        raise RuntimeError("formal alpha1 requires a D04 fixed-block operator asset")
+    operator = _strict_json_object(content, "D04 fixed-block operator asset")
+    scheme = _strict_json_object(payload[_D04_ASSET_PATH], "D04 affect scheme asset")
+    expected = {"schema", "affect_schema", *_D04_VERSION_FIELDS,
+                "axis_ids", "parameter_bounds", "operator"}
+    if set(operator) != expected or operator["schema"] != "d04.fixed-block-operator.v1":
+        raise ValueError("D04 fixed-block operator fields or schema are invalid")
+    if (operator["affect_schema"] != scheme["schema"]
+            or any(operator[name] != scheme[name] for name in _D04_VERSION_FIELDS)
+            or operator["axis_ids"] != [axis["axis_id"] for axis in scheme["axes"]]
+            or operator["parameter_bounds"] != scheme["parameter_bounds"]):
+        raise ValueError("D04 fixed-block operator differs from affect scheme")
+    block = operator["operator"]
+    if not isinstance(block, dict) or set(block) != {"k", "r", "j", "a", "alpha"}:
+        raise ValueError("D04 fixed-block operator is incomplete")
+
+    def matrix(value: object) -> tuple[int, int]:
+        if not isinstance(value, dict) or set(value) != {"rows", "cols", "offsets", "indices", "values"}:
+            raise ValueError("D04 fixed-block matrix is incomplete")
+        rows, cols = value["rows"], value["cols"]
+        offsets, indices, values = value["offsets"], value["indices"], value["values"]
+        if (type(rows) is not int or type(cols) is not int or rows < 0 or cols < 0
+                or not isinstance(offsets, list) or not isinstance(indices, list)
+                or not isinstance(values, list) or len(offsets) != rows + 1
+                or len(indices) != len(values) or not offsets or offsets[0] != 0
+                or offsets[-1] != len(values)
+                or any(type(item) is not int or item < 0 for item in offsets)
+                or offsets != sorted(offsets)
+                or any(type(item) is not int or not 0 <= item < cols for item in indices)
+                or any(type(item) not in (int, float) or not math.isfinite(item) for item in values)):
+            raise ValueError("D04 fixed-block matrix is invalid")
+        return rows, cols
+
+    n = len(scheme["axes"])
+    if any(matrix(block[name]) != (n, n) for name in ("k", "r", "j")):
+        raise ValueError("D04 fixed-block state dimensions differ from affect axes")
+    a_rows, a_cols = matrix(block["a"])
+    alpha = block["alpha"]
+    if (a_cols != n or not isinstance(alpha, list) or len(alpha) != a_rows
+            or any(type(item) not in (int, float) or not math.isfinite(item) or item < 0
+                   for item in alpha)):
+        raise ValueError("D04 fixed-block A/alpha dimensions are invalid")
+    return {"path": _D04_OPERATOR_PATH, "sha256": _sha256(content), "bytes": len(content),
+            "schema": operator["schema"], "affect_scheme_sha256": _sha256(payload[_D04_ASSET_PATH]),
+            **{name: operator[name] for name in _D04_VERSION_FIELDS}}
 
 
 def _sha256(content: bytes) -> str:
@@ -389,6 +441,7 @@ def _manifest(
     native_path: str,
     formal: bool,
     affect_scheme: dict[str, object] | None = None,
+    fixed_block_operator: dict[str, object] | None = None,
 ) -> dict[str, object]:
     files = [
         {"path": path, "sha256": _sha256(content), "bytes": len(content)}
@@ -420,6 +473,8 @@ def _manifest(
     }
     if affect_scheme is not None:
         manifest["affect_scheme"] = affect_scheme
+    if fixed_block_operator is not None:
+        manifest["fixed_block_operator"] = fixed_block_operator
     return manifest
 
 
@@ -479,6 +534,7 @@ def build_package(
     payload = _read_allowlisted_payload(root, formal=formal)
     _verify_workbench_source(root, payload, formal=formal)
     affect_scheme = _d04_binding(payload) if formal else None
+    fixed_block_operator = _d04_operator_binding(payload) if formal else None
     native_path = (
         f"rewrite/sylanne3/_native/{target_os}-{target_arch}/{canonical_native}"
     )
@@ -497,6 +553,7 @@ def build_package(
         native_path=native_path,
         formal=formal,
         affect_scheme=affect_scheme,
+        fixed_block_operator=fixed_block_operator,
     )
     manifest_bytes = (
         json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -618,6 +675,7 @@ def verify_package(package: Path | str) -> None:
                             "resources/catalogue/current.json",
                             "resources/migrations/v1.json",
                             _D04_ASSET_PATH,
+                            _D04_OPERATOR_PATH,
                         )
                         if member in listed
                     }
@@ -634,6 +692,15 @@ def verify_package(package: Path | str) -> None:
                             or any(binding.get(field) != asset_entry.get(field)
                                    for field in ("path", "sha256", "bytes"))):
                         raise ValueError("formal alpha1 D04 manifest binding is invalid")
+                    expected_operator = _d04_operator_binding(resources)
+                    operator_binding = manifest.get("fixed_block_operator")
+                    operator_entry = listed.get(_D04_OPERATOR_PATH)
+                    if (not isinstance(operator_binding, dict)
+                            or operator_binding != expected_operator
+                            or operator_entry is None
+                            or any(operator_binding.get(field) != operator_entry.get(field)
+                                   for field in ("path", "sha256", "bytes"))):
+                        raise ValueError("formal alpha1 D04 operator binding is invalid")
                 except RuntimeError as exc:
                     raise ValueError(str(exc)) from exc
 

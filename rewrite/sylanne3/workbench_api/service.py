@@ -67,6 +67,7 @@ class AuthenticatedSession:
     scope_capabilities: Mapping[str, frozenset[str]]
     scope_audiences: Mapping[str, frozenset[str]]
     scope_purposes: Mapping[str, frozenset[str]]
+    host_username: str | None = None
 
     def allows(self, scope: str, capability: str, purpose: str, audience: str) -> bool:
         return (capability in self.scope_capabilities.get(scope, frozenset())

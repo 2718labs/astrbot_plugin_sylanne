@@ -11,7 +11,9 @@ from unittest.mock import patch
 from astrbot.dashboard.api.plugins import _match_registered_web_api
 
 from rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
-from rewrite.sylanne3.workbench_api.http_transport import ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX
+from rewrite.sylanne3.workbench_api.http_transport import (
+    ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, SESSION_ROUTE,
+)
 
 
 class _Context:
@@ -27,7 +29,7 @@ def test_host_mount_serves_packaged_assets_without_promoting_dashboard_admin_to_
     mount = WorkbenchHostMount()
     with patch("astrbot.api.web.request", SimpleNamespace(username="dashboard-admin")):
         mount.register(context)
-        assert len(context.registered_web_apis) == 3
+        assert len(context.registered_web_apis) == 4
         assert context.registered_web_apis[0][0] == COMMAND_ROUTE
         matched = _match_registered_web_api(
             context.registered_web_apis, COMMAND_ROUTE, "POST",
@@ -53,6 +55,9 @@ def test_host_mount_serves_packaged_assets_without_promoting_dashboard_admin_to_
         assert script.media_type == "text/javascript; charset=utf-8"
         assert Path(script.path).read_bytes().startswith(b"import ")
         assert _match_registered_web_api(context.registered_web_apis, COMMAND_ROUTE, "GET") is not None
+        session, _ = _match_registered_web_api(
+            context.registered_web_apis, SESSION_ROUTE, "GET")
+        assert json.loads(asyncio.run(session()).body)["problem"]["code"] == "authority_unavailable"
         assert asyncio.run(asset(asset="v1/commands")).status_code == 404
         assert asyncio.run(asset(asset="workbench-manifest.json")).status_code == 404
         assert asyncio.run(asset(asset="../metadata.yaml")).status_code == 404

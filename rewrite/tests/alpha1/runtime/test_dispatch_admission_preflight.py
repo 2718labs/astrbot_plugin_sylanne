@@ -21,7 +21,7 @@ from sylanne3.runtime_contracts import (
 from sylanne3.runtime_journal import BudgetConstraint, RecoveryConstraintFootprint
 
 
-def _candidates():
+def _candidates(*, source_ref="source:one", include_grant=False):
     providers = (
         ("role_binding", "d03.role_binding"),
         ("boundary", "d05.boundary"),
@@ -41,7 +41,7 @@ def _candidates():
         "action:one", 1, "goal:one", (), "entity:user", "message",
         "expression", "reversible", canonical_digest("params"), identity,
         "schema:one", specs, GoalPredicate("communicated", "delivery", (), 0.0, None),
-        ("message:entity:user",), None, ("source:one",),
+        ("message:entity:user",), None, (source_ref,),
     )
     schema = ActionSchemaRecord.bind(intent, ActionSchema("schema:one", "message", False, specs))
     refs = tuple("check:" + canonical_digest({
@@ -62,7 +62,7 @@ def _candidates():
     )
     provider = D09ExpressionProvider()
     claims = (ExpressionClaim(
-        "claim:one", "Hello", ClaimKind.EXTERNAL_FACT, ("source:one",),
+        "claim:one", "Hello", ClaimKind.EXTERNAL_FACT, (source_ref,),
         ("entity:user",), ("expression",), "disclosure:one",
     ),)
     blueprint = provider.prepare_blueprint(grant, "scene:one", 1, claims, now=1.0).blueprint
@@ -90,7 +90,8 @@ def _candidates():
         item.check_kind, item.subject_ref, item.action_ref, item.purpose,
         item.required_input_versions, "full", "pass", 100.0, item.provider_id,
     ) for item in specs)
-    return schema, intent, batch, request, receipts
+    result = (schema, intent, batch, request, receipts)
+    return result + (grant,) if include_grant else result
 
 
 def test_matching_candidates_still_hold_on_source_and_business_graph() -> None:

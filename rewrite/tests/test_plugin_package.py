@@ -126,6 +126,18 @@ class PluginPackageTests(unittest.TestCase):
             }],
             "parameter_bounds": [],
         }
+        diagonal = {"rows": 1, "cols": 1, "offsets": [0, 1],
+                    "indices": [0], "values": [1.0]}
+        operator = {
+            "schema": "d04.fixed-block-operator.v1",
+            "affect_schema": affect_scheme["schema"],
+            **{name: affect_scheme[name] for name in (
+                "scheme_version", "operator_version", "parameter_version", "coupling_version")},
+            "axis_ids": [axis["axis_id"] for axis in affect_scheme["axes"]],
+            "parameter_bounds": affect_scheme["parameter_bounds"],
+            "operator": {"k": diagonal, "r": diagonal, "j": diagonal,
+                         "a": diagonal, "alpha": [1.0]},
+        }
         migrations = {
             "legacy_data_policy": "registered_migrators",
             "release_eligibility": "READY",
@@ -144,6 +156,7 @@ class PluginPackageTests(unittest.TestCase):
             "resources/workbench/workbench-manifest.json": json.dumps(workbench_manifest).encode(),
             "resources/catalogue/current.json": json.dumps(catalogue).encode() + b"\n",
             "resources/catalogue/d04-affect-scheme.json": json.dumps(affect_scheme).encode() + b"\n",
+            "resources/catalogue/d04-fixed-block-operator.json": json.dumps(operator).encode() + b"\n",
             "resources/migrations/v1.json": json.dumps(migrations).encode() + b"\n",
             "THIRD_PARTY_NOTICES": b"No bundled third-party runtime assets.\n",
             "SBOM.spdx.json": b'{"spdxVersion":"SPDX-2.3"}\n',
@@ -470,6 +483,33 @@ class PluginPackageTests(unittest.TestCase):
                 output_dir=self.base / "missing-d04",
             )
 
+    def test_formal_build_holds_when_d04_operator_is_absent(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        (self.project / "resources/catalogue/d04-fixed-block-operator.json").unlink()
+        _run_git(self.project, "add", "-A")
+        _run_git(self.project, "commit", "--quiet", "-m", "without D04 operator")
+        with self.assertRaisesRegex(RuntimeError, "requires a D04 fixed-block operator asset"):
+            self.builder.build_package(
+                project_root=self.project, target_os="windows", target_arch="x86_64",
+                native_library=self._native(), output_dir=self.base / "missing-operator",
+            )
+
+    def test_formal_build_rejects_operator_scheme_mismatch(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        path = self.project / "resources/catalogue/d04-fixed-block-operator.json"
+        operator = json.loads(path.read_bytes())
+        operator["axis_ids"] = ["wrong"]
+        path.write_text(json.dumps(operator), encoding="utf-8")
+        _run_git(self.project, "add", ".")
+        _run_git(self.project, "commit", "--quiet", "-m", "wrong D04 axis")
+        with self.assertRaisesRegex(ValueError, "differs from affect scheme"):
+            self.builder.build_package(
+                project_root=self.project, target_os="windows", target_arch="x86_64",
+                native_library=self._native(), output_dir=self.base / "mismatched-operator",
+            )
+
     def test_package_rejects_stale_workbench_resource(self) -> None:
         self._set_formal_version()
         self._add_formal_assets()
@@ -521,6 +561,28 @@ class PluginPackageTests(unittest.TestCase):
                 archive.writestr(name, content)
         with self.assertRaisesRegex(ValueError, "D04 manifest binding"):
             self.builder.verify_package(mismatched)
+
+    def test_formal_verifier_rejects_missing_operator_binding(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        package = self.builder.build_package(
+            project_root=self.project, target_os="windows", target_arch="x86_64",
+            native_library=self._native(), output_dir=self.base / "operator-bound-formal",
+        )
+        with zipfile.ZipFile(package) as source:
+            members = {name: source.read(name) for name in source.namelist()}
+        manifest = json.loads(members["release-manifest.json"])
+        assert manifest["fixed_block_operator"]["sha256"] == hashlib.sha256(
+            members["resources/catalogue/d04-fixed-block-operator.json"]
+        ).hexdigest()
+        del manifest["fixed_block_operator"]
+        members["release-manifest.json"] = json.dumps(manifest).encode("utf-8")
+        tampered = self.base / "missing-operator-binding.zip"
+        with zipfile.ZipFile(tampered, "w") as archive:
+            for name, content in members.items():
+                archive.writestr(name, content)
+        with self.assertRaisesRegex(ValueError, "D04 operator binding"):
+            self.builder.verify_package(tampered)
 
     def test_verifier_rejects_formal_archive_with_candidate_resources(self) -> None:
         self._set_formal_version()

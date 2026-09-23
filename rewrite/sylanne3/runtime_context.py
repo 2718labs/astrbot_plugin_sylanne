@@ -27,6 +27,14 @@ from .installation_policy import AdminInstallationPolicy
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.restore_anchor import ExecutionJournalPort
 from .runtime_contracts import InstallationGrantV2, NamespaceId
+from .workbench_api.async_service import AsyncGraphWorkbenchService
+from .workbench_api.domain_registry import CurrentDomainViewRegistry
+from .workbench_api.http_transport import (
+    BoundCsrfTokens, CurrentOwnerDashboardSessions, CurrentOwnerPairingPort,
+    TransportConfig, WorkbenchHttpTransport,
+)
+from .workbench_api.onboarding import OnboardingPolicyResolver
+from .workbench_api.owner_grant import CurrentOwnerGrantPort, DurableOwnerGrantResolver
 
 
 @dataclass(frozen=True)
@@ -344,6 +352,26 @@ class RuntimeContext:
                 "limited", tuple(missing), detail,
             )
             return self.health
+
+    def workbench_transport(self, *, pairing: CurrentOwnerPairingPort,
+                            owner_grants: CurrentOwnerGrantPort,
+                            onboarding: OnboardingPolicyResolver,
+                            origin: str) -> WorkbenchHttpTransport:
+        """Compose D12 only with explicit external pairing and current W01 ports."""
+        if self._worker is None or not self._v2_namespace_provisioned:
+            raise RuntimeError("v2 graph namespace is unavailable")
+        if not callable(getattr(owner_grants, "resolve_current_owner", None)):
+            raise TypeError("current W01 Owner grant port is required")
+        if (not callable(getattr(onboarding, "resolve_create_character", None))
+                or not callable(getattr(onboarding, "resolve_bind_scene", None))):
+            raise TypeError("trusted onboarding policy resolver is required")
+        sessions = CurrentOwnerDashboardSessions(pairing)
+        service = AsyncGraphWorkbenchService(
+            self._worker, DurableOwnerGrantResolver(owner_grants),
+            CurrentDomainViewRegistry(lambda: self._domains), onboarding)
+        return WorkbenchHttpTransport(
+            service, sessions, BoundCsrfTokens(),
+            TransportConfig(origin, self._package_root / "resources" / "workbench"))
 
     async def start(self) -> RuntimeHealth:
         async with self._lock:

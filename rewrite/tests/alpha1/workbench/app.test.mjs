@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-async function mountWorkbench() {
+async function mountWorkbench({ sessionResponses = [] } = {}) {
   const previousDocument = globalThis.document;
   const previousFetch = globalThis.fetch;
   const requests = [];
@@ -10,6 +10,7 @@ async function mountWorkbench() {
     addEventListener(type, listener) { if (type === "click") this.click = listener; }
   };
   let roleInput = "";
+  let sessionRequests = 0;
   globalThis.document = {
     querySelector(selector) {
       if (selector === "#app") return app;
@@ -17,12 +18,24 @@ async function mountWorkbench() {
       return null;
     }
   };
-  globalThis.fetch = async (_url, init) => new Promise((resolve) => {
-    requests.push({ payload: JSON.parse(init.body), resolve: (body) => resolve({ ok: true, json: async () => body }) });
-  });
+  globalThis.fetch = async (_url, init) => {
+    if (init.method === "GET") {
+      const body = sessionResponses[sessionRequests++] ?? { status: "ready", csrf_token: "issued" };
+      return { ok: body.status === "ready", status: body.status === "ready" ? 200 : 401, json: async () => body };
+    }
+    return new Promise((resolve) => {
+      requests.push({ payload: JSON.parse(init.body), resolve: (body) => resolve({ ok: true, json: async () => body }) });
+    });
+  };
   await import(`../../../../webui-src/src/app.js?test=${Date.now()}-${Math.random()}`);
+  async function nextRequest(index) {
+    for (let attempt = 0; attempt < 10 && requests.length <= index; attempt++) await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(requests[index], `expected command request ${index}`);
+    return requests[index];
+  }
   return {
-    app, requests,
+    app, requests, nextRequest,
+    get sessionRequests() { return sessionRequests; },
     setRole(value) { roleInput = value; },
     clickCommand(command) { return app.click({ target: { closest(selector) { return selector === "[data-command]" ? { dataset: { command } } : null; } } }); },
     clickView(view) { return app.click({ target: { closest(selector) { return selector === "[data-view]" ? { dataset: { view } } : null; } } }); },
@@ -35,11 +48,13 @@ test("an older same-role view response cannot replace the selected page", async 
   try {
     ui.setRole("role-a");
     const initial = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
     ui.requests[0].resolve({ status: "ready", projection: { label: "overview" } });
     await initial;
 
     const older = ui.clickView("creation");
     const newer = ui.clickView("memory");
+    await ui.nextRequest(2);
     ui.requests[2].resolve({ status: "ready", projection: { label: "memory-current" } });
     await newer;
     ui.requests[1].resolve({ status: "ready", projection: { label: "creation-obsolete" } });
@@ -50,17 +65,35 @@ test("an older same-role view response cannot replace the selected page", async 
   } finally { ui.restore(); }
 });
 
+test("unpaired startup exposes recovery and retry verifies a new session", async () => {
+  const ui = await mountWorkbench({ sessionResponses: [
+    { status: "unauthorized", problem: { code: "session_unbound", message: "工作台会话未建立。" } },
+    { status: "ready", csrf_token: "paired" }
+  ] });
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(ui.app.innerHTML, /工作台会话未建立/);
+    assert.match(ui.app.innerHTML, /重新核验工作台会话/);
+    await ui.clickCommand("retry-session");
+    assert.equal(ui.sessionRequests, 2);
+    assert.match(ui.app.innerHTML, /宿主与工作台会话.*已核验/s);
+    assert.doesNotMatch(ui.app.innerHTML, /工作台会话未建立/);
+  } finally { ui.restore(); }
+});
+
 test("a command response from the previous role cannot alter projection or receipt", async () => {
   const ui = await mountWorkbench();
   try {
     ui.setRole("role-a");
     const initial = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
     ui.requests[0].resolve({ status: "ready", projection: { label: "role-a" } });
     await initial;
 
     const oldCommand = ui.clickCommand("open-workspace");
     ui.setRole("role-b");
     const switched = ui.clickCommand("switch-role");
+    await ui.nextRequest(2);
     ui.requests[2].resolve({ status: "ready", projection: { label: "role-b-current" }, receipt: { operation_id: "receipt-b" } });
     await switched;
     ui.requests[1].resolve({ status: "ready", projection: { label: "role-a-obsolete" }, receipt: { operation_id: "receipt-a" } });
@@ -76,15 +109,18 @@ test("refresh retains the current projection while requesting its replacement", 
   try {
     ui.setRole("role-a");
     const initial = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
     ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
     await initial;
 
     const overview = ui.clickView("overview");
+    await ui.nextRequest(1);
     ui.requests[1].resolve({ status: "ready", projection: { label: "current" } });
     await overview;
 
     const refreshing = ui.clickCommand("refresh");
     assert.match(ui.app.innerHTML, /current/);
+    await ui.nextRequest(2);
     ui.requests[2].resolve({ status: "ready", projection: { label: "refreshed" } });
     await refreshing;
     assert.match(ui.app.innerHTML, /refreshed/);
@@ -99,6 +135,7 @@ test("start page requests only the authenticated capability catalogue and never 
     assert.equal(ui.requests.length, 0);
     ui.setRole("role-a");
     const requested = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
     assert.equal(ui.requests[0].payload.action, "open_workspace");
     ui.requests[0].resolve({ status: "ready", projection: { views: [{ view_type: "overview", status: "available" }] } });
     await requested;

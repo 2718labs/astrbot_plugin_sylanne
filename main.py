@@ -19,6 +19,9 @@ from .rewrite.sylanne3.host.authority_profile import AuthorityProfileUnavailable
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
 from .rewrite.sylanne3.runtime_contracts import canonical_digest
+from .rewrite.sylanne3.workbench_api.http_transport import CurrentOwnerPairingPort
+from .rewrite.sylanne3.workbench_api.onboarding import OnboardingPolicyResolver
+from .rewrite.sylanne3.workbench_api.owner_grant import CurrentOwnerGrantPort
 
 
 PLUGIN_NAME = "astrbot_plugin_sylanne"
@@ -37,7 +40,11 @@ def _settings(config: object) -> tuple[bool, AuthoritySelection]:
 class Sylanne3Plugin(Star):
     """Full-runtime host. Incomplete authority or domain sets remain blocked."""
 
-    def __init__(self, context: Context, config: dict | None = None) -> None:
+    def __init__(self, context: Context, config: dict | None = None, *,
+                 workbench_pairing: CurrentOwnerPairingPort | None = None,
+                 workbench_owner_grants: CurrentOwnerGrantPort | None = None,
+                 workbench_onboarding: OnboardingPolicyResolver | None = None,
+                 workbench_origin: str | None = None) -> None:
         super().__init__(context, config)
         try:
             self._enabled, self._authority_selection = _settings(config)
@@ -49,6 +56,10 @@ class Sylanne3Plugin(Star):
         self.runtime_health = RuntimeHealth("limited", ("not_started",))
         self._workbench = WorkbenchHostMount()
         self._workbench.register(context)
+        self._workbench_dependencies = (
+            workbench_pairing, workbench_owner_grants,
+            workbench_onboarding, workbench_origin,
+        )
 
     async def initialize(self) -> None:
         if not self._config_valid:
@@ -132,6 +143,14 @@ class Sylanne3Plugin(Star):
                 logger.error("Sylanne 3 startup blocked: namespace provisioning failed")
                 return
             health = self._runtime.health
+        if all(dependency is not None for dependency in self._workbench_dependencies):
+            try:
+                pairing, grants, onboarding, origin = self._workbench_dependencies
+                self._workbench.attach_transport(self._runtime.workbench_transport(
+                    pairing=pairing, owner_grants=grants,
+                    onboarding=onboarding, origin=origin))
+            except Exception:
+                logger.error("Sylanne D12 workbench pairing could not be attached")
         if health.status == "limited":
             self.runtime_health = health
         else:
