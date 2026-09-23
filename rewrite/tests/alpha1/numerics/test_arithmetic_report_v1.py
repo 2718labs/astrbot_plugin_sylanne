@@ -4,6 +4,7 @@ import ctypes
 import math
 from pathlib import Path
 import platform
+import subprocess
 import unittest
 
 from sylanne3.native_runtime.arithmetic_report import (
@@ -15,7 +16,10 @@ from sylanne3.native_runtime.arithmetic_report import (
 class ArithmeticReportTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        root = Path(__file__).resolve().parents[3] / "native" / "target" / "debug"
+        native = Path(__file__).resolve().parents[3] / "native"
+        subprocess.run(["cargo", "build", "--release", "--locked", "--quiet"],
+                       cwd=native, check=True, timeout=120)
+        root = native / "target" / "release"
         filename = {"Windows": "sylanne3_kernel.dll", "Linux": "libsylanne3_kernel.so",
                     "Darwin": "libsylanne3_kernel.dylib"}[platform.system()]
         cls.library = ctypes.CDLL(str(root / filename))
