@@ -12,6 +12,7 @@ import zipfile
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "build_plugin_package.py"
+WORKBENCH_VERIFIER = Path(__file__).resolve().parents[2] / "scripts" / "alpha1" / "verify_delivery_assets.py"
 
 
 def _load_builder():
@@ -21,6 +22,39 @@ def _load_builder():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_workbench_verifier():
+    spec = importlib.util.spec_from_file_location("verify_delivery_assets", WORKBENCH_VERIFIER)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("unable to load workbench verifier")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class WorkbenchAssetTests(unittest.TestCase):
+    def test_verifier_rejects_source_drift_after_manifest_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "webui-src"
+            destination = root / "resources" / "workbench"
+            source.mkdir()
+            destination.mkdir(parents=True)
+            content = b"<main>current</main>\n"
+            for directory in (source, destination):
+                (directory / "index.html").write_bytes(content)
+            manifest = {
+                "schema_version": "sylanne.workbench-assets.v1",
+                "source": "webui-src",
+                "files": [{"path": "index.html", "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)}],
+            }
+            (destination / "workbench-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            verifier = _load_workbench_verifier()
+            verifier.verify_workbench(root)
+            (source / "index.html").write_bytes(b"<main>new</main>\n")
+            with self.assertRaisesRegex(ValueError, "differs from source"):
+                verifier.verify_workbench(root)
 
 
 def _run_git(root: Path, *args: str) -> None:
