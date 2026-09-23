@@ -25,6 +25,10 @@ from rewrite.tools.build_plugin_package import verify_package  # noqa: E402
 
 def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> dict:
     """Verify a formal ZIP and load its D04 scheme and ABI2 library in isolation."""
+    if len(expected_manifest_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_manifest_sha256
+    ):
+        raise ValueError("expected manifest SHA256 must be 64 lowercase hex characters")
     verify_package(package)
     with zipfile.ZipFile(package) as archive:
         manifest_bytes = archive.read("release-manifest.json")
@@ -41,15 +45,20 @@ def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> 
             run_dir = temporary / "cold-run"
             run_dir.mkdir()
             code = "\n".join((
-                "import hashlib, json, os, sys",
+                "import hashlib, json, os, shutil, sys",
                 "from pathlib import Path",
                 "root = Path(sys.argv[1]).resolve()",
+                "source_root = Path(sys.argv[3]).resolve()",
                 "assert sys.flags.isolated and sys.flags.no_site",
                 "assert os.environ.get('PATH', '') == ''",
+                "assert shutil.which('cargo') is None and shutil.which('rustc') is None",
+                "assert all(not Path(value).resolve().is_relative_to(source_root) for value in sys.path if value)",
                 "sys.path.insert(0, str(root))",
+                "import rewrite",
                 "from rewrite.sylanne3.host.installed_package import verify_installed_package",
                 "from rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme",
                 "from rewrite.sylanne3.native_runtime import load_production_native",
+                "assert Path(rewrite.__file__).resolve().is_relative_to(root)",
                 "installed = verify_installed_package(root, sys.argv[2])",
                 "assert installed.verified and installed.build_mode == 'formal-alpha1', installed",
                 "scheme = load_verified_affect_scheme(root, sys.argv[2])",
@@ -66,8 +75,15 @@ def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> 
                 "assert all(claim[name] == getattr(scheme.scheme, name) for name in ('scheme_version', 'operator_version', 'parameter_version', 'coupling_version'))",
                 "native = load_production_native(root, trusted_manifest_sha256=sys.argv[2])",
                 "assert Path(native.path).resolve().is_relative_to(root)",
+                "binding = native.production_binding",
+                "assert binding is not None",
+                "native_sha = hashlib.sha256(Path(native.path).read_bytes()).hexdigest()",
+                "expected = dict(manifest_sha256=sys.argv[2], native_sha256=native_sha, os=manifest['platform']['os'], arch=manifest['platform']['arch'], libc=manifest['platform']['libc'], abi_version=2)",
+                "assert all(getattr(binding, field) == value for field, value in expected.items())",
+                "assert manifest['native']['sha256'] == native_sha",
+                "assert native.capabilities.abi_version == 2 and native.capabilities.supports_fixed_block_interval_math_v1",
                 "assert all(Path(module.__file__).resolve().is_relative_to(root) for name, module in sys.modules.items() if (name == 'rewrite' or name.startswith('rewrite.')) and getattr(module, '__file__', None))",
-                "print(json.dumps({'manifest_sha256': sys.argv[2], 'scheme_sha256': scheme.asset_sha256, 'operator_sha256': operator_sha, 'catalogue_hash': scheme.registry.type_registry.catalogue_hash, 'abi_version': native.capabilities.abi_version, 'd04_product_certified': False}))",
+                "print(json.dumps({'manifest_sha256': sys.argv[2], 'scheme_sha256': scheme.asset_sha256, 'operator_sha256': operator_sha, 'catalogue_hash': scheme.registry.type_registry.catalogue_hash, 'abi_version': native.capabilities.abi_version, 'native_sha256': native_sha, 'native_binding': expected, 'd04_product_certified': native.capabilities.numerically_certified and not native.capabilities.diagnostic_only}))",
             ))
             environment = {
                 name: value for name, value in os.environ.items()
@@ -75,10 +91,15 @@ def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> 
             }
             environment["PATH"] = ""
             result = subprocess.run(
-                [sys.executable, "-I", "-S", "-c", code, str(extracted), digest],
+                [sys.executable, "-I", "-S", "-c", code, str(extracted), digest, str(ROOT.resolve())],
                 cwd=run_dir, env=environment, check=True, capture_output=True, text=True,
             )
-            return json.loads(result.stdout)
+            return {
+                "status": "formal_package_mechanics_only",
+                "package_bytes": package.stat().st_size,
+                "package_sha256": hashlib.sha256(package.read_bytes()).hexdigest(),
+                **json.loads(result.stdout),
+            }
 
 
 def main() -> None:
