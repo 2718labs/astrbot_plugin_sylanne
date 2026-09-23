@@ -6,10 +6,13 @@ import asyncio
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 import hashlib
+import math
 from threading import Event, RLock, Thread
+import time
 from typing import Awaitable, Callable, Coroutine, Mapping, TypeVar
 
 from ..authority_service.contract import CONTENT_OPERATIONS, identifier
+from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import (
@@ -17,6 +20,7 @@ from ..runtime_contracts import (
     RecoveryConstraintFootprint,
 )
 from .authority_client import AuthorityHandshake, AuthorityProvisioningRequest
+from .authority_profile import AdminIngressClockPolicy
 from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 
 
@@ -31,6 +35,16 @@ _REPAIRABLE_ERRORS = frozenset({
 
 class V2FenceOutcomeUnknown(RuntimeError):
     """The Authority may have committed a request whose response was lost."""
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedIngressClockV2:
+    """Paired Authority sample bounded at the end of a local monotonic round trip."""
+
+    sample: IngressClockSampleV2
+    monotonic_before_seconds: float
+    monotonic_after_seconds: float
+    utc_upper_bound_seconds: float
 
 
 @dataclass
@@ -185,6 +199,33 @@ class V2FencePort:
         with self._lock:
             _, grant = self._identity()
             return grant
+
+    def read_ingress_clock(self, policy: AdminIngressClockPolicy) -> VerifiedIngressClockV2:
+        """Read a bounded Authority clock on the dedicated synchronous graph worker."""
+        if type(policy) is not AdminIngressClockPolicy:
+            raise RuntimeError("v2 ingress clock policy is unavailable")
+        return self._submit(self._with_session_repair(lambda: self._read_ingress_clock(policy)))
+
+    async def _read_ingress_clock(self, policy: AdminIngressClockPolicy) -> VerifiedIngressClockV2:
+        handshake, grant = self._identity()
+        before = time.monotonic()
+        sample = await self._transport.ingress_clock_sample_v2(
+            self._request, handshake, grant.installation_id)
+        after = time.monotonic()
+        if (type(sample) is not IngressClockSampleV2
+                or sample.authority_id != grant.authority_id
+                or sample.installation_id != grant.installation_id
+                or sample.source_id != policy.source_id
+                or sample.utc_error_seconds > policy.max_utc_error_seconds
+                or after < before
+                or after - before > policy.max_round_trip_seconds):
+            raise RuntimeError("v2 ingress clock response is unqualified")
+        upper = math.nextafter(math.fsum((
+            sample.utc_seconds, sample.utc_error_seconds, after - before,
+        )), math.inf)
+        if not math.isfinite(upper):
+            raise RuntimeError("v2 ingress clock response is unqualified")
+        return VerifiedIngressClockV2(sample, before, after, upper)
 
     def provision_namespace(self, *, namespace: NamespaceId,
                             request_id: str) -> NamespaceBootstrapV2:
@@ -459,4 +500,4 @@ class V2FencePort:
         self.close()
 
 
-__all__ = ("V2FenceOutcomeUnknown", "V2FencePort")
+__all__ = ("V2FenceOutcomeUnknown", "V2FencePort", "VerifiedIngressClockV2")
