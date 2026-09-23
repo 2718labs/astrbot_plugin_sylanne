@@ -80,7 +80,7 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_administrator_profile_requires_enrollment(self):
         plugin = self.Plugin(self.plugin.context, {"enabled": True})
-        with patch.object(self.module, "build_admin_authority_transport", side_effect=FileNotFoundError):
+        with patch.object(self.module, "assemble_v2_installation", side_effect=FileNotFoundError):
             await plugin.initialize()
         self.assertEqual(plugin.runtime_health.status, "enrollment_required")
         event = ControlledEvent()
