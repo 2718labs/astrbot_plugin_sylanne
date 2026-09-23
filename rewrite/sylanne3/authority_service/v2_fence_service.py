@@ -15,7 +15,7 @@ import json
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState
 from ..runtime_journal import RecoveryConstraintFootprint
-from .contract import AuthorityUnavailable, identifier
+from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, identifier
 from .core import AuthorityServiceCore
 from .local_bridge import constraint_keys_from_footprint
 from .v2_contract import FencePermitV2
@@ -310,6 +310,22 @@ class AuthorityV2FenceService:
             self.fences.finish_fence_locked(
                 db, permit, subject=subject, current_anchor=anchor,
                 request_id=request_id, request_digest=request_digest)
+
+
+    def get_fence_operation(self, *, credential, subject: str,
+                            operation_id: str) -> tuple[FencePermitV2, str]:
+        """Read this subject's durable content fence without changing its state."""
+        identifier(subject, "subject")
+        identifier(operation_id, "operation_id")
+        self.core._require(credential, "current", self.namespace)
+        with self.core._tx() as db:
+            self._require_mode(db)
+        permit, state, pending = self.fences.get_operation(
+            operation_id, subject=subject, namespace=self.namespace)
+        if permit.operation not in CONTENT_OPERATIONS - {"dispatch"} or pending is not None:
+            raise AuthorityUnavailable("content fence operation unavailable")
+        self.core._require(credential, permit.operation, self.namespace, permit.holder)
+        return permit, state
 
 
 __all__ = ["AuthorityV2FenceService"]

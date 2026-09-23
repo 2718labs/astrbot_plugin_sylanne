@@ -61,6 +61,9 @@ class ControlledMtlsTransport:
         self.lose_finish_after_once = False
         self.fail_finish_always = False
         self.slow_anchor_once = False
+        self.expire_genesis_once = False
+        self.genesis_response = None
+        self.genesis_requests = []
         self.grant = GRANT
         self.mapping = "ns-a"
         self.handshakes = 0
@@ -91,6 +94,18 @@ class ControlledMtlsTransport:
         assert namespace == NAMESPACE
         self.bootstrap_calls += 1
         return NamespaceBootstrapV2("authority-a", NAMESPACE, self.mapping, "holder-a",
+                                    1, "active", NamespaceRuntimeState.ACTIVE,
+                                    replace(ANCHOR, namespace=self.mapping), ())
+
+    async def v2_namespace_genesis(self, request, handshake, namespace, request_id):
+        self._on_owner_loop()
+        self.genesis_requests.append((namespace, request_id))
+        if self.expire_genesis_once:
+            self.expire_genesis_once = False
+            raise RuntimeError("authority service unavailable")
+        if self.genesis_response is not None:
+            return self.genesis_response
+        return NamespaceBootstrapV2("authority-a", namespace, self.mapping, "holder-a",
                                     1, "active", NamespaceRuntimeState.ACTIVE,
                                     replace(ANCHOR, namespace=self.mapping), ())
 
@@ -194,6 +209,39 @@ def test_content_fence_round_trip_and_mapping(port):
         adapter.begin_fence(namespace=NAMESPACE, authority_namespace="ns-a",
                             holder="holder-a", generation=1, operation="dispatch",
                             operation_id="dispatch-a", expected_anchor=ANCHOR)
+
+
+def test_namespace_genesis_retries_same_request_id_after_session_expiry(port):
+    adapter, transport = port
+    assert adapter.installation_grant == GRANT
+    transport.expire_genesis_once = True
+    observed = adapter.provision_namespace(namespace=NAMESPACE, request_id="genesis-stable")
+    assert observed.namespace == NAMESPACE
+    assert observed.authority_namespace == "ns-a"
+    assert observed.anchor == ANCHOR
+    assert transport.genesis_requests == [(NAMESPACE, "genesis-stable")] * 2
+    assert transport.handshakes == 2
+
+
+@pytest.mark.parametrize("invalid_response", [
+    NamespaceBootstrapV2("authority-a", NAMESPACE, "ns-a", "other-holder", 1,
+                         "active", NamespaceRuntimeState.ACTIVE, ANCHOR, ()),
+    NamespaceBootstrapV2("authority-a", NAMESPACE, "ns-a", "holder-a", 2,
+                         "active", NamespaceRuntimeState.ACTIVE,
+                         replace(ANCHOR, activation_generation=2), ()),
+    NamespaceBootstrapV2("authority-a", NAMESPACE, "ns-a", "holder-a", 1,
+                         "active", NamespaceRuntimeState.ACTIVE,
+                         replace(ANCHOR, deletion_seq=1,
+                                 deletion_digest="sha256:" + "d" * 64), ()),
+    NamespaceBootstrapV2("authority-a", NamespaceId("other", "persona-a"),
+                         "ns-a", "holder-a", 1, "active", NamespaceRuntimeState.ACTIVE,
+                         ANCHOR, ()),
+])
+def test_namespace_genesis_rejects_untrusted_activation_facts(port, invalid_response):
+    adapter, transport = port
+    transport.genesis_response = invalid_response
+    with pytest.raises(RuntimeError, match="genesis response"):
+        adapter.provision_namespace(namespace=NAMESPACE, request_id="genesis-check")
 
 
 def test_error_isolation_event_loop_rejection_and_close(port):

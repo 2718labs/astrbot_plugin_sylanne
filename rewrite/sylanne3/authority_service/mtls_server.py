@@ -406,6 +406,14 @@ class AuthorityRpcServer:
                     operation=operation, operation_id=command["operation_id"],
                     expected_anchor=anchor)
                 return {"permit": to_wire(permit)}
+            if method == "get_fence_operation" and set(command) == {
+                    "namespace", "operation_id"}:
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, command["namespace"])
+                permit, state = service.get_fence_operation(
+                    credential=credential, subject=subject,
+                    operation_id=command["operation_id"])
+                return {"permit": to_wire(permit), "state": state}
             if method == "validate_fence" and set(command) == {"permit"}:
                 permit = from_wire(command["permit"])
                 if (type(permit) is not FencePermitV2

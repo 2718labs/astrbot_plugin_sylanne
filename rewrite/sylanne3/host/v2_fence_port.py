@@ -13,7 +13,7 @@ from ..authority_service.contract import CONTENT_OPERATIONS, identifier
 from ..authority_service.v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import (
-    FenceScope, InstallationGrantV2, NamespaceId, NamespaceRuntimeState,
+    FenceScope, InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
     RecoveryConstraintFootprint,
 )
 from .authority_client import AuthorityHandshake, AuthorityProvisioningRequest
@@ -178,6 +178,58 @@ class V2FencePort:
             raise RuntimeError("v2 authority pairing is unavailable")
         return self._handshake, self._grant
 
+    @property
+    def installation_grant(self) -> InstallationGrantV2:
+        """The current paired grant, whose installation facts match the installed profile."""
+        self._reject_event_loop()
+        with self._lock:
+            _, grant = self._identity()
+            return grant
+
+    def provision_namespace(self, *, namespace: NamespaceId,
+                            request_id: str) -> NamespaceBootstrapV2:
+        """Ask the administrator's paired Authority to create one v2 namespace."""
+        with self._lock:
+            self.recover_pending_finish()
+            self.recover_pending_begin()
+            try:
+                return self._submit(self._with_session_repair(
+                    lambda: self._provision_namespace(namespace, request_id)))
+            except RuntimeError as exc:
+                if isinstance(exc, V2FenceOutcomeUnknown) or str(exc) in _REPAIRABLE_ERRORS:
+                    raise V2FenceOutcomeUnknown(
+                        "v2 namespace genesis outcome unknown for request_id=" + request_id
+                        + "; retry only with the original request_id"
+                    ) from exc
+                raise
+
+    async def _provision_namespace(self, namespace: NamespaceId,
+                                   request_id: str) -> NamespaceBootstrapV2:
+        if type(namespace) is not NamespaceId:
+            raise TypeError("namespace must be NamespaceId")
+        identifier(request_id, "request_id")
+        handshake, grant = self._identity()
+        observed = await self._transport.v2_namespace_genesis(
+            self._request, handshake, namespace, request_id)
+        anchor = observed.anchor if type(observed) is NamespaceBootstrapV2 else None
+        if (type(observed) is not NamespaceBootstrapV2
+                or observed.namespace != namespace
+                or observed.authority_id != grant.authority_id
+                or observed.holder != grant.administrator_holder
+                or observed.phase != "active"
+                or observed.state is not NamespaceRuntimeState.ACTIVE
+                or observed.generation != 1
+                or observed.blocking_reasons
+                or type(anchor) is not RestoreAnchor
+                or anchor.authority_id != grant.authority_id
+                or anchor.namespace != observed.authority_namespace
+                or anchor.activation_generation != 1
+                or anchor.deletion_seq != 0 or anchor.deletion_digest != "genesis"
+                or anchor.execution_seq != 0 or anchor.execution_digest != "genesis"
+                or anchor.revocation_epoch != 0):
+            raise RuntimeError("v2 namespace genesis response is invalid")
+        return observed
+
     async def _mapped(self, namespace: NamespaceId, authority_namespace: str):
         if type(namespace) is not NamespaceId or type(authority_namespace) is not str or not authority_namespace:
             raise ValueError("v2 namespace identity is invalid")
@@ -202,6 +254,32 @@ class V2FencePort:
         if anchor.authority_id != grant.authority_id or anchor.namespace != authority_namespace:
             raise RuntimeError("v2 anchor identity mismatch")
         return anchor
+
+    def get_fence_operation(self, *, namespace: NamespaceId,
+                            authority_namespace: str,
+                            operation_id: str) -> tuple[FencePermitV2, str]:
+        """Query a durable own-subject fence through the paired Authority channel."""
+        return self._submit(self._with_session_repair(lambda: self._get_fence_operation(
+            namespace, authority_namespace, operation_id)))
+
+    async def _get_fence_operation(self, namespace: NamespaceId,
+                                   authority_namespace: str,
+                                   operation_id: str) -> tuple[FencePermitV2, str]:
+        identifier(operation_id, "operation_id")
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        permit, state = await self._transport.v2_get_content_fence_operation(
+            self._request, handshake, namespace=authority_namespace,
+            operation_id=operation_id)
+        if (type(permit) is not FencePermitV2
+                or permit.operation not in _CONTENT_OPERATIONS
+                or permit.namespace != authority_namespace
+                or permit.operation_id != operation_id
+                or permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject
+                or state not in ("active", "finished")):
+            raise RuntimeError("v2 fence status identity mismatch")
+        return permit, state
 
     def begin_fence(
         self, *, namespace: NamespaceId, authority_namespace: str, holder: str,

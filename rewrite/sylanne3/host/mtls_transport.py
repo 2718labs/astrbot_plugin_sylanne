@@ -654,6 +654,31 @@ class MtlsAuthorityTransport:
             expected_anchor=expected_anchor,
         )
 
+    async def v2_get_content_fence_operation(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation_id: str,
+    ) -> tuple[FencePermitV2, str]:
+        response = await self._content_rpc(
+            request, handshake, "get_fence_operation",
+            {"namespace": namespace, "operation_id": operation_id},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"permit", "state", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256
+                or type(response["state"]) is not str
+                or response["state"] not in ("active", "finished")):
+            raise RuntimeError("authority v2 status response is invalid")
+        try:
+            permit = from_wire(response["permit"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority v2 status response is invalid") from exc
+        if (type(permit) is not FencePermitV2
+                or permit.operation not in _V2_CONTENT_OPERATIONS
+                or permit.authority_id != handshake.installation_authority_id
+                or permit.subject != handshake.installation_identity_ref
+                or permit.namespace != namespace or permit.operation_id != operation_id):
+            raise RuntimeError("authority v2 status response is invalid")
+        return permit, response["state"]
+
     async def v2_validate_fence(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         permit: FencePermitV2,
