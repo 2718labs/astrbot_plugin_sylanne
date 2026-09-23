@@ -14,6 +14,7 @@ import math
 from .affect import AppraisalBundle
 from ...native_runtime.d04_block_instances import D04BlockIdentity, D04DriveSegment
 from ...native_runtime.d04_engineering_scheme import DIMENSION, LAYERS, MECHANISMS
+from ...runtime_contracts import canonical_digest
 
 
 KNOWN_FIELDS = frozenset({
@@ -232,9 +233,21 @@ def allocate_semantic_drives(
         for (target_ref, meaning_ref), vector in sorted(vectors.items()):
             identity = D04BlockIdentity(role_condition.role_ref, target_ref, meaning_ref, source_ref)
             appraisals_for_block = metadata[source_ref][(target_ref, meaning_ref)]
+            drive = tuple(value * scale / duration for value in vector)
+            drive_ref = "d04:drive:" + canonical_digest({
+                "role": role_condition.role_ref,
+                "persona_version": role_condition.persona_version,
+                "condition_version": role_condition.condition_version,
+                "policy_version": policy.policy_version,
+                "mapping_version": policy.mapping_version,
+                "source": source_ref,
+                "object": target_ref,
+                "meaning": meaning_ref,
+                "interval": (role_start, role_end),
+                "drive": drive,
+            })
             segment = D04DriveSegment(
-                f"{policy.mapping_version}|{source_ref}|{target_ref}|{meaning_ref}|{role_start}:{role_end}",
-                role_start, role_end, tuple(value * scale / duration for value in vector),
+                drive_ref, role_start, role_end, drive,
             )
             drives.append(SourcedDrive(
                 identity, segment, family, reality,
