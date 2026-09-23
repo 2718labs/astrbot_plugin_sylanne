@@ -284,7 +284,7 @@ def test_dialogue_continuity_preserves_unanswered_slots_through_interruption() -
 def test_provider_supplies_real_d09_type_specs_without_dispatch_capability() -> None:
     provider = D09ExpressionProvider()
     specs = provider.register_types()
-    assert len(specs) == 6
+    assert len(specs) == 7
     assert all(isinstance(spec, TypeSpec) for spec in specs)
     assert all(spec.writer_domain == "d09" for spec in specs)
     assert all(spec.schema_hash and callable(spec.validator) for spec in specs)

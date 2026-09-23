@@ -15,10 +15,10 @@ import json
 import math
 
 from ...memory_types import (
-    SourceRecord, episode_key, register_memory_types, source_key,
+    SourceRecord, association_key, episode_key, register_memory_types, source_key,
     subjective_trace_key, validate_episode, validate_subjective_trace,
 )
-from ...memory_types import access_key, validate_access
+from ...memory_types import access_key, validate_access, validate_association
 from ...memory_retrieval import MemoryBatch
 from ...graph_types import AtomKey, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec
 from ...runtime_contracts import (
@@ -32,6 +32,7 @@ from ...runtime_contracts import (
     SourceQualification,
     schema_hash,
 )
+from .source_grant import SourceGrantRead, provide_source_grant_check
 
 
 _PURPOSES = frozenset({"context", "expression", "consolidation", "audit"})
@@ -482,6 +483,10 @@ class D06DomainProvider:
     remains on :class:`D06DomainAdapter`; neither object grants commit authority.
     """
 
+    @staticmethod
+    def provide_required_check(intent, read: SourceGrantRead, *, valid_until: float):
+        return provide_source_grant_check(intent, read, valid_until=valid_until)
+
     @property
     def descriptor(self) -> ProviderDescriptor:
         return ProviderDescriptor(
@@ -562,6 +567,31 @@ class D06DomainProvider:
                     or any(reads.get(write.key) != GraphVersion(write.key, 0)
                            or write.dependencies for write in (episode, trace))):
                 raise ValueError("C02 lacks complete committed provenance or absence proofs")
+        associations = tuple(write for write in proposal.typed_writes
+                             if write.key.type_name == "memory.association.v1")
+        if associations:
+            if len(proposal.typed_writes) != 1:
+                raise ValueError("association proposal must contain exactly one association")
+            write = associations[0]
+            source = AtomKey.from_token(write.value["source_ref"])
+            refs = (source, AtomKey.from_token(write.value["target_ref"]),
+                    *(AtomKey.from_token(ref) for ref in write.value["basis_source_refs"]))
+            if write.key != association_key(source.owner.bot, source.owner.persona,
+                                            source.owner.subject, write.value["association_id"]):
+                raise ValueError("association key does not match its directed source")
+            reads = {ref.key: ref for ref in proposal.envelope.version_guard.read_versions}
+            historical = set(proposal.dependencies.historical_provenance)
+            required = tuple(dict.fromkeys((key for ref in refs for key in (
+                ref, access_key(ref.owner.bot, ref.owner.persona, ref.owner.subject),
+            ))))
+            if (len(reads) != len(proposal.envelope.version_guard.read_versions)
+                    or reads.get(write.key) != GraphVersion(write.key, 0)
+                    or write.dependencies
+                    or any(reads.get(key) is None or reads[key].revision <= 0
+                           or reads[key] not in historical for key in required)
+                    or not set(ref.token for ref in refs).issubset(
+                        proposal.envelope.source_qualification.source_refs)):
+                raise ValueError("association lacks qualified source, access, or absence proofs")
         return proposal
 
 
@@ -572,6 +602,90 @@ class D06DomainAdapter:
         if not isinstance(namespace, NamespaceId):
             raise TypeError("namespace must be NamespaceId")
         self.namespace = namespace
+
+    def association_identity(
+        self,
+        source_id: str,
+        target_id: str,
+        basis_source_ids: tuple[str, ...],
+        *,
+        kind: str,
+        context_tags: tuple[str, ...] = (),
+        content_reality: str = "subjective",
+    ) -> AtomKey:
+        """Provide the stable key needed for a graph absence read before compile."""
+        source = source_key(*self.namespace.as_tuple, source_id)
+        target = source_key(*self.namespace.as_tuple, target_id)
+        basis = tuple(source_key(*self.namespace.as_tuple, item) for item in basis_source_ids)
+        association_id = _stable_id("association", {
+            "source": source.token, "target": target.token,
+            "basis": tuple(key.token for key in basis), "kind": kind,
+            "context_tags": context_tags, "content_reality": content_reality,
+        })
+        key = association_key(*self.namespace.as_tuple, source_id, association_id)
+        validate_association({
+            "association_id": association_id, "source_ref": source.token,
+            "target_ref": target.token, "kind": kind, "weight": 0.0,
+            "context_tags": list(context_tags),
+            "basis_source_refs": [item.token for item in basis],
+            "content_reality": content_reality,
+        })
+        return key
+
+    def compile_association(
+        self,
+        envelope: CommandEnvelope,
+        prepared: object,
+        *,
+        kind: str,
+        weight: float,
+        context_tags: tuple[str, ...] = (),
+        content_reality: str = "subjective",
+    ) -> DomainProposal:
+        """Build one source-traceable directed edge for the shared graph."""
+        from .pipeline import PreparedAssociation
+
+        if not isinstance(envelope, CommandEnvelope) or not isinstance(prepared, PreparedAssociation):
+            raise TypeError("association needs an envelope and prepared source reads")
+        if envelope.authority.namespace != self.namespace or envelope.authority.issuer_domain != "d06":
+            raise ValueError("association authority differs from D06 namespace")
+        if prepared.status != "candidate" or (prepared.epoch.bot, prepared.epoch.persona) != self.namespace.as_tuple:
+            raise ValueError("association preparation is invalid for this namespace")
+        guarded = {version.key: version for version in envelope.version_guard.read_versions}
+        if any(guarded.get(version.key) != version for version in prepared.proof_versions):
+            raise ValueError("association source reads differ from envelope guard")
+        source = source_key(*self.namespace.as_tuple, prepared.source_ref)
+        target = source_key(*self.namespace.as_tuple, prepared.target_ref)
+        basis = tuple(source_key(*self.namespace.as_tuple, source_id)
+                      for source_id in prepared.basis_source_refs)
+        source_refs = tuple(dict.fromkeys((source, target, *basis)))
+        if not set(key.token for key in source_refs).issubset(envelope.source_qualification.source_refs):
+            raise ValueError("association sources are absent from qualification")
+        key = self.association_identity(
+            prepared.source_ref, prepared.target_ref, prepared.basis_source_refs,
+            kind=kind, context_tags=context_tags, content_reality=content_reality,
+        )
+        association_id = key.name
+        if guarded.get(key) != GraphVersion(key, 0):
+            raise ValueError("association requires a revision-0 graph absence proof")
+        value = {
+            "association_id": association_id,
+            "source_ref": source.token,
+            "target_ref": target.token,
+            "kind": kind,
+            "weight": weight,
+            "context_tags": list(context_tags),
+            "basis_source_refs": [key.token for key in basis],
+            "content_reality": content_reality,
+        }
+        validate_association(value)
+        return self.wrap_runtime_proposal(
+            envelope,
+            typed_writes=(GraphWrite(key, value),),
+            dependencies=DependencySet(historical_provenance=prepared.proof_versions),
+            contribution_keys=(f"association:{key.token}",),
+            required_bundle_parts=(),
+        )
 
     def qualify_recall(self, intent: RecallIntent) -> RecallQualification:
         if not isinstance(intent, RecallIntent):
@@ -1385,7 +1499,9 @@ __all__ = [
     "SelectionTicket",
     "SourceAdmission",
     "SourceAdmissionProposal",
+    "SourceGrantRead",
     "SubjectiveTraceCandidate",
     "TransferRequest",
     "TriggerKind",
+    "provide_source_grant_check",
 ]

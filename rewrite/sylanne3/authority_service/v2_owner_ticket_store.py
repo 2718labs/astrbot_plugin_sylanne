@@ -52,6 +52,16 @@ _COMMITTED = """CREATE TABLE authority_owner_issue_committed_v1 (
     FOREIGN KEY(operation_id)
         REFERENCES authority_owner_issue_pending_v1(operation_id)
 ) STRICT"""
+_HEAD = """CREATE TABLE authority_owner_authorization_heads_v1 (
+    authority_namespace TEXT PRIMARY KEY,
+    issue_operation_id TEXT NOT NULL UNIQUE,
+    current_operation_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    state TEXT NOT NULL CHECK(state IN ('active','revoked')),
+    guard_bytes BLOB NOT NULL,
+    FOREIGN KEY(issue_operation_id)
+        REFERENCES authority_owner_issue_committed_v1(operation_id)
+) STRICT"""
 _COLUMNS = {
     "authority_owner_claim_tickets_v1": (
         "authority_namespace", "ticket_id", "ticket_bytes", "issue_operation_id"),
@@ -61,6 +71,9 @@ _COLUMNS = {
     "authority_owner_issue_committed_v1": (
         "authority_namespace", "operation_id", "proof_bytes", "receipt_bytes",
         "guard_bytes"),
+    "authority_owner_authorization_heads_v1": (
+        "authority_namespace", "issue_operation_id", "current_operation_id",
+        "revision", "state", "guard_bytes"),
 }
 
 
@@ -90,10 +103,32 @@ class AuthorityV2OwnerTicketStore:
                 db.execute(_TICKETS)
                 db.execute(_PENDING)
                 db.execute(_COMMITTED)
-            elif present == set(_COLUMNS) - {"authority_owner_issue_committed_v1"} and create:
+                db.execute(_HEAD)
+            elif present == set(_COLUMNS) - {
+                    "authority_owner_issue_committed_v1",
+                    "authority_owner_authorization_heads_v1"} and create:
                 # Explicit, additive upgrade preserves already consumed tickets.
-                self._check_schema(db, old=True)
+                self._check_schema(db, old={"authority_owner_issue_committed_v1",
+                                            "authority_owner_authorization_heads_v1"})
                 db.execute(_COMMITTED)
+                db.execute(_HEAD)
+            elif present == set(_COLUMNS) - {"authority_owner_authorization_heads_v1"} and create:
+                # An already committed first issue becomes the initial current
+                # head without changing its immutable historical receipt.
+                self._check_schema(db, old={"authority_owner_authorization_heads_v1"})
+                db.execute(_HEAD)
+                for namespace, operation_id in db.execute(
+                        "SELECT authority_namespace,operation_id "
+                        "FROM authority_owner_issue_committed_v1"):
+                    committed = self._checked_committed(db, namespace, operation_id)
+                    assert committed is not None
+                    db.execute(
+                        "INSERT INTO authority_owner_authorization_heads_v1"
+                        "(authority_namespace,issue_operation_id,current_operation_id,"
+                        "revision,state,guard_bytes) VALUES(?,?,?,?,?,?)",
+                        (namespace, operation_id, operation_id, 1, "active",
+                         canonical_bytes(committed[1].guard)),
+                    )
             elif present != set(_COLUMNS):
                 raise AuthorityUnavailable("partial owner ticket schema")
             self._check_schema(db)
@@ -102,7 +137,7 @@ class AuthorityV2OwnerTicketStore:
     def _present(db: sqlite3.Connection) -> set[str]:
         return {row[0] for row in db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN (?, ?, ?)", tuple(_COLUMNS))}
+            "AND name IN (?, ?, ?, ?)", tuple(_COLUMNS))}
 
     @staticmethod
     def _checked_committed(db: sqlite3.Connection, authority_namespace: str,
@@ -153,6 +188,40 @@ class AuthorityV2OwnerTicketStore:
         return proof, receipt
 
     @staticmethod
+    def _checked_current_head(db: sqlite3.Connection, authority_namespace: str
+                              ) -> OwnerAuthorizationGuardV1 | None:
+        row = db.execute(
+            "SELECT issue_operation_id,current_operation_id,revision,state,guard_bytes "
+            "FROM authority_owner_authorization_heads_v1 WHERE authority_namespace=?",
+            (authority_namespace,),
+        ).fetchone()
+        if row is None:
+            if db.execute(
+                "SELECT 1 FROM authority_owner_issue_committed_v1 "
+                "WHERE authority_namespace=?", (authority_namespace,),
+            ).fetchone():
+                raise AuthorityUnavailable("committed owner issue lacks current head")
+            return None
+        committed = AuthorityV2OwnerTicketStore._checked_committed(
+            db, authority_namespace, row[0])
+        if committed is None:
+            raise AuthorityUnavailable("owner current head lacks issue origin")
+        try:
+            guard = decode_bytes(row[4])
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise AuthorityUnavailable("owner current head differs") from exc
+        # Only the first issue transition exists so far. Future revoke/rotate
+        # transitions must add a verified ledger before revision > 1 is readable.
+        if (type(guard) is not OwnerAuthorizationGuardV1
+                or row[1:4] != (row[0], 1, "active")
+                or row[4] != canonical_bytes(guard)
+                or guard != committed[1].guard
+                or guard.authorization_revision != row[2]
+                or guard.pending_revoke_operation_id is not None):
+            raise AuthorityUnavailable("owner current head differs")
+        return guard
+
+    @staticmethod
     def _checked_pending(db: sqlite3.Connection, authority_namespace: str,
                          operation_id: str) -> tuple[OwnerAuthorizationOperationV1,
                                                      OwnerAuthorizationReceiptV1] | None:
@@ -195,9 +264,9 @@ class AuthorityV2OwnerTicketStore:
         return operation, receipt
 
     @staticmethod
-    def _check_schema(db: sqlite3.Connection, *, old: bool = False) -> None:
+    def _check_schema(db: sqlite3.Connection, *, old: set[str] | None = None) -> None:
         for name, columns in _COLUMNS.items():
-            if old and name == "authority_owner_issue_committed_v1":
+            if old and name in old:
                 continue
             actual = tuple(row[1] for row in db.execute(f"PRAGMA table_info({name})"))
             ddl = db.execute(
@@ -206,7 +275,8 @@ class AuthorityV2OwnerTicketStore:
             ).fetchone()
             expected = {"authority_owner_claim_tickets_v1": _TICKETS,
                         "authority_owner_issue_pending_v1": _PENDING,
-                        "authority_owner_issue_committed_v1": _COMMITTED}[name]
+                        "authority_owner_issue_committed_v1": _COMMITTED,
+                        "authority_owner_authorization_heads_v1": _HEAD}[name]
             if actual != columns or ddl != (expected,):
                 raise AuthorityUnavailable("owner ticket schema differs")
 
@@ -442,6 +512,27 @@ class AuthorityV2OwnerTicketStore:
                 raise AuthorityUnavailable("owner pending issue is not eligible for graph read")
             return receipt
 
+    def _owner_commit_snapshot(self, db: sqlite3.Connection,
+                               authority_namespace: str) -> tuple[int, tuple]:
+        """Capture the Authority barrier while no graph write can be in flight."""
+        AuthorityV2FenceStore._check_schema(db)
+        AuthorityV2FenceStore._require_no_migration(db)
+        if db.execute(
+            "SELECT 1 FROM authority_v2_fences WHERE namespace=? "
+            "AND (state='active' OR pending IS NOT NULL) LIMIT 1",
+            (authority_namespace,),
+        ).fetchone() or db.execute(
+            "SELECT 1 FROM authority_v2_mutations WHERE namespace=? "
+            "AND state='pending' LIMIT 1", (authority_namespace,),
+        ).fetchone():
+            raise AuthorityUnavailable("live v2 fence blocks owner commit")
+        epoch = db.execute(
+            "SELECT last_epoch FROM authority_v2_epochs WHERE namespace=?",
+            (authority_namespace,),
+        ).fetchone()
+        return (epoch[0] if epoch is not None else 0,
+                self._core._row(db, authority_namespace))
+
     def finalize_issue(self, *, credential: object, authority_namespace: str,
                        operation: OwnerAuthorizationOperationV1,
                        proof: OwnerGraphCommitProofV1) -> OwnerAuthorizationReceiptV1:
@@ -475,8 +566,13 @@ class AuthorityV2OwnerTicketStore:
                 if committed[0] != proof:
                     raise AuthorityUnavailable("owner issue commit replay differs")
                 return committed[1]
+            ticket = operation.ticket
+            assert ticket is not None
+            self._bound_namespace(db, ticket, authority_namespace)
+            before = self._owner_commit_snapshot(db, authority_namespace)
         # A trusted service-side verifier must check the CURRENT graph stamp and
-        # independently durable graph receipt. Never call graph under Core lock.
+        # independently durable graph receipt. A new graph write requires a new
+        # Authority fence epoch; never call graph under Core lock.
         self._verified(self._graph_commit_verifier, operation, proof)
         guard = OwnerAuthorizationGuardV1(
             operation.authority_id, operation.installation_id,
@@ -500,17 +596,8 @@ class AuthorityV2OwnerTicketStore:
                 if committed[0] != proof:
                     raise AuthorityUnavailable("owner issue commit replay differs")
                 return committed[1]
-            # A content mutation may not cross this authorization transition.
-            AuthorityV2FenceStore._check_schema(db)
-            if db.execute(
-                "SELECT 1 FROM authority_v2_fences WHERE namespace=? "
-                "AND (state='active' OR pending IS NOT NULL) LIMIT 1",
-                (authority_namespace,),
-            ).fetchone() or db.execute(
-                "SELECT 1 FROM authority_v2_mutations WHERE namespace=? "
-                "AND state='pending' LIMIT 1", (authority_namespace,),
-            ).fetchone():
-                raise AuthorityUnavailable("live v2 fence blocks owner commit")
+            if self._owner_commit_snapshot(db, authority_namespace) != before:
+                raise AuthorityUnavailable("owner graph proof crossed Authority state change")
             # Absence of a row is genesis. UNIQUE namespace and operation keys
             # make this an atomic genesis -> revision 1 compare-and-set.
             inserted = db.execute(
@@ -526,22 +613,73 @@ class AuthorityV2OwnerTicketStore:
             ).rowcount
             if inserted != 1:
                 raise AuthorityUnavailable("owner authorization genesis CAS failed")
+            head_inserted = db.execute(
+                "INSERT INTO authority_owner_authorization_heads_v1"
+                "(authority_namespace,issue_operation_id,current_operation_id,"
+                "revision,state,guard_bytes) SELECT ?,?,?,1,'active',? WHERE NOT EXISTS "
+                "(SELECT 1 FROM authority_owner_authorization_heads_v1 "
+                "WHERE authority_namespace=?)",
+                (authority_namespace, operation.operation_id, operation.operation_id,
+                 canonical_bytes(guard), authority_namespace),
+            ).rowcount
+            if head_inserted != 1:
+                raise AuthorityUnavailable("owner current head genesis CAS failed")
             return receipt
 
     def get_current_guard(self, *, credential: object,
-                          authority_namespace: str) -> OwnerAuthorizationGuardV1 | None:
-        """Read the durable first-issue guard; no graph permission is inferred."""
+                          authority_namespace: str, installation_id: str,
+                          subject: str, permit: FencePermitV2
+                          ) -> OwnerAuthorizationGuardV1 | None:
+        """Read only the current control head under a live read/write fence.
+
+        The service validates the journal-current permit before this call.
+        This transaction rechecks the durable permit and Authority anchor so a
+        finish or head change between those steps cannot yield a stale guard.
+        A graph consumer still revalidates both control and graph at use time.
+        """
         identifier(authority_namespace, "authority_namespace")
-        self._core._require(credential, "owner_claim", authority_namespace)
+        identifier(installation_id, "installation_id")
+        identifier(subject, "subject")
+        if (type(permit) is not FencePermitV2
+                or permit.operation not in {"read", "write"}
+                or permit.namespace != authority_namespace
+                or permit.subject != subject):
+            raise AuthorityUnavailable("owner guard read requires exact read/write fence")
+        self._core._require(credential, "owner_guard_read", authority_namespace,
+                            permit.holder)
         with self._core._tx() as db:
             self._require_mode(db)
-            row = db.execute(
-                "SELECT operation_id FROM authority_owner_issue_committed_v1 "
-                "WHERE authority_namespace=?", (authority_namespace,),
-            ).fetchone()
-            committed = (self._checked_committed(db, authority_namespace, row[0])
-                         if row is not None else None)
-        return committed[1].guard if committed is not None else None
+            AuthorityV2FenceStore._check_schema(db)
+            AuthorityV2FenceStore._require_no_migration(db)
+            namespace_row = self._core._row(db, authority_namespace)
+            if (namespace_row[0] != permit.holder
+                    or namespace_row[1] != permit.generation
+                    or namespace_row[2] != "active"
+                    or namespace_row[3] is not None
+                    or namespace_row[9] != "clear"
+                    or self._core._anchor(db, authority_namespace, namespace_row)
+                    != permit.pinned_anchor):
+                raise AuthorityUnavailable("owner guard Authority anchor is no longer current")
+            row = AuthorityV2FenceStore._row(db, permit.operation_id)
+            if (row is None or row[1] != authority_namespace
+                    or row[2] != subject or row[3] != permit.token
+                    or row[6] != "active" or row[7] != fence_canonical_bytes(permit)
+                    or row[10] is not None
+                    or AuthorityV2FenceStore._permit(row) != permit
+                    or permit.authority_id != self._core._id(db)
+                    or db.execute(
+                        "SELECT 1 FROM authority_v2_mutations "
+                        "WHERE namespace=? AND state='pending' LIMIT 1",
+                        (authority_namespace,),
+                    ).fetchone() is not None):
+                raise AuthorityUnavailable("owner guard fence is no longer current")
+            guard = self._checked_current_head(db, authority_namespace)
+            if guard is not None and (
+                    guard.authority_id != permit.authority_id
+                    or guard.installation_id != installation_id
+                    or namespace_ref(guard.namespace) != authority_namespace):
+                raise AuthorityUnavailable("owner guard installation identity differs")
+            return guard
 
 
 __all__ = ("AuthorityV2OwnerTicketStore",)

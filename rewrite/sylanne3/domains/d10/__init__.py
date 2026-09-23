@@ -18,6 +18,8 @@ from ...runtime_contracts import (
     schema_hash,
 )
 from ...graph_types import TypeSpec
+from ...runtime_contracts import CheckReceipt, VersionedRef
+from ..d08.execution import ActionIntent
 
 
 def _id(value: object, name: str) -> None:
@@ -363,6 +365,55 @@ class LifeDomain:
         return ContactPolicyCheck(policy.policy_id, policy.subject_ref, opportunity.opportunity_id,
                                   "pass" if not reasons else "fail", tuple(reasons), policy.version,
                                   min(policy.window_end, opportunity.expires_at))
+
+    def contact_policy_required_check(
+        self,
+        intent: ActionIntent,
+        policy: ContactPolicy,
+        opportunity: ProactiveOpportunity,
+        claims: tuple[ContactClaim, ...],
+        *,
+        coverage: str,
+        input_versions: tuple[VersionedRef, ...],
+        now: float,
+    ) -> CheckReceipt:
+        """Adapt a complete, current graph read into D08's proactive check.
+
+        ``coverage`` and ``input_versions`` must come from the same trusted
+        graph read as policy, opportunity, and claims. D10 cannot establish
+        graph currency itself; a partial read or version mismatch therefore
+        produces an unknown receipt and can never qualify the action.
+        """
+        if not isinstance(intent, ActionIntent):
+            raise TypeError("intent must be ActionIntent")
+        if not isinstance(policy, ContactPolicy) or not isinstance(opportunity, ProactiveOpportunity):
+            raise TypeError("policy and opportunity must be D10 values")
+        if not isinstance(claims, tuple) or any(not isinstance(item, ContactClaim) for item in claims):
+            raise TypeError("claims must be a complete tuple of ContactClaim values")
+        if coverage not in {"full", "partial", "none"}:
+            raise ValueError("coverage must be full, partial, or none")
+        if not isinstance(input_versions, tuple) or any(not isinstance(item, VersionedRef) for item in input_versions):
+            raise TypeError("input_versions must be a tuple of VersionedRef values")
+
+        matches = tuple(spec for spec in intent.required_checks
+                        if spec.check_kind == "contact_policy" and spec.provider_id == "d10.contact_policy")
+        if len(matches) != 1:
+            raise ValueError("intent must contain exactly one D10 contact_policy check")
+        spec = matches[0]
+        if spec.action_ref != intent.action_id:
+            raise ValueError("contact_policy check must bind to this ActionIntent")
+
+        complete_current_read = coverage == "full" and input_versions == spec.required_input_versions
+        if not complete_current_read:
+            return CheckReceipt(spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
+                                input_versions, coverage, "unknown", _finite(now, "now"), spec.provider_id)
+
+        check = self.contact_policy_check(policy, opportunity, claims, now=now)
+        if policy.namespace != opportunity.namespace:
+            raise ValueError("policy and opportunity namespace differ")
+        result = "pass" if check.result == "pass" else "fail"
+        return CheckReceipt(spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
+                            input_versions, "full", result, check.valid_until, spec.provider_id)
 
     def claim_contact_window(self, policy: ContactPolicy, opportunity: ProactiveOpportunity, contact_id: str,
                              communication_action_id: str, segment_effects: tuple[str, ...], claims: tuple[ContactClaim, ...], *, now: float) -> ContactClaim:

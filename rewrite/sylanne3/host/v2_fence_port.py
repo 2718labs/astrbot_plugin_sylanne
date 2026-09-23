@@ -14,9 +14,15 @@ from typing import Awaitable, Callable, Coroutine, Mapping, TypeVar
 from ..authority_service.contract import CONTENT_OPERATIONS, identifier
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
-    FencePermitV2, MutationReceiptV2, SCHEMA as AUTHORITY_V2_PROTOCOL,
+    ExecutionBindingV1, FencePermitV2, MutationReceiptV2,
+    SCHEMA as AUTHORITY_V2_PROTOCOL,
 )
-from ..authority_service.v2_owner_contract import OwnerAuthorizationReceiptV1
+from ..authority_service.v2_owner_contract import (
+    OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
+    OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
+)
+from ..authority_service.v2_execution_bridge import HandoffStartV2
+from ..graph_coordinator import namespace_ref
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import (
     FenceScope, InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
@@ -325,6 +331,122 @@ class V2FencePort:
             raise RuntimeError("v2 fence status identity mismatch")
         return permit, state
 
+    def _owner_identity(self, namespace: NamespaceId, authority_namespace: str,
+                        value: OwnerClaimTicketV1 | OwnerAuthorizationOperationV1,
+                        *, pairing: bool = False) -> None:
+        _, grant = self._identity()
+        if (value.namespace != namespace
+                or namespace_ref(namespace) != authority_namespace
+                or value.authority_id != grant.authority_id
+                or (not pairing and value.installation_id != grant.installation_id)):
+            raise RuntimeError("v2 owner identity mismatch")
+
+    def register_owner_ticket(self, *, namespace: NamespaceId,
+                              authority_namespace: str,
+                              ticket: OwnerClaimTicketV1) -> OwnerClaimTicketV1:
+        """Register a separately verified first-creation pairing as this mTLS peer."""
+        return self._submit(self._with_session_repair(
+            lambda: self._register_owner_ticket(namespace, authority_namespace, ticket)))
+
+    async def _register_owner_ticket(self, namespace: NamespaceId,
+                                     authority_namespace: str,
+                                     ticket: OwnerClaimTicketV1) -> OwnerClaimTicketV1:
+        if type(ticket) is not OwnerClaimTicketV1:
+            raise TypeError("owner claim ticket is required")
+        await self._mapped(namespace, authority_namespace)
+        self._owner_identity(namespace, authority_namespace, ticket, pairing=True)
+        handshake, _ = self._identity()
+        result = await self._transport.v2_register_owner_ticket(
+            self._request, handshake, namespace=authority_namespace, ticket=ticket)
+        if result != ticket:
+            raise RuntimeError("v2 owner ticket response differs")
+        return result
+
+    def reserve_owner_issue(self, *, namespace: NamespaceId,
+                            authority_namespace: str,
+                            operation: OwnerAuthorizationOperationV1,
+    ) -> OwnerAuthorizationReceiptV1:
+        return self._submit(self._with_session_repair(
+            lambda: self._reserve_owner_issue(namespace, authority_namespace, operation)))
+
+    async def _reserve_owner_issue(self, namespace: NamespaceId,
+                                   authority_namespace: str,
+                                   operation: OwnerAuthorizationOperationV1,
+    ) -> OwnerAuthorizationReceiptV1:
+        if type(operation) is not OwnerAuthorizationOperationV1:
+            raise TypeError("owner issue operation is required")
+        await self._mapped(namespace, authority_namespace)
+        self._owner_identity(namespace, authority_namespace, operation)
+        handshake, _ = self._identity()
+        result = await self._transport.v2_reserve_owner_issue(
+            self._request, handshake, namespace=authority_namespace,
+            operation=operation)
+        if result.operation != operation or result.phase != "pending":
+            raise RuntimeError("v2 owner pending response differs")
+        return result
+
+    def finalize_owner_issue(self, *, namespace: NamespaceId,
+                             authority_namespace: str,
+                             operation: OwnerAuthorizationOperationV1,
+                             proof: OwnerGraphCommitProofV1,
+    ) -> OwnerAuthorizationReceiptV1:
+        return self._submit(self._with_session_repair(
+            lambda: self._finalize_owner_issue(
+                namespace, authority_namespace, operation, proof)))
+
+    async def _finalize_owner_issue(self, namespace: NamespaceId,
+                                    authority_namespace: str,
+                                    operation: OwnerAuthorizationOperationV1,
+                                    proof: OwnerGraphCommitProofV1,
+    ) -> OwnerAuthorizationReceiptV1:
+        if (type(operation) is not OwnerAuthorizationOperationV1
+                or type(proof) is not OwnerGraphCommitProofV1):
+            raise TypeError("owner issue operation and graph proof are required")
+        await self._mapped(namespace, authority_namespace)
+        self._owner_identity(namespace, authority_namespace, operation)
+        if (proof.namespace != namespace
+                or proof.operation_id != operation.operation_id
+                or proof.request_digest != operation.request_digest):
+            raise RuntimeError("v2 owner graph proof identity mismatch")
+        handshake, _ = self._identity()
+        result = await self._transport.v2_finalize_owner_issue(
+            self._request, handshake, namespace=authority_namespace,
+            operation=operation, proof=proof)
+        if result.operation != operation or result.phase != "committed":
+            raise RuntimeError("v2 owner commit response differs")
+        return result
+
+    def get_current_owner_guard_for_fence(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        permit: FencePermitV2,
+    ) -> tuple[OwnerAuthorizationGuardV1 | None, FencePermitV2]:
+        return self._submit(self._with_session_repair(
+            lambda: self._get_current_owner_guard_for_fence(
+                namespace, authority_namespace, permit)))
+
+    async def _get_current_owner_guard_for_fence(
+        self, namespace: NamespaceId, authority_namespace: str,
+        permit: FencePermitV2,
+    ) -> tuple[OwnerAuthorizationGuardV1 | None, FencePermitV2]:
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        if (type(permit) is not FencePermitV2
+                or permit.operation not in {"read", "write"}
+                or permit.namespace != authority_namespace
+                or permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject):
+            raise RuntimeError("v2 owner guard read permit identity mismatch")
+        guard, current = await self._transport.v2_get_current_owner_guard_for_fence(
+            self._request, handshake, namespace=authority_namespace,
+            permit=permit)
+        if current != permit:
+            raise RuntimeError("v2 owner guard read permit changed")
+        if guard is not None and (
+            guard.namespace != namespace or guard.authority_id != grant.authority_id
+            or guard.installation_id != grant.installation_id):
+            raise RuntimeError("v2 owner guard identity mismatch")
+        return guard, current
+
     def get_pending_owner_issue(self, *, namespace: NamespaceId,
                                 authority_namespace: str,
                                 operation_id: str) -> OwnerAuthorizationReceiptV1 | None:
@@ -578,6 +700,83 @@ class V2FencePort:
         return await self._transport.v2_execution_prepare(
             self._request, handshake, permit=permit,
             mutation_id=mutation_id, footprint=footprint)
+
+    def execution_claim(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        prepared_receipt: MutationReceiptV2, binding: ExecutionBindingV1,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        """Persist a claimed operation; a separate current start is still required."""
+        try:
+            return self._submit(self._with_session_repair(lambda: self._execution_claim(
+                namespace, authority_namespace, prepared_receipt, binding)))
+        except RuntimeError as exc:
+            if isinstance(exc, V2FenceOutcomeUnknown) or str(exc) in _REPAIRABLE_ERRORS:
+                raise V2FenceOutcomeUnknown(
+                    "v2 claim outcome unknown for operation_id=" + binding.operation_id
+                    + "; replay only the exact prepared receipt and binding") from exc
+            raise
+
+    async def _execution_claim(
+        self, namespace: NamespaceId, authority_namespace: str,
+        prepared_receipt: MutationReceiptV2, binding: ExecutionBindingV1,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        if (type(namespace) is not NamespaceId
+                or type(prepared_receipt) is not MutationReceiptV2
+                or type(binding) is not ExecutionBindingV1
+                or binding.namespace != authority_namespace
+                or binding.permit != prepared_receipt.pending.permit):
+            raise ValueError("v2 execution claim identity is invalid")
+        handshake, grant = self._identity()
+        observed = await self._transport.v2_namespace_bootstrap(
+            self._request, handshake, namespace)
+        if (observed.authority_namespace != authority_namespace
+                or observed.authority_id != grant.authority_id
+                or binding.permit.authority_id != grant.authority_id
+                or binding.permit.subject != grant.subject):
+            raise RuntimeError("v2 execution claim mapping changed")
+        return await self._transport.v2_execution_claim(
+            self._request, handshake,
+            prepared_receipt=prepared_receipt, binding=binding)
+
+    def execution_begin_handoff(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        claimed_receipt: MutationReceiptV2, handoff_id: str,
+    ) -> HandoffStartV2:
+        """Record one final handoff start; never a platform send operation."""
+        try:
+            return self._submit(self._with_session_repair(
+                lambda: self._execution_begin_handoff(
+                    namespace, authority_namespace, claimed_receipt, handoff_id)))
+        except RuntimeError as exc:
+            if isinstance(exc, V2FenceOutcomeUnknown) or str(exc) in _REPAIRABLE_ERRORS:
+                raise V2FenceOutcomeUnknown(
+                    "v2 handoff start outcome unknown for handoff_id=" + handoff_id
+                    + "; replay only the exact committed claim and handoff ID") from exc
+            raise
+
+    async def _execution_begin_handoff(
+        self, namespace: NamespaceId, authority_namespace: str,
+        claimed_receipt: MutationReceiptV2, handoff_id: str,
+    ) -> HandoffStartV2:
+        identifier(handoff_id, "handoff_id")
+        if (type(namespace) is not NamespaceId
+                or type(claimed_receipt) is not MutationReceiptV2
+                or claimed_receipt.durable_state != "committed"
+                or claimed_receipt.pending.phase != "claimed"
+                or claimed_receipt.pending.permit.namespace != authority_namespace):
+            raise ValueError("v2 handoff start identity is invalid")
+        handshake, grant = self._identity()
+        observed = await self._transport.v2_namespace_bootstrap(
+            self._request, handshake, namespace)
+        permit = claimed_receipt.pending.permit
+        if (observed.authority_namespace != authority_namespace
+                or observed.authority_id != grant.authority_id
+                or permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject):
+            raise RuntimeError("v2 handoff start mapping changed")
+        return await self._transport.v2_execution_begin_handoff(
+            self._request, handshake,
+            claimed_receipt=claimed_receipt, handoff_id=handoff_id)
 
     def validate_fence(self, scope: FenceScope) -> FencePermitV2:
         return self._submit(self._with_session_repair(lambda: self._validate_fence(scope)))

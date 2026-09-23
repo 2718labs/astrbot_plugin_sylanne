@@ -17,6 +17,9 @@ if installed_stub:
     sys.modules["sylanne3.host"] = host_package
 
 from sylanne3 import runtime_context
+from sylanne3.graph_coordinator import UnavailableGuard
+from sylanne3.domains.d01 import ActiveRoleQualification, PersonaBlock, PersonaPlan
+from sylanne3.domains.d03.context import RoleBinding
 from sylanne3.graph_coordinator import (
     FirstIngressOutcomeUnknown, IngressHostFacts, ingress_host_fingerprint,
 )
@@ -63,7 +66,7 @@ def envelope(namespace, learned_at=11.0):
 
 
 @pytest.mark.asyncio
-async def test_v2_ingress_requires_provision_and_policies_then_uses_one_worker_call(
+async def test_v2_ingress_provisioning_does_not_admit_dialogue_without_role_and_scene(
     tmp_path, monkeypatch,
 ):
     grant = InstallationGrantV2(
@@ -110,6 +113,26 @@ async def test_v2_ingress_requires_provision_and_policies_then_uses_one_worker_c
             status = "committed" if len(trace) == 2 else "duplicate"
             return SimpleNamespace(status=status, operation_id="ingress-op")
 
+        def read_active_role_v2(self, *, namespace):
+            assert namespace == installed.installation_policy.namespace
+            assert get_ident() == self.worker_thread
+            trace.append("trusted-role-read")
+            plan = PersonaPlan(
+                "plan", namespace, 1,
+                (PersonaBlock("identity", "semantic_identity", "controlled", "read_only"),),
+                (), True,
+            )
+            return ActiveRoleQualification(namespace, plan.head_id, plan, (), 1, 1)
+
+        def read_active_scene_v2(self, *, namespace, scene_ref):
+            assert scene_ref == "scene:conversation"
+            trace.append("trusted-scene-read")
+            return self.read_active_role_v2(namespace=namespace), RoleBinding(
+                "binding:scene", "persona:persona", "companion", None, None,
+                scene_ref, "scene", "private", ("norm:default",),
+                1.0, None, 1, ("source:trusted",), 1, "active",
+            )
+
     monkeypatch.setattr(runtime_context, "ProductionGraphStore", Store)
     monkeypatch.setattr(runtime_context, "GraphCoordinator", Coordinator)
     monkeypatch.setattr(
@@ -127,14 +150,23 @@ async def test_v2_ingress_requires_provision_and_policies_then_uses_one_worker_c
     assert await context.handle_ingress(envelope(installed.installation_policy.namespace)) == IngressReceipt("unavailable")
     await context.provision_installed_namespace("provision-op")
     assert context.health.status == "limited"
-    assert context.health.missing_capabilities == ("dispatch",)
+    assert context.health.missing_capabilities == (
+        "owner_guard", "active_role", "scene_binding", "dispatch",
+    )
+    assert (await context.refresh_capabilities()).missing_capabilities == (
+        "scene_binding", "dispatch",
+    )
+    assert (await context.refresh_capabilities(
+        scene_ref="scene:conversation",
+    )).missing_capabilities == ("scene_binding", "dispatch")
+    assert "record exists" in context.health.detail
     first = await context.handle_ingress(envelope(installed.installation_policy.namespace))
     second = await context.handle_ingress(envelope(installed.installation_policy.namespace, 12.0))
-    assert first == IngressReceipt("accepted", "ingress-op")
-    assert second == IngressReceipt("duplicate", "ingress-op")
-    assert trace[1][1] == trace[2][1]
-    assert trace[1][0].learned_at == 11.0
-    assert trace[2][0].learned_at == 12.0
+    assert first == IngressReceipt("unavailable")
+    assert second == IngressReceipt("unavailable")
+    assert trace == [
+        "provision", "trusted-role-read", "trusted-scene-read", "trusted-role-read",
+    ]
     assert context.health.status == "limited"
     await context.stop()
 
@@ -170,6 +202,9 @@ async def test_v2_ingress_missing_policy_stays_limited_and_unavailable(tmp_path,
         def commit_first_ingress_v2(self, *_):
             pytest.fail("ingress called without administrator policies")
 
+        def read_active_role_v2(self, *, namespace):
+            raise UnavailableGuard("no Owner or active role")
+
     monkeypatch.setattr(runtime_context, "ProductionGraphStore", Store)
     monkeypatch.setattr(runtime_context, "GraphCoordinator", Coordinator)
     monkeypatch.setattr(
@@ -186,8 +221,13 @@ async def test_v2_ingress_missing_policy_stays_limited_and_unavailable(tmp_path,
     await context.start_v2(installed)
     await context.provision_installed_namespace("provision-op")
     assert context.health.status == "limited"
-    assert context.health.missing_capabilities == ("product_ingress", "dispatch")
+    assert context.health.missing_capabilities == (
+        "product_ingress", "owner_guard", "active_role", "scene_binding", "dispatch",
+    )
     assert "ingress_clock, ingress_encoding" in context.health.detail
+    assert (await context.refresh_capabilities()).missing_capabilities == (
+        "product_ingress", "owner_guard", "active_role", "scene_binding", "dispatch",
+    )
     assert await context.handle_ingress(envelope(installed.installation_policy.namespace)) == IngressReceipt("unavailable")
     await context.stop()
 
@@ -215,6 +255,7 @@ async def test_v2_receipt_mapping_preserves_uncertainty(tmp_path, status, expect
     context._worker = Worker()
     context._v2_ingress = lambda *_: None
     context._v2_namespace_provisioned = True
+    context.health = runtime_context.RuntimeHealth("ready")
     assert await context.handle_ingress(envelope(NamespaceId("bot", "persona"))) == expected
     assert len(calls) == 1
     assert type(calls[0][1]) is IngressHostFacts
@@ -233,6 +274,7 @@ async def test_v2_worker_error_is_not_reported_as_rejection(tmp_path):
     context._worker = Worker()
     context._v2_ingress = lambda *_: None
     context._v2_namespace_provisioned = True
+    context.health = runtime_context.RuntimeHealth("ready")
     with pytest.raises(RuntimeError, match="worker outcome unknown"):
         await context.handle_ingress(envelope(NamespaceId("bot", "persona")))
 
@@ -250,6 +292,7 @@ async def test_v2_unknown_fence_outcome_is_deferred_with_original_operation_id(t
     context._worker = Worker()
     context._v2_ingress = lambda *_: None
     context._v2_namespace_provisioned = True
+    context.health = runtime_context.RuntimeHealth("ready")
     assert await context.handle_ingress(envelope(NamespaceId("bot", "persona"))) == IngressReceipt(
         "deferred", "ingress-op",
     )

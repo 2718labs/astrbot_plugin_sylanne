@@ -15,11 +15,16 @@ import unittest
 from sylanne3.native_runtime import (
     ABI2NativeLibrary,
     ABI2ResultError,
+    D04CandidateError,
+    D04ProductionReadoutUnavailable,
     FixedBlockCSR,
     FixedBlockStep,
     load_production_native,
+    require_d04_production_readout,
+    run_d04_fixed_block_candidate,
     run_fixed_block_math,
 )
+from sylanne3.domains.d04 import AffectAxis, AffectScheme
 from sylanne3.native_runtime.loader import _runtime_target
 
 
@@ -36,6 +41,45 @@ def _block() -> FixedBlockStep:
     offsets[1] = 0
     previous[0] = 100.0
     return block
+
+
+def _scheme() -> AffectScheme:
+    return AffectScheme(
+        "d04.affect.scheme.v1", "scheme:test:1", "operator:test:1",
+        "parameters:test:1", "coupling:test:1",
+        (AffectAxis("care", "normalized", "care"), AffectAxis("guard", "normalized", "guard")),
+        (),
+    )
+
+
+def _affect_asset() -> dict[str, object]:
+    scheme = _scheme()
+    return {
+        "schema": scheme.schema,
+        "scheme_version": scheme.scheme_version, "operator_version": scheme.operator_version,
+        "parameter_version": scheme.parameter_version, "coupling_version": scheme.coupling_version,
+        "axes": [{"axis_id": axis.axis_id, "unit": axis.unit, "meaning": axis.meaning}
+                 for axis in scheme.axes],
+        "parameter_bounds": [list(bounds) for bounds in scheme.parameter_bounds],
+    }
+
+
+def _operator_asset(block: FixedBlockStep) -> dict[str, object]:
+    scheme = _scheme()
+
+    def matrix(value: FixedBlockCSR) -> dict[str, object]:
+        return dict(rows=value.rows, cols=value.cols, offsets=value.offsets,
+                    indices=value.indices, values=value.values)
+
+    return {
+        "schema": "d04.fixed-block-operator.v1", "affect_schema": scheme.schema,
+        "scheme_version": scheme.scheme_version, "operator_version": scheme.operator_version,
+        "parameter_version": scheme.parameter_version, "coupling_version": scheme.coupling_version,
+        "axis_ids": [axis.axis_id for axis in scheme.axes],
+        "parameter_bounds": [list(bounds) for bounds in scheme.parameter_bounds],
+        "operator": {"k": matrix(block.k), "r": matrix(block.r), "j": matrix(block.j),
+                     "a": matrix(block.a), "alpha": block.alpha},
+    }
 
 
 class FixedBlockTranscriptTests(unittest.TestCase):
@@ -61,17 +105,46 @@ class FixedBlockTranscriptTests(unittest.TestCase):
         shutil.copyfile(self.native_asset, asset)
         native_entry = {"path": relative, "bytes": asset.stat().st_size,
                         "sha256": hashlib.sha256(asset.read_bytes()).hexdigest()}
+        catalogue = root / "resources" / "catalogue"
+        catalogue.mkdir(parents=True)
+        catalogue_path = catalogue / "current.json"
+        catalogue_path.write_text(json.dumps({
+            "activation_status": "candidate_only",
+            "domain_capabilities": {"d04": ["d04.affect.scheme.v1"]},
+        }), encoding="utf-8")
+        catalogue_entry = {"path": "resources/catalogue/current.json",
+                           "bytes": catalogue_path.stat().st_size,
+                           "sha256": hashlib.sha256(catalogue_path.read_bytes()).hexdigest()}
+        affect_path = catalogue / "d04-affect-scheme.json"
+        affect_path.write_text(json.dumps(_affect_asset()), encoding="utf-8")
+        affect_entry = {"path": "resources/catalogue/d04-affect-scheme.json",
+                        "bytes": affect_path.stat().st_size,
+                        "sha256": hashlib.sha256(affect_path.read_bytes()).hexdigest()}
+        operator_path = catalogue / "d04-fixed-block-operator.json"
+        operator_path.write_text(json.dumps(_operator_asset(_block())), encoding="utf-8")
+        operator_entry = {"path": "resources/catalogue/d04-fixed-block-operator.json",
+                          "bytes": operator_path.stat().st_size,
+                          "sha256": hashlib.sha256(operator_path.read_bytes()).hexdigest()}
         manifest = {
             "schema_version": 1,
             "native_math": {"contract": "abi2.fixed-block-interval.v1", "capability_flags": 1},
             "platform": {"os": os_name, "arch": arch, "abi_version": 2,
                          "native_filename": asset.name, "libc": libc, "cpu_features": []},
             "native": native_entry,
-            "files": [native_entry],
+            "affect_scheme": {**affect_entry, "catalogue_capability": "d04.affect.scheme.v1",
+                              "scheme_version": _scheme().scheme_version,
+                              "operator_version": _scheme().operator_version,
+                              "parameter_version": _scheme().parameter_version,
+                              "coupling_version": _scheme().coupling_version},
+            "files": [native_entry, catalogue_entry, affect_entry, operator_entry],
         }
         raw = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
         (root / "release-manifest.json").write_bytes(raw)
         self.handle = load_production_native(root, trusted_manifest_sha256=hashlib.sha256(raw).hexdigest())
+        self.package_root = root
+        self.scheme_path = affect_path
+        self.operator_path = operator_path
+        self.catalogue_path = catalogue_path
         self.addCleanup(self._unload_package_library)
 
     def _unload_package_library(self) -> None:
@@ -107,6 +180,48 @@ class FixedBlockTranscriptTests(unittest.TestCase):
             run_fixed_block_math(direct, _block())
         with self.assertRaisesRegex(ValueError, "zero boundary eta"):
             replace(_block(), boundary_eta=0.01)
+
+    def test_package_scheme_binds_candidate_but_does_not_unlock_production_readout(self) -> None:
+        candidate = run_d04_fixed_block_candidate(
+            self.handle, self.package_root, _scheme(), _block(),
+        )
+        self.assertEqual(candidate.affect_scheme_sha256, hashlib.sha256(self.scheme_path.read_bytes()).hexdigest())
+        self.assertEqual(candidate.operator_sha256, hashlib.sha256(self.operator_path.read_bytes()).hexdigest())
+        self.assertEqual(candidate.math.bounds.certificate_flags, 1)
+        self.assertFalse(self.handle.capabilities.numerically_certified)
+        self.assertTrue(self.handle.capabilities.diagnostic_only)
+        with self.assertRaisesRegex(D04ProductionReadoutUnavailable, "conditional"):
+            require_d04_production_readout(candidate)
+
+    def test_missing_or_changed_scheme_and_operator_are_rejected(self) -> None:
+        with self.assertRaisesRegex(D04CandidateError, "version does not match"):
+            run_d04_fixed_block_candidate(
+                self.handle, self.package_root,
+                replace(_scheme(), operator_version="operator:changed"), _block(),
+            )
+        different = replace(_block(), j=FixedBlockCSR(2, 2, [0, 0, 0], [], []))
+        with self.assertRaisesRegex(D04CandidateError, "differs from trusted complete operator"):
+            run_d04_fixed_block_candidate(self.handle, self.package_root, _scheme(), different)
+        self.operator_path.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(Exception, "does not match trusted release manifest"):
+            run_d04_fixed_block_candidate(self.handle, self.package_root, _scheme(), _block())
+        self.operator_path.unlink()
+        with self.assertRaisesRegex(D04CandidateError, "asset is absent"):
+            run_d04_fixed_block_candidate(self.handle, self.package_root, _scheme(), _block())
+
+    def test_missing_affect_scheme_rejects_candidate(self) -> None:
+        self.scheme_path.unlink()
+        with self.assertRaisesRegex(D04CandidateError, "asset is absent"):
+            run_d04_fixed_block_candidate(self.handle, self.package_root, _scheme(), _block())
+
+    def test_omitted_coupling_has_zero_local_residual_but_large_full_residual(self) -> None:
+        # Midpoint step for x=(1,0), K=R=I, J_10=-1, h=0.1.
+        # Solving only coordinate 0 suppresses the equation that moves coordinate 1.
+        y0 = (1.0 - 0.05) / (1.0 + 0.05)
+        local_residual = y0 - 1.0 + 0.1 * (1.0 + y0) / 2.0
+        omitted_residual = 0.1 * (1.0 + y0) / 2.0
+        self.assertAlmostEqual(local_residual, 0.0)
+        self.assertGreater(omitted_residual, 0.09)
 
 
 if __name__ == "__main__":

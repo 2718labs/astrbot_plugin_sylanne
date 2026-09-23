@@ -7,6 +7,7 @@ or a real AstrBot installation.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -25,6 +26,12 @@ from rewrite.tools.build_plugin_package import build_package, verify_package  # 
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Cold-load a current-platform non-release ZIP")
+    parser.add_argument(
+        "--output-dir", type=Path,
+        help="retain the dev-probe ZIP here; extraction remains temporary",
+    )
+    args = parser.parse_args()
     target_os, target_arch, libc = _runtime_target()
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "rewrite" / "native" / "target"))
     native = target_dir / "release" / CANONICAL_LIBRARIES[target_os]
@@ -38,7 +45,7 @@ def main() -> None:
             target_arch=target_arch,
             target_libc=libc,
             native_library=native,
-            output_dir=temporary / "package",
+            output_dir=args.output_dir if args.output_dir is not None else temporary / "package",
             allow_dirty_dev_probe=True,
         )
         verify_package(package)
@@ -75,6 +82,9 @@ def main() -> None:
                 "import rewrite.sylanne3.native_runtime.loader as loader",
                 "assert Path(rewrite.__file__).resolve().is_relative_to(package_root)",
                 "assert Path(loader.__file__).resolve().is_relative_to(package_root)",
+                "from rewrite.sylanne3.host.installed_package import verify_installed_package",
+                "installed = verify_installed_package(package_root, sys.argv[3])",
+                "assert installed.verified and installed.build_mode == 'dev-probe', installed",
                 "from rewrite.sylanne3.native_runtime import load_production_native",
                 "library = load_production_native(package_root, trusted_manifest_sha256=sys.argv[3])",
                 "assert Path(library.path).resolve() == (package_root / sys.argv[8]).resolve()",
@@ -111,10 +121,12 @@ def main() -> None:
         )
         result = {
             "status": "dev_probe_only",
+            "package": str(package) if args.output_dir is not None else None,
+            "package_bytes": package.stat().st_size,
             "platform": f"{target_os}-{target_arch}",
             "libc": libc,
             "package_sha256": hashlib.sha256(package.read_bytes()).hexdigest(),
-            "cold_load": "isolated_python_without_source_path_or_rust",
+            "cold_load": "isolated_python_verified_install_and_native_without_source_path_or_rust",
             "native": json.loads(loaded.stdout),
         }
         print(json.dumps(result, sort_keys=True))

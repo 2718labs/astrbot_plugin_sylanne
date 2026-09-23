@@ -1,15 +1,50 @@
-"""Mount the D12 command boundary on AstrBot's authenticated plugin API.
-
-An installation grant is not a browser user's graph grant.  The route stays
-unavailable until a separately authenticated W09 session and W01 grant bridge
-can supply a WorkbenchHttpTransport.  No static asset is served here.
-"""
+"""Mount packaged W11 assets and D12 commands on AstrBot's authenticated API."""
 
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
-from ..workbench_api.http_transport import COMMAND_ROUTE, WorkbenchHttpTransport
+from ..workbench_api.http_transport import ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, WorkbenchHttpTransport
+
+
+_WORKBENCH_ROOT = Path(__file__).resolve().parents[3] / "resources" / "workbench"
+_CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                  ".css": "text/css; charset=utf-8"}
+_STATIC_HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+
+
+def _packaged_assets() -> dict[str, str]:
+    manifest = json.loads((_WORKBENCH_ROOT / "workbench-manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != "sylanne.workbench-assets.v1":
+        raise ValueError("packaged workbench manifest is invalid")
+    result = {}
+    for entry in manifest["files"]:
+        path = entry["path"]
+        if path in result or Path(path).suffix not in _CONTENT_TYPES:
+            raise ValueError("packaged workbench asset is invalid")
+        result[path] = entry["sha256"]
+    if "index.html" not in result:
+        raise ValueError("packaged workbench has no index")
+    return result
+
+
+def _asset_file(relative: str, assets: dict[str, str]) -> Path | None:
+    if relative not in assets or "\\" in relative or relative.startswith("/"):
+        return None
+    parts = relative.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        return None
+    path = _WORKBENCH_ROOT
+    for part in parts:
+        path = path / part
+        if path.is_symlink():
+            return None
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != assets[relative]:
+        return None
+    return path
 
 
 class WorkbenchHostMount:
@@ -20,8 +55,29 @@ class WorkbenchHostMount:
         self._closed = False
 
     def register(self, context: Any) -> None:
-        """Register only the AstrBot-authenticated POST extension route."""
-        from astrbot.api.web import json_response, request
+        """Register authenticated, read-only assets and the POST command seam."""
+        from astrbot.api.web import file_response, json_response, request
+
+        async def static(asset: str = ""):
+            if self._closed:
+                return json_response(_unavailable("host_stopped"), status_code=503, headers=_STATIC_HEADERS)
+            if not isinstance(request.username, str) or not request.username:
+                return json_response(
+                    {"status": "unauthorized", "problem": {"code": "host_session_missing",
+                     "retryable": False}}, status_code=401, headers=_STATIC_HEADERS,
+                )
+            try:
+                assets = _packaged_assets()
+                relative = asset or "index.html"
+                path = _asset_file(relative, assets)
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                path = None
+            if path is None:
+                return json_response(
+                    {"status": "unavailable", "problem": {"code": "asset_unavailable",
+                     "retryable": False}}, status_code=404, headers=_STATIC_HEADERS,
+                )
+            return file_response(path, content_type=_CONTENT_TYPES[path.suffix], headers=_STATIC_HEADERS)
 
         async def command():
             headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
@@ -58,6 +114,12 @@ class WorkbenchHostMount:
 
         context.register_web_api(
             COMMAND_ROUTE, command, ["POST"], "Sylanne D12 authenticated command",
+        )
+        context.register_web_api(
+            PLUGIN_ROUTE_PREFIX, static, ["GET"], "Sylanne W11 authenticated workbench",
+        )
+        context.register_web_api(
+            ASSET_ROUTE, static, ["GET"], "Sylanne W11 authenticated static assets",
         )
 
     def close(self) -> None:

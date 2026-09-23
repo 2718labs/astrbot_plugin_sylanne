@@ -339,6 +339,62 @@ class ExecutionBindingV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionBindingV2:
+    """Explicit admission evidence identity, never proof or a send permit.
+
+    The origin is the unchanged P0/V1 dispatch identity. Added digests and the
+    graph stamp must be checked against the real business graph at final
+    admission; parsing this DTO cannot establish that any check passed.
+    """
+
+    origin: ExecutionBindingV1
+    graph_namespace: str
+    graph_incarnation: str
+    admission_receipt_digest: str
+    admission_graph_version: str
+    admission_graph_epoch: int
+    admission_access_epoch: int
+    admission_deletion_epoch: int
+    action_intent_digest: str
+    action_intent_schema_version: str
+    action_schema_digest: str
+    action_schema_version: str
+    required_checks_digest: str
+    required_checks_schema_version: str
+    initial_check_evidence_digest: str
+    utc_deadline: str
+    clock_policy_ref: str
+    clock_policy_digest: str
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        if type(self.origin) is not ExecutionBindingV1:
+            raise ValueError("V2 binding requires the original V1/P0 identity")
+        for name in ("graph_namespace", "graph_incarnation",
+                     "admission_graph_version", "action_intent_schema_version",
+                     "action_schema_version", "required_checks_schema_version",
+                     "clock_policy_ref"):
+            identifier(getattr(self, name), name)
+        if self.graph_namespace != self.origin.namespace:
+            raise ValueError("admission graph namespace differs from dispatch fence")
+        for name in ("admission_graph_epoch", "admission_access_epoch",
+                     "admission_deletion_epoch"):
+            _exact_int(getattr(self, name), name)
+        for name in ("admission_receipt_digest", "action_intent_digest",
+                     "action_schema_digest", "required_checks_digest",
+                     "initial_check_evidence_digest", "clock_policy_digest"):
+            _digest(getattr(self, name), name)
+        if type(self.utc_deadline) is not str or not _UTC_TIMESTAMP.fullmatch(
+                self.utc_deadline):
+            raise ValueError("handoff deadline must be canonical UTC seconds")
+        try:
+            datetime.fromisoformat(self.utc_deadline.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("invalid handoff UTC deadline") from exc
+
+
+@dataclass(frozen=True, slots=True)
 class PlatformObservationV1:
     """Reported platform evidence; only an installed verifier may trust its source."""
 
@@ -600,7 +656,7 @@ def _footprint_from_wire(value: object) -> RecoveryConstraintFootprint:
 
 def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1 |
-            ExecutionBindingV1 | PlatformObservationV1) -> dict[str, Any]:
+            ExecutionBindingV1 | ExecutionBindingV2 | PlatformObservationV1) -> dict[str, Any]:
     """Produce a fresh, JSON-shaped dict with an explicit object kind."""
     if type(value) is FencePermitV2:
         return {
@@ -651,6 +707,28 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             "segment_manifest_digest": value.segment_manifest_digest,
             "segment_index": value.segment_index, "segment_count": value.segment_count,
             "contact_policy_check_ref": value.contact_policy_check_ref,
+        }
+    if type(value) is ExecutionBindingV2:
+        return {
+            "schema": value.schema, "kind": "execution_binding_v2",
+            "origin": to_wire(value.origin),
+            "graph_namespace": value.graph_namespace,
+            "graph_incarnation": value.graph_incarnation,
+            "admission_receipt_digest": value.admission_receipt_digest,
+            "admission_graph_version": value.admission_graph_version,
+            "admission_graph_epoch": value.admission_graph_epoch,
+            "admission_access_epoch": value.admission_access_epoch,
+            "admission_deletion_epoch": value.admission_deletion_epoch,
+            "action_intent_digest": value.action_intent_digest,
+            "action_intent_schema_version": value.action_intent_schema_version,
+            "action_schema_digest": value.action_schema_digest,
+            "action_schema_version": value.action_schema_version,
+            "required_checks_digest": value.required_checks_digest,
+            "required_checks_schema_version": value.required_checks_schema_version,
+            "initial_check_evidence_digest": value.initial_check_evidence_digest,
+            "utc_deadline": value.utc_deadline,
+            "clock_policy_ref": value.clock_policy_ref,
+            "clock_policy_digest": value.clock_policy_digest,
         }
     if type(value) is PlatformObservationV1:
         return {
@@ -717,7 +795,7 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
 
 def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                                  DeletionEvidenceV1 | DeletionPendingV1 |
-                                 DeletionMutationReceiptV1 | ExecutionBindingV1 |
+                                 DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                                  PlatformObservationV1):
     """Reject unknown schemas, fields, kinds and nested shapes before use."""
     if type(value) is not dict or value.get("schema") != SCHEMA:
@@ -780,6 +858,23 @@ def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationRec
             **{key: (permit if key == "permit" else
                      _footprint_from_wire(item) if key == "footprint" else
                      tuple(item) if key == "verified_check_refs" else item)
+               for key, item in value.items() if key != "kind"})
+    if kind == "execution_binding_v2":
+        _fields(value, frozenset({
+            "schema", "kind", "origin", "graph_namespace", "graph_incarnation",
+            "admission_receipt_digest", "admission_graph_version",
+            "admission_graph_epoch", "admission_access_epoch",
+            "admission_deletion_epoch", "action_intent_digest",
+            "action_intent_schema_version", "action_schema_digest",
+            "action_schema_version", "required_checks_digest",
+            "required_checks_schema_version", "initial_check_evidence_digest",
+            "utc_deadline", "clock_policy_ref", "clock_policy_digest",
+        }), "execution binding v2")
+        origin = from_wire(value["origin"])
+        if type(origin) is not ExecutionBindingV1:
+            raise ValueError("V2 origin must be an explicit V1 binding")
+        return ExecutionBindingV2(
+            **{key: (origin if key == "origin" else item)
                for key, item in value.items() if key != "kind"})
     if kind == "platform_observation_v1":
         _fields(value, frozenset({
@@ -868,7 +963,7 @@ def _reject_constant(value: str) -> None:
 
 def canonical_bytes(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                     DeletionEvidenceV1 | DeletionPendingV1 |
-                    DeletionMutationReceiptV1 | ExecutionBindingV1 |
+                    DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                     PlatformObservationV1) -> bytes:
     return json.dumps(to_wire(value), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -876,14 +971,14 @@ def canonical_bytes(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2
 
 def canonical_digest(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                      DeletionEvidenceV1 | DeletionPendingV1 |
-                     DeletionMutationReceiptV1 | ExecutionBindingV1 |
+                     DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                      PlatformObservationV1) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
 def decode_bytes(data: bytes) -> (FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                                   DeletionEvidenceV1 | DeletionPendingV1 |
-                                  DeletionMutationReceiptV1 | ExecutionBindingV1 |
+                                  DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                                   PlatformObservationV1):
     if type(data) is not bytes:
         raise TypeError("authority wire data must be bytes")
@@ -893,7 +988,7 @@ def decode_bytes(data: bytes) -> (FencePermitV2 | PendingMutationV2 | MutationRe
 
 
 __all__ = ["SCHEMA", "FencePermitV2", "PendingMutationV2", "MutationReceiptV2",
-           "ExecutionBindingV1", "PlatformObservationV1",
+           "ExecutionBindingV1", "ExecutionBindingV2", "PlatformObservationV1",
            "DeletionEvidenceV1", "DeletionPendingV1", "DeletionMutationReceiptV1",
            "deletion_scope_digest", "to_wire", "from_wire", "canonical_bytes",
            "canonical_digest", "decode_bytes"]

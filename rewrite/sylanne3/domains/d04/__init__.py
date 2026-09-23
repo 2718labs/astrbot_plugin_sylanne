@@ -13,6 +13,9 @@ from .affect import (
     FeelingState,
     InterpretationInfluence,
     MeaningFacet,
+    MechanismDriveCandidate,
+    MechanismDriveContribution,
+    MechanismSignal,
     MoodField,
     NumericCertificate,
     RecollectionInfluence,
@@ -20,6 +23,7 @@ from .affect import (
     RegulationObservation,
     SemanticDriveRule,
     SelfUnderstanding,
+    UnresolvedMechanism,
 )
 
 __all__ = (
@@ -35,6 +39,9 @@ __all__ = (
     "FeelingState",
     "InterpretationInfluence",
     "MeaningFacet",
+    "MechanismDriveCandidate",
+    "MechanismDriveContribution",
+    "MechanismSignal",
     "MoodField",
     "NumericCertificate",
     "RecollectionInfluence",
@@ -42,4 +49,5 @@ __all__ = (
     "RegulationObservation",
     "SemanticDriveRule",
     "SelfUnderstanding",
+    "UnresolvedMechanism",
 )

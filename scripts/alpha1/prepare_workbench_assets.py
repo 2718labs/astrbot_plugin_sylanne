@@ -3,12 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 
 
-FIXED_TIME = 315532800  # 1980-01-01 UTC, also used by the ZIP builder.
 FORBIDDEN = {".env", "credentials.json", "secrets.json"}
 
 
@@ -34,12 +32,11 @@ def prepare(source: Path, destination: Path) -> None:
         if item.name.casefold() in FORBIDDEN or item.suffix.casefold() in {".log", ".pyc", ".pem", ".key"}:
             raise ValueError(f"forbidden workbench asset: {relative}")
         target = destination / relative
-        data = item.read_bytes(); target.write_bytes(data); os.utime(target, (FIXED_TIME, FIXED_TIME))
+        data = item.read_bytes(); target.write_bytes(data)
         files.append({"path": relative.as_posix(), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)})
     manifest = {"schema_version": "sylanne.workbench-assets.v1", "source": "webui-src", "files": files,
                 "release_eligibility": "HOLD: static asset only; live W09/W10 integration is unverified"}
     (destination / "workbench-manifest.json").write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-    os.utime(destination / "workbench-manifest.json", (FIXED_TIME, FIXED_TIME))
 
 
 if __name__ == "__main__":

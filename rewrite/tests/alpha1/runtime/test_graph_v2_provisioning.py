@@ -62,6 +62,7 @@ class AuthorityPort:
         self.lose_finish_after_durable = False
         self.lose_begin_after_durable = False
         self.lose_genesis_after_durable = False
+        self.pending_owner = None
 
     def outside_graph_lock(self):
         assert not self.store._lock._is_owned()
@@ -116,6 +117,19 @@ class AuthorityPort:
         return self.fences.validate_fence(
             scope.permit, subject="subject",
             current_anchor=self.anchors[scope.namespace])
+
+    def get_pending_owner_issue_for_graph_write(
+            self, *, namespace, authority_namespace, operation_id, permit):
+        self.outside_graph_lock()
+        assert permit.operation == "write"
+        assert permit.namespace == authority_namespace
+        assert self.fences.validate_fence(
+            permit, subject="subject", current_anchor=self.anchors[namespace]) == permit
+        receipt = self.pending_owner
+        if receipt is None or receipt.operation.operation_id != operation_id:
+            return None
+        assert receipt.operation.namespace == namespace
+        return receipt
 
     def finish_fence(self, scope, *, request_id, request_digest):
         self.outside_graph_lock()
@@ -322,10 +336,20 @@ def test_v2_bundle_cold_restart_finishes_only_after_durable_business_receipt(
         authority_db.close()
 
 
-def _owner_issue_case(tmp_path, *, first_ingress=False):
+def _owner_issue_case(tmp_path, *, first_ingress=False, return_bootstrap=False,
+                      role_types=False, scene_types=False,
+                      owner_capabilities=None):
     """Exercise the private graph transaction; this is not Authority admission."""
     registry = TypeRegistry()
     registry.register(owner_grant_spec())
+    if role_types:
+        from sylanne3.domains.d01 import PersonaDomain
+        for spec in PersonaDomain().type_specs():
+            registry.register(spec)
+    if scene_types:
+        from sylanne3.domains.d03 import ContextProvider
+        for spec in ContextProvider().type_specs():
+            registry.register(spec)
     if first_ingress:
         for spec in D06DomainProvider.type_specs() + graph_type_specs():
             registry.register(spec)
@@ -385,8 +409,12 @@ def _owner_issue_case(tmp_path, *, first_ingress=False):
         "issue_operation_id": "owner-issue-1",
         "grant_revision": 1, "state": "pending_authority",
         "scope": "bot/persona", "issuer_ref": "authority:paired-installation",
-        "capabilities": ["workbench.read"],
-        "purposes": ["workbench_view"], "audiences": ["owner"],
+        "capabilities": sorted(owner_capabilities or (
+            ("workbench.create", "workbench.read", "workbench.bind_scene")
+            if role_types else ("workbench.read",))),
+        "purposes": (["workbench_user_action", "workbench_view"]
+                     if role_types else ["workbench_view"]),
+        "audiences": ["owner"],
         "activation_generation": 1,
         "graph_incarnation": creation.graph_incarnation,
     }
@@ -400,7 +428,8 @@ def _owner_issue_case(tmp_path, *, first_ingress=False):
         "sha256:" + canonical_digest(value), 0, guard, ticket)
     pending = OwnerAuthorizationReceiptV1(
         operation, "pending", "owner-issue-pending", guard)
-    return store, authority_db, port, coordinator, policy, operation, pending, value
+    result = (store, authority_db, port, coordinator, policy, operation, pending, value)
+    return result + (bootstrap,) if return_bootstrap else result
 
 
 def _owner_write_scope(store, port, coordinator, namespace, attempt_id):
@@ -463,6 +492,144 @@ def test_first_owner_graph_commit_is_atomic_and_idempotent(tmp_path):
                 "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (1,)
         port.finish_fence(retry_scope, request_id="finish:owner-write-2",
                           request_digest="sha256:" + "b" * 64)
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_first_owner_public_graph_path_fetches_pending_and_recovers_lost_finish(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     pending, value, bootstrap) = _owner_issue_case(tmp_path, return_bootstrap=True)
+    port.pending_owner = pending
+    try:
+        port.lose_finish_after_durable = True
+        with pytest.raises(RuntimeError, match="finish response lost"):
+            coordinator.commit_first_owner_grant_v2(
+                bootstrap, namespace=policy.namespace,
+                operation_id=operation.operation_id, grant_value=value)
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (1,)
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_owner_issue_fences_v1").fetchone() == (1,)
+        assert len(port.finishes) == 2
+        anchors = dict(port.anchors)
+        store.close()
+        registry = TypeRegistry()
+        registry.register(owner_grant_spec())
+        store = ProductionGraphStore(tmp_path / "owner-business.db", registry)
+        port = AuthorityPort(store, authority_db)
+        port.anchors = anchors
+        bootstrap = object()
+        coordinator = GraphCoordinator(
+            store, bootstrap, holder="administrator", content_fence_v2=port)
+        proof = coordinator.commit_first_owner_grant_v2(
+            bootstrap, namespace=policy.namespace,
+            operation_id=operation.operation_id, grant_value=value)
+        assert proof.operation_id == operation.operation_id
+        assert proof.graph_access_epoch == 1
+        assert store._db.execute(
+            "SELECT access_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?",
+            policy.namespace.as_tuple).fetchone() == (1,)
+        assert port.get_fence_operation(
+            namespace=policy.namespace,
+            authority_namespace="opaque:" + policy.namespace.persona_id,
+            operation_id=store._db.execute(
+                "SELECT fence_attempt_id FROM graph_owner_issue_intents_v1"
+            ).fetchone()[0])[1] == "finished"
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_first_owner_public_graph_path_requires_paired_pending(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     _pending, value, bootstrap) = _owner_issue_case(tmp_path, return_bootstrap=True)
+    try:
+        port.lose_finish_after_durable = True
+        with pytest.raises(RuntimeError, match="finish response lost"):
+            coordinator.commit_first_owner_grant_v2(
+                bootstrap, namespace=policy.namespace,
+                operation_id=operation.operation_id, grant_value=value)
+        with pytest.raises(AuthorityDenied, match="terminal rejected_no_commit"):
+            coordinator.commit_first_owner_grant_v2(
+                bootstrap, namespace=policy.namespace,
+                operation_id=operation.operation_id, grant_value=value)
+        assert port.fences.get_operation(
+            "owner-write-" + canonical_digest({
+                "namespace": list(policy.namespace.as_tuple),
+                "operation_id": operation.operation_id,
+                "grant_digest": "sha256:" + canonical_digest(value),
+            })[:48], subject="subject",
+            namespace="opaque:" + policy.namespace.persona_id)[1] == "finished"
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (0,)
+        assert store._db.execute(
+            "SELECT status FROM graph_owner_issue_rejections_v1").fetchone() == (
+                "rejected_no_commit",)
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_first_owner_public_graph_path_replays_unknown_begin_from_saved_intent(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     pending, value, bootstrap) = _owner_issue_case(tmp_path, return_bootstrap=True)
+    port.pending_owner = pending
+    try:
+        port.lose_begin_after_durable = True
+        with pytest.raises(RuntimeError, match="begin response lost"):
+            coordinator.commit_first_owner_grant_v2(
+                bootstrap, namespace=policy.namespace,
+                operation_id=operation.operation_id, grant_value=value)
+        saved = store._db.execute(
+            "SELECT fence_attempt_id,anchor_json,graph_revision,graph_epoch "
+            "FROM graph_owner_issue_intents_v1").fetchone()
+        assert saved is not None and saved[2:] == (0, 0)
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (0,)
+        anchors = dict(port.anchors)
+        store.close()
+        registry = TypeRegistry()
+        registry.register(owner_grant_spec())
+        store = ProductionGraphStore(tmp_path / "owner-business.db", registry)
+        port = AuthorityPort(store, authority_db)
+        port.anchors = anchors
+        port.pending_owner = pending
+        bootstrap = object()
+        coordinator = GraphCoordinator(
+            store, bootstrap, holder="administrator", content_fence_v2=port)
+        proof = coordinator.commit_first_owner_grant_v2(
+            bootstrap, namespace=policy.namespace,
+            operation_id=operation.operation_id, grant_value=value)
+        assert proof.operation_id == operation.operation_id
+        assert store._db.execute(
+            "SELECT fence_attempt_id,anchor_json,graph_revision,graph_epoch "
+            "FROM graph_owner_issue_intents_v1").fetchone() == saved
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_rejected_wrong_grant_digest_does_not_consume_correct_pending_issue(tmp_path):
+    (store, authority_db, port, coordinator, policy, operation,
+     pending, value, bootstrap) = _owner_issue_case(tmp_path, return_bootstrap=True)
+    port.pending_owner = pending
+    try:
+        wrong = dict(value, capabilities=["workbench.write"])
+        with pytest.raises(AuthorityDenied, match="paired pending"):
+            coordinator.commit_first_owner_grant_v2(
+                bootstrap, namespace=policy.namespace,
+                operation_id=operation.operation_id, grant_value=wrong)
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_owner_issue_operations_v1").fetchone() == (0,)
+        proof = coordinator.commit_first_owner_grant_v2(
+            bootstrap, namespace=policy.namespace,
+            operation_id=operation.operation_id, grant_value=value)
+        assert proof.grant_digest == operation.grant_digest
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_owner_issue_rejections_v1").fetchone() == (1,)
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_owner_issue_intents_v1").fetchone() == (2,)
     finally:
         store.close()
         authority_db.close()

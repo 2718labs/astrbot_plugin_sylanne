@@ -4,9 +4,19 @@ from dataclasses import dataclass, fields, replace
 import hashlib
 import json
 import math
+from collections.abc import Callable
 
 from ...graph_types import TypeSpec
-from ...runtime_contracts import DomainProposal, ProviderDescriptor, schema_hash
+from ...runtime_contracts import (
+    CheckReceipt,
+    DomainProposal,
+    NamespaceId,
+    ProviderDescriptor,
+    QueryEpoch,
+    VersionedRef,
+    schema_hash,
+)
+from ..d08.execution import ActionIntent, ActionSchema
 
 
 def _id(value: str, label: str, prefix: str | None = None) -> None:
@@ -165,6 +175,46 @@ class BoundaryCheck:
 
 
 @dataclass(frozen=True)
+class BoundaryRuleReadSet:
+    """One D05 boundary query result, tied to a complete graph read.
+
+    The read verifier is supplied by the trusted graph integration. A caller
+    assertion such as ``coverage_complete=True`` is not sufficient evidence.
+    ``input_versions`` includes the query-scope epoch and every current rule
+    revision returned by that query.
+    """
+
+    namespace: NamespaceId
+    query_epoch: QueryEpoch | None
+    rules: tuple[BoundaryRule, ...]
+    input_versions: tuple[VersionedRef, ...]
+    coverage: str
+    missing_items: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.namespace, NamespaceId):
+            raise TypeError("namespace must be NamespaceId")
+        if self.query_epoch is not None and not isinstance(self.query_epoch, QueryEpoch):
+            raise TypeError("query_epoch must be QueryEpoch or None")
+        if not isinstance(self.rules, tuple) or any(type(item) is not BoundaryRule for item in self.rules):
+            raise TypeError("rules must be a tuple of BoundaryRule values")
+        if not isinstance(self.input_versions, tuple) or any(
+            type(item) is not VersionedRef for item in self.input_versions
+        ):
+            raise TypeError("input_versions must be a tuple of VersionedRef values")
+        if len({item.ref for item in self.input_versions}) != len(self.input_versions):
+            raise ValueError("input_versions cannot repeat a ref")
+        if self.coverage not in {"full", "partial", "none"}:
+            raise ValueError("coverage must be full, partial, or none")
+        if not isinstance(self.missing_items, tuple):
+            raise TypeError("missing_items must be a tuple")
+        if any(not isinstance(item, str) or not item for item in self.missing_items):
+            raise ValueError("missing_items must contain nonempty strings")
+        if self.query_epoch is not None and self.query_epoch.namespace != self.namespace:
+            raise ValueError("query epoch namespace differs from read namespace")
+
+
+@dataclass(frozen=True)
 class InvalidationResult:
     current_status: str
     historical_refs: tuple[str, ...]
@@ -173,9 +223,10 @@ class InvalidationResult:
 class RelationshipProvider:
     """D05 projection and validation only; W01 owns adoption and epochs."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, boundary_read_verifier: Callable[[BoundaryRuleReadSet], bool] | None = None) -> None:
         self._dimensions: frozenset[str] = frozenset()
         self._semantics: frozenset[str] = frozenset()
+        self._boundary_read_verifier = boundary_read_verifier
 
     @property
     def descriptor(self) -> ProviderDescriptor:
@@ -304,6 +355,127 @@ class RelationshipProvider:
         if len(allowed) > 1:
             return BoundaryCheck("conflict", allowed, ("multiple_allow_rules",))
         return BoundaryCheck("pass" if allowed else "pass", allowed, ())
+
+    def boundary_required_check(
+        self,
+        intent: ActionIntent,
+        schema: ActionSchema,
+        read_set: BoundaryRuleReadSet,
+        *,
+        audience_scope: str,
+        scene_ref: str | None,
+        at_time: float,
+        valid_until: float,
+    ) -> CheckReceipt:
+        """Return D05's candidate boundary check for D08.
+
+        Passing only means the boundary query is complete/current and no
+        applicable D05 rule denies this action. D11 must still revalidate the
+        graph and all action qualifications before any real dispatch.
+        """
+        if type(intent) is not ActionIntent or type(schema) is not ActionSchema:
+            raise TypeError("intent and action schema must be D08 values")
+        if type(read_set) is not BoundaryRuleReadSet:
+            raise TypeError("read_set must be BoundaryRuleReadSet")
+        _id(audience_scope, "audience_scope")
+        if scene_ref is not None:
+            _id(scene_ref, "scene_ref", "scene:")
+        timestamp = _time(at_time, "at_time")
+        expiry = _time(valid_until, "valid_until")
+
+        check_kind = "boundary"
+        provider_id = "d05.boundary"
+        schema_specs = tuple(item for item in schema.required_checks
+                             if item.check_kind == check_kind and item.provider_id == provider_id)
+        intent_specs = tuple(item for item in intent.required_checks
+                             if item.check_kind == check_kind and item.provider_id == provider_id)
+        if len(schema_specs) != 1 or len(intent_specs) != 1:
+            raise ValueError("schema and intent must contain exactly one D05 boundary check")
+        spec = schema_specs[0]
+        if (schema.schema_id != intent.schema_id or schema.action_kind != intent.action_kind
+                or spec != intent_specs[0] or spec.action_ref != intent.action_id
+                or spec.purpose != intent.purpose or intent.action_kind != schema.action_kind):
+            raise ValueError("D05 boundary check does not match the frozen D08 action")
+        _id(spec.subject_ref, "subject_ref", "persona:")
+        _id(intent.target_ref, "target_ref", "entity:")
+
+        epoch = read_set.query_epoch
+        epoch_version = (VersionedRef("d05.boundary", epoch.revision)
+                         if epoch is not None and epoch.scope_ref == "d05.boundary" else None)
+        rule_versions = tuple(sorted(
+            (VersionedRef(rule.rule_id, rule.scope_version) for rule in read_set.rules),
+            key=lambda item: item.ref,
+        ))
+        graph_versions = tuple(sorted(
+            ((VersionedRef(spec.criteria_version,
+                           next(item.version for item in spec.required_input_versions
+                                if item.ref == spec.criteria_version)),)
+             + ((epoch_version,) if epoch_version is not None else ()) + rule_versions),
+            key=lambda item: item.ref,
+        ))
+        observed = read_set.input_versions
+        exact_versions = (
+            len({item.ref for item in graph_versions}) == len(graph_versions)
+            and set(observed) == set(graph_versions)
+            and set(observed) == set(spec.required_input_versions)
+        )
+        scope_matches = (
+            read_set.namespace.persona_id == spec.subject_ref.removeprefix("persona:")
+            and epoch is not None and epoch.scope_ref == "d05.boundary"
+            and all(rule.subject_persona_ref == spec.subject_ref
+                    and rule.target_entity_ref == intent.target_ref
+                    for rule in read_set.rules)
+        )
+        trusted_current = False
+        if self._boundary_read_verifier is not None:
+            try:
+                trusted_current = self._boundary_read_verifier(read_set) is True
+            except Exception:
+                trusted_current = False
+        complete = (
+            trusted_current and scope_matches and read_set.coverage == "full"
+            and not read_set.missing_items and exact_versions
+            and expiry >= timestamp
+        )
+        if not complete:
+            coverage = "full" if read_set.coverage == "full" and scope_matches else read_set.coverage
+            return CheckReceipt(spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
+                                observed, coverage, "unknown", timestamp, provider_id)
+
+        matches = tuple(rule for rule in read_set.rules if rule.applies_to(
+            subject_persona_ref=spec.subject_ref,
+            target_entity_ref=intent.target_ref,
+            action_kind=intent.action_kind,
+            audience_scope=audience_scope,
+            scene_ref=scene_ref,
+            at_time=timestamp,
+        ))
+        revoked_or_superseded = tuple(
+            rule for rule in read_set.rules
+            if rule.status in {"revoked", "superseded"}
+            and rule.subject_persona_ref == spec.subject_ref
+            and rule.target_entity_ref == intent.target_ref
+            and rule.action_kind == intent.action_kind
+            and rule.audience_scope == audience_scope
+            and (rule.scene_ref is None or rule.scene_ref == scene_ref)
+            and rule.valid_from <= timestamp
+            and (rule.valid_until is None or timestamp <= rule.valid_until)
+        )
+        if revoked_or_superseded:
+            return CheckReceipt(spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
+                                spec.required_input_versions, "full", "unknown", timestamp, provider_id)
+        denied = tuple(item for item in matches if item.effect == "deny")
+        allowed = tuple(item for item in matches if item.effect == "allow")
+        if denied and allowed or len(allowed) > 1:
+            result = "unknown"
+        elif denied:
+            result = "fail"
+        else:
+            result = "pass"
+        rule_expiries = tuple(item.valid_until for item in matches if item.valid_until is not None)
+        check_expiry = min((expiry, *rule_expiries)) if rule_expiries else expiry
+        return CheckReceipt(spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
+                            spec.required_input_versions, "full", result, check_expiry, provider_id)
 
     def invalidate(self, refs: tuple[str, ...]) -> InvalidationResult:
         if not isinstance(refs, tuple) or not refs:

@@ -202,6 +202,168 @@ class StagingResult:
     missing_slots: tuple[str, ...]
 
 
+_VERIFIED_BATCH_SCHEMA = "d09.verified_segment_batch.v1"
+_VERIFIED_BATCH_FIELDS = frozenset({
+    "schema", "batch_id", "batch_digest", "qualification", "grant_id",
+    "grant_digest", "grant_manifest_digest", "blueprint_digest", "candidate_digest",
+    "communication_action_id", "contact_id", "batch_revision", "intent_ref",
+    "action_id", "intent_revision", "target_ref", "purpose", "audiences",
+    "scene_ref", "conversation_epoch", "valid_until", "cancellation_epoch",
+    "required_slots", "required_check_refs", "claims", "segments", "version",
+})
+
+
+def _verified_batch_digest(value: dict) -> str:
+    return canonical_digest({key: item for key, item in value.items() if key != "batch_digest"})
+
+
+def _validate_verified_batch_value_v1(value: dict) -> None:
+    """Validate the frozen candidate's exact shape and content digest.
+
+    This structural check alone does not qualify D08 authorization or sources.
+    The graph coordinator must also call recompute_verified_batch_v1 with its
+    independently read current inputs before committing the value.
+    """
+
+    if type(value) is not dict or set(value) != _VERIFIED_BATCH_FIELDS:
+        raise ValueError("verified batch fields differ from v1 schema")
+    if (value["schema"] != _VERIFIED_BATCH_SCHEMA
+            or type(value["version"]) is not int or value["version"] != 1):
+        raise ValueError("verified batch schema/version mismatch")
+    if value["qualification"] != "content_verified_source_hold":
+        raise ValueError("verified batch cannot self-assert source qualification")
+    for name in (
+        "batch_id", "grant_id", "communication_action_id", "contact_id",
+        "intent_ref", "action_id", "target_ref", "purpose", "scene_ref",
+    ):
+        _nonempty(value[name], name)
+    if value["purpose"] != "expression":
+        raise ValueError("verified batch purpose must be expression")
+    for name in ("batch_revision", "intent_revision", "conversation_epoch", "cancellation_epoch"):
+        _nonnegative_int(value[name], name)
+    if value["batch_revision"] < 1 or value["intent_revision"] < 1:
+        raise ValueError("verified batch revisions must be positive")
+    _finite(value["valid_until"], "valid_until")
+    for name in ("audiences", "required_slots", "required_check_refs"):
+        if type(value[name]) is not list or any(type(item) is not str or not item for item in value[name]):
+            raise ValueError(f"{name} must be a string list")
+        if len(set(value[name])) != len(value[name]):
+            raise ValueError(f"{name} must contain unique values")
+    for name in ("grant_digest", "grant_manifest_digest", "blueprint_digest", "candidate_digest", "batch_digest"):
+        item = value[name]
+        if type(item) is not str or len(item) != 64 or any(ch not in "0123456789abcdef" for ch in item):
+            raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    if type(value["claims"]) is not list or type(value["segments"]) is not list or not value["segments"]:
+        raise ValueError("verified batch requires frozen claims and finite segments")
+    if len(value["segments"]) > 3:
+        raise ValueError("verified batch exceeds the finite segment limit")
+    claim_fields = {
+        "claim_id", "text", "kind", "source_refs", "allowed_audiences",
+        "eligibility", "disclosure_ref",
+    }
+    claims: dict[str, dict] = {}
+    for claim in value["claims"]:
+        if type(claim) is not dict or set(claim) != claim_fields:
+            raise ValueError("verified claim fields differ from v1 schema")
+        for name in ("claim_id", "text", "disclosure_ref"):
+            _nonempty(claim[name], name)
+        if claim["kind"] not in {kind.value for kind in ClaimKind}:
+            raise ValueError("verified claim kind is unknown")
+        for name in ("source_refs", "allowed_audiences", "eligibility"):
+            parts = claim[name]
+            if type(parts) is not list or any(type(part) is not str or not part for part in parts):
+                raise ValueError(f"verified claim {name} must be a string list")
+            if len(set(parts)) != len(parts):
+                raise ValueError(f"verified claim {name} must be unique")
+        if claim["kind"] != ClaimKind.RHETORIC.value and not claim["source_refs"]:
+            raise ValueError("non-rhetorical claim requires source refs")
+        if not claim["allowed_audiences"] or "expression" not in claim["eligibility"]:
+            raise ValueError("verified claim lacks expression scope")
+        if claim["claim_id"] in claims:
+            raise ValueError("verified claim IDs must be unique")
+        claims[claim["claim_id"]] = claim
+    segment_fields = {
+        "segment_id", "effect_id", "position", "body", "payload_digest",
+        "segment_authorization_ref", "max_chars", "allowed_media",
+        "claim_uses", "source_refs", "covered_slots", "media_refs",
+        "prerequisite_segment_ref", "audiences", "required_check_refs",
+        "valid_until", "cancellation_epoch",
+    }
+    seen_segments: set[str] = set()
+    seen_effects: set[str] = set()
+    covered_slots: set[str] = set()
+    for position, segment in enumerate(value["segments"]):
+        if type(segment) is not dict or set(segment) != segment_fields:
+            raise ValueError("verified segment fields differ from v1 schema")
+        for name in ("segment_id", "effect_id", "body"):
+            _nonempty(segment[name], name)
+        if segment["position"] != position or type(segment["position"]) is not int:
+            raise ValueError("verified segments must be contiguous and ordered")
+        if segment["segment_id"] in seen_segments or segment["effect_id"] in seen_effects:
+            raise ValueError("verified segment identities must be unique")
+        _nonempty(segment["segment_authorization_ref"], "segment_authorization_ref")
+        _nonnegative_int(segment["max_chars"], "max_chars")
+        if len(segment["body"]) > segment["max_chars"]:
+            raise ValueError("verified segment exceeds its granted length")
+        if segment["prerequisite_segment_ref"] is not None and segment["prerequisite_segment_ref"] not in seen_segments:
+            raise ValueError("verified prerequisite must refer to an earlier segment")
+        if segment["valid_until"] != value["valid_until"] or segment["cancellation_epoch"] != value["cancellation_epoch"]:
+            raise ValueError("verified segment validity differs from its batch")
+        if segment["audiences"] != value["audiences"] or segment["required_check_refs"] != value["required_check_refs"]:
+            raise ValueError("verified segment scope differs from its batch")
+        if type(segment["claim_uses"]) is not list:
+            raise ValueError("verified claim uses must be a list")
+        uses: list[ClaimUse] = []
+        source_refs: set[str] = set()
+        cursor = 0
+        for use in segment["claim_uses"]:
+            if type(use) is not dict or set(use) != {"claim_ref", "start", "end", "asserted_as"}:
+                raise ValueError("verified claim use fields differ from v1 schema")
+            mapped = claims.get(use["claim_ref"])
+            if mapped is None or use["asserted_as"] != mapped["kind"]:
+                raise ValueError("verified claim use is not eligible")
+            claim_use = ClaimUse(use["claim_ref"], use["start"], use["end"], ClaimKind(use["asserted_as"]))
+            if claim_use.start < cursor or claim_use.end > len(segment["body"]):
+                raise ValueError("verified claim spans overlap or exceed the body")
+            if any(char.isalnum() for char in segment["body"][cursor:claim_use.start]):
+                raise ValueError("verified segment contains unmapped content")
+            if segment["body"][claim_use.start:claim_use.end] != mapped["text"]:
+                raise ValueError("verified claim span differs from frozen text")
+            uses.append(claim_use)
+            source_refs.update(mapped["source_refs"])
+            cursor = claim_use.end
+        if any(char.isalnum() for char in segment["body"][cursor:]):
+            raise ValueError("verified segment contains unmapped content")
+        for name in ("source_refs", "covered_slots", "media_refs", "allowed_media"):
+            parts = segment[name]
+            if type(parts) is not list or any(type(part) is not str or not part for part in parts):
+                raise ValueError(f"verified segment {name} must be a string list")
+            if len(set(parts)) != len(parts):
+                raise ValueError(f"verified segment {name} must be unique")
+        if segment["source_refs"] != sorted(source_refs):
+            raise ValueError("verified segment source closure differs from claims")
+        if not set(segment["media_refs"]).issubset(set(segment["allowed_media"])):
+            raise ValueError("verified segment media exceeds its granted scope")
+        if segment["payload_digest"] != segment_payload_digest(
+            segment["body"], tuple(segment["media_refs"]), tuple(uses),
+        ):
+            raise ValueError("verified segment payload digest mismatch")
+        covered_slots.update(segment["covered_slots"])
+        seen_segments.add(segment["segment_id"])
+        seen_effects.add(segment["effect_id"])
+    if not set(value["required_slots"]).issubset(covered_slots):
+        raise ValueError("verified batch does not cover required slots")
+    if value["batch_digest"] != _verified_batch_digest(value):
+        raise ValueError("verified batch content digest mismatch")
+
+
+@dataclass(frozen=True)
+class VerifiedBatchRecheckV1:
+    status: str
+    value: dict | None
+    missing: tuple[str, ...]
+
+
 @dataclass(frozen=True)
 class AdmissionReceipt:
     admission_ref: str
@@ -389,6 +551,7 @@ class D09ExpressionProvider:
                 ("segment_id", "str"), ("effect_id", "str"), ("payload_digest", "digest"),
                 ("claim_refs", "str_list"), ("version", "positive_int"),
             )),
+            ("d09.verified_segment_batch.v1", ("activity",), "state", True, ()),
             ("d09.dialogue_progress.v1", ("activity",), "projection", False, (
                 ("progress_id", "str"), ("segment_id", "str"),
                 ("delivery_state", "enum:prepared|verified|admitted|handed_off|accepted|unknown|rejected|superseded"),
@@ -399,7 +562,10 @@ class D09ExpressionProvider:
             name=name,
             owner_kinds=owners,
             storage_role=role,
-            validator=_strict_graph_validator(name, fields),
+            validator=(
+                _validate_verified_batch_value_v1 if name == _VERIFIED_BATCH_SCHEMA
+                else _strict_graph_validator(name, fields)
+            ),
             immutable=immutable,
             schema_version=1,
             writer_domain="d09",
@@ -525,12 +691,153 @@ class D09ExpressionProvider:
                 candidate.covered_slots, candidate.media_refs, grant.prerequisite_segment_ref,
                 blueprint.audiences,
             ))
+        if set(seen_segments) != set(grants):
+            failures.append("segment_manifest")
         if failures:
             return StagingResult("rejected", (), tuple(dict.fromkeys(failures)), ())
         missing = tuple(slot for slot in blueprint.required_slots if slot not in covered)
         if missing:
             return StagingResult("unavailable", (), (), missing)
         return StagingResult("complete", tuple(sorted(verified, key=lambda item: item.position)), (), ())
+
+    @staticmethod
+    def build_verified_batch_v1(
+        intent: CommunicationIntentGrant,
+        blueprint: ExpressionBlueprint,
+        candidates: tuple[SegmentCandidate, ...],
+        *,
+        now: float,
+    ) -> dict:
+        """Freeze a complete content-verified batch candidate, not a send grant.
+
+        The caller must obtain the D08 grant and all source qualifications from
+        their authoritative current reads. An in-memory grant object alone does
+        not establish that provenance, so the stored qualification remains HOLD.
+        """
+
+        if not isinstance(intent, CommunicationIntentGrant):
+            raise TypeError("intent must be CommunicationIntentGrant")
+        if not isinstance(blueprint, ExpressionBlueprint):
+            raise TypeError("blueprint must be ExpressionBlueprint")
+        _finite(now, "now")
+        prepared = D09ExpressionProvider.prepare_blueprint(
+            intent, blueprint.scene_ref, blueprint.conversation_epoch,
+            blueprint.claims, now=now,
+        )
+        if prepared.status != "complete" or prepared.blueprint != blueprint:
+            raise ValueError("blueprint differs from the current D08 intent or has expired")
+        staged = D09ExpressionProvider.verify_and_stage(blueprint, candidates)
+        if staged.status != "complete":
+            raise ValueError(f"finite segment verification failed: {staged.status}: {staged.failures or staged.missing_slots}")
+        claims = {claim.claim_id: claim for claim in blueprint.claims}
+        grants = {grant.segment_id: grant for grant in intent.segment_grants}
+        claim_values = [{
+            "claim_id": claim.claim_id,
+            "text": claim.text,
+            "kind": claim.kind.value,
+            "source_refs": list(claim.source_refs),
+            "allowed_audiences": list(claim.allowed_audiences),
+            "eligibility": list(claim.eligibility),
+            "disclosure_ref": claim.disclosure_ref,
+        } for claim in blueprint.claims]
+        segment_values = []
+        for segment in staged.segments:
+            grant = grants[segment.segment_id]
+            segment_values.append({
+                "segment_id": segment.segment_id,
+                "effect_id": segment.effect_id,
+                "position": segment.position,
+                "body": segment.body,
+                "payload_digest": segment.payload_digest,
+                "segment_authorization_ref": intent.segment_authorization_ref(segment.segment_id),
+                "max_chars": grant.max_chars,
+                "allowed_media": list(grant.allowed_media),
+                "claim_uses": [{
+                    "claim_ref": use.claim_ref,
+                    "start": use.start,
+                    "end": use.end,
+                    "asserted_as": use.asserted_as.value,
+                } for use in segment.claim_uses],
+                "source_refs": sorted({
+                    ref for use in segment.claim_uses
+                    for ref in claims[use.claim_ref].source_refs
+                }),
+                "covered_slots": list(segment.covered_slots),
+                "media_refs": list(segment.media_refs),
+                "prerequisite_segment_ref": segment.prerequisite_segment_ref,
+                "audiences": list(segment.audiences),
+                "required_check_refs": list(grant.required_check_refs),
+                "valid_until": grant.valid_until,
+                "cancellation_epoch": grant.cancellation_epoch,
+            })
+        grant_digest = canonical_digest(intent)
+        blueprint_digest = canonical_digest(blueprint)
+        candidate_digest = canonical_digest(candidates)
+        batch_id = "verified-batch:" + canonical_digest({
+            "grant_id": intent.grant_id,
+            "grant_digest": grant_digest,
+            "blueprint_digest": blueprint_digest,
+            "candidate_digest": candidate_digest,
+        })
+        value = {
+            "schema": _VERIFIED_BATCH_SCHEMA,
+            "batch_id": batch_id,
+            "qualification": "content_verified_source_hold",
+            "grant_id": intent.grant_id,
+            "grant_digest": grant_digest,
+            "grant_manifest_digest": intent.segment_manifest_digest,
+            "blueprint_digest": blueprint_digest,
+            "candidate_digest": candidate_digest,
+            "communication_action_id": intent.communication_action_id,
+            "contact_id": intent.contact_id,
+            "batch_revision": intent.batch_revision,
+            "intent_ref": intent.intent_ref,
+            "action_id": intent.action_id,
+            "intent_revision": intent.intent_revision,
+            "target_ref": intent.target_ref,
+            "purpose": intent.purpose,
+            "audiences": list(intent.audiences),
+            "scene_ref": blueprint.scene_ref,
+            "conversation_epoch": blueprint.conversation_epoch,
+            "valid_until": intent.valid_until,
+            "cancellation_epoch": intent.cancellation_epoch,
+            "required_slots": list(intent.required_slots),
+            "required_check_refs": list(intent.required_check_refs),
+            "claims": claim_values,
+            "segments": segment_values,
+            "version": 1,
+        }
+        value["batch_digest"] = _verified_batch_digest(value)
+        return value
+
+    @staticmethod
+    def recompute_verified_batch_v1(
+        value: dict,
+        *,
+        intent: CommunicationIntentGrant | None,
+        blueprint: ExpressionBlueprint,
+        candidates: tuple[SegmentCandidate, ...],
+        now: float,
+    ) -> VerifiedBatchRecheckV1:
+        """Graph pre-commit check against independently read D08/D09 inputs.
+
+        Exact equality includes the full segment manifest, body, claim spans,
+        sources, scene, audience, validity and dependency chain. Source-access
+        and current D08 provenance remain separate graph/Authority checks.
+        """
+
+        _validate_verified_batch_value_v1(value)
+        if intent is None:
+            return VerifiedBatchRecheckV1("hold", None, ("current_d08_grant",))
+        expected = D09ExpressionProvider.build_verified_batch_v1(
+            intent, blueprint, candidates, now=now,
+        )
+        if value != expected:
+            raise ValueError("verified batch differs from recomputed finite source inputs")
+        return VerifiedBatchRecheckV1(
+            "content_verified_source_hold", value,
+            ("current_d08_grant_provenance", "current_source_reads"),
+        )
 
     @staticmethod
     def prepare_delivery(
@@ -637,5 +944,6 @@ __all__ = [
     "AdmissionReceipt", "BlueprintResult", "ClaimKind", "ClaimUse", "CommunicationIntentGrant",
     "ConversationTrack", "D09ExpressionProvider", "DeliveryObservation", "DeliveryPreparation",
     "DialogueProgress", "ExpressionBlueprint", "ExpressionClaim", "SegmentCandidate", "SegmentGrant",
-    "StagingResult", "TopicThread", "VerifiedSegment", "segment_payload_digest",
+    "StagingResult", "TopicThread", "VerifiedBatchRecheckV1", "VerifiedSegment",
+    "segment_payload_digest",
 ]

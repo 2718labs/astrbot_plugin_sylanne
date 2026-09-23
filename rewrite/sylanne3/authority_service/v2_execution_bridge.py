@@ -1,8 +1,8 @@
 """Internal B2.2 prepared-dispatch journal/Authority transaction bridge.
 
 The host service supplies an authenticated subject; Core's authorizer and D08
-verifier run before locks. The mTLS adapter exposes only prepared dispatch;
-this is not a platform send or a production RuntimeDependency.
+verifier run before locks. A handoff start is a durable boundary, not a platform
+send or a production RuntimeDependency.
 The `prepared`, `claimed` and verified `observed` phases are service-owned
 journal transitions. Observation preserves the platform's stated evidence
 scope; `handed_off` and `unknown` do not prove delivery or settlement.
@@ -24,11 +24,23 @@ from .local_bridge import constraint_keys_from_footprint
 from .v2_contract import (
     ExecutionBindingV1, FencePermitV2, MutationReceiptV2, PendingMutationV2, canonical_bytes,
     canonical_digest,
-    PlatformObservationV1, decode_bytes, to_wire,
+    PlatformObservationV1, decode_bytes, from_wire, to_wire,
 )
 from .v2_execution_journal import AuthorityV2ExecutionJournal, VerifiedAppendV2
 from .v2_deletion_guard import AuthorityV2DeletionGuard
 from .v2_fence_store import AuthorityV2FenceStore
+
+
+_HANDOFF_DDL = """CREATE TABLE authority_execution_handoff_starts_v1 (
+                handoff_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL UNIQUE,
+                namespace TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                claim_digest TEXT NOT NULL,
+                binding_digest TEXT NOT NULL,
+                graph_claim_ref TEXT NOT NULL,
+                permit BLOB NOT NULL
+            ) STRICT"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +51,65 @@ class PreparedExecutionObservationV2:
     result: tuple[MutationReceiptV2, FencePermitV2] | None
 
 
+@dataclass(frozen=True, slots=True)
+class HandoffStartV2:
+    """One durable Authority start bound to a current dispatch fence.
+
+    The business graph's independently durable claim is named, not reproduced.
+    This receipt alone cannot authorize a platform adapter to send.
+    """
+
+    handoff_id: str
+    operation_id: str
+    effect_id: str
+    namespace: str
+    claim_digest: str
+    binding_digest: str
+    graph_claim_ref: str
+    permit: FencePermitV2
+    replay: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("handoff_id", "operation_id", "effect_id", "namespace",
+                     "graph_claim_ref"):
+            identifier(getattr(self, name), name)
+        if type(self.replay) is not bool:
+            raise ValueError("handoff replay must be an exact boolean")
+        if (type(self.permit) is not FencePermitV2
+                or self.permit.operation != "dispatch"
+                or self.permit.operation_id != self.operation_id
+                or self.permit.effect_id != self.effect_id
+                or self.permit.namespace != self.namespace
+                or any(type(value) is not str or not value.startswith("sha256:")
+                       or len(value) != 71
+                       or any(ch not in "0123456789abcdef" for ch in value[7:])
+                       for value in (
+                           self.claim_digest, self.binding_digest))):
+            raise ValueError("handoff start identity is invalid")
+
+    def to_wire(self) -> dict[str, object]:
+        return {"handoff_id": self.handoff_id, "operation_id": self.operation_id,
+                "effect_id": self.effect_id, "namespace": self.namespace,
+                "claim_digest": self.claim_digest,
+                "binding_digest": self.binding_digest,
+                "graph_claim_ref": self.graph_claim_ref,
+                "permit": to_wire(self.permit), "replay": self.replay}
+
+    @classmethod
+    def from_wire(cls, value: object) -> "HandoffStartV2":
+        if type(value) is not dict or set(value) != {
+                "handoff_id", "operation_id", "effect_id", "namespace",
+                "claim_digest", "binding_digest", "graph_claim_ref", "permit",
+                "replay"}:
+            raise ValueError("handoff start wire fields differ")
+        permit = from_wire(value["permit"])
+        result = cls(**{key: item for key, item in value.items() if key != "permit"},
+                     permit=permit)
+        if result.to_wire() != value:
+            raise ValueError("handoff start wire is not canonical")
+        return result
+
+
 class AuthorityV2ExecutionBridge:
     """One isolated service namespace using Core's real Authority DB and lock."""
 
@@ -46,7 +117,7 @@ class AuthorityV2ExecutionBridge:
                  fences: AuthorityV2FenceStore,
                  journal: AuthorityV2ExecutionJournal, namespace: str,
                  deletion: AuthorityV2DeletionGuard | None = None,
-                 observation_verifier=None):
+                 observation_verifier=None, final_handoff_authorizer=None):
         identifier(namespace, "namespace")
         if (type(core) is not AuthorityServiceCore
                 or type(fences) is not AuthorityV2FenceStore
@@ -66,6 +137,21 @@ class AuthorityV2ExecutionBridge:
         if observation_verifier is not None and not callable(observation_verifier):
             raise AuthorityUnavailable("platform observation verifier must be installed by service")
         self._observation_verifier = observation_verifier
+        if final_handoff_authorizer is not None and not callable(final_handoff_authorizer):
+            raise AuthorityUnavailable("final handoff authorizer must be installed by service")
+        # Contract: callback atomically checks current business-graph RequiredChecks
+        # and reserves a durable, replayable graph claim keyed by handoff_id. It
+        # runs outside Core and both journal locks; it must never call back into
+        # this Authority bridge. Missing callback keeps handoff closed.
+        self._final_handoff_authorizer = final_handoff_authorizer
+        with core._tx() as db:
+            stored = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='authority_execution_handoff_starts_v1'").fetchone()
+            if stored is None:
+                db.execute(_HANDOFF_DDL)
+            elif stored != (_HANDOFF_DDL,):
+                raise AuthorityUnavailable("handoff start schema differs")
 
     def _check_deletion_locked(self, db, head):
         row = self.core._row(db, self.namespace)
@@ -786,6 +872,128 @@ class AuthorityV2ExecutionBridge:
         return self.reconcile_mutation(
             credential=credential, subject=subject, pending=pending)
 
+    def _check_handoff_current_locked(self, db, *, permit: FencePermitV2,
+                                      subject: str, claimed_receipt: MutationReceiptV2,
+                                      deletion_head, execution_head) -> None:
+        """P2/current-state barrier used before and after the graph claim."""
+        self._require_v2_mode_locked(db)
+        self.fences._check_schema(db)
+        self._check_deletion_locked(db, deletion_head)
+        if (execution_head.journal_id, execution_head.seq,
+                execution_head.digest) != (
+                    permit.pinned_anchor.execution_journal_id,
+                    permit.pinned_anchor.execution_seq,
+                    permit.pinned_anchor.execution_digest):
+            raise AuthorityUnavailable("claimed append is no longer current")
+        self._check_execution_head_locked(db, execution_head)
+        self._check_core_owner(db, permit)
+        self._check_fence_locked(db, permit, subject)
+        original = self._load_mutation_locked(db, claimed_receipt.pending, subject)
+        if self._completed_result(original) != (claimed_receipt, permit):
+            raise AuthorityUnavailable("original committed claim changed")
+        effect = db.execute(
+            "SELECT state,execution_seq FROM authority_effects "
+            "WHERE namespace=? AND effect_id=?",
+            (self.namespace, permit.effect_id)).fetchone()
+        if effect != ("unresolved", claimed_receipt.after_anchor.execution_seq):
+            raise AuthorityUnavailable("current effect claim differs")
+
+    def begin_handoff(self, *, credential, subject: str,
+                      claimed_receipt: MutationReceiptV2,
+                      handoff_id: str) -> HandoffStartV2:
+        """Finalize business admission and durably mark one possible handoff.
+
+        No platform call is made. The injected graph authority must atomically
+        validate RequiredChecks and reserve an idempotent graph claim using
+        this handoff_id before this Authority CAS; missing authority fails closed.
+        """
+        identifier(subject, "subject")
+        identifier(handoff_id, "handoff_id")
+        if (type(claimed_receipt) is not MutationReceiptV2
+                or claimed_receipt.durable_state != "committed"
+                or claimed_receipt.pending.phase != "claimed"):
+            raise AuthorityUnavailable("handoff requires committed claim")
+        if not callable(self._final_handoff_authorizer):
+            raise AuthorityUnavailable("trusted final handoff authorizer is unavailable")
+        pending = claimed_receipt.pending
+        binding = pending.binding
+        assert binding is not None
+        permit = replace(pending.permit, revision=claimed_receipt.updated_revision,
+                         pinned_anchor=claimed_receipt.after_anchor)
+        if permit.subject != subject or permit.namespace != self.namespace:
+            raise AuthorityUnavailable("handoff subject or namespace differs")
+        self.core._require(credential, "execution", self.namespace, permit.holder)
+        claim_digest = canonical_digest(claimed_receipt)
+        binding_digest = canonical_digest(binding)
+        with self.core._tx() as db:
+            self._require_v2_mode_locked(db)
+            row = db.execute(
+                "SELECT handoff_id,namespace,subject,claim_digest,binding_digest,"
+                "graph_claim_ref,permit FROM authority_execution_handoff_starts_v1 "
+                "WHERE operation_id=? OR handoff_id=?",
+                (permit.operation_id, handoff_id)).fetchone()
+            if row is not None:
+                if row[:5] != (handoff_id, self.namespace, subject,
+                               claim_digest, binding_digest):
+                    raise AuthorityUnavailable("handoff replay identity differs")
+                saved_permit = decode_bytes(row[6])
+                if saved_permit != permit:
+                    raise AuthorityUnavailable("handoff replay permit differs")
+                return HandoffStartV2(handoff_id, permit.operation_id,
+                                      permit.effect_id, self.namespace,
+                                      claim_digest, binding_digest,
+                                      row[5], permit, replay=True)
+        # Check the P2 head, live fence, unresolved effect and exact claim
+        # before leaving any durable graph reservation. Release all freezes
+        # before the graph callback to avoid GraphWorker/Authority deadlock.
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    raise AuthorityUnavailable("historical deletion closure blocks handoff")
+                execution_head = self.journal.verified_head()
+                with self.core._tx() as db:
+                    self._check_handoff_current_locked(
+                        db, permit=permit, subject=subject,
+                        claimed_receipt=claimed_receipt,
+                        deletion_head=deletion_head,
+                        execution_head=execution_head)
+        # External business graph transaction MUST be atomic and idempotent by
+        # handoff_id. No Core, deletion, or execution journal lock is held here.
+        try:
+            graph_claim_ref = self._final_handoff_authorizer(
+                binding, claimed_receipt, handoff_id)
+        except Exception as exc:
+            raise AuthorityUnavailable("final business graph handoff denied") from exc
+        identifier(graph_claim_ref, "graph_claim_ref")
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    raise AuthorityUnavailable("historical deletion closure blocks handoff")
+                execution_head = self.journal.verified_head()
+                with self.core._tx() as db:
+                    self._check_handoff_current_locked(
+                        db, permit=permit, subject=subject,
+                        claimed_receipt=claimed_receipt,
+                        deletion_head=deletion_head,
+                        execution_head=execution_head)
+                    if db.execute(
+                        "SELECT 1 FROM authority_execution_handoff_starts_v1 "
+                        "WHERE operation_id=? OR handoff_id=?",
+                        (permit.operation_id, handoff_id)).fetchone():
+                        raise AuthorityUnavailable("handoff start raced")
+                    db.execute(
+                        "INSERT INTO authority_execution_handoff_starts_v1"
+                        "(handoff_id,operation_id,namespace,subject,claim_digest,"
+                        "binding_digest,graph_claim_ref,permit) VALUES(?,?,?,?,?,?,?,?)",
+                        (handoff_id, permit.operation_id, self.namespace, subject,
+                         claim_digest, binding_digest, graph_claim_ref,
+                         canonical_bytes(permit)))
+        return HandoffStartV2(handoff_id, permit.operation_id, permit.effect_id,
+                              self.namespace, claim_digest, binding_digest,
+                              graph_claim_ref, permit)
+
     def execution_observe(self, *, credential, subject: str,
                           claimed_receipt: MutationReceiptV2,
                           observation: PlatformObservationV1):
@@ -804,4 +1012,5 @@ class AuthorityV2ExecutionBridge:
             credential=credential, subject=subject, pending=pending)
 
 
-__all__ = ["AuthorityV2ExecutionBridge", "PreparedExecutionObservationV2"]
+__all__ = ["AuthorityV2ExecutionBridge", "PreparedExecutionObservationV2",
+           "HandoffStartV2"]

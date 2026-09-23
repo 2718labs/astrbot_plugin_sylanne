@@ -15,6 +15,7 @@ from ...graph_types import GraphVersion, NamespaceEpoch
 from ...memory_repository import MemoryRepository
 from ...memory_retrieval import MemoryBatch, MemoryQuery, MemoryRetriever
 from ...memory_types import source_key
+from ...memory_types import access_key
 from ...runtime_contracts import NamespaceId
 from . import (
     CandidateSet,
@@ -92,6 +93,16 @@ class RetrievalOutcome:
     batches: tuple[MemoryBatch, ...]
 
 
+@dataclass(frozen=True)
+class PreparedAssociation:
+    source_ref: str
+    target_ref: str
+    basis_source_refs: tuple[str, ...]
+    proof_versions: tuple[GraphVersion, ...]
+    epoch: NamespaceEpoch
+    status: str = "candidate"
+
+
 class D06MemoryPipeline:
     """Connect committed source evidence to D06-only encoding/query candidates."""
 
@@ -105,6 +116,52 @@ class D06MemoryPipeline:
         self.adapter = adapter
         self.repository = repository
         self.retriever = MemoryRetriever(repository)
+
+    def prepare_association(
+        self,
+        source_id: str,
+        target_id: str,
+        basis_source_ids: tuple[str, ...],
+        *,
+        audience: str,
+        purpose: str,
+    ) -> PreparedAssociation:
+        """Read all edge sources through current access before graph compilation."""
+        if type(basis_source_ids) is not tuple or not basis_source_ids:
+            raise ValueError("association needs at least one basis source")
+        if source_id == target_id:
+            raise ValueError("association endpoints must differ")
+        ids = tuple(dict.fromkeys((source_id, target_id, *basis_source_ids)))
+        if len(ids) > 10 or any(type(item) is not str or not item for item in ids):
+            raise ValueError("association source IDs must be bounded nonempty strings")
+        proofs: list[GraphVersion] = []
+        epoch = None
+        namespace = self.adapter.namespace.as_tuple
+        for source_id_to_read in ids:
+            source, proof = self.repository.read_source_evidence(
+                source_id_to_read, audience=audience, purpose=purpose,
+            )
+            if source is None:
+                raise PermissionError("association source is unavailable")
+            current_epoch = proof.epochs[0]
+            if epoch is not None and current_epoch != epoch:
+                raise RuntimeError("association namespace changed during source reads")
+            epoch = current_epoch
+            for key in (source_key(*namespace, source_id_to_read),
+                        access_key(*namespace, source_id_to_read)):
+                if not any(version.key == key and version.revision > 0 for version in proof.versions):
+                    raise RuntimeError("association source lacks committed access proof")
+            proofs.extend(proof.versions)
+        if self.repository.store.graph_epoch(*namespace) != epoch:
+            raise RuntimeError("association namespace changed during preparation")
+        unique = {version.key: version for version in proofs}
+        if len(unique) != len(proofs) and any(
+            unique[version.key] != version for version in proofs
+        ):
+            raise RuntimeError("association source proof changed during preparation")
+        return PreparedAssociation(
+            source_id, target_id, basis_source_ids, tuple(unique.values()), epoch,
+        )
 
     def prepare_encoding(
         self,

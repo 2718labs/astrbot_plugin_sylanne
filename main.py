@@ -122,6 +122,7 @@ class Sylanne3Plugin(Star):
                     + canonical_digest(installation.installation_policy.digest_payload())
                 )
                 await self._runtime.provision_installed_namespace(operation_id)
+                await self._runtime.refresh_capabilities()
             except Exception:
                 failed = self._runtime.health
                 self.runtime_health = (

@@ -32,7 +32,9 @@ def open_core(path, create=False):
         path, create=create,
         authorizer=lambda credential, action, namespace, holder:
             credential == "claimant" and action == "owner_claim" and namespace == AUTH_NS
-            or credential == "pairer" and action == "owner_pair" and namespace == AUTH_NS,
+            or credential == "pairer" and action == "owner_pair" and namespace == AUTH_NS
+            or (credential == "guard-reader" and action == "owner_guard_read"
+                and namespace == AUTH_NS and holder == "holder"),
         deletion_verifier=lambda *_: True, execution_verifier=lambda *_: True,
         effect_verifier=lambda *_: True, dispatch_verifier=lambda *_: True,
     )
@@ -87,6 +89,23 @@ def finalize(store, operation, proof):
                                 operation=operation, proof=proof)
 
 
+def current_under_read(core, store, *, operation_id="current-read"):
+    fence = AuthorityV2FenceStore(core._db, lock=core._lock)
+    with core._tx() as db:
+        anchor = core._anchor(db, AUTH_NS, core._row(db, AUTH_NS))
+    permit = fence.begin_fence(
+        subject="reader-subject", holder="holder", operation="read",
+        current_anchor=anchor, operation_id=operation_id)
+    try:
+        return store.get_current_guard(
+            credential="guard-reader", authority_namespace=AUTH_NS,
+            installation_id="installation", subject="reader-subject", permit=permit)
+    finally:
+        fence.finish_fence(
+            permit, subject="reader-subject", current_anchor=anchor,
+            request_id="finish-" + operation_id, request_digest=digest("f"))
+
+
 def test_commit_is_canonical_durable_and_exact_replay_after_restart(tmp_path):
     path = tmp_path / "authority.db"
     core = open_core(path, create=True)
@@ -100,8 +119,7 @@ def test_commit_is_canonical_durable_and_exact_replay_after_restart(tmp_path):
         assert committed.phase == "committed"
         assert committed.guard.authorization_revision == 1
         assert committed.grant_revision == 1
-        assert store.get_current_guard(credential="claimant",
-                                       authority_namespace=AUTH_NS) == committed.guard
+        assert current_under_read(core, store) == committed.guard
         assert finalize(store, operation, proof) == committed
     finally:
         core.close()
@@ -133,8 +151,7 @@ def test_missing_denied_or_mismatched_graph_proof_keeps_pending(tmp_path):
             replace(proof, graph_access_epoch=True)
         with pytest.raises(AuthorityUnavailable, match="proof differs"):
             finalize(accepted, operation, replace(proof, grant_digest=digest("e")))
-        assert accepted.get_current_guard(credential="claimant",
-                                          authority_namespace=AUTH_NS) is None
+        assert current_under_read(core, accepted) is None
         assert finalize(accepted, operation, proof).phase == "committed"
     finally:
         core.close()
@@ -163,5 +180,135 @@ def test_live_fence_blocks_commit_without_losing_pending(tmp_path):
                        "finish_request_id='finish',finish_request_digest=?",
                        (digest("f"),))
         assert finalize(store, operation, proof).phase == "committed"
+    finally:
+        core.close()
+
+
+def test_completed_write_between_graph_verification_and_commit_blocks_issue(tmp_path):
+    core = open_core(tmp_path / "authority.db", create=True)
+    verified = []
+
+    def verify_then_finish_write(_operation, _proof):
+        verified.append(True)
+        with core._tx() as db:
+            db.execute("INSERT INTO authority_v2_epochs VALUES(?,1)", (AUTH_NS,))
+            db.execute(
+                "INSERT INTO authority_v2_fences"
+                "(operation_id,namespace,subject,token,fence_epoch,revision,state,"
+                "permit,finish_request_id,finish_request_digest) "
+                "VALUES(?,?,?,?,1,0,'finished',?,?,?)",
+                ("other-write", AUTH_NS, "subject", "token", b"permit",
+                 "finish", digest("f")),
+            )
+        return True
+
+    try:
+        store, ticket, operation, proof = setup(
+            core, create=True, graph_verifier=verify_then_finish_write)
+        reserve(store, ticket, operation)
+        with pytest.raises(AuthorityUnavailable, match="state change"):
+            finalize(store, operation, proof)
+        assert verified == [True]
+        assert current_under_read(core, store) is None
+        assert store.get_pending(credential="claimant", authority_namespace=AUTH_NS,
+                                 operation_id="issue").phase == "pending"
+    finally:
+        core.close()
+
+
+def test_current_guard_requires_scoped_credential_live_fence_and_anchor(tmp_path):
+    core = open_core(tmp_path / "authority.db", create=True)
+    try:
+        store, ticket, operation, proof = setup(
+            core, create=True, graph_verifier=lambda *_: True)
+        reserve(store, ticket, operation)
+        committed = finalize(store, operation, proof)
+        fence = AuthorityV2FenceStore(core._db, lock=core._lock)
+        with core._tx() as db:
+            anchor = core._anchor(db, AUTH_NS, core._row(db, AUTH_NS))
+        permit = fence.begin_fence(
+            subject="reader-subject", holder="holder", operation="read",
+            current_anchor=anchor, operation_id="guard-read")
+        request = dict(authority_namespace=AUTH_NS, installation_id="installation",
+                       subject="reader-subject", permit=permit)
+        assert store.get_current_guard(credential="guard-reader", **request) == committed.guard
+        for denied in ("claimant", "pairer", "installer"):
+            with pytest.raises(AuthorityUnavailable, match="authentication denied"):
+                store.get_current_guard(credential=denied, **request)
+        with pytest.raises(AuthorityUnavailable, match="installation identity"):
+            store.get_current_guard(credential="guard-reader",
+                                    **{**request, "installation_id": "other"})
+        with pytest.raises(AuthorityUnavailable, match="exact read/write fence"):
+            store.get_current_guard(credential="guard-reader",
+                                    **{**request, "subject": "other"})
+        fence.finish_fence(permit, subject="reader-subject", current_anchor=anchor,
+                           request_id="finish-guard-read", request_digest=digest("f"))
+        with pytest.raises(AuthorityUnavailable, match="no longer current"):
+            store.get_current_guard(credential="guard-reader", **request)
+
+        second = fence.begin_fence(
+            subject="reader-subject", holder="holder", operation="write",
+            current_anchor=anchor, operation_id="guard-write")
+        with core._tx() as db:
+            db.execute("UPDATE authority_namespaces SET revocation_epoch=1 "
+                       "WHERE namespace=?", (AUTH_NS,))
+        with pytest.raises(AuthorityUnavailable, match="anchor is no longer current"):
+            store.get_current_guard(
+                credential="guard-reader", authority_namespace=AUTH_NS,
+                installation_id="installation", subject="reader-subject", permit=second)
+    finally:
+        core.close()
+
+
+def test_current_head_integrity_and_missing_head_fail_closed(tmp_path):
+    core = open_core(tmp_path / "authority.db", create=True)
+    try:
+        store, ticket, operation, proof = setup(
+            core, create=True, graph_verifier=lambda *_: True)
+        reserve(store, ticket, operation)
+        committed = finalize(store, operation, proof)
+        with core._tx() as db:
+            head = db.execute(
+                "SELECT issue_operation_id,current_operation_id,revision,state,guard_bytes "
+                "FROM authority_owner_authorization_heads_v1 WHERE authority_namespace=?",
+                (AUTH_NS,),
+            ).fetchone()
+        assert head == ("issue", "issue", 1, "active", canonical_bytes(committed.guard))
+
+        with core._tx() as db:
+            db.execute("UPDATE authority_owner_authorization_heads_v1 "
+                       "SET guard_bytes=? WHERE authority_namespace=?",
+                       (b"{}", AUTH_NS))
+        with pytest.raises(AuthorityUnavailable, match="current head differs"):
+            current_under_read(core, store)
+        with core._tx() as db:
+            db.execute("UPDATE authority_owner_authorization_heads_v1 "
+                       "SET guard_bytes=? WHERE authority_namespace=?",
+                       (head[4], AUTH_NS))
+            db.execute("DELETE FROM authority_owner_authorization_heads_v1 "
+                       "WHERE authority_namespace=?", (AUTH_NS,))
+        with pytest.raises(AuthorityUnavailable, match="lacks current head"):
+            current_under_read(core, store, operation_id="second-read")
+        assert finalize(store, operation, proof) == committed
+    finally:
+        core.close()
+
+
+def test_legacy_committed_issue_upgrades_to_current_head(tmp_path):
+    path = tmp_path / "authority.db"
+    core = open_core(path, create=True)
+    try:
+        store, ticket, operation, proof = setup(
+            core, create=True, graph_verifier=lambda *_: True)
+        reserve(store, ticket, operation)
+        committed = finalize(store, operation, proof)
+        with core._tx() as db:
+            db.execute("DROP TABLE authority_owner_authorization_heads_v1")
+    finally:
+        core.close()
+    core = open_core(path)
+    try:
+        store, _, _, _ = setup(core, create=True)
+        assert current_under_read(core, store) == committed.guard
     finally:
         core.close()

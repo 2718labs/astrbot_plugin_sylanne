@@ -333,6 +333,39 @@ def _validate_formal_resources(payload: dict[str, bytes]) -> None:
         raise RuntimeError("formal alpha1 rejects unproven migration placeholders")
 
 
+def _verify_workbench_source(project_root: Path, payload: dict[str, bytes], *, formal: bool) -> None:
+    """Keep packaged workbench bytes identical to the tested W11 source."""
+    source = project_root / "webui-src"
+    prefix = "resources/workbench/"
+    packaged = {path.removeprefix(prefix): content for path, content in payload.items()
+                if path.startswith(prefix)}
+    if not source.is_dir() and not packaged and not formal:
+        return  # Minimal development fixtures have no workbench.
+    if not source.is_dir() or "workbench-manifest.json" not in packaged:
+        raise ValueError("packaged workbench source or manifest is missing")
+    manifest = _strict_json_object(packaged["workbench-manifest.json"], "workbench manifest")
+    if (manifest.get("schema_version") != "sylanne.workbench-assets.v1"
+            or manifest.get("source") != "webui-src"):
+        raise ValueError("packaged workbench manifest has the wrong source")
+    rows = manifest.get("files")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("packaged workbench manifest is incomplete")
+    listed = {row.get("path"): row for row in rows if isinstance(row, dict)}
+    if len(listed) != len(rows):
+        raise ValueError("packaged workbench manifest has duplicate or invalid entries")
+    source_paths = {"index.html", *(path.relative_to(source).as_posix()
+                                   for path in (source / "src").rglob("*") if path.is_file())}
+    if set(listed) != source_paths or set(packaged) - {"workbench-manifest.json"} != source_paths:
+        raise ValueError("packaged workbench file set differs from source")
+    for relative in source_paths:
+        _validate_member_path(relative)
+        source_file = source / relative
+        if source_file.is_symlink() or source_file.read_bytes() != packaged[relative]:
+            raise ValueError(f"packaged workbench differs from source: {relative}")
+        if listed[relative].get("bytes") != len(packaged[relative]) or listed[relative].get("sha256") != _sha256(packaged[relative]):
+            raise ValueError(f"packaged workbench manifest is stale: {relative}")
+
+
 def _zip_info(path: str) -> zipfile.ZipInfo:
     info = zipfile.ZipInfo(path, FIXED_ZIP_TIME)
     info.compress_type = zipfile.ZIP_DEFLATED
@@ -444,6 +477,7 @@ def build_package(
             f"formal alpha1 requires metadata version {FORMAL_VERSION!r}; found {version!r}"
         )
     payload = _read_allowlisted_payload(root, formal=formal)
+    _verify_workbench_source(root, payload, formal=formal)
     affect_scheme = _d04_binding(payload) if formal else None
     native_path = (
         f"rewrite/sylanne3/_native/{target_os}-{target_arch}/{canonical_native}"

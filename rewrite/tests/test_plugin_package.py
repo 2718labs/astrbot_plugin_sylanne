@@ -131,8 +131,17 @@ class PluginPackageTests(unittest.TestCase):
             "release_eligibility": "READY",
             "migrations": [{"id": "fixture-only", "activation": "validated"}],
         }
+        workbench_index = b"<main>Sylanne</main>\n"
+        workbench_manifest = {
+            "schema_version": "sylanne.workbench-assets.v1",
+            "source": "webui-src",
+            "files": [{"path": "index.html", "sha256": hashlib.sha256(workbench_index).hexdigest(),
+                       "bytes": len(workbench_index)}],
+        }
         files = {
-            "resources/workbench/index.html": b"<main>Sylanne</main>\n",
+            "webui-src/index.html": workbench_index,
+            "resources/workbench/index.html": workbench_index,
+            "resources/workbench/workbench-manifest.json": json.dumps(workbench_manifest).encode(),
             "resources/catalogue/current.json": json.dumps(catalogue).encode() + b"\n",
             "resources/catalogue/d04-affect-scheme.json": json.dumps(affect_scheme).encode() + b"\n",
             "resources/migrations/v1.json": json.dumps(migrations).encode() + b"\n",
@@ -459,6 +468,18 @@ class PluginPackageTests(unittest.TestCase):
                 target_arch="x86_64",
                 native_library=self._native(),
                 output_dir=self.base / "missing-d04",
+            )
+
+    def test_package_rejects_stale_workbench_resource(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        (self.project / "webui-src/index.html").write_bytes(b"<main>new source</main>\n")
+        _run_git(self.project, "add", ".")
+        _run_git(self.project, "commit", "--quiet", "-m", "new workbench source")
+        with self.assertRaisesRegex(ValueError, "packaged workbench differs from source"):
+            self.builder.build_package(
+                project_root=self.project, target_os="windows", target_arch="x86_64",
+                native_library=self._native(), output_dir=self.base / "stale-workbench",
             )
 
     def test_formal_verifier_rejects_missing_or_mismatched_d04_binding(self) -> None:

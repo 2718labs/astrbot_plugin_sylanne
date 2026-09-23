@@ -9,6 +9,12 @@ from .context import (
     RoleBindingResolution,
     WorldEvent,
 )
+from .scene_applicability import (
+    NormApplicabilityEvidenceV1,
+    SceneBindingApplicabilityV1,
+    SceneIngressScopeV1,
+    check_current_scene_applicability,
+)
 
 __all__ = (
     "AccountBinding",
@@ -17,5 +23,9 @@ __all__ = (
     "RoleBinding",
     "RoleBindingRequest",
     "RoleBindingResolution",
+    "NormApplicabilityEvidenceV1",
+    "SceneBindingApplicabilityV1",
+    "SceneIngressScopeV1",
     "WorldEvent",
+    "check_current_scene_applicability",
 )

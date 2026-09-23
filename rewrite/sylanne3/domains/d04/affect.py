@@ -535,9 +535,81 @@ class SemanticDriveRule:
 
     def __post_init__(self) -> None:
         _nonempty(self.axis_id, "axis_id")
-        if self.facet_field not in {"anticipated_impact", "controllability"}:
+        if self.facet_field not in {"anticipated_impact", "controllability"} | {
+            f"mechanism:{name}" for name in INITIAL_MECHANISMS
+        }:
             raise ValueError("facet_field must be an implemented semantic dimension")
         object.__setattr__(self, "gain", _finite(self.gain, "gain"))
+
+
+INITIAL_MECHANISMS = (
+    "expectation", "approach_protection", "agency", "relationship", "self_evaluation",
+)
+
+
+@dataclass(frozen=True)
+class MechanismSignal:
+    """A sourced hypothesis for one meaning under one interpretation.
+
+    Positive/negative values express opposite directions *within* the named
+    mechanism: expectation met/disappointed, approach/protection, agency/loss
+    of control, relationship affirmation/threat, self affirmation/reproach.
+    They never mean overall pleasure or displeasure.  The five initial names
+    are candidate mechanisms, not an exhaustive emotion vocabulary.
+    """
+
+    facet_id: str
+    interpretation_ref: str
+    mechanism_id: str
+    value: float | None
+    source_refs: tuple[str, ...]
+    unknown_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("facet_id", "interpretation_ref", "mechanism_id"):
+            _nonempty(getattr(self, name), name)
+        object.__setattr__(self, "source_refs", _refs(self.source_refs, "source_refs"))
+        if self.value is None:
+            _nonempty(self.unknown_reason, "unknown_reason")
+        else:
+            value = _finite(self.value, "mechanism signal")
+            if not -1.0 <= value <= 1.0:
+                raise ValueError("mechanism signal must be in [-1, 1]")
+            object.__setattr__(self, "value", value)
+            if self.unknown_reason is not None:
+                raise ValueError("known mechanism signal cannot have an unknown reason")
+
+
+@dataclass(frozen=True)
+class MechanismDriveContribution:
+    facet_id: str
+    interpretation_ref: str
+    mechanism_id: str
+    axis_id: str
+    drive: float
+    source_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnresolvedMechanism:
+    facet_id: str
+    interpretation_ref: str
+    mechanism_id: str
+    value: float | None
+    reason: str
+    source_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MechanismDriveCandidate:
+    """Uncommitted semantic mapping, with no summed valence or numeric certificate."""
+
+    appraisal_id: str
+    contribution_key: str
+    scheme_version: str
+    mapping_version: str
+    contributions: tuple[MechanismDriveContribution, ...]
+    unresolved: tuple[UnresolvedMechanism, ...]
 
 
 @dataclass(frozen=True)
@@ -686,6 +758,84 @@ class AffectProvider:
             raise TypeError("appraisal must be AppraisalBundle")
         return appraisal
 
+    def assemble_mechanism_drives(
+        self,
+        appraisal: AppraisalBundle,
+        scheme: AffectScheme,
+        signals: tuple[MechanismSignal, ...],
+        rules: tuple[SemanticDriveRule, ...],
+        *,
+        mapping_version: str,
+    ) -> MechanismDriveCandidate:
+        """Map declared signals without merging meanings or rival interpretations.
+
+        Unresolved rows are representation gaps, not zero-valued inputs.  This
+        pure candidate cannot be fed to the numerical solver as a certificate.
+        """
+        if not isinstance(appraisal, AppraisalBundle) or not isinstance(scheme, AffectScheme):
+            raise TypeError("appraisal and scheme must be D04 contract values")
+        _nonempty(mapping_version, "mapping_version")
+        if not isinstance(signals, tuple) or any(not isinstance(signal, MechanismSignal) for signal in signals):
+            raise TypeError("signals must be MechanismSignal values")
+        if not isinstance(rules, tuple) or any(not isinstance(rule, SemanticDriveRule) for rule in rules):
+            raise TypeError("rules must be SemanticDriveRule values")
+        registered_axes = {axis.axis_id for axis in scheme.axes}
+        if any(rule.axis_id not in registered_axes for rule in rules):
+            raise ValueError("mechanism rule uses an unregistered axis")
+        if any(not rule.facet_field.startswith("mechanism:") for rule in rules):
+            raise ValueError("mechanism assembly needs only mechanism rules")
+        mechanism_rules = rules
+        if len({(rule.axis_id, rule.facet_field) for rule in mechanism_rules}) != len(mechanism_rules):
+            raise ValueError("duplicate mechanism rule would repeat one drive")
+        facets = {facet.facet_id: facet for facet in appraisal.meaning_facets}
+        keyed_signals: dict[tuple[str, str], MechanismSignal] = {}
+        for signal in signals:
+            facet = facets.get(signal.facet_id)
+            if facet is None:
+                raise ValueError("mechanism signal refers to a missing meaning facet")
+            if signal.interpretation_ref != facet.interpretation_ref:
+                raise ValueError("mechanism signal interpretation differs from its meaning facet")
+            if not set(signal.source_refs) <= set(facet.source_refs):
+                raise ValueError("mechanism signal source is absent from its meaning facet")
+            key = (signal.facet_id, signal.mechanism_id)
+            if key in keyed_signals:
+                raise ValueError("duplicate mechanism signal for one meaning facet")
+            keyed_signals[key] = signal
+
+        contributions: list[MechanismDriveContribution] = []
+        unresolved: list[UnresolvedMechanism] = []
+        mapped_mechanisms = tuple(dict.fromkeys(
+            rule.facet_field.removeprefix("mechanism:") for rule in mechanism_rules
+        ))
+        for facet in appraisal.meaning_facets:
+            for mechanism in mapped_mechanisms:
+                signal = keyed_signals.get((facet.facet_id, mechanism))
+                if signal is None or signal.value is None:
+                    unresolved.append(UnresolvedMechanism(
+                        facet.facet_id, facet.interpretation_ref, mechanism,
+                        None if signal is None else signal.value,
+                        "missing_signal" if signal is None else signal.unknown_reason,
+                        facet.source_refs if signal is None else signal.source_refs,
+                    ))
+                    continue
+                for rule in mechanism_rules:
+                    if rule.facet_field == f"mechanism:{mechanism}":
+                        contributions.append(MechanismDriveContribution(
+                            facet.facet_id, facet.interpretation_ref, mechanism,
+                            rule.axis_id, rule.gain * signal.value, signal.source_refs,
+                        ))
+            for signal in signals:
+                if signal.facet_id == facet.facet_id and signal.mechanism_id not in mapped_mechanisms:
+                    unresolved.append(UnresolvedMechanism(
+                        facet.facet_id, facet.interpretation_ref, signal.mechanism_id,
+                        signal.value,
+                        "unmapped_mechanism", signal.source_refs,
+                    ))
+        return MechanismDriveCandidate(
+            appraisal.appraisal_id, appraisal.contribution_key, scheme.scheme_version,
+            mapping_version, tuple(contributions), tuple(unresolved),
+        )
+
     def proposal_for(
         self,
         envelope: CommandEnvelope,
@@ -776,6 +926,8 @@ class AffectProvider:
             raise TypeError("mixed update requires D04 appraisal, scheme, feeling, and mood")
         if not isinstance(rules, tuple) or not rules or any(not isinstance(rule, SemanticDriveRule) for rule in rules):
             raise ValueError("mixed update needs declared semantic drive rules")
+        if any(rule.facet_field.startswith("mechanism:") for rule in rules):
+            raise ValueError("candidate mechanism mapping has no certified numeric operator")
         if current_feeling.cursor != current_mood.cursor:
             raise ValueError("feeling and mood must share one committed time cursor")
         if (current_feeling.basis_version, current_feeling.operator_version,

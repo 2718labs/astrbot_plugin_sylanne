@@ -79,7 +79,17 @@ class AstrBotTextPlatformCapability:
                 or request.platform_capability_ref != self.descriptor.capability_ref
                 or start.operation_id != request.operation_id
                 or start.effect_id != request.effect_id
-                or start.platform_capability_ref != request.platform_capability_ref):
+                or start.platform_capability_ref != request.platform_capability_ref
+                or start.dispatch_generation != request.dispatch_generation
+                or start.activation_generation != request.activation_generation
+                or start.worker_fence != request.worker_fence
+                or start.content_fence != request.content_fence
+                or start.cancel_epoch != request.cancel_epoch
+                or start.proactive_contact != request.proactive_contact
+                or start.segment_authorization_ref != request.segment_authorization_ref
+                or start.segment_manifest_digest != request.segment_manifest_digest
+                or start.segment_index != request.segment_index
+                or start.segment_count != request.segment_count):
             raise DispatchBlocked("handoff identity differs from the bound capability")
         try:
             running_loop = asyncio.get_running_loop()

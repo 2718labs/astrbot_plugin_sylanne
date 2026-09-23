@@ -3,6 +3,7 @@ import unittest
 
 from sylanne3.domains.d08 import (
     ActionIntent,
+    ActionSchemaRecord,
     ActionOutcome,
     ActionSchema,
     Commitment,
@@ -20,6 +21,7 @@ from sylanne3.domains.d08 import (
     RepairIntent,
     RequiredCheckRegistry,
     RequiredCheckSpec,
+    prepare_expression_plan,
 )
 from sylanne3.graph_types import AtomKey, GraphVersion, GraphWrite, Owner
 from sylanne3.runtime_contracts import (
@@ -84,12 +86,27 @@ def _receipt(spec, *, result="pass", coverage="full", valid_until=50.0, versions
     )
 
 
+def _commitment_spec(action_ref="action:share-1"):
+    versions = (
+        VersionedRef("criteria:1", 1),
+        VersionedRef("goal:share-art", 1),
+        VersionedRef("commitment:show-art", 1),
+        VersionedRef("commitments-query:persona:sylanne", 4),
+        VersionedRef(f"execution-epoch:{action_ref}", 3),
+        VersionedRef(f"cancellation-epoch:{action_ref}", 2),
+    )
+    return RequiredCheckSpec(
+        "commitment_conflict", "d08.commitment_conflict", "persona:sylanne",
+        action_ref, "respond", "criteria:1", versions,
+    )
+
+
 def _schema(*, proactive=False, action_ref="action:share-1"):
     base = (
         _spec("role_binding", "d03.role_binding", version_ref="binding:1", action_ref=action_ref),
         _spec("boundary", "d05.boundary", version_ref="boundary:1", action_ref=action_ref),
         _spec("source_grant", "d06.source_grant", version_ref="grant:1", action_ref=action_ref),
-        _spec("commitment_conflict", "d08.commitment_conflict", version_ref="commitments:1", action_ref=action_ref),
+        _commitment_spec(action_ref),
         _spec("dispatch_budget", "d11.dispatch_budget", version_ref="budget:1", action_ref=action_ref),
     )
     if proactive:
@@ -215,30 +232,82 @@ class GoalExecutionDomainTests(unittest.TestCase):
     def test_d08_commitment_check_requires_a_complete_conflict_snapshot(self):
         provider = GoalExecutionProvider()
         intent = _intent()
+        schema = _schema()
         spec = next(item for item in intent.required_checks if item.provider_id == "d08.commitment_conflict")
+
+        def snapshot(**changes):
+            values = dict(
+                input_versions=spec.required_input_versions,
+                coverage="full",
+                applicable_commitment_refs=intent.commitment_refs,
+                conflicting_commitment_refs=(),
+                pending_effect_refs=(),
+                action_ref=intent.action_id,
+                action_revision=intent.revision,
+                intent_digest=canonical_digest(intent),
+                schema_id=schema.schema_id,
+                goal_ref=intent.goal_ref,
+                target_ref=intent.target_ref,
+                action_kind=intent.action_kind,
+                purpose=intent.purpose,
+                commitment_query_epoch_ref="commitments-query:persona:sylanne",
+                commitment_query_epoch=4,
+                execution_epoch_ref=f"execution-epoch:{intent.action_id}",
+                execution_epoch=3,
+                cancellation_epoch_ref=f"cancellation-epoch:{intent.action_id}",
+                cancellation_epoch=2,
+                current_read_confirmed=True,
+                action_cancelled=False,
+                conflicting_action_refs=(),
+            )
+            values.update(changes)
+            return CommitmentConflictSnapshot(**values)
+
         partial = provider.provide_required_check(
             intent,
-            CommitmentConflictSnapshot(spec.required_input_versions, "partial", (), (), ("query:gap",)),
+            schema,
+            snapshot(coverage="partial", pending_effect_refs=("effect:unknown",)),
             valid_until=20.0,
         )
         self.assertEqual((partial.result, partial.coverage), ("unknown", "partial"))
         conflict = provider.provide_required_check(
             intent,
-            CommitmentConflictSnapshot(
-                spec.required_input_versions, "full", intent.commitment_refs,
-                ("commitment:conflicting",), (),
+            schema,
+            snapshot(
+                applicable_commitment_refs=intent.commitment_refs + ("commitment:conflicting",),
+                conflicting_commitment_refs=("commitment:conflicting",),
             ),
             valid_until=20.0,
         )
         self.assertEqual(conflict.result, "fail")
         clear = provider.provide_required_check(
             intent,
-            CommitmentConflictSnapshot(
-                spec.required_input_versions, "full", intent.commitment_refs, (), (),
-            ),
+            schema,
+            snapshot(),
             valid_until=20.0,
         )
         self.assertEqual((clear.result, clear.coverage), ("pass", "full"))
+
+        missing_current_read = provider.provide_required_check(
+            intent, schema, snapshot(current_read_confirmed=False), valid_until=20.0,
+        )
+        self.assertEqual((missing_current_read.result, missing_current_read.coverage), ("unknown", "partial"))
+        changed_candidate = replace(intent, parameters_digest=canonical_digest({"target": "other"}))
+        mismatched_candidate = provider.provide_required_check(
+            changed_candidate, schema, snapshot(), valid_until=20.0,
+        )
+        self.assertEqual((mismatched_candidate.result, mismatched_candidate.coverage), ("unknown", "partial"))
+        cancelled = provider.provide_required_check(
+            intent, schema, snapshot(action_cancelled=True), valid_until=20.0,
+        )
+        self.assertEqual((cancelled.result, cancelled.coverage), ("fail", "full"))
+        changed_cancel_epoch = provider.provide_required_check(
+            intent,
+            schema,
+            snapshot(cancellation_epoch=3),
+            valid_until=20.0,
+        )
+        self.assertEqual((changed_cancel_epoch.result, changed_cancel_epoch.coverage), ("unknown", "partial"))
 
     def test_version_mismatch_and_expiry_do_not_produce_qualification(self):
         registry = RequiredCheckRegistry()
@@ -298,7 +367,7 @@ class GoalExecutionDomainTests(unittest.TestCase):
             action_id="action:repair-1", effect_id="effect:repair-1", attempt_id="attempt:repair-1"
         )
         qualified = RequiredCheckRegistry()
-        qualified.register(_schema())
+        qualified.register(_schema(action_ref=repair.action_id))
         decision = qualified.qualify(repair, tuple(_receipt(s) for s in repair.required_checks), now=5.0)
         result = RepairIntent.create(
             "repair:1", original, repair, decision, ("outcome:failed-1",),
@@ -338,6 +407,65 @@ class GoalExecutionDomainTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             provider.validate(_proposal(writes=(bad_write,)), snapshot=None)
+
+    def test_action_schema_is_frozen_with_the_exact_intent_operation(self):
+        provider = GoalExecutionProvider()
+        schema = _schema()
+        intent = _intent(schema)
+        base = _proposal()
+        envelope = replace(base.envelope, identity=intent.identity)
+        candidate = provider.prepare_action_candidate(replace(base, envelope=envelope), intent, schema)
+        action_writes = tuple(write for write in candidate.typed_writes
+                              if write.key.type_name == "d08.action_intent.v1")
+        schema_writes = tuple(write for write in candidate.typed_writes
+                              if write.key.type_name == "d08.action_schema.v1")
+        self.assertEqual(len(action_writes), 1)
+        self.assertEqual(len(schema_writes), 1)
+        self.assertEqual(action_writes[0].key.owner, schema_writes[0].key.owner)
+        self.assertTrue(next(spec for spec in provider.register_types()
+                             if spec.name == "d08.action_schema.v1").immutable)
+
+        schema_type = next(spec for spec in provider.register_types()
+                           if spec.name == "d08.action_schema.v1")
+        decoded = schema_type.validator(schema_writes[0].value)
+        self.assertIsInstance(decoded, ActionSchemaRecord)
+        self.assertEqual(decoded.operation, intent.identity)
+        self.assertEqual(decoded.intent_digest, canonical_digest(intent))
+        self.assertEqual(decoded.required_checks, schema.required_checks)
+        self.assertEqual(candidate.envelope.identity, decoded.operation)
+
+        with self.assertRaisesRegex(ValueError, "exactly one intent and one frozen schema"):
+            provider.validate(replace(candidate, typed_writes=action_writes), snapshot=None)
+        with self.assertRaisesRegex(ValueError, "exact operation identity"):
+            provider.prepare_action_candidate(base, intent, schema)
+
+    def test_action_schema_candidate_rejects_removed_checks_or_tampered_versions(self):
+        provider = GoalExecutionProvider()
+        schema = _schema()
+        intent = _intent(schema)
+        base = _proposal()
+        envelope = replace(base.envelope, identity=intent.identity)
+        incomplete_schema = ActionSchema(
+            schema.schema_id, schema.action_kind, schema.proactive,
+            tuple(item for item in schema.required_checks if item.check_kind != "boundary"),
+        )
+        with self.assertRaisesRegex(ValueError, "removed required checks"):
+            provider.prepare_action_candidate(replace(base, envelope=envelope), intent, incomplete_schema)
+
+        candidate = provider.prepare_action_candidate(replace(base, envelope=envelope), intent, schema)
+        schema_write = next(write for write in candidate.typed_writes
+                            if write.key.type_name == "d08.action_schema.v1")
+        tampered = dict(schema_write.value)
+        tampered["schema_hash"] = "0" * 64
+        tampered_proposal = replace(
+            candidate,
+            typed_writes=tuple(
+                GraphWrite(write.key, tampered, write.dependencies) if write is schema_write else write
+                for write in candidate.typed_writes
+            ),
+        )
+        with self.assertRaises(ValueError):
+            provider.validate(tampered_proposal, snapshot=None)
 
     def test_qualified_action_freezes_a_finite_multi_segment_communication_grant(self):
         registry = RequiredCheckRegistry()
@@ -505,6 +633,63 @@ class GoalExecutionDomainTests(unittest.TestCase):
         self.assertEqual(delivery.status, "unavailable")
         self.assertEqual(delivery.admitted_segment_refs, ("segment:1",))
         self.assertEqual(delivery.missing, ("d11_admission:segment:2",))
+
+    def test_required_checks_to_finite_expression_plan_respects_cancel_and_unknown(self):
+        registry = RequiredCheckRegistry()
+        schema = _schema()
+        registry.register(schema)
+        intent = _intent(schema)
+        receipts = tuple(_receipt(spec) for spec in schema.required_checks)
+        use_one = ClaimUse("claim:one", 0, 5, ClaimKind.EXTERNAL_FACT)
+        use_two = ClaimUse("claim:two", 0, 6, ClaimKind.EXTERNAL_FACT)
+        request = CommunicationGrantRequest(
+            "communication:share-1", "contact:alice-1", 1, ("entity:alice",),
+            ("answer",), ("external_fact",), (),
+            (
+                CommunicationSegmentSpec("segment:1", "effect:segment-1", 0,
+                    segment_payload_digest("First", (), (use_one,)), 200, (), None),
+                CommunicationSegmentSpec("segment:2", "effect:segment-2", 1,
+                    segment_payload_digest("Second", (), (use_two,)), 200, (), "segment:1"),
+            ),
+            2,
+        )
+        claims = (
+            ExpressionClaim("claim:one", "First", ClaimKind.EXTERNAL_FACT,
+                ("source:request-1",), ("entity:alice",), ("expression",), "disclosure:1"),
+            ExpressionClaim("claim:two", "Second", ClaimKind.EXTERNAL_FACT,
+                ("source:request-1",), ("entity:alice",), ("expression",), "disclosure:1"),
+        )
+        candidates = (
+            SegmentCandidate("segment:1", "effect:segment-1", "First", (use_one,), ("answer",), (), 0.0),
+            SegmentCandidate("segment:2", "effect:segment-2", "Second", (use_two,), (), (), 0.0),
+        )
+        args = (registry, intent, receipts, request, claims, candidates)
+        result = prepare_expression_plan(*args, scene_ref="scene:chat", conversation_epoch=1,
+            cancellation_epoch=2, now=5.0)
+        self.assertEqual(result.status, "complete")
+        self.assertIsNotNone(result.grant)
+        self.assertEqual(result.grant.required_check_refs, result.grant.segment_grants[1].required_check_refs)
+        self.assertEqual(tuple(segment.segment_id for segment in result.staging.segments),
+            ("segment:1", "segment:2"))
+        incomplete_plan = prepare_expression_plan(registry, intent, receipts, request, claims, candidates[:1],
+            scene_ref="scene:chat", conversation_epoch=1, cancellation_epoch=2, now=5.0)
+        self.assertEqual(incomplete_plan.status, "rejected")
+        self.assertIn("segment_manifest", incomplete_plan.missing)
+        unknown = AdmissionReceipt("admission:1", "segment:1", "effect:segment-1",
+            result.staging.segments[0].payload_digest, "unknown")
+        delivery = D09ExpressionProvider.prepare_delivery(result.staging, result.grant, (unknown,))
+        self.assertEqual(delivery.status, "pending_confirmation")
+        self.assertEqual(delivery.blocked_segment_refs, ("segment:2",))
+
+        missing = prepare_expression_plan(registry, intent, receipts[:-1], request, claims, candidates,
+            scene_ref="scene:chat", conversation_epoch=1, cancellation_epoch=2, now=5.0)
+        self.assertEqual(missing.status, "unavailable")
+        self.assertIsNone(missing.grant)
+        self.assertIn("dispatch_budget", missing.missing)
+        canceled = prepare_expression_plan(*args, scene_ref="scene:chat", conversation_epoch=1,
+            cancellation_epoch=3, now=5.0)
+        self.assertEqual(canceled.status, "stale")
+        self.assertIsNone(canceled.grant)
 
 
 if __name__ == "__main__":

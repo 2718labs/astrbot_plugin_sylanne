@@ -47,6 +47,12 @@ _TRACE_FIELDS = frozenset({
     "trace_id", "episode_ref", "perspective_ref", "then_feeling_refs",
     "interpretation_refs", "detail_weights",
 })
+_ASSOCIATION_FIELDS = frozenset({
+    "association_id", "source_ref", "target_ref", "kind", "weight",
+    "context_tags", "basis_source_refs", "content_reality",
+})
+_ASSOCIATION_KINDS = frozenset({"co_experience", "similarity", "contrast", "subjective_meaning"})
+_ASSOCIATION_REALITIES = frozenset({"observed", "reported", "authored", "simulated", "subjective"})
 
 _SOURCE_SCHEMA_HASH = schema_hash({
     "type": "memory.source",
@@ -73,6 +79,10 @@ _EPISODE_SCHEMA_HASH = schema_hash({
 _TRACE_SCHEMA_HASH = schema_hash({
     "type": "memory.subjective_trace.v1", "version": 1,
     "fields": sorted(_TRACE_FIELDS), "immutable": True,
+})
+_ASSOCIATION_SCHEMA_HASH = schema_hash({
+    "type": "memory.association.v1", "version": 1,
+    "fields": sorted(_ASSOCIATION_FIELDS), "immutable": True,
 })
 
 
@@ -255,6 +265,10 @@ def subjective_trace_key(bot: str, persona: str, trace_id: str) -> AtomKey:
     return AtomKey(Owner("event", bot, persona, trace_id), "memory.subjective_trace.v1", "record")
 
 
+def association_key(bot: str, persona: str, source_id: str, association_id: str) -> AtomKey:
+    return AtomKey(Owner("event", bot, persona, source_id), "memory.association.v1", association_id)
+
+
 def _graph_ref(value: object, label: str) -> AtomKey:
     _text(value, label)
     try:
@@ -307,6 +321,29 @@ def validate_subjective_trace(value: object) -> None:
             raise ValueError("detail weight must be finite and between 0 and 1")
 
 
+def validate_association(value: object) -> None:
+    data = _exact_object(value, _ASSOCIATION_FIELDS, "memory association")
+    _text(data["association_id"], "association_id")
+    source = _graph_ref(data["source_ref"], "source_ref")
+    target = _graph_ref(data["target_ref"], "target_ref")
+    basis = _graph_ref_list(data["basis_source_refs"], "basis_source_refs", require_one=True)
+    if any(key.type_name != "memory.source" for key in (source, target, *basis)):
+        raise ValueError("association endpoints and basis must reference memory sources")
+    if len({(key.owner.bot, key.owner.persona) for key in (source, target, *basis)}) != 1:
+        raise ValueError("association references cross namespace")
+    if source == target:
+        raise ValueError("association endpoints must differ")
+    _enum(data["kind"], _ASSOCIATION_KINDS, "association kind")
+    _enum(data["content_reality"], _ASSOCIATION_REALITIES, "association reality")
+    weight = data["weight"]
+    if type(weight) not in (int, float) or not math.isfinite(weight) or not 0 <= weight <= 1:
+        raise ValueError("association weight must be finite and between 0 and 1")
+    tags = _tuple_from_json(data["context_tags"], "context_tags")
+    _string_tuple(tags, "context_tags")
+    if len(tags) > 8:
+        raise ValueError("association context_tags may contain at most 8 values")
+
+
 def validate_access(value: object) -> None:
     data = _exact_object(value, _ACCESS_FIELDS, "memory access")
     _text(data["source_id"], "source_id")
@@ -348,4 +385,8 @@ def register_memory_types(registry: TypeRegistry) -> None:
     registry.register(TypeSpec(
         "memory.subjective_trace.v1", ("event",), "source", validate_subjective_trace,
         immutable=True, writer_domain="d06", schema_hash=_TRACE_SCHEMA_HASH,
+    ))
+    registry.register(TypeSpec(
+        "memory.association.v1", ("event",), "source", validate_association,
+        immutable=True, writer_domain="d06", schema_hash=_ASSOCIATION_SCHEMA_HASH,
     ))

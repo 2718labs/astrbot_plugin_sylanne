@@ -1,7 +1,7 @@
 export const VIEW_STATES = Object.freeze(["loading", "empty", "unauthorized", "stale", "partial", "unavailable", "ready"]);
 
 export function initialState() {
-  return { role: null, roleEpoch: 0, view: "overview", projection: null, status: "unavailable", problem: { code: "service_unavailable", message: "工作台服务尚未提供可验证投影。" }, receipt: null };
+  return { role: null, roleEpoch: 0, view: "setup", projection: null, status: "unavailable", problem: { code: "service_unavailable", message: "尚未核验工作台连接。" }, receipt: null };
 }
 
 export function switchRole(state, role) {

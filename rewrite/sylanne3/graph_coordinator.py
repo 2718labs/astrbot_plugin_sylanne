@@ -154,6 +154,48 @@ class NamespaceProvisionReceiptV2:
     permit_wire: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class RoleInitializationReceiptV1:
+    """One durable D01 first head; this receipt is not an Owner capability."""
+
+    namespace: NamespaceId
+    operation_id: str
+    request_digest: str
+    input_digest: str
+    plan_id: str
+    head_id: str
+    owner_grant_id: str
+    owner_grant_revision: int
+    owner_authorization_head: str
+    graph_incarnation: str
+    graph_revision: int
+    graph_epoch: int
+    fence_attempt_id: str
+    finish_request_id: str
+    finish_request_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SceneBindingReceiptV1:
+    """Durable first D03 scene binding, never a standing social-role permit."""
+
+    namespace: NamespaceId
+    operation_id: str
+    request_digest: str
+    input_digest: str
+    scene_ref: str
+    binding_id: str
+    role_head_id: str
+    owner_grant_id: str
+    owner_authorization_head: str
+    graph_incarnation: str
+    graph_revision: int
+    graph_epoch: int
+    fence_attempt_id: str
+    finish_request_id: str
+    finish_request_digest: str
+
+
 @dataclass(frozen=True)
 class _NamespaceProvisionIntentV2:
     namespace: NamespaceId
@@ -984,6 +1026,1511 @@ class GraphCoordinator:
                 digest, canonical_json(asdict(proof))),
         )
         return proof
+
+    def commit_first_owner_grant_v2(self, bootstrap: object, *,
+                                    namespace: NamespaceId, operation_id: str,
+                                    grant_value: dict):
+        """Commit only the paired pending first Owner issue under a v2 write fence.
+
+        Authority is queried as the installed graph peer, never through a DTO
+        supplied by the caller. The resulting proof is inert until Authority
+        independently verifies it and finalizes the issue.
+        """
+        from .authority_service.contract import identifier
+        from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
+        from .authority_service.v2_owner_contract import OwnerGraphCommitProofV1
+
+        if bootstrap is not self.__bootstrap:
+            raise AuthorityDenied("owner graph issue requires host bootstrap")
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None):
+            raise UnavailableGuard("owner graph issue requires production v2")
+        if type(namespace) is not NamespaceId:
+            raise TypeError("namespace must be NamespaceId")
+        identifier(operation_id, "operation_id")
+        validate_owner_grant_v1(grant_value)
+        grant_digest = "sha256:" + canonical_digest(grant_value)
+        store = self.__store
+        port = self.__content_fence_v2
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            intent = store._db.execute(
+                "SELECT operation_id,grant_digest,fence_attempt_id,"
+                "requirements_json,anchor_json,graph_revision,graph_epoch "
+                "FROM graph_owner_issue_intents_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=? AND grant_digest=?",
+                namespace.as_tuple + (operation_id, grant_digest),
+            ).fetchone()
+            rejected = store._db.execute(
+                "SELECT status,permit_json,graph_revision,graph_epoch,"
+                "finish_request_id,finish_request_digest "
+                "FROM graph_owner_issue_rejections_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=? AND grant_digest=?",
+                namespace.as_tuple + (operation_id, grant_digest),
+            ).fetchone()
+            saved = store._db.execute(
+                "SELECT operation_id,permit_json,pre_graph_revision,"
+                "pre_graph_epoch,post_graph_revision,post_graph_epoch,"
+                "finish_request_id,finish_request_digest "
+                "FROM graph_owner_issue_fences_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            proof_row = store._db.execute(
+                "SELECT operation_id,request_digest,grant_id,grant_digest,"
+                "graph_incarnation,graph_access_epoch,graph_epoch,"
+                "graph_receipt_digest,proof_json "
+                "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+        target = metadata.requirements
+        if (target.namespace != namespace or target.activation_generation != 1
+                or target.authority_id != port.installation_grant.authority_id
+                or target.authority_namespace == ""):
+            raise UnavailableGuard("owner graph recovery identity differs")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("owner graph recovery anchor differs")
+        attempt_id = "owner-write-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "grant_digest": grant_digest,
+        })[:48]
+        identity = (operation_id, grant_digest, attempt_id,
+                    canonical_json(asdict(target)), canonical_json(asdict(anchor)))
+        if intent is not None and intent[:5] != identity:
+            raise AuthorityDenied("first Owner issue intent differs")
+        if intent is not None and (metadata.graph_revision, epoch.revision) != intent[5:7]:
+            if saved is None:
+                raise UnavailableGuard("uncommitted Owner issue graph stamp changed")
+        if rejected is not None:
+            if saved is not None or proof_row is not None or intent is None:
+                raise UnavailableGuard("rejected Owner issue has business receipt")
+            permit = from_wire(json.loads(rejected[1]))
+            abort_id = "abort:" + attempt_id
+            abort_digest = "sha256:" + canonical_digest({
+                "operation_id": attempt_id, "permit_token": permit.token,
+                "action": "rejected_no_owner_commit",
+                "business_operation_id": operation_id,
+                "grant_digest": grant_digest,
+            })
+            if (rejected[0] != "rejected_no_commit"
+                    or rejected[2:4] != intent[5:7]
+                    or rejected[4:6] != (abort_id, abort_digest)
+                    or permit.operation_id != attempt_id
+                    or permit.operation != "write" or permit.holder != self.__holder
+                    or permit.subject != port.installation_grant.subject
+                    or permit.authority_id != target.authority_id
+                    or permit.namespace != target.authority_namespace
+                    or permit.generation != 1
+                    or permit.pinned_anchor != anchor):
+                raise UnavailableGuard("durable Owner rejection identity differs")
+            observed, state = port.get_fence_operation(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                operation_id=attempt_id)
+            if observed != permit or state not in {"active", "finished"}:
+                raise UnavailableGuard("rejected Owner issue fence differs")
+            if state == "active":
+                scope = FenceScope(namespace, target.authority_namespace, 1,
+                    "write", attempt_id, permit, anchor,
+                    NamespaceEpoch(*namespace.as_tuple, intent[6]), intent[5])
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("rejected Owner write permit changed")
+                port.finish_fence(scope, request_id=abort_id,
+                                  request_digest=abort_digest)
+            raise AuthorityDenied("Owner issue is terminal rejected_no_commit")
+        if (saved is None) != (proof_row is None):
+            raise UnavailableGuard("Owner graph proof and fence receipt disagree")
+        if saved is not None:
+            try:
+                permit = from_wire(json.loads(saved[1]))
+                proof = OwnerGraphCommitProofV1(
+                    namespace, proof_row[0], proof_row[1], proof_row[2],
+                    proof_row[3], proof_row[4], 1, proof_row[5],
+                    proof_row[6], proof_row[7])
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("durable Owner issue proof is invalid") from exc
+            finish_id = "finish:" + attempt_id
+            finish_digest = "sha256:" + canonical_digest({
+                "operation_id": attempt_id, "permit_token": permit.token,
+                "action": "finish_owner_issue", "business_operation_id": operation_id,
+                "graph_receipt_digest": proof.graph_receipt_digest,
+            })
+            if (intent is None or saved[0] != operation_id
+                    or saved[2:4] != intent[5:7]
+                    or saved[4] != saved[2] + 1 or saved[5] != proof.graph_epoch
+                    or saved[6:8] != (finish_id, finish_digest)
+                    or proof_row[0] != operation_id or proof_row[3] != grant_digest
+                    or proof_row[8] != canonical_json(asdict(proof))
+                    or permit.operation_id != attempt_id or permit.operation != "write"
+                    or permit.holder != self.__holder
+                    or permit.subject != port.installation_grant.subject
+                    or permit.authority_id != target.authority_id
+                    or permit.namespace != target.authority_namespace
+                    or permit.generation != 1 or permit.pinned_anchor != anchor):
+                raise UnavailableGuard("durable Owner issue fence identity differs")
+            with store._lock:
+                atom = store._db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (owner_grant_key(*namespace.as_tuple).token,),
+                ).fetchone()
+                access = store._db.execute(
+                    "SELECT access_epoch FROM graph_authority_epochs "
+                    "WHERE bot=? AND persona=?", namespace.as_tuple,
+                ).fetchone()
+                if (atom != (1, canonical_json(grant_value), 1)
+                        or access != (proof.graph_access_epoch,)):
+                    raise UnavailableGuard("durable Owner grant differs from graph")
+            observed, state = port.get_fence_operation(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                operation_id=attempt_id)
+            if observed != permit or state not in {"active", "finished"}:
+                raise UnavailableGuard("Owner issue Authority fence differs")
+            if state == "active":
+                if (metadata.graph_revision, epoch.revision) != saved[4:6]:
+                    raise UnavailableGuard("active Owner issue lost its graph stamp")
+                scope = FenceScope(
+                    namespace, target.authority_namespace, 1, "write", attempt_id,
+                    permit, anchor, NamespaceEpoch(*namespace.as_tuple, saved[3]),
+                    saved[2])
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("Owner issue write permit changed")
+                port.finish_fence(scope, request_id=finish_id,
+                                  request_digest=finish_digest)
+            elif (metadata.graph_revision < saved[4]
+                  or epoch.revision < saved[5]):
+                raise UnavailableGuard("finished Owner issue lost its graph stamp")
+            return proof
+        if proof_row is not None:
+            raise UnavailableGuard("Owner graph proof lacks durable fence receipt")
+        if intent is None:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("Owner issue graph stamp changed before intent")
+                    db.execute(
+                        "INSERT OR IGNORE INTO graph_owner_issue_intents_v1"
+                        "(bot,persona,operation_id,grant_digest,fence_attempt_id,"
+                        "requirements_json,anchor_json,graph_revision,graph_epoch) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + identity + (
+                            metadata.graph_revision, epoch.revision),
+                    )
+                    intent = db.execute(
+                        "SELECT operation_id,grant_digest,fence_attempt_id,"
+                        "requirements_json,anchor_json,graph_revision,graph_epoch "
+                        "FROM graph_owner_issue_intents_v1 WHERE bot=? AND persona=? "
+                        "AND operation_id=? AND grant_digest=?",
+                        namespace.as_tuple + (operation_id, grant_digest),
+                    ).fetchone()
+                    if intent != identity + (metadata.graph_revision, epoch.revision):
+                        raise AuthorityDenied("Owner issue intent was not installed")
+                    db.execute("COMMIT")
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                    raise
+        from .runtime.restore_anchor import RestoreAnchor
+        try:
+            pinned_anchor = RestoreAnchor(**json.loads(intent[4]))
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("Owner issue intent anchor is invalid") from exc
+        if pinned_anchor != anchor:
+            raise UnavailableGuard("Owner issue intent anchor changed")
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=1, operation="write",
+            operation_id=attempt_id, expected_anchor=pinned_anchor,
+            retain_on_unknown=True)
+        if (type(permit) is not FencePermitV2 or permit.operation_id != attempt_id
+                or permit.operation != "write" or permit.holder != self.__holder
+                or permit.subject != port.installation_grant.subject
+                or permit.authority_id != target.authority_id
+                or permit.namespace != target.authority_namespace
+                or permit.generation != 1 or permit.pinned_anchor != anchor):
+            raise UnavailableGuard("Owner issue write permit differs")
+        scope = FenceScope(namespace, target.authority_namespace, 1, "write",
+                           attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        def reject_no_commit():
+            abort_id = "abort:" + attempt_id
+            abort_digest = "sha256:" + canonical_digest({
+                "operation_id": attempt_id, "permit_token": permit.token,
+                "action": "rejected_no_owner_commit",
+                "business_operation_id": operation_id,
+                "grant_digest": grant_digest,
+            })
+            rejection = (
+                "rejected_no_commit", canonical_json(to_wire(permit)),
+                metadata.graph_revision, epoch.revision,
+                abort_id, abort_digest,
+            )
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise UnavailableGuard("Owner issue rollback stamp changed")
+                    if db.execute(
+                        "SELECT 1 FROM graph_owner_issue_operations_v1 "
+                        "WHERE bot=? AND persona=?", namespace.as_tuple,
+                    ).fetchone() is not None:
+                        raise UnavailableGuard("Owner issue has a business commit")
+                    db.execute(
+                        "INSERT OR IGNORE INTO graph_owner_issue_rejections_v1"
+                        "(bot,persona,operation_id,grant_digest,status,permit_json,"
+                        "graph_revision,graph_epoch,finish_request_id,"
+                        "finish_request_digest) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (operation_id, grant_digest) + rejection,
+                    )
+                    actual = db.execute(
+                        "SELECT status,permit_json,graph_revision,graph_epoch,"
+                        "finish_request_id,finish_request_digest "
+                        "FROM graph_owner_issue_rejections_v1 WHERE bot=? AND persona=? "
+                        "AND operation_id=? AND grant_digest=?",
+                        namespace.as_tuple + (operation_id, grant_digest),
+                    ).fetchone()
+                    if actual != rejection:
+                        raise UnavailableGuard("Owner issue rejection differs")
+                    db.execute("COMMIT")
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                    raise
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("rejected Owner write permit changed")
+            port.finish_fence(scope, request_id=abort_id,
+                              request_digest=abort_digest)
+
+        pending_reader = getattr(port, "get_pending_owner_issue_for_graph_write", None)
+        if not callable(pending_reader):
+            raise UnavailableGuard("paired pending Owner issue port is unavailable")
+        pending = pending_reader(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            operation_id=operation_id, permit=permit)
+        if pending is None or pending.operation.grant_digest != grant_digest:
+            reject_no_commit()
+            raise AuthorityDenied("paired pending Owner issue differs")
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("Owner issue write permit changed")
+        rolled_back_error = None
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("Owner issue graph stamp changed")
+                if db.execute(
+                    "SELECT operation_id,grant_digest,fence_attempt_id,"
+                    "requirements_json,anchor_json,graph_revision,graph_epoch "
+                    "FROM graph_owner_issue_intents_v1 WHERE bot=? AND persona=? "
+                    "AND operation_id=? AND grant_digest=?",
+                    namespace.as_tuple + (operation_id, grant_digest),
+                ).fetchone() != intent:
+                    raise AuthorityDenied("first Owner issue intent changed")
+                proof = self._stage_first_owner_grant_locked(
+                    pending.operation, pending, grant_value, scope, metadata, epoch)
+                finish_id = "finish:" + attempt_id
+                finish_digest = "sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_owner_issue", "business_operation_id": operation_id,
+                    "graph_receipt_digest": proof.graph_receipt_digest,
+                })
+                db.execute(
+                    "INSERT INTO graph_owner_issue_fences_v1"
+                    "(bot,persona,operation_id,permit_json,pre_graph_revision,"
+                    "pre_graph_epoch,post_graph_revision,post_graph_epoch,"
+                    "finish_request_id,finish_request_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (
+                        operation_id, canonical_json(to_wire(permit)),
+                        metadata.graph_revision, epoch.revision,
+                        metadata.graph_revision + 1, proof.graph_epoch,
+                        finish_id, finish_digest),
+                )
+                db.execute("COMMIT")
+            except BaseException as exc:
+                if not db.in_transaction:
+                    raise
+                db.execute("ROLLBACK")
+                if not isinstance(exc, Exception):
+                    raise
+                rolled_back_error = exc
+        if rolled_back_error is not None:
+            reject_no_commit()
+            raise rolled_back_error
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("committed Owner issue permit changed")
+        with store._lock:
+            current, current_epoch = self._v2_graph_stamp(namespace)
+            if (current.graph_revision != metadata.graph_revision + 1
+                    or current_epoch.revision != proof.graph_epoch):
+                raise UnavailableGuard("committed Owner issue graph stamp changed")
+        port.finish_fence(scope, request_id=finish_id,
+                          request_digest=finish_digest)
+        return proof
+
+    def _reject_owner_graph_write_v2(self, *, kind, namespace, operation_id,
+                                     input_digest, attempt_id, metadata, epoch,
+                                     anchor, permit, intent):
+        """Persist a proven no-commit outcome before finishing its original fence."""
+        from .authority_service.v2_contract import to_wire
+
+        if kind not in {"role_init", "scene_binding"}:
+            raise ValueError("unknown Owner graph write")
+        table = ("graph_role_init_rejections_v1" if kind == "role_init"
+                 else "graph_scene_binding_rejections_v1")
+        receipt_table = ("graph_role_init_receipts_v1" if kind == "role_init"
+                         else "graph_scene_binding_receipts_v1")
+        intent_table = ("graph_role_init_intents_v1" if kind == "role_init"
+                        else "graph_scene_binding_intents_v1")
+        finish_id = "abort:" + attempt_id
+        finish_digest = "sha256:" + canonical_digest({
+            "operation_id": attempt_id, "permit_token": permit.token,
+            "action": "rejected_no_commit", "business_operation_id": operation_id,
+            "input_digest": input_digest, "kind": kind,
+        })
+        expected = (operation_id, "rejected_no_commit",
+                    canonical_json(to_wire(permit)), metadata.graph_revision,
+                    epoch.revision, finish_id, finish_digest)
+        store = self.__store
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise UnavailableGuard("Owner graph no-commit stamp changed")
+                if db.execute(
+                        f"SELECT 1 FROM {receipt_table} WHERE bot=? AND persona=? "
+                        "AND operation_id=?", namespace.as_tuple + (operation_id,),
+                ).fetchone() is not None:
+                    raise UnavailableGuard("Owner graph business receipt exists")
+                current_intent = db.execute(
+                    f"SELECT * FROM {intent_table} WHERE bot=? AND persona=? "
+                    "AND operation_id=?", namespace.as_tuple + (operation_id,),
+                ).fetchone()
+                if current_intent != namespace.as_tuple + intent:
+                    raise UnavailableGuard("Owner graph durable intent changed")
+                db.execute(
+                    f"INSERT OR IGNORE INTO {table}"
+                    "(bot,persona,operation_id,status,permit_json,graph_revision,"
+                    "graph_epoch,finish_request_id,finish_request_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)", namespace.as_tuple + expected,
+                )
+                recorded = db.execute(
+                    f"SELECT operation_id,status,permit_json,graph_revision,"
+                    "graph_epoch,finish_request_id,finish_request_digest "
+                    f"FROM {table} WHERE bot=? AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (operation_id,),
+                ).fetchone()
+                if recorded != expected:
+                    raise UnavailableGuard("Owner graph rejection identity differs")
+                db.execute("COMMIT")
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        self._finish_rejected_owner_graph_write_v2(
+            kind=kind, namespace=namespace, operation_id=operation_id,
+            input_digest=input_digest, attempt_id=attempt_id, metadata=metadata,
+            epoch=epoch, anchor=anchor, rejection=expected)
+
+    def _finish_rejected_owner_graph_write_v2(self, *, kind, namespace,
+                                               operation_id, input_digest,
+                                               attempt_id, metadata, epoch,
+                                               anchor, rejection):
+        from .authority_service.v2_contract import FencePermitV2, from_wire
+
+        port = self.__content_fence_v2
+        target = metadata.requirements
+        try:
+            permit = from_wire(json.loads(rejection[2]))
+        except (TypeError, ValueError) as exc:
+            raise UnavailableGuard("Owner graph rejected permit is invalid") from exc
+        expected_digest = "sha256:" + canonical_digest({
+            "operation_id": attempt_id, "permit_token": permit.token,
+            "action": "rejected_no_commit", "business_operation_id": operation_id,
+            "input_digest": input_digest, "kind": kind,
+        })
+        if (type(permit) is not FencePermitV2
+                or rejection != (operation_id, "rejected_no_commit",
+                                 rejection[2], metadata.graph_revision,
+                                 epoch.revision, "abort:" + attempt_id,
+                                 expected_digest)
+                or permit.operation_id != attempt_id or permit.operation != "write"
+                or permit.holder != self.__holder
+                or permit.subject != port.installation_grant.subject
+                or permit.authority_id != target.authority_id
+                or permit.namespace != target.authority_namespace
+                or permit.generation != 1 or permit.pinned_anchor != anchor):
+            raise UnavailableGuard("Owner graph rejected fence identity differs")
+        observed, state = port.get_fence_operation(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            operation_id=attempt_id)
+        if observed != permit or state not in {"active", "finished"}:
+            raise UnavailableGuard("Owner graph rejected Authority fence differs")
+        if state == "active":
+            scope = FenceScope(namespace, target.authority_namespace, 1, "write",
+                               attempt_id, permit, anchor, epoch,
+                               metadata.graph_revision)
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("Owner graph rejected permit changed")
+            port.finish_fence(scope, request_id=rejection[5],
+                              request_digest=rejection[6])
+
+    def commit_role_initialization_v2(self, *, namespace: NamespaceId,
+                                      operation_id: str, plan, principal,
+                                      request_digest: str):
+        """Install one authored D01 plan and active head after committed Owner issue.
+
+        This internal GraphWorker operation is not an Owner login endpoint. Its
+        caller must separately authenticate the claimant; the graph worker
+        checks the paired Authority's current guard under its exact write fence.
+        """
+        from .authority_service.contract import identifier
+        from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
+        from .authority_service.v2_owner_contract import (
+            OwnerAuthorizationGuardV1, OwnerGraphCommitProofV1, OwnerPrincipalV1,
+            canonical_digest as owner_contract_digest,
+        )
+        from .domains.d01 import PersonaDomain, PersonaPlan, _activation_key
+        from .runtime.restore_anchor import RestoreAnchor
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None):
+            raise UnavailableGuard("role initialization requires production v2")
+        if type(namespace) is not NamespaceId or type(plan) is not PersonaPlan:
+            raise TypeError("role initialization requires a typed namespace and plan")
+        if type(principal) is not OwnerPrincipalV1:
+            raise TypeError("role initialization requires the paired Owner principal")
+        identifier(operation_id, "operation_id")
+        if (type(request_digest) is not str or len(request_digest) != 71
+                or not request_digest.startswith("sha256:")
+                or any(char not in "0123456789abcdef" for char in request_digest[7:])):
+            raise ValueError("full role creation request digest is required")
+        if plan.namespace != namespace or plan.authored is not True:
+            raise AuthorityDenied("role plan is not an authored plan for this namespace")
+        port = self.__content_fence_v2
+        guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
+        if not callable(guard_reader):
+            raise UnavailableGuard("current Owner guard fence port is unavailable")
+        store = self.__store
+        domain = PersonaDomain()
+        plan_write = domain.plan_write(plan)
+        activation_key = _activation_key(namespace)
+        grant_key = owner_grant_key(*namespace.as_tuple)
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            db = store._db
+            grant_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (grant_key.token,),
+            ).fetchone()
+            proof_row = db.execute(
+                "SELECT operation_id,request_digest,grant_id,grant_digest,"
+                "graph_incarnation,graph_access_epoch,graph_epoch,"
+                "graph_receipt_digest,proof_json "
+                "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            access_row = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone()
+            intent = db.execute(
+                "SELECT operation_id,input_digest,fence_attempt_id,"
+                "requirements_json,anchor_json,graph_revision,graph_epoch "
+                "FROM graph_role_init_intents_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            saved = db.execute(
+                "SELECT operation_id,input_digest,permit_json,receipt_json,"
+                "pre_graph_revision,pre_graph_epoch,post_graph_revision,"
+                "post_graph_epoch,finish_request_id,finish_request_digest "
+                "FROM graph_role_init_receipts_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            rejection = db.execute(
+                "SELECT operation_id,status,permit_json,graph_revision,"
+                "graph_epoch,finish_request_id,finish_request_digest "
+                "FROM graph_role_init_rejections_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+        if (grant_row is None or grant_row[0] != 1 or grant_row[2] != 1
+                or proof_row is None or access_row != (1, 0)):
+            raise UnavailableGuard("first Owner grant or access epoch is unavailable")
+        grant = GraphAtom(grant_key, grant_row[0], json.loads(grant_row[1]), True)
+        validate_owner_grant_v1(grant.value)
+        proof = OwnerGraphCommitProofV1(
+            namespace, proof_row[0], proof_row[1], proof_row[2], proof_row[3],
+            proof_row[4], 1, proof_row[5], proof_row[6], proof_row[7])
+        if (proof_row[8] != canonical_json(asdict(proof))
+                or grant_row[1] != canonical_json(grant.value)
+                or grant.value["grant_id"] != proof.grant_id
+                or "sha256:" + canonical_digest(grant.value) != proof.grant_digest
+                or grant.value["graph_incarnation"] != proof.graph_incarnation
+                or grant.value["principal"] != asdict(principal)
+                or grant.value["issue_operation_id"] != proof.operation_id
+                or proof.graph_access_epoch != 1
+                or metadata.requirements.graph_incarnation != proof.graph_incarnation):
+            raise AuthorityDenied("role principal or grant differs from Owner issue")
+        if ("workbench.create" not in grant.value["capabilities"]
+                or "workbench_user_action" not in grant.value["purposes"]
+                or "owner" not in grant.value["audiences"]):
+            raise AuthorityDenied("Owner grant lacks role creation permission")
+        target = metadata.requirements
+        if (target.namespace != namespace or target.activation_generation != 1
+                or target.authority_id != grant.value["authority_id"]
+                or port.installation_grant.authority_id != target.authority_id
+                or port.installation_grant.installation_id != grant.value["installation_id"]):
+            raise UnavailableGuard("role recovery or installation identity differs")
+        input_digest = "sha256:" + canonical_digest({
+            "schema": "sylanne3.graph.role_initialization.v1",
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "request_digest": request_digest,
+            "plan": asdict(plan), "principal": asdict(principal),
+            "owner_proof": asdict(proof),
+        })
+        attempt_id = "role-write-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "input_digest": input_digest,
+        })[:48]
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("role recovery anchor differs")
+        identity = (operation_id, input_digest, attempt_id,
+                    canonical_json(asdict(target)), canonical_json(asdict(anchor)))
+        if intent is not None and intent[:5] != identity:
+            raise AuthorityDenied("role initialization identity differs")
+        if (saved is None) != (intent is None) and saved is not None:
+            raise UnavailableGuard("role receipt lacks original intent")
+        if rejection is not None:
+            if intent is None or saved is not None:
+                raise UnavailableGuard("rejected role has a business receipt")
+            self._finish_rejected_owner_graph_write_v2(
+                kind="role_init", namespace=namespace, operation_id=operation_id,
+                input_digest=input_digest, attempt_id=attempt_id, metadata=metadata,
+                epoch=epoch, anchor=anchor, rejection=rejection)
+            raise UnavailableGuard("role initialization terminal rejected_no_commit")
+        if saved is not None:
+            try:
+                payload = json.loads(saved[3])
+                if type(payload) is not dict or type(payload.get("namespace")) is not dict:
+                    raise ValueError("role receipt is not canonical")
+                payload["namespace"] = NamespaceId(**payload["namespace"])
+                receipt = RoleInitializationReceiptV1(**payload)
+                permit = from_wire(json.loads(saved[2]))
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("durable role receipt is invalid") from exc
+            finish_digest = "sha256:" + canonical_digest({
+                "operation_id": attempt_id, "permit_token": permit.token,
+                "action": "finish_role_initialization",
+                "business_operation_id": operation_id,
+                "input_digest": input_digest,
+            })
+            if (type(permit) is not FencePermitV2
+                    or saved[0:2] != (operation_id, input_digest)
+                    or saved[4:6] != intent[5:7]
+                    or saved[6:8] != (receipt.graph_revision, receipt.graph_epoch)
+                    or saved[6] != saved[4] + 1
+                    or saved[8:10] != ("finish:" + attempt_id, finish_digest)
+                    or saved[3] != canonical_json(asdict(receipt))
+                    or receipt.namespace != namespace
+                    or receipt.operation_id != operation_id
+                    or receipt.request_digest != request_digest
+                    or receipt.input_digest != input_digest
+                    or receipt.plan_id != plan.plan_id
+                    or receipt.head_id != plan.head_id
+                    or receipt.owner_grant_id != proof.grant_id
+                    or receipt.owner_grant_revision != 1
+                    or receipt.owner_authorization_head != owner_contract_digest(proof)
+                    or receipt.graph_incarnation != proof.graph_incarnation
+                    or receipt.fence_attempt_id != attempt_id
+                    or receipt.finish_request_id != saved[8]
+                    or receipt.finish_request_digest != saved[9]
+                    or permit.operation_id != attempt_id or permit.operation != "write"
+                    or permit.holder != self.__holder
+                    or permit.subject != port.installation_grant.subject
+                    or permit.authority_id != target.authority_id
+                    or permit.namespace != target.authority_namespace
+                    or permit.generation != 1 or permit.pinned_anchor != anchor):
+                raise UnavailableGuard("durable role initialization receipt differs")
+            with store._lock:
+                plan_row = store._db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (plan_write.key.token,),
+                ).fetchone()
+                activation_row = store._db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (activation_key.token,),
+                ).fetchone()
+                committed_guard = OwnerAuthorizationGuardV1(
+                    target.authority_id, grant.value["installation_id"], namespace,
+                    1, receipt.owner_authorization_head, 0, 0)
+                expected_activation = domain.activation_write(
+                    plan, grant, committed_guard)
+                if (plan_row != (1, canonical_json(plan_write.value), 1)
+                        or activation_row != (
+                            1, canonical_json(expected_activation.value), 1)):
+                    raise UnavailableGuard("durable role graph atoms differ")
+            observed, state = port.get_fence_operation(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                operation_id=attempt_id)
+            if observed != permit or state not in {"active", "finished"}:
+                raise UnavailableGuard("role Authority fence differs")
+            if state == "active":
+                if (metadata.graph_revision, epoch.revision) != saved[6:8]:
+                    raise UnavailableGuard("active role fence lost business stamp")
+                scope = FenceScope(
+                    namespace, target.authority_namespace, 1, "write", attempt_id,
+                    permit, anchor, NamespaceEpoch(*namespace.as_tuple, intent[6]),
+                    intent[5])
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("role write permit changed")
+                port.finish_fence(scope, request_id=saved[8],
+                                  request_digest=saved[9])
+            elif (metadata.graph_revision < saved[6]
+                  or epoch.revision < saved[7]):
+                raise UnavailableGuard("finished role lost business stamp")
+            return receipt
+        if (intent is not None and
+                (metadata.graph_revision, epoch.revision) != intent[5:7]):
+            raise UnavailableGuard("uncommitted role graph stamp changed")
+        if (metadata.graph_revision != 1 or epoch.revision != proof.graph_epoch
+                or proof.graph_epoch != 1):
+            raise UnavailableGuard("role initialization requires first Owner graph head")
+        with store._lock:
+            if (store._db.execute(
+                    "SELECT 1 FROM graph_atoms WHERE token IN (?,?) LIMIT 1",
+                    (plan_write.key.token, activation_key.token)).fetchone() is not None):
+                raise UnavailableGuard("initial role atoms already exist")
+        if intent is None:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("role graph stamp changed before intent")
+                    db.execute(
+                        "INSERT INTO graph_role_init_intents_v1"
+                        "(bot,persona,operation_id,input_digest,fence_attempt_id,"
+                        "requirements_json,anchor_json,graph_revision,graph_epoch) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + identity + (
+                            metadata.graph_revision, epoch.revision),
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                    raise
+            intent = identity + (metadata.graph_revision, epoch.revision)
+        pinned_anchor = RestoreAnchor(**json.loads(intent[4]))
+        if pinned_anchor != anchor:
+            raise UnavailableGuard("role original fence anchor changed")
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=1, operation="write",
+            operation_id=attempt_id, expected_anchor=pinned_anchor,
+            retain_on_unknown=True)
+        if (type(permit) is not FencePermitV2 or permit.operation_id != attempt_id
+                or permit.operation != "write" or permit.holder != self.__holder
+                or permit.subject != port.installation_grant.subject
+                or permit.authority_id != target.authority_id
+                or permit.namespace != target.authority_namespace
+                or permit.generation != 1 or permit.pinned_anchor != anchor):
+            raise UnavailableGuard("role write permit differs")
+        scope = FenceScope(namespace, target.authority_namespace, 1, "write",
+                           attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        try:
+            guarded = guard_reader(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                permit=permit)
+            if (type(guarded) is not tuple or len(guarded) != 2
+                    or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                    or guarded[1] != permit):
+                raise UnavailableGuard("current Owner guard response is unavailable")
+            guard = guarded[0]
+            if (guard.authority_id != target.authority_id
+                    or guard.installation_id != grant.value["installation_id"]
+                    or guard.namespace != namespace
+                    or guard.authorization_revision != 1
+                    or guard.authorization_head != owner_contract_digest(proof)
+                    or guard.pending_revoke_operation_id is not None
+                    or guard.minimum_revocation_revision != 0
+                    or guard.minimum_revocation_epoch != 0):
+                raise AuthorityDenied("current Owner authorization differs from graph")
+        except Exception:
+            self._reject_owner_graph_write_v2(
+                kind="role_init", namespace=namespace, operation_id=operation_id,
+                input_digest=input_digest, attempt_id=attempt_id, metadata=metadata,
+                epoch=epoch, anchor=anchor, permit=permit, intent=intent)
+            raise
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("role write permit changed")
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("role graph stamp changed")
+                if db.execute(
+                    "SELECT operation_id,input_digest,fence_attempt_id,"
+                    "requirements_json,anchor_json,graph_revision,graph_epoch "
+                    "FROM graph_role_init_intents_v1 WHERE bot=? AND persona=?",
+                    namespace.as_tuple,
+                ).fetchone() != intent:
+                    raise UnavailableGuard("role durable intent changed")
+                current_grant = db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (grant_key.token,),
+                ).fetchone()
+                current_access = db.execute(
+                    "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                    "WHERE bot=? AND persona=?", namespace.as_tuple,
+                ).fetchone()
+                if current_grant != grant_row or current_access != (1, 0):
+                    raise StaleRead("Owner grant changed before role initialization")
+                activation_write = domain.activation_write(plan, grant, guard)
+                candidate = GraphCandidate(
+                    Event(Scope(*namespace.as_tuple, "d01-role-initialization"),
+                          operation_id, 0, "role_initialized", {
+                              "input_digest": input_digest,
+                              "owner_grant_id": proof.grant_id,
+                              "authorization_head": guard.authorization_head,
+                          }),
+                    (GraphVersion(grant_key, 1), GraphVersion(plan_write.key, 0),
+                     GraphVersion(activation_key, 0)),
+                    (plan_write, activation_write), (epoch,),
+                )
+                graph_receipt = GraphStore._graph_commit_in_transaction(
+                    store, candidate, _capability=self.__graph_capability)
+                if (graph_receipt.status != "committed"
+                        or graph_receipt.epoch.revision != epoch.revision + 1
+                        or graph_receipt.revisions != (
+                            GraphVersion(plan_write.key, 1),
+                            GraphVersion(activation_key, 1))):
+                    raise UnavailableGuard("role graph transaction did not commit both atoms")
+                store.cas_graph_recovery_metadata(
+                    metadata, target, _capability=self.__graph_capability)
+                finish_id = "finish:" + attempt_id
+                finish_digest = "sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_role_initialization",
+                    "business_operation_id": operation_id,
+                    "input_digest": input_digest,
+                })
+                receipt = RoleInitializationReceiptV1(
+                    namespace, operation_id, request_digest, input_digest, plan.plan_id,
+                    plan.head_id, proof.grant_id, 1, guard.authorization_head,
+                    proof.graph_incarnation, metadata.graph_revision + 1,
+                    graph_receipt.epoch.revision, attempt_id,
+                    finish_id, finish_digest,
+                )
+                db.execute(
+                    "INSERT INTO graph_role_init_receipts_v1"
+                    "(bot,persona,operation_id,input_digest,permit_json,receipt_json,"
+                    "pre_graph_revision,pre_graph_epoch,post_graph_revision,"
+                    "post_graph_epoch,finish_request_id,finish_request_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (
+                        operation_id, input_digest, canonical_json(to_wire(permit)),
+                        canonical_json(asdict(receipt)), metadata.graph_revision,
+                        epoch.revision, receipt.graph_revision,
+                        receipt.graph_epoch, finish_id, finish_digest),
+                )
+                db.execute("COMMIT")
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("committed role write permit changed")
+        with store._lock:
+            current, current_epoch = self._v2_graph_stamp(namespace)
+            if (current.graph_revision != receipt.graph_revision
+                    or current_epoch.revision != receipt.graph_epoch):
+                raise UnavailableGuard("committed role graph stamp changed")
+        port.finish_fence(scope, request_id=finish_id,
+                          request_digest=finish_digest)
+        return receipt
+
+    def _scene_binding_state_locked(self, namespace, guard, prior):
+        """Read the complete current D01 head and D03 binding query at one epoch."""
+        from .domains.d01 import PersonaDomain, _activation_key
+        from .domains.d03 import RoleBinding
+        from .graph_types import GraphSnapshot
+        from .runtime_contracts import QueryEpoch
+
+        store = self.__store
+        db = store._db
+        epoch = GraphStore.graph_epoch(
+            store, *namespace.as_tuple, _capability=self.__graph_capability)
+        activation_key = _activation_key(namespace)
+        grant_key = owner_grant_key(*namespace.as_tuple)
+        activation_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (activation_key.token,),
+        ).fetchone()
+        if activation_row is None or activation_row[2] != 1:
+            raise UnavailableGuard("active D01 role head is absent")
+        activation = json.loads(activation_row[1])
+        if type(activation) is not dict or type(activation.get("plan_id")) is not str:
+            raise UnavailableGuard("active D01 role head is invalid")
+        from .graph_types import AtomKey, Owner
+        plan_key = AtomKey(Owner("persona", *namespace.as_tuple),
+                           "d01.persona_plan.v1", activation["plan_id"])
+        atoms = []
+        for key in (activation_key, plan_key, grant_key):
+            row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (key.token,),
+            ).fetchone()
+            if row is None:
+                raise UnavailableGuard("active role graph atoms are incomplete")
+            atoms.append(GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])))
+        try:
+            role = PersonaDomain.resolve_active_role(
+                GraphSnapshot(tuple(atoms), (epoch,)), namespace=namespace,
+                current_guard=guard)
+        except (TypeError, ValueError) as exc:
+            raise UnavailableGuard("active role differs from Owner guard") from exc
+        saved_role = db.execute(
+            "SELECT receipt_json FROM graph_role_init_receipts_v1 "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        if saved_role is None:
+            raise UnavailableGuard("D01 role has no durable initialization receipt")
+        data = json.loads(saved_role[0])
+        if (type(data) is not dict or data.get("head_id") != role.head_id
+                or data.get("owner_grant_id") != atoms[2].value["grant_id"]
+                or data.get("owner_authorization_head") != guard.authorization_head):
+            raise UnavailableGuard("D01 initialization receipt differs from active role")
+        rows = db.execute(
+            "SELECT token,revision,value FROM graph_atoms "
+            "WHERE bot=? AND persona=? AND type_name='d03.role_binding' "
+            "AND valid=1 ORDER BY token", namespace.as_tuple,
+        ).fetchall()
+        versions = []
+        bindings = []
+        for token, revision, encoded in rows:
+            key = AtomKey.from_token(token)
+            value = json.loads(encoded)
+            try:
+                binding = RoleBinding(**{
+                    **value, "norm_refs": tuple(value["norm_refs"]),
+                    "source_refs": tuple(value["source_refs"]),
+                })
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("current D03 binding is invalid") from exc
+            if (key.name != binding.role_binding_id
+                    or revision != binding.binding_version
+                    or (key.owner.kind == "scene"
+                        and key.owner.subject != binding.scene_ref)):
+                raise UnavailableGuard("current D03 binding identity differs")
+            versions.append(GraphVersion(key, revision))
+            bindings.append(binding)
+        query = QueryEpoch(namespace, "d03.role_binding", epoch.revision)
+        if (prior.query_epoch != query
+                or len(prior.read_versions) != len(versions)
+                or set(prior.read_versions) != set(versions)):
+            raise StaleRead("D03 negative query versions or epoch changed")
+        return role, tuple(bindings), epoch
+
+    def commit_scene_binding_v2(self, *, namespace: NamespaceId,
+                                operation_id: str, proposal, prior,
+                                principal, request_digest: str):
+        """Commit one D03 scene binding with current Owner, D01 and query guards."""
+        from .authority_service.contract import identifier
+        from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
+        from .authority_service.v2_owner_contract import (
+            OwnerAuthorizationGuardV1, OwnerGraphCommitProofV1, OwnerPrincipalV1,
+            canonical_digest as owner_contract_digest,
+        )
+        from .domains.d03 import ContextProvider, RoleBinding, RoleBindingResolution
+        from .runtime.restore_anchor import RestoreAnchor
+        from .runtime_contracts import DomainProposal, QueryEpoch
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None):
+            raise UnavailableGuard("scene binding requires production v2")
+        if (type(namespace) is not NamespaceId or type(proposal) is not DomainProposal
+                or type(prior) is not RoleBindingResolution
+                or type(principal) is not OwnerPrincipalV1):
+            raise TypeError("scene binding requires typed D03 and Owner inputs")
+        identifier(operation_id, "operation_id")
+        if (type(request_digest) is not str or len(request_digest) != 71
+                or not request_digest.startswith("sha256:")
+                or any(char not in "0123456789abcdef" for char in request_digest[7:])):
+            raise ValueError("full scene binding request digest is required")
+        registration = self.__providers.get("d03")
+        if registration is None or type(registration[0]) is not ContextProvider:
+            raise UnavailableGuard("trusted D03 scene provider is unavailable")
+        provider = registration[0]
+        provider.validate(proposal, None)
+        envelope = proposal.envelope
+        if (envelope.authority.namespace != namespace
+                or envelope.identity.operation_id != operation_id
+                or envelope.authority.activation_generation != 1
+                or len(proposal.typed_writes) != 1
+                or proposal.typed_writes[0].key.type_name != "d03.role_binding"
+                or prior.request is None or not prior.request.scope_complete
+                or prior.status != "no_applicable_binding"
+                or prior.matched_bindings or prior.missing_items
+                or prior.query_epoch is None):
+            raise AuthorityDenied("scene binding proposal is not a complete first binding")
+        write = proposal.typed_writes[0]
+        value = write.value
+        try:
+            binding = RoleBinding(**{
+                **value, "norm_refs": tuple(value["norm_refs"]),
+                "source_refs": tuple(value["source_refs"]),
+            })
+        except (TypeError, ValueError, KeyError) as exc:
+            raise AuthorityDenied("D03 scene binding value is invalid") from exc
+        if (write.key.owner.kind != "scene"
+                or write.key.owner.subject != binding.scene_ref
+                or binding.scene_ref != prior.request.scene_ref):
+            raise AuthorityDenied("D03 scene binding scope differs")
+        port = self.__content_fence_v2
+        guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
+        if not callable(guard_reader):
+            raise UnavailableGuard("current Owner guard fence port is unavailable")
+        store = self.__store
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            db = store._db
+            grant_key = owner_grant_key(*namespace.as_tuple)
+            grant_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (grant_key.token,),
+            ).fetchone()
+            proof_row = db.execute(
+                "SELECT operation_id,request_digest,grant_id,grant_digest,"
+                "graph_incarnation,graph_access_epoch,graph_epoch,"
+                "graph_receipt_digest,proof_json "
+                "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            access_row = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone()
+            intent = db.execute(
+                "SELECT operation_id,input_digest,binding_id,fence_attempt_id,"
+                "requirements_json,anchor_json,graph_revision,graph_epoch "
+                "FROM graph_scene_binding_intents_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            saved = db.execute(
+                "SELECT input_digest,permit_json,receipt_json,pre_graph_revision,"
+                "pre_graph_epoch,post_graph_revision,post_graph_epoch,"
+                "finish_request_id,finish_request_digest "
+                "FROM graph_scene_binding_receipts_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            rejection = db.execute(
+                "SELECT operation_id,status,permit_json,graph_revision,"
+                "graph_epoch,finish_request_id,finish_request_digest "
+                "FROM graph_scene_binding_rejections_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+        if (grant_row is None or grant_row[0] != 1 or grant_row[2] != 1
+                or proof_row is None or access_row != (1, 0)):
+            raise UnavailableGuard("current first Owner grant is unavailable")
+        grant = json.loads(grant_row[1])
+        validate_owner_grant_v1(grant)
+        proof = OwnerGraphCommitProofV1(
+            namespace, proof_row[0], proof_row[1], proof_row[2], proof_row[3],
+            proof_row[4], 1, proof_row[5], proof_row[6], proof_row[7])
+        target = metadata.requirements
+        if (proof_row[8] != canonical_json(asdict(proof))
+                or grant_row[1] != canonical_json(grant)
+                or "sha256:" + canonical_digest(grant) != proof.grant_digest
+                or grant["principal"] != asdict(principal)
+                or grant["grant_id"] != proof.grant_id
+                or grant["graph_incarnation"] != proof.graph_incarnation
+                or proof.graph_access_epoch != 1
+                or target.namespace != namespace
+                or target.graph_incarnation != proof.graph_incarnation
+                or target.activation_generation != 1
+                or target.authority_id != grant["authority_id"]
+                or port.installation_grant.installation_id != grant["installation_id"]):
+            raise AuthorityDenied("scene principal or Owner grant differs")
+        if ("workbench.bind_scene" not in grant["capabilities"]
+                or "workbench_user_action" not in grant["purposes"]
+                or "owner" not in grant["audiences"]):
+            raise AuthorityDenied("Owner grant lacks scene binding permission")
+        input_digest = "sha256:" + canonical_digest({
+            "schema": "sylanne3.graph.scene_binding.v1",
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "request_digest": request_digest,
+            "proposal": asdict(proposal), "prior": asdict(prior),
+            "principal": asdict(principal), "owner_proof": asdict(proof),
+        })
+        attempt_id = "scene-write-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "input_digest": input_digest,
+        })[:48]
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("scene recovery anchor differs")
+        identity = (operation_id, input_digest, binding.role_binding_id,
+                    attempt_id, canonical_json(asdict(target)),
+                    canonical_json(asdict(anchor)))
+        if intent is not None and intent[:6] != identity:
+            raise AuthorityDenied("scene binding operation replay differs")
+        if rejection is not None:
+            if intent is None or saved is not None:
+                raise UnavailableGuard("rejected scene has a business receipt")
+            self._finish_rejected_owner_graph_write_v2(
+                kind="scene_binding", namespace=namespace,
+                operation_id=operation_id, input_digest=input_digest,
+                attempt_id=attempt_id, metadata=metadata, epoch=epoch,
+                anchor=anchor, rejection=rejection)
+            raise UnavailableGuard("scene binding terminal rejected_no_commit")
+        if saved is not None:
+            if intent is None:
+                raise UnavailableGuard("scene receipt lacks durable intent")
+            try:
+                payload = json.loads(saved[2])
+                if type(payload) is not dict or type(payload.get("namespace")) is not dict:
+                    raise ValueError("scene receipt is not canonical")
+                payload["namespace"] = NamespaceId(**payload["namespace"])
+                receipt = SceneBindingReceiptV1(**payload)
+                permit = from_wire(json.loads(saved[1]))
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("durable scene receipt is invalid") from exc
+            finish_id = "finish:" + attempt_id
+            finish_digest = "sha256:" + canonical_digest({
+                "operation_id": attempt_id, "permit_token": permit.token,
+                "action": "finish_scene_binding",
+                "business_operation_id": operation_id,
+                "input_digest": input_digest,
+            })
+            if (type(permit) is not FencePermitV2
+                    or saved[0] != input_digest
+                    or saved[2] != canonical_json(asdict(receipt))
+                    or saved[3:5] != intent[6:8]
+                    or saved[5:7] != (receipt.graph_revision, receipt.graph_epoch)
+                    or saved[5] != saved[3] + 1
+                    or saved[7:9] != (finish_id, finish_digest)
+                    or receipt.namespace != namespace
+                    or receipt.operation_id != operation_id
+                    or receipt.request_digest != request_digest
+                    or receipt.input_digest != input_digest
+                    or receipt.scene_ref != binding.scene_ref
+                    or receipt.binding_id != binding.role_binding_id
+                    or receipt.owner_grant_id != proof.grant_id
+                    or receipt.owner_authorization_head != owner_contract_digest(proof)
+                    or receipt.graph_incarnation != proof.graph_incarnation
+                    or receipt.fence_attempt_id != attempt_id
+                    or receipt.finish_request_id != finish_id
+                    or receipt.finish_request_digest != finish_digest
+                    or permit.operation_id != attempt_id or permit.operation != "write"
+                    or permit.holder != self.__holder
+                    or permit.subject != port.installation_grant.subject
+                    or permit.authority_id != target.authority_id
+                    or permit.namespace != target.authority_namespace
+                    or permit.generation != 1 or permit.pinned_anchor != anchor):
+                raise UnavailableGuard("durable scene receipt differs")
+            with store._lock:
+                atom = store._db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (write.key.token,),
+                ).fetchone()
+                if atom != (1, canonical_json(value), 1):
+                    raise UnavailableGuard("durable D03 binding atom differs")
+            observed, state = port.get_fence_operation(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                operation_id=attempt_id)
+            if observed != permit or state not in {"active", "finished"}:
+                raise UnavailableGuard("scene Authority fence differs")
+            if state == "active":
+                if (metadata.graph_revision, epoch.revision) != saved[5:7]:
+                    raise UnavailableGuard("active scene fence lost business stamp")
+                scope = FenceScope(
+                    namespace, target.authority_namespace, 1, "write", attempt_id,
+                    permit, anchor, NamespaceEpoch(*namespace.as_tuple, intent[7]),
+                    intent[6])
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("scene write permit changed")
+                port.finish_fence(scope, request_id=finish_id,
+                                  request_digest=finish_digest)
+            elif (metadata.graph_revision < saved[5]
+                  or epoch.revision < saved[6]):
+                raise UnavailableGuard("finished scene lost business stamp")
+            return receipt
+        # This command only creates the first binding for a scene. D03's
+        # no_applicable_binding can also describe a revoked or out-of-window
+        # valid atom; accepting a second one would make the scene unreadable.
+        with store._lock:
+            if store._db.execute(
+                    "SELECT 1 FROM graph_atoms WHERE bot=? AND persona=? "
+                    "AND owner_kind='scene' AND subject=? "
+                    "AND type_name='d03.role_binding' AND valid=1 LIMIT 1",
+                    namespace.as_tuple + (binding.scene_ref,),
+            ).fetchone() is not None:
+                raise AuthorityDenied("scene already has a valid D03 binding")
+        if prior.query_epoch != QueryEpoch(namespace, "d03.role_binding", epoch.revision):
+            raise StaleRead("D03 negative query versions or epoch changed")
+        if intent is not None and (metadata.graph_revision, epoch.revision) != intent[6:8]:
+            raise UnavailableGuard("uncommitted scene graph stamp changed")
+        if intent is None:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("scene graph stamp changed before intent")
+                    db.execute(
+                        "INSERT INTO graph_scene_binding_intents_v1"
+                        "(bot,persona,operation_id,input_digest,binding_id,"
+                        "fence_attempt_id,requirements_json,anchor_json,"
+                        "graph_revision,graph_epoch) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + identity + (
+                            metadata.graph_revision, epoch.revision),
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                    raise
+            intent = identity + (metadata.graph_revision, epoch.revision)
+        pinned_anchor = RestoreAnchor(**json.loads(intent[5]))
+        if pinned_anchor != anchor:
+            raise UnavailableGuard("scene original fence anchor changed")
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=1, operation="write",
+            operation_id=attempt_id, expected_anchor=pinned_anchor,
+            retain_on_unknown=True)
+        if (type(permit) is not FencePermitV2 or permit.operation_id != attempt_id
+                or permit.operation != "write" or permit.holder != self.__holder
+                or permit.subject != port.installation_grant.subject
+                or permit.authority_id != target.authority_id
+                or permit.namespace != target.authority_namespace
+                or permit.generation != 1 or permit.pinned_anchor != anchor):
+            raise UnavailableGuard("scene write permit differs")
+        scope = FenceScope(namespace, target.authority_namespace, 1, "write",
+                           attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        try:
+            guarded = guard_reader(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                permit=permit)
+            if (type(guarded) is not tuple or len(guarded) != 2
+                    or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                    or guarded[1] != permit):
+                raise UnavailableGuard("current scene Owner guard is unavailable")
+            guard = guarded[0]
+            if (guard.authority_id != target.authority_id
+                    or guard.installation_id != grant["installation_id"]
+                    or guard.namespace != namespace
+                    or guard.authorization_revision != 1
+                    or guard.authorization_head != owner_contract_digest(proof)
+                    or guard.pending_revoke_operation_id is not None
+                    or guard.minimum_revocation_revision != 0
+                    or guard.minimum_revocation_epoch != 0):
+                raise AuthorityDenied("scene Owner authorization changed")
+        except Exception:
+            self._reject_owner_graph_write_v2(
+                kind="scene_binding", namespace=namespace,
+                operation_id=operation_id, input_digest=input_digest,
+                attempt_id=attempt_id, metadata=metadata, epoch=epoch,
+                anchor=anchor, permit=permit, intent=intent)
+            raise
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("scene write permit changed")
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("scene graph stamp changed")
+                if db.execute(
+                    "SELECT operation_id,input_digest,binding_id,fence_attempt_id,"
+                    "requirements_json,anchor_json,graph_revision,graph_epoch "
+                    "FROM graph_scene_binding_intents_v1 WHERE bot=? AND persona=? "
+                    "AND operation_id=?", namespace.as_tuple + (operation_id,),
+                ).fetchone() != intent:
+                    raise UnavailableGuard("scene durable intent changed")
+                role, bindings, current_epoch = self._scene_binding_state_locked(
+                    namespace, guard, prior)
+                if current_epoch != epoch:
+                    raise StaleRead("scene negative query epoch changed")
+                if db.execute(
+                        "SELECT 1 FROM graph_atoms WHERE bot=? AND persona=? "
+                        "AND owner_kind='scene' AND subject=? "
+                        "AND type_name='d03.role_binding' AND valid=1 LIMIT 1",
+                        namespace.as_tuple + (binding.scene_ref,),
+                ).fetchone() is not None:
+                    raise AuthorityDenied("scene already has a valid D03 binding")
+                observed_negative = provider.resolve_role_binding(
+                    prior.request, bindings)
+                if observed_negative.status != "no_applicable_binding":
+                    raise AuthorityDenied("scene has an applicable binding")
+                rebuilt = provider.build_scene_binding_proposal(
+                    envelope, binding, role, guard, prior)
+                if rebuilt != proposal:
+                    raise AuthorityDenied("D03 proposal differs from current qualifications")
+                version_guard = envelope.version_guard
+                expected_versions = (
+                    set(role.read_versions) | set(prior.read_versions)
+                    | {GraphVersion(write.key, 0)}
+                )
+                if (len(version_guard.read_versions) != len(expected_versions)
+                        or set(version_guard.read_versions) != expected_versions
+                        or version_guard.query_epochs != (QueryEpoch(
+                            namespace, "d03.role_binding", epoch.revision),)
+                        or version_guard.access_epoch != 1
+                        or version_guard.delete_epoch != 0
+                        or version_guard.catalogue_version != store._registry.catalogue_hash
+                        or version_guard.scheme_version != self._version(
+                            db, namespace, "scheme", "current")
+                        or version_guard.operator_version != self._version(
+                            db, namespace, "operator", "current")
+                        or version_guard.policy_version != self._version(
+                            db, namespace, "policy", "current")):
+                    raise AuthorityDenied("D03 command guard differs from current graph")
+                candidate = GraphCandidate(
+                    Event(Scope(*namespace.as_tuple, "d03-scene-binding"),
+                          operation_id, 0, "scene_binding", {
+                              "request_digest": request_digest,
+                              "input_digest": input_digest,
+                              "role_head_id": role.head_id,
+                          }),
+                    version_guard.read_versions, proposal.typed_writes,
+                    (epoch,),
+                )
+                graph_receipt = GraphStore._graph_commit_in_transaction(
+                    store, candidate, _capability=self.__graph_capability)
+                if (graph_receipt.status != "committed"
+                        or graph_receipt.revisions != (GraphVersion(write.key, 1),)
+                        or graph_receipt.epoch.revision != epoch.revision + 1):
+                    raise UnavailableGuard("D03 scene binding graph commit differed")
+                store.cas_graph_recovery_metadata(
+                    metadata, target, _capability=self.__graph_capability)
+                finish_id = "finish:" + attempt_id
+                finish_digest = "sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_scene_binding",
+                    "business_operation_id": operation_id,
+                    "input_digest": input_digest,
+                })
+                receipt = SceneBindingReceiptV1(
+                    namespace, operation_id, request_digest, input_digest,
+                    binding.scene_ref, binding.role_binding_id, role.head_id,
+                    proof.grant_id, guard.authorization_head,
+                    proof.graph_incarnation, metadata.graph_revision + 1,
+                    graph_receipt.epoch.revision, attempt_id,
+                    finish_id, finish_digest,
+                )
+                db.execute(
+                    "INSERT INTO graph_scene_binding_receipts_v1"
+                    "(bot,persona,operation_id,input_digest,permit_json,receipt_json,"
+                    "pre_graph_revision,pre_graph_epoch,post_graph_revision,"
+                    "post_graph_epoch,finish_request_id,finish_request_digest) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (
+                        operation_id, input_digest, canonical_json(to_wire(permit)),
+                        canonical_json(asdict(receipt)), metadata.graph_revision,
+                        epoch.revision, receipt.graph_revision,
+                        receipt.graph_epoch, finish_id, finish_digest),
+                )
+                db.execute("COMMIT")
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("committed scene write permit changed")
+        with store._lock:
+            current, current_epoch = self._v2_graph_stamp(namespace)
+            if (current.graph_revision != receipt.graph_revision
+                    or current_epoch.revision != receipt.graph_epoch):
+                raise UnavailableGuard("committed scene graph stamp changed")
+        port.finish_fence(scope, request_id=finish_id,
+                          request_digest=finish_digest)
+        return receipt
+
+    def read_active_role_v2(self, *, namespace: NamespaceId):
+        """Read the current D01 head under one paired Authority read fence."""
+        return self._read_active_scene_v2(namespace, None)[0]
+
+    def read_active_scene_v2(self, *, namespace: NamespaceId, scene_ref: str):
+        """Read current D01 head and one scene binding at the same graph epoch."""
+        from .authority_service.contract import identifier
+        identifier(scene_ref, "scene_ref")
+        if not scene_ref.startswith("scene:"):
+            raise ValueError("scene_ref must be a scene identity")
+        return self._read_active_scene_v2(namespace, scene_ref)
+
+    def _read_active_scene_v2(self, namespace: NamespaceId,
+                              scene_ref: str | None):
+        from .authority_service.v2_owner_contract import (
+            OwnerAuthorizationGuardV1, OwnerGraphCommitProofV1,
+            canonical_digest as owner_contract_digest,
+        )
+        from .domains.d01 import PersonaDomain, _activation_key
+        from .domains.d03 import RoleBinding
+        from .graph_types import AtomKey, GraphSnapshot, Owner
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None or type(namespace) is not NamespaceId):
+            raise UnavailableGuard("active role requires a production v2 namespace")
+        port = self.__content_fence_v2
+        guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
+        if not callable(guard_reader):
+            raise UnavailableGuard("current Owner guard fence port is unavailable")
+        store = self.__store
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        if target.namespace != namespace or target.activation_generation != 1:
+            raise UnavailableGuard("active role recovery identity differs")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("active role recovery anchor differs")
+        attempt_id = "role-read-" + secrets.token_hex(16)
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=1, operation="read",
+            operation_id=attempt_id, expected_anchor=anchor)
+        scope = FenceScope(namespace, target.authority_namespace, 1, "read",
+                           attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        try:
+            guarded = guard_reader(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                permit=permit)
+            if (type(guarded) is not tuple or len(guarded) != 2
+                    or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                    or guarded[1] != permit):
+                raise UnavailableGuard("current Owner guard is unavailable")
+            guard = guarded[0]
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("active role read permit changed")
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("active role graph stamp changed")
+                db = store._db
+                proof_row = db.execute(
+                    "SELECT operation_id,request_digest,grant_id,grant_digest,"
+                    "graph_incarnation,graph_access_epoch,graph_epoch,"
+                    "graph_receipt_digest,proof_json "
+                    "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+                    namespace.as_tuple,
+                ).fetchone()
+                if proof_row is None:
+                    raise UnavailableGuard("first Owner graph proof is absent")
+                proof = OwnerGraphCommitProofV1(
+                    namespace, proof_row[0], proof_row[1], proof_row[2],
+                    proof_row[3], proof_row[4], 1, proof_row[5],
+                    proof_row[6], proof_row[7])
+                if (proof_row[8] != canonical_json(asdict(proof))
+                        or guard.authorization_head != owner_contract_digest(proof)
+                        or guard.authorization_revision != 1
+                        or guard.pending_revoke_operation_id is not None
+                        or guard.minimum_revocation_revision != 0
+                        or guard.minimum_revocation_epoch != 0):
+                    raise UnavailableGuard("current Owner authorization differs")
+                activation_key = _activation_key(namespace)
+                activation_row = db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (activation_key.token,),
+                ).fetchone()
+                if activation_row is None or activation_row[2] != 1:
+                    raise UnavailableGuard("active role head is absent")
+                activation = json.loads(activation_row[1])
+                plan_key = AtomKey(
+                    Owner("persona", *namespace.as_tuple),
+                    "d01.persona_plan.v1", activation["plan_id"])
+                keys = (activation_key, plan_key,
+                        owner_grant_key(*namespace.as_tuple))
+                atoms = []
+                for key in keys:
+                    row = db.execute(
+                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                        (key.token,),
+                    ).fetchone()
+                    if row is None:
+                        raise UnavailableGuard("active role graph atoms are incomplete")
+                    atoms.append(GraphAtom(
+                        key, row[0], json.loads(row[1]), bool(row[2])))
+                try:
+                    role = PersonaDomain.resolve_active_role(
+                        GraphSnapshot(tuple(atoms), (epoch,)), namespace=namespace,
+                        current_guard=guard)
+                except (TypeError, ValueError) as exc:
+                    raise UnavailableGuard("active role qualification failed") from exc
+                role_row = db.execute(
+                    "SELECT receipt_json FROM graph_role_init_receipts_v1 "
+                    "WHERE bot=? AND persona=?", namespace.as_tuple,
+                ).fetchone()
+                if role_row is None:
+                    raise UnavailableGuard("active role lacks initialization receipt")
+                role_receipt = json.loads(role_row[0])
+                if (role_receipt.get("head_id") != role.head_id
+                        or role_receipt.get("owner_grant_id")
+                        != atoms[2].value["grant_id"]
+                        or role_receipt.get("owner_authorization_head")
+                        != guard.authorization_head):
+                    raise UnavailableGuard("active role receipt differs")
+                binding = None
+                if scene_ref is not None:
+                    rows = db.execute(
+                        "SELECT token,revision,value FROM graph_atoms WHERE bot=? "
+                        "AND persona=? AND owner_kind='scene' AND subject=? "
+                        "AND type_name='d03.role_binding' AND valid=1",
+                        namespace.as_tuple + (scene_ref,),
+                    ).fetchall()
+                    if len(rows) != 1:
+                        raise UnavailableGuard("current scene binding is unavailable")
+                    key = AtomKey.from_token(rows[0][0])
+                    value = json.loads(rows[0][2])
+                    binding = RoleBinding(**{
+                        **value, "norm_refs": tuple(value["norm_refs"]),
+                        "source_refs": tuple(value["source_refs"]),
+                    })
+                    if (rows[0][1] != binding.binding_version
+                            or key.name != binding.role_binding_id
+                            or binding.scene_ref != scene_ref
+                            or binding.subject_persona_ref
+                            != f"persona:{namespace.persona_id}"
+                            or binding.status != "active"):
+                        raise UnavailableGuard("current scene binding differs")
+                    scene_row = db.execute(
+                        "SELECT r.receipt_json FROM graph_history AS h "
+                        "JOIN graph_scene_binding_receipts_v1 AS r "
+                        "ON r.bot=h.event_bot AND r.persona=h.event_persona "
+                        "AND r.operation_id=h.event_id "
+                        "WHERE h.token=? AND h.revision=? "
+                        "AND h.event_session='d03-scene-binding'",
+                        (key.token, rows[0][1]),
+                    ).fetchone()
+                    if scene_row is None:
+                        raise UnavailableGuard("scene binding lacks fenced receipt")
+                    scene_receipt = json.loads(scene_row[0])
+                    if (scene_receipt.get("scene_ref") != scene_ref
+                            or scene_receipt.get("binding_id") != binding.role_binding_id
+                            or scene_receipt.get("role_head_id") != role.head_id):
+                        raise UnavailableGuard("scene binding receipt differs")
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("active role read permit changed")
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("active role graph stamp changed after read")
+            return role, binding
+        finally:
+            port.finish_fence(
+                scope, request_id="finish:" + attempt_id,
+                request_digest="sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_active_role_read",
+                }))
 
     def provision_namespace_v2(self, bootstrap: object, policy, *,
                                operation_id: str) -> NamespaceProvisionReceiptV2:

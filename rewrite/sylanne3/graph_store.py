@@ -212,6 +212,97 @@ class GraphStore(Store):
                 graph_receipt_digest TEXT NOT NULL,
                 proof_json TEXT NOT NULL,
                 PRIMARY KEY(bot,persona), UNIQUE(operation_id), UNIQUE(grant_id));
+            CREATE TABLE IF NOT EXISTS graph_owner_issue_intents_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, grant_digest TEXT NOT NULL,
+                fence_attempt_id TEXT NOT NULL UNIQUE,
+                requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id,grant_digest));
+            CREATE TABLE IF NOT EXISTS graph_owner_issue_fences_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, permit_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL, pre_graph_epoch INTEGER NOT NULL,
+                post_graph_revision INTEGER NOT NULL, post_graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL, finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona));
+            CREATE TABLE IF NOT EXISTS graph_owner_issue_rejections_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, grant_digest TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status='rejected_no_commit'),
+                permit_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL, finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id,grant_digest),
+                FOREIGN KEY(bot,persona,operation_id,grant_digest)
+                    REFERENCES graph_owner_issue_intents_v1(
+                        bot,persona,operation_id,grant_digest));
+            CREATE TABLE IF NOT EXISTS graph_role_init_intents_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, input_digest TEXT NOT NULL,
+                fence_attempt_id TEXT NOT NULL UNIQUE,
+                requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                PRIMARY KEY(bot,persona));
+            CREATE TABLE IF NOT EXISTS graph_role_init_receipts_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, input_digest TEXT NOT NULL,
+                permit_json TEXT NOT NULL, receipt_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL, pre_graph_epoch INTEGER NOT NULL,
+                post_graph_revision INTEGER NOT NULL, post_graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL, finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona),
+                FOREIGN KEY(bot,persona) REFERENCES graph_role_init_intents_v1(bot,persona));
+            CREATE TABLE IF NOT EXISTS graph_role_init_rejections_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status='rejected_no_commit'),
+                permit_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL,
+                finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona),
+                FOREIGN KEY(bot,persona) REFERENCES graph_role_init_intents_v1(bot,persona));
+            CREATE TRIGGER IF NOT EXISTS graph_role_init_rejection_no_update_v1
+                BEFORE UPDATE ON graph_role_init_rejections_v1
+                BEGIN SELECT RAISE(ABORT, 'role rejection is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_role_init_rejection_no_delete_v1
+                BEFORE DELETE ON graph_role_init_rejections_v1
+                BEGIN SELECT RAISE(ABORT, 'role rejection is immutable'); END;
+            CREATE TABLE IF NOT EXISTS graph_scene_binding_intents_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, input_digest TEXT NOT NULL,
+                binding_id TEXT NOT NULL, fence_attempt_id TEXT NOT NULL UNIQUE,
+                requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_scene_binding_receipts_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, input_digest TEXT NOT NULL,
+                permit_json TEXT NOT NULL, receipt_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL, pre_graph_epoch INTEGER NOT NULL,
+                post_graph_revision INTEGER NOT NULL, post_graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL, finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id),
+                FOREIGN KEY(bot,persona,operation_id)
+                    REFERENCES graph_scene_binding_intents_v1(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_scene_binding_rejections_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status='rejected_no_commit'),
+                permit_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL,
+                finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id),
+                FOREIGN KEY(bot,persona,operation_id)
+                    REFERENCES graph_scene_binding_intents_v1(bot,persona,operation_id));
+            CREATE TRIGGER IF NOT EXISTS graph_scene_binding_rejection_no_update_v1
+                BEFORE UPDATE ON graph_scene_binding_rejections_v1
+                BEGIN SELECT RAISE(ABORT, 'scene rejection is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_scene_binding_rejection_no_delete_v1
+                BEFORE DELETE ON graph_scene_binding_rejections_v1
+                BEGIN SELECT RAISE(ABORT, 'scene rejection is immutable'); END;
             CREATE TABLE IF NOT EXISTS graph_bundle_fences_v2 (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 operation_id TEXT NOT NULL, digest TEXT NOT NULL,

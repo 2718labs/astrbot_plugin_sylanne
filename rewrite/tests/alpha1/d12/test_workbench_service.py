@@ -59,6 +59,72 @@ def test_missing_provider_returns_unavailable_without_a_write_receipt():
     assert answer.problem["code"] == "provider_unavailable"
 
 
+@pytest.mark.parametrize("action,input_data,capability", [
+    ("create_character", {"display_name": "小岚", "blueprint": "blank",
+                          "model_capability_ref": "host/model", "budget_ref": "host/budget"},
+     "workbench.create"),
+    ("bind_scene", {"scene_ref": "scene:private-123", "visibility": "private",
+                    "acknowledgement": True}, "workbench.bind_scene"),
+])
+def test_onboarding_commands_require_trusted_issuer_and_durable_receipt(action, input_data, capability):
+    class NoWriter:
+        def execute(self, **_):
+            return {"status": "unavailable", "problem": {"code": "action_issuer_unavailable"}}
+
+    payload = request(action, **input_data)
+    denied = WorkbenchService().handle(payload, session=session("workbench.read"), context=CONTEXT)
+    assert denied.status == "unauthorized" and denied.receipt is None
+
+    missing = WorkbenchService().handle(payload, session=session(capability), context=CONTEXT)
+    assert missing.status == "unavailable" and missing.receipt is None
+
+    unavailable = WorkbenchService(NoWriter()).handle(payload, session=session(capability), context=CONTEXT)
+    assert unavailable.status == "unavailable" and unavailable.receipt is None
+
+
+@pytest.mark.parametrize("action,input_data,receipt", [
+    ("create_character", {"display_name": "小岚", "blueprint": "blank",
+                          "model_capability_ref": "host/model", "budget_ref": "host/budget"},
+     {"phase": "role_initialized", "role_ref": "bot/persona"}),
+    ("bind_scene", {"scene_ref": "scene:private-123", "visibility": "private",
+                    "acknowledgement": True},
+     {"phase": "scene_bound", "scene_ref": "scene:private-123"}),
+])
+def test_onboarding_does_not_accept_incomplete_success_receipt(action, input_data, receipt):
+    class FalseSuccess:
+        def execute(self, **kwargs):
+            return {"status": "ready", "receipt": {"operation_id": kwargs["operation_id"], **receipt}}
+
+    capability = "workbench.create" if action == "create_character" else "workbench.bind_scene"
+    answer = WorkbenchService(FalseSuccess()).handle(
+        request(action, **input_data), session=session(capability), context=CONTEXT)
+    assert answer.status == "unavailable" and answer.receipt is None
+    assert answer.problem["code"] == "invalid_provider_response"
+
+
+def test_scene_visibility_must_be_explicitly_acknowledged():
+    answer = WorkbenchService().handle(
+        request("bind_scene", scene_ref="scene:group-123", visibility="group",
+                acknowledgement=False),
+        session=session("workbench.bind_scene"), context=CONTEXT)
+    assert answer.problem["code"] == "invalid_request"
+
+
+def test_scene_receipt_must_identify_the_requested_scene():
+    class WrongScene:
+        def execute(self, **kwargs):
+            return {"status": "ready", "receipt": {
+                "operation_id": kwargs["operation_id"], "phase": "scene_bound",
+                "scene_ref": "scene:another", "binding_revision": 1,
+            }}
+
+    answer = WorkbenchService(WrongScene()).handle(
+        request("bind_scene", scene_ref="scene:chosen", visibility="private",
+                acknowledgement=True),
+        session=session("workbench.bind_scene"), context=CONTEXT)
+    assert answer.status == "unavailable" and answer.receipt is None
+
+
 class Reader:
     def read_projection(self, **_):
         return {"status": "partial", "projection": {"private": "must not leak"},

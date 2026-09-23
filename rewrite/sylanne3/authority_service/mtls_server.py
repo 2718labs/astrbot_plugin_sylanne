@@ -24,11 +24,19 @@ from ..runtime_contracts import InstallationGrantV2, NamespaceBootstrapV2, Names
 from .core import AuthorityServiceCore
 from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, ContentPermit, identifier
 from .v2_clock import AuthorityClockReadingV2, IngressClockSampleV2
-from .v2_contract import FencePermitV2, SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire
+from .v2_contract import (
+    ExecutionBindingV1, FencePermitV2, MutationReceiptV2,
+    SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
+)
 from .v2_fence_service import AuthorityV2FenceService
 from .v2_execution_bridge import AuthorityV2ExecutionBridge
-from .v2_owner_contract import OwnerAuthorizationReceiptV1, to_wire as owner_to_wire
+from .v2_owner_contract import (
+    OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
+    OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
+    from_wire as owner_from_wire, to_wire as owner_to_wire,
+)
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from ..graph_coordinator import namespace_ref
 
 
 _MAX_SESSIONS = 256
@@ -145,6 +153,7 @@ class AuthorityRpcServer:
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
         v2_owner_tickets: AuthorityV2OwnerTicketStore | None = None,
+        v2_final_handoff_authorizers: Mapping[str, Callable] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
         clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
@@ -178,10 +187,15 @@ class AuthorityRpcServer:
                      or v2_owner_tickets._core is not core)):
             raise TypeError("v2 owner tickets must use the same Authority core")
         self._v2_owner_tickets = v2_owner_tickets
+        handoff_authorizers = dict(v2_final_handoff_authorizers or {})
+        if any(namespace not in services or not callable(callback)
+               for namespace, callback in handoff_authorizers.items()):
+            raise TypeError("v2 final handoff authorizers must be installed per namespace")
         self._v2_execution = {
             namespace: AuthorityV2ExecutionBridge(
                 core=core, fences=service.fences, journal=service.execution,
                 namespace=namespace, deletion=service.deletion,
+                final_handoff_authorizer=handoff_authorizers.get(namespace),
             ) for namespace, service in services.items()
         }
         installed = dict(installations_v2 or {})
@@ -446,6 +460,92 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method == "get_current_owner_guard_for_fence" and set(command) == {
+                    "namespace", "permit"}:
+                namespace = identifier(command["namespace"], "namespace")
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                tickets = self._v2_owner_tickets
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                if tickets is None or installed is None:
+                    raise AuthorityUnavailable("owner ticket service is unavailable")
+                permit = from_wire(command["permit"])
+                if (type(permit) is not FencePermitV2
+                        or permit.operation not in {"read", "write"}
+                        or permit.namespace != namespace or permit.subject != subject):
+                    raise AuthorityUnavailable("owner guard read requires a content fence")
+                current = service.validate_fence(
+                    credential=credential, subject=subject, permit=permit)
+                guard = tickets.get_current_guard(
+                    credential=credential, authority_namespace=namespace,
+                    installation_id=installed.installation_id,
+                    subject=subject, permit=current)
+                if guard is not None and (
+                    type(guard) is not OwnerAuthorizationGuardV1
+                    or guard.authority_id != self._authority_id()
+                    or guard.installation_id != installed.installation_id
+                    or namespace_ref(guard.namespace) != namespace
+                    or self._namespace_bindings_v2.get((
+                        credential.certificate_sha256, profile_id,
+                        guard.namespace)) != namespace
+                ):
+                    raise AuthorityUnavailable("owner guard identity mismatch")
+                return {"guard": None if guard is None else owner_to_wire(guard),
+                        "permit": to_wire(current)}
+            if method in {"register_owner_ticket", "reserve_owner_issue",
+                          "finalize_owner_issue"}:
+                namespace = identifier(command.get("namespace"), "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                tickets = self._v2_owner_tickets
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                if tickets is None or installed is None:
+                    raise AuthorityUnavailable("owner ticket service is unavailable")
+                expected = ({"namespace", "ticket"} if method == "register_owner_ticket"
+                            else {"namespace", "operation", "proof"}
+                            if method == "finalize_owner_issue"
+                            else {"namespace", "operation"})
+                if set(command) != expected:
+                    raise AuthorityUnavailable("owner command is invalid")
+                field = "ticket" if method == "register_owner_ticket" else "operation"
+                raw = command[field]
+                value = owner_from_wire(raw)
+                if owner_to_wire(value) != raw:
+                    raise AuthorityUnavailable("owner command is not canonical")
+                required_type = (OwnerClaimTicketV1 if field == "ticket"
+                                 else OwnerAuthorizationOperationV1)
+                if (type(value) is not required_type
+                        or value.authority_id != self._authority_id()
+                        or (method != "register_owner_ticket"
+                            and value.installation_id != installed.installation_id)
+                        or namespace_ref(value.namespace) != namespace
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            value.namespace)) != namespace):
+                    raise AuthorityUnavailable("owner command identity mismatch")
+                if method == "register_owner_ticket":
+                    ticket = tickets.register_ticket(
+                        credential=credential, authority_namespace=namespace,
+                        ticket=value)
+                    return {"ticket": owner_to_wire(ticket)}
+                if method == "reserve_owner_issue":
+                    receipt = tickets.reserve_issue(
+                        credential=credential, authority_namespace=namespace,
+                        operation=value)
+                    return {"receipt": owner_to_wire(receipt)}
+                raw_proof = command["proof"]
+                proof = owner_from_wire(raw_proof)
+                if (type(proof) is not OwnerGraphCommitProofV1
+                        or owner_to_wire(proof) != raw_proof):
+                    raise AuthorityUnavailable("owner graph proof is invalid")
+                # This is only a candidate. Store invokes its trusted, independent
+                # graph verifier and rechecks the Authority snapshot before CAS.
+                receipt = tickets.finalize_issue(
+                    credential=credential, authority_namespace=namespace,
+                    operation=value, proof=proof)
+                return {"receipt": owner_to_wire(receipt)}
             if method == "get_pending_owner_issue_for_graph_write" and set(command) == {
                     "namespace", "operation_id", "permit"}:
                 namespace = identifier(command["namespace"], "namespace")
@@ -513,6 +613,40 @@ class AuthorityRpcServer:
                     credential=credential, subject=subject, permit=permit,
                     mutation_id=command["mutation_id"], footprint=footprint)
                 return {"receipt": to_wire(receipt), "permit": to_wire(updated)}
+            if method == "execution_claim" and set(command) == {
+                    "prepared_receipt", "binding"}:
+                prepared = from_wire(command["prepared_receipt"])
+                binding = from_wire(command["binding"])
+                if (type(prepared) is not MutationReceiptV2
+                        or prepared.pending.phase != "prepared"
+                        or type(binding) is not ExecutionBindingV1
+                        or to_wire(prepared) != command["prepared_receipt"]
+                        or to_wire(binding) != command["binding"]
+                        or binding.permit != prepared.pending.permit
+                        or binding.permit.subject != subject):
+                    raise AuthorityUnavailable("prepared execution claim identity is invalid")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, binding.namespace)
+                receipt, updated = self._v2_execution[binding.namespace].execution_claim(
+                    credential=credential, subject=subject,
+                    prepared_receipt=prepared, binding=binding)
+                return {"receipt": to_wire(receipt), "permit": to_wire(updated)}
+            if method == "execution_begin_handoff" and set(command) == {
+                    "claimed_receipt", "handoff_id"}:
+                claimed = from_wire(command["claimed_receipt"])
+                handoff_id = identifier(command["handoff_id"], "handoff_id")
+                if (type(claimed) is not MutationReceiptV2
+                        or claimed.pending.phase != "claimed"
+                        or claimed.durable_state != "committed"
+                        or claimed.pending.permit.subject != subject):
+                    raise AuthorityUnavailable("committed claim required")
+                namespace = claimed.pending.permit.namespace
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                start = self._v2_execution[namespace].begin_handoff(
+                    credential=credential, subject=subject,
+                    claimed_receipt=claimed, handoff_id=handoff_id)
+                return {"start": start.to_wire()}
             if method == "current_anchor" and set(command) == {"namespace"}:
                 service = self._bound_v2_service(
                     credential, profile_id, manifest_digest, command["namespace"])

@@ -15,6 +15,7 @@ from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuar
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
+from sylanne3.authority_service.v2_contract import ExecutionBindingV1, from_wire, to_wire
 from sylanne3.authority_service.v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 from sylanne3.host.authority_client import (
     AUTHORITY_PROTOCOL, AuthorityHandshake, AuthorityProvisioningRequest,
@@ -23,6 +24,7 @@ from sylanne3.host.authority_client import (
 from sylanne3.host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime_contracts import NamespaceId, NamespaceRuntimeState
+from sylanne3.runtime_journal import RecoveryConstraintFootprint
 
 
 PEER_A = MtlsPeerCredential("a" * 64)
@@ -277,6 +279,64 @@ def test_graph_pending_query_requires_live_installed_write_fence(installed):
             call("get_pending_owner_issue_for_graph_write", query)
     finally:
         core._authorize_callback = original_authorize
+
+
+def test_dispatch_handoff_start_rpc_requires_final_graph_claim(installed):
+    server, core, _, _ = installed
+    call, _ = paired(server)
+    genesis = call("namespace_genesis", {
+        "namespace": asdict(ROLE), "request_id": "dispatch-handoff-genesis"})
+    item = RecoveryConstraintFootprint(
+        namespace="opaque-role-a", activity_id="activity-handoff",
+        effect_id="effect-handoff", conflict_keys=("resource-handoff",))
+    permit = from_wire(call("begin_dispatch_fence", {
+        "namespace": "opaque-role-a", "holder": "holder-a",
+        "operation_id": "dispatch-handoff", "expected_anchor": genesis["anchor"],
+        "effect_id": "effect-handoff", "command_digest": "sha256:" + "a" * 64,
+        "footprint": json.loads(item._json()),
+    })["permit"])
+    prepared = from_wire(call("execution_prepare", {
+        "permit": to_wire(permit), "mutation_id": "prepare-handoff",
+        "footprint": json.loads(item._json()),
+    })["receipt"])
+    binding = ExecutionBindingV1(
+        permit=permit, namespace="opaque-role-a", activity_id=item.activity_id,
+        effect_id=item.effect_id, attempt_id="attempt-handoff",
+        operation_id=permit.operation_id, dispatch_generation=1,
+        activation_generation=permit.generation, admission_ref="admission-handoff",
+        verified_check_refs=("check-handoff",), payload_digest="sha256:" + "b" * 64,
+        platform_capability_ref="capability-handoff", adapter_ref="adapter-handoff",
+        account_ref="account-handoff", destination_ref="destination-handoff",
+        worker_fence=1, content_fence="content-handoff", cancel_epoch=0,
+        footprint=item)
+    claimed = from_wire(call("execution_claim", {
+        "prepared_receipt": to_wire(prepared), "binding": to_wire(binding),
+    })["receipt"])
+    command = {"claimed_receipt": to_wire(claimed), "handoff_id": "handoff-rpc"}
+    with pytest.raises(RuntimeError, match="unavailable"):
+        call("execution_begin_handoff", command)
+    assert core._db.execute(
+        "SELECT count(*) FROM authority_execution_handoff_starts_v1"
+    ).fetchone() == (0,)
+    verified = []
+
+    def final_graph_claim(received_binding, received_claim, handoff_id):
+        assert not core._db.in_transaction
+        assert received_binding == binding and received_claim == claimed
+        verified.append(handoff_id)
+        return "graph-handoff-claim"
+
+    server._v2_execution["opaque-role-a"]._final_handoff_authorizer = final_graph_claim
+    start = call("execution_begin_handoff", command)["start"]
+    assert start["graph_claim_ref"] == "graph-handoff-claim"
+    assert start["handoff_id"] == "handoff-rpc"
+    assert start["replay"] is False
+    replay = call("execution_begin_handoff", command)["start"]
+    assert replay == {**start, "replay": True}
+    assert verified == ["handoff-rpc"]
+    other_call, _ = paired(server, PEER_B)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        other_call("execution_begin_handoff", command)
 
 
 @pytest.mark.asyncio

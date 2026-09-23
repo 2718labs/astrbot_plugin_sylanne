@@ -15,15 +15,17 @@ import hashlib
 import json
 import math
 
-from ...graph_types import AtomKey, GraphVersion, GraphWrite, Owner, TypeSpec
+from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeSpec
 from ...runtime_contracts import (
     CommandEnvelope,
     DependencySet,
     DomainProposal,
     ProviderDescriptor,
     RUNTIME_SCHEMA,
+    SourceQualification,
     schema_hash,
 )
+from ..d04 import AffectProvider, AffectScheme, FeelingState, MoodField
 from ..d06 import CandidateSet, SelectionTicket
 
 
@@ -233,6 +235,16 @@ class AttentionPolicy:
 class RankedAttention:
     ticket: AttentionTicket
     score: float
+
+
+@dataclass(frozen=True)
+class AffectFocusProjection:
+    """A D07 choice and its D04 read guard, pending D11 commit validation."""
+
+    focus: FocusState
+    adjusted_ticket: AttentionTicket
+    read_versions: tuple[GraphVersion, GraphVersion]
+    source_qualification: SourceQualification
 
 
 @dataclass(frozen=True)
@@ -873,6 +885,77 @@ class D07DomainProvider:
             "selected_by_bounded_attention" if refs else "no_eligible_ticket",
         )
 
+    def allocate_focus_with_affect(
+        self,
+        current: FocusState,
+        tickets: tuple[AttentionTicket, ...],
+        policy: AttentionPolicy,
+        *,
+        now: float,
+        snapshot: GraphSnapshot,
+        feeling_key: AtomKey,
+        mood_key: AtomKey,
+        scheme: AffectScheme,
+        source_qualification: SourceQualification,
+        axis_id: str,
+        gain: float,
+    ) -> AffectFocusProjection:
+        """Project committed D04 feeling into one question's subjective salience.
+
+        The graph reader must supply a current authorized snapshot. The returned
+        versions must join the D11 write guard; this pure projection cannot
+        certify a numeric solve or commit a focus change by itself.
+        """
+        if not isinstance(snapshot, GraphSnapshot) or not isinstance(scheme, AffectScheme):
+            raise TypeError("affect focus requires a graph snapshot and active D04 scheme")
+        if not isinstance(source_qualification, SourceQualification):
+            raise TypeError("affect focus requires classified source qualification")
+        if feeling_key.type_name != "d04.feeling_state.v1" or mood_key.type_name != "d04.mood_field.v1":
+            raise ValueError("affect focus requires D04 feeling and mood graph keys")
+        if feeling_key.owner != mood_key.owner or feeling_key.owner.kind != "persona":
+            raise ValueError("feeling and mood must share one persona owner")
+        if current.persona_id != feeling_key.owner.persona:
+            raise ValueError("focus persona differs from D04 affect owner")
+        if axis_id not in {axis.axis_id for axis in scheme.axes}:
+            raise ValueError("attention axis is absent from the active D04 scheme")
+        gain = _finite_unit(gain, "affect attention gain")
+        feeling_atom, mood_atom = snapshot.get(feeling_key), snapshot.get(mood_key)
+        if feeling_atom is None or mood_atom is None or not feeling_atom.valid or not mood_atom.valid:
+            raise ValueError("affect focus requires valid graph feeling and mood states")
+        specs = {spec.name: spec for spec in AffectProvider(active_scheme=scheme).type_specs()}
+        feeling = specs[feeling_key.type_name].validator(feeling_atom.value)
+        mood = specs[mood_key.type_name].validator(mood_atom.value)
+        if not isinstance(feeling, FeelingState) or not isinstance(mood, MoodField):
+            raise TypeError("D04 graph states did not decode to feeling and mood")
+        if (feeling.basis_version, feeling.operator_version, feeling.parameter_version,
+                feeling.coupling_version) != (scheme.scheme_version, scheme.operator_version,
+                                              scheme.parameter_version, scheme.coupling_version):
+            raise ValueError("feeling is not on the active affect scheme")
+        if (mood.basis_version, mood.parameter_version, mood.coupling_version) != (
+            scheme.scheme_version, scheme.parameter_version, scheme.coupling_version
+        ) or mood.cursor != feeling.cursor:
+            raise ValueError("mood is not synchronized with the active feeling")
+        if not set(feeling.historical_source_refs + mood.source_refs) <= set(source_qualification.source_refs):
+            raise ValueError("affect sources are missing from source qualification")
+        if type(tickets) is not tuple or any(not isinstance(ticket, AttentionTicket) for ticket in tickets):
+            raise TypeError("tickets must be a tuple of AttentionTicket")
+        matching = [ticket for ticket in tickets if ticket.question_key == feeling.target_ref]
+        if len(matching) != 1:
+            raise ValueError("D04 feeling must target exactly one attention question")
+        ticket = matching[0]
+        feeling_axes, mood_axes = dict(feeling.coordinates), dict(mood.coordinates)
+        if axis_id not in feeling_axes or axis_id not in mood_axes:
+            raise ValueError("attention axis must be present in both affect states")
+        salience = gain * (0.75 * abs(feeling_axes[axis_id]) + 0.25 * abs(mood_axes[axis_id]))
+        adjusted = replace(ticket, emotional_salience=salience)
+        projected = tuple(adjusted if item is ticket else item for item in tickets)
+        focus = self.allocate_focus(current, projected, policy, now=now)
+        return AffectFocusProjection(
+            focus, adjusted,
+            (GraphVersion(feeling_key, feeling_atom.revision), GraphVersion(mood_key, mood_atom.revision)),
+            source_qualification,
+        )
+
     @staticmethod
     def assemble_working_set(
         activity_id: str,
@@ -1074,7 +1157,7 @@ class D07DomainProvider:
 
 
 __all__ = [
-    "AttentionPolicy", "AttentionTicket", "BeliefRevision", "CognitiveActivity", "Concern",
+    "AffectFocusProjection", "AttentionPolicy", "AttentionTicket", "BeliefRevision", "CognitiveActivity", "Concern",
     "CurrentInterpretationCandidate", "D07DomainProvider",
     "EvidenceStatus", "FocusState", "Hypothesis", "HypothesisSet", "RankedAttention",
     "RecollectionHandoff", "ReflectionCheckpoint", "SimulationBranch", "SimulationRequest",

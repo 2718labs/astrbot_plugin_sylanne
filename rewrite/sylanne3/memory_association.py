@@ -7,6 +7,10 @@ import math
 from types import MappingProxyType
 from typing import Mapping
 
+from .graph_types import AtomKey, GraphVersion, NamespaceEpoch
+from .memory_repository import MemoryRepository
+from .memory_types import source_key, validate_association
+
 
 def _nonempty(value: object, label: str) -> None:
     if type(value) is not str or not value:
@@ -149,9 +153,187 @@ class AssociationActivator:
         return result
 
 
+@dataclass(frozen=True)
+class AssociationTraversal:
+    activation: ActivationResult
+    source_refs: tuple[str, ...]
+    edge_refs: tuple[str, ...]
+    read_versions: tuple[GraphVersion, ...]
+    epoch: NamespaceEpoch
+    coverage: str
+
+
+@dataclass(frozen=True)
+class AssociationDeletionRefs:
+    association_refs: tuple[str, ...]
+    epoch: NamespaceEpoch
+    coverage: str
+
+
+class PersistentAssociationReader:
+    """Read a bounded local neighborhood; every followed edge is reauthorized."""
+
+    def __init__(self, repository: MemoryRepository):
+        if not isinstance(repository, MemoryRepository):
+            raise TypeError("repository must be MemoryRepository")
+        self.repository = repository
+
+    def collect_deletion_refs(
+        self, source_id: str, *, max_pages: int = 16,
+    ) -> AssociationDeletionRefs:
+        """Find source-linked edges, including target/basis links and invalid rows.
+
+        A partial result cannot authorize a completed deletion closure.
+        """
+        if type(source_id) is not str or not source_id:
+            raise ValueError("source_id must be nonempty")
+        if type(max_pages) is not int or not 1 <= max_pages <= 16:
+            raise ValueError("max_pages must be between 1 and 16")
+        namespace = (self.repository.bot, self.repository.persona)
+        key = source_key(*namespace, source_id)
+        store = self.repository.store
+        epoch = store.graph_epoch(*namespace)
+        after = None
+        refs: list[str] = []
+        for _ in range(max_pages):
+            page = store.graph_query(
+                *namespace, type_names=("memory.association.v1",),
+                after=after, limit=512, expected_epoch=epoch, include_invalid=True,
+            )
+            for atom in page.snapshot.atoms:
+                validate_association(atom.value)
+                value = atom.value
+                if key.token in (value["source_ref"], value["target_ref"],
+                                 *value["basis_source_refs"]):
+                    refs.append(atom.key.token)
+            after = page.next_after
+            if after is None:
+                break
+        if store.graph_epoch(*namespace) != epoch:
+            raise ValueError("association closure namespace changed")
+        return AssociationDeletionRefs(
+            tuple(refs), epoch, "complete" if after is None else "partial",
+        )
+
+    def traverse(
+        self,
+        source_id: str,
+        policy: ActivationPolicy,
+        *,
+        audience: str,
+        purpose: str,
+        context_tags: tuple[str, ...] = (),
+        max_hops: int = 2,
+        max_edges: int = 128,
+        expected_epoch: NamespaceEpoch | None = None,
+    ) -> AssociationTraversal:
+        if type(source_id) is not str or not source_id:
+            raise ValueError("source_id must be nonempty")
+        if not isinstance(policy, ActivationPolicy):
+            raise TypeError("policy must be ActivationPolicy")
+        if type(max_hops) is not int or not 0 <= max_hops <= 2:
+            raise ValueError("max_hops must be between 0 and 2")
+        if type(max_edges) is not int or not 1 <= max_edges <= 256:
+            raise ValueError("max_edges must be between 1 and 256")
+        if type(context_tags) is not tuple or len(context_tags) > 8 or any(
+            type(tag) is not str or not tag for tag in context_tags
+        ):
+            raise ValueError("context_tags must be up to eight nonempty strings")
+        store = self.repository.store
+        namespace = (self.repository.bot, self.repository.persona)
+        epoch = store.graph_epoch(*namespace)
+        if expected_epoch is not None and expected_epoch != epoch:
+            raise ValueError("association traversal namespace epoch is stale")
+        authorized: dict[str, bool] = {}
+        versions: dict[AtomKey, GraphVersion] = {}
+
+        def available(item_id: str) -> bool:
+            if item_id not in authorized:
+                source, proof = self.repository.read_source_evidence(
+                    item_id, audience=audience, purpose=purpose,
+                )
+                if proof.epochs != (epoch,):
+                    raise ValueError("association traversal epoch changed during access check")
+                authorized[item_id] = source is not None
+                if source is not None:
+                    for version in proof.versions:
+                        versions[version.key] = version
+            return authorized[item_id]
+
+        if not available(source_id):
+            raise PermissionError("association cue is unavailable")
+        frontier = (source_id,)
+        visited = {source_id}
+        edges: list[AssociationEdge] = []
+        edge_refs: list[str] = []
+        partial = False
+        for _ in range(max_hops):
+            next_frontier: list[str] = []
+            for current in frontier:
+                if len(edges) >= max_edges:
+                    partial = True
+                    break
+                page = store.graph_query(
+                    *namespace, type_names=("memory.association.v1",),
+                    owner_kind="event", subject=current,
+                    limit=min(32, max_edges - len(edges)), expected_epoch=epoch,
+                )
+                if page.next_after is not None:
+                    partial = True
+                for atom in page.snapshot.atoms:
+                    validate_association(atom.value)
+                    value = atom.value
+                    source_key_ref = AtomKey.from_token(value["source_ref"])
+                    target_key_ref = AtomKey.from_token(value["target_ref"])
+                    if (source_key_ref != source_key(*namespace, current)
+                            or atom.key.owner.subject != current
+                            or (target_key_ref.owner.bot, target_key_ref.owner.persona) != namespace):
+                        raise ValueError("association graph edge does not match its directed owner")
+                    fit = 1.0 if not value["context_tags"] else float(bool(
+                        set(value["context_tags"]) & set(context_tags)
+                    ))
+                    if fit == 0:
+                        continue
+                    basis_keys = tuple(AtomKey.from_token(ref) for ref in value["basis_source_refs"])
+                    target_id = target_key_ref.owner.subject
+                    if target_id not in visited and len(visited) >= policy.max_nodes:
+                        partial = True
+                        continue
+                    if not available(target_key_ref.owner.subject) or any(
+                        not available(key.owner.subject) for key in basis_keys
+                    ):
+                        continue
+                    edges.append(AssociationEdge(
+                        source_key_ref.token, target_key_ref.token, value["weight"],
+                        fit, atom.key.token,
+                    ))
+                    edge_refs.append(atom.key.token)
+                    versions[atom.key] = GraphVersion(atom.key, atom.revision)
+                    if target_id not in visited:
+                        visited.add(target_id)
+                        next_frontier.append(target_id)
+            frontier = tuple(next_frontier)
+            if not frontier:
+                break
+        if store.graph_epoch(*namespace) != epoch:
+            raise ValueError("association traversal namespace changed")
+        cue = source_key(*namespace, source_id).token
+        activation = AssociationActivator(policy).propagate({cue: 1.0}, tuple(edges))
+        return AssociationTraversal(
+            activation,
+            tuple(source_key(*namespace, item).token for item in sorted(visited)
+                  if authorized.get(item, False)),
+            tuple(edge_refs), tuple(versions.values()), epoch,
+            "partial" if partial else "bounded_complete",
+        )
+
+
 __all__ = [
     "ActivationPolicy",
     "ActivationResult",
     "AssociationActivator",
     "AssociationEdge",
+    "AssociationDeletionRefs",
+    "AssociationTraversal",
+    "PersistentAssociationReader",
 ]

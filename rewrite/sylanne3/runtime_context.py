@@ -8,7 +8,10 @@ import inspect
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from .contracts import StaleRead
 from .domain_registry import DomainRegistry, discover_domain_registry
+from .domains.d01 import ActiveRoleQualification
+from .domains.d03.context import RoleBinding
 from .graph_coordinator import (
     FirstIngressOutcomeUnknown, GraphCoordinator, IngressClockSample,
     IngressIssuancePolicy, UnavailableGuard,
@@ -112,6 +115,9 @@ class RuntimeContext:
         self._worker: GraphWorker | None = None
         self._v2_provision: Callable | None = None
         self._v2_ingress: Callable | None = None
+        self._v2_role_probe: Callable | None = None
+        self._v2_scene_probe: Callable | None = None
+        self._v2_namespace: NamespaceId | None = None
         self._v2_missing_ingress_policies: tuple[str, ...] = ()
         self._v2_namespace_provisioned = False
         self._ingress_handler: Callable[
@@ -225,6 +231,13 @@ class RuntimeContext:
                 return self.health
             self._v2_provision = provision
             self._v2_ingress = ingress
+            self._v2_namespace = policy.namespace
+            self._v2_role_probe = lambda graph: graph.read_active_role_v2(
+                namespace=policy.namespace,
+            )
+            self._v2_scene_probe = lambda graph, scene_ref: graph.read_active_scene_v2(
+                namespace=policy.namespace, scene_ref=scene_ref,
+            )
             self._v2_missing_ingress_policies = tuple(
                 name for name, configured in (
                     ("ingress_clock", installation.ingress_clock),
@@ -261,16 +274,76 @@ class RuntimeContext:
                 )
                 raise
             self._v2_namespace_provisioned = True
-            missing = ["dispatch"]
+            # Provisioning creates the namespace, not its Owner, active role,
+            # or D03 scene binding. First dialogue cannot be admitted yet.
+            missing = ["owner_guard", "active_role", "scene_binding", "dispatch"]
             if self._v2_ingress is None:
                 missing.insert(0, "product_ingress")
-            detail = "installed namespace provisioned; dispatch remains pending"
+            detail = (
+                "installed namespace provisioned; trusted Owner, active role, "
+                "scene binding, and dispatch remain pending"
+            )
             if self._v2_missing_ingress_policies:
                 detail += "; ingress requires " + ", ".join(self._v2_missing_ingress_policies)
             self.health = RuntimeHealth(
                 "limited", tuple(missing), detail,
             )
             return receipt
+
+    async def refresh_capabilities(self, *, scene_ref: str | None = None) -> RuntimeHealth:
+        """Probe current Owner, role and optional exact scene on the graph worker.
+
+        The result is diagnostic only. A later ingress must obtain fresh
+        Owner, role and scene proofs inside its own fenced operation.
+        """
+        async with self._lock:
+            if (self._worker is None or not self._v2_namespace_provisioned
+                    or self._v2_role_probe is None or self.health.status == "blocked"):
+                return self.health
+            if scene_ref is not None and (
+                    not isinstance(scene_ref, str) or not scene_ref.startswith("scene:")
+                    or len(scene_ref) == len("scene:")):
+                raise ValueError("scene_ref must identify a scene")
+            try:
+                if scene_ref is None:
+                    role = await self._worker.call(self._v2_role_probe)
+                    scene = None
+                else:
+                    role, scene = await self._worker.call(self._v2_scene_probe, scene_ref)
+                if (type(role) is not ActiveRoleQualification
+                        or role.namespace != self._v2_namespace):
+                    raise ValueError("current role probe returned an invalid qualification")
+                if scene_ref is not None and (
+                        type(scene) is not RoleBinding or scene.scene_ref != scene_ref
+                        or scene.subject_persona_ref != f"persona:{self._v2_namespace.persona_id}"):
+                    raise ValueError("current scene probe returned an invalid binding")
+            except V2FenceOutcomeUnknown as exc:
+                self.health = RuntimeHealth(
+                    "blocked", ("v2_fence_recovery",), str(exc),
+                )
+                return self.health
+            except (UnavailableGuard, StaleRead, ValueError):
+                owner_role = ("owner_guard", "active_role")
+                scene_ready = False
+            else:
+                owner_role = ()
+                scene_ready = scene_ref is not None
+            missing = list(owner_role) + ["scene_binding", "dispatch"]
+            if self._v2_ingress is None:
+                missing.insert(0, "product_ingress")
+            if owner_role:
+                detail = "trusted Owner and active role remain unavailable"
+            elif scene_ready:
+                detail = (
+                    "current scene binding record exists; message-time eligibility "
+                    "and dispatch remain pending"
+                )
+            else:
+                detail = "current Owner and role checked; scene-specific proof and dispatch remain pending"
+            self.health = RuntimeHealth(
+                "limited", tuple(missing), detail,
+            )
+            return self.health
 
     async def start(self) -> RuntimeHealth:
         async with self._lock:
@@ -397,7 +470,8 @@ class RuntimeContext:
         if not isinstance(envelope, HostIngressEnvelope):
             raise TypeError("envelope must be HostIngressEnvelope")
         if self._worker is not None:
-            if not self._v2_namespace_provisioned or self._v2_ingress is None:
+            if (self.health.status != "ready" or not self._v2_namespace_provisioned
+                    or self._v2_ingress is None):
                 return IngressReceipt("unavailable")
             try:
                 receipt = await self._worker.call(self._v2_ingress, ingress_host_facts(envelope))
@@ -427,6 +501,9 @@ class RuntimeContext:
             worker, self._worker = self._worker, None
             self._v2_provision = None
             self._v2_ingress = None
+            self._v2_role_probe = None
+            self._v2_scene_probe = None
+            self._v2_namespace = None
             self._v2_missing_ingress_policies = ()
             self._v2_namespace_provisioned = False
             store, self._store = self._store, None

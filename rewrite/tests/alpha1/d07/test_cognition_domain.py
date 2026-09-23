@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import json
 
 import pytest
 
@@ -28,7 +29,10 @@ from rewrite.sylanne3.domains.d07 import (
     WorkingSetItem,
     WorkingSet,
 )
-from rewrite.sylanne3.graph_types import AtomKey, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec
+from rewrite.sylanne3.domains.d04 import AffectAxis, AffectScheme, FeelingState, MoodField
+from rewrite.sylanne3.graph_types import (
+    AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec,
+)
 from rewrite.sylanne3.memory_types import access_key, source_key
 from rewrite.sylanne3.runtime_contracts import (
     AuthorityContext,
@@ -144,6 +148,63 @@ def test_focus_is_one_primary_plus_three_auxiliary_and_epoch_is_serial() -> None
     assert next_state.focus_epoch == 8
     assert next_state.primary_ticket_ref == "t0"
     assert next_state.auxiliary_ticket_refs == ("t1", "t2", "t3")
+
+
+def test_committed_affect_changes_focus_only_with_matching_guarded_sources() -> None:
+    provider = D07DomainProvider()
+    policy = AttentionPolicy.default()
+    current = FocusState("persona", 7, None, (), "previous")
+    other = replace(ticket("other"), enqueued_seq=1)
+    concerned = replace(ticket("concerned"), enqueued_seq=2)
+    assert provider.allocate_focus(current, (other, concerned), policy, now=1.0).primary_ticket_ref == "other"
+
+    scheme = AffectScheme(
+        "d04.affect.scheme.v1", "basis-1", "operator-1", "parameter-1", "coupling-1",
+        (AffectAxis("arousal", "normalized", "subjective activation"),), (),
+    )
+    feeling = FeelingState(
+        "process-1", concerned.question_key, "basis-1", "operator-1",
+        (("arousal", 1.0),), ("meaning-1",), ("interpretation-1",), ("driver-1",),
+        ("source-1",), "parameter-1", "coupling-1", 2.0,
+    )
+    mood = MoodField(
+        "mood-1", "basis-1", (("arousal", 1.0),), ("source-1",),
+        "parameter-1", "coupling-1", 2.0,
+    )
+    owner = Owner("persona", "bot", "persona")
+    feeling_key = AtomKey(owner, "d04.feeling_state.v1", "process-1")
+    mood_key = AtomKey(owner, "d04.mood_field.v1", "mood-1")
+    snapshot = GraphSnapshot((
+        GraphAtom(feeling_key, 3, json.loads(json.dumps(asdict(feeling)))),
+        GraphAtom(mood_key, 4, json.loads(json.dumps(asdict(mood)))),
+    ), ())
+    qualification = SourceQualification(
+        ("source-1",), "reported", 1.0, 2.0, "external_report", "eligible", 0.7,
+        "not_applicable",
+    )
+    projection = provider.allocate_focus_with_affect(
+        current, (other, concerned), policy, now=1.0, snapshot=snapshot,
+        feeling_key=feeling_key, mood_key=mood_key, scheme=scheme,
+        source_qualification=qualification, axis_id="arousal", gain=1.0,
+    )
+    assert projection.focus.primary_ticket_ref == "concerned"
+    assert projection.adjusted_ticket.emotional_salience == 1.0
+    assert projection.read_versions == (GraphVersion(feeling_key, 3), GraphVersion(mood_key, 4))
+    assert projection.source_qualification is qualification
+    with pytest.raises(ValueError, match="missing from source qualification"):
+        provider.allocate_focus_with_affect(
+            current, (other, concerned), policy, now=1.0, snapshot=snapshot,
+            feeling_key=feeling_key, mood_key=mood_key, scheme=scheme,
+            source_qualification=replace(qualification, source_refs=("other-source",)),
+            axis_id="arousal", gain=1.0,
+        )
+    with pytest.raises(ValueError, match="valid graph feeling"):
+        provider.allocate_focus_with_affect(
+            current, (other, concerned), policy, now=1.0,
+            snapshot=GraphSnapshot((replace(snapshot.atoms[0], valid=False), snapshot.atoms[1]), ()),
+            feeling_key=feeling_key, mood_key=mood_key, scheme=scheme,
+            source_qualification=qualification, axis_id="arousal", gain=1.0,
+        )
 
 
 def test_working_set_keeps_hard_constraints_and_counterevidence() -> None:

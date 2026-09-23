@@ -18,13 +18,14 @@ from uuid import UUID
 D12_SCHEMA = "d12.contract.v1"
 _SCOPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 _ACTIONS = frozenset({
-    "open_workspace", "compile_scheme", "activate_scheme", "read_character_view",
+    "open_workspace", "create_character", "bind_scene", "compile_scheme", "activate_scheme", "read_character_view",
     "correct_or_edit", "run_experiment", "prepare_transfer", "execute_transfer",
     "erase_or_retire", "diagnose_and_export_support", "install_or_upgrade",
     "configure_or_control",
 })
 _READ_ACTIONS = frozenset({"open_workspace", "read_character_view"})
 _MUTATION_CAPABILITIES = {
+    "create_character": "workbench.create", "bind_scene": "workbench.bind_scene",
     "compile_scheme": "workbench.compile", "activate_scheme": "workbench.activate",
     "correct_or_edit": "workbench.correct", "run_experiment": "workbench.experiment",
     "prepare_transfer": "workbench.transfer", "execute_transfer": "workbench.transfer",
@@ -34,6 +35,8 @@ _MUTATION_CAPABILITIES = {
 _PROJECTION_STATES = frozenset({"loading", "empty", "unauthorized", "stale", "partial", "unavailable", "ready"})
 _INPUT_FIELDS = {
     "open_workspace": frozenset({"client_protocol"}),
+    "create_character": frozenset({"display_name", "blueprint", "model_capability_ref", "budget_ref"}),
+    "bind_scene": frozenset({"scene_ref", "visibility", "acknowledgement"}),
     "compile_scheme": frozenset({"draft", "draft_ref", "field_diff", "view_type", "intent", "budget_ref"}),
     "activate_scheme": frozenset({"compiled_scheme_ref", "read_set", "adopt_intent"}),
     "read_character_view": frozenset({"view_type", "cursor", "page_size"}),
@@ -139,7 +142,7 @@ class WorkbenchService:
             returned = self._issuer.execute(session=session, action=command["action"], scope=command["scope"],
                                             purpose=command["purpose"], audience=command["audience"],
                                             operation_id=command["operation_id"], input_data=command["input"])
-            return self._command_response(command["action"], command["operation_id"], returned)
+            return self._command_response(command["action"], command["operation_id"], command["input"], returned)
         except PermissionError:
             return self._problem("unauthorized", "capability_denied", "服务端拒绝了当前能力。", False)
         except LookupError:
@@ -188,6 +191,27 @@ class WorkbenchService:
             raise ValueError("read_character_view requires a known view_type")
         if action == "open_workspace" and input_data.get("client_protocol") != D12_SCHEMA:
             raise ValueError("open_workspace requires the current client protocol")
+        if action == "create_character":
+            if set(input_data) != _INPUT_FIELDS[action]:
+                raise ValueError("create_character requires display_name, blueprint, model_capability_ref and budget_ref")
+            if (not isinstance(input_data["display_name"], str)
+                    or not 1 <= len(input_data["display_name"].strip()) <= 80):
+                raise ValueError("create_character requires a display name")
+            if input_data["blueprint"] not in {"blank", "example"}:
+                raise ValueError("create_character requires a known blueprint")
+            if any(not isinstance(input_data[name], str) or not _SCOPE.fullmatch(input_data[name])
+                   for name in ("model_capability_ref", "budget_ref")):
+                raise ValueError("create_character requires server-resolvable capability and budget references")
+        if action == "bind_scene":
+            if set(input_data) != _INPUT_FIELDS[action]:
+                raise ValueError("bind_scene requires scene_ref, visibility and acknowledgement")
+            if (not isinstance(input_data["scene_ref"], str)
+                    or not input_data["scene_ref"].startswith("scene:")
+                    or len(input_data["scene_ref"]) <= len("scene:")
+                    or not _SCOPE.fullmatch(input_data["scene_ref"])):
+                raise ValueError("bind_scene requires a server-resolvable scene reference")
+            if input_data["visibility"] not in {"private", "group"} or input_data["acknowledgement"] is not True:
+                raise ValueError("bind_scene requires an acknowledged visibility")
         if "page_size" in input_data and (type(input_data["page_size"]) is not int or not 1 <= input_data["page_size"] <= 100):
             raise ValueError("page_size must be an integer from 1 through 100")
         return {"action": action, "scope": scope, "purpose": purpose, "audience": audience,
@@ -207,7 +231,8 @@ class WorkbenchService:
                            problem=returned.get("problem") if isinstance(returned.get("problem"), Mapping) else None)
 
     @classmethod
-    def _command_response(cls, action: str, operation_id: str, returned: Mapping[str, Any]) -> ApiResponse:
+    def _command_response(cls, action: str, operation_id: str, input_data: Mapping[str, Any],
+                          returned: Mapping[str, Any]) -> ApiResponse:
         status = returned.get("status")
         if status not in {"ready", "partial", "stale", "unavailable", "unauthorized"}:
             return cls._problem("unavailable", "invalid_provider_response", "提供方返回了未知操作状态。", False)
@@ -220,6 +245,19 @@ class WorkbenchService:
         receipt = returned.get("receipt")
         if not isinstance(receipt, Mapping) or receipt.get("operation_id") != operation_id:
             return cls._problem("unavailable", "invalid_provider_response", "提供方没有与请求绑定的耐久操作收据。", False)
+        if action == "create_character" and (
+                receipt.get("phase") != "role_initialized"
+                or not isinstance(receipt.get("role_ref"), str)
+                or not receipt["role_ref"]
+                or type(receipt.get("owner_grant_revision")) is not int
+                or receipt["owner_grant_revision"] < 1):
+            return cls._problem("unavailable", "invalid_provider_response", "角色初始化缺少权威收据。", False)
+        if action == "bind_scene" and (
+                receipt.get("phase") != "scene_bound"
+                or receipt.get("scene_ref") != input_data["scene_ref"]
+                or type(receipt.get("binding_revision")) is not int
+                or receipt["binding_revision"] < 1):
+            return cls._problem("unavailable", "invalid_provider_response", "场景绑定缺少权威收据。", False)
         return ApiResponse(status="ready", projection=returned.get("projection") if isinstance(returned.get("projection"), Mapping) else None,
                            receipt=receipt)
 

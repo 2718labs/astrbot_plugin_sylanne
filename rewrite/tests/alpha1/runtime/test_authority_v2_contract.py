@@ -7,7 +7,8 @@ import json
 import pytest
 
 from sylanne3.authority_service.v2_contract import (
-    ExecutionBindingV1, FencePermitV2, MutationReceiptV2, PendingMutationV2,
+    ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
+    PendingMutationV2,
     PlatformObservationV1, SCHEMA,
     canonical_bytes, canonical_digest, decode_bytes, from_wire, to_wire,
 )
@@ -188,6 +189,75 @@ def binding(*, contact: bool = False, **changes) -> ExecutionBindingV1:
     )
     fields.update(changes)
     return ExecutionBindingV1(**fields)
+
+
+def binding_v2(**changes) -> ExecutionBindingV2:
+    fields = dict(
+        origin=binding(), graph_namespace="ns-a",
+        graph_incarnation="graph-incarnation-a",
+        admission_receipt_digest=digest("1"),
+        admission_graph_version="graph-version-a",
+        admission_graph_epoch=3, admission_access_epoch=2,
+        admission_deletion_epoch=0,
+        action_intent_digest=digest("2"),
+        action_intent_schema_version="d08.action-intent.v1",
+        action_schema_digest=digest("3"),
+        action_schema_version="d08.action-schema.v1",
+        required_checks_digest=digest("4"),
+        required_checks_schema_version="d08.required-checks.v1",
+        initial_check_evidence_digest=digest("5"),
+        utc_deadline="2029-01-01T00:00:00Z",
+        clock_policy_ref="clock-policy-a", clock_policy_digest=digest("6"),
+    )
+    fields.update(changes)
+    return ExecutionBindingV2(**fields)
+
+
+def test_execution_binding_v2_roundtrip_is_explicit_and_v1_stays_historical() -> None:
+    original_v1 = binding()
+    original_v2 = binding_v2(origin=original_v1)
+    assert to_wire(original_v1)["kind"] == "execution_binding_v1"
+    assert to_wire(original_v2)["kind"] == "execution_binding_v2"
+    assert from_wire(to_wire(original_v1)) == original_v1
+    assert decode_bytes(canonical_bytes(original_v1)) == original_v1
+    assert from_wire(to_wire(original_v2)) == original_v2
+    assert decode_bytes(canonical_bytes(original_v2)) == original_v2
+    assert original_v2.origin.permit == original_v1.permit
+    assert canonical_digest(original_v2) != canonical_digest(original_v1)
+    assert type(from_wire(to_wire(original_v1))) is ExecutionBindingV1
+
+
+@pytest.mark.parametrize("changes", [
+    {"graph_namespace": "ns-other"},
+    {"graph_incarnation": ""},
+    {"admission_receipt_digest": digest("A")},
+    {"admission_graph_epoch": True},
+    {"admission_access_epoch": -1},
+    {"action_intent_digest": "genesis"},
+    {"required_checks_digest": digest("A")},
+    {"initial_check_evidence_digest": ""},
+    {"utc_deadline": "2029-02-30T00:00:00Z"},
+    {"utc_deadline": "2029-01-01T00:00:00+00:00"},
+    {"clock_policy_ref": ""},
+    {"origin": "v1-ref"},
+])
+def test_execution_binding_v2_rejects_invalid_identity_or_evidence(changes) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        binding_v2(**changes)
+
+
+def test_execution_binding_v2_wire_rejects_missing_unknown_and_v1_substitution() -> None:
+    wire = to_wire(binding_v2())
+    for changed in (
+        {key: value for key, value in wire.items() if key != "clock_policy_digest"},
+        {**wire, "unexpected": True},
+        {**wire, "origin": to_wire(permit())},
+        {**wire, "graph_namespace": "ns-other"},
+        {**wire, "admission_graph_epoch": False},
+        {**to_wire(binding()), "kind": "execution_binding_v2"},
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            from_wire(changed)
 
 
 def observation(**changes) -> PlatformObservationV1:

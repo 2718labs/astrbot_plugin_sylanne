@@ -11,9 +11,13 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
 from ..graph_types import GraphPage
-from ..runtime_contracts import AuthorityContext
+from ..graph_coordinator import RoleInitializationReceiptV1, SceneBindingReceiptV1
+from ..domains.d01 import ActiveRoleQualification
+from ..domains.d03.context import RoleBinding, RoleBindingResolution
+from ..runtime_contracts import AuthorityContext, DomainProposal
 from .domain_registry import PROJECTION_CONTEXT_V1
-from .service import AuthenticatedSession
+from .onboarding import OnboardingPolicyResolver, TrustedBindScene, TrustedCreateCharacter
+from .service import AuthenticatedSession, request_digest
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,8 @@ class GraphWorkbenchIssuer:
     """
 
     def __init__(self, coordinator: object, grants: GrantResolver,
-                 view_registry: DomainViewRegistry) -> None:
+                 view_registry: DomainViewRegistry,
+                 onboarding: OnboardingPolicyResolver | None = None) -> None:
         if not callable(getattr(coordinator, "query", None)):
             raise TypeError("coordinator must expose query")
         if not callable(getattr(grants, "resolve", None)):
@@ -65,6 +70,7 @@ class GraphWorkbenchIssuer:
         self._coordinator = coordinator
         self._grants = grants
         self._view_registry = view_registry
+        self._onboarding = onboarding
 
     def read_projection(self, *, session: AuthenticatedSession, scope: str, view_type: str,
                         purpose: str, audience: str) -> Mapping[str, Any]:
@@ -193,7 +199,115 @@ class GraphWorkbenchIssuer:
     def execute(self, *, session: AuthenticatedSession, action: str, scope: str,
                 purpose: str, audience: str, operation_id: str,
                 input_data: Mapping[str, Any]) -> Mapping[str, Any]:
+        if action == "create_character":
+            return self._create_character(session=session, scope=scope, purpose=purpose,
+                                          audience=audience, operation_id=operation_id,
+                                          input_data=input_data)
+        if action == "bind_scene":
+            return self._bind_scene(session=session, scope=scope, purpose=purpose,
+                                    audience=audience, operation_id=operation_id,
+                                    input_data=input_data)
         return _unavailable("action_issuer_unavailable")
+
+    def _bind_scene(self, *, session: AuthenticatedSession, scope: str,
+                    purpose: str, audience: str, operation_id: str,
+                    input_data: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not session.allows(scope, "workbench.bind_scene", purpose, audience):
+            return _unavailable("authority_unavailable")
+        resolver = self._onboarding
+        commit = getattr(self._coordinator, "commit_scene_binding_v2", None)
+        if resolver is None or not callable(commit):
+            return _unavailable("scene_binding_unavailable")
+        digest = "sha256:" + request_digest({
+            "action": "bind_scene", "scope": scope, "purpose": purpose,
+            "audience": audience, "operation_id": operation_id, "input": input_data,
+        })
+        resolved = resolver.resolve_bind_scene(
+            coordinator=self._coordinator, session=session, scope=scope,
+            purpose=purpose, audience=audience, operation_id=operation_id,
+            request_digest=digest, input_data=input_data,
+        )
+        if (not isinstance(resolved, TrustedBindScene)
+                or resolved.actor_id != session.actor_id
+                or resolved.session_id != session.session_id
+                or resolved.scope != scope or resolved.operation_id != operation_id
+                or resolved.request_digest != digest
+                or not isinstance(resolved.binding, RoleBinding)
+                or not isinstance(resolved.active_role, ActiveRoleQualification)
+                or not isinstance(resolved.proposal, DomainProposal)
+                or not isinstance(resolved.prior, RoleBindingResolution)
+                or resolved.binding.scene_ref != input_data["scene_ref"]
+                or resolved.binding.visibility_scope != input_data["visibility"]
+                or resolved.binding.subject_persona_ref
+                != f"persona:{resolved.active_role.namespace.persona_id}"
+                or resolved.proposal.domain != "d03"
+                or resolved.proposal.envelope.identity.operation_id != operation_id
+                or resolved.proposal.envelope.authority.namespace != resolved.active_role.namespace
+                or resolved.prior.status != "no_applicable_binding"
+                or resolved.prior.request is None
+                or resolved.prior.request.scene_ref != input_data["scene_ref"]):
+            return _unavailable("scene_binding_policy_unavailable")
+        result = commit(namespace=resolved.active_role.namespace,
+                        operation_id=operation_id, proposal=resolved.proposal,
+                        prior=resolved.prior, principal=resolved.principal,
+                        request_digest=digest)
+        if (not isinstance(result, SceneBindingReceiptV1)
+                or result.namespace != resolved.active_role.namespace
+                or result.operation_id != operation_id
+                or result.request_digest != digest
+                or result.scene_ref != input_data["scene_ref"]
+                or result.binding_id != resolved.binding.role_binding_id
+                or result.role_head_id != resolved.active_role.head_id):
+            return _unavailable("scene_binding_receipt_invalid")
+        return {"status": "ready", "receipt": {
+            "operation_id": operation_id, "phase": "scene_bound",
+            "scene_ref": result.scene_ref, "binding_id": result.binding_id,
+            "binding_revision": resolved.binding.binding_version,
+            "role_head_id": result.role_head_id,
+            "graph_revision": result.graph_revision,
+        }}
+
+    def _create_character(self, *, session: AuthenticatedSession, scope: str,
+                          purpose: str, audience: str, operation_id: str,
+                          input_data: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not session.allows(scope, "workbench.create", purpose, audience):
+            return _unavailable("authority_unavailable")
+        resolver = self._onboarding
+        commit = getattr(self._coordinator, "commit_role_initialization_v2", None)
+        if resolver is None or not callable(commit):
+            return _unavailable("role_initialization_unavailable")
+        digest = "sha256:" + request_digest({
+            "action": "create_character", "scope": scope, "purpose": purpose,
+            "audience": audience, "operation_id": operation_id, "input": input_data,
+        })
+        resolved = resolver.resolve_create_character(
+            session=session, scope=scope, purpose=purpose, audience=audience,
+            operation_id=operation_id, request_digest=digest, input_data=input_data,
+        )
+        if (not isinstance(resolved, TrustedCreateCharacter)
+                or resolved.actor_id != session.actor_id
+                or resolved.session_id != session.session_id
+                or resolved.scope != scope or resolved.operation_id != operation_id
+                or resolved.request_digest != digest):
+            return _unavailable("role_initialization_policy_unavailable")
+        result = commit(namespace=resolved.plan.namespace, operation_id=operation_id,
+                        request_digest=digest, plan=resolved.plan,
+                        principal=resolved.principal)
+        if (not isinstance(result, RoleInitializationReceiptV1)
+                or result.namespace != resolved.plan.namespace
+                or result.operation_id != operation_id or result.request_digest != digest
+                or result.plan_id != resolved.plan.plan_id
+                or result.head_id != resolved.plan.head_id
+                or result.owner_grant_revision < 1):
+            return _unavailable("role_initialization_receipt_invalid")
+        return {"status": "ready", "receipt": {
+            "operation_id": operation_id, "phase": "role_initialized",
+            "role_ref": f"persona:{result.namespace.persona_id}",
+            "plan_id": result.plan_id, "head_id": result.head_id,
+            "owner_grant_id": result.owner_grant_id,
+            "owner_grant_revision": result.owner_grant_revision,
+            "graph_revision": result.graph_revision,
+        }}
 
     def _views(self, grant: CoordinatorGrant) -> Mapping[str, tuple[str, ...]] | None:
         try:

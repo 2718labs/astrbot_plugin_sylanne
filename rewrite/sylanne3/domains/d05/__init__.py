@@ -3,6 +3,7 @@
 from .relationship import (
     BoundaryCheck,
     BoundaryRule,
+    BoundaryRuleReadSet,
     InvalidationResult,
     RelationshipContribution,
     RelationshipProvider,
@@ -11,6 +12,7 @@ from .relationship import (
 __all__ = (
     "BoundaryCheck",
     "BoundaryRule",
+    "BoundaryRuleReadSet",
     "InvalidationResult",
     "RelationshipContribution",
     "RelationshipProvider",

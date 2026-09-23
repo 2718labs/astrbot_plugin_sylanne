@@ -4,11 +4,17 @@ This module owns no storage.  W01 supplies the authorised graph transaction;
 D06 supplies source eligibility, and D08 consumes the resulting checks.
 """
 
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 import math
 
-from ...graph_types import TypeSpec
-from ...runtime_contracts import DomainProposal, ProviderDescriptor, schema_hash
+from ...authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
+from ...domains.d01 import ActiveRoleQualification
+from ...domains.d08 import ActionIntent
+from ...graph_types import AtomKey, GraphVersion, GraphWrite, NamespaceEpoch, Owner, TypeSpec
+from ...runtime_contracts import (
+    AuthorityContext, CheckReceipt, CommandEnvelope, DependencySet, DomainProposal,
+    ProviderDescriptor, QueryEpoch, VersionedRef, schema_hash,
+)
 
 
 def _id(value: str, label: str, prefix: str | None = None) -> None:
@@ -219,6 +225,10 @@ class RoleBindingResolution:
     matched_bindings: tuple[str, ...]
     applicable_norm_refs: tuple[str, ...]
     missing_items: tuple[str, ...]
+    read_versions: tuple[GraphVersion, ...] = ()
+    query_epoch: QueryEpoch | None = None
+    valid_until: float | None = None
+    request: RoleBindingRequest | None = None
 
 
 class ContextProvider:
@@ -290,7 +300,12 @@ class ContextProvider:
             "d03.role_binding": lambda value: RoleBinding(**_tuple_payload(value, "norm_refs", "source_refs")),
         }
         for write in proposal.typed_writes:
-            decoders[write.key.type_name](write.value)
+            decoded = decoders[write.key.type_name](write.value)
+            if write.key.type_name == "d03.role_binding":
+                if (write.key.name != decoded.role_binding_id
+                        or (write.key.owner.kind == "scene"
+                            and write.key.owner.subject != decoded.scene_ref)):
+                    raise ValueError("role binding graph identity differs from its payload")
         return proposal
 
     def compile_scheme(self, draft: dict, snapshot: object) -> dict:
@@ -317,14 +332,229 @@ class ContextProvider:
             return RoleBindingResolution("partial", (), (), ("scope_coverage",))
         if not matches:
             return RoleBindingResolution("no_applicable_binding", (), (), ())
-        unknown_norms = tuple(sorted({ref for item in matches for ref in item.norm_refs} - self._norms))
-        if unknown_norms:
-            return RoleBindingResolution("partial", (), (), ("norm_catalogue",))
+        unknown_roles = {item.social_role for item in matches} - self._roles
+        unknown_norms = {ref for item in matches for ref in item.norm_refs} - self._norms
+        if unknown_roles or unknown_norms:
+            missing = tuple(name for name, absent in (
+                ("role_catalogue", unknown_roles), ("norm_catalogue", unknown_norms)
+            ) if absent)
+            return RoleBindingResolution("partial", (), (), missing)
         return RoleBindingResolution(
             "complete",
             tuple(item.role_binding_id for item in matches),
             tuple(sorted({ref for item in matches for ref in item.norm_refs})),
             (),
+            valid_until=min((item.effective_until for item in matches
+                             if item.effective_until is not None), default=None),
+        )
+
+    def resolve_role_binding_from_graph(
+        self, request: RoleBindingRequest, coordinator: object,
+        authority: AuthorityContext, lease: object,
+    ) -> RoleBindingResolution:
+        """Resolve only D03's binding slot from authorised current graph pages.
+
+        The returned query epoch and read versions must be carried into the
+        eventual graph commit guard. Owner status and D01 role activation are
+        separate prerequisites; this method does not infer either one.
+        """
+        if not isinstance(request, RoleBindingRequest):
+            raise TypeError("request must be RoleBindingRequest")
+        if not isinstance(authority, AuthorityContext):
+            raise TypeError("authority must be AuthorityContext")
+        if request.subject_persona_ref != f"persona:{authority.namespace.persona_id}":
+            raise ValueError("binding subject differs from authorised persona")
+        if not callable(getattr(coordinator, "query", None)):
+            raise TypeError("coordinator must provide authorised graph query")
+        if not request.scope_complete:
+            return RoleBindingResolution("partial", (), (), ("scope_coverage",))
+
+        epoch: NamespaceEpoch | None = None
+        atoms = []
+        for owner_kind in ("persona", "scene"):
+            after = None
+            while True:
+                page = coordinator.query(
+                    authority, lease, type_names=("d03.role_binding",),
+                    owner_kind=owner_kind, after=after, expected_epoch=epoch,
+                    limit=512,
+                )
+                current_epoch = page.snapshot.epochs[0]
+                if epoch is None:
+                    epoch = current_epoch
+                elif epoch != current_epoch:
+                    raise ValueError("role binding query changed between pages")
+                atoms.extend(page.snapshot.atoms)
+                if page.next_after is None:
+                    break
+                after = page.next_after
+
+        assert epoch is not None
+        bindings = []
+        for atom in atoms:
+            binding = RoleBinding(**_tuple_payload(atom.value, "norm_refs", "source_refs"))
+            if (atom.key.name != binding.role_binding_id
+                    or atom.revision != binding.binding_version
+                    or (atom.key.owner.kind == "scene"
+                        and atom.key.owner.subject != binding.scene_ref)):
+                return RoleBindingResolution(
+                    "stale", (), (), ("binding_version",),
+                    tuple(GraphVersion(item.key, item.revision) for item in atoms),
+                    QueryEpoch(authority.namespace, "d03.role_binding", epoch.revision),
+                    request=request,
+                )
+            bindings.append(binding)
+        if len({item.role_binding_id for item in bindings}) != len(bindings):
+            return RoleBindingResolution(
+                "conflict", (), (), ("binding_identity",),
+                tuple(GraphVersion(item.key, item.revision) for item in atoms),
+                QueryEpoch(authority.namespace, "d03.role_binding", epoch.revision),
+                request=request,
+            )
+        result = self.resolve_role_binding(request, tuple(bindings))
+        return RoleBindingResolution(
+            result.status, result.matched_bindings, result.applicable_norm_refs,
+            result.missing_items,
+            tuple(GraphVersion(atom.key, atom.revision) for atom in atoms),
+            QueryEpoch(authority.namespace, "d03.role_binding", epoch.revision),
+            result.valid_until,
+            request,
+        )
+
+    def provide_required_check(
+        self, intent: ActionIntent, resolution: RoleBindingResolution, *, valid_until: float,
+    ) -> CheckReceipt:
+        """Describe a D03 binding check; D11 must revalidate its graph guards."""
+        if not isinstance(intent, ActionIntent) or not isinstance(resolution, RoleBindingResolution):
+            raise TypeError("action intent and D03 resolution are required")
+        specs = tuple(item for item in intent.required_checks
+                      if item.check_kind == "role_binding" and item.provider_id == "d03.role_binding")
+        if len(specs) != 1:
+            raise ValueError("action intent must contain exactly one D03 role-binding check")
+        spec = specs[0]
+        expiry = _time(valid_until, "valid_until")
+        request = resolution.request
+        epoch = resolution.query_epoch
+        matched = set(resolution.matched_bindings)
+        binding_versions = tuple(sorted(
+            (VersionedRef(item.key.name, item.revision)
+             for item in resolution.read_versions if item.key.name in matched),
+            key=lambda item: item.ref,
+        ))
+        observed = (
+            tuple(item for item in spec.required_input_versions
+                  if item.ref == spec.criteria_version)
+            + ((VersionedRef("d03.role_binding", epoch.revision),) if epoch is not None else ())
+            + binding_versions
+        )
+        scope_matches = (
+            request is not None and request.scope_complete
+            and request.subject_persona_ref == spec.subject_ref
+            and request.requested_action_kind == intent.action_kind
+            and request.purpose == intent.purpose == spec.purpose
+            and spec.action_ref == intent.action_id
+            and intent.target_ref in (
+                request.target_entity_ref, request.group_ref, request.scene_ref,
+            )
+            and epoch is not None and epoch.scope_ref == "d03.role_binding"
+            and epoch.namespace.persona_id == request.subject_persona_ref.removeprefix("persona:")
+        )
+        coverage = "full" if scope_matches and resolution.status != "partial" else "partial"
+        pinned = (
+            len(observed) == len(spec.required_input_versions)
+            and len({item.ref for item in observed}) == len(observed)
+            and set(observed) == set(spec.required_input_versions)
+            and len(binding_versions) == len(matched)
+        )
+        passed = (
+            coverage == "full" and resolution.status == "complete"
+            and not resolution.missing_items and bool(matched)
+            and pinned and (resolution.valid_until is None or expiry <= resolution.valid_until)
+            and request is not None and expiry >= request.at_time
+        )
+        return CheckReceipt(
+            spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
+            spec.required_input_versions if passed else observed,
+            coverage, "pass" if passed else "unknown", expiry, spec.provider_id,
+        )
+
+    def build_scene_binding_proposal(
+        self, envelope: CommandEnvelope, binding: RoleBinding,
+        active_role: ActiveRoleQualification, owner_guard: OwnerAuthorizationGuardV1,
+        prior: RoleBindingResolution,
+    ) -> DomainProposal:
+        """Build a first scene-binding candidate for D11's guarded transaction.
+
+        D11 must freshly verify the Owner/D01 qualifications and commit the
+        envelope's read/query guards; constructing this object is not authority.
+        """
+        if not isinstance(envelope, CommandEnvelope) or not isinstance(binding, RoleBinding):
+            raise TypeError("binding and command envelope are required")
+        if not isinstance(active_role, ActiveRoleQualification):
+            raise TypeError("a qualified active role is required")
+        if not isinstance(owner_guard, OwnerAuthorizationGuardV1):
+            raise TypeError("a current Owner authorization guard is required")
+        if not isinstance(prior, RoleBindingResolution):
+            raise TypeError("a current negative binding query is required")
+        namespace = envelope.authority.namespace
+        request = prior.request
+        if (prior.query_epoch is None
+                or active_role.namespace != namespace
+                or active_role.graph_epoch != prior.query_epoch.revision
+                or owner_guard.namespace != namespace
+                or owner_guard.authorization_revision != active_role.authorization_revision
+                or owner_guard.pending_revoke_operation_id is not None
+                or owner_guard.minimum_revocation_revision >= 1
+                or owner_guard.minimum_revocation_epoch >= 1
+                or envelope.authority.activation_generation < 1):
+            raise ValueError("active role and binding query differ from command namespace")
+        if (prior.status != "no_applicable_binding" or prior.query_epoch is None
+                or prior.query_epoch.namespace != namespace
+                or prior.query_epoch.scope_ref != "d03.role_binding"
+                or request is None or not request.scope_complete
+                or request.subject_persona_ref != binding.subject_persona_ref
+                or request.subject_persona_ref != f"persona:{namespace.persona_id}"
+                or request.scene_ref != binding.scene_ref
+                or request.target_entity_ref is not None or request.group_ref is not None
+                or request.requested_action_kind != "bind_scene"
+                or request.purpose != envelope.authority.purpose):
+            raise ValueError("negative query does not cover this scene-binding command")
+        if (binding.scene_ref is None or binding.target_entity_ref is not None
+                or binding.group_ref is not None or binding.scope_selector != "scene"
+                or binding.visibility_scope not in {"private", "group"}
+                or binding.binding_version != 1 or binding.status != "active"
+                or not binding.applies_to(request)):
+            raise ValueError("first scene binding must be active and scoped to this scene")
+        if (binding.social_role not in self._roles
+                or not set(binding.norm_refs).issubset(self._norms)):
+            raise ValueError("scene binding role or norms are not in the active D03 scheme")
+        if (envelope.source_qualification.evidence_eligibility == "ineligible"
+                or not set(binding.source_refs).issubset(envelope.source_qualification.source_refs)
+                or not set(binding.source_refs).issubset(envelope.input_refs)):
+            raise ValueError("scene binding lacks qualified source references")
+
+        key = AtomKey(
+            Owner("scene", namespace.bot_id, namespace.persona_id, binding.scene_ref),
+            "d03.role_binding", binding.role_binding_id,
+        )
+        guard = envelope.version_guard
+        required = set(active_role.read_versions) | set(prior.read_versions) | {
+            GraphVersion(key, 0)
+        }
+        if (prior.query_epoch not in guard.query_epochs
+                or not required.issubset(set(guard.read_versions))
+                or any(item.key.name == binding.role_binding_id
+                       for item in prior.read_versions)):
+            raise ValueError("command is missing first-binding and active-role CAS guards")
+        value = asdict(binding)
+        value["norm_refs"] = list(binding.norm_refs)
+        value["source_refs"] = list(binding.source_refs)
+        return DomainProposal(
+            "d03", "d03.proposal.v1", self.descriptor.request_schema_hash,
+            envelope,
+            (GraphWrite(key, value, tuple(item.key for item in active_role.read_versions)),),
+            DependencySet(current_invalidation=active_role.read_versions),
+            (), (),
         )
 
     def project(self, query: RoleBindingRequest, snapshot: tuple[RoleBinding, ...]) -> RoleBindingResolution:

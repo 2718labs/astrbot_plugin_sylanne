@@ -6,6 +6,7 @@ from .execution import (
     ActionIntent,
     ActionOutcome,
     ActionSchema,
+    ActionSchemaRecord,
     Aspiration,
     Commitment,
     CommitmentConflictSnapshot,
@@ -26,6 +27,7 @@ from .execution import (
     RequiredCheckSpec,
     SegmentGrant,
 )
+from .expression import CommunicationPlanResult, prepare_expression_plan
 
 __all__ = (
     "BASE_REQUIRED_PROVIDERS",
@@ -33,6 +35,7 @@ __all__ = (
     "ActionIntent",
     "ActionOutcome",
     "ActionSchema",
+    "ActionSchemaRecord",
     "Aspiration",
     "Commitment",
     "CommitmentConflictSnapshot",
@@ -52,4 +55,6 @@ __all__ = (
     "RequiredCheckRegistry",
     "RequiredCheckSpec",
     "SegmentGrant",
+    "CommunicationPlanResult",
+    "prepare_expression_plan",
 )

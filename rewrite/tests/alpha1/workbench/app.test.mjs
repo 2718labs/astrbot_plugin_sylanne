@@ -76,13 +76,34 @@ test("refresh retains the current projection while requesting its replacement", 
   try {
     ui.setRole("role-a");
     const initial = ui.clickCommand("switch-role");
-    ui.requests[0].resolve({ status: "ready", projection: { label: "current" } });
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
     await initial;
+
+    const overview = ui.clickView("overview");
+    ui.requests[1].resolve({ status: "ready", projection: { label: "current" } });
+    await overview;
 
     const refreshing = ui.clickCommand("refresh");
     assert.match(ui.app.innerHTML, /current/);
-    ui.requests[1].resolve({ status: "ready", projection: { label: "refreshed" } });
+    ui.requests[2].resolve({ status: "ready", projection: { label: "refreshed" } });
     await refreshing;
     assert.match(ui.app.innerHTML, /refreshed/);
+  } finally { ui.restore(); }
+});
+
+test("start page requests only the authenticated capability catalogue and never claims role binding", async () => {
+  const ui = await mountWorkbench();
+  try {
+    assert.match(ui.app.innerHTML, /开始与连接/);
+    assert.match(ui.app.innerHTML, /角色初始化.*未核验/s);
+    assert.equal(ui.requests.length, 0);
+    ui.setRole("role-a");
+    const requested = ui.clickCommand("switch-role");
+    assert.equal(ui.requests[0].payload.action, "open_workspace");
+    ui.requests[0].resolve({ status: "ready", projection: { views: [{ view_type: "overview", status: "available" }] } });
+    await requested;
+    assert.match(ui.app.innerHTML, /宿主与工作台会话.*已核验/s);
+    assert.match(ui.app.innerHTML, /角色初始化.*未核验/s);
+    assert.match(ui.app.innerHTML, /场景绑定.*未核验/s);
   } finally { ui.restore(); }
 });

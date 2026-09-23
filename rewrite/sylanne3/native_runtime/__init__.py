@@ -30,6 +30,13 @@ from .fixed_block_transcript import (
     FixedBlockStep,
     run_fixed_block_math,
 )
+from .d04_candidate import (
+    D04CandidateError,
+    D04FixedBlockCandidate,
+    D04ProductionReadoutUnavailable,
+    run_d04_fixed_block_candidate,
+    require_d04_production_readout,
+)
 
 __all__ = [
     "ArithmeticReport",
@@ -56,4 +63,9 @@ __all__ = [
     "FixedBlockMathTranscript",
     "FixedBlockStep",
     "run_fixed_block_math",
+    "D04CandidateError",
+    "D04FixedBlockCandidate",
+    "D04ProductionReadoutUnavailable",
+    "run_d04_fixed_block_candidate",
+    "require_d04_production_readout",
 ]

@@ -8,7 +8,7 @@ they are never copied from an AstrBot setting or an Authority request.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
@@ -20,12 +20,15 @@ from typing import Mapping
 from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
-    FencePermitV2, MutationReceiptV2, SCHEMA as AUTHORITY_V2_PROTOCOL,
-    from_wire, to_wire,
+    ExecutionBindingV1, FencePermitV2, MutationReceiptV2, SCHEMA as AUTHORITY_V2_PROTOCOL,
+    canonical_digest, from_wire, to_wire,
 )
 from ..authority_service.v2_owner_contract import (
-    OwnerAuthorizationReceiptV1, from_wire as owner_from_wire,
+    OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
+    OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
+    from_wire as owner_from_wire, to_wire as owner_to_wire,
 )
+from ..authority_service.v2_execution_bridge import HandoffStartV2
 from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
 from ..runtime.restore_anchor import RestoreAnchor
@@ -757,6 +760,181 @@ class MtlsAuthorityTransport:
                 or updated.authority_id != handshake.installation_authority_id):
             raise RuntimeError("authority v2 prepared receipt binding is invalid")
         return receipt, updated
+
+    async def v2_execution_claim(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, prepared_receipt: MutationReceiptV2, binding: ExecutionBindingV1,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        """Persist the exact claimed phase; this response is not a send permit."""
+        if (type(prepared_receipt) is not MutationReceiptV2
+                or prepared_receipt.pending.phase != "prepared"
+                or prepared_receipt.durable_state != "committed"
+                or type(binding) is not ExecutionBindingV1
+                or binding.permit != prepared_receipt.pending.permit):
+            raise TypeError("original prepared receipt and execution binding are required")
+        response = await self._content_rpc(
+            request, handshake, "execution_claim", {
+                "prepared_receipt": to_wire(prepared_receipt),
+                "binding": to_wire(binding),
+            }, protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"receipt", "permit", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority v2 claim response is invalid")
+        try:
+            receipt = from_wire(response["receipt"])
+            updated = from_wire(response["permit"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority v2 claim response is invalid") from exc
+        if (type(receipt) is not MutationReceiptV2 or type(updated) is not FencePermitV2
+                or receipt.durable_state != "committed"
+                or receipt.pending.phase != "claimed"
+                or receipt.pending.prepared_receipt != prepared_receipt
+                or receipt.pending.binding != binding
+                or updated.pinned_anchor != receipt.after_anchor
+                or updated.revision != receipt.updated_revision
+                or updated.operation_id != binding.operation_id
+                or updated.subject != handshake.installation_identity_ref
+                or updated.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority v2 claim binding is invalid")
+        return receipt, updated
+
+    async def v2_execution_begin_handoff(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, claimed_receipt: MutationReceiptV2, handoff_id: str,
+    ) -> HandoffStartV2:
+        """Durably begin one handoff; the RPC itself never sends content."""
+        if (type(claimed_receipt) is not MutationReceiptV2
+                or claimed_receipt.pending.phase != "claimed"
+                or claimed_receipt.durable_state != "committed"):
+            raise TypeError("committed execution claim is required")
+        response = await self._content_rpc(
+            request, handshake, "execution_begin_handoff", {
+                "claimed_receipt": to_wire(claimed_receipt),
+                "handoff_id": handoff_id,
+            }, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict
+                or set(response) != {"start", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority v2 handoff start response is invalid")
+        try:
+            start = HandoffStartV2.from_wire(response["start"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority v2 handoff start response is invalid") from exc
+        claimed_permit = claimed_receipt.pending.permit
+        if (start.handoff_id != handoff_id
+                or start.operation_id != claimed_permit.operation_id
+                or start.effect_id != claimed_permit.effect_id
+                or start.namespace != claimed_permit.namespace
+                or start.claim_digest != canonical_digest(claimed_receipt)
+                or start.binding_digest != canonical_digest(claimed_receipt.pending.binding)
+                or start.permit != replace(
+                    claimed_permit, revision=claimed_receipt.updated_revision,
+                    pinned_anchor=claimed_receipt.after_anchor)
+                or start.permit.authority_id != handshake.installation_authority_id
+                or start.permit.subject != handshake.installation_identity_ref):
+            raise RuntimeError("authority v2 handoff start binding is invalid")
+        return start
+
+    @staticmethod
+    def _owner_result(response: dict[str, object], handshake: AuthorityHandshake,
+                      field: str, expected_type: type):
+        if (type(response) is not dict
+                or set(response) != {field, "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority owner response is invalid")
+        try:
+            result = owner_from_wire(response[field])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority owner response is invalid") from exc
+        if (type(result) is not expected_type
+                or owner_to_wire(result) != response[field]):
+            raise RuntimeError("authority owner response is invalid")
+        return result
+
+    async def v2_register_owner_ticket(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, ticket: OwnerClaimTicketV1,
+    ) -> OwnerClaimTicketV1:
+        if type(ticket) is not OwnerClaimTicketV1:
+            raise TypeError("owner claim ticket is required")
+        response = await self._content_rpc(
+            request, handshake, "register_owner_ticket",
+            {"namespace": namespace, "ticket": owner_to_wire(ticket)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        result = self._owner_result(response, handshake, "ticket", OwnerClaimTicketV1)
+        if (result != ticket or result.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority owner ticket response is invalid")
+        return result
+
+    async def v2_reserve_owner_issue(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation: OwnerAuthorizationOperationV1,
+    ) -> OwnerAuthorizationReceiptV1:
+        if type(operation) is not OwnerAuthorizationOperationV1:
+            raise TypeError("owner issue operation is required")
+        response = await self._content_rpc(
+            request, handshake, "reserve_owner_issue",
+            {"namespace": namespace, "operation": owner_to_wire(operation)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        result = self._owner_result(
+            response, handshake, "receipt", OwnerAuthorizationReceiptV1)
+        if (result.operation != operation or result.phase != "pending"
+                or result.operation.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority owner issue response is invalid")
+        return result
+
+    async def v2_finalize_owner_issue(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation: OwnerAuthorizationOperationV1,
+        proof: OwnerGraphCommitProofV1,
+    ) -> OwnerAuthorizationReceiptV1:
+        if (type(operation) is not OwnerAuthorizationOperationV1
+                or type(proof) is not OwnerGraphCommitProofV1):
+            raise TypeError("owner issue operation and graph proof are required")
+        response = await self._content_rpc(
+            request, handshake, "finalize_owner_issue",
+            {"namespace": namespace, "operation": owner_to_wire(operation),
+             "proof": owner_to_wire(proof)}, protocol=AUTHORITY_V2_PROTOCOL)
+        result = self._owner_result(
+            response, handshake, "receipt", OwnerAuthorizationReceiptV1)
+        if (result.operation != operation or result.phase != "committed"
+                or result.operation.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority owner commit response is invalid")
+        return result
+
+    async def v2_get_current_owner_guard_for_fence(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, permit: FencePermitV2,
+    ) -> tuple[OwnerAuthorizationGuardV1 | None, FencePermitV2]:
+        if (type(permit) is not FencePermitV2
+                or permit.operation not in {"read", "write"}
+                or permit.namespace != namespace
+                or permit.subject != handshake.installation_identity_ref
+                or permit.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("owner guard read requires this installation's content fence")
+        response = await self._content_rpc(
+            request, handshake, "get_current_owner_guard_for_fence",
+            {"namespace": namespace, "permit": to_wire(permit)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict
+                or set(response) != {"guard", "permit", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority owner guard response is invalid")
+        try:
+            current = from_wire(response["permit"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority owner guard response is invalid") from exc
+        if type(current) is not FencePermitV2 or current != permit:
+            raise RuntimeError("authority owner guard permit changed")
+        if response["guard"] is None:
+            return None, current
+        guard = self._owner_result(
+            {"guard": response["guard"],
+             "channel_binding_sha256": response["channel_binding_sha256"]},
+            handshake, "guard", OwnerAuthorizationGuardV1)
+        if guard.authority_id != handshake.installation_authority_id:
+            raise RuntimeError("authority owner guard response is invalid")
+        return guard, current
 
     async def v2_get_pending_owner_issue(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

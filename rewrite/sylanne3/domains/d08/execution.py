@@ -7,10 +7,11 @@ only dispatcher and the graph coordinator remains the only persistence path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
+import json
 import math
 
-from ...graph_types import TypeSpec
+from ...graph_types import AtomKey, GraphWrite, Owner, TypeSpec
 from ...runtime_contracts import (
     CheckReceipt,
     DomainProposal,
@@ -18,6 +19,7 @@ from ...runtime_contracts import (
     ProviderDescriptor,
     RUNTIME_SCHEMA,
     VersionedRef,
+    canonical_serialize,
     canonical_digest,
     schema_hash,
 )
@@ -331,6 +333,8 @@ class RequiredCheckSpec:
         ))
         if not any(item.ref == self.criteria_version for item in self.required_input_versions):
             raise ValueError("criteria_version must be pinned in required_input_versions")
+        if len({item.ref for item in self.required_input_versions}) != len(self.required_input_versions):
+            raise ValueError("required_input_versions cannot repeat a ref")
 
 
 @dataclass(frozen=True)
@@ -349,6 +353,106 @@ class ActionSchema:
         if len({item.check_kind for item in checks}) != len(checks):
             raise ValueError("an action schema cannot repeat a check kind")
         object.__setattr__(self, "required_checks", checks)
+
+
+@dataclass(frozen=True)
+class ActionSchemaRecord:
+    """Immutable, action-bound schema stored beside its ActionIntent candidate."""
+
+    schema_ref: str
+    schema_id: str
+    action_ref: str
+    action_revision: int
+    operation: OperationIdentity
+    intent_digest: str
+    action_kind: str
+    purpose: str
+    proactive: bool
+    required_checks: tuple[RequiredCheckSpec, ...]
+    schema_hash: str
+
+    def __post_init__(self) -> None:
+        _text(self.schema_ref, "schema_ref", "action-schema:")
+        _text(self.schema_id, "schema_id")
+        _text(self.action_ref, "action_ref", "action:")
+        _positive(self.action_revision, "action_revision")
+        if not isinstance(self.operation, OperationIdentity):
+            raise TypeError("operation must be OperationIdentity")
+        if (len(self.intent_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.intent_digest)):
+            raise ValueError("intent_digest must be a lowercase SHA-256 digest")
+        _text(self.action_kind, "action_kind")
+        _text(self.purpose, "purpose")
+        if type(self.proactive) is not bool:
+            raise TypeError("proactive must be bool")
+        checks = _typed(self.required_checks, RequiredCheckSpec, "required_checks", allow_empty=False)
+        if len({item.check_kind for item in checks}) != len(checks):
+            raise ValueError("schema record cannot repeat a check kind")
+        _validate_required_provider_set(checks, self.proactive)
+        if any(item.action_ref != self.action_ref or item.purpose != self.purpose for item in checks):
+            raise ValueError("schema checks must be bound to this action and purpose")
+        object.__setattr__(self, "required_checks", checks)
+        expected_hash = _action_schema_hash(
+            self.schema_id, self.action_ref, self.action_revision, self.operation,
+            self.intent_digest, self.action_kind, self.purpose, self.proactive, checks,
+        )
+        if self.schema_hash != expected_hash or self.schema_ref != f"action-schema:{expected_hash}":
+            raise ValueError("schema hash or content-addressed schema ref does not match")
+
+    @classmethod
+    def bind(cls, intent: "ActionIntent", schema: ActionSchema) -> "ActionSchemaRecord":
+        _validate_action_schema(intent, schema)
+        digest = canonical_digest(intent)
+        value_hash = _action_schema_hash(
+            schema.schema_id, intent.action_id, intent.revision, intent.identity,
+            digest, intent.action_kind, intent.purpose, schema.proactive, schema.required_checks,
+        )
+        return cls(
+            f"action-schema:{value_hash}", schema.schema_id, intent.action_id,
+            intent.revision, intent.identity, digest, intent.action_kind,
+            intent.purpose, schema.proactive, schema.required_checks, value_hash,
+        )
+
+
+def _validate_required_provider_set(checks: tuple[RequiredCheckSpec, ...], proactive: bool) -> None:
+    actual = {(item.check_kind, item.provider_id) for item in checks}
+    required = set(BASE_REQUIRED_PROVIDERS)
+    if proactive:
+        required.add(PROACTIVE_REQUIRED_PROVIDER)
+    missing = required - actual
+    if missing:
+        raise ValueError(f"action schema removed required checks: {sorted(missing)!r}")
+
+
+def _validate_action_schema(intent: "ActionIntent", schema: ActionSchema) -> None:
+    if not isinstance(intent, ActionIntent) or not isinstance(schema, ActionSchema):
+        raise TypeError("typed ActionIntent and ActionSchema are required")
+    if schema.schema_id != intent.schema_id or schema.action_kind != intent.action_kind:
+        raise ValueError("action schema does not describe this intent")
+    _validate_required_provider_set(schema.required_checks, schema.proactive)
+    if intent.required_checks != schema.required_checks:
+        raise ValueError("intent must carry the exact frozen schema check set")
+    if any(item.action_ref != intent.action_id or item.purpose != intent.purpose
+           for item in schema.required_checks):
+        raise ValueError("schema check scope differs from the concrete action")
+
+
+def _action_schema_hash(
+    schema_id: str, action_ref: str, action_revision: int, operation: OperationIdentity,
+    intent_digest: str, action_kind: str, purpose: str, proactive: bool,
+    required_checks: tuple[RequiredCheckSpec, ...],
+) -> str:
+    return canonical_digest({
+        "schema_id": schema_id,
+        "action_ref": action_ref,
+        "action_revision": action_revision,
+        "operation": operation,
+        "intent_digest": intent_digest,
+        "action_kind": action_kind,
+        "purpose": purpose,
+        "proactive": proactive,
+        "required_checks": required_checks,
+    })
 
 
 @dataclass(frozen=True)
@@ -632,6 +736,23 @@ class CommitmentConflictSnapshot:
     applicable_commitment_refs: tuple[str, ...]
     conflicting_commitment_refs: tuple[str, ...]
     pending_effect_refs: tuple[str, ...]
+    action_ref: str | None = None
+    action_revision: int | None = None
+    intent_digest: str | None = None
+    schema_id: str | None = None
+    goal_ref: str | None = None
+    target_ref: str | None = None
+    action_kind: str | None = None
+    purpose: str | None = None
+    commitment_query_epoch_ref: str | None = None
+    commitment_query_epoch: int | None = None
+    execution_epoch_ref: str | None = None
+    execution_epoch: int | None = None
+    cancellation_epoch_ref: str | None = None
+    cancellation_epoch: int | None = None
+    current_read_confirmed: bool = False
+    action_cancelled: bool = False
+    conflicting_action_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_versions", _typed(
@@ -639,8 +760,27 @@ class CommitmentConflictSnapshot:
         ))
         if self.coverage not in {"full", "partial", "none"}:
             raise ValueError("unsupported commitment snapshot coverage")
-        for name in ("applicable_commitment_refs", "conflicting_commitment_refs", "pending_effect_refs"):
+        for name in ("applicable_commitment_refs", "conflicting_commitment_refs",
+                     "pending_effect_refs", "conflicting_action_refs"):
             object.__setattr__(self, name, _strings(getattr(self, name), name))
+        for name in ("action_ref", "schema_id", "goal_ref", "target_ref", "action_kind", "purpose",
+                     "commitment_query_epoch_ref", "execution_epoch_ref", "cancellation_epoch_ref"):
+            value = getattr(self, name)
+            if value is not None:
+                _text(value, name)
+        if self.intent_digest is not None and (
+            len(self.intent_digest) != 64
+            or any(char not in "0123456789abcdef" for char in self.intent_digest)
+        ):
+            raise ValueError("intent_digest must be a lowercase SHA-256 digest")
+        for name in ("action_revision", "commitment_query_epoch", "execution_epoch", "cancellation_epoch"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a nonnegative exact integer")
+        if type(self.current_read_confirmed) is not bool or type(self.action_cancelled) is not bool:
+            raise TypeError("read and cancellation confirmations must be bool")
+        if not set(self.conflicting_commitment_refs) <= set(self.applicable_commitment_refs):
+            raise ValueError("conflicting commitments must be in the complete applicable set")
 
 
 class RequiredCheckRegistry:
@@ -679,9 +819,14 @@ class RequiredCheckRegistry:
             schema = self._schemas[intent.schema_id]
         except KeyError:
             return self._decision("unavailable", intent, (), (), ("schema",), (), (), (), None)
-        schema_pairs = {(item.check_kind, item.provider_id) for item in schema.required_checks}
-        intent_pairs = {(item.check_kind, item.provider_id) for item in intent.required_checks}
-        if not schema_pairs <= intent_pairs or intent.action_kind != schema.action_kind:
+        intent_specs = {(item.check_kind, item.provider_id): item for item in intent.required_checks}
+        if (
+            intent.action_kind != schema.action_kind
+            or any(intent_specs.get((item.check_kind, item.provider_id)) != item
+                   for item in schema.required_checks)
+            or any(item.action_ref != intent.action_id or item.purpose != intent.purpose
+                   for item in intent.required_checks)
+        ):
             return self._decision("unavailable", intent, (), (), ("schema",), (), (), (), None)
         if not isinstance(receipts, tuple) or any(not isinstance(item, CheckReceipt) for item in receipts):
             raise TypeError("receipts must be CheckReceipt values")
@@ -1044,6 +1189,13 @@ def _decode_intent(payload: dict) -> ActionIntent:
     return ActionIntent(**data)
 
 
+def _decode_action_schema(payload: dict) -> ActionSchemaRecord:
+    data = _tuple_fields(payload, "required_checks")
+    data["operation"] = _operation(data["operation"])
+    data["required_checks"] = tuple(_check_spec(item) for item in data["required_checks"])
+    return ActionSchemaRecord(**data)
+
+
 def _decode_communication_grant(payload: dict) -> CommunicationIntentGrant:
     data = _tuple_fields(
         payload, "audiences", "required_slots", "allowed_claim_kinds", "promise_grants",
@@ -1069,6 +1221,8 @@ def _decode(type_name: str, payload: dict) -> object:
         return _decode_joint_plan(payload)
     if type_name == "d08.action_intent.v1":
         return _decode_intent(payload)
+    if type_name == "d08.action_schema.v1":
+        return _decode_action_schema(payload)
     if type_name == "d08.communication_intent_grant.v1":
         return _decode_communication_grant(payload)
     if type_name == "d08.action_outcome.v1":
@@ -1089,6 +1243,7 @@ class GoalExecutionProvider:
         "d08.commitment.v1": ("persona", "relation", "activity"),
         "d08.joint_plan.v1": ("activity",),
         "d08.action_intent.v1": ("activity",),
+        "d08.action_schema.v1": ("activity",),
         "d08.communication_intent_grant.v1": ("activity",),
         "d08.action_outcome.v1": ("activity",),
         "d08.decision_record.v1": ("activity",),
@@ -1124,7 +1279,7 @@ class GoalExecutionProvider:
                 validator,
                 immutable=type_name in {
                     "d08.action_outcome.v1", "d08.decision_record.v1",
-                    "d08.communication_intent_grant.v1",
+                    "d08.communication_intent_grant.v1", "d08.action_schema.v1",
                 },
                 schema_version=1,
                 writer_domain="d08",
@@ -1148,46 +1303,141 @@ class GoalExecutionProvider:
             if write.key.owner.kind not in spec.owner_kinds:
                 raise ValueError("D08 graph type does not support this owner")
             spec.validator(write.value)
+        action_writes = tuple(item for item in proposal.typed_writes
+                              if item.key.type_name == "d08.action_intent.v1")
+        schema_writes = tuple(item for item in proposal.typed_writes
+                              if item.key.type_name == "d08.action_schema.v1")
+        if action_writes or schema_writes:
+            if len(action_writes) != 1 or len(schema_writes) != 1:
+                raise ValueError("an action proposal requires exactly one intent and one frozen schema")
+            intent = _decode_intent(action_writes[0].value)
+            binding = _decode_action_schema(schema_writes[0].value)
+            schema = ActionSchema(
+                binding.schema_id, binding.action_kind, binding.proactive, binding.required_checks,
+            )
+            _validate_action_schema(intent, schema)
+            if (
+                proposal.envelope.identity != intent.identity
+                or binding.operation != proposal.envelope.identity
+                or binding.action_ref != intent.action_id
+                or binding.action_revision != intent.revision
+                or binding.schema_id != intent.schema_id
+                or binding.intent_digest != canonical_digest(intent)
+                or binding != ActionSchemaRecord.bind(intent, schema)
+                or action_writes[0].key.name != intent.action_id
+                or schema_writes[0].key.name != binding.schema_ref
+                or action_writes[0].key.owner != schema_writes[0].key.owner
+            ):
+                raise ValueError("action intent and frozen schema are not bound to this exact operation")
         return proposal
 
+    def prepare_action_candidate(
+        self, proposal: DomainProposal, intent: ActionIntent, schema: ActionSchema,
+    ) -> DomainProposal:
+        """Add the immutable per-action schema beside its intent candidate.
+
+        This is pure proposal assembly. The graph writer must commit both
+        writes in the same operation and repeat the same checks at commit time.
+        """
+        if not isinstance(proposal, DomainProposal):
+            raise TypeError("proposal must be DomainProposal")
+        _validate_action_schema(intent, schema)
+        if proposal.envelope.identity != intent.identity:
+            raise ValueError("proposal and action intent must share one exact operation identity")
+        if any(write.key.type_name in {"d08.action_intent.v1", "d08.action_schema.v1"}
+               for write in proposal.typed_writes):
+            raise ValueError("proposal already contains an action intent or schema")
+
+        namespace = proposal.envelope.authority.namespace
+        owner = Owner("activity", namespace.bot_id, namespace.persona_id, intent.identity.activity_id)
+        binding = ActionSchemaRecord.bind(intent, schema)
+        action_key = AtomKey(owner, "d08.action_intent.v1", intent.action_id)
+        schema_key = AtomKey(owner, "d08.action_schema.v1", binding.schema_ref)
+        writes = proposal.typed_writes + (
+            GraphWrite(action_key, json.loads(canonical_serialize(asdict(intent)))),
+            GraphWrite(schema_key, json.loads(canonical_serialize(asdict(binding)))),
+        )
+        return self.validate(replace(proposal, typed_writes=writes))
+
     def provide_required_check(
-        self, intent: ActionIntent, snapshot: CommitmentConflictSnapshot, *, valid_until: float
+        self, intent: ActionIntent, schema: ActionSchema, snapshot: CommitmentConflictSnapshot,
+        *, valid_until: float,
     ) -> CheckReceipt:
-        """Provide D08's commitment/conflict check without dispatching anything."""
+        """Issue a scoped D08 check candidate from a complete current read.
+
+        This receipt is one RequiredCheck candidate only. It is not a dispatch
+        permit; D11 must re-read and serialize current state during admission.
+        """
         if not isinstance(intent, ActionIntent):
             raise TypeError("intent must be ActionIntent")
+        if not isinstance(schema, ActionSchema):
+            raise TypeError("schema must be ActionSchema")
         if not isinstance(snapshot, CommitmentConflictSnapshot):
             raise TypeError("snapshot must be CommitmentConflictSnapshot")
-        candidates = tuple(
-            item for item in intent.required_checks
-            if item.check_kind == "commitment_conflict" and item.provider_id == "d08.commitment_conflict"
-        )
-        if len(candidates) != 1:
-            raise ValueError("action intent must contain exactly one D08 commitment check")
-        spec = candidates[0]
+        if schema.schema_id != intent.schema_id or schema.action_kind != intent.action_kind:
+            raise ValueError("action schema does not describe this intent")
+        schema_checks = tuple(item for item in schema.required_checks
+                              if item.check_kind == "commitment_conflict"
+                              and item.provider_id == "d08.commitment_conflict")
+        intent_checks = tuple(item for item in intent.required_checks
+                              if item.check_kind == "commitment_conflict"
+                              and item.provider_id == "d08.commitment_conflict")
+        if len(schema_checks) != 1 or len(intent_checks) != 1 or schema_checks[0] != intent_checks[0]:
+            raise ValueError("schema and intent must contain the same unique D08 check")
+        spec = intent_checks[0]
+        if spec.action_ref != intent.action_id or spec.purpose != intent.purpose:
+            raise ValueError("D08 check scope differs from the concrete action")
         expiry = _time(valid_until, "valid_until")
-        if snapshot.input_versions != spec.required_input_versions:
+
+        def receipt(result: str, coverage: str) -> CheckReceipt:
             return CheckReceipt(
                 spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
-                snapshot.input_versions, "full" if snapshot.coverage == "full" else snapshot.coverage,
-                "unknown", expiry, spec.provider_id,
+                snapshot.input_versions, coverage, result, expiry, spec.provider_id,
             )
-        if snapshot.coverage != "full":
-            return CheckReceipt(
-                spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
-                snapshot.input_versions, snapshot.coverage, "unknown", expiry, spec.provider_id,
-            )
-        missing_linked = set(intent.commitment_refs) - set(snapshot.applicable_commitment_refs)
-        if missing_linked or snapshot.pending_effect_refs:
-            result = "unknown"
-        elif snapshot.conflicting_commitment_refs:
-            result = "fail"
-        else:
-            result = "pass"
-        return CheckReceipt(
-            spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
-            snapshot.input_versions, "full", result, expiry, spec.provider_id,
+
+        # A caller-supplied or cached projection is not a current authoritative
+        # read. Every identity and epoch below must be pinned by this check's
+        # complete read set; the runtime/D11 still verifies the read fence.
+        if not snapshot.current_read_confirmed or snapshot.coverage != "full":
+            return receipt("unknown", "partial" if snapshot.coverage != "none" else "none")
+        if (
+            snapshot.action_ref != intent.action_id
+            or snapshot.action_revision != intent.revision
+            or snapshot.intent_digest != canonical_digest(intent)
+            or snapshot.schema_id != schema.schema_id
+            or snapshot.goal_ref != intent.goal_ref
+            or snapshot.target_ref != intent.target_ref
+            or snapshot.action_kind != intent.action_kind
+            or snapshot.purpose != intent.purpose
+        ):
+            return receipt("unknown", "partial")
+
+        versions = {item.ref: item.version for item in snapshot.input_versions}
+        if len(versions) != len(snapshot.input_versions) or snapshot.input_versions != spec.required_input_versions:
+            return receipt("unknown", "partial")
+        required_refs = {
+            intent.goal_ref, *intent.commitment_refs,
+            snapshot.commitment_query_epoch_ref or "",
+            snapshot.execution_epoch_ref or "",
+            snapshot.cancellation_epoch_ref or "",
+        }
+        if "" in required_refs or not required_refs <= versions.keys():
+            return receipt("unknown", "partial")
+        epoch_pairs = (
+            (snapshot.commitment_query_epoch_ref, snapshot.commitment_query_epoch),
+            (snapshot.execution_epoch_ref, snapshot.execution_epoch),
+            (snapshot.cancellation_epoch_ref, snapshot.cancellation_epoch),
         )
+        if any(ref is None or epoch is None or versions.get(ref) != epoch for ref, epoch in epoch_pairs):
+            return receipt("unknown", "partial")
+        if not set(intent.commitment_refs) <= set(snapshot.applicable_commitment_refs):
+            return receipt("unknown", "partial")
+
+        if snapshot.action_cancelled or snapshot.conflicting_commitment_refs or snapshot.conflicting_action_refs:
+            return receipt("fail", "full")
+        if snapshot.pending_effect_refs:
+            return receipt("unknown", "full")
+        return receipt("pass", "full")
 
     def compile_scheme(self, draft: object, snapshot: object = None) -> object:
         if not isinstance(draft, tuple) or any(not isinstance(item, ActionSchema) for item in draft):
@@ -1209,7 +1459,7 @@ class GoalExecutionProvider:
 
 __all__ = (
     "BASE_REQUIRED_PROVIDERS", "PROACTIVE_REQUIRED_PROVIDER", "ActionIntent", "ActionOutcome",
-    "ActionSchema", "Aspiration", "Commitment", "CommitmentConflictSnapshot",
+    "ActionSchema", "ActionSchemaRecord", "Aspiration", "Commitment", "CommitmentConflictSnapshot",
     "CommunicationGrantRequest", "CommunicationIntentGrant", "CommunicationSegmentSpec", "SegmentGrant",
     "DecisionRecord", "Goal", "GoalExecutionProvider",
     "GoalPredicate", "JointPlan", "JointPlanAcceptance", "OutcomeSettlement", "PlanNode",

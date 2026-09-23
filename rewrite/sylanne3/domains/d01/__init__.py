@@ -8,7 +8,11 @@ remain with the shared runtime coordinator.
 from dataclasses import asdict, dataclass, fields
 from typing import Mapping
 
-from ...graph_types import AtomKey, GraphWrite, Owner, TypeSpec
+from ...graph_types import (
+    AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite, Owner,
+    TypeSpec, owner_grant_key, validate_owner_grant_v1,
+)
+from ...authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
 
 from ...runtime_contracts import (
     CommandEnvelope,
@@ -164,6 +168,47 @@ class PersonaScheme:
 
 
 @dataclass(frozen=True)
+class PersonaActivation:
+    """Current D01 head, committed after an independently authorized Owner issue."""
+
+    namespace: NamespaceId
+    plan_id: str
+    plan_version: int
+    head_id: str
+    owner_grant_id: str
+    owner_grant_revision: int
+    graph_incarnation: str
+    activation_generation: int
+    authorization_revision: int
+    state: str = "active"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.namespace, NamespaceId):
+            raise TypeError("activation namespace must be NamespaceId")
+        for name in ("plan_id", "owner_grant_id", "graph_incarnation"):
+            _identifier(getattr(self, name), name)
+        for name in ("plan_version", "owner_grant_revision", "activation_generation",
+                     "authorization_revision"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive exact integer")
+        if self.head_id != f"{self.plan_id}@{self.plan_version}":
+            raise ValueError("activation head differs from selected plan")
+        if self.state != "active":
+            raise ValueError("activation state is not active")
+
+
+@dataclass(frozen=True)
+class ActiveRoleQualification:
+    namespace: NamespaceId
+    head_id: str
+    plan: PersonaPlan
+    read_versions: tuple[GraphVersion, ...]
+    graph_epoch: int
+    authorization_revision: int
+
+
+@dataclass(frozen=True)
 class PersonaView:
     head_id: str
     namespace: NamespaceId
@@ -284,6 +329,16 @@ def _validate_growth_contribution(value: object) -> None:
     GrowthProposal(**data)
 
 
+def _validate_persona_activation(value: object) -> None:
+    data = _exact_payload(value, {field.name for field in fields(PersonaActivation)}, "persona activation")
+    data["namespace"] = _namespace(data["namespace"])
+    PersonaActivation(**data)
+
+
+def _activation_key(namespace: NamespaceId) -> AtomKey:
+    return AtomKey(Owner("persona", *namespace.as_tuple), "d01.persona_activation.v1", "current")
+
+
 class PersonaDomain:
     """Pure D01 validator/projector; integration supplies graph snapshots and commits."""
 
@@ -306,6 +361,7 @@ class PersonaDomain:
     def type_specs(self) -> tuple[TypeSpec, ...]:
         layouts = (
             ("d01.persona_plan.v1", _validate_persona_plan, PersonaPlan),
+            ("d01.persona_activation.v1", _validate_persona_activation, PersonaActivation),
             ("d01.persona_revision.v1", _validate_persona_revision, PersonaRevision),
             ("d01.growth_contribution.v1", _validate_growth_contribution, GrowthProposal),
         )
@@ -371,6 +427,100 @@ class PersonaDomain:
             plan.plan_id,
         )
         return GraphWrite(key, _json_value(asdict(plan)))
+
+    @staticmethod
+    def activation_write(
+        plan: PersonaPlan, owner_grant: GraphAtom,
+        current_guard: OwnerAuthorizationGuardV1,
+    ) -> GraphWrite:
+        """Prepare the head for a D11 transaction; caller supplies a fresh Authority guard."""
+        if not isinstance(plan, PersonaPlan):
+            raise TypeError("plan must be PersonaPlan")
+        if not isinstance(owner_grant, GraphAtom) or not owner_grant.valid:
+            raise ValueError("current Owner grant atom is required")
+        if owner_grant.key != owner_grant_key(*plan.namespace.as_tuple):
+            raise ValueError("Owner grant belongs to another role")
+        validate_owner_grant_v1(owner_grant.value)
+        grant = owner_grant.value
+        if (owner_grant.revision != grant["grant_revision"]
+                or grant["scope"] != "/".join(plan.namespace.as_tuple)
+                or not isinstance(current_guard, OwnerAuthorizationGuardV1)
+                or current_guard.namespace != plan.namespace
+                or current_guard.authority_id != grant["authority_id"]
+                or current_guard.installation_id != grant["installation_id"]
+                or current_guard.authorization_revision != 1
+                or current_guard.pending_revoke_operation_id is not None
+                or current_guard.minimum_revocation_revision >= 1
+                or current_guard.minimum_revocation_epoch >= 1):
+            raise ValueError("Owner grant is not currently committed and usable")
+        activation = PersonaActivation(
+            plan.namespace, plan.plan_id, plan.version, plan.head_id,
+            grant["grant_id"], owner_grant.revision, grant["graph_incarnation"],
+            grant["activation_generation"], current_guard.authorization_revision,
+        )
+        return GraphWrite(
+            _activation_key(plan.namespace), _json_value(asdict(activation)),
+            (owner_grant.key, PersonaDomain.plan_write(plan).key),
+        )
+
+    @staticmethod
+    def resolve_active_role(
+        snapshot: GraphSnapshot, *, namespace: NamespaceId,
+        current_guard: OwnerAuthorizationGuardV1,
+    ) -> ActiveRoleQualification:
+        """Qualify a graph head against a freshly read trusted Authority guard."""
+        if not isinstance(snapshot, GraphSnapshot) or not isinstance(namespace, NamespaceId):
+            raise TypeError("graph snapshot and namespace are required")
+        if not isinstance(current_guard, OwnerAuthorizationGuardV1):
+            raise TypeError("fresh Owner authorization guard is required")
+        if current_guard.namespace != namespace or current_guard.pending_revoke_operation_id:
+            raise ValueError("Owner authorization is unavailable")
+        activation_atom = snapshot.get(_activation_key(namespace))
+        grant_atom = snapshot.get(owner_grant_key(*namespace.as_tuple))
+        if (activation_atom is None or grant_atom is None
+                or not activation_atom.valid or not grant_atom.valid):
+            raise ValueError("role activation or Owner grant is missing")
+        _validate_persona_activation(activation_atom.value)
+        validate_owner_grant_v1(grant_atom.value)
+        activation = activation_atom.value
+        grant = grant_atom.value
+        if (activation["namespace"] != _json_value(asdict(namespace))
+                or activation["owner_grant_id"] != grant["grant_id"]
+                or activation["owner_grant_revision"] != grant_atom.revision
+                or activation["graph_incarnation"] != grant["graph_incarnation"]
+                or activation["activation_generation"] != grant["activation_generation"]
+                or activation["authorization_revision"] != current_guard.authorization_revision
+                or current_guard.authorization_revision != 1
+                or current_guard.authority_id != grant["authority_id"]
+                or current_guard.installation_id != grant["installation_id"]
+                or current_guard.minimum_revocation_revision >= 1
+                or current_guard.minimum_revocation_epoch >= 1):
+            raise ValueError("role activation differs from current Owner authorization")
+        plan_key = AtomKey(Owner("persona", *namespace.as_tuple),
+                           "d01.persona_plan.v1", activation["plan_id"])
+        plan_atom = snapshot.get(plan_key)
+        if plan_atom is None or not plan_atom.valid:
+            raise ValueError("active persona plan is missing")
+        _validate_persona_plan(plan_atom.value)
+        raw = plan_atom.value
+        if (raw["namespace"] != _json_value(asdict(namespace))
+                or raw["version"] != activation["plan_version"]
+                or f"{raw['plan_id']}@{raw['version']}" != activation["head_id"]):
+            raise ValueError("active persona head is stale")
+        epochs = [item.revision for item in snapshot.epochs
+                  if (item.bot, item.persona) == namespace.as_tuple]
+        if len(epochs) != 1:
+            raise ValueError("complete role graph epoch is required")
+        plan_data = dict(raw)
+        plan_data["namespace"] = namespace
+        plan_data["blocks"] = tuple(_persona_block(item) for item in raw["blocks"])
+        plan_data["values"] = tuple(_value_rule(item) for item in raw["values"])
+        return ActiveRoleQualification(
+            namespace, activation["head_id"], PersonaPlan(**plan_data),
+            tuple(GraphVersion(atom.key, atom.revision)
+                  for atom in (activation_atom, plan_atom, grant_atom)),
+            epochs[0], current_guard.authorization_revision,
+        )
 
     @staticmethod
     def revision_write(namespace: NamespaceId, revision: PersonaRevision) -> GraphWrite:

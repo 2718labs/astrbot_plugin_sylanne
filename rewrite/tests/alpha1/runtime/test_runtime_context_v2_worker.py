@@ -138,7 +138,9 @@ def test_context_owns_v2_worker_without_publishing_ready(
         assert await context.provision_installed_namespace("install-persona") == (
             "installation", "install-persona")
         assert context.health.status == "limited"
-        assert context.health.missing_capabilities == ("product_ingress", "dispatch")
+        assert context.health.missing_capabilities == (
+            "product_ingress", "owner_guard", "active_role", "scene_binding", "dispatch",
+        )
         worker = context._worker
         if unresolved_fence:
             with pytest.raises(V2FenceOutcomeUnknown, match="fence result unknown"):

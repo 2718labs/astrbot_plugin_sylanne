@@ -13,6 +13,7 @@ import pytest
 
 BUILDER_PATH = Path(__file__).resolve().parents[3] / "tools" / "build_plugin_package.py"
 VERIFIER_PATH = Path(__file__).resolve().parents[3] / "sylanne3" / "host" / "installed_package.py"
+FORMAL_COLD_INSTALL = Path(__file__).resolve().parents[4] / "scripts" / "alpha1" / "verify_formal_cold_install.py"
 
 
 def _load_verifier():
@@ -80,6 +81,22 @@ def test_valid_extracted_dev_probe(installed_dev_probe: tuple[Path, str]) -> Non
     assert result.verified
     assert result.manifest_digest == digest
     assert result.build_mode == "dev-probe"
+
+
+def test_formal_cold_install_rejects_dev_probe(installed_dev_probe: tuple[Path, str], tmp_path: Path) -> None:
+    root, digest = installed_dev_probe
+    package = tmp_path / "dev-probe.zip"
+    with zipfile.ZipFile(package, "w") as archive:
+        for path in root.rglob("*"):
+            if path.is_file():
+                archive.write(path, path.relative_to(root).as_posix())
+    result = subprocess.run(
+        [sys.executable, str(FORMAL_COLD_INSTALL), "--package", str(package),
+         "--expected-manifest-sha256", digest],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "requires a formal-alpha1 ZIP" in result.stderr
 
 
 def test_rejects_tampered_listed_file(installed_dev_probe: tuple[Path, str]) -> None:

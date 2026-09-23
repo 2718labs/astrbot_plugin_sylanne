@@ -712,8 +712,15 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
             async def provision_installed_namespace(self, operation_id):
                 order.append(("provision", operation_id))
-                self.health = RuntimeHealth("limited", ("product_ingress", "dispatch"))
+                self.health = RuntimeHealth("limited", (
+                    "product_ingress", "owner_guard", "active_role",
+                    "scene_binding", "dispatch",
+                ))
                 return object()
+
+            async def refresh_capabilities(self):
+                order.append("refresh")
+                return self.health
 
         self_outer = self
         with tempfile.TemporaryDirectory() as directory:
@@ -731,12 +738,14 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(order[4], (
                 "provision", "namespace-provision:" + canonical_digest(policy.digest_payload()),
             ))
+            self.assertEqual(order[5], "refresh")
             self.assertEqual(plugin._runtime.arguments, (
                 resolved_dir, module.PACKAGE_ROOT, None, registry,
             ))
             self.assertEqual(plugin.runtime_health.status, "limited")
             self.assertEqual(plugin.runtime_health.missing_capabilities,
-                             ("product_ingress", "dispatch"))
+                             ("product_ingress", "owner_guard", "active_role",
+                              "scene_binding", "dispatch"))
             self.assertEqual(plugin.runtime_health.detail, "")
             event = Event()
             await plugin.ingress(event)

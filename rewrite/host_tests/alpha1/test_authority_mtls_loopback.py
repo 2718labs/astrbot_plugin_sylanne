@@ -24,7 +24,9 @@ from sylanne3.authority_service.mtls_server import (
     AuthorityServerTlsConfig,
     MtlsPeerCredential,
 )
-from sylanne3.authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
+from sylanne3.authority_service.v2_contract import (
+    ExecutionBindingV1, SCHEMA as AUTHORITY_V2_PROTOCOL,
+)
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
@@ -504,6 +506,53 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                     await second.v2_execution_prepare(
                         second_request, second_handshake, permit=dispatch,
                         mutation_id="mutation-a", footprint=footprint)
+
+                binding = ExecutionBindingV1(
+                    permit=dispatch, namespace="ns:role", activity_id="activity-a",
+                    effect_id="effect-a", attempt_id="attempt-a",
+                    operation_id="dispatch-a", dispatch_generation=1,
+                    activation_generation=dispatch.generation,
+                    admission_ref="admission-a", verified_check_refs=("check-a",),
+                    payload_digest="sha256:" + "b" * 64,
+                    platform_capability_ref="capability-a", adapter_ref="adapter-a",
+                    account_ref="account-a", destination_ref="destination-a",
+                    worker_fence=1, content_fence="content-a", cancel_epoch=0,
+                    footprint=footprint,
+                )
+                async def lose_claim_response(*args, **kwargs):
+                    response = await content_rpc(*args, **kwargs)
+                    if args[2] == "execution_claim":
+                        raise RuntimeError("authority transport unavailable")
+                    return response
+
+                first._content_rpc = lose_claim_response
+                with self.assertRaisesRegex(RuntimeError, "transport unavailable"):
+                    await first.v2_execution_claim(
+                        first_request, first_handshake,
+                        prepared_receipt=receipt, binding=binding)
+                first._content_rpc = content_rpc
+                await first.close()
+                first_handshake = await first.handshake(
+                    first_request, protocol=AUTHORITY_V2_PROTOCOL)
+                claim, claimed_permit = await first.v2_execution_claim(
+                    first_request, first_handshake,
+                    prepared_receipt=receipt, binding=binding)
+                self.assertEqual(claim.pending.phase, "claimed")
+                self.assertEqual(claim.durable_state, "committed")
+                self.assertEqual(execution.verified_head().seq, 2)
+                self.assertEqual((claim, claimed_permit), await first.v2_execution_claim(
+                    first_request, first_handshake,
+                    prepared_receipt=receipt, binding=binding))
+                self.assertEqual(execution.verified_head().seq, 2)
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await second.v2_execution_claim(
+                        second_request, second_handshake,
+                        prepared_receipt=receipt, binding=binding)
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await first.v2_execution_claim(
+                        first_request, first_handshake,
+                        prepared_receipt=receipt,
+                        binding=replace(binding, payload_digest="sha256:" + "c" * 64))
 
                 legacy, legacy_request = client("client", "legacy")
                 legacy_handshake = await legacy.handshake(legacy_request)

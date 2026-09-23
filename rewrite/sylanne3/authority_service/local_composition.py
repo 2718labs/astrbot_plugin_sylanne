@@ -1,0 +1,112 @@
+"""Install a first-Owner Authority RPC with a pinned, current local graph.
+
+Deployment supplies the graph path and authenticators; no RPC field selects
+the database or substitutes evidence for an independently finished write fence.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Mapping
+
+from .contract import AuthorityUnavailable
+from .core import AuthorityServiceCore
+from .current_graph_verifier import PinnedCurrentGraphVerifier
+from .mtls_server import (
+    AdministratorInstallationV2, AuthorityRpcServer,
+)
+from .v2_clock import AuthorityClockReadingV2
+from .v2_contract import FencePermitV2
+from .v2_fence_service import AuthorityV2FenceService
+from .v2_fence_store import AuthorityV2FenceStore
+from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
+from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from ..runtime_contracts import NamespaceId
+
+
+def compose_local_owner_authority(
+    *, core: AuthorityServiceCore,
+    v2_fences: Mapping[str, AuthorityV2FenceService],
+    graph_db_path: str | Path,
+    utc_clock: Callable[[], datetime],
+    first_claim_verifier: Callable[[object, OwnerClaimTicketV1, str], bool],
+    claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1], bool],
+    administrator_authorizer: Callable[[object, str, str, str | None], bool],
+    publisher_manifest_verifier: Callable[[str, str, str, str], bool],
+    installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2],
+    namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
+    clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
+    create_owner_schema: bool = False,
+) -> AuthorityRpcServer:
+    """Build the independent local Authority endpoint from trusted install config.
+
+    The finished-fence check reads the durable Authority row under both journal
+    freezes. Owner finalization calls the graph verifier outside Core's lock.
+    No service is started and no ownership is issued by this factory.
+    """
+    if type(core) is not AuthorityServiceCore:
+        raise TypeError("independent Authority core is required")
+    services = dict(v2_fences)
+    if (not services or any(
+            type(namespace) is not str or type(service) is not AuthorityV2FenceService
+            or service.core is not core or service.namespace != namespace
+            for namespace, service in services.items())):
+        raise AuthorityUnavailable("trusted v2 fence services are required")
+    if (not callable(utc_clock) or not callable(first_claim_verifier)
+            or not callable(claimant_verifier)
+            or not callable(administrator_authorizer)
+            or not callable(publisher_manifest_verifier)):
+        raise AuthorityUnavailable("trusted Authority callbacks are required")
+    if not installations_v2 or not namespace_bindings_v2:
+        raise AuthorityUnavailable("installed peer and namespace bindings are required")
+    if set(namespace_bindings_v2.values()) != set(services):
+        raise AuthorityUnavailable("owner namespace bindings must cover the installed services")
+
+    def finished_fence(permit: FencePermitV2, finish_id: str,
+                       finish_digest: str) -> bool:
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or type(finish_id) is not str or type(finish_digest) is not str):
+            return False
+        service = services.get(permit.namespace)
+        if service is None:
+            return False
+        with service._frozen() as (db, deletion_head, execution_head,
+                                   deletion_history):
+            current = service._current_locked(db, deletion_head, execution_head)
+            if deletion_history or current != permit.pinned_anchor:
+                return False
+            AuthorityV2FenceStore._check_schema(db)
+            AuthorityV2FenceStore._require_no_migration(db)
+            row = AuthorityV2FenceStore._row(db, permit.operation_id)
+            # The epoch is fixed in this fence row. Later finished fences advance
+            # the issuance counter without invalidating this durable receipt.
+            return (row is not None
+                    and row[:6] == (
+                        permit.operation_id, permit.namespace, permit.subject,
+                        permit.token, permit.fence_epoch, permit.revision)
+                    and row[6] == "finished"
+                    and row[8:11] == (finish_id, finish_digest, None)
+                    and AuthorityV2FenceStore._permit(row) == permit
+                    and permit.authority_id == core._id(db))
+
+    graph_verifier = PinnedCurrentGraphVerifier(
+        graph_db_path, finished_fence_verifier=finished_fence)
+    owner_tickets = AuthorityV2OwnerTicketStore(
+        core, utc_clock=utc_clock,
+        first_claim_verifier=first_claim_verifier,
+        claimant_verifier=claimant_verifier,
+        graph_commit_verifier=graph_verifier,
+        create=create_owner_schema,
+    )
+    return AuthorityRpcServer(
+        core, v2_fences=services, v2_owner_tickets=owner_tickets,
+        administrator_authorizer=administrator_authorizer,
+        publisher_manifest_verifier=publisher_manifest_verifier,
+        installations_v2=installations_v2,
+        namespace_bindings_v2=namespace_bindings_v2,
+        clock_provider=clock_provider,
+    )
+
+
+__all__ = ("compose_local_owner_authority",)

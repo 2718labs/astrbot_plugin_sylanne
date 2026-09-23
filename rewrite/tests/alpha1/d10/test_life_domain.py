@@ -10,7 +10,8 @@ from sylanne3.domains.d10 import (
     LifeProject,
     ProactiveOpportunity,
 )
-from sylanne3.runtime_contracts import NamespaceId
+from sylanne3.domains.d08 import ActionIntent, GoalPredicate, RequiredCheckSpec
+from sylanne3.runtime_contracts import NamespaceId, OperationIdentity, VersionedRef, canonical_digest
 
 
 class LifeDomainTests(unittest.TestCase):
@@ -21,6 +22,22 @@ class LifeDomainTests(unittest.TestCase):
             policy_id="policy:one", namespace=self.namespace, version=1, subject_ref="user:one",
             channel="private", category="ordinary", consent=True, quiet=False,
             quota_limit=1, window_start=0.0, window_end=24.0,
+        )
+
+    def _proactive_intent(self):
+        versions = (VersionedRef("criteria:contact", 1), VersionedRef("policy:one", 1),
+                    VersionedRef("opportunity:one", 1))
+        spec = RequiredCheckSpec("contact_policy", "d10.contact_policy", "persona:one",
+                                 "action:one", "proactive_contact", "criteria:contact", versions)
+        return ActionIntent(
+            action_id="action:one", revision=1, goal_ref="goal:one", commitment_refs=(),
+            target_ref="user:one", action_kind="message", purpose="proactive_contact",
+            risk_class="limited", parameters_digest="a" * 64,
+            identity=OperationIdentity("activity:one", "effect:one", "attempt:one", "prepare",
+                                       "operation:one", canonical_digest({"input_refs": []})),
+            schema_id="schema:one", required_checks=(spec,),
+            success_predicate=GoalPredicate("communicated", "d11.observer", (), 0.0, None),
+            effect_scope=("effect:one",), compensation_ref=None, source_refs=("source:one",),
         )
 
     def test_life_project_cannot_adopt_planned_or_unknown_work_as_progress(self):
@@ -48,6 +65,37 @@ class LifeDomainTests(unittest.TestCase):
         check = self.domain.contact_policy_check(quiet, opportunity, (), now=1.0)
         self.assertEqual(check.result, "fail")
         self.assertFalse(check.dispatch_authorized)
+
+    def test_required_contact_check_passes_only_full_matching_current_graph_read(self):
+        intent = self._proactive_intent()
+        versions = intent.required_checks[0].required_input_versions
+        opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone", "user:one",
+                                           "private", "ordinary", 0.0, 10.0)
+        receipt = self.domain.contact_policy_required_check(
+            intent, self.policy, opportunity, (), coverage="full", input_versions=versions, now=1.0
+        )
+        self.assertEqual((receipt.result, receipt.coverage, receipt.issuer),
+                         ("pass", "full", "d10.contact_policy"))
+        partial = self.domain.contact_policy_required_check(
+            intent, self.policy, opportunity, (), coverage="partial", input_versions=versions, now=1.0
+        )
+        self.assertEqual((partial.result, partial.coverage), ("unknown", "partial"))
+        stale = self.domain.contact_policy_required_check(
+            intent, self.policy, opportunity, (), coverage="full",
+            input_versions=(VersionedRef("policy:one", 2),), now=1.0
+        )
+        self.assertEqual(stale.result, "unknown")
+
+    def test_required_contact_check_fails_closed_for_policy_gates(self):
+        intent = self._proactive_intent()
+        versions = intent.required_checks[0].required_input_versions
+        opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone", "user:one",
+                                           "private", "ordinary", 0.0, 10.0)
+        policy = replace(self.policy, consent=False)
+        receipt = self.domain.contact_policy_required_check(
+            intent, policy, opportunity, (), coverage="full", input_versions=versions, now=1.0
+        )
+        self.assertEqual((receipt.result, receipt.coverage), ("fail", "full"))
 
     def test_unknown_segment_holds_contact_occupancy_and_new_contact_id_cannot_bypass_no_response_gate(self):
         opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone", "user:one", "private", "ordinary", 0.0, 10.0)
