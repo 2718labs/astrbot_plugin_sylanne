@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import hashlib
 import json
 import secrets
 import ssl
+import threading
 import time
 from typing import Callable
 
@@ -21,6 +23,7 @@ from .v2_fence_service import AuthorityV2FenceService
 
 
 _MAX_SESSIONS = 256
+_MAX_INFLIGHT_DISPATCHES = 32
 _SESSION_TTL_SECONDS = 30.0
 AUTHORITY_PROTOCOL = "sylanne3.authority.v1"
 _ENROLLMENT_CAPABILITIES = ("enrollment",)
@@ -123,11 +126,14 @@ class AuthorityRpcServer:
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
+        max_inflight_dispatches: int = _MAX_INFLIGHT_DISPATCHES,
     ) -> None:
         if not isinstance(core, AuthorityServiceCore):
             raise TypeError("AuthorityServiceCore is required")
         if not callable(administrator_authorizer) or not callable(publisher_manifest_verifier):
             raise TypeError("server-side authorizer and publisher verifier are required")
+        if type(max_inflight_dispatches) is not int or max_inflight_dispatches < 1:
+            raise ValueError("authority dispatch capacity is invalid")
         if v2_fences is None:
             services = {}
         elif type(v2_fences) is AuthorityV2FenceService:
@@ -171,6 +177,12 @@ class AuthorityRpcServer:
             role_to_namespace[role] = namespace
         self._namespace_bindings_v2 = bindings
         self._sessions: dict[str, tuple[float, str, str]] = {}
+        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="authority-rpc")
+        self._worker_slots = threading.BoundedSemaphore(max_inflight_dispatches)
+        self._worker_lock = threading.Lock()
+        self._worker_close_lock = asyncio.Lock()
+        self._worker_closed = False
+        self._worker_shutdown_task: asyncio.Task[None] | None = None
 
     @staticmethod
     def error_payload(exc: BaseException) -> dict[str, object]:
@@ -542,6 +554,40 @@ class AuthorityRpcServer:
             command=command,
         )
 
+    async def _dispatch_on_worker(self, method, request, credential, binding,
+                                  handshake_binding, command) -> dict[str, object]:
+        # Release only when the concurrent future actually completes. Cancelling
+        # the awaiting connection does not release a still-running service call.
+        with self._worker_lock:
+            if self._worker_closed or not self._worker_slots.acquire(blocking=False):
+                raise RuntimeError("authority unavailable")
+            try:
+                future = self._worker.submit(
+                    self.dispatch, method, request, credential, binding,
+                    handshake_binding=handshake_binding, command=command,
+                )
+            except Exception:
+                self._worker_slots.release()
+                raise
+            future.add_done_callback(lambda _: self._worker_slots.release())
+        return await asyncio.wrap_future(future)
+
+    async def aclose(self) -> None:
+        """Stop accepting dispatches and wait for submitted service work to finish.
+
+        Deployment closes its asyncio listener first, then awaits this method.
+        Closing the listener alone does not own the RPC worker's lifecycle.
+        """
+        async with self._worker_close_lock:
+            if self._worker_shutdown_task is None:
+                with self._worker_lock:
+                    self._worker_closed = True
+                self._worker_shutdown_task = asyncio.create_task(
+                    asyncio.to_thread(self._worker.shutdown, wait=True)
+                )
+            shutdown = self._worker_shutdown_task
+        await asyncio.shield(shutdown)
+
     async def serve_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
         *, timeout_seconds: float, max_message_bytes: int,
@@ -573,10 +619,9 @@ class AuthorityRpcServer:
                     if (type(payload.get("request")) is not dict
                             or payload["request"].get("protocol") != payload["protocol"]):
                         raise RuntimeError("authority unavailable")
-                    result = self.dispatch(
+                    result = await self._dispatch_on_worker(
                         payload["method"], payload.get("request"), credential, binding,
-                        handshake_binding=payload.get("handshake_binding_sha256"),
-                        command=payload.get("command"),
+                        payload.get("handshake_binding_sha256"), payload.get("command"),
                     )
                     response = {"request_id": payload["request_id"], "ok": True, "result": result}
                 except Exception as exc:
