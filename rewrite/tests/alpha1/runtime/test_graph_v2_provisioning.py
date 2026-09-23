@@ -339,7 +339,7 @@ def test_v2_bundle_cold_restart_finishes_only_after_durable_business_receipt(
 
 def _owner_issue_case(tmp_path, *, first_ingress=False, return_bootstrap=False,
                       role_types=False, scene_types=False,
-                      owner_capabilities=None):
+                      owner_capabilities=None, extra_specs=()):
     """Exercise the private graph transaction; this is not Authority admission."""
     registry = TypeRegistry()
     registry.register(owner_grant_spec())
@@ -354,6 +354,8 @@ def _owner_issue_case(tmp_path, *, first_ingress=False, return_bootstrap=False,
     if first_ingress:
         for spec in D06DomainProvider.type_specs() + graph_type_specs():
             registry.register(spec)
+    for spec in extra_specs:
+        registry.register(spec)
     store = ProductionGraphStore(tmp_path / "owner-business.db", registry)
     authority_db = sqlite3.connect(tmp_path / "owner-authority.db", isolation_level=None)
     port = AuthorityPort(store, authority_db)

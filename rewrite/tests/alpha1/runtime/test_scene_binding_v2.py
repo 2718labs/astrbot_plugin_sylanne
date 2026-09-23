@@ -32,12 +32,12 @@ from test_graph_v2_provisioning import _owner_issue_case
 
 
 def _scene_case(tmp_path, *, owner_capabilities=None,
-                enable_ingress=False):
+                enable_ingress=False, extra_specs=()):
     (store, authority_db, port, coordinator, policy, operation,
      pending, grant_value, bootstrap) = _owner_issue_case(
         tmp_path, first_ingress=enable_ingress, return_bootstrap=True,
         role_types=True, scene_types=True,
-        owner_capabilities=owner_capabilities)
+        owner_capabilities=owner_capabilities, extra_specs=extra_specs)
     scene_ref = (scene_ref_for_conversation(
         policy.namespace, "platform", "conversation")
         if enable_ingress else "scene:private")
