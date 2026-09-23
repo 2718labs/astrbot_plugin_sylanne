@@ -346,14 +346,14 @@ test("Owner can submit D01 creation using only explicit trusted references and r
     await opened;
     assert.match(ui.app.innerHTML, /模型能力和预算目录不会由工作台推测/);
     assert.match(ui.app.innerHTML, /来自可信安装资料/);
-    ui.setCreateFields({ display_name: "Mira", blueprint: "blank", model_capability_ref: "capability:local:verified", budget_ref: "budget:local:verified" });
+    ui.setCreateFields({ display_name: "Mira", blueprint: "d01.persona.warm-listener.v1", model_capability_ref: "capability:local:verified", budget_ref: "budget:local:verified" });
     const submitted = ui.clickCommand("create-character");
     const request = await ui.nextRequest(1);
     assert.equal(request.payload.action, "create_character");
     assert.equal(request.payload.scope, "role-a");
     assert.match(request.payload.operation_id, /^[0-9a-f-]{36}$/i);
     assert.deepEqual(request.payload.input, {
-      display_name: "Mira", blueprint: "blank",
+      display_name: "Mira", blueprint: "d01.persona.warm-listener.v1",
       model_capability_ref: "capability:local:verified", budget_ref: "budget:local:verified"
     });
     request.resolve({ status: "ready", receipt: { operation_id: request.payload.operation_id, phase: "role_initialized", role_ref: "persona:mira", owner_grant_revision: 1 } });
@@ -373,7 +373,7 @@ test("D01 creation stays HOLD when installed catalogue resolution is unavailable
     await ui.nextRequest(0);
     ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
     await opened;
-    ui.setCreateFields({ display_name: "Mira", blueprint: "example", model_capability_ref: "capability:from:install", budget_ref: "budget:from:install" });
+    ui.setCreateFields({ display_name: "Mira", blueprint: "d01.persona.curious-maker.v1", model_capability_ref: "capability:from:install", budget_ref: "budget:from:install" });
     const submitted = ui.clickCommand("create-character");
     const request = await ui.nextRequest(1);
     request.resolve({ status: "unavailable", problem: { code: "role_initialization_unavailable", retryable: true } });

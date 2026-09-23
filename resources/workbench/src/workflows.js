@@ -28,7 +28,7 @@ export function workflowForPage(page, values) {
       const modelCapabilityRef = text(values.model_capability_ref);
       const budgetRef = text(values.budget_ref);
       if (!displayName || displayName.length > 80) throw new Error("名称需为 1 至 80 个字符。");
-      if (!["blank", "example"].includes(blueprint)) throw new Error("请选择服务端支持的初始化方案。");
+      if (!["d01.persona.warm-listener.v1", "d01.persona.curious-maker.v1"].includes(blueprint)) throw new Error("请选择本地目录中的有效角色预设。");
       const validRef = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$/;
       if (!validRef.test(modelCapabilityRef) || !validRef.test(budgetRef)) throw new Error("请填写可信安装资料中的模型能力引用和预算引用。");
       return [ACTIONS.createCharacter, {
