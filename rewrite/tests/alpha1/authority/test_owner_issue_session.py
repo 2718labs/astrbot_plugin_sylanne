@@ -26,9 +26,15 @@ from sylanne3.authority_service.v2_owner_session import (
     AuthorityV2OwnerSessionStore, OwnerSessionLoginRequestV1,
 )
 from sylanne3.authority_service.v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from sylanne3.authority_service.current_graph_verifier import PinnedCurrentGraphVerifier
 from sylanne3.graph_coordinator import namespace_ref
 from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime_contracts import NamespaceId
+from rewrite.tests.alpha1.authority.test_local_owner_round_trip import (
+    _installed, _owner_issue, ADMIN, AUTH_NS as ROUND_TRIP_AUTH_NS,
+    CLAIMANT, ROLE,
+)
+from rewrite.tests.alpha1.runtime.test_graph_v2_provisioning import policy_for
 
 
 NS = NamespaceId("bot", "persona")
@@ -239,3 +245,94 @@ def test_composition_installs_same_core_owner_sessions(tmp_path):
         deletion.close()
         guard.close()
         execution.close()
+
+
+def test_real_graph_first_issue_uses_live_owner_session(tmp_path):
+    (coordinator, bootstrap, service, compose, expected, principal,
+     authority_id, resources) = _installed(tmp_path)
+    core = resources[1]
+    original_authorizer = core._authorize_callback
+    core._authorize_callback = lambda credential, action, namespace, holder: (
+        (credential == CLAIMANT and action == "owner_session"
+         and namespace == ROUND_TRIP_AUTH_NS)
+        or original_authorizer(credential, action, namespace, holder)
+    )
+    try:
+        policy = replace(
+            policy_for(resources[0]), expected_authority_id=authority_id,
+            authority_namespace=ROUND_TRIP_AUTH_NS)
+        creation = coordinator.provision_namespace_v2(
+            bootstrap, policy, operation_id="owner-creation")
+        expected.update(operation_id=creation.operation_id,
+                        digest="sha256:" + creation.input_digest)
+        _, original_tickets = compose()
+
+        key = Ed25519PrivateKey.generate()
+        proof_store = AuthorityV2OwnerProofStore(
+            core, utc_clock=lambda: NOW, pairing_verifier=lambda *_: True, create=True)
+        proof_store.register_credential(
+            transport_credential=ADMIN,
+            registration=OwnerCredentialRegistrationV1(
+                authority_id, ROUND_TRIP_AUTH_NS, "installation", principal,
+                "owner-key", 1,
+                key.public_key().public_bytes(
+                    serialization.Encoding.Raw, serialization.PublicFormat.Raw),
+                "enroll",
+            ),
+        )
+        sessions = AuthorityV2OwnerSessionStore(
+            core, utc_clock=lambda: NOW, create=True)
+        request = OwnerSessionLoginRequestV1(
+            authority_id, ROUND_TRIP_AUTH_NS, "installation", principal,
+            "owner-key", 1, "sylanne-owner-console", "http://localhost:6185",
+        )
+        challenge = sessions.begin_login(
+            transport_credential=CLAIMANT, request=request)
+        token = sessions.accept_login(
+            transport_credential=CLAIMANT, challenge=challenge,
+            signature=key.sign(challenge.signed_bytes()))
+
+        server = compose_local_owner_authority(
+            core=core, v2_fences={ROUND_TRIP_AUTH_NS: service},
+            graph_db_path=tmp_path / "business.db",
+            utc_clock=lambda: datetime.now(timezone.utc),
+            first_claim_verifier=original_tickets._first_claim_verifier,
+            claimant_verifier=None, owner_proofs=proof_store,
+            owner_sessions=sessions,
+            administrator_authorizer=lambda *_: False,
+            publisher_manifest_verifier=lambda *_: False,
+            installations_v2={("a" * 64, "installed"): AdministratorInstallationV2(
+                "installation", "administrator", "policy", "capabilities-v2", "c" * 64)},
+            namespace_bindings_v2={("a" * 64, "installed", ROLE): ROUND_TRIP_AUTH_NS},
+        )
+        tickets = server._v2_owner_tickets
+        assert isinstance(tickets._graph_commit_verifier, PinnedCurrentGraphVerifier)
+        assert tickets._claimant_verifier is None
+        coordinator._GraphCoordinator__content_fence_v2.tickets = tickets
+        ticket, operation, value = _owner_issue(creation, authority_id, principal)
+        tickets.register_ticket(
+            credential=ADMIN, authority_namespace=ROUND_TRIP_AUTH_NS,
+            ticket=ticket)
+        pending = tickets.reserve_issue(
+            credential=CLAIMANT, authority_namespace=ROUND_TRIP_AUTH_NS,
+            operation=operation, session_token=token, session_request=request)
+        assert pending.phase == "pending"
+        proof = coordinator.commit_first_owner_grant_v2(
+            bootstrap, namespace=ROLE, operation_id=operation.operation_id,
+            grant_value=value)
+        assert tickets._graph_commit_verifier(operation, proof) is True
+        committed = tickets.finalize_issue(
+            credential=CLAIMANT, authority_namespace=ROUND_TRIP_AUTH_NS,
+            operation=operation, proof=proof,
+            session_token=token, session_request=request)
+        assert committed.phase == "committed"
+        sessions.logout(
+            transport_credential=CLAIMANT, token=token, request=request)
+        with pytest.raises(AuthorityUnavailable, match="not current"):
+            tickets.finalize_issue(
+                credential=CLAIMANT, authority_namespace=ROUND_TRIP_AUTH_NS,
+                operation=operation, proof=proof,
+                session_token=token, session_request=request)
+    finally:
+        for resource in resources:
+            resource.close()
