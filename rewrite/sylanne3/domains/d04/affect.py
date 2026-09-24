@@ -16,9 +16,10 @@ from ...runtime_contracts import (
     DomainProposal,
     ProviderDescriptor,
     RUNTIME_SCHEMA,
+    canonical_digest,
     schema_hash,
 )
-from .encoding_baseline import EncodingBaseline, decode_encoding_baseline
+from .encoding_baseline import CommittedRef, EncodingBaseline, decode_encoding_baseline
 
 
 def _nonempty(value: object, label: str) -> str:
@@ -863,6 +864,111 @@ class AffectProvider:
             required_bundle_parts=required_bundle_parts,
         )
 
+    def propose_encoding_baseline(
+        self,
+        envelope: CommandEnvelope,
+        snapshot: GraphSnapshot,
+        *,
+        source_refs: tuple[str, ...],
+        perspective_ref: str,
+        then_feeling_refs: tuple[str, ...] = (),
+        interpretation_refs: tuple[str, ...] = (),
+        projection_policy_ref: str,
+    ) -> DomainProposal:
+        """Propose one immutable, unknown-valued baseline from committed reads.
+
+        D11 owns the fresh graph/Authority read, source access check, and commit.
+        This candidate neither records a new feeling nor certifies a projection.
+        """
+        if not isinstance(envelope, CommandEnvelope) or not isinstance(snapshot, GraphSnapshot):
+            raise TypeError("baseline needs a command envelope and committed graph snapshot")
+        scheme = self._active_scheme
+        if scheme is None:
+            raise ValueError("baseline needs the active D04 scheme")
+        if not isinstance(source_refs, tuple) or not source_refs:
+            raise ValueError("baseline needs committed source refs")
+        if any(not isinstance(refs, tuple) for refs in (then_feeling_refs, interpretation_refs)):
+            raise TypeError("baseline version refs must be tuples")
+        if any(len(set(refs)) != len(refs) for refs in (
+            source_refs, then_feeling_refs, interpretation_refs,
+        )):
+            raise ValueError("baseline refs must be unique")
+        # A canonical order gives the same identity to retries of the same read set.
+        sources = tuple(sorted(source_refs))
+        feeling_refs = tuple(sorted(then_feeling_refs))
+        interpretations = tuple(sorted(interpretation_refs))
+        ref_tokens = (*sources, perspective_ref, *feeling_refs, *interpretations)
+        keys = tuple(AtomKey.from_token(ref) for ref in ref_tokens)
+        if len(set(keys)) != len(keys) or len({atom.key for atom in snapshot.atoms}) != len(snapshot.atoms):
+            raise ValueError("baseline read set contains duplicate graph keys")
+        guarded = {item.key: item for item in envelope.version_guard.read_versions}
+        if len(guarded) != len(envelope.version_guard.read_versions):
+            raise ValueError("baseline guard repeats graph keys")
+        versions = []
+        for key in keys:
+            atom = snapshot.get(key)
+            proof = guarded.get(key)
+            if (atom is None or not atom.valid or atom.revision < 1
+                    or proof != GraphVersion(key, atom.revision)):
+                raise ValueError("baseline refs require matching committed guarded revisions")
+            versions.append(proof)
+        source_key = keys[0]
+        identity = {
+            "schema": "d04.encoding_baseline.v1",
+            "refs": [(item.key.token, item.revision) for item in versions],
+            "as_known_at": envelope.source_qualification.learned_at,
+            "projection_policy_ref": projection_policy_ref,
+            "projection_policy_version": envelope.version_guard.policy_version,
+            "basis_version": scheme.scheme_version,
+            "parameter_version": scheme.parameter_version,
+        }
+        baseline = EncodingBaseline(
+            baseline_id="baseline:" + canonical_digest(identity),
+            source_refs=sources,
+            perspective_ref=perspective_ref,
+            then_feeling_versions=tuple(CommittedRef(ref, guarded[AtomKey.from_token(ref)].revision)
+                                        for ref in feeling_refs),
+            interpretation_versions=tuple(CommittedRef(ref, guarded[AtomKey.from_token(ref)].revision)
+                                          for ref in interpretations),
+            as_known_at=envelope.source_qualification.learned_at,
+            projection_policy_ref=projection_policy_ref,
+            projection_policy_version=envelope.version_guard.policy_version,
+            basis_version=scheme.scheme_version,
+            parameter_version=scheme.parameter_version,
+            salience_interval=None,
+            tone_interval=None,
+            unknown_reasons=(
+                "salience_interval:numeric_projection_uncertified",
+                "tone_interval:numeric_projection_uncertified",
+            ),
+        )
+        baseline_key = AtomKey(source_key.owner, "d04.encoding_baseline.v1", baseline.baseline_id)
+        if snapshot.get(baseline_key) is not None:
+            raise ValueError("baseline identity already exists in the graph read")
+        absent = GraphVersion(baseline_key, 0)
+        if baseline_key in guarded and guarded[baseline_key] != absent:
+            raise ValueError("baseline needs a revision-0 write guard")
+        if baseline_key not in guarded:
+            envelope = replace(envelope, version_guard=replace(
+                envelope.version_guard,
+                read_versions=(*envelope.version_guard.read_versions, absent),
+            ))
+        value = {
+            **baseline.__dict__,
+            "source_refs": list(baseline.source_refs),
+            "then_feeling_versions": [item.__dict__ for item in baseline.then_feeling_versions],
+            "interpretation_versions": [item.__dict__ for item in baseline.interpretation_versions],
+            "unknown_reasons": list(baseline.unknown_reasons),
+        }
+        proposal = self.proposal_for(
+            envelope,
+            typed_writes=(GraphWrite(baseline_key, value),),
+            dependencies=DependencySet(historical_provenance=tuple(versions)),
+            contribution_keys=(),
+            required_bundle_parts=(),
+        )
+        return self.validate(proposal, snapshot=snapshot)
+
     def build_feeling(
         self,
         appraisal: AppraisalBundle,
@@ -1341,8 +1447,8 @@ class AffectProvider:
                     AtomKey.from_token(item.ref): item.revision
                     for item in (*decoded.then_feeling_versions, *decoded.interpretation_versions)
                 }
-                if not set(refs) <= set(write.dependencies):
-                    raise ValueError("encoding baseline graph dependencies omit referenced atoms")
+                if write.dependencies:
+                    raise ValueError("immutable encoding baseline cannot have invalidating dependencies")
                 for key in refs:
                     proof = guarded.get(key)
                     if (proof is None or proof.revision < 1
