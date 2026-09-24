@@ -24,10 +24,6 @@ def _unit(value: float, label: str) -> float:
     return float(value)
 
 
-def _midpoint(interval: tuple[float, float]) -> float:
-    return (interval[0] + interval[1]) / 2
-
-
 def _clamp(value: float, lower: float, upper: float) -> float:
     return min(upper, max(lower, value))
 
@@ -71,12 +67,13 @@ class SourceField:
 @dataclass(frozen=True)
 class ReconstructedDetail:
     detail_id: str
-    state: str  # retrieved / blurred / inferred / unavailable
+    state: str  # retrieved / blurred / inferred / unavailable / uncertain
     recalled_text: str | None
     source_ref: str | None
     source_span: tuple[int, int] | None
     interpretation_ref: str | None
     subjective_salience: tuple[float, float]
+    subjective_accessibility: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +99,7 @@ class RecollectionReconstruction:
     then_feeling_refs: tuple[str, ...] = ()
     then_feeling_versions: tuple[GraphVersion, ...] = ()
     then_feeling_status: str = "not_read"
+    subjective_duration_interval_v1: tuple[float, float] | None = None
 
 
 def reconstruct_recollection_candidate(
@@ -136,7 +134,10 @@ def reconstruct_recollection_candidate(
     if type(temporal_focus) is not bool:
         raise TypeError("temporal_focus must be bool")
 
-    salience_shift = _midpoint(view.subjective_salience) - _midpoint(view.base_salience)
+    salience_shift = (
+        view.subjective_salience[0] - view.base_salience[1],
+        view.subjective_salience[1] - view.base_salience[0],
+    )
     source_fields: list[SourceField] = []
     details: list[ReconstructedDetail] = []
     for cue in detail_cues:
@@ -157,17 +158,32 @@ def reconstruct_recollection_candidate(
             cue.detail_id, view.source_ref, cue.source_span, literal,
             view.source_kind, view.assertion_status,
         ))
-        accessibility = _clamp(cue.accessibility + _MOOD_ACCESS_GAIN * salience_shift, 0, 1)
-        state = ("retrieved" if accessibility >= _RETRIEVED_AT else
-                 "blurred" if accessibility >= _BLURRED_AT else "unavailable")
+        accessibility = (
+            _clamp(cue.accessibility + _MOOD_ACCESS_GAIN * salience_shift[0], 0, 1),
+            _clamp(cue.accessibility + _MOOD_ACCESS_GAIN * salience_shift[1], 0, 1),
+        )
+        if accessibility[0] >= _RETRIEVED_AT:
+            state = "retrieved"
+        elif accessibility[0] >= _BLURRED_AT and accessibility[1] < _RETRIEVED_AT:
+            state = "blurred"
+        elif accessibility[1] < _BLURRED_AT:
+            state = "unavailable"
+        else:
+            state = "uncertain"
         details.append(ReconstructedDetail(
             cue.detail_id, state, literal if state == "retrieved" else None,
             view.source_ref, cue.source_span, None, view.subjective_salience,
+            accessibility,
         ))
 
-    tone = _midpoint(view.subjective_tone)
-    weight = _midpoint(view.subjective_salience)
-    duration_delta = _clamp(-tone * weight, -1, 1) if temporal_focus else None
+    duration_interval = None
+    if temporal_focus:
+        products = tuple(
+            _clamp(-tone * weight, -1, 1)
+            for tone in view.subjective_tone
+            for weight in view.subjective_salience
+        )
+        duration_interval = (min(products), max(products))
     return RecollectionReconstruction(
         recollection_id=proposal.recollection_id,
         activity_id=proposal.activity_id,
@@ -180,9 +196,12 @@ def reconstruct_recollection_candidate(
         self_understanding_refs=proposal.self_understanding_refs,
         subjective_weight=view.subjective_salience,
         subjective_tone=view.subjective_tone,
-        subjective_duration_delta=duration_delta,
+        # Keep the legacy point field empty; new consumers must use the bounded
+        # v1 interval instead of treating a midpoint as a determinate duration.
+        subjective_duration_delta=None,
         mood_ref=view.mood_ref,
         coupling_version=view.coupling_version,
         read_versions=view.read_versions,
         epoch=view.epoch,
+        subjective_duration_interval_v1=duration_interval,
     )

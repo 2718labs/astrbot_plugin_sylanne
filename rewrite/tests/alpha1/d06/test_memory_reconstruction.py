@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from sylanne3.domains.d04 import AffectAxis, AffectCoupling, AffectScheme, MoodField
 from sylanne3.domains.d06 import CandidateItem, CandidateSet, RecollectionProposal, SelectionTicket
@@ -75,10 +76,48 @@ class ReconstructionTests(unittest.TestCase):
         self.assertEqual(guarded.subjective_details[0].state, "blurred")
         self.assertEqual(warm.subjective_details[0].recalled_text, self.source.text[:6])
         self.assertIsNone(guarded.subjective_details[0].recalled_text)
-        self.assertLess(warm.subjective_duration_delta, guarded.subjective_duration_delta)
+        self.assertIsNone(warm.subjective_duration_delta)
+        self.assertIsInstance(warm.subjective_duration_interval_v1, tuple)
+        self.assertIsInstance(guarded.subjective_duration_interval_v1, tuple)
         self.assertNotEqual(warm.subjective_weight, guarded.subjective_weight)
         self.assertEqual(warm.then_meaning_refs, guarded.then_meaning_refs)
         self.assertEqual(warm.status, "candidate_hold")
+
+    def test_threshold_crossing_is_uncertain_without_recalled_text(self):
+        view = self._view(0.8)
+        result = reconstruct_recollection_candidate(
+            proposal=self.proposal, view=view,
+            detail_cues=(
+                DetailCue("retrieved-threshold", (0, 6), 0.55),
+                DetailCue("unavailable-threshold", (0, 6), 0.10),
+            ),
+        )
+        retrieved_boundary, unavailable_boundary = result.subjective_details
+        self.assertEqual(retrieved_boundary.state, "uncertain")
+        self.assertAlmostEqual(retrieved_boundary.subjective_accessibility[0], 0.60)
+        self.assertAlmostEqual(retrieved_boundary.subjective_accessibility[1], 0.70)
+        self.assertIsNone(retrieved_boundary.recalled_text)
+        self.assertEqual(unavailable_boundary.state, "uncertain")
+        self.assertAlmostEqual(unavailable_boundary.subjective_accessibility[0], 0.15)
+        self.assertAlmostEqual(unavailable_boundary.subjective_accessibility[1], 0.25)
+        self.assertIsNone(unavailable_boundary.recalled_text)
+
+    def test_narrow_accessibility_interval_has_stable_state_and_duration_range(self):
+        view = replace(
+            self._view(0.8), subjective_salience=(0.70, 0.72),
+            base_salience=(0.50, 0.52), subjective_tone=(0.20, 0.22),
+        )
+        result = reconstruct_recollection_candidate(
+            proposal=self.proposal, view=view,
+            detail_cues=(DetailCue("stable-retrieval", (0, 6), 0.70),),
+            temporal_focus=True,
+        )
+        detail = result.subjective_details[0]
+        self.assertEqual(detail.state, "retrieved")
+        self.assertEqual(detail.recalled_text, self.source.text[:6])
+        self.assertAlmostEqual(result.subjective_duration_interval_v1[0], -0.1584)
+        self.assertAlmostEqual(result.subjective_duration_interval_v1[1], -0.14)
+        self.assertIsNone(result.subjective_duration_delta)
 
     def test_inference_stays_inferred_and_never_becomes_a_source_fact(self):
         cues = (
