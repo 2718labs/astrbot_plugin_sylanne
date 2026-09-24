@@ -698,6 +698,46 @@ class AuthorityV2FenceStore:
             canonical_bytes(updated), pending.mutation_id))
         return updated
 
+    def finish_deletion_mutation_locked(
+            self, db: sqlite3.Connection, receipt: DeletionMutationReceiptV1,
+            *, subject: str) -> FencePermitV2:
+        """Store one original deletion result in the Authority CAS transaction."""
+        if type(receipt) is not DeletionMutationReceiptV1:
+            raise AuthorityUnavailable("typed deletion receipt required")
+        self._check_schema(db)
+        self._require_no_migration(db)
+        pending = receipt.pending
+        permit = pending.permit
+        row = self._row(db, permit.operation_id)
+        mutation = self.mutation_locked(db, pending.mutation_id)
+        if (row is None or row[6] != "active" or row[10] != canonical_bytes(pending)
+                or self._permit(row) != permit or mutation is None
+                or mutation[:5] != (permit.operation_id, permit.namespace, subject,
+                                    pending.request_digest, "pending")
+                or mutation[6] != canonical_bytes(pending)
+                or mutation[9] != "deletion"
+                or mutation[10] != canonical_bytes(pending.evidence)
+                or mutation[11] is not None):
+            raise AuthorityUnavailable("deletion pending no longer owns fence")
+        kind, saved, prior, updated = self._decode_mutation_row(mutation)
+        if kind != "deletion" or saved != pending or prior is not None or updated is not None:
+            raise AuthorityUnavailable("deletion pending record differs")
+        updated = replace(permit, revision=receipt.updated_revision,
+                          pinned_anchor=receipt.after_anchor)
+        changed_fence = db.execute(
+            "UPDATE authority_v2_fences SET revision=?,permit=?,pending=NULL "
+            "WHERE operation_id=? AND state='active' AND revision=? AND pending=?",
+            (updated.revision, canonical_bytes(updated), permit.operation_id,
+             permit.revision, canonical_bytes(pending))).rowcount
+        changed_mutation = db.execute(
+            "UPDATE authority_v2_mutations SET state='committed',receipt=?,updated_permit=? "
+            "WHERE mutation_id=? AND state='pending' AND pending=? AND mutation_kind='deletion'",
+            (canonical_bytes(receipt), canonical_bytes(updated), pending.mutation_id,
+             canonical_bytes(pending))).rowcount
+        if (changed_fence, changed_mutation) != (1, 1):
+            raise AuthorityUnavailable("deletion result CAS failed")
+        return updated
+
     def finish_fence(self, permit: FencePermitV2, *, subject: str,
                      current_anchor: RestoreAnchor, request_id: str,
                      request_digest: str) -> None:

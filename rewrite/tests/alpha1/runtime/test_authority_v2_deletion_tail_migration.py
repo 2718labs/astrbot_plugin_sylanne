@@ -10,6 +10,9 @@ import pytest
 from sylanne3.authority_service.contract import AuthorityUnavailable, JournalHead
 from sylanne3.authority_service.core import AuthorityServiceCore
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
+from sylanne3.authority_service.v2_deletion_recovery_service import (
+    AuthorityV2DeletionPendingRecovery,
+)
 from sylanne3.authority_service.v2_contract import (
     DeletionEvidenceV1, DeletionMutationReceiptV1, DeletionPendingV1, canonical_bytes,
     deletion_scope_digest,
@@ -196,6 +199,114 @@ def _persist_fixture_pending(parts, pending):
                     canonical_bytes(pending.evidence)))
 
 
+def _recovery(parts):
+    return AuthorityV2DeletionPendingRecovery(
+        core=parts[0], fences=parts[1], deletion=parts[3],
+        execution=parts[4], namespace="ns-a")
+
+
+def test_original_pending_recovery_holds_without_append_then_commits_once(tmp_path):
+    parts = bundle(tmp_path, create=True, old_history=False)
+    try:
+        parts[5].run(credential="ok")
+        parts[6].run(credential="ok")
+        pending = _pending(parts)
+        _persist_fixture_pending(parts, pending)
+        recovery = _recovery(parts)
+        assert recovery.recover(credential="ok", subject="subject-a",
+                                mutation_id=pending.mutation_id) is None
+        assert parts[1].get_mutation(pending.mutation_id, subject="subject-a",
+                                     namespace="ns-a")[2] is None
+        with parts[0]._tx() as db:
+            before = parts[0]._anchor(db, "ns-a", parts[0]._row(db, "ns-a"))
+            assert before == pending.before_anchor
+        with pytest.raises(AuthorityUnavailable):
+            AuthorityV2FenceService(core=parts[0], fences=parts[1],
+                                    deletion=parts[3], execution=parts[4],
+                                    namespace="ns-a").current_anchor(
+                                        credential="ok", subject="subject-a")
+
+        parts[3].append_pending(pending, core=parts[0], fences=parts[1])
+        receipt = recovery.recover(credential="ok", subject="subject-a",
+                                   mutation_id=pending.mutation_id)
+        assert type(receipt) is DeletionMutationReceiptV1
+        assert receipt.pending == pending
+        assert receipt.after_anchor.deletion_seq == pending.expected_deletion_seq
+        assert receipt.after_anchor.deletion_digest == pending.expected_append_digest
+        assert receipt.after_anchor.revocation_epoch == before.revocation_epoch + 1
+        assert receipt.updated_revision == pending.permit.revision + 1
+        with parts[0]._tx() as db:
+            row = parts[0]._row(db, "ns-a")
+            assert row[9] == "pending"
+            assert parts[0]._anchor(db, "ns-a", row) == receipt.after_anchor
+        assert recovery.recover(credential="ok", subject="subject-a",
+                                mutation_id=pending.mutation_id) == receipt
+        with parts[3].freeze_writes():
+            assert parts[3].verified_head().seq == pending.expected_deletion_seq
+        kind, saved, stored, updated = parts[1].get_mutation(
+            pending.mutation_id, subject="subject-a", namespace="ns-a")
+        assert kind == "deletion" and saved == pending and stored == receipt
+        assert updated.pinned_anchor == receipt.after_anchor
+        with pytest.raises(AuthorityUnavailable):
+            AuthorityV2FenceService(core=parts[0], fences=parts[1],
+                                    deletion=parts[3], execution=parts[4],
+                                    namespace="ns-a").current_anchor(
+                                        credential="ok", subject="subject-a")
+    finally:
+        close(parts)
+
+
+def test_original_pending_recovery_after_restart_and_authority_rollback(
+        tmp_path, monkeypatch):
+    parts = bundle(tmp_path, create=True, old_history=False)
+    parts[5].run(credential="ok")
+    parts[6].run(credential="ok")
+    pending = _pending(parts)
+    _persist_fixture_pending(parts, pending)
+    parts[3].append_pending(pending, core=parts[0], fences=parts[1])
+    close(parts)
+
+    resumed = bundle(tmp_path)
+    try:
+        recovery = _recovery(resumed)
+        def fail_after_head_update(*args, **kwargs):
+            raise AuthorityUnavailable("injected Authority result write failure")
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(resumed[1], "finish_deletion_mutation_locked",
+                            fail_after_head_update)
+            with pytest.raises(AuthorityUnavailable, match="injected Authority"):
+                recovery.recover(credential="ok", subject="subject-a",
+                                 mutation_id=pending.mutation_id)
+        with resumed[0]._tx() as db:
+            row = resumed[0]._row(db, "ns-a")
+            assert row[9] == "clear"
+            assert resumed[0]._anchor(db, "ns-a", row) == pending.before_anchor
+        assert resumed[1].get_mutation(
+            pending.mutation_id, subject="subject-a", namespace="ns-a")[2] is None
+        with pytest.raises(AuthorityUnavailable):
+            recovery.recover(credential="bad", subject="subject-a",
+                             mutation_id=pending.mutation_id)
+        with pytest.raises(AuthorityUnavailable):
+            recovery.recover(credential="ok", subject="subject-b",
+                             mutation_id=pending.mutation_id)
+        receipt = recovery.recover(credential="ok", subject="subject-a",
+                                   mutation_id=pending.mutation_id)
+        assert receipt.after_anchor.deletion_digest == pending.expected_append_digest
+    finally:
+        close(resumed)
+
+    completed = bundle(tmp_path)
+    try:
+        assert _recovery(completed).recover(
+            credential="ok", subject="subject-a",
+            mutation_id=pending.mutation_id) == receipt
+        with completed[3].freeze_writes():
+            assert completed[3].verified_head().seq == 1
+    finally:
+        close(completed)
+
+
 def test_schema2_append_requires_persisted_exact_pending_and_retries(tmp_path):
     parts = bundle(tmp_path, create=True, old_history=False)
     parts[5].run(credential="ok")
@@ -350,6 +461,11 @@ def test_extra_valid_chain_entry_quarantines_pending_inspection(tmp_path):
         assert guard.verified_head().seq == 2
     with pytest.raises(AuthorityUnavailable, match="extra or mismatched"):
         guard.inspect_pending(pending, core=parts[0], fences=parts[1])
+    with pytest.raises(AuthorityUnavailable, match="extra or mismatched"):
+        _recovery(parts).recover(credential="ok", subject="subject-a",
+                                 mutation_id=pending.mutation_id)
+    with parts[0]._tx() as db:
+        assert parts[0]._anchor(db, "ns-a", parts[0]._row(db, "ns-a")) == pending.before_anchor
     close(parts)
 
 
