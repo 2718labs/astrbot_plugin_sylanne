@@ -70,7 +70,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], sce
       }) });
     });
   };
-  await import(`../../../../resources/workbench/src/app.js?test=${Date.now()}-${Math.random()}`);
+  await import(`../../../../webui-src/src/app.js?test=${Date.now()}-${Math.random()}`);
   async function nextRequest(index) {
     for (let attempt = 0; attempt < 10 && requests.length <= index; attempt++) await new Promise((resolve) => setImmediate(resolve));
     assert.ok(requests[index], `expected command request ${index}`);
@@ -437,5 +437,65 @@ test("D01 creation stays HOLD when installed catalogue resolution is unavailable
     await submitted;
     assert.match(ui.app.innerHTML, /角色初始化.*HOLD.*服务端未确认初始化/);
     assert.doesNotMatch(ui.app.innerHTML, /role_initialized/);
+  } finally { ui.restore(); }
+});
+
+test("creation page renders only the authorized D01 plan summary returned by read_character_view", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    const selected = ui.clickView("creation");
+    const request = await ui.nextRequest(1);
+    assert.equal(request.payload.action, "read_character_view");
+    assert.equal(request.payload.scope, "bot/persona");
+    assert.deepEqual(request.payload.input, { view_type: "creation", page_size: 50 });
+    request.resolve({ status: "ready", projection: {
+      view_type: "creation", namespace: { bot: "bot", persona: "persona" },
+      data: { candidates: [{ plan_id: "plan:<script>alert(1)</script>", version: 2,
+        authored: true, block_count: 3, value_rule_count: 1 }] },
+      snapshot_epoch: 7
+    } });
+    await selected;
+    assert.match(ui.app.innerHTML, /已授权角色方案/);
+    assert.match(ui.app.innerHTML, /plan:&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+    assert.match(ui.app.innerHTML, /版本 2 · 创作标记：是/);
+    assert.match(ui.app.innerHTML, /3 个设定块 · 1 条价值规则/);
+    assert.doesNotMatch(ui.app.innerHTML, /<script>alert\(1\)<\/script>/);
+    assert.doesNotMatch(ui.app.innerHTML, /已采用方案/);
+  } finally { ui.restore(); }
+});
+
+test("creation page keeps empty and malformed projections distinct and clears on Owner lock", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    const selected = ui.clickView("creation");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: {
+      view_type: "creation", data: { candidates: [] }
+    } });
+    await selected;
+    assert.match(ui.app.innerHTML, /没有已保存的角色方案/);
+    const refreshed = ui.clickCommand("refresh");
+    await ui.nextRequest(2);
+    ui.requests[2].resolve({ status: "ready", projection: {
+      view_type: "creation", data: { candidates: [{ plan_id: "unverified" }] }
+    } });
+    await refreshed;
+    assert.match(ui.app.innerHTML, /方案投影不可用/);
+    assert.doesNotMatch(ui.app.innerHTML, /<strong>unverified<\/strong>/);
+    const logout = ui.clickCommand("owner-logout");
+    await ui.nextRequest(3);
+    assert.doesNotMatch(ui.app.innerHTML, /已授权角色方案/);
+    ui.requests[3].resolve({ status: "ok", owner_session: "locked" });
+    await logout;
   } finally { ui.restore(); }
 });
