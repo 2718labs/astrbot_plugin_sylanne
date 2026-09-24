@@ -237,3 +237,40 @@ def test_authority_self_identity_allows_current_reregistration_after_revocation(
         request_operation_id="mapping-operation", permit=permit, port=CurrentPort(),
     )
     assert mapping.self_entity_ref == "entity:role-self"
+
+
+def test_authority_self_identity_projection_stable_across_current_permits():
+    role, activation, policy, grant, guard, permit, current = _admin_inputs()
+
+    class CurrentPort:
+        def __init__(self, receipt):
+            self.receipt = receipt
+
+        def current_self_identity(self, *, namespace, authority_namespace,
+                                  request_operation_id, permit):
+            assert (namespace, authority_namespace, request_operation_id, permit) == (
+                self.receipt.namespace, self.receipt.authority_namespace,
+                self.receipt.request_operation_id, self.receipt.permit,
+            )
+            return self.receipt
+
+    def qualify(receipt):
+        return qualify_authority_current_self_identity(
+            role=role, activation_atom=activation, policy=policy,
+            installation_grant=grant, owner_guard=guard,
+            request_operation_id=receipt.request_operation_id,
+            permit=receipt.permit, port=CurrentPort(receipt),
+        )
+
+    first = qualify(current)
+    next_permit = replace(permit, operation_id="fence-operation-2", token="y" * 32,
+                          revision=2)
+    next_request = replace(current, request_operation_id="mapping-operation-2",
+                           permit=next_permit)
+    assert canonical_digest(current) != canonical_digest(next_request)
+    assert qualify(next_request) == first
+
+    replacement = replace(next_request, mapping_revision=2,
+                          registration_operation_id="registration-operation-2",
+                          registration_digest="f" * 64)
+    assert qualify(replacement).certification_ref != first.certification_ref

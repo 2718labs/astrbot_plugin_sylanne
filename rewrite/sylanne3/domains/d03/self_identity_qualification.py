@@ -108,12 +108,27 @@ def qualify_authority_current_self_identity(
             or current.request_operation_id != request_operation_id
             or current.permit != permit):
         raise ValueError("Authority self identity differs from current role or fence")
-    digest = canonical_digest(current)
+    # A current receipt includes the request operation and opaque fence token.
+    # Those prove this use, but are not part of the durable graph projection.
+    certification_digest = canonical_digest({
+        "authority_id": current.authority_id,
+        "authority_namespace": current.authority_namespace,
+        "namespace": current.namespace.as_tuple,
+        "installation_id": current.installation_id,
+        "manifest_digest": current.manifest_digest,
+        "mapping_id": current.mapping_id,
+        "mapping_revision": current.mapping_revision,
+        "mapping_revocation_epoch": current.mapping_revocation_epoch,
+        "registration_operation_id": current.registration_operation_id,
+        "registration_digest": current.registration_digest,
+        "persona_ref": current.persona_ref,
+        "self_entity_ref": current.self_entity_ref,
+    })
     return SelfIdentityMapping(
         current.mapping_id,
         current.persona_ref,
         current.self_entity_ref,
-        "authority:self-identity:" + digest,
+        "authority:self-identity:" + certification_digest,
         current.role_head_id,
         current.graph_incarnation,
         "active",
