@@ -100,6 +100,7 @@ class RecollectionReconstruction:
     status: str = "candidate_hold"
     encoding_trace_ref: str | None = None
     then_feeling_refs: tuple[str, ...] = ()
+    then_feeling_versions: tuple[GraphVersion, ...] = ()
     then_feeling_status: str = "not_read"
 
 

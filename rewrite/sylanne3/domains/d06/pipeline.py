@@ -202,7 +202,7 @@ class PreparedAssociation:
 
 @dataclass(frozen=True)
 class CommittedEncodingEvidence:
-    """Committed C02 references; these do not define an affective baseline."""
+    """C02 references; historical revisions are baseline identity, not current CAS."""
 
     source_ref: str
     episode_ref: str
@@ -301,17 +301,12 @@ class D06MemoryPipeline:
         current = self.repository.store.graph_snapshot(tuple(dict.fromkeys(
             (*[version.key for proof in source_proofs for version in proof.versions],
              trace_key, episode_ref,
-             *((baseline_key,) if baseline_key is not None else ()),
-             *(version.key for version in then_feeling_versions))
+             *((baseline_key,) if baseline_key is not None else ()))
         )))
         if (current.epochs != source_proof.epochs or
                 current.get(trace_key) != trace or current.get(episode_ref) != episode or
                 (baseline_key is not None and
                  current.get(baseline_key) != baseline_snapshot.get(baseline_key)) or
-                any(current.get(version.key) is None or
-                    not current.get(version.key).valid or
-                    current.get(version.key).revision != version.revision
-                    for version in then_feeling_versions) or
                 any(current.get(version.key) is None or
                     current.get(version.key).revision != version.revision or
                     not current.get(version.key).valid
@@ -326,8 +321,7 @@ class D06MemoryPipeline:
             tuple(dict.fromkeys((*(version for proof in source_proofs for version in proof.versions),
                                   *episode_snapshot.versions,
                                   *trace_snapshot.versions,
-                                  *(baseline_snapshot.versions if baseline_snapshot is not None else ()),
-                                  *then_feeling_versions))),
+                                  *(baseline_snapshot.versions if baseline_snapshot is not None else ())))),
             source_proof.epochs[0],
         )
 
@@ -360,6 +354,8 @@ class D06MemoryPipeline:
         A versioned C02 trace can identify the then-feeling references, but
         caller-supplied base intervals remain unqualified projection inputs.
         This method never turns them into a D04-certified encoding baseline.
+        The immutable baseline identifies historical feeling revisions; this
+        candidate does not claim the corresponding history rows remain available.
         """
         if outcome.status != "candidate" or outcome.candidates is None or outcome.epoch is None:
             raise ValueError("a qualified D06 retrieval outcome is required")
@@ -419,7 +415,8 @@ class D06MemoryPipeline:
             result = replace(
                 result, encoding_trace_ref=encoding.trace_ref,
                 then_feeling_refs=encoding.then_feeling_refs,
-                then_feeling_status="baseline_versioned_refs",
+                then_feeling_versions=encoding.then_feeling_versions,
+                then_feeling_status="baseline_ref_history_unverified",
                 read_versions=tuple(dict.fromkeys((
                     *result.read_versions, *encoding.proof_versions,
                 ))),

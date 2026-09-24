@@ -141,10 +141,12 @@ class AffectivePipelineTests(unittest.TestCase):
         self.assertEqual(warm.source_fields, guarded.source_fields)
         self.assertEqual(warm.then_feeling_refs, (feeling.token,))
         self.assertEqual(warm.then_feeling_refs, guarded.then_feeling_refs)
-        self.assertEqual(warm.then_feeling_status, "baseline_versioned_refs")
+        self.assertEqual(warm.then_feeling_status, "baseline_ref_history_unverified")
+        self.assertEqual(warm.then_feeling_versions, guarded.then_feeling_versions)
+        self.assertEqual(warm.then_feeling_versions[0].revision, 1)
         self.assertEqual(warm.encoding_trace_ref, trace.token)
         self.assertNotEqual(warm.subjective_tone, guarded.subjective_tone)
-        self.assertIn(feeling, (version.key for version in warm.read_versions))
+        self.assertNotIn(feeling, (version.key for version in warm.read_versions))
         self.assertIn(trace, (version.key for version in guarded.read_versions))
         self.assertNotEqual(
             next(version.revision for version in warm.read_versions if version.key == self.mood_key),
@@ -157,8 +159,18 @@ class AffectivePipelineTests(unittest.TestCase):
                 **current.get(feeling).value, "cursor": 3.0, "revision": 2,
             }),), current.epochs,
         ))
-        with self.assertRaisesRegex(RuntimeError, "encoding source, access, or trace changed"):
-            self.prepare(self.mood(0.2, "after-feeling-update"), encoding_trace_id="trace-then")
+        later = self.prepare(self.mood(0.2, "after-feeling-update"),
+                             encoding_trace_id="trace-then")
+        self.assertEqual(later.source_fields, warm.source_fields)
+        self.assertEqual(later.then_feeling_versions[0].revision, 1)
+        self.assertEqual(self.store.graph_snapshot((feeling,)).get(feeling).revision, 2)
+        before_withdrawal = self.store.graph_snapshot((self.mood_key,))
+        self.repository.set_access(
+            Event(self.scope, "withdraw-then", 4, "withdraw", {}), "message-1",
+            audiences=("owner",), purposes=("context",), status="withdrawn", recorded_at=4,
+        )
+        with self.assertRaisesRegex(PermissionError, "source is unavailable"):
+            self.prepare(before_withdrawal, encoding_trace_id="trace-then")
 
     def test_withdrawal_and_stale_mood_stop_preparation(self):
         old_mood = self.mood(0.8, "warm")
