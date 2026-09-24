@@ -25,6 +25,142 @@ from rewrite.sylanne3.native_runtime.loader import CANONICAL_LIBRARIES, _runtime
 from rewrite.tools.build_plugin_package import build_package, verify_package  # noqa: E402
 
 
+_COLD_NONLINEAR_PROBE = '''\
+def probe_nonlinear(library, binding):
+    from dataclasses import fields, replace
+    from decimal import Decimal, localcontext
+    from rewrite.sylanne3.native_runtime import FixedBlockCSR, FixedBlockStep, run_fixed_block_math
+
+    k = FixedBlockCSR(2, 2, (0, 2, 4), (0, 1, 0, 1), (2.0, 1.0, 1.0, 2.0))
+    r = FixedBlockCSR(2, 2, (0, 2, 4), (0, 1, 0, 1), (1.5, 0.25, 0.25, 1.25))
+    j = FixedBlockCSR(2, 2, (0, 1, 2), (1, 0), (0.2, -0.2))
+    a = FixedBlockCSR(1, 2, (0, 2), (0, 1), (0.5, -0.25))
+    block = FixedBlockStep(k, r, j, a, (0.2,), (0.2, -0.1),
+                           (0.01, -0.02), (0.2, -0.1), 0.02, 0.0, 30, 1e-3)
+    transcript = run_fixed_block_math(library, block)
+    bounds = transcript.bounds
+    assert bounds.status == 0 and bounds.certificate_flags == 1
+    assert bounds.boundary_eta == 0.0 and bounds.q_upper <= 0.8
+    assert bounds.iteration_error <= block.tolerance
+    assert transcript.production_binding == binding
+    assert transcript.input_sha256 == block.digest()
+
+    with localcontext() as context:
+        context.prec = 80
+        d = Decimal.from_float
+        x = tuple(map(d, block.previous))
+        drive = tuple(map(d, block.drive))
+        step = d(block.h)
+        alpha = d(block.alpha[0])
+        a0, a1 = tuple(map(d, block.a.values))
+        r00, r01, r10, r11 = tuple(map(d, block.r.values))
+        j01, j10 = tuple(map(d, block.j.values))
+
+        def tanh(value):
+            doubled = (2 * value).exp()
+            return (doubled - 1) / (doubled + 1)
+
+        def log_cosh(value):
+            return ((value.exp() + (-value).exp()) / 2).ln()
+
+        def force(gradient):
+            g0, g1 = gradient
+            return (-r00 * g0 + (j01 - r01) * g1 + drive[0],
+                    (j10 - r10) * g0 - r11 * g1 + drive[1])
+
+        ax = a0 * x[0] + a1 * x[1]
+        def avf_force(y):
+            ay = a0 * y[0] + a1 * y[1]
+            mean_tanh = ((log_cosh(ay) - log_cosh(ax)) / (ay - ax)
+                         if ay != ax else tanh(ax))
+            midpoint = ((x[0] + y[0]) / 2, (x[1] + y[1]) / 2)
+            return force((2 * midpoint[0] + midpoint[1] + alpha * a0 * mean_tanh,
+                          midpoint[0] + 2 * midpoint[1] + alpha * a1 * mean_tanh))
+
+        reference = x
+        for _ in range(100):
+            flow = avf_force(reference)
+            next_reference = (x[0] + step * flow[0], x[1] + step * flow[1])
+            if max(abs(left - right) for left, right in zip(next_reference, reference)) < Decimal('1e-60'):
+                reference = next_reference
+                break
+            reference = next_reference
+        else:
+            raise AssertionError('nonlinear Decimal AVF reference did not converge')
+
+        def distance(left, right):
+            return sum((a - b) ** 2 for a, b in zip(left, right)).sqrt()
+
+        output = tuple(map(d, transcript.output))
+        endpoint_distance = distance(output, reference)
+        assert endpoint_distance <= d(bounds.iteration_error)
+
+        def continuous_force(state):
+            argument = a0 * state[0] + a1 * state[1]
+            nonlinear = alpha * tanh(argument)
+            return force((2 * state[0] + state[1] + a0 * nonlinear,
+                          state[0] + 2 * state[1] + a1 * nonlinear))
+
+        def rk4(steps):
+            dt = step / steps
+            state = x
+            samples = [state]
+            for _ in range(steps):
+                one = continuous_force(state)
+                two = continuous_force(tuple(state[i] + dt * one[i] / 2 for i in range(2)))
+                three = continuous_force(tuple(state[i] + dt * two[i] / 2 for i in range(2)))
+                four = continuous_force(tuple(state[i] + dt * three[i] for i in range(2)))
+                state = tuple(state[i] + dt * (one[i] + 2 * two[i] + 2 * three[i] + four[i]) / 6
+                              for i in range(2))
+                samples.append(state)
+            return samples
+
+        coarse, fine = rk4(128), rk4(256)
+        oracle_gap = max(distance(state, fine[2 * index])
+                         for index, state in enumerate(coarse))
+        assert oracle_gap < Decimal('1e-12')
+        path_distance = max(
+            distance(tuple(x[i] + Decimal(index) / 256 * (output[i] - x[i]) for i in range(2)), state)
+            for index, state in enumerate(fine)
+        )
+        assert path_distance + oracle_gap <= d(bounds.trajectory_error)
+
+        # A certificate for a different alpha cannot prove this block's result.
+        altered = run_fixed_block_math(library, replace(block, alpha=(0.0,)))
+        altered_distance = distance(tuple(map(d, altered.output)), reference)
+        assert altered.input_sha256 != transcript.input_sha256
+        assert altered_distance > d(altered.bounds.iteration_error)
+
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
+                                  allow_nan=False).encode('utf-8')).hexdigest()
+
+    assert transcript.output_sha256 == digest(transcript.output)
+    assert transcript.transcript_sha256 == digest({
+        'schema': 'abi2.fixed-block-math-transcript.v1',
+        'input_sha256': transcript.input_sha256,
+        'output_sha256': transcript.output_sha256,
+        'manifest_sha256': binding.manifest_sha256,
+        'native_sha256': binding.native_sha256,
+        'bounds': {field.name: getattr(bounds, field.name) for field in fields(bounds)},
+    })
+    return {
+        'scope': 'one_complete_nonlinear_coupled_2x2_block',
+        'certificate_flags': bounds.certificate_flags,
+        'input_sha256': transcript.input_sha256,
+        'output_sha256': transcript.output_sha256,
+        'transcript_sha256': transcript.transcript_sha256,
+        'endpoint_error_upper': bounds.iteration_error,
+        'reference_endpoint_distance': str(endpoint_distance),
+        'trajectory_error_upper': bounds.trajectory_error,
+        'path_samples': len(fine),
+        'max_sampled_path_distance': str(path_distance),
+        'reference_resolution_gap': str(oracle_gap),
+        'altered_alpha_distance_outside_its_bound': str(altered_distance),
+    }
+'''
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cold-load a current-platform non-release ZIP")
     parser.add_argument(
@@ -146,7 +282,9 @@ def main() -> None:
                 "assert coupled_transcript.transcript_sha256 == digest({'schema': 'abi2.fixed-block-math-transcript.v1', 'input_sha256': coupled_transcript.input_sha256, 'output_sha256': coupled_transcript.output_sha256, 'manifest_sha256': binding.manifest_sha256, 'native_sha256': binding.native_sha256, 'bounds': {field.name: getattr(coupled_bounds, field.name) for field in fields(coupled_bounds)}})",
                 "math_receipt = {'scope': 'one_complete_fixed_scalar_block', 'certificate_flags': bounds.certificate_flags, 'input_sha256': transcript.input_sha256, 'output_sha256': transcript.output_sha256, 'transcript_sha256': transcript.transcript_sha256, 'endpoint_error_upper': bounds.iteration_error}",
                 "coupled_receipt = {'scope': 'one_complete_coupled_2x2_linear_block', 'certificate_flags': coupled_bounds.certificate_flags, 'input_sha256': coupled_transcript.input_sha256, 'output_sha256': coupled_transcript.output_sha256, 'transcript_sha256': coupled_transcript.transcript_sha256, 'endpoint_error_upper': coupled_bounds.iteration_error, 'reference_endpoint_distance': str(endpoint_distance), 'trajectory_error_upper': coupled_bounds.trajectory_error, 'reference_trajectory_distance': trajectory_distance}",
-                "print(json.dumps({'abi_version': capabilities.abi_version, 'max_dimension': capabilities.max_dimension, 'fixed_block_interval_math_v1': capabilities.supports_fixed_block_interval_math_v1, 'numerically_certified': capabilities.numerically_certified, 'diagnostic_only': capabilities.diagnostic_only, 'binding': expected, 'fixed_block_math': math_receipt, 'coupled_fixed_block_math': coupled_receipt}))",
+                _COLD_NONLINEAR_PROBE,
+                "nonlinear_receipt = probe_nonlinear(library, binding)",
+                "print(json.dumps({'abi_version': capabilities.abi_version, 'max_dimension': capabilities.max_dimension, 'fixed_block_interval_math_v1': capabilities.supports_fixed_block_interval_math_v1, 'numerically_certified': capabilities.numerically_certified, 'diagnostic_only': capabilities.diagnostic_only, 'binding': expected, 'fixed_block_math': math_receipt, 'coupled_fixed_block_math': coupled_receipt, 'nonlinear_fixed_block_math': nonlinear_receipt}))",
             )
         )
         cold_env = {

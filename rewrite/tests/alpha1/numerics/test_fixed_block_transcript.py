@@ -46,6 +46,17 @@ def _block() -> FixedBlockStep:
     return block
 
 
+def _nonlinear_block() -> FixedBlockStep:
+    return FixedBlockStep(
+        FixedBlockCSR(2, 2, (0, 2, 4), (0, 1, 0, 1), (2.0, 1.0, 1.0, 2.0)),
+        FixedBlockCSR(2, 2, (0, 2, 4), (0, 1, 0, 1), (1.5, 0.25, 0.25, 1.25)),
+        FixedBlockCSR(2, 2, (0, 1, 2), (1, 0), (0.2, -0.2)),
+        FixedBlockCSR(1, 2, (0, 2), (0, 1), (0.5, -0.25)),
+        (0.2,), (0.2, -0.1), (0.01, -0.02), (0.2, -0.1),
+        0.02, 0.0, 30, 1e-3,
+    )
+
+
 def _scheme() -> AffectScheme:
     return AffectScheme(
         "d04.affect.scheme.v1", "scheme:test:1", "operator:test:1",
@@ -222,6 +233,29 @@ class FixedBlockTranscriptTests(unittest.TestCase):
         self.assertNotEqual(transcript.input_sha256, replace(block, previous_error=2e-4).digest())
         with self.assertRaises(FrozenInstanceError):
             transcript.output = (0.0, 0.0)
+
+    def test_nonlinear_certificate_is_scoped_to_the_exact_complete_block(self) -> None:
+        block = _nonlinear_block()
+        self.assertNotEqual(block.a.values, ())
+        self.assertGreater(block.alpha[0], 0)
+        self.assertNotEqual(block.j.values, ())
+        original = run_fixed_block_math(self.handle, block)
+        self.assertEqual(original.bounds.certificate_flags, 1)
+        self.assertEqual(original.input_sha256, block.digest())
+
+        # A second valid certificate binds a different model, not the original.
+        altered = run_fixed_block_math(self.handle, replace(block, alpha=(0.0,)))
+        self.assertEqual(altered.bounds.certificate_flags, 1)
+        self.assertNotEqual(altered.input_sha256, original.input_sha256)
+        self.assertGreater(
+            math.dist(altered.output, original.output),
+            altered.bounds.iteration_error + original.bounds.iteration_error,
+        )
+
+        # Diagnostic convergence beyond the verified tanh domain is not a certificate.
+        outside = replace(block, previous=(10.0, 0.0), iterate=(10.0, 0.0))
+        with self.assertRaisesRegex(ABI2ResultError, "unsupported native certificate flags"):
+            run_fixed_block_math(self.handle, outside)
 
     def test_24d_engineering_candidate_interval_contains_independent_reference(self) -> None:
         candidate = build_d04_engineering_candidate()
