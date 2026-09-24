@@ -17,6 +17,7 @@ from .fixed_block_transcript import (
     _digest,
     _same_fixed_model,
     _same_float_bits,
+    run_fixed_block_math,
 )
 from .loader import ABI2NativeLibrary, NativeLoadBinding
 
@@ -53,8 +54,22 @@ def _outward_binary64(value: Fraction, *, lower: bool) -> float:
     return rounded
 
 
+def _same_bounds_bits(left: object, right: object) -> bool:
+    for field in fields(left):
+        before = getattr(left, field.name)
+        after = getattr(right, field.name)
+        if isinstance(before, float):
+            if not _same_float_bits((before,), (after,)):
+                return False
+        elif before != after:
+            return False
+    return True
+
+
 def _require_consistent_trajectory(
-    trajectory: FixedBlockTrajectoryMathTranscript, binding: NativeLoadBinding,
+    handle: ABI2NativeLibrary,
+    trajectory: FixedBlockTrajectoryMathTranscript,
+    binding: NativeLoadBinding,
 ) -> None:
     steps = trajectory.steps
     if not steps or trajectory.production_binding != binding:
@@ -86,6 +101,13 @@ def _require_consistent_trajectory(
             or not _same_fixed_model(steps[0].input, FixedBlockContinuation.from_step(step.input))
         ):
             raise ABI2ResultError("linear readout trajectory chain is inconsistent")
+        # A digest only checks record consistency. Replaying the exact input
+        # against the verified native package checks that its claimed output
+        # and interval bounds were actually issued by ABI2 in this process.
+        native = run_fixed_block_math(handle, step.input)
+        if (not _same_float_bits(native.output, step.output)
+                or not _same_bounds_bits(native.bounds, step.bounds)):
+            raise ABI2ResultError("linear readout native replay mismatch")
     if trajectory.transcript_sha256 != _digest({
         "schema": "abi2.fixed-block-trajectory-math-transcript.v1",
         "initial_error": trajectory.initial_error,
@@ -114,7 +136,7 @@ def run_fixed_block_linear_readout_math(
     if not isinstance(trajectory, FixedBlockTrajectoryMathTranscript):
         raise TypeError("linear readout requires a fixed-block trajectory transcript")
     binding = handle.production_binding
-    _require_consistent_trajectory(trajectory, binding)
+    _require_consistent_trajectory(handle, trajectory, binding)
     final = trajectory.steps[-1]
     try:
         weights = tuple(float(value) for value in coefficients)

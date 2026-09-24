@@ -93,6 +93,82 @@ pub extern "C" fn sylanne3_v2_max_dimension() -> u32 {
     MAX_N as u32
 }
 
+/// Derive an outward Euclidean error bound from a complete initial-state box.
+/// The box's external source is a caller premise, not authenticated by ABI2.
+/// The nominal state must lie inside every coordinate interval. Output is
+/// untouched on rejection and this function grants no product capability.
+///
+/// # Safety
+/// Input pointers must address aligned, live arrays of `n` f64 values.
+/// `output` must address one aligned writable f64 disjoint from all inputs.
+#[no_mangle]
+pub unsafe extern "C" fn sylanne3_v2_verify_initial_box(
+    n: u32,
+    nominal: *const f64,
+    lower: *const f64,
+    upper: *const f64,
+    output: *mut f64,
+    output_len: u32,
+) -> i32 {
+    let count = n as usize;
+    if count == 0
+        || count > MAX_N
+        || output_len != 1
+        || nominal.is_null()
+        || lower.is_null()
+        || upper.is_null()
+        || output.is_null()
+        || [nominal, lower, upper, output as *const f64]
+            .iter()
+            .any(|pointer| (*pointer as usize) % std::mem::align_of::<f64>() != 0)
+    {
+        return -1;
+    }
+    let nominal = slice::from_raw_parts(nominal, count);
+    let lower = slice::from_raw_parts(lower, count);
+    let upper = slice::from_raw_parts(upper, count);
+    let mut squared = match Interval::point(0.0) {
+        Ok(value) => value,
+        Err(_) => return -2,
+    };
+    for index in 0..count {
+        let (center, lo, hi) = (nominal[index], lower[index], upper[index]);
+        if !center.is_finite()
+            || !lo.is_finite()
+            || !hi.is_finite()
+            || lo < -1.0e6
+            || hi > 1.0e6
+            || lo > center
+            || center > hi
+        {
+            return -1;
+        }
+        let term = Interval::new(lo, hi)
+            .and_then(|box_coordinate| box_coordinate.sub(Interval::point(center)?))
+            .and_then(|difference| difference.mul(difference));
+        let Ok(term) = term else {
+            return -2;
+        };
+        let next =
+            Interval::new(0.0, term.upper()).and_then(|nonnegative| squared.add(nonnegative));
+        let Ok(next) = next else {
+            return -2;
+        };
+        squared = match Interval::new(next.lower().max(0.0), next.upper()) {
+            Ok(value) => value,
+            Err(_) => return -2,
+        };
+    }
+    let Ok(radius) = squared.sqrt() else {
+        return -2;
+    };
+    if !radius.upper().is_finite() {
+        return -2;
+    }
+    *output = radius.upper();
+    0
+}
+
 struct Matrix<'a> {
     rows: usize,
     offsets: &'a [u32],
@@ -1562,5 +1638,58 @@ mod tests {
             values: values.as_ptr(),
         };
         assert!(unsafe { read_matrix(&malformed, 1, 1) }.is_none());
+    }
+
+    #[test]
+    fn initial_box_radius_encloses_corners_and_rejects_uncovered_nominal() {
+        let nominal = [0.0, 0.0];
+        let lower = [-3.0, -4.0];
+        let upper = [3.0, 4.0];
+        let mut radius = [99.0];
+        assert_eq!(
+            unsafe {
+                sylanne3_v2_verify_initial_box(
+                    2,
+                    nominal.as_ptr(),
+                    lower.as_ptr(),
+                    upper.as_ptr(),
+                    radius.as_mut_ptr(),
+                    1,
+                )
+            },
+            0
+        );
+        assert!(radius[0] >= 5.0 && radius[0] < 5.0 + 1e-12);
+        let saved = radius;
+        let outside = [3.1, 0.0];
+        assert_eq!(
+            unsafe {
+                sylanne3_v2_verify_initial_box(
+                    2,
+                    outside.as_ptr(),
+                    lower.as_ptr(),
+                    upper.as_ptr(),
+                    radius.as_mut_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(radius, saved);
+        let nonfinite = [f64::NAN, 0.0];
+        assert_eq!(
+            unsafe {
+                sylanne3_v2_verify_initial_box(
+                    2,
+                    nominal.as_ptr(),
+                    nonfinite.as_ptr(),
+                    upper.as_ptr(),
+                    radius.as_mut_ptr(),
+                    1,
+                )
+            },
+            -1
+        );
+        assert_eq!(radius, saved);
     }
 }

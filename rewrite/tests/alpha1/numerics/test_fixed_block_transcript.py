@@ -28,6 +28,8 @@ from sylanne3.native_runtime import (
     run_d04_fixed_block_candidate,
     run_fixed_block_math,
     run_fixed_block_linear_readout_math,
+    run_fixed_block_box_trajectory_math,
+    run_fixed_block_box_linear_readout_math,
     run_fixed_block_trajectory_math,
 )
 from sylanne3.domains.d04 import AffectAxis, AffectScheme
@@ -292,6 +294,37 @@ class FixedBlockTranscriptTests(unittest.TestCase):
                 (1.0, -1.0),
             )
 
+        # Hashes are not native provenance: even a fully rehashed false bound
+        # must fail when the exact step is replayed against the package.
+        last = trajectory.steps[-1]
+        false_bounds = replace(last.bounds, trajectory_error=0.0)
+        def digest(value: object) -> str:
+            return hashlib.sha256(json.dumps(
+                value, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ).encode()).hexdigest()
+        false_step_hash = digest({
+            "schema": "abi2.fixed-block-math-transcript.v1",
+            "input_sha256": last.input_sha256,
+            "output_sha256": last.output_sha256,
+            "manifest_sha256": last.production_binding.manifest_sha256,
+            "native_sha256": last.production_binding.native_sha256,
+            "bounds": {field.name: getattr(false_bounds, field.name) for field in fields(false_bounds)},
+        })
+        false_last = replace(last, bounds=false_bounds, transcript_sha256=false_step_hash)
+        false_steps = trajectory.steps[:-1] + (false_last,)
+        false_trajectory_hash = digest({
+            "schema": "abi2.fixed-block-trajectory-math-transcript.v1",
+            "initial_error": trajectory.initial_error,
+            "final_error": 0.0,
+            "production_binding": {field.name: getattr(trajectory.production_binding, field.name)
+                                   for field in fields(trajectory.production_binding)},
+            "steps": [step.transcript_sha256 for step in false_steps],
+        })
+        forged = replace(trajectory, steps=false_steps, final_error=0.0,
+                         transcript_sha256=false_trajectory_hash)
+        with self.assertRaisesRegex(ABI2ResultError, "native replay mismatch"):
+            run_fixed_block_linear_readout_math(self.handle, forged, (1.0, -1.0))
+
     def test_24d_linear_readout_encloses_binary64_point_and_rejects_nonfinite(self) -> None:
         operator = build_d04_engineering_candidate()
         state = (0.5, 0.25, 0.125) + (0.0,) * 21
@@ -320,6 +353,104 @@ class FixedBlockTranscriptTests(unittest.TestCase):
         beyond_finite = Fraction.from_float(float.fromhex("0x1.fffffffffffffp+1023")) + 1
         with self.assertRaisesRegex(ABI2ResultError, "exceeds finite binary64"):
             _outward_binary64(beyond_finite, lower=False)
+
+    def test_native_initial_box_derives_inherited_error_for_exact_continuous_flow(self) -> None:
+        first = replace(_block(), previous_error=0.0)
+        lower = (0.3999, -0.2002)
+        upper = (0.4003, -0.1999)
+        self.assertTrue(self.handle.capabilities.supports_initial_box_math_v1)
+        boxed = run_fixed_block_box_trajectory_math(
+            self.handle, first,
+            (FixedBlockContinuation.from_step(first, h=0.05),
+             FixedBlockContinuation.from_step(first, h=0.08)),
+            lower=lower, upper=upper,
+        )
+        radius = Fraction.from_float(boxed.verified_initial_error)
+        actual_initial = (upper[0], lower[1])
+        exact_squared = sum((
+            (Fraction.from_float(actual) - Fraction.from_float(nominal)) ** 2
+            for actual, nominal in zip(actual_initial, first.previous)
+        ), Fraction())
+        self.assertGreaterEqual(radius * radius, exact_squared)
+        self.assertEqual(boxed.trajectory.initial_error, boxed.verified_initial_error)
+        self.assertEqual(boxed.trajectory.steps[0].input.previous_error, boxed.verified_initial_error)
+        self.assertEqual(boxed.production_binding, self.handle.production_binding)
+
+        elapsed = 0.0
+        for transcript in boxed.trajectory.steps:
+            elapsed += transcript.input.h
+            decay, cosine, sine = math.exp(-2 * elapsed), math.cos(0.4 * elapsed), math.sin(0.4 * elapsed)
+            exact = (
+                decay * (cosine * actual_initial[0] + sine * actual_initial[1]),
+                decay * (-sine * actual_initial[0] + cosine * actual_initial[1]),
+            )
+            self.assertLessEqual(math.dist(transcript.output, exact), transcript.bounds.trajectory_error)
+        readout = run_fixed_block_box_linear_readout_math(
+            self.handle, boxed, (1.0, -1.0),
+        )
+        self.assertLessEqual(readout.readout.lower, exact[0] - exact[1])
+        self.assertGreaterEqual(readout.readout.upper, exact[0] - exact[1])
+        self.assertEqual(readout.box_trajectory.transcript_sha256, boxed.transcript_sha256)
+
+        # Rehashing a false zero-radius box cannot replace the native radius.
+        def digest(value: object) -> str:
+            return hashlib.sha256(json.dumps(
+                value, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ).encode()).hexdigest()
+        binding_fields = {field.name: getattr(boxed.production_binding, field.name)
+                          for field in fields(boxed.production_binding)}
+        false_box_hash = digest({
+            "schema": "abi2.initial-box-math.v1",
+            "nominal": first.previous,
+            "lower": lower,
+            "upper": upper,
+            "verified_error": 0.0,
+            "production_binding": binding_fields,
+        })
+        false_chain_hash = digest({
+            "schema": "abi2.box-trajectory-math.v1",
+            "initial_box_sha256": false_box_hash,
+            "trajectory_sha256": boxed.trajectory.transcript_sha256,
+            "production_binding": binding_fields,
+        })
+        forged = replace(boxed, verified_initial_error=0.0,
+                         initial_box_sha256=false_box_hash, transcript_sha256=false_chain_hash)
+        with self.assertRaisesRegex(ABI2ResultError, "native radius"):
+            run_fixed_block_box_linear_readout_math(self.handle, forged, (1.0, -1.0))
+        changed = run_fixed_block_box_trajectory_math(
+            self.handle, first, (FixedBlockContinuation.from_step(first, h=0.05),),
+            lower=lower, upper=(0.4004, upper[1]),
+        )
+        self.assertNotEqual(boxed.initial_box_sha256, changed.initial_box_sha256)
+        self.assertNotEqual(boxed.transcript_sha256, changed.transcript_sha256)
+
+    def test_initial_box_rejects_uncovered_nominal_and_supplied_error(self) -> None:
+        first = replace(_block(), previous_error=0.0)
+        continuation = (FixedBlockContinuation.from_step(first),)
+        with self.assertRaisesRegex(ABI2ResultError, "verification failed"):
+            run_fixed_block_box_trajectory_math(
+                self.handle, first, continuation,
+                lower=(0.41, -0.21), upper=(0.42, -0.19),
+            )
+        with self.assertRaisesRegex(ValueError, "derive, not supply"):
+            run_fixed_block_box_trajectory_math(
+                self.handle, replace(first, previous_error=0.001), continuation,
+                lower=(0.39, -0.21), upper=(0.41, -0.19),
+            )
+
+        operator = build_d04_engineering_candidate()
+        state = (0.5, 0.25, 0.125) + (0.0,) * 21
+        block = FixedBlockStep(
+            operator.k, operator.r, operator.j, operator.a, operator.alpha,
+            state, (0.0, 0.0625, 0.0) + (0.0,) * 21,
+            state, 1.0 / 256.0, 0.0, 64, 1e-5,
+        )
+        boxed = run_fixed_block_box_trajectory_math(
+            self.handle, block, (FixedBlockContinuation.from_step(block),),
+            lower=state, upper=tuple(value + 1e-6 for value in state),
+        )
+        self.assertEqual(len(boxed.trajectory.steps[-1].output), 24)
+        self.assertGreater(boxed.verified_initial_error, 0)
 
     def test_real_package_bound_step_retains_actual_values_and_hashes(self) -> None:
         block = _block()

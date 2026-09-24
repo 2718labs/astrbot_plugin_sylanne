@@ -53,6 +53,7 @@ class NativeCapabilities:
     supports_cancellation: bool = False
     diagnostic_only: bool = True
     supports_fixed_block_interval_math_v1: bool = False
+    supports_initial_box_math_v1: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +91,17 @@ class ABI2NativeLibrary:
             ctypes.POINTER(ABI2StepResult),
         ]
         step.restype = ctypes.c_int32
+        initial_box = getattr(library, "sylanne3_v2_verify_initial_box", None)
+        if initial_box is not None:
+            initial_box.argtypes = [
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.c_uint32,
+            ]
+            initial_box.restype = ctypes.c_int32
         abi = int(version())
         max_dimension = int(maximum())
         math_flags = int(math_capabilities())
@@ -101,9 +113,11 @@ class ABI2NativeLibrary:
             raise NativeIntegrityError("native reports unsupported ABI2 math capabilities")
         self._library = library
         self._step = step
+        self._initial_box = initial_box
         self.capabilities = NativeCapabilities(
             abi, max_dimension,
             supports_fixed_block_interval_math_v1=bool(math_flags & ABI2_FIXED_BLOCK_INTERVAL_V1),
+            supports_initial_box_math_v1=initial_box is not None,
         )
         self._production_binding: NativeLoadBinding | None = None
 

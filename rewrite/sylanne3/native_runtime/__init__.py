@@ -37,6 +37,12 @@ from .linear_readout import (
     FixedBlockLinearReadoutMathTranscript,
     run_fixed_block_linear_readout_math,
 )
+from .initial_box_trajectory import (
+    FixedBlockBoxLinearReadoutMathTranscript,
+    FixedBlockBoxTrajectoryMathTranscript,
+    run_fixed_block_box_linear_readout_math,
+    run_fixed_block_box_trajectory_math,
+)
 from .d04_candidate import (
     D04CandidateError,
     D04FixedBlockCandidate,
@@ -75,6 +81,10 @@ __all__ = [
     "run_fixed_block_trajectory_math",
     "FixedBlockLinearReadoutMathTranscript",
     "run_fixed_block_linear_readout_math",
+    "FixedBlockBoxTrajectoryMathTranscript",
+    "run_fixed_block_box_trajectory_math",
+    "FixedBlockBoxLinearReadoutMathTranscript",
+    "run_fixed_block_box_linear_readout_math",
     "D04CandidateError",
     "D04FixedBlockCandidate",
     "D04ProductionReadoutUnavailable",
