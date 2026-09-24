@@ -49,12 +49,15 @@ class Manager:
         self.seen_umo = []
         self.on_selection = None
 
-    async def get_using_provider_async(self, *, provider_type, umo):
+    def get_using_provider(self, *, provider_type, umo):
         assert provider_type is ProviderType.CHAT_COMPLETION
         self.seen_umo.append(umo)
         if self.on_selection is not None:
             self.on_selection(len(self.seen_umo))
         return self.selected
+
+    async def get_using_provider_async(self, *, provider_type, umo):
+        return self.get_using_provider(provider_type=provider_type, umo=umo)
 
 
 def call_request():

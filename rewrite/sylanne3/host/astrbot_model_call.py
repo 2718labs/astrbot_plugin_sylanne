@@ -230,9 +230,19 @@ class AstrBotModelProvider:
                 and installed_model_config_ref(meta.id, meta.model, digest)
                 == self._admin_model.provider_config_ref)
 
+    async def _selected_provider(self):
+        """Read AstrBot's current UMO selection on its owning host loop."""
+        async_selector = getattr(self._context, "get_using_provider_async", None)
+        if callable(async_selector):
+            return await async_selector(self._trusted_umo)
+        selector = getattr(self._context, "get_using_provider", None)
+        if callable(selector):
+            return selector(self._trusted_umo)
+        raise RuntimeError("AstrBot chat provider selection is unavailable")
+
     async def _invoke_on_host(self, request: ModelCallRequest) -> ProviderResponse:
         try:
-            provider = await self._context.get_using_provider_async(self._trusted_umo)
+            provider = await self._selected_provider()
             if not self._matches_live_provider(provider):
                 return ProviderResponse("not_dispatched", None, {}, {}, None)
         except asyncio.CancelledError:
@@ -257,7 +267,7 @@ class AstrBotModelProvider:
             # No network operation has begun. Re-read the selected provider and
             # its live configuration immediately before creating the call.
             try:
-                selected = await self._context.get_using_provider_async(self._trusted_umo)
+                selected = await self._selected_provider()
                 if (selected is not provider
                         or not self._matches_live_provider(provider)
                         or provider.client is not selected_client
