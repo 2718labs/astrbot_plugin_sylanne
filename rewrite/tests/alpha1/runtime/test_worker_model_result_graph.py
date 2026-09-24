@@ -188,9 +188,7 @@ def _case(tmp_path):
     db.execute("INSERT INTO graph_namespace_provisioning_v2 VALUES(?,?,?,?,?)",
                (*namespace.as_tuple, provision["operation_id"],
                 provision["input_digest"], canonical_json(provision)))
-    qualification = SourceQualification(
-        (source_atom.token,), "authored", None, time.time(), "authored_content",
-        "ineligible", None, "actual")
+    qualification = model_request.envelope.source_qualification
     db.execute("INSERT INTO runtime_ingress_issuance VALUES(?,?,?,?,?,?,?)",
                (*namespace.as_tuple, original_id, 1, quote.quote_id, grant.grant_id,
                 canonical_serialize(asdict(qualification))))
@@ -201,7 +199,7 @@ def _case(tmp_path):
                (*namespace.as_tuple, original_id, "reserve", "c"*64))
     intent = ModelEgressIntentV1(
         anchor.authority_id, anchor.namespace, job.lease_holder,
-        "model-operation-1", model_request.call_id, model_request.digest,
+        acquire_id, model_request.call_id, model_request.digest,
         job_id, job.fence, "m" * 32, 2, 0, canonical_digest(asdict(anchor)),
         (source.source_id,), ((source.source_id, 1),),
         ((source.source_id, 1),), 0, 0, 1, 1, 1, 0, 0, 0,
@@ -288,5 +286,19 @@ def test_original_reservation_receipt_and_qualification_are_required(tmp_path):
                    (*request.namespace.as_tuple, job.operation_id, "reserve", "c" * 64))
         db.execute("UPDATE runtime_ingress_issuance SET source_qualification_json=NULL")
         assert verifier.current(request, intent, permit) is False
+    finally:
+        db.close()
+
+
+def test_original_model_and_budget_operations_cannot_be_rebound(tmp_path):
+    db, _, intent, request, permit, verifier, _, _ = _case(tmp_path)
+    try:
+        assert verifier.current(request, intent, permit) is True
+        assert verifier.current(request, replace(intent, operation_id="other-model-op"), permit) is False
+        assert verifier.current(
+            request, replace(intent, budget_reservation_operation_id="other-budget-op"),
+            permit) is False
+        assert verifier.current(replace(request, acquire_operation_id="other-acquire"),
+                                intent, permit) is False
     finally:
         db.close()

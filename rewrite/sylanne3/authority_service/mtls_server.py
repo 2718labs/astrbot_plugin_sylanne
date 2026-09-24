@@ -52,6 +52,13 @@ from .current_model_result_read_graph_verifier import PinnedCurrentModelResultRe
 from .v2_model_result_read_wire import (
     from_wire as result_from_wire, to_wire as result_to_wire,
 )
+from .v2_worker_model_result_contract import (
+    WorkerModelResultReadRequestV1, to_wire as worker_result_to_wire,
+    from_wire as worker_result_from_wire,
+)
+from .v2_worker_model_result_read_service import (
+    AuthorityV2WorkerModelResultReadService, WorkerResultDeliveryV1,
+)
 from .v2_execution_bridge import AuthorityV2ExecutionBridge
 from .v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
@@ -101,6 +108,21 @@ class MtlsPeerCredential:
                 or len(self.certificate_sha256) != 64
                 or any(item not in "0123456789abcdef" for item in self.certificate_sha256)):
             raise ValueError("invalid mTLS peer credential")
+
+
+@dataclass(slots=True)
+class _DeferredWorkerDelivery:
+    payload: dict[str, object]
+    service: AuthorityV2WorkerModelResultReadService
+    credential: MtlsPeerCredential
+    delivery: WorkerResultDeliveryV1
+
+    def finish(self) -> None:
+        self.service.finish_delivery(
+            credential=self.credential, delivery=self.delivery)
+
+    def abandon(self) -> None:
+        self.service.abandon_delivery(delivery=self.delivery)
 
 
 @dataclass(frozen=True)
@@ -191,6 +213,8 @@ class AuthorityRpcServer:
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
         v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
         v2_model_result_reads: Mapping[str, AuthorityV2ModelResultReadService] | None = None,
+        v2_worker_model_result_reads: Mapping[str, AuthorityV2WorkerModelResultReadService] | None = None,
+        worker_result_readers_v2: Mapping[str, tuple[str, str]] | None = None,
         model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_accounting: Mapping[str, AuthorityV2AccountingMaintenanceService] | None = None,
         accounting_observers_v2: Mapping[str, tuple[str, str]] | None = None,
@@ -331,6 +355,29 @@ class AuthorityRpcServer:
                 for namespace, service in result_reads.items()):
             raise TypeError("result reads require the installed model and Owner composition")
         self._v2_model_result_reads = result_reads
+        worker_reads = dict(v2_worker_model_result_reads or {})
+        worker_readers = dict(worker_result_readers_v2 or {})
+        if (set(worker_reads) != set(worker_readers)
+                or any(type(namespace) is not str or namespace not in model_services
+                       or type(service) is not AuthorityV2WorkerModelResultReadService
+                       or service._store is not model_services[namespace]._store
+                       or service._fences is not services[namespace]
+                       or type(worker_readers[namespace]) is not tuple
+                       or len(worker_readers[namespace]) != 2
+                       or worker_readers[namespace] not in installed
+                       or not any(peer == worker_readers[namespace][0]
+                                      and profile == worker_readers[namespace][1]
+                                      and mapped == namespace
+                                      for (peer, profile, _), mapped in bindings.items())
+                       or (service._read_subject, service._installation_id,
+                           service._holder) != (
+                               "mtls:sha256:" + worker_readers[namespace][0],
+                               installed[worker_readers[namespace]].installation_id,
+                               installed[worker_readers[namespace]].administrator_holder)
+                       for namespace, service in worker_reads.items())):
+            raise TypeError("worker results require installed original model and reader")
+        self._v2_worker_model_result_reads = worker_reads
+        self._worker_result_readers_v2 = worker_readers
         if v2_accounting is not None and not isinstance(v2_accounting, Mapping):
             raise TypeError("Authority accounting service mapping required")
         accounting_services = dict(v2_accounting or {})
@@ -611,6 +658,41 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method in {"worker_model_result_read_v1",
+                          "worker_model_result_recover_finish_v1"}:
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("worker result command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                service = self._v2_worker_model_result_reads.get(namespace)
+                if (service is None or service._read_subject != subject
+                        or self._worker_result_readers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("installed worker reader unavailable")
+                request = worker_result_from_wire(
+                    command["read_request"], WorkerModelResultReadRequestV1)
+                if (request.authority_id != self._authority_id()
+                        or request.authority_namespace != namespace
+                        or request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            request.namespace)) != namespace):
+                    raise AuthorityUnavailable("worker result installation differs")
+                if method == "worker_model_result_recover_finish_v1":
+                    service.recover_finish(credential=credential, request=request)
+                    return {"finished": True}
+                delivery = service.prepare(credential=credential, request=request)
+                try:
+                    result_wire = worker_result_to_wire(delivery.result)
+                except BaseException:
+                    service.abandon_delivery(delivery=delivery)
+                    raise
+                return _DeferredWorkerDelivery(
+                    {"result": result_wire},
+                    service, credential, delivery)
             if method in {"accounting_begin_v1", "accounting_validate_v1",
                           "accounting_finish_v1", "accounting_recover_finish_v1"}:
                 expected = ({"namespace", "request"} if method in {
@@ -1404,6 +1486,9 @@ class AuthorityRpcServer:
             method, credential, wire.profile_id, wire.manifest_sha256, command)
                   if wire.protocol == AUTHORITY_V2_PROTOCOL else
                   self._content_command(method, credential, command))
+        if type(result) is _DeferredWorkerDelivery:
+            result.payload["channel_binding_sha256"] = binding
+            return result
         result["channel_binding_sha256"] = binding
         return result
 
@@ -1448,7 +1533,21 @@ class AuthorityRpcServer:
                 self._worker_slots.release()
                 raise
             future.add_done_callback(lambda _: self._worker_slots.release())
-        return await asyncio.wrap_future(future)
+        wrapped = asyncio.wrap_future(future)
+        try:
+            return await asyncio.shield(wrapped)
+        except asyncio.CancelledError:
+            # The synchronous worker may still complete after the TLS caller
+            # disappears. Release only its in-process handoff reservation.
+            def abandoned(done):
+                try:
+                    result = done.result()
+                    if type(result) is _DeferredWorkerDelivery:
+                        result.abandon()
+                except Exception:
+                    pass
+            future.add_done_callback(abandoned)
+            raise
 
     async def aclose(self) -> None:
         """Stop accepting dispatches and wait for submitted service work to finish.
@@ -1493,6 +1592,7 @@ class AuthorityRpcServer:
                         or not isinstance(payload.get("request_id"), str)
                         or not isinstance(payload.get("method"), str)):
                     raise RuntimeError("authority unavailable")
+                result = None
                 try:
                     if (type(payload.get("request")) is not dict
                             or payload["request"].get("protocol") != payload["protocol"]):
@@ -1501,16 +1601,25 @@ class AuthorityRpcServer:
                         payload["method"], payload.get("request"), credential, binding,
                         payload.get("handshake_binding_sha256"), payload.get("command"),
                     )
-                    response = {"request_id": payload["request_id"], "ok": True, "result": result}
+                    response = {"request_id": payload["request_id"], "ok": True,
+                                "result": (result.payload if type(result) is _DeferredWorkerDelivery
+                                           else result)}
                 except Exception as exc:
                     response = {"request_id": payload["request_id"], **self.error_payload(exc)}
-                encoded = _canonical(response)
-                if len(encoded) + 1 > max_message_bytes:
-                    raise RuntimeError("authority unavailable")
-                writer.write(encoded + b"\n")
-                await asyncio.wait_for(writer.drain(), timeout_seconds)
+                try:
+                    encoded = _canonical(response)
+                    if len(encoded) + 1 > max_message_bytes:
+                        raise RuntimeError("authority unavailable")
+                    writer.write(encoded + b"\n")
+                    await asyncio.wait_for(writer.drain(), timeout_seconds)
+                except BaseException:
+                    if response["ok"] is True and type(result) is _DeferredWorkerDelivery:
+                        result.abandon()
+                    raise
+                if response["ok"] is True and type(result) is _DeferredWorkerDelivery:
+                    await asyncio.shield(asyncio.to_thread(result.finish))
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, RuntimeError,
-                TimeoutError, ValueError):
+                TimeoutError, TypeError, ValueError, ConnectionError):
             pass
         finally:
             writer.close()

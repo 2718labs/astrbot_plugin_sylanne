@@ -72,9 +72,11 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
                    != (request.authority_id, request.authority_namespace,
                        request.read_attempt_id)
                 or (intent.authority_id, intent.namespace, intent.call_id,
-                    intent.job_id, intent.request_digest) !=
+                    intent.job_id, intent.request_digest,
+                    intent.operation_id, intent.budget_reservation_operation_id) !=
                    (request.authority_id, request.authority_namespace,
-                    request.call_id, request.job_id, request.model_request_digest)):
+                    request.call_id, request.job_id, request.model_request_digest,
+                    request.acquire_operation_id, request.original_operation_id)):
             return False
         try:
             now = self._clock()
@@ -169,6 +171,8 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
         if (frozen["schema"] != "sylanne.first-ingress-encoding-call.v2"
                 or frozen["acquire_operation_id"] != request.acquire_operation_id
                 or frozen["original_operation_id"] != request.original_operation_id
+                or frozen["envelope"]["identity"]["operation_id"]
+                   != request.acquire_operation_id
                 or frozen["worker_fence"] != job.fence
                 or frozen["worker_lease_expires_utc"] != job.lease_expires_utc
                 or authority["actor"] != intent.subject
@@ -328,6 +332,8 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
             "source_refs": tuple(qualification_data["source_refs"]),
         })
         if (canonical_serialize(asdict(qualification)) != qualification_row[0]
+                or json.loads(canonical_serialize(qualification))
+                   != frozen["envelope"]["source_qualification"]
                 or qualification.source_refs != (source_token := source_key(*ns, binding.source_id).token,)):
             return False
 

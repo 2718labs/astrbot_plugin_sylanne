@@ -24,6 +24,10 @@ from .v2_accounting_service import AuthorityV2AccountingMaintenanceService
 from .v2_model_egress_service import AuthorityV2ModelEgressService
 from .v2_model_result_read_service import AuthorityV2ModelResultReadService
 from .current_model_result_read_graph_verifier import PinnedCurrentModelResultReadGraphVerifier
+from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
+from .current_worker_model_result_graph_verifier import PinnedCurrentWorkerModelResultGraphVerifier
+from .v2_worker_model_result_attempts import AuthorityV2WorkerModelResultAttempts
+from .v2_worker_model_result_read_service import AuthorityV2WorkerModelResultReadService
 from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 from .v2_owner_proof import AuthorityV2OwnerProofStore, OwnerProofAcceptanceV1
@@ -45,9 +49,11 @@ def compose_local_owner_authority(
     v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
     model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
     accounting_observers_v2: Mapping[str, tuple[str, str]] | None = None,
+    worker_result_readers_v2: Mapping[str, tuple[str, str]] | None = None,
     model_result_source_purposes: Mapping[str, str] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
+    create_worker_result_schema: bool = False,
     owner_proofs: AuthorityV2OwnerProofStore | None = None,
     current_claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1,
                                         OwnerProofAcceptanceV1], bool] | None = None,
@@ -181,6 +187,42 @@ def compose_local_owner_authority(
             read_subject="mtls:sha256:" + observer[0],
             holder=installed.administrator_holder,
             source_purpose=purpose)
+    worker_readers = dict(worker_result_readers_v2 or {})
+    worker_result_reads = {}
+
+    def trusted_worker_now_utc() -> float:
+        reading = utc_clock()
+        if (type(reading) is not datetime or reading.tzinfo is None
+                or reading.utcoffset() is None
+                or reading.utcoffset().total_seconds() != 0):
+            raise AuthorityUnavailable("worker result needs an aware UTC clock")
+        return reading.timestamp()
+
+    attempts = (AuthorityV2WorkerModelResultAttempts(
+        core._db, create=create_worker_result_schema, lock=core._lock)
+        if worker_readers else None)
+    for namespace, observer in worker_readers.items():
+        model = models.get(namespace)
+        installed = (installations_v2.get(observer)
+                     if type(observer) is tuple and len(observer) == 2 else None)
+        model_graph = (model._graph_verifier
+                       if type(model) is AuthorityV2ModelEgressService else None)
+        if (installed is None or model_graph is None
+                or type(model_graph) is not PinnedCurrentModelEgressGraphVerifier
+                or model._fences is not services.get(namespace)
+                or not any(peer == observer[0] and profile == observer[1]
+                               and mapped == namespace
+                               for (peer, profile, _), mapped in namespace_bindings_v2.items())):
+            raise AuthorityUnavailable("worker result reader installation differs")
+        worker_graph = PinnedCurrentWorkerModelResultGraphVerifier(
+            graph_db_path, d11_issuer=model_graph._issuer,
+            trusted_now_utc=trusted_worker_now_utc)
+        worker_result_reads[namespace] = AuthorityV2WorkerModelResultReadService(
+            store=model._store, fences=services[namespace], attempts=attempts,
+            graph_verifier=worker_graph,
+            installation_id=installed.installation_id,
+            read_subject="mtls:sha256:" + observer[0],
+            holder=installed.administrator_holder)
     accounting_observers = dict(accounting_observers_v2 or {})
     accounting_services = {}
     for namespace, observer in accounting_observers.items():
@@ -201,6 +243,8 @@ def compose_local_owner_authority(
     return AuthorityRpcServer(
         core, v2_fences=services, v2_model_egress=v2_model_egress,
         v2_model_result_reads=result_reads,
+        v2_worker_model_result_reads=worker_result_reads,
+        worker_result_readers_v2=worker_result_readers_v2,
         model_observers_v2=model_observers_v2,
         v2_accounting=accounting_services,
         accounting_observers_v2=accounting_observers,
