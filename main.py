@@ -333,8 +333,11 @@ class Sylanne3Plugin(Star):
         except Exception:
             logger.exception("Sylanne 3 ingress failed")
             return
-        if receipt.status in {"accepted", "duplicate", "deferred"}:
-            event.stop_event()
+        # Ingress receipts describe the durable D06 observation, not a reply.
+        # Until runtime egress completes a host response, let AstrBot continue
+        # processing every event, including duplicate and deferred ingress.
+        if receipt.status == "deferred":
+            logger.warning("Sylanne 3 ingress outcome pending confirmation")
 
 
 __all__ = ("Sylanne3Plugin",)

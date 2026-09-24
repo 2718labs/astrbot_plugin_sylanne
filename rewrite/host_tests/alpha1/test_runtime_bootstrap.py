@@ -659,7 +659,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 StarTools.get_data_dir = original
 
-    async def test_controlled_ready_runtime_receipt_is_the_only_event_takeover_boundary(self) -> None:
+    async def test_ready_runtime_durable_receipt_does_not_take_over_host_reply(self) -> None:
         module = load_plugin_module()
 
         class ControlledRuntime:
@@ -682,12 +682,13 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         expected = await module.build_astrbot_ingress(event, plugin.context)
         plugin._installed_namespace = expected.namespace
         await plugin.ingress(event)
-        self.assertTrue(event.is_stopped())
+        self.assertFalse(event.is_stopped())
+        self.assertEqual(event.sent, [])
         self.assertEqual(len(controlled.envelopes), 1)
         self.assertEqual(controlled.envelopes[0].lineage.source_ref.__len__(), 64)
         self.assertEqual(len(plugin.observed_scene_candidates(expected.namespace)), 1)
 
-    async def test_limited_installed_v2_ingress_claims_only_committed_receipts(self) -> None:
+    async def test_limited_installed_v2_ingress_never_claims_receipt_as_reply(self) -> None:
         module = load_plugin_module()
 
         class ControlledRuntime:
@@ -709,18 +710,19 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         plugin.runtime_health = RuntimeHealth("limited", ("scene_binding", "dispatch"))
         expected = await module.build_astrbot_ingress(Event(), plugin.context)
         plugin._installed_namespace = expected.namespace
-        for receipt, claimed in (
-            (IngressReceipt("unavailable"), False),
-            (IngressReceipt("rejected"), False),
-            (IngressReceipt("accepted", "operation-1"), True),
-            (IngressReceipt("duplicate", "operation-1"), True),
-            (IngressReceipt("deferred", "operation-1"), True),
+        for receipt in (
+            IngressReceipt("unavailable"),
+            IngressReceipt("rejected"),
+            IngressReceipt("accepted", "operation-1"),
+            IngressReceipt("duplicate", "operation-1"),
+            IngressReceipt("deferred", "operation-1"),
         ):
             runtime = ControlledRuntime(receipt)
             plugin._runtime = runtime
             event = Event()
             await plugin.ingress(event)
-            self.assertEqual(event.is_stopped(), claimed)
+            self.assertFalse(event.is_stopped())
+            self.assertEqual(event.sent, [])
             self.assertEqual(len(runtime.envelopes), 1)
             self.assertEqual(plugin.runtime_health.status, "limited")
         runtime = ControlledRuntime(IngressReceipt("accepted", "operation-2"))
