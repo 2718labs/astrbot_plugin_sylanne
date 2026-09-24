@@ -42,7 +42,9 @@ from .host.mtls_transport import MtlsAuthorityTransport
 from .host.first_ingress_result import OriginalFirstIngressRead
 from .host.worker_result_identity import first_ingress_worker_result_request_v1
 from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
-from .authority_service.v2_worker_model_result_contract import WorkerModelResultReadRequestV1
+from .authority_service.v2_worker_model_result_contract import (
+    WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
+)
 from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from .host.v2_installation import V2InstallationAssembly
 from .host.v2_fence_port import V2FenceOutcomeUnknown, V2FencePort
@@ -54,7 +56,10 @@ from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.first_ingress_v2 import ingress_ids
 from .runtime.original_model_result_context import OriginalModelResultContextV1
 from .runtime.restore_anchor import ExecutionJournalPort
-from .runtime_contracts import AuthorityContext, CommitReceipt, InstallationGrantV2, NamespaceId
+from .runtime_contracts import (
+    AuthorityContext, CommitReceipt, InstallationGrantV2, NamespaceId,
+    canonical_digest,
+)
 from .workbench_api.async_service import AsyncGraphWorkbenchService
 from .workbench_api.domain_registry import CurrentDomainViewRegistry
 from .workbench_api.http_transport import (
@@ -105,11 +110,12 @@ class AcquiredFirstIngressEncodingV2:
 
 @dataclass(frozen=True)
 class PreparedFirstIngressWorkerResultV1:
-    """Content-free original facts, held under the live D11 worker scope."""
+    """Original facts and worker-read body under the live D11 worker scope."""
 
     egress: FrozenEncodingEgressResult
     result_context: OriginalModelResultContextV1
     read_request: WorkerModelResultReadRequestV1
+    result_read: WorkerModelResultReadV1
 
 
 @dataclass(frozen=True)
@@ -1107,8 +1113,8 @@ class RuntimeContext:
     ) -> AsyncIterator[PreparedFirstIngressWorkerResultV1 | None]:
         """Hold the one worker lease through egress, accounting and result read.
 
-        The caller may use the yielded request only while this scope remains
-        open. Authority's worker read and D06 adoption are separate gates.
+        The worker result is fetched before releasing this same D11 lease.
+        D06 candidate preparation and adoption remain separate gates.
         This scope is not scheduled until the upstream D04 baseline is committed.
         """
         async with self.acquired_first_ingress_encoding_v2(
@@ -1131,6 +1137,7 @@ class RuntimeContext:
             context = await self.read_first_ingress_original_model_result_context_v1(
                 acquired)
             if (type(context) is not OriginalModelResultContextV1
+                    or context.namespace != acquired.authority.namespace
                     or (context.authority_id, context.authority_namespace,
                         context.installation_id, context.job_id,
                         context.acquire_operation_id, context.call_id,
@@ -1144,6 +1151,7 @@ class RuntimeContext:
                         egress.intent.budget_reservation_operation_id,
                         egress.intent.request_digest,
                         egress.intent.subject, egress.intent.worker_fence)
+                    or canonical_digest(context.anchor) != egress.intent.anchor_digest
                     or (context.worker_actor, context.worker_fence,
                         context.source_id, context.source_revision,
                         context.access_revision) != (
@@ -1153,8 +1161,26 @@ class RuntimeContext:
                         egress.intent.access_revisions[0][1])):
                 yield None
                 return
+            read_request = first_ingress_worker_result_request_v1(context)
+            result_read = await executor.read_original_for_worker(
+                read_request=read_request, intent=egress.intent,
+                terminal=egress.terminal)
+            if type(result_read) is not WorkerModelResultReadV1:
+                yield None
+                return
+            try:
+                result_read.require_original_intent(egress.intent)
+            except ValueError:
+                yield None
+                return
+            if (result_read.request != read_request
+                    or result_read.terminal_receipt != egress.terminal
+                    or result_read.observation.digest
+                       != egress.terminal.observation_digest):
+                yield None
+                return
             yield PreparedFirstIngressWorkerResultV1(
-                egress, context, first_ingress_worker_result_request_v1(context))
+                egress, context, read_request, result_read)
 
     async def run_committed_first_ingress_encoding_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,

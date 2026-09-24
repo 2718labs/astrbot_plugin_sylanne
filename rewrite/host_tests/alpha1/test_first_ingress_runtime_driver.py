@@ -18,13 +18,20 @@ from sylanne3.host.model_egress_executor import (
     FrozenEncodingEgressResult, HostModelEgressExecutor,
 )
 from sylanne3.host.worker_result_identity import first_ingress_worker_result_request_v1
-from sylanne3.authority_service.v2_model_egress_contract import ModelTerminalReceiptV2
+from sylanne3.authority_service.v2_model_egress_contract import (
+    ModelEgressObservationV1, ModelTerminalReceiptV2,
+)
+from sylanne3.authority_service.v2_worker_model_result_contract import (
+    WorkerModelResultReadV1,
+)
 from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
 from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.runtime.first_ingress_v2 import ingress_ids
 from sylanne3.runtime.original_model_result_context import OriginalModelResultContextV1
 from sylanne3.runtime_context import RuntimeContext
-from sylanne3.runtime_contracts import AuthorityContext, CommitReceipt
+from sylanne3.runtime_contracts import (
+    AuthorityContext, CommitReceipt, canonical_digest, canonical_serialize,
+)
 
 
 class Worker:
@@ -194,7 +201,10 @@ async def test_owner_result_reads_current_job_before_authority_query(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_committed_ingress_acquires_original_job_then_reads_preparation(tmp_path):
+@pytest.mark.parametrize("read_mode", ("original", "wrong_consumer"))
+async def test_committed_ingress_acquires_original_job_then_reads_preparation(
+    tmp_path, read_mode,
+):
     host = model_fixture.AstrBotModelCallTests(
         methodName="test_one_http_request_on_host_loop_with_usage")
     await host.asyncSetUp()
@@ -298,13 +308,19 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(tm
             original_intent, authority_id=anchor.authority_id,
             namespace=anchor.namespace, subject=grant.subject,
             operation_id=graph.acquire_id, job_id=job_id, worker_fence=1,
+            anchor_digest=canonical_digest(anchor),
             source_refs=(binding.source_id,),
             source_revisions=((binding.source_id, binding.source_revision),),
             access_revisions=((binding.source_id, binding.access_revision),),
             budget_reservation_operation_id=ingress_op)
+        observation = ModelEgressObservationV1(
+            intent.authority_id, intent.namespace, intent.subject,
+            intent.operation_id, intent.call_id, intent.request_digest,
+            "completed", canonical_serialize({"text": "encoded"}),
+            (("output_tokens", 2),), (), "provider-call-1")
         terminal_receipt = ModelTerminalReceiptV2(
             "a" * 64, intent.call_id, intent.request_digest,
-            "b" * 64, "c" * 64, "sha256:" + "d" * 64,
+            "b" * 64, observation.digest, "sha256:" + "d" * 64,
             grant.installation_id, "e" * 64)
         original_context = OriginalModelResultContextV1(
             envelope.namespace, intent.authority_id, intent.namespace,
@@ -326,18 +342,38 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(tm
 
         executor.execute_frozen_encoding_once = MethodType(execute_observed, executor)
         runtime.commit_first_ingress_model_cost_v1 = MethodType(settle_cost, runtime)
+
+        async def read_original(self, *, read_request, intent, terminal):
+            order.append("read")
+            assert graph.releases == 2
+            assert intent == prepared_intent and terminal == terminal_receipt
+            assert read_request == first_ingress_worker_result_request_v1(
+                original_context)
+            if read_mode == "wrong_consumer":
+                read_request = replace(
+                    read_request, consumer_operation_id="another-consumer")
+            return WorkerModelResultReadV1(
+                read_request, observation, terminal_receipt)
+
+        prepared_intent = intent
+        executor.read_original_for_worker = MethodType(read_original, executor)
         async with runtime.prepared_first_ingress_worker_result_v1(
                 envelope, receipt, executor=executor) as prepared:
-            assert prepared is not None
+            if read_mode == "wrong_consumer":
+                assert prepared is None
+            else:
+                assert prepared is not None
+                assert prepared.egress.intent == intent
+                assert prepared.result_context == original_context
+                assert prepared.read_request.consumer_operation_id.startswith(
+                    "first-ingress-c02-")
+                assert prepared.read_request == first_ingress_worker_result_request_v1(
+                    replace(original_context, graph_revision=99, graph_epoch=99))
+                assert prepared.result_read.observation == observation
+                assert prepared.result_read.terminal_receipt == terminal_receipt
             assert graph.releases == 2
-            assert prepared.egress.intent == intent
-            assert prepared.result_context == original_context
-            assert prepared.read_request.consumer_operation_id.startswith(
-                "first-ingress-c02-")
-            assert prepared.read_request == first_ingress_worker_result_request_v1(
-                replace(original_context, graph_revision=99, graph_epoch=99))
-            assert graph.releases == 2
-        assert order == ["egress", "cost", "context"]
+        assert order == ["egress", "cost", "context", "read"]
         assert graph.releases == 3
+        assert host.requests == []
     finally:
         await host.asyncTearDown()
