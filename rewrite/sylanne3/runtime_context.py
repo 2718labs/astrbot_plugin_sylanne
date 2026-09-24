@@ -22,13 +22,17 @@ from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
 from .host.authority_profile import (
     AdminD03ArrivalPolicy, AdminIngressClockPolicy, AdminIngressEncodingPolicy,
-    AdminIngressModelPolicy,
+    AdminIngressModelPolicy, AdminInstallationBundle, AdminModelWorkflowsV2,
+    AdminModelWorkflowV2,
 )
 from .host.v2_ingress_adapter import ingress_host_facts
 from .host.installed_package import verify_installed_package
 from .host.v2_installation import V2InstallationAssembly
 from .host.v2_fence_port import V2FenceOutcomeUnknown, V2FencePort
 from .installation_policy import AdminInstallationPolicy
+from .model_broker.first_ingress_encoding import (
+    FIRST_INGRESS_ENCODING_TEMPLATE_VERSION, issue_first_ingress_encoding_request_v2,
+)
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.restore_anchor import ExecutionJournalPort
 from .runtime_contracts import InstallationGrantV2, NamespaceId
@@ -239,9 +243,11 @@ class RuntimeContext:
             owner_runtime = None
             model_config_matched = False
             model_selected = False
+            encoding_request_issuer = None
 
             def make_coordinator(store, port):
                 nonlocal provision, ingress, owner_runtime, model_config_matched, model_selected
+                nonlocal encoding_request_issuer
                 if port.installation_grant != installation_grant:
                     raise RuntimeError("v2 port installation grant changed")
                 bootstrap = object()
@@ -291,6 +297,54 @@ class RuntimeContext:
                     except Exception:
                         model_config_matched = False
                         model_selected = False
+                bundle = installation.admin_bundle
+                workflows = (bundle.model_workflows
+                             if type(bundle) is AdminInstallationBundle else None)
+                workflow = (workflows.encode
+                            if type(workflows) is AdminModelWorkflowsV2 else None)
+                if (type(workflow) is AdminModelWorkflowV2
+                        and bundle.installation_policy == policy
+                        and bundle.ingress_encoding == installation.ingress_encoding
+                        and bundle.ingress_model is None
+                        and installation.ingress_model is None
+                        and workflow.work_kind == "d06.encode_source"
+                        and workflow.purpose == "consolidation"
+                        and workflow.template_version == FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
+                        and type(installation.ingress_encoding) is AdminIngressEncodingPolicy
+                        and set(workflow.required_capabilities) <= {"text"}
+                        and all(amount <= installation.ingress_encoding.quote_ceiling.get(dimension, 0)
+                                and amount <= policy.root_lease.limits.get(dimension, 0)
+                                and amount <= policy.root_grant.max_ceiling.get(dimension, 0)
+                                for dimension, amount in workflow.quote_ceiling.items())
+                        and self._model_selection_port is not None):
+                    def current_selection():
+                        try:
+                            return (self._model_selection_port.verify_admin_config(
+                                policy.namespace, workflow) is True
+                                and self._model_selection_port.verify_admin_selection(
+                                    policy.namespace, workflow) is True)
+                        except Exception:
+                            return False
+
+                    if current_selection():
+                        def encoding_request_issuer(context):
+                            if (context.authority.namespace != policy.namespace
+                                    or context.authority.purpose != workflow.purpose
+                                    or not set(context.authority.audience).issubset(
+                                        workflow.audiences)
+                                    or not current_selection()):
+                                raise UnavailableGuard(
+                                    "current installed encoding selection or scope unavailable; HOLD")
+                            return issue_first_ingress_encoding_request_v2(
+                                context, provider_id=workflow.provider_id,
+                                model_id=workflow.model_id,
+                                provider_config_ref=workflow.provider_config_ref,
+                                provider_config_digest=workflow.provider_config_digest,
+                                required_capabilities=frozenset(workflow.required_capabilities),
+                                privacy_tier=workflow.privacy_tier,
+                                timeout_seconds=workflow.timeout_seconds,
+                                max_output_tokens=workflow.max_output_tokens,
+                            )
                 coordinator = GraphCoordinator(
                     store, bootstrap, holder=installation_grant.administrator_holder,
                     content_fence_v2=port,
@@ -303,6 +357,7 @@ class RuntimeContext:
                                               else None),
                     scene_identity_port=self._scene_identity_port,
                     scene_clock_policy=installation.ingress_clock,
+                    encoding_request_issuer=encoding_request_issuer,
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(

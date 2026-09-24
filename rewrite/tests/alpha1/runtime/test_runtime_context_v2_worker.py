@@ -21,12 +21,17 @@ from sylanne3.graph_coordinator import UnavailableGuard
 from sylanne3.domain_registry import discover_domain_registry
 from sylanne3.domains.d04 import AffectAxis, AffectScheme
 from sylanne3.host.installed_package import InstalledPackageVerification
+from sylanne3.host.authority_profile import (
+    AdminIngressEncodingPolicy, AdminInstallationBundle, AdminModelWorkflowV2,
+    AdminModelWorkflowsV2, installed_model_config_ref,
+)
 from sylanne3.host.v2_installation import V2InstallationAssembly
 from sylanne3.host.v2_fence_port import V2FenceOutcomeUnknown
 from sylanne3.installation_policy import AdminInstallationPolicy
 from sylanne3.runtime.budget import BudgetLease
 from sylanne3.runtime.issuers import BudgetLeaseGrant
 from sylanne3.runtime_contracts import InstallationGrantV2, NamespaceId, canonical_digest
+from sylanne3.model_broker.first_ingress_encoding import FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
 
 if installed_stub:
     del sys.modules["sylanne3.host"]
@@ -37,11 +42,12 @@ def installation(grant, port_factory, package_root, data_dir, *,
     namespace = NamespaceId("bot", "persona")
     lease = BudgetLease(
         "root-lease", None, *namespace.as_tuple, "USD",
-        {"cpu_ms": 200}, {}, {}, {}, 1, "active",
+        {"cpu_ms": 200, "output_tokens": 256}, {}, {}, {}, 1, "active",
     )
     root_grant = BudgetLeaseGrant(
         "root-grant", 1, *namespace.as_tuple, lease.lease_id,
-        "USD", {"cpu_ms": 100}, ("encode",), time.time() + 3600, "d11-policy",
+        "USD", {"cpu_ms": 100, "output_tokens": 256},
+        ("encode", "d06.encode_source"), time.time() + 3600, "d11-policy",
     )
     policy = AdminInstallationPolicy(
         namespace, "opaque:persona", grant.installation_id, grant.manifest_digest,
@@ -69,6 +75,111 @@ def test_installed_policy_yields_stable_bounded_namespace_operation_id(tmp_path)
     assert policy.digest_payload()["namespace"] == {
         "bot_id": "bot", "persona_id": "persona",
     }
+
+
+@pytest.mark.parametrize("profile_case", [
+    "current", "missing", "legacy", "wrong_template", "excess_budget", "stale_selection",
+])
+def test_v2_worker_installs_only_current_scoped_encoding_issuer(
+    tmp_path, monkeypatch, profile_case,
+):
+    async def scenario():
+        grant = InstallationGrantV2(
+            "authority", "subject", "administrator", "installation",
+            "a" * 64, "publisher-trust", "2", "b" * 64,
+        )
+        assembled = installation(grant, lambda: Port(), tmp_path, tmp_path / "data")
+        encoding = AdminIngressEncodingPolicy(
+            30, {"output_tokens": 128}, "snapshot", "resource", "interval",
+        )
+        config_digest = "c" * 64
+        def workflow(kind, purpose, *, template=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+                     output=64):
+            return AdminModelWorkflowV2(
+                kind, "provider", "model",
+                installed_model_config_ref("provider", "model", config_digest),
+                config_digest, purpose, ("private",), "private", template,
+                ("text",), 20, output, {"output_tokens": output},
+            )
+        encode = workflow("d06.encode_source", "consolidation",
+                          template="wrong" if profile_case == "wrong_template"
+                          else FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+                          output=129 if profile_case == "excess_budget" else 64)
+        workflows = AdminModelWorkflowsV2(2, encode, workflow("reply", "proposal"))
+        bundle = AdminInstallationBundle(
+            None, assembled.installation_policy, b"k" * 32, b"d" * 32,
+            ingress_encoding=encoding,
+            model_workflows=None if profile_case in {"missing", "legacy"} else workflows,
+        )
+        assembled = replace(assembled, ingress_encoding=encoding, admin_bundle=bundle)
+        monkeypatch.setattr(runtime_context, "verify_installed_package",
+            lambda *_args, **_kwargs: InstalledPackageVerification(
+                True, "verified", grant.manifest_digest, "3.0.0-alpha1", "formal-alpha1"))
+
+        class Port:
+            installation_grant = grant
+            def close(self):
+                pass
+
+        class Store:
+            def __init__(self, *_args):
+                pass
+            def close(self):
+                pass
+
+        installed = {"current": profile_case != "stale_selection", "calls": 0}
+        class SelectionPort:
+            def verify_admin_config(self, namespace, selection):
+                installed["calls"] += 1
+                assert namespace == assembled.installation_policy.namespace
+                assert selection is encode
+                return installed["current"]
+            def verify_admin_selection(self, namespace, selection):
+                assert namespace == assembled.installation_policy.namespace
+                assert selection is encode
+                return installed["current"]
+
+        captured = {}
+        class Coordinator:
+            def __init__(self, _store, _bootstrap, **kwargs):
+                captured["issuer"] = kwargs["encoding_request_issuer"]
+            def register_provider(self, *_args):
+                pass
+
+        monkeypatch.setattr(runtime_context, "ProductionGraphStore", Store)
+        monkeypatch.setattr(runtime_context, "GraphCoordinator", Coordinator)
+        issued = []
+        monkeypatch.setattr(runtime_context, "issue_first_ingress_encoding_request_v2",
+            lambda context, **kwargs: issued.append((context, kwargs)) or "issued")
+        context = runtime_context.RuntimeContext(
+            tmp_path / "data", package_root=tmp_path, dependencies=None,
+            domains=SimpleNamespace(complete=True, registrations={}, type_registry=object()),
+            model_selection_port=SelectionPort(),
+        )
+        assert (await context.start_v2(assembled)).status == "limited"
+        issuer = captured["issuer"]
+        if profile_case == "current":
+            assert callable(issuer)
+            request_context = SimpleNamespace(authority=SimpleNamespace(
+                namespace=assembled.installation_policy.namespace,
+                purpose="consolidation", audience=("private",)))
+            assert issuer(request_context) == "issued"
+            assert issued[0][1]["provider_config_ref"] == encode.provider_config_ref
+            assert issued[0][1]["max_output_tokens"] == encode.max_output_tokens
+            with pytest.raises(UnavailableGuard, match="scope unavailable"):
+                issuer(SimpleNamespace(authority=SimpleNamespace(
+                    namespace=assembled.installation_policy.namespace,
+                    purpose="consolidation", audience=("public",))))
+            installed["current"] = False
+            with pytest.raises(UnavailableGuard, match="scope unavailable"):
+                issuer(request_context)
+            assert len(issued) == 1
+            assert installed["calls"] >= 3
+        else:
+            assert issuer is None
+        assert (await context.stop()).status == "stopped"
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("unresolved_fence", [False, True])
