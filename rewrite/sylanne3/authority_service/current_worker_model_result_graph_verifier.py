@@ -21,13 +21,16 @@ from ..memory_types import SourceRecord, access_key, source_key, validate_access
 from ..runtime.d11_types import (
     RuntimeOutboxValue, job_graph_write, runtime_job_key, runtime_outbox_key,
 )
-from ..runtime.encoding_call_binding import binding_to_json, load_binding
+from ..runtime.encoding_call_binding import (
+    CommittedEncodingBaselineV1, binding_to_json, load_binding,
+)
 from ..runtime.first_ingress_v2 import ingress_ids
 from ..runtime.jobs import get_job
 from ..runtime.issuers import D11BudgetJobIssuer
 from ..runtime_contracts import NamespaceId, SnapshotRequirementsV2, SourceQualification, canonical_serialize
 from .v2_contract import FencePermitV2
 from .v2_model_egress_contract import ModelEgressIntentV1
+from .current_d04_baseline_graph_proof import committed_baseline_current
 from .v2_worker_model_result_contract import WorkerModelResultReadRequestV1
 from ..graph_coordinator import NamespaceProvisionReceiptV2
 
@@ -168,7 +171,9 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
         frozen = binding.request
         authority = frozen["envelope"]["authority"]
         audience = authority["audience"]
-        if (frozen["schema"] != "sylanne.first-ingress-encoding-call.v2"
+        if (frozen["schema"] not in {
+                    "sylanne.first-ingress-encoding-call.v2",
+                    "sylanne.first-ingress-encoding-call.v3"}
                 or frozen["acquire_operation_id"] != request.acquire_operation_id
                 or frozen["original_operation_id"] != request.original_operation_id
                 or frozen["envelope"]["identity"]["operation_id"]
@@ -207,6 +212,24 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
                 or acquire_requirements.get("activation_generation")
                    != anchor.activation_generation):
             return False
+        if frozen["schema"] == "sylanne.first-ingress-encoding-call.v3":
+            baseline = CommittedEncodingBaselineV1(**frozen["baseline"])
+            acquire_stamp = db.execute(
+                "SELECT graph_revision,graph_epoch FROM "
+                "graph_job_acquire_intents_v2 WHERE bot=? AND persona=? "
+                "AND acquire_operation_id=?",
+                ns + (request.acquire_operation_id,),
+            ).fetchone()
+            if acquire_stamp is None:
+                return False
+            if not committed_baseline_current(
+                    db, namespace=request.namespace, baseline=baseline,
+                    source_id=binding.source_id, requirements=requirements,
+                    current_graph_revision=meta[2],
+                    current_graph_epoch=graph_epoch[0],
+                    acquire_graph_revision=acquire_stamp[0],
+                    acquire_graph_epoch=acquire_stamp[1]):
+                return False
         original = db.execute(
             "SELECT activity_id,effect_id,receipt_json FROM graph_bundle_operations "
             "WHERE bot=? AND persona=? AND operation_id=?",
@@ -250,6 +273,25 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
         quote_ref = job.operator_versions.get("resource_quote")
         if type(quote_ref) is not str or ":" not in quote_ref:
             return False
+        original_quote_fence = job.fence
+        if frozen["schema"] == "sylanne.first-ingress-encoding-call.v3":
+            original_job_rows = db.execute(
+                "SELECT value FROM graph_history WHERE token=? AND valid=1 "
+                "AND event_bot=? AND event_persona=? AND event_session=? "
+                "AND event_id=?",
+                (job_key.token, *ns, job.activity_id, job.operation_id),
+            ).fetchall()
+            if len(original_job_rows) != 1:
+                return False
+            original_job = _canonical(original_job_rows[0][0])
+            if (original_job.get("job_id") != job.job_id
+                    or original_job.get("operation_id") != job.operation_id
+                    or original_job.get("phase") != "queued"
+                    or original_job.get("fence") != 0):
+                return False
+            # The signed quote belongs to the queued original ingress, before
+            # the acquire raised the live worker fence to its current value.
+            original_quote_fence = None
         quote_id, quote_version = quote_ref.rsplit(":", 1)
         quote = self._issuer.resource_issuer.original_signed_quote(
             db, quote_id, int(quote_version))
@@ -300,7 +342,7 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
                     quote.graph_job_ref, quote.outbox_refs) !=
                    (*ns, job.activity_id, job.operation_id, None,
                     job.budget_ref, job.work_kind, job.snapshot_ref,
-                    job.resource_ref, job.fence, job_key.token,
+                    job.resource_ref, original_quote_fence, job_key.token,
                     (outbox_key.token,))
                 or dict(quote.ceiling) != dict(intent.budget_ceiling)):
             return False

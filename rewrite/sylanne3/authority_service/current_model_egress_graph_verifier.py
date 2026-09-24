@@ -17,8 +17,9 @@ from typing import Callable
 
 from .v2_contract import FencePermitV2, from_wire
 from .v2_model_egress_contract import ModelEgressIntentV1
+from .current_d04_baseline_graph_proof import committed_baseline_current
 from ..contracts import canonical_json
-from ..graph_types import GraphVersion
+from ..graph_types import AtomKey, GraphVersion
 from ..memory_types import SourceRecord, access_key, source_key, validate_access
 from ..model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
@@ -26,7 +27,9 @@ from ..model_broker.first_ingress_encoding import (
 )
 from ..runtime.budget import get_budget_lease, require_budget_family_admissible
 from ..runtime.d11_types import RuntimeOutboxValue, job_graph_write, runtime_job_key, runtime_outbox_key
-from ..runtime.encoding_call_binding import binding_to_json, load_binding
+from ..runtime.encoding_call_binding import (
+    CommittedEncodingBaselineV1, binding_to_json, load_binding,
+)
 from ..runtime.first_ingress_v2 import ingress_ids
 from ..runtime.issuers import D11BudgetJobIssuer
 from ..runtime.jobs import get_job
@@ -124,7 +127,9 @@ class PinnedCurrentModelEgressGraphVerifier:
         if binding is None:
             return False
         frozen = binding.request
-        if frozen.get("schema") != "sylanne.first-ingress-encoding-call.v2":
+        if frozen.get("schema") not in {
+                "sylanne.first-ingress-encoding-call.v2",
+                "sylanne.first-ingress-encoding-call.v3"}:
             return False
         acquire = db.execute(
             "SELECT i.acquire_operation_id,i.job_id,i.original_operation_id,"
@@ -203,9 +208,45 @@ class PinnedCurrentModelEgressGraphVerifier:
         if len(provisions) != 1:
             return False
         catalogue = _canonical(provisions[0][0]).get("catalogue_hash")
+        baseline_version = ()
+        if frozen["schema"] == "sylanne.first-ingress-encoding-call.v3":
+            baseline = CommittedEncodingBaselineV1(**frozen["baseline"])
+            acquire_stamp = db.execute(
+                "SELECT graph_revision,graph_epoch FROM "
+                "graph_job_acquire_intents_v2 WHERE bot=? AND persona=? "
+                "AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            if acquire_stamp is None:
+                return False
+            recovery = db.execute(
+                "SELECT requirements_json,graph_revision FROM "
+                "graph_recovery_metadata_v2 WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            epoch = db.execute(
+                "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
+                namespace.as_tuple,
+            ).fetchone()
+            if recovery is None or epoch is None:
+                return False
+            requirements_data = _canonical(recovery[0])
+            requirements = SnapshotRequirementsV2(**{
+                **requirements_data, "namespace": namespace})
+            if not committed_baseline_current(
+                    db, namespace=namespace, baseline=baseline,
+                    source_id=source_id, requirements=requirements,
+                    current_graph_revision=recovery[1],
+                    current_graph_epoch=epoch[0],
+                    acquire_graph_revision=acquire_stamp[0],
+                    acquire_graph_epoch=acquire_stamp[1]):
+                return False
+            baseline_version = (
+                GraphVersion(AtomKey.from_token(baseline.baseline_ref),
+                             baseline.baseline_revision),)
         expected_guard = VersionGuard(
             (GraphVersion(source_key(*namespace.as_tuple, source_id), source_row[0]),
-             GraphVersion(access_key_value, access_row[0])), (),
+             GraphVersion(access_key_value, access_row[0])) + baseline_version, (),
             intent.access_epoch, intent.delete_epoch, catalogue,
             current["scheme"], current["operator"], current["policy"],
             (), (), (),
