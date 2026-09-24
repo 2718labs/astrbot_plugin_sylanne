@@ -14,7 +14,7 @@ from sylanne3.workbench_api import (
     AuthenticatedSession, CoordinatorGrant, CurrentDomainViewRegistry, GraphWorkbenchIssuer,
     RequestContext, WorkbenchService,
 )
-from sylanne3.workbench_api.domain_registry import PROJECTION_CONTEXT_V1
+from sylanne3.workbench_api.domain_registry import PROJECTION_CONTEXT_V1, PROJECTION_CONTEXT_V2
 
 
 SCOPE = "bot/persona"
@@ -241,6 +241,30 @@ def test_open_workspace_is_a_real_read_catalogue_without_a_durable_receipt():
     assert all(entry["status"] == "available" for entry in answer.projection["views"])
     assert len(coordinator.calls) == 2
     assert {call[2]["owner_kind"] for call in coordinator.calls} == {"persona", "event"}
+
+
+def test_workspace_does_not_advertise_a_view_when_its_complete_projection_fails():
+    provider, coordinator, _ = issuer()
+
+    class CompleteViewRegistry(Registry):
+        def projection_context_version(self, _authority, view_type):
+            return PROJECTION_CONTEXT_V2 if view_type == "memory" else None
+
+    provider._view_registry = CompleteViewRegistry()
+
+    def failed_projection(*_args, **_kwargs):
+        raise RuntimeError("complete fenced projection unavailable")
+
+    coordinator.project_workbench_snapshot_v1 = failed_projection
+    opened = WorkbenchService(provider).handle(
+        request("open_workspace"), session=SESSION, context=CONTEXT)
+    assert opened.status == "ready"
+    assert opened.projection["views"] == (
+        {"view_type": "memory", "status": "unavailable"},
+        {"view_type": "overview", "status": "available", "snapshot_epoch": 9},
+    )
+    assert "data" not in str(opened.projection)
+    assert len(coordinator.calls) == 1
 
 
 def test_workspace_catalogue_does_not_offer_a_cursor_that_skips_unread_content():

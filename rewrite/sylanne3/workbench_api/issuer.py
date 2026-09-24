@@ -232,37 +232,18 @@ class GraphWorkbenchIssuer:
         if views is None:
             return _unavailable("domain_registry_unavailable")
         entries = []
-        for name, types in sorted(views.items()):
-            owner_kind = self._owner_kind(grant, name)
-            if owner_kind is None:
-                entries.append({"view_type": name, "status": "unavailable"})
-                continue
-            try:
-                context_version = self._context_version(grant, name)
-            except (TypeError, ValueError, LookupError):
-                entries.append({"view_type": name, "status": "unavailable"})
-                continue
-            try:
-                page = self._coordinator.query(grant.authority, grant.lease, type_names=types,
-                                               owner_kind=owner_kind, limit=1)
-            except PermissionError:
-                raise
-            except Exception:
-                entries.append({"view_type": name, "status": "unavailable"})
-                continue
-            if (not isinstance(page, GraphPage) or len(page.snapshot.epochs) != 1
-                    or page.snapshot.epochs[0].bot != grant.authority.namespace.bot_id
-                    or page.snapshot.epochs[0].persona != grant.authority.namespace.persona_id
-                    or any(atom.key.owner.kind != owner_kind
-                           or atom.key.type_name not in types
-                           or (atom.key.owner.bot, atom.key.owner.persona)
-                           != grant.authority.namespace.as_tuple for atom in page.snapshot.atoms)):
-                entries.append({"view_type": name, "status": "unavailable"})
-                continue
-            epoch = page.snapshot.epochs[0]
-            entry = {"view_type": name, "status": "available"}
-            if context_version is None:
-                entry["snapshot_epoch"] = epoch.revision
+        for name in sorted(views):
+            # The catalogue must use the same fenced graph and field projection
+            # path as a view read. A one-row query cannot establish that a v2
+            # view can complete its private, multi-page projection.
+            read = self.read_projection(
+                session=session, scope=scope, view_type=name,
+                purpose=purpose, audience=audience,
+            )
+            entry = {"view_type": name,
+                     "status": "available" if read.get("status") == "ready" else "unavailable"}
+            if entry["status"] == "available" and "snapshot_epoch" in read["projection"]:
+                entry["snapshot_epoch"] = read["projection"]["snapshot_epoch"]
             entries.append(entry)
         return {"status": "ready", "projection": {
             "namespace": {"bot": grant.authority.namespace.bot_id,
