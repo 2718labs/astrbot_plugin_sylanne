@@ -597,3 +597,49 @@ def test_prepared_not_dispatched_closes_only_unsent_fence(tmp_path):
             next(fixture)
         except StopIteration:
             pass
+
+
+def test_dispatch_admission_holds_without_installed_policy_and_never_replays(tmp_path):
+    from rewrite.tests.alpha1.runtime.test_authority_v2_rpc_content_fences import _PEER_A, rpc
+    from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
+
+    fixture = rpc.__wrapped__(tmp_path)
+    server = next(fixture)
+    try:
+        fences = server._v2_fences["ns-a"]
+        store = AuthorityV2ModelEgressStore(fences.core._db, create=True,
+                                            lock=fences.core._lock)
+        service = AuthorityV2ModelEgressService(store, fences)
+        anchor = fences.current_anchor(credential=_PEER_A, subject="worker")
+        draft = ModelEgressDraftV1.from_intent(intent(
+            namespace="ns-a", authority_id=anchor.authority_id,
+            authority_activation_generation=anchor.activation_generation,
+            authority_revocation_epoch=anchor.revocation_epoch,
+            authority_deletion_seq=anchor.deletion_seq,
+            authority_execution_seq=anchor.execution_seq))
+        prepared, _ = service.prepare_fenced(
+            credential=_PEER_A, subject="worker", holder="holder-a",
+            draft=draft, expected_anchor=anchor)
+
+        def attempt():
+            with pytest.raises(AuthorityUnavailable):
+                service.admit_dispatch_once(
+                    credential=_PEER_A, subject="worker", holder="holder-a",
+                    intent=prepared.intent, expected_anchor=anchor)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda _: attempt(), range(2)))
+        attempt()
+        assert store.read(prepared.intent.call_id, subject="worker", namespace="ns-a").state == "prepared"
+        row = fences.fences._row(fences.core._db, prepared.intent.operation_id)
+        assert row[6] == "finished"
+        assert service.recover_fenced(
+            credential=_PEER_A, subject="worker", intent=prepared.intent)[0].state == "prepared"
+        with pytest.raises(TypeError):
+            AuthorityV2ModelEgressService(store, fences,
+                                          graph_verifier=lambda _: True)
+    finally:
+        try:
+            next(fixture)
+        except StopIteration:
+            pass

@@ -7,6 +7,7 @@ from dataclasses import asdict
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest
 from .contract import AuthorityUnavailable, identifier
+from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
 from .v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressObservationV1,
 )
@@ -16,15 +17,20 @@ from .v2_fence_service import AuthorityV2FenceService
 
 class AuthorityV2ModelEgressService:
     def __init__(self, store: AuthorityV2ModelEgressStore,
-                 fences: AuthorityV2FenceService | None = None):
+                 fences: AuthorityV2FenceService | None = None, *,
+                 graph_verifier: PinnedCurrentModelEgressGraphVerifier | None = None):
         if type(store) is not AuthorityV2ModelEgressStore:
             raise TypeError("Authority-owned model egress store required")
         if fences is not None and (type(fences) is not AuthorityV2FenceService
                                    or store._db is not fences.core._db
                                    or store._lock is not fences.core._lock):
             raise AuthorityUnavailable("model egress and fence must share Authority DB and lock")
+        if (graph_verifier is not None
+                and type(graph_verifier) is not PinnedCurrentModelEgressGraphVerifier):
+            raise TypeError("administrator-pinned model egress graph verifier required")
         self._store = store
         self._fences = fences
+        self._graph_verifier = graph_verifier
 
     def prepare_fenced(self, *, credential, subject: str, holder: str,
                        draft: ModelEgressDraftV1,
@@ -197,6 +203,57 @@ class AuthorityV2ModelEgressService:
             record = self._store._finish_not_dispatched_fenced_locked(
                 db, intent, permit, self._fences.fences, anchor)
             return record, permit
+
+    def admit_dispatch_once(self, *, credential, subject: str, holder: str,
+                            intent: ModelEgressIntentV1,
+                            expected_anchor: RestoreAnchor):
+        """Fail closed until an independent administrator model gate is installed.
+
+        A model fence is held across the independent graph read. Any failure
+        closes an untouched prepared call as not_dispatched. The durable
+        prepared-to-dispatch_started CAS remains reserved for a future fully
+        configured Authority executor; this method never returns send rights.
+        """
+        if (self._fences is None or type(intent) is not ModelEgressIntentV1
+                or type(expected_anchor) is not RestoreAnchor):
+            raise AuthorityUnavailable("protected typed model egress unavailable")
+        identifier(subject, "subject")
+        identifier(holder, "holder")
+        if (subject, intent.namespace) != (intent.subject, self._fences.namespace):
+            raise AuthorityUnavailable("model egress subject or namespace mismatch")
+        self._fences.core._require(credential, "model_egress", self._fences.namespace, holder)
+        with self._fences._frozen() as (db, deletion_head, execution_head, deletion_history):
+            anchor = self._fences._current_locked(
+                db, deletion_head, execution_head, holder=holder,
+                generation=expected_anchor.activation_generation)
+            if anchor != expected_anchor or deletion_history:
+                raise AuthorityUnavailable("model dispatch anchor changed or deletion history exists")
+            record = self._store.read_locked(db, intent)
+            row = self._fences.fences._row(db, intent.operation_id)
+            if row is None or row[6] != "active":
+                raise AuthorityUnavailable("model dispatch fence is no longer active")
+            permit = self._fences.fences._permit(row)
+            self._fences.fences.validate_fence_locked(
+                db, permit, subject=subject, current_anchor=anchor)
+            if not self._store.is_fence_bound_locked(db, intent):
+                raise AuthorityUnavailable("model dispatch lacks original fence binding")
+            if record.state != "prepared":
+                raise AuthorityUnavailable("model dispatch admission cannot repeat")
+        # No journal or Authority lock is held during this independent read.
+        try:
+            graph_current = (self._graph_verifier is not None
+                             and self._graph_verifier.complete_graph_current(intent) is True)
+        except Exception:
+            graph_current = False
+        # The administrator policy, live provider configuration, privacy, and
+        # executable token ceiling still need a trusted Authority integration.
+        # Even a positive graph result cannot grant provider dispatch today.
+        self._finish_prepared_not_dispatched_fenced(
+            credential=credential, subject=subject, holder=holder,
+            intent=intent, expected_anchor=expected_anchor)
+        if not graph_current:
+            raise AuthorityUnavailable("HOLD: complete current model graph is unavailable")
+        raise AuthorityUnavailable("HOLD: independent administrator model policy is unavailable")
 
     async def begin_handoff(self, request, request_digest):
         raise AuthorityUnavailable(
