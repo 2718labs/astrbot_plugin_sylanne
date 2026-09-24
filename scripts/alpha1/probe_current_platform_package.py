@@ -70,7 +70,7 @@ def main() -> None:
         run_dir.mkdir()
         code = "\n".join(
             (
-                "import json, os, shutil, sys",
+                "import json, math, os, shutil, sys",
                 "from pathlib import Path",
                 "package_root, source_root = (Path(value).resolve() for value in sys.argv[1:3])",
                 "assert sys.flags.isolated and sys.flags.no_site",
@@ -93,12 +93,25 @@ def main() -> None:
                 "assert capabilities.abi_version == 2 and capabilities.diagnostic_only",
                 "assert not capabilities.numerically_certified",
                 "assert capabilities.supports_fixed_block_interval_math_v1",
+                "from rewrite.sylanne3.native_runtime import FixedBlockCSR, FixedBlockStep, run_fixed_block_math",
+                "diagonal = FixedBlockCSR(1, 1, (0, 1), (0,), (2.0,))",
+                "recovery = FixedBlockCSR(1, 1, (0, 1), (0,), (1.0,))",
+                "zero = FixedBlockCSR(1, 1, (0, 0), (), ())",
+                "arguments = FixedBlockCSR(0, 1, (0,), (), ())",
+                "block = FixedBlockStep(diagonal, recovery, zero, arguments, (), (0.4,), (0.1,), (0.4,), 0.1, 0.0, 80, 1e-12)",
+                "transcript = run_fixed_block_math(library, block)",
+                "bounds = transcript.bounds",
+                "expected_endpoint = (0.4 * (1.0 - 0.1) + 0.1 * 0.1) / (1.0 + 0.1)",
+                "assert bounds.status == 0 and bounds.certificate_flags == 1 and bounds.boundary_eta == 0.0",
+                "assert bounds.q_upper <= 0.8 and bounds.iteration_error <= block.tolerance",
+                "assert math.isfinite(transcript.output[0]) and abs(transcript.output[0] - expected_endpoint) <= bounds.iteration_error",
                 "binding = library.production_binding",
                 "if binding is None: raise AssertionError('loaded native has no production binding')",
                 "expected = dict(manifest_sha256=sys.argv[3], native_sha256=sys.argv[4], os=sys.argv[5], arch=sys.argv[6], libc=json.loads(sys.argv[7]), abi_version=2)",
                 "for field, value in expected.items():",
                 "    if getattr(binding, field) != value: raise AssertionError(f'native binding {field} mismatch')",
-                "print(json.dumps({'abi_version': capabilities.abi_version, 'max_dimension': capabilities.max_dimension, 'fixed_block_interval_math_v1': capabilities.supports_fixed_block_interval_math_v1, 'numerically_certified': capabilities.numerically_certified, 'diagnostic_only': capabilities.diagnostic_only, 'binding': expected}))",
+                "math_receipt = {'scope': 'one_complete_fixed_scalar_block', 'certificate_flags': bounds.certificate_flags, 'input_sha256': transcript.input_sha256, 'output_sha256': transcript.output_sha256, 'transcript_sha256': transcript.transcript_sha256, 'endpoint_error_upper': bounds.iteration_error}",
+                "print(json.dumps({'abi_version': capabilities.abi_version, 'max_dimension': capabilities.max_dimension, 'fixed_block_interval_math_v1': capabilities.supports_fixed_block_interval_math_v1, 'numerically_certified': capabilities.numerically_certified, 'diagnostic_only': capabilities.diagnostic_only, 'binding': expected, 'fixed_block_math': math_receipt}))",
             )
         )
         cold_env = {

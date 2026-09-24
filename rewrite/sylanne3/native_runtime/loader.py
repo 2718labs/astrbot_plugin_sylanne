@@ -41,6 +41,12 @@ class NativePlatformError(NativeLoadError):
 
 @dataclass(frozen=True)
 class NativeCapabilities:
+    """Product admission flags are separate from conditional ABI2 math support.
+
+    A reported fixed-block interval capability still requires a successful
+    per-call certificate and does not authorize a production D04 readout.
+    """
+
     abi_version: int
     max_dimension: int
     numerically_certified: bool = False
