@@ -4,9 +4,10 @@ from dataclasses import dataclass, fields, replace
 import hashlib
 import json
 import math
+import re
 from collections.abc import Callable
 
-from ...graph_types import TypeSpec
+from ...graph_types import AtomKey, TypeSpec
 from ...runtime_contracts import (
     CheckReceipt,
     DomainProposal,
@@ -240,6 +241,69 @@ class RelationshipProvider:
             cost_reporting_mode="actual_or_unconfirmed", health_capabilities=("probe",),
             recovery_capabilities=("query_operation",),
         )
+
+    @property
+    def workbench_view_contract(self) -> dict[str, dict[str, object]]:
+        return {"relations": {
+            "types": ("d05.relationship_projection",),
+            "fields": ("relations", "coverage"),
+            "projection_context": "d12.projection_context.v2",
+        }}
+
+    @staticmethod
+    def project_workbench(view_type: str, atoms: tuple[dict, ...], *, context: object) -> dict:
+        """Show committed subjective statuses without source or boundary metadata."""
+        from ...graph_coordinator import verify_complete_projection_snapshot_v1
+        from ...workbench_api.domain_registry import ProjectionContextV2
+
+        types = ("d05.relationship_projection",)
+        if view_type != "relations" or type(context) is not ProjectionContextV2:
+            raise ValueError("unsupported D05 workbench projection context")
+        if not verify_complete_projection_snapshot_v1(
+            context.snapshot_proof, authority=context.authority, view_type=view_type,
+            type_names=types, owner_kind="relation", audience=context.audience,
+            purpose=context.purpose,
+        ):
+            raise ValueError("complete fenced snapshot proof is unavailable")
+        if type(atoms) is not tuple:
+            raise TypeError("atoms must be a tuple")
+
+        relations: dict[str, dict] = {}
+        seen_dimensions: set[tuple[str, str]] = set()
+        for atom in atoms:
+            if type(atom) is not dict or set(atom) != {"key", "type", "name", "revision", "value"}:
+                raise ValueError("D05 workbench atom has an invalid shape")
+            key = AtomKey.from_token(atom["key"])
+            atom_type = atom["type"]
+            if (key.type_name != atom_type or key.name != atom["name"]
+                    or atom_type not in types or key.owner.kind != "relation"
+                    or (key.owner.bot, key.owner.persona) != context.authority.namespace.as_tuple
+                    or type(atom["revision"]) is not int or atom["revision"] < 1):
+                raise ValueError("D05 workbench atom crosses its graph scope")
+            value = atom["value"]
+            _validate_relationship_projection(value)
+            subject = value["subject_entity_ref"]
+            dimension = value["dimension"]
+            if (re.fullmatch(r"entity:[A-Za-z0-9_.:-]{1,96}", subject) is None
+                    or re.fullmatch(r"[A-Za-z0-9_.:-]{1,96}", dimension) is None
+                    or value["status"] not in {
+                        "unknown", "available", "unavailable", "stale", "blocked_rebuild",
+                        "rebuilt", "sanitized", "reset",
+                    }):
+                raise ValueError("relationship projection has no public status token")
+            if (subject, dimension) in seen_dimensions:
+                raise ValueError("duplicate relationship dimension")
+            seen_dimensions.add((subject, dimension))
+            if key.owner.subject != subject:
+                raise ValueError("relation subject differs from graph Owner")
+            relation = relations.setdefault(subject, {
+                "subject_entity_ref": subject, "dimensions": [],
+            })
+            relation["dimensions"].append({"dimension": dimension, "status": value["status"]})
+        for relation in relations.values():
+            relation["dimensions"].sort(key=lambda item: item["dimension"])
+        return {"relations": [relations[subject] for subject in sorted(relations)],
+                "coverage": "complete"}
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
         layouts = (
