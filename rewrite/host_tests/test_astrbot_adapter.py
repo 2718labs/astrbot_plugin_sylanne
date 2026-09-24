@@ -90,7 +90,7 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
         await plugin.ingress(event)
         self.assertFalse(event.stopped)
 
-    async def test_ready_ingress_claims_only_accepted_runtime_receipts(self):
+    async def test_ready_ingress_preserves_host_event_after_runtime_receipts(self):
         runtime = types.SimpleNamespace(handle_ingress=AsyncMock())
         self.plugin._runtime = runtime
         self.plugin._enabled = True
@@ -111,7 +111,7 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
             runtime.handle_ingress.return_value = types.SimpleNamespace(status="accepted")
             await self.plugin.ingress(event)
-            self.assertTrue(event.stopped)
+            self.assertFalse(event.stopped)
             runtime.handle_ingress.assert_awaited_once_with(build.return_value)
 
             runtime.handle_ingress.return_value = types.SimpleNamespace(status="rejected")

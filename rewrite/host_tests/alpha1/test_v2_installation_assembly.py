@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sylanne3.host.authority_client import AuthorityClientStatus
 from sylanne3.host.installed_package import InstalledPackageVerification
 from sylanne3.host.authority_profile import (
-    AdminIngressModelPolicy, installed_model_config_ref,
+    AdminD03ArrivalPolicy, AdminIngressModelPolicy, AdminInstallationBundle,
+    installed_model_config_ref,
 )
 from sylanne3.host.v2_installation import assemble_v2_installation
 from sylanne3.runtime_contracts import InstallationGrantV2
@@ -48,7 +49,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
         client.status_v2 = AsyncMock(return_value=AuthorityClientStatus("paired", "authority"))
         client.installation_grant_v2 = AsyncMock(return_value=grant)
         package = InstalledPackageVerification(True, "verified", digest, "3.0.0-alpha1", "formal-alpha1")
-        with (patch("sylanne3.host.v2_installation.load_admin_installation_bundle", return_value=bundle),
+        with (patch("sylanne3.host.v2_installation.load_admin_installation_bundle", return_value=bundle) as load_bundle,
               patch("sylanne3.host.v2_installation.verify_installed_package", return_value=package),
               patch("sylanne3.host.v2_installation.MtlsAuthorityTransport", return_value=transport),
               patch("sylanne3.host.v2_installation.AuthorityClient", return_value=client),
@@ -68,6 +69,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
                              "https://workbench.example.org:8443")
             self.assertIs(assembled.ingress_model, bundle.ingress_model)
             self.assertIs(assembled.admin_bundle, bundle)
+            self.assertIsNone(assembled.d03_arrival)
             port_type.assert_not_called()
             await asyncio.to_thread(assembled.fence_port_factory)
             request, profiles, selected_grant = port_type.call_args.args
@@ -77,6 +79,19 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(profiles, {"installed": profile})
             self.assertIs(selected_grant, grant)
             transport.close.assert_awaited_once()
+
+            arrival = AdminD03ArrivalPolicy(1.0, {"cpu_ms": 1}, "snapshot", "resource")
+            real_bundle = AdminInstallationBundle(
+                profile, policy, bundle.d11_signing_key, bundle.d02_signing_key,
+                ingress_model=bundle.ingress_model,
+                d03_arrival=arrival,
+            )
+            load_bundle.return_value = real_bundle
+            with_arrival = await assemble_v2_installation(
+                "installed", package_root=Path.cwd() / "package", data_dir=Path.cwd() / "data",
+            )
+            self.assertIs(with_arrival.admin_bundle, real_bundle)
+            self.assertIs(with_arrival.d03_arrival, arrival)
 
     async def test_installation_mismatch_fails_closed_and_closes_probe(self):
         digest = "a" * 64

@@ -121,7 +121,7 @@ async def assemble_v2_installation(
         bundle.ingress_encoding, bundle.workbench_origin,
         getattr(bundle, "ingress_model", None),
         bundle,
-        bundle.d03_arrival,
+        getattr(bundle, "d03_arrival", None),
     )
 
 
