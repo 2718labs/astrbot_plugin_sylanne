@@ -41,7 +41,28 @@ def d03_self_identity_projection_activity_id_v1(
     })[:40]
 
 
+def d03_self_identity_projection_retry_operation_id_v2(
+    namespace: NamespaceId, source_ref: str, certification_ref: str,
+    previous_operation_id: str, retry_index: int,
+) -> str:
+    """A new business ID after the preceding write was durably rejected."""
+    original = d03_self_identity_projection_operation_id_v1(
+        namespace, source_ref, certification_ref)
+    if (type(previous_operation_id) is not str
+            or not previous_operation_id.startswith("d03-self-projection-")
+            or type(retry_index) is not int or retry_index < 1):
+        raise ValueError("D03 retry needs the prior stage operation and ordinal")
+    return "d03-self-projection-" + canonical_digest({
+        "schema": "sylanne3.d03.self-identity-projection-retry.v2",
+        "namespace": namespace.as_tuple,
+        "original_operation_id": original,
+        "previous_operation_id": previous_operation_id,
+        "retry_index": retry_index,
+    })[:40]
+
+
 __all__ = (
     "d03_self_identity_projection_operation_id_v1",
     "d03_self_identity_projection_activity_id_v1",
+    "d03_self_identity_projection_retry_operation_id_v2",
 )
