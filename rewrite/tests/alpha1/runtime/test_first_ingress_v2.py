@@ -168,6 +168,50 @@ def test_first_ingress_commits_and_replays_exact_receipt(ingress_system):
     assert len([item for item in port.finishes if item[0] == "write"]) == 5
 
 
+def test_first_ingress_commits_identity_receipt_with_bundle(ingress_system):
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = (
+        ingress_system)
+    committed = coordinator.commit_first_ingress_v2(
+        bootstrap, host, policy, clock, encoding)
+    identity = store._db.execute(
+        "SELECT source_ref,platform_ref,conversation_ref,sender_ref,message_id,"
+        "visibility,bundle_digest FROM graph_first_ingress_identity_v1"
+    ).fetchone()
+    assert identity == (
+        host.lineage.source_ref, host.platform_ref, host.conversation_ref,
+        host.sender_ref, host.message_id, host.visibility,
+        committed.operation_digest,
+    )
+    assert coordinator.commit_first_ingress_v2(
+        bootstrap, host, policy, clock, encoding) == committed
+
+
+def test_identity_read_requires_committed_matching_original(ingress_system):
+    from sylanne3.runtime.ingress_observation import read_committed_ingress_identity
+
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = (
+        ingress_system)
+    assert read_committed_ingress_identity(
+        store._db, host.namespace, host.lineage.source_ref) is None
+    committed = coordinator.commit_first_ingress_v2(
+        bootstrap, host, policy, clock, encoding)
+    proof = read_committed_ingress_identity(
+        store._db, host.namespace, host.lineage.source_ref)
+    assert proof.bundle_digest == committed.operation_digest
+    assert json.loads(proof.identity_json)["message_id"] == host.message_id
+    store._db.execute(
+        "UPDATE graph_first_ingress_identity_v1 SET message_id='forged'")
+    with pytest.raises(Exception, match="identity"):
+        read_committed_ingress_identity(
+            store._db, host.namespace, host.lineage.source_ref)
+    store._db.execute("DELETE FROM graph_first_ingress_identity_v1")
+    assert read_committed_ingress_identity(
+        store._db, host.namespace, host.lineage.source_ref) is None
+    with pytest.raises(UnavailableGuard, match="business receipt differs"):
+        coordinator.commit_first_ingress_v2(
+            bootstrap, host, policy, clock, encoding)
+
+
 def test_changed_content_does_not_reuse_first_ingress_operation(ingress_system):
     store, coordinator, bootstrap, port, policy, clock, encoding, host = (
         ingress_system)

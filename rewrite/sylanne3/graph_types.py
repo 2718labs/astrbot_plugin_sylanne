@@ -261,9 +261,20 @@ class NamespaceEpoch:
 
 
 @dataclass(frozen=True)
+class IngressIdentityReceipt:
+    """Coordinator-read v2 host identity, bound to a committed ingress bundle."""
+
+    identity_json: str
+    content_fingerprint: str
+    learned_at: float
+    bundle_digest: str
+
+
+@dataclass(frozen=True)
 class GraphSnapshot:
     atoms: tuple[GraphAtom, ...]
     epochs: tuple[NamespaceEpoch, ...]
+    ingress_receipts: tuple[IngressIdentityReceipt, ...] = ()
 
     def __post_init__(self):
         atoms = tuple(self.atoms)
@@ -272,8 +283,12 @@ class GraphSnapshot:
             raise TypeError("atoms must contain GraphAtom values")
         if any(not isinstance(epoch, NamespaceEpoch) for epoch in epochs):
             raise TypeError("epochs must contain NamespaceEpoch values")
+        receipts = tuple(self.ingress_receipts)
+        if any(type(receipt) is not IngressIdentityReceipt for receipt in receipts):
+            raise TypeError("ingress receipts must be coordinator-read values")
         object.__setattr__(self, "atoms", atoms)
         object.__setattr__(self, "epochs", epochs)
+        object.__setattr__(self, "ingress_receipts", receipts)
 
     def get(self, key: AtomKey) -> GraphAtom | None:
         return next((atom for atom in self.atoms if atom.key == key), None)

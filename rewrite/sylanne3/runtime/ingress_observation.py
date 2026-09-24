@@ -10,14 +10,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 from typing import Callable
 
 from ..contracts import EventConflict, StaleRead
+from ..contracts import canonical_json
+from ..graph_types import IngressIdentityReceipt
 from ..graph_coordinator import (
     AuthorityDenied, GraphCoordinator, _operation_capability_ref,
 )
 from ..graph_store import ProductionGraphStore
+from ..runtime_contracts import NamespaceId
+from .first_ingress_v2 import ingress_ids
 from .ingress_contracts import (
     CanonicalIngressObservation,
     CommittedIngressReplay,
@@ -31,6 +36,76 @@ def _digest(value: str, label: str) -> str:
             or any(ch not in "0123456789abcdef" for ch in value)):
         raise ValueError(f"{label} must be lowercase SHA-256")
     return value
+
+
+def read_committed_ingress_identity(db, namespace: NamespaceId,
+                                    source_ref: str) -> IngressIdentityReceipt | None:
+    """Read original host identity inside the coordinator's current DB fence.
+
+    A missing v1 identity is a legacy HOLD. Callers must never fill it from a
+    proposal. The D03 provider independently checks the returned tuple against
+    its current source and scene.
+    """
+    if type(namespace) is not NamespaceId:
+        raise TypeError("ingress receipt namespace is required")
+    _digest(source_ref, "source ref")
+    exists = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='graph_first_ingress_identity_v1'").fetchone()
+    if exists is None:
+        return None
+    operation_id = ingress_ids(source_ref)[2]
+    row = db.execute(
+        "SELECT source_ref,platform_ref,conversation_ref,sender_ref,message_id,"
+        "visibility,identity_json,content_fingerprint,learned_at,bundle_digest "
+        "FROM graph_first_ingress_identity_v1 WHERE bot=? AND persona=? "
+        "AND operation_id=?",
+        namespace.as_tuple + (operation_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        identity = json.loads(row[6])
+        valid = (
+            type(identity) is dict and set(identity) == {
+                "schema", "namespace", "operation_id", "source_ref",
+                "platform_ref", "conversation_ref", "sender_ref", "message_id",
+                "visibility", "lineage"}
+            and identity["schema"] == "sylanne3.ingress.identity.v1"
+            and identity["namespace"] == list(namespace.as_tuple)
+            and identity["operation_id"] == operation_id
+            and tuple(identity[name] for name in (
+                "source_ref", "platform_ref", "conversation_ref", "sender_ref",
+                "message_id", "visibility")) == row[:6]
+            and identity["source_ref"] == source_ref
+            and canonical_json(identity) == row[6]
+        )
+    except (TypeError, ValueError, KeyError):
+        valid = False
+    observed = db.execute(
+        "SELECT content_fingerprint,learned_at,bundle_digest "
+        "FROM ingress_first_observations WHERE bot=? AND persona=? "
+        "AND operation_id=?",
+        namespace.as_tuple + (operation_id,),
+    ).fetchone()
+    committed = db.execute(
+        "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
+        "AND operation_id=?",
+        namespace.as_tuple + (operation_id,),
+    ).fetchone()
+    intent = db.execute(
+        "SELECT identity_json FROM graph_first_ingress_intents_v2 "
+        "WHERE bot=? AND persona=? AND operation_id=?",
+        namespace.as_tuple + (operation_id,),
+    ).fetchone()
+    try:
+        pinned_fingerprint = json.loads(intent[0])["fingerprint"] if intent else None
+    except (TypeError, ValueError, KeyError):
+        pinned_fingerprint = None
+    if (not valid or observed != row[7:10] or committed != (row[9],)
+            or pinned_fingerprint != row[7]):
+        raise EventConflict("committed ingress identity differs from original")
+    return IngressIdentityReceipt(row[6], row[7], row[8], row[9])
 
 
 async def _run_durable(operation, *args):
@@ -302,4 +377,4 @@ class GraphIngressObservationAuthority:
                     raise
 
 
-__all__ = ("GraphIngressObservationAuthority",)
+__all__ = ("GraphIngressObservationAuthority", "read_committed_ingress_identity")

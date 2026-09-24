@@ -488,6 +488,22 @@ def ingress_host_fingerprint(host: IngressHostFacts) -> str:
     })
 
 
+def ingress_host_identity_json(host: IngressHostFacts, operation_id: str) -> str:
+    """Persist only host-verified identity; the D06 source retains message text."""
+    return canonical_json({
+        "schema": "sylanne3.ingress.identity.v1",
+        "namespace": list(host.namespace.as_tuple),
+        "operation_id": operation_id,
+        "source_ref": host.lineage.source_ref,
+        "platform_ref": host.platform_ref,
+        "conversation_ref": host.conversation_ref,
+        "sender_ref": host.sender_ref,
+        "message_id": host.message_id,
+        "visibility": host.visibility,
+        "lineage": asdict(host.lineage),
+    })
+
+
 @dataclass(frozen=True, eq=False)
 class _AuthorityLease:
     marker: object
@@ -4398,7 +4414,26 @@ class GraphCoordinator:
                 raise StaleRead("read version changed")
             atoms.append(GraphAtom(read.key, revision, json.loads(row[1]), bool(row[2]))
                          if row else GraphAtom(read.key, 0, {}, False))
-        return GraphSnapshot(tuple(atoms), (graph_epoch,))
+        ingress_receipts = []
+        if any(
+                proposal.domain == "d03" and any(
+                    write.key.type_name == "d03.world_event"
+                    and (write.value.get("kind") == "message_received"
+                         or write.value.get("reality") == "host_observed")
+                    for write in proposal.typed_writes)
+                for proposal in bundle.proposals):
+            from .runtime.ingress_observation import read_committed_ingress_identity
+
+            for source_ref in envelope.source_qualification.source_refs:
+                key = self._parse_ref(source_ref, namespace)
+                if key.type_name != "memory.source" or key.owner.subject is None:
+                    raise UnavailableGuard("host arrival lacks a source identity")
+                receipt = read_committed_ingress_identity(
+                    db, namespace, key.owner.subject)
+                if receipt is not None:
+                    ingress_receipts.append(receipt)
+        return GraphSnapshot(tuple(atoms), (graph_epoch,),
+                             tuple(ingress_receipts))
 
     @staticmethod
     def _parse_ref(ref: str, namespace: NamespaceId) -> AtomKey:
@@ -4732,8 +4767,19 @@ class GraphCoordinator:
                         "AND operation_id=?",
                         namespace.as_tuple + (operation_id,),
                     ).fetchone()
+                    identity_row = store._db.execute(
+                        "SELECT identity_json,content_fingerprint,learned_at,"
+                        "bundle_digest FROM graph_first_ingress_identity_v1 "
+                        "WHERE bot=? AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone() if store._db.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                        "name='graph_first_ingress_identity_v1'").fetchone() else None
                 if (saved[0] != receipt.operation_digest
                         or obs != (fingerprint, learned_at, receipt.operation_digest)
+                        or identity_row != (
+                            ingress_host_identity_json(host, operation_id),
+                            fingerprint, learned_at, receipt.operation_digest)
                         or saved[2:4] != row[6:8]
                         or saved[4] != saved[2] + 1
                         or saved[5] != receipt.invalidated_epochs[0].revision
@@ -4944,6 +4990,20 @@ class GraphCoordinator:
                         learned_at REAL NOT NULL CHECK(learned_at > 0),
                         bundle_digest TEXT,
                         PRIMARY KEY(bot,persona,operation_id))""")
+                    db.execute("""CREATE TABLE IF NOT EXISTS graph_first_ingress_identity_v1(
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        operation_id TEXT NOT NULL,
+                        source_ref TEXT NOT NULL,
+                        platform_ref TEXT NOT NULL,
+                        conversation_ref TEXT NOT NULL,
+                        sender_ref TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        visibility TEXT NOT NULL,
+                        identity_json TEXT NOT NULL,
+                        content_fingerprint TEXT NOT NULL,
+                        learned_at REAL NOT NULL,
+                        bundle_digest TEXT NOT NULL,
+                        PRIMARY KEY(bot,persona,operation_id))""")
                     db.execute("""CREATE TABLE IF NOT EXISTS runtime_ingress_issuance(
                         bot TEXT NOT NULL, persona TEXT NOT NULL,
                         operation_id TEXT NOT NULL,
@@ -5001,6 +5061,19 @@ class GraphCoordinator:
                         source_identity=source_identity,
                         payload_ref=host.lineage.source_ref,
                         idempotency_key=idem)
+                    db.execute(
+                        "INSERT INTO graph_first_ingress_identity_v1"
+                        "(bot,persona,operation_id,source_ref,platform_ref,"
+                        "conversation_ref,sender_ref,message_id,visibility,"
+                        "identity_json,content_fingerprint,learned_at,"
+                        "bundle_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            operation_id, host.lineage.source_ref,
+                            host.platform_ref, host.conversation_ref,
+                            host.sender_ref, host.message_id, host.visibility,
+                            ingress_host_identity_json(host, operation_id),
+                            fingerprint, learned_at, bundle.digest),
+                    )
                     db.execute(
                         "UPDATE ingress_first_observations SET bundle_digest=? "
                         "WHERE bot=? AND persona=? AND operation_id=?",
