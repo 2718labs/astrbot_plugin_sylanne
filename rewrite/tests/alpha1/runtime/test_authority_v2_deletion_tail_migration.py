@@ -11,7 +11,7 @@ from sylanne3.authority_service.contract import AuthorityUnavailable, JournalHea
 from sylanne3.authority_service.core import AuthorityServiceCore
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_contract import (
-    DeletionEvidenceV1, DeletionPendingV1, canonical_bytes,
+    DeletionEvidenceV1, DeletionMutationReceiptV1, DeletionPendingV1, canonical_bytes,
     deletion_scope_digest,
 )
 from sylanne3.authority_service.v2_deletion_migration import AuthorityV2DeletionMigration
@@ -146,29 +146,38 @@ def test_upgrade_rejects_changed_prefix_ddl(tmp_path):
     close(parts)
 
 
-def _pending(parts):
+def _pending(parts, *, direct_fence=False, fence_id="delete-fence-a",
+             mutation_id="deletion-mutation-a", append_id="deletion-append-a",
+             deletion_operation_id="deletion-operation-a"):
     core, fences, _, guard, execution, _, _ = parts
-    service = AuthorityV2FenceService(core=core, fences=fences, deletion=guard,
-                                      execution=execution, namespace="ns-a")
-    anchor = service.current_anchor(credential="ok", subject="subject-a")
-    permit = service.begin_fence(
-        credential="ok", subject="subject-a", holder="holder-a",
-        operation="delete", operation_id="delete-fence-a", expected_anchor=anchor)
+    if direct_fence:
+        with core._tx() as db:
+            anchor = core._anchor(db, "ns-a", core._row(db, "ns-a"))
+        permit = fences.begin_fence(
+            subject="subject-a", holder="holder-a", operation="delete",
+            operation_id=fence_id, current_anchor=anchor)
+    else:
+        service = AuthorityV2FenceService(core=core, fences=fences, deletion=guard,
+                                          execution=execution, namespace="ns-a")
+        anchor = service.current_anchor(credential="ok", subject="subject-a")
+        permit = service.begin_fence(
+            credential="ok", subject="subject-a", holder="holder-a",
+            operation="delete", operation_id=fence_id, expected_anchor=anchor)
     request_digest = "sha256:" + "a" * 64
     evidence = DeletionEvidenceV1(
         authority_id=permit.authority_id, namespace="ns-a",
-        deletion_operation_id="deletion-operation-a", kind="request_authorized",
+        deletion_operation_id=deletion_operation_id, kind="request_authorized",
         issuer_id="test-trusted-issuer", evidence_id="evidence-a",
         bound_anchor=anchor, request_digest=request_digest,
         scope_digest=deletion_scope_digest(("root-a",), 1, "policy-a"),
         proof_digest="sha256:" + "b" * 64)
     draft = DeletionPendingV1(
-        permit=permit, mutation_id="deletion-mutation-a",
-        request_digest=request_digest, deletion_operation_id="deletion-operation-a",
+        permit=permit, mutation_id=mutation_id,
+        request_digest=request_digest, deletion_operation_id=deletion_operation_id,
         source_phase="absent", target_phase="pending",
         closure_roots=("root-a",), deletion_epoch=1, policy_ref="policy-a",
         before_anchor=anchor, evidence=evidence,
-        expected_append_id="deletion-append-a",
+        expected_append_id=append_id,
         expected_append_digest="sha256:" + "0" * 64)
     pending = replace(draft, expected_append_digest=guard.expected_digest(draft))
     return pending
@@ -341,4 +350,49 @@ def test_extra_valid_chain_entry_quarantines_pending_inspection(tmp_path):
         assert guard.verified_head().seq == 2
     with pytest.raises(AuthorityUnavailable, match="extra or mismatched"):
         guard.inspect_pending(pending, core=parts[0], fences=parts[1])
+    close(parts)
+
+
+def test_historical_prefix_pending_blocks_duplicate_operation_before_append(tmp_path):
+    parts = bundle(tmp_path, create=True, old_history=True)
+    parts[5].run(credential="ok")
+    parts[6].run(credential="ok")
+    pending = _pending(parts, direct_fence=True,
+                       deletion_operation_id="old-delete")
+    _persist_fixture_pending(parts, pending)
+    with pytest.raises(AuthorityUnavailable, match="already has history"):
+        parts[3].append_pending(pending, core=parts[0], fences=parts[1])
+    with parts[3].freeze_writes():
+        assert parts[3].verified_head().seq == pending.before_anchor.deletion_seq
+    close(parts)
+
+
+def test_schema2_tail_pending_blocks_duplicate_operation_before_append(tmp_path):
+    parts = bundle(tmp_path, create=True, old_history=False)
+    parts[5].run(credential="ok")
+    parts[6].run(credential="ok")
+    first = _pending(parts)
+    _persist_fixture_pending(parts, first)
+    parts[3].append_pending(first, core=parts[0], fences=parts[1])
+    # Fixture only: simulate an Authority CAS so a second durable fence can be
+    # formed for the same deletion operation. The real CAS is not implemented.
+    with parts[0]._tx() as db:
+        db.execute("UPDATE authority_namespaces SET deletion_seq=?,deletion_digest=?,revocation_epoch=revocation_epoch+1,anchor_nonce=? WHERE namespace='ns-a'",
+                   (first.expected_deletion_seq, first.expected_append_digest,
+                    parts[0]._new_nonce()))
+        after = parts[0]._anchor(db, "ns-a", parts[0]._row(db, "ns-a"))
+        receipt = DeletionMutationReceiptV1(first, after, 1)
+        updated = replace(first.permit, revision=1, pinned_anchor=after)
+        db.execute("UPDATE authority_v2_fences SET state='finished',revision=1,permit=?,pending=NULL,finish_request_id='fixture-finish',finish_request_digest=? WHERE operation_id=?",
+                   (canonical_bytes(updated), "sha256:" + "f" * 64,
+                    first.permit.operation_id))
+        db.execute("UPDATE authority_v2_mutations SET state='committed',receipt=?,updated_permit=? WHERE mutation_id=?",
+                   (canonical_bytes(receipt), canonical_bytes(updated), first.mutation_id))
+    duplicate = _pending(parts, direct_fence=True, fence_id="delete-fence-b",
+                         mutation_id="deletion-mutation-b", append_id="deletion-append-b")
+    _persist_fixture_pending(parts, duplicate)
+    with pytest.raises(AuthorityUnavailable, match="already has history"):
+        parts[3].append_pending(duplicate, core=parts[0], fences=parts[1])
+    with parts[3].freeze_writes():
+        assert parts[3].verified_head().seq == first.expected_deletion_seq
     close(parts)

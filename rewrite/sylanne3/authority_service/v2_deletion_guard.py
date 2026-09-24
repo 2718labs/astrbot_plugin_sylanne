@@ -406,6 +406,9 @@ class AuthorityV2DeletionGuard:
         if head.journal_id != before.deletion_journal_id:
             raise AuthorityUnavailable("deletion journal identity differs")
         if (head.seq, head.digest) == (before.deletion_seq, before.deletion_digest):
+            phases = self.latest_phases()
+            if phases.get((pending.permit.namespace, pending.deletion_operation_id)) is not None:
+                raise AuthorityUnavailable("deletion operation already has history; quarantine")
             return None
         if (head.seq, head.digest) != (pending.expected_deletion_seq,
                                        pending.expected_append_digest):
@@ -428,6 +431,9 @@ class AuthorityV2DeletionGuard:
             pending.expected_append_digest)
         if row != expected:
             raise AuthorityUnavailable("deletion append fields differ; quarantine")
+        # A matching row can still be an illegal second pending for a legacy
+        # or v2 operation. Chain integrity and transition integrity are distinct.
+        self.latest_phases()
         return VerifiedDeletionAppendV2(
             pending.expected_deletion_seq, pending.expected_append_id,
             pending.mutation_id, pending.expected_append_digest)
