@@ -7,11 +7,21 @@ Only the paired Authority v2 response may supply the local start identity.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict, dataclass
 
 from ..authority_service.v2_model_egress_contract import (
-    HostObservedModelCompletionV2, ModelEgressIntentV1, ModelTerminalReceiptV2,
+    HostObservedModelCompletionV2, ModelEgressDraftV1, ModelEgressIntentV1,
+    ModelTerminalReceiptV2,
 )
+from ..authority_service.v2_model_egress_wire import from_wire as model_from_wire
+from ..graph_types import AtomKey
 from ..model_broker.broker import ModelCallRequest, ProviderResponse
+from ..model_broker.first_ingress_encoding import (
+    FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
+    FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+)
+from ..memory_types import source_key
+from ..runtime.encoding_call_binding import EncodingCallBinding, binding_to_json
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import InstallationGrantV2, canonical_serialize
 from .astrbot_model_call import AstrBotModelProvider, LocalModelAdmission
@@ -19,6 +29,28 @@ from .authority_client import AuthorityClient
 from .authority_profile import (
     AdminIngressModelPolicy, AdminInstallationBundle, AdminModelWorkflowV2,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenEncodingEgressResult:
+    """Original operation identity and a content-free terminal, if observed."""
+
+    intent: ModelEgressIntentV1
+    terminal: ModelTerminalReceiptV2 | None
+
+
+def _plain_frozen(value):
+    """Remove canonical storage type tags before strict model wire parsing."""
+    if type(value) is dict:
+        if set(value) == {"token"}:
+            return asdict(AtomKey.from_token(value["token"]))
+        if set(value) == {"$type", "token"}:
+            return asdict(AtomKey.from_token(value["token"]))
+        return {key: _plain_frozen(item) for key, item in value.items()
+                if key != "$type"}
+    if type(value) is list:
+        return [_plain_frozen(item) for item in value]
+    return value
 
 
 class HostModelEgressExecutor:
@@ -47,6 +79,132 @@ class HostModelEgressExecutor:
         self._bundle = bundle
         self._grant = grant
         self._adapter = adapter
+        self._frozen_attempts: set[str] = set()
+
+    def _frozen_encoding_request(
+        self, binding: EncodingCallBinding, draft: ModelEgressDraftV1,
+        expected_anchor: RestoreAnchor,
+    ) -> ModelCallRequest:
+        """Rebuild the immutable V2 request; Authority still checks graph truth."""
+        if (type(binding) is not EncodingCallBinding
+                or type(draft) is not ModelEgressDraftV1
+                or type(expected_anchor) is not RestoreAnchor
+                or type(self._adapter._admin_model) is not AdminModelWorkflowV2):
+            raise ValueError("V2 encoding binding, draft and anchor are required")
+        binding_to_json(binding)
+        frozen = binding.request
+        model = self._adapter._admin_model
+        policy = self._bundle.installation_policy
+        if (frozen.get("schema") != "sylanne.first-ingress-encoding-call.v2"
+                or model is not self._bundle.model_workflows.encode
+                or model.work_kind != "d06.encode_source"
+                or model.template_version != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
+                or binding.namespace != policy.namespace
+                or draft.namespace != policy.authority_namespace
+                or draft.authority_id != self._grant.authority_id
+                or expected_anchor.authority_id != draft.authority_id
+                or expected_anchor.namespace != draft.namespace):
+            raise ValueError("installed V2 encoding authority differs")
+        fields = (
+            "envelope", "call_id", "provider_id", "model_id",
+            "required_capabilities", "privacy_tier", "prompt_template_digest",
+            "payload", "timeout_seconds", "max_output_tokens",
+        )
+        request = model_from_wire(
+            {name: _plain_frozen(frozen[name]) for name in fields}, ModelCallRequest)
+        authority = request.envelope.authority
+        guard = request.envelope.version_guard
+        source_token = source_key(*binding.namespace.as_tuple, binding.source_id).token
+        if (request.digest != binding.model_request_digest
+                or request.call_id != binding.call_id
+                or request.identity.operation_id != frozen["acquire_operation_id"]
+                or request.identity.phase != "encode"
+                or request.envelope.input_refs != (source_token,)
+                or request.envelope.source_qualification.source_refs != (source_token,)
+                or request.prompt_template_digest != FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST
+                or frozen["prompt_template_version"] != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
+                or frozen["provider_config_ref"] != model.provider_config_ref
+                or frozen["provider_config_digest"] != model.provider_config_digest
+                or authority.namespace != binding.namespace
+                or authority.issuer_domain != "d11"
+                or authority.purpose != "consolidation"
+                or authority.worker_fence != frozen["worker_fence"]
+                or request.envelope.parent_budget_lease_ref != binding.budget_lease_id
+                or (draft.subject, draft.operation_id, draft.call_id,
+                    draft.request_digest, draft.job_id, draft.worker_fence)
+                != (authority.actor, request.identity.operation_id, request.call_id,
+                    request.digest, binding.job_id, frozen["worker_fence"])
+                or draft.source_refs != (binding.source_id,)
+                or draft.source_revisions != ((binding.source_id, binding.source_revision),)
+                or draft.access_revisions != ((binding.source_id, binding.access_revision),)
+                or (draft.access_epoch, draft.delete_epoch)
+                != (guard.access_epoch, guard.delete_epoch)
+                or draft.authority_activation_generation != authority.activation_generation
+                or (draft.budget_lease_id, draft.budget_reservation_operation_id)
+                != (binding.budget_lease_id, binding.budget_reservation_operation_id)
+                or (draft.provider_id, draft.model_id, draft.provider_config_digest,
+                    draft.max_output_tokens)
+                != (request.provider_id, request.model_id, model.provider_config_digest,
+                    request.max_output_tokens)
+                or not self._adapter._request_allowed(request)):
+            raise ValueError("frozen encoding request differs from original model draft")
+        return request
+
+    async def execute_frozen_encoding_once(
+        self, *, binding: EncodingCallBinding, draft: ModelEgressDraftV1,
+        expected_anchor: RestoreAnchor,
+    ) -> FrozenEncodingEgressResult | None:
+        """Prepare and spend one exact V2 call; uncertainty remains HOLD.
+
+        Re-entry in this executor never reissues prepare or admission. Across
+        host restarts the Authority's original operation/terminal must be read
+        before any new orchestration decision.
+        """
+        try:
+            request = self._frozen_encoding_request(binding, draft, expected_anchor)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if binding.call_id in self._frozen_attempts:
+            return None
+        self._frozen_attempts.add(binding.call_id)
+        try:
+            record, permit = await self._authority.model_prepare_fenced_v1(
+                self._bundle, self._grant, draft=draft,
+                expected_anchor=expected_anchor)
+        except Exception:
+            return None
+        intent = record.intent
+        if (record.state != "prepared"
+                or ModelEgressDraftV1.from_intent(intent) != draft
+                or permit.operation != "model_egress"
+                or permit.operation_id != draft.operation_id
+                or permit.pinned_anchor != expected_anchor):
+            return FrozenEncodingEgressResult(intent, None)
+        terminal = await self.execute_once(
+            intent=intent, expected_anchor=expected_anchor, request=request)
+        if terminal is None:
+            terminal = await self.recover_original_terminal(intent)
+        return FrozenEncodingEgressResult(intent, terminal)
+
+    async def recover_original_terminal(
+        self, intent: ModelEgressIntentV1,
+    ) -> ModelTerminalReceiptV2 | None:
+        """Read original Authority facts after an uncertain dispatch or finish."""
+        if type(intent) is not ModelEgressIntentV1:
+            return None
+        try:
+            record, permit, admission, receipt = (
+                await self._authority.model_terminal_fact_v2(
+                    self._bundle, self._grant, intent=intent))
+        except Exception:
+            return None
+        if (record.intent != intent
+                or permit.operation_id != intent.operation_id
+                or admission.call_id != intent.call_id
+                or receipt is None
+                or record.state != "observed"):
+            return None
+        return receipt
 
     async def execute_once(
         self, *, intent: ModelEgressIntentV1, expected_anchor: RestoreAnchor,
@@ -127,4 +285,4 @@ class HostModelEgressExecutor:
         return receipt
 
 
-__all__ = ("HostModelEgressExecutor",)
+__all__ = ("HostModelEgressExecutor", "FrozenEncodingEgressResult")

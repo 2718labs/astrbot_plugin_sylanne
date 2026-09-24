@@ -13,6 +13,9 @@ from ..authority_service.v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
     ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
 )
+from ..authority_service.v2_model_result_read_contract import (
+    ModelResultReadRequestV1, ModelResultReadV1,
+)
 from ..model_broker.broker import ModelCallRequest
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.restore_anchor import RestoreAnchor
@@ -201,6 +204,15 @@ class AuthorityTransport(Protocol):
     async def model_complete_observed_v2(self, request, handshake, grant, *, namespace,
                                          holder, intent, expected_anchor, admission,
                                          report): ...
+
+    async def model_terminal_fact_v2(self, request, handshake, grant, *, namespace,
+                                     holder, intent): ...
+
+    async def model_result_read_v1(self, request, handshake, grant, *, namespace,
+                                   read_request, owner_session_token): ...
+
+    async def model_result_read_recover_finish_v1(self, request, handshake, grant,
+                                                   *, namespace, read_request): ...
 
 
 class AuthorityClient:
@@ -398,6 +410,43 @@ class AuthorityClient:
             request, handshake, grant, namespace=policy.authority_namespace,
             holder=policy.administrator_holder, intent=intent,
             expected_anchor=expected_anchor, admission=admission, report=report)
+
+    async def model_terminal_fact_v2(
+        self, bundle, grant: InstallationGrantV2, *, intent: ModelEgressIntentV1,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2, ModelAdmissionV2,
+               ModelTerminalReceiptV2 | None]:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.model_terminal_fact_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            holder=policy.administrator_holder, intent=intent)
+
+    async def model_result_read_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: ModelResultReadRequestV1, owner_session_token: str,
+    ) -> ModelResultReadV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ModelResultReadRequestV1
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id):
+            raise RuntimeError("Owner result read differs from installed namespace")
+        return await self._transport.model_result_read_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request, owner_session_token=owner_session_token)
+
+    async def model_result_read_recover_finish_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: ModelResultReadRequestV1,
+    ) -> bool:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ModelResultReadRequestV1
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id):
+            raise RuntimeError("Owner result read differs from installed namespace")
+        return await self._transport.model_result_read_recover_finish_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
 
     async def capability_grant(self) -> AuthorityCapabilityGrant | None:
         """Return a complete runtime grant; enrollment-only facts remain blocked."""

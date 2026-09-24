@@ -27,6 +27,9 @@ from .host.authority_profile import (
 )
 from .host.v2_ingress_adapter import ingress_host_facts
 from .host.installed_package import verify_installed_package
+from .host.model_egress_executor import (
+    FrozenEncodingEgressResult, HostModelEgressExecutor,
+)
 from .host.v2_installation import V2InstallationAssembly
 from .host.v2_fence_port import V2FenceOutcomeUnknown, V2FencePort
 from .installation_policy import AdminInstallationPolicy
@@ -35,7 +38,9 @@ from .model_broker.first_ingress_encoding import (
 )
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.restore_anchor import ExecutionJournalPort
-from .runtime_contracts import InstallationGrantV2, NamespaceId
+from .runtime.restore_anchor import RestoreAnchor
+from .authority_service.v2_model_egress_contract import ModelEgressDraftV1
+from .runtime_contracts import AuthorityContext, InstallationGrantV2, NamespaceId
 from .workbench_api.async_service import AsyncGraphWorkbenchService
 from .workbench_api.domain_registry import CurrentDomainViewRegistry
 from .workbench_api.http_transport import (
@@ -161,6 +166,7 @@ class RuntimeContext:
         self._v2_port: V2FencePort | None = None
         self._v2_policy: AdminInstallationPolicy | None = None
         self._v2_installation_grant: InstallationGrantV2 | None = None
+        self._v2_model_bundle: AdminInstallationBundle | None = None
         self._v2_owner_actor: Callable[[OwnerPrincipalV1, NamespaceId], str | None] | None = None
         self._workbench_owner_sessions: BoundOwnerSessions | None = None
         self._v2_provision: Callable | None = None
@@ -409,7 +415,8 @@ class RuntimeContext:
                 (self._v2_coordinator, self._v2_bootstrap, port,
                  self._v2_policy, self._v2_owner_actor) = owner_runtime
                 self._v2_port = port if isinstance(port, V2FencePort) else None
-                self._v2_installation_grant = installation_grant
+            self._v2_installation_grant = installation_grant
+            self._v2_model_bundle = installation.admin_bundle
             self._v2_role_probe = lambda graph: graph.read_active_role_v2(
                 namespace=policy.namespace,
             )
@@ -740,6 +747,41 @@ class RuntimeContext:
             self.health = RuntimeHealth("ready")
             return self.health
 
+    async def execute_first_ingress_encoding_v2(
+        self, authority: AuthorityContext, lease: object,
+        job_id: str, acquire_operation_id: str, *,
+        executor: HostModelEgressExecutor, draft: ModelEgressDraftV1,
+        expected_anchor: RestoreAnchor,
+    ) -> FrozenEncodingEgressResult | None:
+        """Read the original graph binding, then attempt its Authority-fenced call.
+
+        The worker's read is the only request source. The separate Authority
+        admission rechecks its current graph, budget and model configuration.
+        An unresolved return is a HOLD under the original operation identity.
+        """
+        if (type(executor) is not HostModelEgressExecutor
+                or type(authority) is not AuthorityContext
+                or type(draft) is not ModelEgressDraftV1
+                or type(expected_anchor) is not RestoreAnchor
+                or self._worker is None
+                or not self._v2_namespace_provisioned
+                or authority.namespace != self._v2_namespace
+                or executor._bundle is not self._v2_model_bundle
+                or executor._grant != self._v2_installation_grant
+                or executor._bundle.installation_policy != self._v2_policy):
+            return None
+        try:
+            binding = await self._worker.call(
+                lambda graph, auth, bound_lease, job, acquire: (
+                    graph.read_first_ingress_encoding_binding_v2(
+                        auth, bound_lease, job, acquire)),
+                authority, lease, job_id, acquire_operation_id,
+            )
+        except Exception:
+            return None
+        return await executor.execute_frozen_encoding_once(
+            binding=binding, draft=draft, expected_anchor=expected_anchor)
+
     async def handle_ingress(self, envelope: HostIngressEnvelope) -> IngressReceipt:
         if not isinstance(envelope, HostIngressEnvelope):
             raise TypeError("envelope must be HostIngressEnvelope")
@@ -779,6 +821,7 @@ class RuntimeContext:
             self._v2_port = None
             self._v2_policy = None
             self._v2_installation_grant = None
+            self._v2_model_bundle = None
             self._v2_owner_actor = None
             self._workbench_owner_sessions = None
             self._v2_role_probe = None

@@ -21,6 +21,7 @@ from ..authority_service.mtls_server import (
 )
 from ..authority_service.v2_clock import AuthorityClockReadingV2
 from ..authority_service.v2_fence_service import AuthorityV2FenceService
+from ..authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
 from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationOperationV1, OwnerClaimTicketV1, OwnerPrincipalV1,
 )
@@ -192,6 +193,9 @@ def compose_owner_deployment(
     publisher_manifest_verifier: Callable[[str, str, str, str], bool],
     installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2],
     namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
+    v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
+    model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
+    model_result_source_purposes: Mapping[str, str] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
     owner_sessions: AuthorityV2OwnerSessionStore | None = None,
@@ -228,6 +232,9 @@ def compose_owner_deployment(
         publisher_manifest_verifier=publisher_manifest_verifier,
         installations_v2=installations_v2,
         namespace_bindings_v2=namespace_bindings_v2,
+        v2_model_egress=v2_model_egress,
+        model_observers_v2=model_observers_v2,
+        model_result_source_purposes=model_result_source_purposes,
         clock_provider=clock_provider, create_owner_schema=create_owner_schema,
     )
 

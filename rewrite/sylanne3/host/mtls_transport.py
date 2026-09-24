@@ -47,6 +47,12 @@ from ..authority_service.v2_model_egress_contract import (
 from ..authority_service.v2_model_egress_wire import (
     from_wire as model_from_wire, to_wire as model_to_wire,
 )
+from ..authority_service.v2_model_result_read_contract import (
+    ModelResultReadRequestV1, ModelResultReadV1,
+)
+from ..authority_service.v2_model_result_read_wire import (
+    from_wire as result_from_wire, to_wire as result_to_wire,
+)
 from ..model_broker.broker import ModelCallRequest
 from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
@@ -632,6 +638,90 @@ class MtlsAuthorityTransport:
                 or receipt.observation_digest != record.observation_digest):
             raise RuntimeError("authority model terminal receipt binding is invalid")
         return record, permit, receipt
+
+    async def model_terminal_fact_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str, holder: str,
+        intent: ModelEgressIntentV1,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2, ModelAdmissionV2,
+               ModelTerminalReceiptV2 | None]:
+        """Query the original content-free terminal; never reissue admission."""
+        self._model_identity(request, handshake, grant, namespace, holder, intent)
+        response = await self._content_rpc(
+            request, handshake, "model_terminal_fact_v2",
+            {"namespace": namespace, "holder": holder,
+             "intent": model_to_wire(intent)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"record", "permit", "admission", "receipt",
+                             "channel_binding_sha256"}:
+            raise RuntimeError("authority model terminal facts are invalid")
+        record, permit = self._model_response(
+            {key: response[key] for key in
+             ("record", "permit", "channel_binding_sha256")},
+            grant, intent, None)
+        try:
+            admission = model_from_wire(response["admission"], ModelAdmissionV2)
+            receipt = (None if response["receipt"] is None else
+                       model_from_wire(response["receipt"], ModelTerminalReceiptV2))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority model terminal facts are invalid") from exc
+        self._model_admission_binding(
+            admission, grant, request, intent, admission.host_incarnation)
+        if ((record.state == "observed") != (receipt is not None)
+                or receipt is not None and (
+                    receipt.admission_id != admission.admission_id
+                    or receipt.call_id != intent.call_id
+                    or receipt.request_digest != intent.request_digest
+                    or receipt.observation_digest != record.observation_digest
+                    or receipt.installation_id != grant.installation_id
+                    or receipt.host_incarnation != admission.host_incarnation)):
+            raise RuntimeError("authority model terminal identity differs")
+        return record, permit, admission, receipt
+
+    async def model_result_read_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: ModelResultReadRequestV1, owner_session_token: str,
+    ) -> ModelResultReadV1:
+        if (type(read_request) is not ModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id)
+                != (grant.authority_id, namespace, grant.installation_id)
+                or type(owner_session_token) is not str
+                or not owner_session_token):
+            raise RuntimeError("installed Owner result read identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "model_result_read_v1",
+            {"namespace": namespace, "read_request": result_to_wire(read_request),
+             "owner_session_token": owner_session_token},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("authority Owner result response is invalid")
+        try:
+            result = result_from_wire(response["result"], ModelResultReadV1)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority Owner result response is invalid") from exc
+        if result.call_id != read_request.call_id:
+            raise RuntimeError("authority Owner result call identity differs")
+        return result
+
+    async def model_result_read_recover_finish_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: ModelResultReadRequestV1,
+    ) -> bool:
+        if (type(read_request) is not ModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id)
+                != (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed Owner result read identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "model_result_read_recover_finish_v1",
+            {"namespace": namespace, "read_request": result_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"finished", "channel_binding_sha256"}
+                or response["finished"] is not True):
+            raise RuntimeError("authority Owner read finish is unresolved")
+        return True
 
     async def ingress_clock_sample_v2(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
