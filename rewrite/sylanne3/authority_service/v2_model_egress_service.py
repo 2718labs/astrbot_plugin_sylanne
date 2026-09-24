@@ -246,8 +246,8 @@ class AuthorityV2ModelEgressService:
         """Grant one internal dispatch admission after graph and policy checks.
 
         A model fence is held across the independent graph read. Any failure
-        closes an untouched prepared call as not_dispatched. This internal
-        method is not a production RPC or an executor-result binding.
+        closes an untouched prepared call as not_dispatched. The admission
+        marker is not a provider result or a host executor-result binding.
         """
         if (self._fences is None or type(intent) is not ModelEgressIntentV1
                 or type(expected_anchor) is not RestoreAnchor):

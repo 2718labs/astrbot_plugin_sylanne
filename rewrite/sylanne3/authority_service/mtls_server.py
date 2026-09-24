@@ -1,4 +1,8 @@
-"""Content-free stdlib mTLS JSON-RPC adapter for a separately installed Authority."""
+"""Stdlib mTLS JSON-RPC adapter for a separately installed Authority.
+
+Model admission carries a complete candidate request so Authority can verify
+its digest and policy. No provider response or result is accepted on this port.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +33,9 @@ from .v2_contract import (
     SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
 )
 from .v2_fence_service import AuthorityV2FenceService
+from .v2_model_egress_contract import ModelEgressDraftV1, ModelEgressIntentV1
+from .v2_model_egress_service import AuthorityV2ModelEgressService
+from .v2_model_egress_wire import from_wire as model_from_wire, to_wire as model_to_wire
 from .v2_execution_bridge import AuthorityV2ExecutionBridge
 from .v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
@@ -166,6 +173,7 @@ class AuthorityRpcServer:
         administrator_authorizer: Callable[[object, str, str, str | None], bool],
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
+        v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
         v2_owner_tickets: AuthorityV2OwnerTicketStore | None = None,
         v2_owner_proofs: AuthorityV2OwnerProofStore | None = None,
         v2_owner_sessions: AuthorityV2OwnerSessionStore | None = None,
@@ -199,6 +207,17 @@ class AuthorityRpcServer:
         self._administrator_authorizer = administrator_authorizer
         self._publisher_manifest_verifier = publisher_manifest_verifier
         self._v2_fences = services
+        if v2_model_egress is not None and not isinstance(v2_model_egress, Mapping):
+            raise TypeError("Authority model egress service mapping required")
+        model_services = dict(v2_model_egress or {})
+        if any(type(namespace) is not str
+               or type(service) is not AuthorityV2ModelEgressService
+               or namespace not in services or service._fences is not services[namespace]
+               or service._store._db is not core._db
+               or service._graph_verifier is None or service._admin_model_policy is None
+               for namespace, service in model_services.items()):
+            raise TypeError("model egress services require installed Authority dependencies")
+        self._v2_model_egress = model_services
         if (v2_owner_tickets is not None
                 and (type(v2_owner_tickets) is not AuthorityV2OwnerTicketStore
                      or v2_owner_tickets._core is not core)):
@@ -516,6 +535,48 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method in {"model_prepare_fenced_v1", "model_admit_dispatch_once_v1",
+                          "model_recover_fenced_v1"}:
+                expected = ({"namespace", "holder", "draft", "expected_anchor"}
+                            if method == "model_prepare_fenced_v1" else
+                            {"namespace", "holder", "intent", "expected_anchor", "request"}
+                            if method == "model_admit_dispatch_once_v1" else
+                            {"namespace", "holder", "intent"})
+                if set(command) != expected:
+                    raise AuthorityUnavailable("model command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[(credential.certificate_sha256, profile_id)]
+                holder = identifier(command["holder"], "holder")
+                model = self._v2_model_egress.get(namespace)
+                if holder != installed.administrator_holder or model is None:
+                    raise AuthorityUnavailable("installed model service or holder unavailable")
+                if method == "model_prepare_fenced_v1":
+                    draft = model_from_wire(command["draft"], ModelEgressDraftV1)
+                    anchor = self._anchor_from_command({"anchor": command["expected_anchor"]})
+                    record, permit = model.prepare_fenced(
+                        credential=credential, subject=subject, holder=holder,
+                        draft=draft, expected_anchor=anchor)
+                elif method == "model_admit_dispatch_once_v1":
+                    from ..model_broker.broker import ModelCallRequest
+                    intent = model_from_wire(command["intent"], ModelEgressIntentV1)
+                    request = model_from_wire(command["request"], ModelCallRequest)
+                    anchor = self._anchor_from_command({"anchor": command["expected_anchor"]})
+                    if not any(peer == credential.certificate_sha256
+                               and profile == profile_id and role == request.envelope.authority.namespace
+                               and mapped == namespace
+                               for (peer, profile, role), mapped in self._namespace_bindings_v2.items()):
+                        raise AuthorityUnavailable("model request namespace differs")
+                    record, permit = model.admit_dispatch_once(
+                        credential=credential, subject=subject, holder=holder,
+                        intent=intent, expected_anchor=anchor, request=request)
+                else:
+                    intent = model_from_wire(command["intent"], ModelEgressIntentV1)
+                    record, permit = model.recover_fenced(
+                        credential=credential, subject=subject, intent=intent)
+                    if permit.holder != holder:
+                        raise AuthorityUnavailable("model recovery holder differs")
+                return {"record": model_to_wire(record), "permit": to_wire(permit)}
             if method in {"current_owner_actor_binding_v1",
                           "current_owner_principal_binding_v1"}:
                 namespace = identifier(command.get("namespace"), "namespace")
