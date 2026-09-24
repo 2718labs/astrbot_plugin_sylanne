@@ -32,6 +32,8 @@ from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 from .v2_owner_proof import AuthorityV2OwnerProofStore, OwnerProofAcceptanceV1
 from .v2_owner_session import AuthorityV2OwnerSessionStore
+from .v2_self_identity_service import AuthorityV2SelfIdentityService
+from .current_self_identity_graph_verifier import PinnedCurrentSelfIdentityGraphVerifier
 from ..runtime_contracts import NamespaceId
 
 
@@ -50,10 +52,12 @@ def compose_local_owner_authority(
     model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
     accounting_observers_v2: Mapping[str, tuple[str, str]] | None = None,
     worker_result_readers_v2: Mapping[str, tuple[str, str]] | None = None,
+    self_identity_readers_v2: Mapping[str, tuple[str, str]] | None = None,
     model_result_source_purposes: Mapping[str, str] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
     create_worker_result_schema: bool = False,
+    create_self_identity_schema: bool = False,
     owner_proofs: AuthorityV2OwnerProofStore | None = None,
     current_claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1,
                                         OwnerProofAcceptanceV1], bool] | None = None,
@@ -154,6 +158,28 @@ def compose_local_owner_authority(
         creation_pairing_source=creation_pairing_source,
         create=create_owner_schema,
     )
+    self_readers = dict(self_identity_readers_v2 or {})
+    self_services = {}
+    if self_readers:
+        self_graph = PinnedCurrentSelfIdentityGraphVerifier(graph_db_path)
+        for namespace, observer in self_readers.items():
+            installed = (installations_v2.get(observer)
+                         if type(observer) is tuple and len(observer) == 2 else None)
+            roles = [role for (peer, profile, role), mapped in
+                     namespace_bindings_v2.items()
+                     if (peer, profile) == observer and mapped == namespace]
+            if (namespace not in services or installed is None
+                    or len(roles) != 1):
+                raise AuthorityUnavailable("self identity reader installation differs")
+            self_services[namespace] = AuthorityV2SelfIdentityService(
+                core=core, fences=services[namespace], owner_tickets=owner_tickets,
+                graph=self_graph, namespace_id=roles[0],
+                installation_id=installed.installation_id,
+                manifest_digest=installed.manifest_digest,
+                read_subject="mtls:sha256:" + observer[0],
+                holder=installed.administrator_holder,
+                administrator_authorizer=administrator_authorizer,
+                create=create_self_identity_schema)
     purposes = dict(model_result_source_purposes or {})
     models = dict(v2_model_egress or {})
     observers = dict(model_observers_v2 or {})
@@ -252,6 +278,8 @@ def compose_local_owner_authority(
         v2_owner_proofs=owner_proofs,
         v2_owner_sessions=owner_sessions,
         v2_owner_pairings=creation_pairing_source,
+        v2_self_identity=self_services,
+        self_identity_readers_v2=self_readers,
         administrator_authorizer=administrator_authorizer,
         publisher_manifest_verifier=publisher_manifest_verifier,
         installations_v2=installations_v2,

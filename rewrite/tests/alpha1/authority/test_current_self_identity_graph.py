@@ -12,9 +12,11 @@ from sylanne3.authority_service.v2_owner_contract import (
     canonical_digest as owner_digest,
 )
 from sylanne3.contracts import canonical_json
+from sylanne3.graph_coordinator import RoleInitializationReceiptV1
 from sylanne3.domains.d01 import PersonaActivation, PersonaBlock, PersonaPlan
 from sylanne3.graph_store import ProductionGraphStore, TypeRegistry
 from sylanne3.graph_types import AtomKey, Owner, owner_grant_key
+from sylanne3.runtime.role_resources import RoleRuntimeResourcesV1, role_resources_key
 from sylanne3.runtime_contracts import NamespaceId, SnapshotRequirementsV2, canonical_digest
 
 
@@ -59,6 +61,24 @@ def _case(tmp_path):
     activation = PersonaActivation(
         namespace, plan.plan_id, plan.version, plan.head_id,
         grant["grant_id"], 1, incarnation, anchor.activation_generation, 1)
+    role_operation = "role-init-a"
+    request_digest = "sha256:" + "e" * 64
+    resources = RoleRuntimeResourcesV1(
+        namespace.bot_id, namespace.persona_id, role_operation,
+        plan.plan_id, plan.head_id, "blueprint-a", "sha256:" + "f" * 64,
+        "model-capability-a", "model-resource-a", 1, "sha256:" + "1" * 64,
+        "budget-a", "budget-lease-a", 1, "sha256:" + "2" * 64)
+    input_digest = "sha256:" + canonical_digest({
+        "schema": "sylanne3.graph.role_initialization.v1",
+        "namespace": list(namespace.as_tuple), "operation_id": role_operation,
+        "request_digest": request_digest, "plan": asdict(plan),
+        "principal": grant["principal"], "resources": asdict(resources),
+        "owner_proof": asdict(proof),
+    })
+    attempt_id = "role-write-" + canonical_digest({
+        "namespace": list(namespace.as_tuple),
+        "operation_id": role_operation, "input_digest": input_digest,
+    })[:48]
     db.execute("INSERT INTO graph_recovery_metadata_v2 VALUES(?,?,?,?,?)",
                (*namespace.as_tuple, "sylanne3.authority.v2",
                 canonical_json(asdict(requirements)), 3))
@@ -70,12 +90,44 @@ def _case(tmp_path):
                 proof.grant_id, proof.grant_digest, incarnation,
                 proof.graph_access_epoch, proof.graph_epoch,
                 proof.graph_receipt_digest, canonical_json(asdict(proof))))
+    role_permit = fences.begin_fence(
+        credential="ok", subject="subject-a", holder="holder-a",
+        operation="write", operation_id=attempt_id, expected_anchor=anchor)
+    finish_id = "finish:" + role_permit.operation_id
+    finish_digest = "sha256:" + canonical_digest({
+        "operation_id": role_permit.operation_id,
+        "permit_token": role_permit.token,
+        "action": "finish_role_initialization",
+        "business_operation_id": role_operation,
+        "input_digest": input_digest,
+    })
+    from sylanne3.authority_service.v2_contract import to_wire as fence_to_wire
+    receipt = RoleInitializationReceiptV1(
+        namespace, role_operation, request_digest, input_digest,
+        plan.plan_id, plan.head_id, grant["grant_id"], 1,
+        owner_guard.authorization_head, incarnation, 2, 2,
+        role_permit.operation_id, finish_id, finish_digest)
+    db.execute("INSERT INTO graph_role_init_intents_v1 VALUES(?,?,?,?,?,?,?,?,?)",
+               (*namespace.as_tuple, role_operation, input_digest,
+                role_permit.operation_id, canonical_json(asdict(requirements)),
+                canonical_json(asdict(anchor)), 1, 1))
+    db.execute("INSERT INTO graph_role_init_request_proofs_v1 VALUES(?,?,?,?,?)",
+               (*namespace.as_tuple, role_operation, request_digest, input_digest))
+    db.execute("INSERT INTO graph_role_init_receipts_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+               (*namespace.as_tuple, role_operation, input_digest,
+                canonical_json(fence_to_wire(role_permit)),
+                canonical_json(asdict(receipt)), 1, 1, 2, 2,
+                finish_id, finish_digest))
+    fences.finish_fence(
+        credential="ok", subject="subject-a", permit=role_permit,
+        request_id=finish_id, request_digest=finish_digest)
     for key, value in (
             (owner_grant_key(*namespace.as_tuple), grant),
             (AtomKey(Owner("persona", *namespace.as_tuple),
                      "d01.persona_plan.v1", plan.plan_id), asdict(plan)),
             (AtomKey(Owner("persona", *namespace.as_tuple),
-                     "d01.persona_activation.v1", "current"), asdict(activation))):
+                     "d01.persona_activation.v1", "current"), asdict(activation)),
+            (role_resources_key(namespace, plan.plan_id), asdict(resources))):
         db.execute("INSERT INTO graph_atoms VALUES(?,?,?,?,?,?,?,?,?,1)",
                    (key.token, *namespace.as_tuple, key.owner.kind,
                     key.owner.subject, key.type_name, key.name, 1,
@@ -89,10 +141,21 @@ def test_real_graph_store_current_role_and_revocation_negative(tmp_path):
     verifier, ns, anchor, owner_guard, graph, core, deletion, guard, execution = _case(tmp_path)
     try:
         assert verifier.current(ns, anchor, "installation-a", owner_guard) == (
-            "graph-incarnation-a", "plan-a@1")
+            "graph-incarnation-a", "plan-a@1", 3, 3)
         assert verifier.current(ns, anchor, "other-installation", owner_guard) is None
         assert verifier.current(ns, anchor, "installation-a", replace(
             owner_guard, pending_revoke_operation_id="revoke-a")) is None
+        original_role = graph._db.execute(
+            "SELECT * FROM graph_role_init_receipts_v1").fetchone()
+        graph._db.execute("DELETE FROM graph_role_init_receipts_v1")
+        graph._db.commit()
+        assert verifier.current(ns, anchor, "installation-a", owner_guard) is None
+        graph._db.execute(
+            "INSERT INTO graph_role_init_receipts_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            original_role)
+        graph._db.commit()
+        assert verifier.current(ns, anchor, "installation-a", owner_guard) == (
+            "graph-incarnation-a", "plan-a@1", 3, 3)
         graph._db.execute("UPDATE graph_authority_epochs SET delete_epoch=1")
         graph._db.commit()
         assert verifier.current(ns, anchor, "installation-a", owner_guard) is None

@@ -33,9 +33,11 @@ def _case(tmp_path, monkeypatch):
     graph_path = tmp_path / "graph.db"
     graph_path.touch()
     graph = PinnedCurrentSelfIdentityGraphVerifier(graph_path)
-    monkeypatch.setattr(graph, "current", lambda *_: ("graph-incarnation-a", "role-a@1"))
+    monkeypatch.setattr(graph, "current", lambda *_: (
+        "graph-incarnation-a", "role-a@1", 3, 3))
     service = AuthorityV2SelfIdentityService(
         core=core, fences=fences, owner_tickets=tickets, graph=graph,
+        namespace_id=NS,
         installation_id="installation-a", manifest_digest="c" * 64,
         read_subject=SUBJECT, holder="holder-a",
         administrator_authorizer=lambda credential, action, ns, installation:
@@ -60,6 +62,15 @@ def test_real_store_admin_registration_replay_replacement_and_revocation(tmp_pat
         first = service.mutate(credential="admin", subject=SUBJECT, mutation=mutation)
         assert (first.revision, first.revocation_epoch, first.state) == (1, 0, "active")
         assert service.mutate(credential="admin", subject=SUBJECT, mutation=mutation) == first
+        with core._tx() as db:
+            assert db.execute(
+                "SELECT registration_subject FROM authority_self_identity_heads_v1 "
+                "WHERE authority_namespace='ns-a'").fetchone() == (SUBJECT,)
+            assert db.execute(
+                "SELECT administrator_subject FROM authority_self_identity_operations_v1 "
+                "WHERE operation_id='register-a'").fetchone() == (SUBJECT,)
+        with pytest.raises(AuthorityUnavailable, match="replay differs"):
+            service.mutate(credential="admin", subject="different-admin", mutation=mutation)
         with pytest.raises(AuthorityUnavailable, match="replay differs"):
             service.mutate(credential="admin", subject=SUBJECT,
                            mutation=replace(mutation, self_entity_ref="entity:other"))
@@ -88,11 +99,14 @@ def test_active_read_fence_excludes_admin_change_and_current_is_fence_bound(tmp_
         permit = service._fences.begin_fence(
             credential="ok", subject=SUBJECT, holder="holder-a",
             operation="read", operation_id="read-self-a", expected_anchor=anchor)
+        assert service.mutate(credential="admin", subject=SUBJECT,
+                              mutation=mutation).operation_id == mutation.operation_id
         request = SelfIdentityCurrentRequestV1(
             anchor.authority_id, "ns-a", NS, "installation-a", "c" * 64,
             "d03-self-perspective-a", permit)
         current = service.current(credential="ok", subject=SUBJECT, request=request)
         assert current is not None
+        assert (current.graph_revision, current.graph_epoch) == (3, 3)
         assert (current.self_entity_ref, current.registration_operation_id,
                 current.registration_digest, current.permit) == (
                     "entity:role-a", mutation.operation_id, mutation.request_digest, permit)

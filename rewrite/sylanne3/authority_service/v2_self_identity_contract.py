@@ -94,6 +94,7 @@ class SelfIdentityCurrentRequestV1:
 
 @dataclass(frozen=True, slots=True)
 class AuthorityCurrentSelfIdentityV1:
+    """One fenced graph snapshot; a later business commit rechecks its stamp."""
     namespace: NamespaceId
     authority_namespace: str
     authority_id: str
@@ -102,6 +103,8 @@ class AuthorityCurrentSelfIdentityV1:
     activation_generation: int
     graph_incarnation: str
     role_head_id: str
+    graph_revision: int
+    graph_epoch: int
     persona_ref: str
     self_entity_ref: str
     mapping_id: str
@@ -133,6 +136,8 @@ class AuthorityCurrentSelfIdentityV1:
         if not self.mapping_id.startswith("self-map:"):
             raise ValueError("self identity mapping ID differs")
         if (type(self.mapping_revision) is not int or self.mapping_revision < 1
+                or type(self.graph_revision) is not int or self.graph_revision < 1
+                or type(self.graph_epoch) is not int or self.graph_epoch < 1
                 or type(self.mapping_revocation_epoch) is not int
                 or self.mapping_revocation_epoch < 0
                 or type(self.activation_generation) is not int

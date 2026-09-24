@@ -71,6 +71,12 @@ from .v2_owner_contract import (
     from_wire as owner_from_wire, to_wire as owner_to_wire,
 )
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from .v2_self_identity_contract import (
+    SelfIdentityCurrentRequestV1, SelfIdentityMutationV1,
+    from_wire as self_identity_from_wire, to_wire as self_identity_to_wire,
+)
+from .v2_self_identity_service import AuthorityV2SelfIdentityService
+from .current_self_identity_graph_verifier import PinnedCurrentSelfIdentityGraphVerifier
 from .v2_owner_proof import (
     AuthorityV2OwnerProofStore, OwnerCredentialRegistrationV1,
     OwnerProofChallengeV1, OwnerProofRequestV1,
@@ -226,6 +232,8 @@ class AuthorityRpcServer:
         v2_owner_proofs: AuthorityV2OwnerProofStore | None = None,
         v2_owner_sessions: AuthorityV2OwnerSessionStore | None = None,
         v2_owner_pairings: AuthorityOwnerPairingSource | None = None,
+        v2_self_identity: Mapping[str, AuthorityV2SelfIdentityService] | None = None,
+        self_identity_readers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_final_handoff_authorizers: Mapping[str, Callable] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
@@ -326,6 +334,34 @@ class AuthorityRpcServer:
             namespace_to_role[namespace] = role
             role_to_namespace[role] = namespace
         self._namespace_bindings_v2 = bindings
+        self_identity_services = dict(v2_self_identity or {})
+        self_identity_readers = dict(self_identity_readers_v2 or {})
+        if (set(self_identity_services) != set(self_identity_readers)
+                or any(type(namespace) is not str or namespace not in services
+                       or type(service) is not AuthorityV2SelfIdentityService
+                       or service._core is not core
+                       or service._fences is not services[namespace]
+                       or service._tickets is not v2_owner_tickets
+                       or type(service._graph) is not PinnedCurrentSelfIdentityGraphVerifier
+                       or type(service._namespace_id) is not NamespaceId
+                       or type(self_identity_readers[namespace]) is not tuple
+                       or len(self_identity_readers[namespace]) != 2
+                       or self_identity_readers[namespace] not in installed
+                       or not any(peer == self_identity_readers[namespace][0]
+                                      and profile == self_identity_readers[namespace][1]
+                                      and role == service._namespace_id
+                                      and mapped == namespace
+                                      for (peer, profile, _), mapped in bindings.items())
+                       or (service._read_subject, service._installation_id,
+                           service._manifest_digest, service._holder) != (
+                               "mtls:sha256:" + self_identity_readers[namespace][0],
+                               installed[self_identity_readers[namespace]].installation_id,
+                               installed[self_identity_readers[namespace]].manifest_digest,
+                               installed[self_identity_readers[namespace]].administrator_holder)
+                       for namespace, service in self_identity_services.items())):
+            raise TypeError("self identity requires an installed namespace-bound reader")
+        self._v2_self_identity = self_identity_services
+        self._self_identity_readers_v2 = self_identity_readers
         observers = dict(model_observers_v2 or {})
         if any(namespace not in model_services
                or type(observer) is not tuple or len(observer) != 2
@@ -667,6 +703,45 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method in {"self_identity_mutate_v1", "self_identity_current_v1"}:
+                expected = ({"namespace", "mutation"}
+                            if method == "self_identity_mutate_v1" else
+                            {"namespace", "current_request"})
+                if set(command) != expected:
+                    raise AuthorityUnavailable("self identity command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                service = self._v2_self_identity.get(namespace)
+                if service is None:
+                    raise AuthorityUnavailable("self identity service is unavailable")
+                if method == "self_identity_mutate_v1":
+                    mutation = self_identity_from_wire(
+                        command["mutation"])
+                    if (type(mutation) is not SelfIdentityMutationV1
+                            or mutation.authority_id != self._authority_id()
+                            or mutation.authority_namespace != namespace
+                            or mutation.namespace != service._namespace_id):
+                        raise AuthorityUnavailable("self identity mutation differs")
+                    receipt = service.mutate(
+                        credential=credential, subject=subject, mutation=mutation)
+                    return {"receipt": asdict(receipt)}
+                if self._self_identity_readers_v2.get(namespace) != (
+                        credential.certificate_sha256, profile_id):
+                    raise AuthorityUnavailable("designated self identity reader differs")
+                request = self_identity_from_wire(
+                    command["current_request"])
+                if (type(request) is not SelfIdentityCurrentRequestV1
+                        or request.authority_id != self._authority_id()
+                        or request.authority_namespace != namespace
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            request.namespace)) != namespace):
+                    raise AuthorityUnavailable("self identity read installation differs")
+                current = service.current(
+                    credential=credential, subject=subject, request=request)
+                return {"current": None if current is None
+                        else self_identity_to_wire(current)}
             if method in {"worker_model_result_read_v1",
                           "worker_model_result_recover_finish_v1"}:
                 if set(command) != {"namespace", "read_request"}:

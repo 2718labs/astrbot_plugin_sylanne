@@ -38,12 +38,14 @@ _HEAD = """CREATE TABLE authority_self_identity_heads_v1 (
     revocation_epoch INTEGER NOT NULL CHECK(revocation_epoch >= 0),
     state TEXT NOT NULL CHECK(state IN ('active','revoked')),
     registration_operation_id TEXT NOT NULL,
-    registration_digest TEXT NOT NULL
+    registration_digest TEXT NOT NULL,
+    registration_subject TEXT NOT NULL
 ) STRICT"""
 _OPERATIONS = """CREATE TABLE authority_self_identity_operations_v1 (
     operation_id TEXT PRIMARY KEY,
     authority_namespace TEXT NOT NULL,
     request_digest TEXT NOT NULL,
+    administrator_subject TEXT NOT NULL,
     receipt_json TEXT NOT NULL
 ) STRICT"""
 
@@ -76,6 +78,7 @@ class AuthorityV2SelfIdentityService:
                  fences: AuthorityV2FenceService,
                  owner_tickets: AuthorityV2OwnerTicketStore,
                  graph: PinnedCurrentSelfIdentityGraphVerifier,
+                 namespace_id: NamespaceId,
                  installation_id: str, manifest_digest: str,
                  read_subject: str, holder: str,
                  administrator_authorizer: Callable[[object, str, str, str], bool],
@@ -89,6 +92,8 @@ class AuthorityV2SelfIdentityService:
                 or fences.fences._lock is not core._lock
                 or not callable(administrator_authorizer)):
             raise AuthorityUnavailable("self identity needs the installed Authority composition")
+        if type(namespace_id) is not NamespaceId:
+            raise AuthorityUnavailable("installed self identity namespace is required")
         for name, value in (("installation_id", installation_id),
                             ("read_subject", read_subject), ("holder", holder)):
             identifier(value, name)
@@ -97,6 +102,7 @@ class AuthorityV2SelfIdentityService:
             raise AuthorityUnavailable("installed manifest digest differs")
         self._core, self._fences, self._tickets = core, fences, owner_tickets
         self._graph = graph
+        self._namespace_id = namespace_id
         self._installation_id, self._manifest_digest = installation_id, manifest_digest
         self._read_subject, self._holder = read_subject, holder
         self._admin_authorizer = administrator_authorizer
@@ -127,7 +133,7 @@ class AuthorityV2SelfIdentityService:
         return db.execute(
             "SELECT namespace_json,installation_id,manifest_digest,mapping_id,"
             "self_entity_ref,revision,revocation_epoch,state,"
-            "registration_operation_id,registration_digest "
+            "registration_operation_id,registration_digest,registration_subject "
             "FROM authority_self_identity_heads_v1 WHERE authority_namespace=?",
             (namespace,)).fetchone()
 
@@ -141,6 +147,7 @@ class AuthorityV2SelfIdentityService:
         identifier(subject, "subject")
         if (type(mutation) is not SelfIdentityMutationV1
                 or mutation.authority_namespace != self._fences.namespace
+                or mutation.namespace != self._namespace_id
                 or mutation.installation_id != self._installation_id
                 or mutation.manifest_digest != self._manifest_digest):
             raise AuthorityUnavailable("self identity mutation installation differs")
@@ -157,36 +164,35 @@ class AuthorityV2SelfIdentityService:
             anchor = self._current_namespace(db, deletion_head, execution_head)
             if (history or mutation.authority_id != anchor.authority_id):
                 raise AuthorityUnavailable("self identity namespace is not current")
-            # This check is in the same short transaction as the mutation.  A
-            # concurrent content fence cannot start before this transaction ends.
-            AuthorityV2FenceStore.require_idle_owner_write_in_tx(
-                db, mutation.authority_namespace)
             prior = db.execute(
-                "SELECT authority_namespace,request_digest,receipt_json FROM "
+                "SELECT authority_namespace,request_digest,administrator_subject,receipt_json FROM "
                 "authority_self_identity_operations_v1 WHERE operation_id=?",
                 (mutation.operation_id,)).fetchone()
             if prior is not None:
-                if prior[:2] != (mutation.authority_namespace,
-                                 mutation.request_digest):
+                if prior[:3] != (mutation.authority_namespace,
+                                 mutation.request_digest, subject):
                     raise AuthorityUnavailable("self identity operation ID replay differs")
-                receipt = SelfIdentityMutationReceiptV1(**json.loads(prior[2]))
-                if canonical_json(asdict(receipt)) != prior[2]:
+                receipt = SelfIdentityMutationReceiptV1(**json.loads(prior[3]))
+                if canonical_json(asdict(receipt)) != prior[3]:
                     raise AuthorityUnavailable("stored self identity operation differs")
                 return receipt
+            # Recovery of an exact original operation is read-only and must
+            # work even if a later read fence is active. New mutations wait.
+            AuthorityV2FenceStore.require_idle_owner_write_in_tx(
+                db, mutation.authority_namespace)
             head = self._head(db, mutation.authority_namespace)
             current_revision = 0 if head is None else head[5]
             if current_revision != mutation.expected_revision:
                 raise AuthorityUnavailable("self identity revision changed")
-            if head is not None and (head[0] != canonical_json(asdict(mutation.namespace))
-                                     or head[1:3] != (mutation.installation_id,
-                                                       mutation.manifest_digest)):
-                raise AuthorityUnavailable("self identity installation changed")
+            if head is not None and head[0] != canonical_json(asdict(mutation.namespace)):
+                raise AuthorityUnavailable("self identity namespace changed")
             if mutation.action == "revoke":
                 if head is None or head[7] != "active" or head[4] != mutation.self_entity_ref:
                     raise AuthorityUnavailable("active self identity is absent")
                 mapping_id = head[3]
                 revocation_epoch = head[6] + 1
                 registration_operation_id, registration_digest = head[8:10]
+                registration_subject = head[10]
                 state = "revoked"
             else:
                 mapping_id = "self-map:" + canonical_digest({
@@ -198,23 +204,25 @@ class AuthorityV2SelfIdentityService:
                 revocation_epoch = 0 if head is None else head[6] + 1
                 registration_operation_id = mutation.operation_id
                 registration_digest = mutation.request_digest
+                registration_subject = subject
                 state = "active"
             revision = current_revision + 1
             new_head = (canonical_json(asdict(mutation.namespace)),
                         mutation.installation_id, mutation.manifest_digest,
                         mapping_id, mutation.self_entity_ref, revision,
                         revocation_epoch, state, registration_operation_id,
-                        registration_digest)
+                        registration_digest, registration_subject)
             if head is None:
                 db.execute(
-                    "INSERT INTO authority_self_identity_heads_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO authority_self_identity_heads_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (mutation.authority_namespace, *new_head))
             else:
                 changed = db.execute(
                     "UPDATE authority_self_identity_heads_v1 SET namespace_json=?,"
                     "installation_id=?,manifest_digest=?,mapping_id=?,self_entity_ref=?,"
                     "revision=?,revocation_epoch=?,state=?,registration_operation_id=?,"
-                    "registration_digest=? WHERE authority_namespace=? AND revision=?",
+                    "registration_digest=?,registration_subject=? "
+                    "WHERE authority_namespace=? AND revision=?",
                     (*new_head, mutation.authority_namespace, current_revision),
                 ).rowcount
                 if changed != 1:
@@ -224,9 +232,9 @@ class AuthorityV2SelfIdentityService:
                 mutation.authority_namespace, mapping_id, revision,
                 revocation_epoch, state)
             db.execute(
-                "INSERT INTO authority_self_identity_operations_v1 VALUES(?,?,?,?)",
+                "INSERT INTO authority_self_identity_operations_v1 VALUES(?,?,?,?,?)",
                 (mutation.operation_id, mutation.authority_namespace,
-                 mutation.request_digest, canonical_json(asdict(receipt))))
+                 mutation.request_digest, subject, canonical_json(asdict(receipt))))
             return receipt
 
     def _read_locked(self, db, deletion_head, execution_head, history,
@@ -277,6 +285,7 @@ class AuthorityV2SelfIdentityService:
         identifier(subject, "subject")
         if (type(request) is not SelfIdentityCurrentRequestV1
                 or request.authority_namespace != self._fences.namespace
+                or request.namespace != self._namespace_id
                 or request.installation_id != self._installation_id
                 or request.manifest_digest != self._manifest_digest
                 or subject != self._read_subject):
@@ -298,7 +307,7 @@ class AuthorityV2SelfIdentityService:
                                       history, credential, subject, request)
             if after != before:
                 raise AuthorityUnavailable("self identity changed during graph read")
-        graph_incarnation, role_head_id = current_graph
+        graph_incarnation, role_head_id, graph_revision, graph_epoch = current_graph
         return AuthorityCurrentSelfIdentityV1(
             namespace=request.namespace,
             authority_namespace=request.authority_namespace,
@@ -308,6 +317,7 @@ class AuthorityV2SelfIdentityService:
             activation_generation=anchor.activation_generation,
             graph_incarnation=graph_incarnation,
             role_head_id=role_head_id,
+            graph_revision=graph_revision, graph_epoch=graph_epoch,
             persona_ref="persona:" + request.namespace.persona_id,
             self_entity_ref=head[4], mapping_id=head[3],
             mapping_revision=head[5], mapping_revocation_epoch=head[6],
