@@ -65,7 +65,7 @@ _MAX_INFLIGHT_DISPATCHES = 32
 _SESSION_TTL_SECONDS = 30.0
 AUTHORITY_PROTOCOL = "sylanne3.authority.v1"
 _ENROLLMENT_CAPABILITIES = ("enrollment",)
-_V2_REMOTE_CONTENT_OPERATIONS = CONTENT_OPERATIONS - {"dispatch"}
+_V2_REMOTE_CONTENT_OPERATIONS = CONTENT_OPERATIONS - {"dispatch", "model_egress"}
 
 
 def _canonical(value: object) -> bytes:

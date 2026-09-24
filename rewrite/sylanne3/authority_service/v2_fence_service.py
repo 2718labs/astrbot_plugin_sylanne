@@ -239,6 +239,9 @@ class AuthorityV2FenceService:
         identifier(subject, "subject")
         identifier(holder, "holder")
         identifier(operation_id, "operation_id")
+        if operation == "model_egress":
+            raise AuthorityUnavailable(
+                "model_egress fence requires atomic typed model preparation")
         if type(expected_anchor) is not RestoreAnchor or expected_anchor.namespace != self.namespace:
             raise AuthorityUnavailable("expected full v2 anchor is required")
         self.core._require(credential, operation, self.namespace, holder)

@@ -398,6 +398,9 @@ class AuthorityV2FenceStore:
                     effect_id: str | None = None, command_digest: str | None = None,
                     footprint_digest: str | None = None) -> FencePermitV2:
         """Issue a service-generated token; same active operation ID is retryable."""
+        if operation == "model_egress":
+            raise AuthorityUnavailable(
+                "model_egress fence requires atomic typed model preparation")
         identifier(subject, "subject")
         identifier(holder, "holder")
         operation_id = identifier(str(uuid.uuid4()) if operation_id is None else operation_id,

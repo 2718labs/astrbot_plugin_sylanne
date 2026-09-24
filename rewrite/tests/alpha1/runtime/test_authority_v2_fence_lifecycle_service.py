@@ -205,13 +205,9 @@ def test_execution_journal_drift_rejects_live_permit(installed):
                                 namespace="ns-a")[1] == "active"
 
 
-def test_generic_service_finish_holds_model_egress(installed):
+def test_generic_service_begin_rejects_unbound_model_egress(installed):
     connect, _ = installed
     service, fences, _, _ = connect(create=True)
-    permit = begin(service, operation="model_egress")
-    assert validate(service, permit) == permit
-    with pytest.raises(AuthorityUnavailable, match="model_egress.*HOLD"):
-        finish(service, permit)
-    assert fences.get_operation(
-        permit.operation_id, subject="subject-a", namespace="ns-a"
-    ) == (permit, "active", None)
+    with pytest.raises(AuthorityUnavailable, match="atomic typed"):
+        begin(service, operation="model_egress")
+    assert fences._row(service.core._db, "operation-a") is None

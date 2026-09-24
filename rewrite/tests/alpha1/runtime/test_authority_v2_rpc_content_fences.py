@@ -130,24 +130,15 @@ def test_finishable_contract_content_operations_round_trip(rpc):
             call("validate_fence", {"permit": permit_wire})
 
 
-def test_model_egress_rpc_generic_finish_holds_active_permit(rpc):
+def test_model_egress_rpc_generic_begin_cannot_orphan_permit(rpc):
     call = paired(rpc, _PEER_A, b"channel-a")
     anchor = call("current_anchor", {"namespace": "ns-a"})
     anchor.pop("channel_binding_sha256")
-    permit_wire = call("begin_fence", begin_command(
-        anchor, "model_egress", "begin-model-egress"))["permit"]
-    assert call("validate_fence", {"permit": permit_wire})["permit"] == permit_wire
     with pytest.raises(RuntimeError, match="authority unavailable"):
-        call("finish_fence", {
-            "permit": permit_wire, "request_id": "finish-model-egress",
-            "request_digest": "sha256:" + "d" * 64,
-        })
-    operation = call("get_fence_operation", {
-        "namespace": "ns-a", "operation_id": "begin-model-egress",
-    })
-    assert operation["permit"] == permit_wire
-    assert operation["state"] == "active"
-    assert call("validate_fence", {"permit": permit_wire})["permit"] == permit_wire
+        call("begin_fence", begin_command(
+            anchor, "model_egress", "begin-model-egress"))
+    assert rpc._v2_fences["ns-a"].fences._row(
+        rpc._core._db, "begin-model-egress") is None
 
 
 def test_begin_rejects_dispatch_unknown_operations_and_extra_fields(rpc):
@@ -173,7 +164,7 @@ def test_other_mtls_peer_cannot_validate_or_finish_content_permit(rpc):
     anchor.pop("channel_binding_sha256")
     with pytest.raises(RuntimeError, match="authority unavailable"):
         second("current_anchor", {"namespace": "ns-a"})
-    permit = first("begin_fence", begin_command(anchor, "model_egress", "egress-a"))["permit"]
+    permit = first("begin_fence", begin_command(anchor, "read", "read-a"))["permit"]
     with pytest.raises(RuntimeError, match="authority unavailable"):
         second("validate_fence", {"permit": permit})
     with pytest.raises(RuntimeError, match="authority unavailable"):

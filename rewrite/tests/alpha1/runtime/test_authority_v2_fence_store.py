@@ -112,24 +112,12 @@ def test_exclusive_retry_finish_epoch_and_restart(tmp_path):
     db.close()
 
 
-def test_generic_store_finish_holds_model_egress(tmp_path):
+def test_generic_store_begin_rejects_unbound_model_egress(tmp_path):
     db, store = open_store(tmp_path / "model-egress.db", create=True)
     try:
-        permit = begin(store, operation="model_egress")
-        assert store.validate_fence(
-            permit, subject="subject-a", current_anchor=anchor()) == permit
-        with pytest.raises(AuthorityUnavailable, match="model_egress.*HOLD"):
-            finish(store, permit)
-        with pytest.raises(AuthorityUnavailable, match="model_egress.*HOLD"):
-            with store._tx() as transaction:
-                store.finish_fence_locked(
-                    transaction, permit, subject="subject-a",
-                    current_anchor=anchor(), request_id="finish-locked",
-                    request_digest=digest("e"),
-                )
-        assert store.get_operation(
-            permit.operation_id, subject="subject-a", namespace="ns-a"
-        ) == (permit, "active", None)
+        with pytest.raises(AuthorityUnavailable, match="atomic typed"):
+            begin(store, operation="model_egress")
+        assert store._row(db, "op-a") is None
     finally:
         db.close()
 
