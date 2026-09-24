@@ -307,9 +307,16 @@ class ContextProvider:
                         or (write.key.owner.kind == "scene"
                             and write.key.owner.subject != decoded.scene_ref)):
                     raise ValueError("role binding graph identity differs from its payload")
-        if any(write.key.type_name == "d03.world_event"
-               and write.value.get("kind") == "message_received"
-               for write in proposal.typed_writes):
+        host_events = tuple(
+            write for write in proposal.typed_writes
+            if write.key.type_name == "d03.world_event"
+            and (write.value.get("kind") == "message_received"
+                 or write.value.get("reality") == "host_observed")
+        )
+        if host_events and any(write.value.get("kind") != "message_received"
+                               for write in host_events):
+            raise ValueError("trusted host scene evidence is unavailable for host-observed events")
+        if host_events:
             from .message_arrival import validate_message_arrival_snapshot
             validate_message_arrival_snapshot(proposal, snapshot)
         return proposal

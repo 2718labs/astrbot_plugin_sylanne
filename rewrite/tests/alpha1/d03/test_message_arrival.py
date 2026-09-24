@@ -150,7 +150,22 @@ def test_compiled_arrival_guards_source_access_and_both_target_keys():
         GraphAtom(candidate.sender_key, 0, {}, False),
         GraphAtom(candidate.event_key, 0, {}, False),
     ), (NamespaceEpoch("bot", "persona", 1),))
-    assert ContextProvider().validate(proposal, snapshot) == proposal
+    with pytest.raises(ValueError, match="trusted host scene evidence"):
+        ContextProvider().validate(proposal, snapshot)
+    altered_scene = replace(
+        proposal.typed_writes[-1],
+        value={**proposal.typed_writes[-1].value, "scene_ref": "scene:other"},
+    )
+    altered = replace(proposal, typed_writes=proposal.typed_writes[:-1] + (altered_scene,))
+    with pytest.raises(ValueError, match="trusted host scene evidence"):
+        ContextProvider().validate(altered, snapshot)
+    disguised_event = replace(
+        proposal.typed_writes[-1],
+        value={**proposal.typed_writes[-1].value, "kind": "message_arrival"},
+    )
+    disguised = replace(proposal, typed_writes=proposal.typed_writes[:-1] + (disguised_event,))
+    with pytest.raises(ValueError, match="trusted host scene evidence"):
+        ContextProvider().validate(disguised, snapshot)
 
 
 def test_compiled_arrival_reuses_existing_compatible_account_anchor():
@@ -206,7 +221,8 @@ def test_provider_rechecks_reused_anchor_against_transaction_snapshot():
         (NamespaceEpoch("bot", "persona", 1),),
     )
     provider = ContextProvider()
-    assert provider.validate(proposal, good) == proposal
+    with pytest.raises(ValueError, match="trusted host scene evidence"):
+        provider.validate(proposal, good)
     conflicting = GraphAtom(
         candidate.sender_key, 3, {**sender_atom.value, "kind": "person"},
     )

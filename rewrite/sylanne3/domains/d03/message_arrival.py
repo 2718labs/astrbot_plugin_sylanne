@@ -294,6 +294,14 @@ def validate_message_arrival_snapshot(
             or {ref.key for ref in proposal.dependencies.current_invalidation}
             != {source, access, sender}):
         raise ValueError("message arrival lost source, access, or sender dependencies")
+    # A reported D06 source can carry speaker, audience and provenance strings
+    # without being a D11 host ingress. The sealed first-ingress observation
+    # currently retains only a fingerprint, not the platform/conversation/
+    # sender/message tuple needed to rebuild scene, account and event IDs.
+    # Thus every such identity in this proposal is caller-controlled. W01/W09
+    # must supply a versioned D11 receipt, independently checked in the same
+    # read fence, before any host-observed arrival can be adopted.
+    raise ValueError("trusted host scene evidence is unavailable for message arrival")
 
 
 __all__ = (
