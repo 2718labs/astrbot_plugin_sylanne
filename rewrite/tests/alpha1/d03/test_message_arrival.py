@@ -9,12 +9,20 @@ from sylanne3.domains.d03 import message_arrival
 from sylanne3.domains.d03.context import ContextProvider
 from sylanne3.domains.d03.message_arrival import build_message_arrival_candidate
 from sylanne3.domains.d06 import D06DomainAdapter, SourceAdmission
-from sylanne3.graph_types import GraphAtom, GraphSnapshot, GraphVersion, NamespaceEpoch
+from sylanne3.graph_types import (
+    AtomKey, GraphAtom, GraphSnapshot, GraphVersion, IngressIdentityReceipt,
+    NamespaceEpoch, Owner,
+)
+from sylanne3.graph_coordinator import (
+    IngressHostFacts, IngressLineage, ingress_host_fingerprint,
+    ingress_host_identity_json,
+)
 from sylanne3.host.ingress import HostIngressEnvelope, SourceLineage
 from sylanne3.memory_types import access_key, source_key
 from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
+from sylanne3.runtime.first_ingress_v2 import ingress_ids
 from sylanne3.runtime_contracts import (
-    AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
+    AuthorityContext, CommandEnvelope, DependencySet, NamespaceId, OperationIdentity,
     QueryEpoch, RUNTIME_SCHEMA, VersionGuard, canonical_digest,
 )
 
@@ -229,3 +237,102 @@ def test_provider_rechecks_reused_anchor_against_transaction_snapshot():
     bad = replace(good, atoms=(source_atom, access_atom, conflicting, event_absent))
     with pytest.raises(ValueError, match="sender anchor"):
         provider.validate(proposal, bad)
+
+
+def test_self_consistent_event_and_sender_rewrites_still_need_d11_ingress_proof():
+    envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
+    proposal = message_arrival.build_message_arrival_proposal(
+        envelope, candidate, sender_atom=sender_atom,
+    )
+    _, _, admitted, access, _, _ = _inputs()
+    source_atom = GraphAtom(candidate.source_version.key, 1, admitted.source.to_dict())
+    access_atom = GraphAtom(candidate.access_version.key, 1, access)
+    provider = ContextProvider()
+
+    other_event_id = "world:other-arrival"
+    other_event_key = AtomKey(
+        Owner("event", "bot", "persona", other_event_id), "d03.world_event", "current",
+    )
+    event_write = replace(
+        proposal.typed_writes[0], key=other_event_key,
+        value={**proposal.typed_writes[0].value, "event_id": other_event_id},
+    )
+    event_proposal = replace(proposal, typed_writes=(event_write,))
+    event_snapshot = GraphSnapshot(
+        (source_atom, access_atom, sender_atom, GraphAtom(other_event_key, 0, {}, False)),
+        (NamespaceEpoch("bot", "persona", 1),),
+    )
+    with pytest.raises(ValueError, match="trusted host scene evidence"):
+        provider.validate(event_proposal, event_snapshot)
+
+    other_sender_id = "entity:account-v1:other"
+    other_sender_key = AtomKey(
+        Owner("persona", "bot", "persona"), "d03.entity_anchor", other_sender_id,
+    )
+    other_sender = GraphAtom(
+        other_sender_key, 3,
+        {**sender_atom.value, "entity_id": other_sender_id},
+    )
+    sender_write = replace(
+        proposal.typed_writes[0],
+        value={**proposal.typed_writes[0].value,
+               "participant_roles": [[other_sender_id, "sender_account"]]},
+        dependencies=(candidate.source_version.key, candidate.access_version.key,
+                      other_sender_key),
+    )
+    sender_proposal = replace(
+        proposal, typed_writes=(sender_write,),
+        dependencies=DependencySet(current_invalidation=(
+            candidate.source_version, candidate.access_version,
+            GraphVersion(other_sender_key, 3),
+        )),
+    )
+    sender_snapshot = GraphSnapshot(
+        (source_atom, access_atom, other_sender,
+         GraphAtom(candidate.event_key, 0, {}, False)),
+        (NamespaceEpoch("bot", "persona", 1),),
+    )
+    with pytest.raises(ValueError, match="trusted host scene evidence"):
+        provider.validate(sender_proposal, sender_snapshot)
+
+
+def test_trusted_receipt_rebuilds_exact_arrival_but_scene_still_holds():
+    envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
+    proposal = message_arrival.build_message_arrival_proposal(
+        envelope, candidate, sender_atom=sender_atom)
+    ingress, scene, admitted, access, _, _ = _inputs()
+    host = IngressHostFacts(
+        ingress.namespace, ingress.platform_ref, ingress.conversation_ref,
+        ingress.sender_ref, ingress.message_id, ingress.text,
+        ingress.occurred_at, admitted.source.recorded_at, ingress.visibility,
+        IngressLineage(**asdict(ingress.lineage)),
+    )
+    receipt = IngressIdentityReceipt(
+        ingress_host_identity_json(host, ingress_ids(host.lineage.source_ref)[2]),
+        ingress_host_fingerprint(host), admitted.source.recorded_at, "b" * 64,
+    )
+    snapshot = GraphSnapshot((
+        GraphAtom(candidate.source_version.key, 1, admitted.source.to_dict()),
+        GraphAtom(candidate.access_version.key, 1, access),
+        sender_atom, GraphAtom(candidate.event_key, 0, {}, False),
+    ), (NamespaceEpoch("bot", "persona", 1),), (receipt,))
+    assert message_arrival.derive_trusted_message_arrival_identity(
+        proposal, snapshot) == (scene.scene_ref, scene.visibility)
+    with pytest.raises(ValueError, match="trusted host scene evidence"):
+        ContextProvider().validate(proposal, snapshot)
+    forged_receipt = replace(receipt, content_fingerprint="c" * 64)
+    with pytest.raises(ValueError, match="trusted ingress identity"):
+        message_arrival.derive_trusted_message_arrival_identity(
+            proposal, replace(snapshot, ingress_receipts=(forged_receipt,)))
+    forged_source = replace(snapshot.atoms[0], value={
+        **snapshot.atoms[0].value, "text": "replacement message"})
+    with pytest.raises(ValueError, match="trusted ingress identity"):
+        message_arrival.derive_trusted_message_arrival_identity(
+            proposal, replace(snapshot, atoms=(forged_source,) + snapshot.atoms[1:]))
+    forged_event = replace(proposal.typed_writes[0], value={
+        **proposal.typed_writes[0].value,
+        "participant_roles": [["entity:account-v1:forged", "sender_account"]],
+    })
+    with pytest.raises(ValueError, match="trusted ingress identity"):
+        message_arrival.derive_trusted_message_arrival_identity(
+            replace(proposal, typed_writes=(forged_event,)), snapshot)

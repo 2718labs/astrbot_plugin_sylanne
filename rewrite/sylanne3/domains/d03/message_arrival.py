@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 from typing import TYPE_CHECKING
 
-from ...graph_types import AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite, Owner
+from ...graph_types import (
+    AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite,
+    IngressIdentityReceipt, Owner,
+)
 from ...host.ingress import HostIngressEnvelope
 from ...memory_types import SourceRecord, access_key, source_key, validate_access
 from ...runtime.first_ingress_v2 import scene_ref_for_conversation
@@ -294,14 +298,105 @@ def validate_message_arrival_snapshot(
             or {ref.key for ref in proposal.dependencies.current_invalidation}
             != {source, access, sender}):
         raise ValueError("message arrival lost source, access, or sender dependencies")
-    # A reported D06 source can carry speaker, audience and provenance strings
-    # without being a D11 host ingress. The sealed first-ingress observation
-    # currently retains only a fingerprint, not the platform/conversation/
-    # sender/message tuple needed to rebuild scene, account and event IDs.
-    # Thus every such identity in this proposal is caller-controlled. W01/W09
-    # must supply a versioned D11 receipt, independently checked in the same
-    # read fence, before any host-observed arrival can be adopted.
+    derive_trusted_message_arrival_identity(proposal, snapshot)
+    # Receipt identity is now checked independently of the proposal. A D03
+    # arrival still needs the current scene binding and Owner head proved in
+    # this same transaction; the first-ingress-only fixed epoch check cannot
+    # stand in for continuing conversation authorization.
     raise ValueError("trusted host scene evidence is unavailable for message arrival")
+
+
+def derive_trusted_message_arrival_identity(
+    proposal: DomainProposal, snapshot: GraphSnapshot,
+) -> tuple[str, str]:
+    """Rebuild D03 IDs from W01's committed receipt and current D06 source.
+
+    This is one prerequisite, not scene admission. The caller still needs a
+    same-snapshot current scene/Owner proof before adopting host_observed.
+    """
+    from ...contracts import canonical_json
+    from ...graph_coordinator import (
+        IngressHostFacts, IngressLineage, ingress_host_fingerprint,
+    )
+    from ...runtime.first_ingress_v2 import ingress_ids
+
+    if (type(snapshot) is not GraphSnapshot
+            or len(snapshot.ingress_receipts) != 1
+            or type(snapshot.ingress_receipts[0]) is not IngressIdentityReceipt):
+        raise ValueError("trusted host scene evidence is unavailable for message arrival")
+    try:
+        receipt = snapshot.ingress_receipts[0]
+        identity = json.loads(receipt.identity_json)
+        namespace = proposal.envelope.authority.namespace
+        event_writes = [write for write in proposal.typed_writes
+                        if write.key.type_name == "d03.world_event"
+                        and write.value.get("kind") == "message_received"]
+        if len(event_writes) != 1:
+            raise ValueError("one arrival event is required")
+        write = event_writes[0]
+        source_refs = write.value["source_refs"]
+        if type(source_refs) is not list or len(source_refs) != 1:
+            raise ValueError("arrival source is required")
+        source_key_current = AtomKey.from_token(source_refs[0])
+        source_atom = snapshot.get(source_key_current)
+        if source_atom is None or not source_atom.valid:
+            raise ValueError("current source is unavailable")
+        record = SourceRecord.from_dict(source_atom.value)
+        if (type(identity) is not dict or set(identity) != {
+                "schema", "namespace", "operation_id", "source_ref",
+                "platform_ref", "conversation_ref", "sender_ref", "message_id",
+                "visibility", "lineage"}
+                or identity["schema"] != "sylanne3.ingress.identity.v1"
+                or identity["namespace"] != list(namespace.as_tuple)
+                or identity["source_ref"] != record.source_id
+                or identity["operation_id"] != ingress_ids(record.source_id)[2]
+                or canonical_json(identity) != receipt.identity_json
+                or receipt.learned_at != record.recorded_at
+                or type(receipt.bundle_digest) is not str
+                or len(receipt.bundle_digest) != 64
+                or any(ch not in "0123456789abcdef"
+                       for ch in receipt.bundle_digest)):
+            raise ValueError("receipt does not identify current source")
+        lineage = IngressLineage(**identity["lineage"])
+        host = IngressHostFacts(
+            namespace, identity["platform_ref"], identity["conversation_ref"],
+            identity["sender_ref"], identity["message_id"], record.text,
+            record.occurred_at, record.recorded_at, identity["visibility"],
+            lineage,
+        )
+        scene_ref = scene_ref_for_conversation(
+            namespace, host.platform_ref, host.conversation_ref)
+        sender_id = "entity:account-v1:" + canonical_digest({
+            "namespace": namespace.as_tuple,
+            "platform_ref": host.platform_ref,
+            "sender_ref": host.sender_ref,
+        })
+        event_id = "world:message-arrival-v1:" + canonical_digest({
+            "namespace": namespace.as_tuple,
+            "platform_ref": host.platform_ref,
+            "conversation_ref": host.conversation_ref,
+            "message_id": host.message_id,
+            "source_id": record.source_id,
+        })
+        if (ingress_host_fingerprint(host) != receipt.content_fingerprint
+                or record.speaker_id != host.sender_ref
+                or record.source_kind != lineage.source_kind
+                or record.assertion_status != "reported"
+                or record.provenance_root != lineage.provenance_family
+                or record.audiences != (host.conversation_ref,)
+                or "context" not in record.purposes
+                or write.value["event_id"] != event_id
+                or write.key != AtomKey(
+                    Owner("event", *namespace.as_tuple, event_id),
+                    "d03.world_event", "current")
+                or write.value["scene_ref"] != scene_ref
+                or write.value["participant_roles"]
+                != [[sender_id, "sender_account"]]
+                or write.value["learned_at"] != record.recorded_at):
+            raise ValueError("arrival differs from committed host identity")
+        return scene_ref, host.visibility
+    except (TypeError, ValueError, KeyError, IndexError) as exc:
+        raise ValueError("trusted ingress identity does not match D03 arrival") from exc
 
 
 __all__ = (
