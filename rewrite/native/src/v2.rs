@@ -4,7 +4,8 @@
 //! independent outward-interval verifier accepts its candidate endpoint.
 use crate::interval::{environment_supported, Interval};
 use crate::interval_verifier::{
-    verify_joint_error_bounds, verify_joint_step, JointVerificationInput, SparseMatrix,
+    verify_affine_parameter_switch, verify_joint_error_bounds, verify_joint_step,
+    JointVerificationInput, SparseMatrix,
 };
 use std::{
     ptr, slice,
@@ -815,6 +816,70 @@ pub unsafe extern "C" fn sylanne3_v2_propagate_parameter_switch_bounds(
     0
 }
 
+/// Independently verify error propagation through an explicit affine switch.
+/// Output is `[computed_mapping_lipschitz_upper, nominal_mapping_error_upper,
+/// mapped_error_upper]`. This is fixed-block math, not product admission or a
+/// certificate for the caller's source, event boundary, or new operator.
+///
+/// # Safety
+/// All pointers must be live, aligned buffers of the declared lengths. The
+/// output must be writable for three f64 values and disjoint from all inputs.
+#[no_mangle]
+pub unsafe extern "C" fn sylanne3_v2_verify_affine_parameter_switch(
+    old_n: u32,
+    new_n: u32,
+    mapping: *const Csr,
+    offset: *const f64,
+    old_nominal: *const f64,
+    new_nominal: *const f64,
+    old_error: f64,
+    output: *mut f64,
+    output_len: u32,
+) -> i32 {
+    let old_len = old_n as usize;
+    let new_len = new_n as usize;
+    if old_len == 0
+        || new_len == 0
+        || old_len > 64
+        || new_len > 64
+        || mapping.is_null()
+        || offset.is_null()
+        || old_nominal.is_null()
+        || new_nominal.is_null()
+        || output.is_null()
+        || output_len != 3
+        || (mapping as usize) % std::mem::align_of::<Csr>() != 0
+        || [offset, old_nominal, new_nominal, output as *const f64]
+            .iter()
+            .any(|pointer| (*pointer as usize) % std::mem::align_of::<f64>() != 0)
+    {
+        return -1;
+    }
+    let Some(matrix) = read_matrix(&*mapping, new_len, old_len) else {
+        return -1;
+    };
+    let input_error = match Interval::new(0.0, old_error) {
+        Ok(value) => value,
+        Err(_) => return -3,
+    };
+    let bounds = verify_affine_parameter_switch(
+        matrix.verified_view(old_len),
+        slice::from_raw_parts(offset, new_len),
+        slice::from_raw_parts(old_nominal, old_len),
+        slice::from_raw_parts(new_nominal, new_len),
+        input_error,
+    );
+    let Ok(bounds) = bounds else {
+        return -3;
+    };
+    slice::from_raw_parts_mut(output, 3).copy_from_slice(&[
+        bounds.mapping_lipschitz_upper,
+        bounds.nominal_mapping_error.upper(),
+        bounds.mapped_error.upper(),
+    ]);
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1423,6 +1488,56 @@ mod tests {
             -1
         );
         assert_eq!(output, saved);
+    }
+
+    #[test]
+    fn ffi_affine_switch_derives_bound_from_mapping_and_rejects_bad_claims() {
+        let mapping = csr(1, 1, &[0, 1], &[0], &[3.0]);
+        let mut output = [99.0; 3];
+        let offset = [0.25];
+        let old = [0.5];
+        let new = [1.75];
+        let status = unsafe {
+            sylanne3_v2_verify_affine_parameter_switch(
+                1,
+                1,
+                &mapping,
+                offset.as_ptr(),
+                old.as_ptr(),
+                new.as_ptr(),
+                0.1,
+                output.as_mut_ptr(),
+                3,
+            )
+        };
+        assert_eq!(status, 0);
+        assert!(output[0] >= 3.0);
+        assert!(output[1] < 1e-12);
+        assert!(output[2] >= 0.3);
+        let saved = output;
+        let rejected = unsafe {
+            sylanne3_v2_verify_affine_parameter_switch(
+                1,
+                1,
+                &mapping,
+                offset.as_ptr(),
+                old.as_ptr(),
+                new.as_ptr(),
+                f64::NAN,
+                output.as_mut_ptr(),
+                3,
+            )
+        };
+        assert_eq!(rejected, -3);
+        assert_eq!(output, saved);
+        assert_eq!(
+            sylanne3_v2_math_capabilities(),
+            if environment_supported() {
+                ABI2_FIXED_BLOCK_INTERVAL_V1
+            } else {
+                0
+            }
+        );
     }
 
     #[test]

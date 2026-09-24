@@ -69,6 +69,18 @@ class NativeV2FFITests(unittest.TestCase):
             ctypes.c_uint32,
         ]
         cls.library.sylanne3_v2_propagate_parameter_switch_bounds.restype = ctypes.c_int32
+        cls.library.sylanne3_v2_verify_affine_parameter_switch.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ABI2CSR),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_double,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_uint32,
+        ]
+        cls.library.sylanne3_v2_verify_affine_parameter_switch.restype = ctypes.c_int32
 
     @staticmethod
     def _csr(rows: int, cols: int, offsets, indices, values) -> ABI2CSR:
@@ -250,6 +262,27 @@ class NativeV2FFITests(unittest.TestCase):
         self.assertGreaterEqual(output[0], 0.32)
         self.assertEqual(output[1], -0.5)
         self.assertGreater(output[2], 0.0)
+
+    def test_python_ffi_affine_switch_verifies_actual_map_and_inherited_error(self) -> None:
+        offsets = (ctypes.c_uint32 * 2)(0, 1)
+        indices = (ctypes.c_uint32 * 1)(0)
+        values = (ctypes.c_double * 1)(3.0)
+        mapping = self._csr(1, 1, offsets, indices, values)
+        offset = (ctypes.c_double * 1)(0.25)
+        old = (ctypes.c_double * 1)(0.5)
+        new = (ctypes.c_double * 1)(1.75)
+        output = (ctypes.c_double * 3)(99.0, 99.0, 99.0)
+        call = self.library.sylanne3_v2_verify_affine_parameter_switch
+        status = call(1, 1, ctypes.byref(mapping), offset, old, new, 0.1, output, 3)
+        self.assertEqual(status, 0)
+        self.assertGreaterEqual(output[0], 3.0)
+        self.assertLess(output[1], 1e-12)
+        self.assertGreaterEqual(output[2], 0.3)
+        saved = tuple(output)
+        self.assertEqual(
+            call(1, 1, ctypes.byref(mapping), offset, old, new, math.nan, output, 3), -3
+        )
+        self.assertEqual(tuple(output), saved)
 
 
 if __name__ == "__main__":

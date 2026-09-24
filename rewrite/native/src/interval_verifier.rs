@@ -148,6 +148,89 @@ pub(crate) struct FixedTrajectoryBounds {
     pub(crate) input_sha256: [u8; 32],
 }
 
+/// A mathematical envelope for one explicit affine basis/parameter switch.
+/// It says nothing about the external source or authorization of that switch.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AffineSwitchBounds {
+    pub(crate) mapping_lipschitz_upper: f64,
+    pub(crate) nominal_mapping_error: Interval,
+    pub(crate) mapped_error: Interval,
+}
+
+/// Propagate a verified old-state error through `new = M old + offset`.
+/// The complete mapping is checked here; no caller-supplied Lipschitz claim is
+/// accepted. The nominal new state may differ from the exact affine image by
+/// its explicitly enclosed mapping error, which is added to the inherited ball.
+pub(crate) fn verify_affine_parameter_switch(
+    mapping: SparseMatrix<'_>,
+    offset: &[f64],
+    old_nominal: &[f64],
+    new_nominal: &[f64],
+    old_error: Interval,
+) -> Result<AffineSwitchBounds, VerifierError> {
+    if !environment_supported() {
+        return Err(VerifierError::UnsupportedEnvironment);
+    }
+    let old_n = old_nominal.len();
+    let new_n = new_nominal.len();
+    if old_n == 0
+        || new_n == 0
+        || old_n > MAX_VERIFIED_N
+        || new_n > MAX_VERIFIED_N
+        || offset.len() != new_n
+    {
+        return Err(VerifierError::InvalidDimension);
+    }
+    if !old_error.lower().is_finite() || !old_error.upper().is_finite() || old_error.lower() < 0.0 {
+        return Err(VerifierError::InvalidInheritedError);
+    }
+    validate_state(old_nominal)?;
+    validate_state(new_nominal)?;
+    validate_state(offset)?;
+    validate_csr(mapping, MatrixRole::A, new_n, old_n)?;
+
+    let mut column_sums = vec![Interval::point(0.0)?; old_n];
+    let mut row_max = 0.0_f64;
+    for row in 0..new_n {
+        let mut row_sum = Interval::point(0.0)?;
+        for position in mapping.row_range(row) {
+            let column = mapping.indices[position] as usize;
+            let absolute = Interval::point(mapping.values[position].abs())?;
+            row_sum = finite_interval(row_sum.add(absolute)?)?;
+            column_sums[column] = finite_interval(column_sums[column].add(absolute)?)?;
+        }
+        row_max = row_max.max(row_sum.upper());
+    }
+    let column_max = column_sums
+        .iter()
+        .map(|sum| sum.upper())
+        .fold(0.0_f64, f64::max);
+    // ||M||_2 <= sqrt(||M||_1 ||M||_infinity) <= max of the two norms.
+    let mapping_lipschitz_upper = row_max.max(column_max);
+    let image = matvec(mapping, &point_vector(old_nominal)?)?;
+    let nominal = point_vector(new_nominal)?;
+    let mut differences = Vec::with_capacity(new_n);
+    for row in 0..new_n {
+        differences.push(finite_interval(
+            image[row]
+                .add(Interval::point(offset[row])?)?
+                .sub(nominal[row])?,
+        )?);
+    }
+    let nominal_mapping_error = interval_l2_norm(&differences)?;
+    let mapped_upper = finite_interval(
+        Interval::point(mapping_lipschitz_upper)?
+            .mul(old_error)?
+            .add(nominal_mapping_error)?,
+    )?
+    .upper();
+    Ok(AffineSwitchBounds {
+        mapping_lipschitz_upper,
+        nominal_mapping_error,
+        mapped_error: Interval::new(0.0, mapped_upper)?,
+    })
+}
+
 /// Verify a mathematical fixed-parameter IVP from the first exact input state.
 /// Subsequent inherited errors are computed from the preceding verified step,
 /// never supplied by a caller. This establishes neither the external origin of
@@ -1134,6 +1217,80 @@ mod tests {
         assert_eq!(
             verify_fixed_trajectory(&[first, changed_drive]),
             Err(VerifierError::TrajectorySourceMismatch)
+        );
+    }
+
+    #[test]
+    fn affine_switch_computes_amplification_and_carries_error_into_new_model() {
+        let unit = [1.0];
+        let empty = SparseMatrix::new(1, 1, &[0, 0], &[], &[]);
+        let first = JointVerificationInput {
+            k: scalar_matrix(&unit),
+            r: scalar_matrix(&unit),
+            j: empty,
+            a: SparseMatrix::new(0, 1, &[0], &[], &[]),
+            alpha: &[],
+            x: &[1.0],
+            y: &[0.9],
+            h: 0.1,
+            drive: &[0.0],
+        };
+        let before = verify_joint_error_bounds(&first, Interval::point(0.0).unwrap()).unwrap();
+        let map_values = [2.0];
+        let map = scalar_matrix(&map_values);
+        let switched =
+            verify_affine_parameter_switch(map, &[0.0], first.y, &[1.8], before.time_error)
+                .unwrap();
+        assert!(switched.mapping_lipschitz_upper >= 2.0);
+        assert!(switched.mapped_error.upper() >= 2.0 * before.time_error.upper());
+
+        // A new parameter interval must inherit the amplified envelope. Resetting
+        // it at the switch would produce a demonstrably smaller false bound.
+        let new_r = [0.5];
+        let second = JointVerificationInput {
+            r: scalar_matrix(&new_r),
+            x: &[1.8],
+            y: &[1.7],
+            ..first
+        };
+        let inherited = verify_joint_error_bounds(&second, switched.mapped_error).unwrap();
+        let reset = verify_joint_error_bounds(&second, Interval::point(0.0).unwrap()).unwrap();
+        assert!(inherited.time_error.upper() > reset.time_error.upper());
+
+        // A migration offset is part of the map; an unexplained nominal jump
+        // is charged to the error ball instead of being silently discarded.
+        let offset =
+            verify_affine_parameter_switch(map, &[0.25], first.y, &[2.05], before.time_error)
+                .unwrap();
+        let unexplained =
+            verify_affine_parameter_switch(map, &[0.0], first.y, &[2.05], before.time_error)
+                .unwrap();
+        assert!(unexplained.mapped_error.upper() > offset.mapped_error.upper() + 0.24);
+    }
+
+    #[test]
+    fn affine_switch_rejects_missing_mapping_and_unknown_error() {
+        let missing = SparseMatrix::new(1, 1, &[0, 1], &[1], &[2.0]);
+        assert_eq!(
+            verify_affine_parameter_switch(
+                missing,
+                &[0.0],
+                &[1.0],
+                &[2.0],
+                Interval::point(0.1).unwrap(),
+            ),
+            Err(VerifierError::InvalidCsr(MatrixRole::A))
+        );
+        let map_values = [2.0];
+        assert_eq!(
+            verify_affine_parameter_switch(
+                scalar_matrix(&map_values),
+                &[0.0],
+                &[1.0],
+                &[2.0],
+                Interval::point(f64::INFINITY).unwrap(),
+            ),
+            Err(VerifierError::InvalidInheritedError)
         );
     }
 
