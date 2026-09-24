@@ -7,7 +7,7 @@ import json
 from typing import TYPE_CHECKING
 
 from ...graph_types import (
-    AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite,
+    AtomKey, CurrentSceneProof, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite,
     IngressIdentityReceipt, Owner,
 )
 from ...host.ingress import HostIngressEnvelope
@@ -275,6 +275,12 @@ def validate_message_arrival_snapshot(
         raise ValueError("message arrival source or access lost current eligibility")
     anchor_writes = tuple(write for write in proposal.typed_writes
                           if write.key.type_name == "d03.entity_anchor")
+    expected_writes = {event_write.key}
+    if sender_atom.revision == 0:
+        expected_writes.add(sender)
+    if (len(proposal.typed_writes) != len(expected_writes)
+            or {write.key for write in proposal.typed_writes} != expected_writes):
+        raise ValueError("message arrival write shape differs from sender state")
     if sender_atom.revision == 0:
         if len(anchor_writes) != 1 or anchor_writes[0].key != sender:
             raise ValueError("new sender anchor write is missing")
@@ -298,12 +304,31 @@ def validate_message_arrival_snapshot(
             or {ref.key for ref in proposal.dependencies.current_invalidation}
             != {source, access, sender}):
         raise ValueError("message arrival lost source, access, or sender dependencies")
-    derive_trusted_message_arrival_identity(proposal, snapshot)
-    # Receipt identity is now checked independently of the proposal. A D03
-    # arrival still needs the current scene binding and Owner head proved in
-    # this same transaction; the first-ingress-only fixed epoch check cannot
-    # stand in for continuing conversation authorization.
-    raise ValueError("trusted host scene evidence is unavailable for message arrival")
+    scene_ref, visibility = derive_trusted_message_arrival_identity(
+        proposal, snapshot)
+    if (len(snapshot.scene_proofs) != 1
+            or type(snapshot.scene_proofs[0]) is not CurrentSceneProof
+            or len(snapshot.epochs) != 1):
+        raise ValueError("trusted host scene evidence is unavailable for message arrival")
+    proof = snapshot.scene_proofs[0]
+    epoch = snapshot.epochs[0]
+    if (epoch.bot != namespace.bot_id or epoch.persona != namespace.persona_id
+            or proof.source_ref != source.owner.subject
+            or proof.scene_ref != scene_ref or event.scene_ref != proof.scene_ref
+            or proof.visibility != visibility
+            or proof.learned_at != record.recorded_at
+            or proof.graph_epoch != epoch.revision
+            or type(proof.graph_incarnation) is not str
+            or not proof.graph_incarnation
+            or not proof.owner_grant_id or not proof.owner_authorization_head
+            or proof.owner_authorization_revision < 1
+            or type(proof.owner_revocation_epoch) is not int
+            or proof.owner_revocation_epoch < 0
+            or not proof.role_head_id or not proof.binding_id
+            or proof.binding_version < 1
+            or not proof.binding_receipt_operation_id
+            or not 0 < proof.binding_receipt_graph_epoch <= proof.graph_epoch):
+        raise ValueError("trusted host scene evidence differs from current arrival")
 
 
 def derive_trusted_message_arrival_identity(

@@ -10,8 +10,8 @@ from sylanne3.domains.d03.context import ContextProvider
 from sylanne3.domains.d03.message_arrival import build_message_arrival_candidate
 from sylanne3.domains.d06 import D06DomainAdapter, SourceAdmission
 from sylanne3.graph_types import (
-    AtomKey, GraphAtom, GraphSnapshot, GraphVersion, IngressIdentityReceipt,
-    NamespaceEpoch, Owner,
+    AtomKey, CurrentSceneProof, GraphAtom, GraphSnapshot, GraphVersion,
+    IngressIdentityReceipt, NamespaceEpoch, Owner,
 )
 from sylanne3.graph_coordinator import (
     IngressHostFacts, IngressLineage, ingress_host_fingerprint,
@@ -320,6 +320,38 @@ def test_trusted_receipt_rebuilds_exact_arrival_but_scene_still_holds():
         proposal, snapshot) == (scene.scene_ref, scene.visibility)
     with pytest.raises(ValueError, match="trusted host scene evidence"):
         ContextProvider().validate(proposal, snapshot)
+    proof = CurrentSceneProof(
+        host.lineage.source_ref, scene.scene_ref, scene.visibility,
+        admitted.source.recorded_at, 1, "graph-incarnation", "owner-grant",
+        1, "owner-head", 0, "role-head", "binding:scene", 1,
+        "scene-binding-operation", 1,
+    )
+    admitted_snapshot = replace(snapshot, scene_proofs=(proof,))
+    assert ContextProvider().validate(proposal, admitted_snapshot) == proposal
+    extra_id = "world:unrelated-extra"
+    extra = replace(proposal.typed_writes[0],
+                    key=AtomKey(Owner("event", "bot", "persona", extra_id),
+                                "d03.world_event", "current"),
+                    value={**proposal.typed_writes[0].value,
+                           "event_id": extra_id, "kind": "unrelated",
+                           "reality": "reported"})
+    with pytest.raises(ValueError, match="message arrival write shape"):
+        message_arrival.validate_message_arrival_snapshot(
+            replace(proposal, typed_writes=proposal.typed_writes + (extra,)),
+            admitted_snapshot)
+    for mismatch in (
+        replace(proof, source_ref="f" * 64),
+        replace(proof, scene_ref="scene:wrong"),
+        replace(proof, visibility="group"),
+        replace(proof, learned_at=21.0),
+        replace(proof, graph_epoch=2),
+    ):
+        with pytest.raises(ValueError, match="trusted host scene evidence"):
+            ContextProvider().validate(
+                proposal, replace(snapshot, scene_proofs=(mismatch,)))
+    with pytest.raises(ValueError, match="trusted host scene evidence"):
+        ContextProvider().validate(
+            proposal, replace(snapshot, scene_proofs=(proof, proof)))
     forged_receipt = replace(receipt, content_fingerprint="c" * 64)
     with pytest.raises(ValueError, match="trusted ingress identity"):
         message_arrival.derive_trusted_message_arrival_identity(
