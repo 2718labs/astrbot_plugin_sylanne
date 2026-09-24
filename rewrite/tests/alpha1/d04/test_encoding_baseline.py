@@ -98,7 +98,7 @@ class EncodingBaselineTests(unittest.TestCase):
         mapping_key = self_mapping_key(namespace)
         mapping = SelfIdentityMapping(
             "self-map:one", "persona:persona", "entity:self",
-            "d11:self-identity:one", "role:head", "incarnation:one", "active",
+            "authority:self-identity:one", "role:head", "incarnation:one", "active",
         )
         perspective = SelfPerspective(
             self_perspective_id(namespace, event.scene_ref, event_key.token),
