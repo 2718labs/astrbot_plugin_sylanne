@@ -253,6 +253,8 @@ class ContextProvider:
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
+        from .self_perspective import SelfIdentityMapping, SelfPerspective
+
         layouts = (
             ("d03.entity_anchor", ("persona",), "state", EntityAnchor,
              ("creation_evidence_refs",)),
@@ -261,6 +263,8 @@ class ContextProvider:
              ("participant_roles", "source_refs")),
             ("d03.role_binding", ("persona", "scene"), "state", RoleBinding,
              ("norm_refs", "source_refs")),
+            ("d03.self_identity_mapping.v1", ("persona",), "state", SelfIdentityMapping, ()),
+            ("d03.self_perspective.v1", ("persona",), "state", SelfPerspective, ()),
         )
         result = []
         for name, owners, storage, value_type, tuple_fields in layouts:
@@ -285,6 +289,10 @@ class ContextProvider:
         return tuple(spec.name for spec in self.type_specs())
 
     def validate(self, proposal: DomainProposal, snapshot: object) -> DomainProposal:
+        from .self_perspective import (
+            SelfIdentityMapping, SelfPerspective, validate_self_perspective_snapshot,
+        )
+
         if not isinstance(proposal, DomainProposal):
             raise TypeError("proposal must be DomainProposal")
         if proposal.domain != "d03":
@@ -299,7 +307,14 @@ class ContextProvider:
             "d03.account_binding": lambda value: AccountBinding(**_tuple_payload(value)),
             "d03.world_event": lambda value: WorldEvent(**_tuple_payload(value, "participant_roles", "source_refs")),
             "d03.role_binding": lambda value: RoleBinding(**_tuple_payload(value, "norm_refs", "source_refs")),
+            "d03.self_identity_mapping.v1": lambda value: SelfIdentityMapping(**_tuple_payload(value)),
+            "d03.self_perspective.v1": lambda value: SelfPerspective(**_tuple_payload(value)),
         }
+        # A trusted D11 mapping issuer has not been implemented. A D03 proposal
+        # must never bootstrap its own proof of who the persona is.
+        if any(write.key.type_name == "d03.self_identity_mapping.v1"
+               for write in proposal.typed_writes):
+            raise ValueError("certified self identity mapping issuer is unavailable")
         for write in proposal.typed_writes:
             decoded = decoders[write.key.type_name](write.value)
             if write.key.type_name == "d03.role_binding":
@@ -319,6 +334,9 @@ class ContextProvider:
         if host_events:
             from .message_arrival import validate_message_arrival_snapshot
             validate_message_arrival_snapshot(proposal, snapshot)
+        if any(write.key.type_name == "d03.self_perspective.v1"
+               for write in proposal.typed_writes):
+            validate_self_perspective_snapshot(proposal, snapshot)
         return proposal
 
     def compile_scheme(self, draft: dict, snapshot: object) -> dict:
