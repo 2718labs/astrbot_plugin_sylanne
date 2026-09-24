@@ -6,6 +6,8 @@ from dataclasses import asdict
 
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest
+from ..host.authority_profile import AdminIngressModelPolicy
+from ..model_broker.broker import ModelCallRequest
 from .contract import AuthorityUnavailable, identifier
 from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
 from .v2_model_egress_contract import (
@@ -18,7 +20,8 @@ from .v2_fence_service import AuthorityV2FenceService
 class AuthorityV2ModelEgressService:
     def __init__(self, store: AuthorityV2ModelEgressStore,
                  fences: AuthorityV2FenceService | None = None, *,
-                 graph_verifier: PinnedCurrentModelEgressGraphVerifier | None = None):
+                 graph_verifier: PinnedCurrentModelEgressGraphVerifier | None = None,
+                 admin_model_policy: AdminIngressModelPolicy | None = None):
         if type(store) is not AuthorityV2ModelEgressStore:
             raise TypeError("Authority-owned model egress store required")
         if fences is not None and (type(fences) is not AuthorityV2FenceService
@@ -28,9 +31,47 @@ class AuthorityV2ModelEgressService:
         if (graph_verifier is not None
                 and type(graph_verifier) is not PinnedCurrentModelEgressGraphVerifier):
             raise TypeError("administrator-pinned model egress graph verifier required")
+        if (admin_model_policy is not None
+                and type(admin_model_policy) is not AdminIngressModelPolicy):
+            raise TypeError("administrator-installed model policy required")
         self._store = store
         self._fences = fences
         self._graph_verifier = graph_verifier
+        self._admin_model_policy = admin_model_policy
+
+    def _admin_model_matches(self, intent: ModelEgressIntentV1,
+                             request: ModelCallRequest | None) -> bool:
+        """Match a graph-bound request to this Authority installation's policy."""
+        policy = self._admin_model_policy
+        if type(policy) is not AdminIngressModelPolicy or type(request) is not ModelCallRequest:
+            return False
+        authority = request.envelope.authority
+        return (
+            bool(policy.allowed_purposes and policy.allowed_audiences
+                 and policy.allowed_privacy_tiers)
+            and request.digest == intent.request_digest
+            and request.call_id == intent.call_id
+            and request.identity.operation_id == intent.operation_id
+            and authority.actor == intent.subject
+            and authority.issuer_domain == "d11"
+            and authority.activation_generation == intent.authority_activation_generation
+            and authority.worker_fence == intent.worker_fence
+            and authority.purpose in policy.allowed_purposes
+            and bool(authority.audience)
+            and set(authority.audience) <= set(policy.allowed_audiences)
+            and request.privacy_tier == policy.privacy_tier
+            and request.privacy_tier in policy.allowed_privacy_tiers
+            and request.required_capabilities == frozenset(policy.required_capabilities)
+            and (request.provider_id, request.model_id,
+                 intent.provider_id, intent.model_id) == (
+                    policy.provider_id, policy.model_id,
+                    policy.provider_id, policy.model_id)
+            and intent.provider_config_digest == policy.provider_config_digest
+            and request.max_output_tokens == intent.max_output_tokens
+            and request.max_output_tokens <= policy.max_output_tokens
+            and request.max_output_tokens <= dict(intent.budget_ceiling).get("output_tokens", 0)
+            and request.timeout_seconds == policy.timeout_seconds
+        )
 
     def prepare_fenced(self, *, credential, subject: str, holder: str,
                        draft: ModelEgressDraftV1,
@@ -206,13 +247,13 @@ class AuthorityV2ModelEgressService:
 
     def admit_dispatch_once(self, *, credential, subject: str, holder: str,
                             intent: ModelEgressIntentV1,
-                            expected_anchor: RestoreAnchor):
-        """Fail closed until an independent administrator model gate is installed.
+                            expected_anchor: RestoreAnchor,
+                            request: ModelCallRequest | None = None):
+        """Grant one internal dispatch admission after graph and policy checks.
 
         A model fence is held across the independent graph read. Any failure
-        closes an untouched prepared call as not_dispatched. The durable
-        prepared-to-dispatch_started CAS remains reserved for a future fully
-        configured Authority executor; this method never returns send rights.
+        closes an untouched prepared call as not_dispatched. This internal
+        method is not a production RPC or an executor-result binding.
         """
         if (self._fences is None or type(intent) is not ModelEgressIntentV1
                 or type(expected_anchor) is not RestoreAnchor):
@@ -245,15 +286,40 @@ class AuthorityV2ModelEgressService:
                              and self._graph_verifier.complete_graph_current(intent) is True)
         except Exception:
             graph_current = False
-        # The administrator policy, live provider configuration, privacy, and
-        # executable token ceiling still need a trusted Authority integration.
-        # Even a positive graph result cannot grant provider dispatch today.
-        self._finish_prepared_not_dispatched_fenced(
-            credential=credential, subject=subject, holder=holder,
-            intent=intent, expected_anchor=expected_anchor)
-        if not graph_current:
-            raise AuthorityUnavailable("HOLD: complete current model graph is unavailable")
-        raise AuthorityUnavailable("HOLD: independent administrator model policy is unavailable")
+        try:
+            policy_current = self._admin_model_matches(intent, request)
+        except Exception:
+            policy_current = False
+        if not graph_current or not policy_current:
+            self._finish_prepared_not_dispatched_fenced(
+                credential=credential, subject=subject, holder=holder,
+                intent=intent, expected_anchor=expected_anchor)
+            if not graph_current:
+                raise AuthorityUnavailable("HOLD: complete current model graph is unavailable")
+            raise AuthorityUnavailable("HOLD: independent administrator model policy is unavailable")
+        try:
+            with self._fences._frozen() as (db, deletion_head, execution_head,
+                                           deletion_history):
+                anchor = self._fences._current_locked(
+                    db, deletion_head, execution_head, holder=holder,
+                    generation=expected_anchor.activation_generation)
+                if anchor != expected_anchor or deletion_history:
+                    raise AuthorityUnavailable("model dispatch anchor changed or deletion history exists")
+                row = self._fences.fences._row(db, intent.operation_id)
+                if row is None or self._fences.fences._permit(row) != permit:
+                    raise AuthorityUnavailable("original model dispatch permit changed")
+                record = self._store._record_dispatch_started_fenced_locked(
+                    db, intent, permit, self._fences.fences, anchor)
+                return record, permit
+        except AuthorityUnavailable:
+            # A competing successful CAS must never be reclassified as unsent.
+            try:
+                self._finish_prepared_not_dispatched_fenced(
+                    credential=credential, subject=subject, holder=holder,
+                    intent=intent, expected_anchor=expected_anchor)
+            except AuthorityUnavailable:
+                pass
+            raise
 
     async def begin_handoff(self, request, request_digest):
         raise AuthorityUnavailable(

@@ -643,3 +643,83 @@ def test_dispatch_admission_holds_without_installed_policy_and_never_replays(tmp
             next(fixture)
         except StopIteration:
             pass
+
+
+def test_internal_dispatch_admission_cas_has_one_winner(tmp_path, monkeypatch):
+    """A stubbed graph result tests CAS only; it is no production qualification."""
+    from rewrite.tests.alpha1.model_broker.test_broker import request as broker_request
+    from rewrite.tests.alpha1.runtime.test_authority_v2_rpc_content_fences import _PEER_A, rpc
+    from sylanne3.authority_service.current_model_egress_graph_verifier import (
+        PinnedCurrentModelEgressGraphVerifier,
+    )
+    from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
+    from sylanne3.host.authority_profile import AdminIngressModelPolicy, installed_model_config_ref
+
+    fixture = rpc.__wrapped__(tmp_path)
+    server = next(fixture)
+    try:
+        fences = server._v2_fences["ns-a"]
+        store = AuthorityV2ModelEgressStore(fences.core._db, create=True,
+                                            lock=fences.core._lock)
+        anchor = fences.current_anchor(credential=_PEER_A, subject="worker")
+        base = broker_request()
+        envelope = replace(
+            base.envelope,
+            identity=replace(base.identity, operation_id="job-operation"),
+            authority=replace(base.envelope.authority, actor="worker",
+                              issuer_domain="d11", worker_fence=7),
+        )
+        request = replace(
+            base, envelope=envelope, call_id="call-1", provider_id="provider-1",
+            model_id="model-1", required_capabilities=frozenset({"text"}),
+            timeout_seconds=20.0, max_output_tokens=256)
+        draft = ModelEgressDraftV1.from_intent(intent(
+            namespace="ns-a", authority_id=anchor.authority_id,
+            authority_activation_generation=anchor.activation_generation,
+            authority_revocation_epoch=anchor.revocation_epoch,
+            authority_deletion_seq=anchor.deletion_seq,
+            authority_execution_seq=anchor.execution_seq,
+            request_digest=request.digest, budget_ceiling=(("output_tokens", 256),)))
+        config_digest = "d" * 64
+        policy = AdminIngressModelPolicy(
+            "provider-1", "model-1",
+            installed_model_config_ref("provider-1", "model-1", config_digest),
+            config_digest, 20.0, 256, ("text",), "private",
+            ("proposal",), ("owner",), ("private",))
+        barrier = Barrier(2)
+        verifier = object.__new__(PinnedCurrentModelEgressGraphVerifier)
+
+        def complete_graph_current(candidate):
+            assert candidate.request_digest == request.digest
+            assert not fences.core._db.in_transaction
+            barrier.wait(timeout=5)
+            return True
+
+        monkeypatch.setattr(verifier, "complete_graph_current", complete_graph_current)
+        service = AuthorityV2ModelEgressService(
+            store, fences, graph_verifier=verifier, admin_model_policy=policy)
+        prepared, permit = service.prepare_fenced(
+            credential=_PEER_A, subject="worker", holder="holder-a",
+            draft=draft, expected_anchor=anchor)
+
+        def attempt():
+            try:
+                return service.admit_dispatch_once(
+                    credential=_PEER_A, subject="worker", holder="holder-a",
+                    intent=prepared.intent, expected_anchor=anchor,
+                    request=request)
+            except AuthorityUnavailable:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(lambda _: attempt(), range(2)))
+        assert sum(outcome is not None for outcome in outcomes) == 1
+        assert next(outcome for outcome in outcomes if outcome is not None)[1] == permit
+        assert store.read(prepared.intent.call_id, subject="worker", namespace="ns-a").state == "dispatch_started"
+        assert fences.fences._row(fences.core._db, prepared.intent.operation_id)[6] == "active"
+        assert attempt() is None
+    finally:
+        try:
+            next(fixture)
+        except StopIteration:
+            pass
