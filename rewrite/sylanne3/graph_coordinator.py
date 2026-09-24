@@ -522,7 +522,8 @@ class GraphCoordinator:
                  ingress_policy=None, ingress_clock=None,
                  owner_principal_resolver=None,
                  dispatch_admission_issuer=None, dispatch_clock_policy=None,
-                 scene_identity_port=None, scene_clock_policy=None):
+                 scene_identity_port=None, scene_clock_policy=None,
+                 encoding_request_issuer=None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -552,6 +553,9 @@ class GraphCoordinator:
         self.__closure_verifier = closure_verifier
         self.__d02_issuer = d02_issuer
         self.__d11_issuer = d11_issuer
+        if encoding_request_issuer is not None and not callable(encoding_request_issuer):
+            raise TypeError("encoding_request_issuer must be callable")
+        self.__encoding_request_issuer = encoding_request_issuer
         # Installed by trusted host composition only.  A missing issuer leaves
         # D08/D09 candidates in HOLD; caller receipt strings are never enough.
         self.__dispatch_admission_issuer = dispatch_admission_issuer
@@ -5609,6 +5613,12 @@ class GraphCoordinator:
             source = SourceRecord.from_dict(json.loads(row[0]))
             if source.source_id != outbox.payload_ref:
                 raise UnavailableGuard("encoding source differs from original outbox")
+            if self.__store._db.execute(
+                    "SELECT 1 FROM runtime_encoding_call_redactions_v1 "
+                    "WHERE bot=? AND persona=? AND source_id=? LIMIT 1",
+                    authority.namespace.as_tuple + (source.source_id,),
+            ).fetchone():
+                raise UnavailableGuard("encoding source request was erased; HOLD")
             return FirstIngressEncodingInputsV1(
                 job, source, source_version.revision, access_version.revision,
                 job.budget_ref, job.operation_id)
@@ -5639,6 +5649,53 @@ class GraphCoordinator:
             raise UnavailableGuard("job acquire result lost runnable eligibility; HOLD") from exc
         return current
 
+    def _issue_first_ingress_encoding_binding(
+        self, namespace, planned, outbox, source_version, access_version,
+        authority,
+    ):
+        """Freeze the installed pure issuer output for one planned worker fence."""
+        from datetime import datetime
+        from .memory_types import SourceRecord
+        from .runtime.encoding_call_binding import (
+            EncodingRequestIssueV1, prepare_binding,
+        )
+        from .model_broker.first_ingress_encoding import (
+            FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+        )
+
+        with self.__store._lock:
+            row = self.__store._db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (source_version.key.token,),
+            ).fetchone()
+        if row is None or row[0] != source_version.revision or row[2] != 1:
+            raise UnavailableGuard("encoding source changed before request issue; HOLD")
+        source = SourceRecord.from_dict(json.loads(row[1]))
+        if source.source_id != outbox.payload_ref:
+            raise UnavailableGuard("encoding source differs from original outbox")
+        issue = self.__encoding_request_issuer(
+            planned, source, source_version.revision, access_version.revision)
+        if type(issue) is not EncodingRequestIssueV1:
+            raise UnavailableGuard("encoding request issuer returned no typed request")
+        request = issue.request
+        if (request.envelope.identity.activity_id != planned.activity_id
+                or request.envelope.authority.actor != authority.actor
+                or request.envelope.authority.issuer_domain != "d06"
+                or request.envelope.authority.activation_generation
+                != authority.activation_generation
+                or request.envelope.authority.worker_fence != planned.fence
+                or request.envelope.deadline_utc >
+                datetime.fromisoformat(
+                    planned.deadline_utc.replace("Z", "+00:00")).timestamp()):
+            raise UnavailableGuard("encoding request differs from acquired worker fence")
+        return prepare_binding(
+            namespace, planned.job_id, source, source_version.revision,
+            access_version.revision, planned.budget_ref, planned.operation_id,
+            request, prompt_template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+            provider_config_ref=issue.provider_config_ref,
+            provider_config_digest=issue.provider_config_digest,
+        )
+
     def acquire_first_ingress_encoding_job_v2(
         self, authority: AuthorityContext, lease: object, job_id: str,
         acquire_operation_id: str, *, lease_seconds: int,
@@ -5651,6 +5708,9 @@ class GraphCoordinator:
         from .runtime.d11_types import job_graph_write, outbox_graph_write
         from .runtime.first_ingress_v2 import trusted_upper
         from .runtime.issuers import D11BudgetJobIssuer
+        from .runtime.encoding_call_binding import (
+            binding_from_json, binding_to_json, insert_binding, load_binding,
+        )
 
         store = self.__store
         port = self.__content_fence_v2
@@ -5676,7 +5736,8 @@ class GraphCoordinator:
                 "SELECT request_digest,job_id,original_operation_id,actor,"
                 "fixed_now_utc,lease_seconds,expected_job_revision,expected_fence,"
                 "expected_cancel_epoch,fence_attempt_id,requirements_json,anchor_json,"
-                "graph_revision,graph_epoch FROM graph_job_acquire_intents_v2 "
+                "graph_revision,graph_epoch,encoding_binding_json "
+                "FROM graph_job_acquire_intents_v2 "
                 "WHERE bot=? AND persona=? AND acquire_operation_id=?",
                 namespace.as_tuple + (acquire_operation_id,),
             ).fetchone()
@@ -5695,12 +5756,25 @@ class GraphCoordinator:
                 "AND acquire_operation_id=?",
                 namespace.as_tuple + (acquire_operation_id,),
             ).fetchone()
+            erased = store._db.execute(
+                "SELECT 1 FROM runtime_encoding_call_redactions_v1 "
+                "WHERE bot=? AND persona=? AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
             if intent is None:
                 (job, job_key, job_revision, outbox, outbox_key,
                  outbox_revision, source_version, access_version) = (
                     self._first_ingress_encoding_job_locked(namespace, job_id))
+                if store._db.execute(
+                        "SELECT 1 FROM runtime_encoding_call_redactions_v1 "
+                        "WHERE bot=? AND persona=? AND source_id=? LIMIT 1",
+                        namespace.as_tuple + (outbox.payload_ref,),
+                ).fetchone():
+                    raise UnavailableGuard("encoding source request was erased; HOLD")
             else:
                 job = None
+        if erased is not None:
+            raise UnavailableGuard("encoding request was erased; HOLD")
         original_operation_id = job.operation_id if intent is None else intent[2]
         if not _job_acquire_id_matches(
                 acquire_operation_id, namespace, job_id,
@@ -5735,6 +5809,10 @@ class GraphCoordinator:
                 raise UnavailableGuard("encoding job is not runnable; HOLD") from exc
             if planned == job or job.cancel_epoch:
                 raise UnavailableGuard("encoding job has an active or cancelled lease; HOLD")
+            binding = (self._issue_first_ingress_encoding_binding(
+                namespace, planned, outbox, source_version, access_version,
+                authority) if self.__encoding_request_issuer is not None else None)
+            binding_json = binding_to_json(binding) if binding is not None else None
             request_digest = canonical_digest({
                 "schema": "sylanne.job-acquire.v2",
                 "namespace": list(namespace.as_tuple), "job_id": job_id,
@@ -5751,7 +5829,7 @@ class GraphCoordinator:
                 request_digest, job_id, job.operation_id, authority.actor,
                 now_text, lease_seconds, job_revision, job.fence, job.cancel_epoch,
                 attempt_id, requirements_json, anchor_json,
-                metadata.graph_revision, epoch.revision,
+                metadata.graph_revision, epoch.revision, binding_json,
             )
             with store._lock:
                 db = store._db
@@ -5765,14 +5843,16 @@ class GraphCoordinator:
                         "original_operation_id,actor,fixed_now_utc,lease_seconds,"
                         "expected_job_revision,expected_fence,expected_cancel_epoch,"
                         "fence_attempt_id,requirements_json,anchor_json,"
-                        "graph_revision,graph_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "graph_revision,graph_epoch,encoding_binding_json) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         namespace.as_tuple + (acquire_operation_id,) + expected_intent,
                     )
                     intent = db.execute(
                         "SELECT request_digest,job_id,original_operation_id,actor,"
                         "fixed_now_utc,lease_seconds,expected_job_revision,expected_fence,"
                         "expected_cancel_epoch,fence_attempt_id,requirements_json,anchor_json,"
-                        "graph_revision,graph_epoch FROM graph_job_acquire_intents_v2 "
+                        "graph_revision,graph_epoch,encoding_binding_json "
+                        "FROM graph_job_acquire_intents_v2 "
                         "WHERE bot=? AND persona=? AND acquire_operation_id=?",
                         namespace.as_tuple + (acquire_operation_id,),
                     ).fetchone()
@@ -5841,6 +5921,12 @@ class GraphCoordinator:
                         or receipt[7] != finish_identity(permit)[0]):
                     raise UnavailableGuard("job acquire receipt identity differs")
                 historical = PersistentJob(**json.loads(receipt[1]))
+                with store._lock:
+                    durable_binding = load_binding(store._db, namespace, job_id)
+                frozen_binding = (binding_from_json(intent[14])
+                                  if intent[14] is not None else None)
+                if durable_binding != frozen_binding:
+                    raise UnavailableGuard("replayed job binding differs from frozen intent; HOLD")
                 replay_now = trusted_upper(clock)
                 replay_now_text = datetime.fromtimestamp(
                     replay_now, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -5911,6 +5997,20 @@ class GraphCoordinator:
             raise UnavailableGuard("encoding job acquire deadline expired; HOLD") from exc
         if planned == job or job.cancel_epoch:
             raise UnavailableGuard("encoding job is no longer runnable; HOLD")
+        frozen_binding = (binding_from_json(intent[14])
+                          if intent[14] is not None else None)
+        if frozen_binding is not None:
+            if self.__encoding_request_issuer is None:
+                raise UnavailableGuard("original encoding request issuer is unavailable; HOLD")
+            current_binding = self._issue_first_ingress_encoding_binding(
+                namespace, planned, outbox, source_version, access_version,
+                authority)
+            if current_binding != frozen_binding:
+                raise UnavailableGuard("encoding request configuration changed; HOLD")
+        elif self.__encoding_request_issuer is not None:
+            # The original intent predates this issuer. It cannot gain a
+            # request after its Authority operation identity was frozen.
+            raise UnavailableGuard("original job acquire has no encoding request; HOLD")
 
         try:
             permit = port.begin_fence(
@@ -5974,10 +6074,14 @@ class GraphCoordinator:
                 raise StaleRead("job acquire mutation differed from frozen plan")
             reconcile_runtime_write(db, candidate.writes[0])
             reconcile_runtime_write(db, candidate.writes[1])
+            if frozen_binding is not None:
+                insert_binding(db, frozen_binding)
 
         def receipt_hook(db, graph_receipt):
             if graph_receipt.status != "committed" or len(graph_receipt.revisions) != 2:
                 raise UnavailableGuard("job acquire graph event was not committed")
+            if load_binding(db, namespace, job_id) != frozen_binding:
+                raise UnavailableGuard("job acquire binding did not match frozen intent")
             store.cas_graph_recovery_metadata(
                 metadata, metadata.requirements,
                 _capability=self.__graph_capability)

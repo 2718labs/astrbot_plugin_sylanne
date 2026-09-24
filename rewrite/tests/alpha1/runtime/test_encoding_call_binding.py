@@ -11,7 +11,8 @@ from sylanne3.model_broker.first_ingress_encoding import (
     build_first_ingress_encoding_payload,
 )
 from sylanne3.memory_types import SourceRecord
-from sylanne3.memory_types import source_key
+from sylanne3.memory_types import access_key, source_key
+from sylanne3.graph_types import GraphVersion
 from sylanne3.runtime.encoding_call_binding import (
     EncodingCallConflict, insert_binding, install_schema, load_binding,
     prepare_binding,
@@ -28,10 +29,11 @@ SOURCE = SourceRecord("source-1", "source text", "speaker-1", "reported",
                       ("internal",), ("consolidation",))
 
 
-def _request(*, call_id="call-1", payload=None, max_output_tokens=128):
-    source_id = "source-1"
+def _request(*, call_id="call-1", payload=None, max_output_tokens=128,
+             source=SOURCE):
+    source_id = source.source_id
     source_ref = source_key(*NAMESPACE.as_tuple, source_id).token
-    expected_payload, template_digest = build_first_ingress_encoding_payload(SOURCE)
+    expected_payload, template_digest = build_first_ingress_encoding_payload(source)
     envelope = CommandEnvelope(
         "sylanne.runtime.v1",
         OperationIdentity("activity-1", None, "attempt-1", "encode",
@@ -39,7 +41,10 @@ def _request(*, call_id="call-1", payload=None, max_output_tokens=128):
         AuthorityContext("worker", "d06", "capability", NAMESPACE,
                          ("activity",), "consolidation", ("internal",), "policy", 1,
                          worker_fence=1),
-        VersionGuard((), (), 0, 0, "catalogue", "scheme", "operator",
+        VersionGuard((
+            GraphVersion(source_key(*NAMESPACE.as_tuple, source_id), 1),
+            GraphVersion(access_key(*NAMESPACE.as_tuple, source_id), 1),
+        ), (), 0, 0, "catalogue", "scheme", "operator",
                      "policy", (), (), ()),
         SourceQualification((source_ref,), "reported", None, 1.0,
                             "external_report", "qualified", None, "not_applicable"),
@@ -53,10 +58,11 @@ def _request(*, call_id="call-1", payload=None, max_output_tokens=128):
     )
 
 
-def _binding(request=None, *, job_id="job-1"):
+def _binding(request=None, *, job_id="job-1", source=SOURCE):
     return prepare_binding(
-        NAMESPACE, job_id, SOURCE, 1, 1, "budget-1", "operation-1",
-        request or _request(), prompt_template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+        NAMESPACE, job_id, source, 1, 1, "budget-1", "operation-1",
+        request or _request(source=source),
+        prompt_template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
         provider_config_ref="admin-config-1", provider_config_digest="b" * 64,
     )
 
@@ -95,6 +101,26 @@ def test_call_id_cannot_move_to_another_job(tmp_path):
         other = _binding(job_id="job-2")
         with pytest.raises(EncodingCallConflict, match="another job"):
             insert_binding(db, other)
+
+
+def test_erased_call_id_cannot_be_reused_by_another_source(tmp_path):
+    with sqlite3.connect(tmp_path / "graph.db") as db:
+        install_schema(db)
+        original = insert_binding(db, _binding())
+        db.execute("DELETE FROM runtime_encoding_call_bindings_v1 WHERE job_id=?",
+                   (original.job_id,))
+        db.execute(
+            "INSERT INTO runtime_encoding_call_redactions_v1"
+            "(bot,persona,acquire_operation_id,job_id,source_id,call_id,"
+            "binding_digest,model_request_digest,deletion_operation_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            NAMESPACE.as_tuple + ("acquire-1", original.job_id,
+                original.source_id, original.call_id, original.binding_digest,
+                original.model_request_digest, "delete-1"),
+        )
+        other_source = replace(SOURCE, source_id="source-2")
+        with pytest.raises(EncodingCallConflict, match="erased call ID"):
+            insert_binding(db, _binding(job_id="job-2", source=other_source))
 
 
 def test_wrong_source_or_budget_is_rejected_before_storage():

@@ -7,7 +7,7 @@ Nothing here grants permission to call a provider.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -40,7 +40,71 @@ class EncodingCallBinding:
         return json.loads(self.request_json)
 
 
+@dataclass(frozen=True)
+class EncodingRequestIssueV1:
+    """Trusted pure issuer output; configuration identity contains no secret."""
+
+    request: ModelCallRequest
+    provider_config_ref: str
+    provider_config_digest: str
+
+
+def binding_to_json(binding: EncodingCallBinding) -> str:
+    from ..runtime_contracts import canonical_serialize
+
+    _validate_binding_content(binding)
+    return canonical_serialize(asdict(binding))
+
+
+def binding_from_json(value: str) -> EncodingCallBinding:
+    from ..runtime_contracts import NamespaceId
+
+    data = json.loads(value)
+    data["namespace"] = NamespaceId(**data["namespace"])
+    binding = EncodingCallBinding(**data)
+    _validate_binding_content(binding)
+    if binding_to_json(binding) != value:
+        raise EncodingCallConflict("frozen encoding binding is not canonical")
+    return binding
+
+
 def install_schema(db) -> None:
+    intent_columns = {row[1] for row in db.execute(
+        "PRAGMA table_info(graph_job_acquire_intents_v2)")}
+    if intent_columns and "encoding_binding_json" not in intent_columns:
+        db.execute("ALTER TABLE graph_job_acquire_intents_v2 "
+                   "ADD COLUMN encoding_binding_json TEXT")
+    if intent_columns:
+        db.execute("DROP TRIGGER IF EXISTS graph_job_acquire_intent_no_update_v2")
+        db.execute("""
+            CREATE TRIGGER graph_job_acquire_intent_no_update_v2
+            BEFORE UPDATE ON graph_job_acquire_intents_v2
+            WHEN NOT (
+                OLD.encoding_binding_json IS NOT NULL
+                AND NEW.encoding_binding_json IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM runtime_encoding_call_redactions_v1 AS r
+                    WHERE r.bot=OLD.bot AND r.persona=OLD.persona
+                    AND r.acquire_operation_id=OLD.acquire_operation_id
+                )
+                AND NEW.bot IS OLD.bot AND NEW.persona IS OLD.persona
+                AND NEW.acquire_operation_id IS OLD.acquire_operation_id
+                AND NEW.request_digest IS OLD.request_digest
+                AND NEW.job_id IS OLD.job_id
+                AND NEW.original_operation_id IS OLD.original_operation_id
+                AND NEW.actor IS OLD.actor AND NEW.fixed_now_utc IS OLD.fixed_now_utc
+                AND NEW.lease_seconds IS OLD.lease_seconds
+                AND NEW.expected_job_revision IS OLD.expected_job_revision
+                AND NEW.expected_fence IS OLD.expected_fence
+                AND NEW.expected_cancel_epoch IS OLD.expected_cancel_epoch
+                AND NEW.fence_attempt_id IS OLD.fence_attempt_id
+                AND NEW.requirements_json IS OLD.requirements_json
+                AND NEW.anchor_json IS OLD.anchor_json
+                AND NEW.graph_revision IS OLD.graph_revision
+                AND NEW.graph_epoch IS OLD.graph_epoch
+            )
+            BEGIN SELECT RAISE(ABORT, 'job acquire intent is immutable'); END
+        """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS runtime_encoding_call_bindings_v1(
             bot TEXT NOT NULL, persona TEXT NOT NULL,
@@ -64,6 +128,26 @@ def install_schema(db) -> None:
     """)
     # D12 closure cleanup must eventually be able to purge source-bearing
     # request JSON. Normal write admission has no delete operation.
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_encoding_call_redactions_v1(
+            bot TEXT NOT NULL, persona TEXT NOT NULL,
+            acquire_operation_id TEXT NOT NULL, job_id TEXT NOT NULL,
+            source_id TEXT NOT NULL, call_id TEXT NOT NULL,
+            binding_digest TEXT NOT NULL, model_request_digest TEXT NOT NULL,
+            deletion_operation_id TEXT NOT NULL,
+            PRIMARY KEY(bot,persona,acquire_operation_id)
+        )
+    """)
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS runtime_encoding_call_redactions_no_update_v1
+        BEFORE UPDATE ON runtime_encoding_call_redactions_v1
+        BEGIN SELECT RAISE(ABORT, 'encoding call redaction is immutable'); END
+    """)
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS runtime_encoding_call_redactions_no_delete_v1
+        BEFORE DELETE ON runtime_encoding_call_redactions_v1
+        BEGIN SELECT RAISE(ABORT, 'encoding call redaction is immutable'); END
+    """)
 
 
 def prepare_binding(
@@ -74,7 +158,7 @@ def prepare_binding(
     provider_config_digest: str,
 ) -> EncodingCallBinding:
     """Freeze all request inputs. Caller must independently qualify their origin."""
-    from ..memory_types import SourceRecord, source_key
+    from ..memory_types import SourceRecord, access_key, source_key
     from ..model_broker.broker import ModelCallRequest
     from ..model_broker.first_ingress_encoding import (
         FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
@@ -86,7 +170,9 @@ def prepare_binding(
             or type(source) is not SourceRecord):
         raise TypeError("typed namespace, source and model request are required")
     source_id = source.source_id
-    source_ref = source_key(*namespace.as_tuple, source_id).token
+    source_atom = source_key(*namespace.as_tuple, source_id)
+    access_atom = access_key(*namespace.as_tuple, source_id)
+    source_ref = source_atom.token
     if any(type(value) is not str or not value for value in (
             job_id, source_id, budget_lease_id,
             budget_reservation_operation_id, prompt_template_version,
@@ -104,6 +190,15 @@ def prepare_binding(
             or request.envelope.parent_budget_lease_ref != budget_lease_id
             or request.envelope.input_refs != (source_ref,)):
         raise ValueError("model request differs from source or budget identity")
+    guard_versions = {
+        item.key: item.revision
+        for item in request.envelope.version_guard.read_versions
+    }
+    if (guard_versions.get(source_atom) != source_revision
+            or guard_versions.get(access_atom) != access_revision
+            or request.envelope.authority.purpose not in source.purposes
+            or not set(request.envelope.authority.audience).issubset(source.audiences)):
+        raise ValueError("model request lost source version or access scope")
     expected_payload, expected_template_digest = build_first_ingress_encoding_payload(source)
     if (dict(request.payload) != expected_payload
             or request.prompt_template_digest != expected_template_digest
@@ -200,6 +295,18 @@ def insert_binding(db, binding: EncodingCallBinding) -> EncodingCallBinding:
     if type(binding) is not EncodingCallBinding:
         raise TypeError("typed encoding call binding required")
     _validate_binding_content(binding)
+    if db.execute(
+        "SELECT 1 FROM runtime_encoding_call_redactions_v1 "
+        "WHERE bot=? AND persona=? AND source_id=? LIMIT 1",
+        binding.namespace.as_tuple + (binding.source_id,),
+    ).fetchone():
+        raise EncodingCallConflict("erased source cannot regain an encoding request")
+    if db.execute(
+        "SELECT 1 FROM runtime_encoding_call_redactions_v1 "
+        "WHERE bot=? AND persona=? AND call_id=? LIMIT 1",
+        binding.namespace.as_tuple + (binding.call_id,),
+    ).fetchone():
+        raise EncodingCallConflict("erased call ID cannot be reused")
     prior = load_binding(db, binding.namespace, binding.job_id)
     if prior is not None:
         if prior != binding:
@@ -225,3 +332,73 @@ def insert_binding(db, binding: EncodingCallBinding) -> EncodingCallBinding:
             binding.request_json),
     )
     return binding
+
+
+def _redact_source_binding_content_in_transaction(
+    db, namespace: NamespaceId, source_id: str, deletion_operation_id: str,
+) -> int:
+    """D12-only storage facet. Caller must hold the graph lock and verified barrier.
+
+    This primitive intentionally has no coordinator entrypoint until the D12
+    fence-bound cleanup authority exists. The caller owns commit/rollback.
+    """
+    from ..runtime_contracts import NamespaceId
+
+    if not db.in_transaction:
+        raise RuntimeError("encoding redaction requires an existing graph transaction")
+    if type(namespace) is not NamespaceId or any(
+            type(value) is not str or not value
+            for value in (source_id, deletion_operation_id)):
+        raise ValueError("redaction requires exact namespace, source and deletion identity")
+    prior = db.execute(
+        "SELECT DISTINCT deletion_operation_id FROM runtime_encoding_call_redactions_v1 "
+        "WHERE bot=? AND persona=? AND source_id=?",
+        namespace.as_tuple + (source_id,),
+    ).fetchall()
+    if any(row[0] != deletion_operation_id for row in prior):
+        raise EncodingCallConflict("source redaction belongs to another deletion")
+    intent_rows = db.execute(
+        "SELECT acquire_operation_id,job_id,encoding_binding_json "
+        "FROM graph_job_acquire_intents_v2 WHERE bot=? AND persona=? "
+        "AND encoding_binding_json IS NOT NULL",
+        namespace.as_tuple,
+    ).fetchall()
+    matching = []
+    for operation_id, job_id, frozen_json in intent_rows:
+        binding = binding_from_json(frozen_json)
+        if binding.source_id != source_id:
+            continue
+        if binding.namespace != namespace or binding.job_id != job_id:
+            raise EncodingCallConflict("source redaction found a mismatched intent")
+        matching.append((operation_id, binding))
+    bound_rows = db.execute(
+        "SELECT job_id FROM runtime_encoding_call_bindings_v1 "
+        "WHERE bot=? AND persona=? AND source_id=?",
+        namespace.as_tuple + (source_id,),
+    ).fetchall()
+    for (job_id,) in bound_rows:
+        bound = load_binding(db, namespace, job_id)
+        if not any(binding == bound for _, binding in matching):
+            raise EncodingCallConflict("bound request has no matching frozen intent")
+    for operation_id, binding in matching:
+        db.execute(
+            "INSERT INTO runtime_encoding_call_redactions_v1"
+            "(bot,persona,acquire_operation_id,job_id,source_id,call_id,"
+            "binding_digest,model_request_digest,deletion_operation_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            namespace.as_tuple + (operation_id, binding.job_id,
+                binding.source_id, binding.call_id, binding.binding_digest,
+                binding.model_request_digest, deletion_operation_id),
+        )
+        db.execute(
+            "UPDATE graph_job_acquire_intents_v2 SET encoding_binding_json=NULL "
+            "WHERE bot=? AND persona=? AND acquire_operation_id=? "
+            "AND encoding_binding_json=?",
+            namespace.as_tuple + (operation_id, binding_to_json(binding)),
+        )
+    db.execute(
+        "DELETE FROM runtime_encoding_call_bindings_v1 "
+        "WHERE bot=? AND persona=? AND source_id=?",
+        namespace.as_tuple + (source_id,),
+    )
+    return len(matching)
