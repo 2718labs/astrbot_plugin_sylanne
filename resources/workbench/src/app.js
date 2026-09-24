@@ -40,6 +40,7 @@ function escapeHtml(value) {
 
 function statusCopy(status, problem) {
   if (problem?.code === "owner_session_locked") return ["Owner 尚未解锁", "AstrBot 控制台已登录。Sylanne Owner 会话尚未建立或已失效；角色内容和操作保持锁定。"];
+  if (problem?.code === "source_correction_commit_unavailable") return ["更正待接入（HOLD）", problem.message ?? "服务端尚未接通权威更正提交；来源与解释未修改。"];
   const map = {
     loading: ["正在核验", "正在向服务重新请求权限过滤的投影。"],
     empty: ["暂无内容", "服务已确认这个视图为空；这不表示其他领域也为空。"],
@@ -56,6 +57,7 @@ function statusCopy(status, problem) {
 function formMarkup(page) {
   if (page[0] === "setup") return `<p class="setup-hint">近期场景候选仅来自宿主已观察到的会话，供 Owner 点选。点选不会绑定场景；服务端仍会核验场景和权限，可能暂缓绑定。</p><button type="button" class="quiet" data-command="refresh-scene-candidates" ${state.sessionReady ? "" : "disabled"}>刷新场景候选</button><div class="scene-candidates" aria-label="近期场景候选">${sceneCandidatesProblem ? `<p>${escapeHtml(sceneCandidatesProblem)}</p>` : sceneCandidates.length ? sceneCandidates.map((item, index) => `<button type="button" class="quiet" data-scene-candidate="${index}">${escapeHtml(item.platform_ref)} · ${escapeHtml(item.conversation_ref)} · ${item.visibility === "group" ? "群聊" : "私聊"}</button>`).join("") : "<p>暂无近期场景候选；需在目标会话中产生真实消息后刷新。</p>"}</div><label>场景引用<input name="scene_ref" required autocomplete="off" placeholder="scene:conversation-v1:（64 位小写十六进制值）" /></label><label>可见范围<select name="visibility" required><option value="">请选择</option><option value="private">私聊</option><option value="group">群聊</option></select></label><label class="acknowledgement"><input type="checkbox" name="acknowledgement" required /><span>我确认所选场景和可见范围适用于当前角色，并明确申请绑定。</span></label>`;
   if (page[0] === "creation") return `<label>方案草稿（JSON 对象，可编辑）<textarea name="draft_json" placeholder='{"fields":{},"field_sources":{}}'></textarea></label><label>已有方案草稿引用（与 JSON 二选一）<input name="draft_ref" placeholder="由已授权草稿提供" /></label><label>已编译候选引用<input name="compiled_scheme_ref" placeholder="采用前由服务签发" /></label><label>操作<select name="mode"><option value="compile">编译候选</option><option value="activate">采用方案</option></select></label>`;
+  if (page[0] === "memory") return `<p>提交来源更正申请需要已核验的来源/目标引用和访问、删除纪元。服务端当前可能返回 HOLD；申请不代表更正已采用。</p><label>更正说明<textarea name="statement" required maxlength="4096"></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" required /></label><label>目标引用（逗号分隔）<input name="target_refs" required /></label><label>访问纪元<input name="access_epoch" type="number" min="0" step="1" required /></label><label>删除纪元<input name="deletion_epoch" type="number" min="0" step="1" required /></label><label>影响预览引用（可选）<input name="impact_preview_ref" /></label><button type="button" class="quiet" data-command="memory-correction" ${state.role && state.sessionReady && state.status !== "loading" ? "" : "disabled"}>提交来源更正申请</button>`;
   if (page[0] === "relations") return `<label>纠错类型<select name="correction_kind"><option value="source_correction">来源更正</option><option value="interpretation_challenge">解释质疑</option><option value="administrative_edit">创作调整</option></select></label><label>新说明<textarea name="statement" required></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" /></label>`;
   if (["cognition", "action", "expression"].includes(page[0])) return `<label>对象引用<input name="object_ref" required /></label><label>控制请求<input name="control" placeholder="只提交领域可解释的控制请求" /></label>`;
   if (page[0] === "diagnostics") return `<label>操作<select name="mode"><option value="experiment">隔离实验</option><option value="support">生成脱敏支持诊断</option></select></label><label>假设或问题<textarea name="hypothesis"></textarea><input name="question" placeholder="支持问题" /></label>`;
@@ -440,6 +442,15 @@ async function command(action) {
   if (action === "retry-status") return verifyInstallationStatus();
   if (action === "refresh") return loadView();
   if (action === "creation-next") return loadMoreCreation();
+  if (action === "memory-correction") {
+    if (state.view !== "memory" || !state.sessionReady) return;
+    try {
+      const [nextAction, input] = workflowForPage("memory", Object.fromEntries(new FormData(document.querySelector("#page-form")).entries()));
+      return commandAction(nextAction, input);
+    } catch (error) {
+      Object.assign(state, applyProblem(state, { code: "invalid_input", message: error.message, retryable: false })); render(); return;
+    }
+  }
   if (action === "open-workspace") return commandAction(ACTIONS.openWorkspace, { client_protocol: "d12.contract.v1" }, "workbench_view");
   if (action === "page-action") {
     const page = pages.find(([id]) => id === state.view) ?? pages[0];
