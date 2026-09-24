@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from threading import get_ident
 from types import ModuleType, SimpleNamespace
@@ -25,10 +26,14 @@ from sylanne3.graph_coordinator import (
 )
 from sylanne3.host.authority_profile import (
     AdminD03ArrivalPolicy, AdminIngressClockPolicy, AdminIngressEncodingPolicy,
+    AdminInstallationBundle,
 )
+from sylanne3.host.authority_client import AuthorityClient
 from sylanne3.host.ingress import HostIngressEnvelope, IngressReceipt, SourceLineage
 from sylanne3.host.installed_package import InstalledPackageVerification
+from sylanne3.host.mtls_transport import AuthorityTlsProfile
 from sylanne3.host.v2_installation import V2InstallationAssembly
+from sylanne3.host.worker_result_read_fact_port import InstalledWorkerResultReadFactPort
 from sylanne3.installation_policy import AdminInstallationPolicy
 from sylanne3.runtime.budget import BudgetLease
 from sylanne3.runtime.issuers import BudgetLeaseGrant
@@ -68,6 +73,80 @@ def envelope(namespace, learned_at=11.0):
         10.0, learned_at, "private",
         SourceLineage("a" * 64, "reported", "platform", "external_report", "reported_claim"),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pairing", ("missing_bundle", "paired", "unpaired"))
+async def test_v2_installs_worker_fact_port_only_from_paired_bundle(
+    tmp_path, monkeypatch, pairing,
+):
+    grant = InstallationGrantV2(
+        "authority", "subject", "administrator", "installation",
+        "a" * 64, "publisher-trust", "2", "b" * 64,
+    )
+    installed = assembly(tmp_path, grant, object, clock=None, encoding=None)
+    if pairing != "missing_bundle":
+        profile = AuthorityTlsProfile(
+            "profile", "authority.example", 443, "authority.example",
+            grant.authority_id, tmp_path / "ca.pem", tmp_path / "client.pem",
+            tmp_path / "client.key",
+        )
+        installed = replace(installed, admin_bundle=AdminInstallationBundle(
+            profile, installed.installation_policy,
+            installed.d11_signing_key, installed.d02_signing_key,
+        ))
+
+    async def status_v2(self):
+        return SimpleNamespace(state="paired" if pairing == "paired" else "unpaired")
+
+    async def installation_grant_v2(self):
+        return grant
+
+    monkeypatch.setattr(AuthorityClient, "status_v2", status_v2)
+    monkeypatch.setattr(AuthorityClient, "installation_grant_v2", installation_grant_v2)
+    monkeypatch.setattr(
+        runtime_context, "verify_installed_package",
+        lambda root, digest, *, available_cpu_features: InstalledPackageVerification(
+            True, "verified", digest, "3.0.0-alpha1", "formal-alpha1"),
+    )
+
+    class Store:
+        def __init__(self, *_):
+            pass
+
+        def close(self):
+            pass
+
+    class Port:
+        installation_grant = grant
+
+        def close(self):
+            pass
+
+    captured = []
+
+    class Coordinator:
+        def __init__(self, store, bootstrap, **kwargs):
+            captured.append(kwargs["worker_result_fact_port"])
+
+    monkeypatch.setattr(runtime_context, "ProductionGraphStore", Store)
+    monkeypatch.setattr(runtime_context, "GraphCoordinator", Coordinator)
+    installed = replace(installed, fence_port_factory=Port)
+    context = runtime_context.RuntimeContext(
+        installed.data_dir, package_root=tmp_path, dependencies=None,
+        domains=SimpleNamespace(complete=True, registrations={}, type_registry=object()),
+    )
+    try:
+        assert (await context.start_v2(installed)).status == "limited"
+        assert len(captured) == 1
+        if pairing == "paired":
+            assert isinstance(captured[0], InstalledWorkerResultReadFactPort)
+            assert captured[0]._grant == grant
+            assert captured[0]._bundle is installed.admin_bundle
+        else:
+            assert captured[0] is None
+    finally:
+        await context.stop()
 
 
 @pytest.mark.asyncio

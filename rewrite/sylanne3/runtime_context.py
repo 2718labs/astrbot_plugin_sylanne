@@ -38,6 +38,7 @@ from .host.accounting_maintenance_port import InstalledAccountingMaintenancePort
 from .host.authority_client import AuthorityClient, AuthoritySelection
 from .host.model_terminal_cost_port import InstalledModelTerminalCostPort
 from .host.self_identity_current_port import InstalledCurrentSelfIdentityPort
+from .host.worker_result_read_fact_port import InstalledWorkerResultReadFactPort
 from .host.mtls_transport import MtlsAuthorityTransport
 from .host.first_ingress_result import OriginalFirstIngressRead
 from .host.worker_result_identity import first_ingress_worker_result_request_v1
@@ -292,6 +293,7 @@ class RuntimeContext:
             terminal_cost_port = None
             accounting_port = None
             self_identity_port = None
+            worker_result_fact_port = None
             bundle = installation.admin_bundle
             if type(bundle) is AdminInstallationBundle:
                 cost_transport = MtlsAuthorityTransport({
@@ -316,9 +318,14 @@ class RuntimeContext:
                     self_identity_port = InstalledCurrentSelfIdentityPort(
                         client=client, bundle=bundle,
                         grant=installation_grant, owner_loop=loop)
+                    worker_result_fact_port = InstalledWorkerResultReadFactPort(
+                        client=client, bundle=bundle,
+                        grant=installation_grant, owner_loop=loop)
                 except Exception:
                     await cost_transport.close()
                     cost_transport = None
+                    terminal_cost_port = accounting_port = None
+                    self_identity_port = worker_result_fact_port = None
 
             def make_store():
                 return ProductionGraphStore(
@@ -448,6 +455,7 @@ class RuntimeContext:
                     model_terminal_cost_port=terminal_cost_port,
                     accounting_maintenance_port=accounting_port,
                     self_identity_port=self_identity_port,
+                    worker_result_fact_port=worker_result_fact_port,
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(
