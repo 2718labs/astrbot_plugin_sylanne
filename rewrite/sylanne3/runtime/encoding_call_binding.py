@@ -22,6 +22,30 @@ class EncodingCallConflict(RuntimeError):
     """One job or call identity was reused with different content."""
 
 
+@dataclass(frozen=True, slots=True)
+class CommittedEncodingBaselineV1:
+    """Historical D04 graph identity to freeze before a new model acquire."""
+
+    baseline_ref: str
+    baseline_revision: int
+    operation_id: str
+    bundle_digest: str
+    graph_incarnation: str
+    graph_epoch: int
+
+    def __post_init__(self) -> None:
+        from ..graph_types import AtomKey
+
+        key = AtomKey.from_token(self.baseline_ref)
+        if key.type_name != "d04.encoding_baseline.v1":
+            raise ValueError("D04 encoding baseline graph token required")
+        if (type(self.baseline_revision) is not int or self.baseline_revision < 1
+                or type(self.graph_epoch) is not int or self.graph_epoch < 1
+                or any(type(value) is not str or not value for value in (
+                    self.operation_id, self.bundle_digest, self.graph_incarnation))):
+            raise ValueError("committed D04 baseline identity is incomplete")
+
+
 @dataclass(frozen=True)
 class EncodingCallBinding:
     namespace: NamespaceId
@@ -167,8 +191,10 @@ def prepare_binding(
     *, prompt_template_version: str, provider_config_ref: str,
     provider_config_digest: str,
     production_context=None,
+    baseline: CommittedEncodingBaselineV1 | None = None,
 ) -> EncodingCallBinding:
     """Freeze all request inputs. Caller must independently qualify their origin."""
+    from ..graph_types import AtomKey, GraphVersion
     from ..memory_types import SourceRecord, access_key, source_key
     from ..model_broker.broker import ModelCallRequest
     from ..model_broker.first_ingress_encoding import (
@@ -180,6 +206,14 @@ def prepare_binding(
     if (type(request) is not ModelCallRequest or type(namespace) is not NamespaceId
             or type(source) is not SourceRecord):
         raise TypeError("typed namespace, source and model request are required")
+    if baseline is not None:
+        if production_context is None or type(baseline) is not CommittedEncodingBaselineV1:
+            raise ValueError("V3 baseline needs a production issue context")
+        baseline_key = AtomKey.from_token(baseline.baseline_ref)
+        if (NamespaceId.from_key(baseline_key) != namespace
+                or request.envelope.version_guard.read_versions.count(
+                    GraphVersion(baseline_key, baseline.baseline_revision)) != 1):
+            raise ValueError("V3 request must guard the committed D04 baseline")
     source_id = source.source_id
     source_atom = source_key(*namespace.as_tuple, source_id)
     access_atom = access_key(*namespace.as_tuple, source_id)
@@ -216,7 +250,9 @@ def prepare_binding(
             or prompt_template_version != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION):
         raise ValueError("model request differs from fixed first-ingress template")
     frozen = {
-        "schema": ("sylanne.first-ingress-encoding-call.v2"
+        "schema": ("sylanne.first-ingress-encoding-call.v3"
+                   if baseline is not None else
+                   "sylanne.first-ingress-encoding-call.v2"
                    if production_context is not None else
                    "sylanne.first-ingress-encoding-call.v1"),
         "namespace": list(namespace.as_tuple),
@@ -264,6 +300,8 @@ def prepare_binding(
             "worker_lease_expires_utc": production_context.job.lease_expires_utc,
             "clock_epoch": production_context.clock_epoch,
         })
+    if baseline is not None:
+        frozen["baseline"] = asdict(baseline)
     request_json = canonical_serialize(frozen)
     if len(request_json.encode("utf-8")) > 131_072:
         raise ValueError("encoding request exceeds durable binding limit")
@@ -292,14 +330,17 @@ def load_binding(db, namespace: NamespaceId, job_id: str) -> EncodingCallBinding
 
 
 def _validate_binding_content(binding: EncodingCallBinding) -> None:
-    from ..runtime_contracts import canonical_digest
+    from ..graph_types import AtomKey
+    from ..runtime_contracts import NamespaceId, canonical_digest, canonical_serialize
 
     request = binding.request
     schema = request.get("schema")
     if schema not in {"sylanne.first-ingress-encoding-call.v1",
-                      "sylanne.first-ingress-encoding-call.v2"}:
+                      "sylanne.first-ingress-encoding-call.v2",
+                      "sylanne.first-ingress-encoding-call.v3"}:
         raise EncodingCallConflict("unknown encoding request binding schema")
-    if schema == "sylanne.first-ingress-encoding-call.v2":
+    if schema in {"sylanne.first-ingress-encoding-call.v2",
+                  "sylanne.first-ingress-encoding-call.v3"}:
         try:
             envelope = request["envelope"]
             identity = envelope["identity"]
@@ -329,6 +370,20 @@ def _validate_binding_content(binding: EncodingCallBinding) -> None:
                 raise ValueError("production context differs")
         except (KeyError, TypeError, ValueError) as exc:
             raise EncodingCallConflict("production encoding context is incomplete") from exc
+    if schema == "sylanne.first-ingress-encoding-call.v3":
+        try:
+            baseline = CommittedEncodingBaselineV1(**request["baseline"])
+            baseline_key = AtomKey.from_token(baseline.baseline_ref)
+            guarded = request["envelope"]["version_guard"]["read_versions"]
+            if (NamespaceId.from_key(baseline_key) != binding.namespace
+                    or sum(item["key"] == json.loads(canonical_serialize(
+                        baseline_key)) and item["revision"] == baseline.baseline_revision
+                           for item in guarded) != 1):
+                raise ValueError("baseline guard differs")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EncodingCallConflict("V3 committed baseline identity differs") from exc
+    elif "baseline" in request:
+        raise EncodingCallConflict("legacy binding cannot claim a D04 baseline")
     try:
         model_digest = canonical_digest({
             "envelope": request["envelope"],
