@@ -29,6 +29,20 @@ _V2_TAIL_DDL = """CREATE TABLE authority_deletion_v2_tail(
     epoch INTEGER NOT NULL, policy_ref TEXT NOT NULL,
     prev_digest TEXT NOT NULL, chain_digest TEXT NOT NULL
 ) STRICT"""
+_V2_TAIL_DDL_V2 = """CREATE TABLE authority_deletion_v2_tail(
+    seq INTEGER PRIMARY KEY CHECK(seq > 0),
+    schema TEXT NOT NULL CHECK(schema='sylanne3.deletion-tail.v2'),
+    kind TEXT NOT NULL CHECK(kind='deletion'),
+    append_id TEXT NOT NULL UNIQUE, mutation_id TEXT NOT NULL UNIQUE,
+    request_digest TEXT NOT NULL, namespace TEXT NOT NULL,
+    operation_id TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('pending','accepted','closed')),
+    subject TEXT NOT NULL, holder TEXT NOT NULL, token_digest TEXT NOT NULL,
+    fence_epoch INTEGER NOT NULL, revision INTEGER NOT NULL,
+    before_seq INTEGER NOT NULL, before_digest TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL, roots_json TEXT NOT NULL,
+    epoch INTEGER NOT NULL, policy_ref TEXT NOT NULL,
+    prev_digest TEXT NOT NULL, chain_digest TEXT NOT NULL
+) STRICT"""
 _PREFIX_TRIGGERS = {
     "deletion_events_immutable_insert": "CREATE TRIGGER deletion_events_immutable_insert BEFORE INSERT ON deletion_events BEGIN SELECT RAISE(ABORT,'v2 historical prefix'); END",
     "deletion_events_immutable_update": "CREATE TRIGGER deletion_events_immutable_update BEFORE UPDATE ON deletion_events BEGIN SELECT RAISE(ABORT,'v2 historical prefix'); END",
@@ -38,6 +52,11 @@ _TAIL_TRIGGERS = {
     "authority_deletion_v2_no_insert": "CREATE TRIGGER authority_deletion_v2_no_insert BEFORE INSERT ON authority_deletion_v2_tail BEGIN SELECT RAISE(ABORT,'v2 deletion append disabled'); END",
     "authority_deletion_v2_no_update": "CREATE TRIGGER authority_deletion_v2_no_update BEFORE UPDATE ON authority_deletion_v2_tail BEGIN SELECT RAISE(ABORT,'append-only'); END",
     "authority_deletion_v2_no_delete": "CREATE TRIGGER authority_deletion_v2_no_delete BEFORE DELETE ON authority_deletion_v2_tail BEGIN SELECT RAISE(ABORT,'append-only'); END",
+}
+_TAIL_TRIGGERS_V2 = {
+    "authority_deletion_v2_guarded_insert": "CREATE TRIGGER authority_deletion_v2_guarded_insert BEFORE INSERT ON authority_deletion_v2_tail BEGIN SELECT CASE WHEN authority_deletion_v2_append_allowed() != 1 THEN RAISE(ABORT,'v2 deletion append requires service guard') END; END",
+    "authority_deletion_v2_no_update": _TAIL_TRIGGERS["authority_deletion_v2_no_update"],
+    "authority_deletion_v2_no_delete": _TAIL_TRIGGERS["authority_deletion_v2_no_delete"],
 }
 
 
@@ -49,6 +68,11 @@ class AuthorityV2DeletionGuard:
         self._lock = threading.RLock()
         self._db = sqlite3.connect(f"file:{self.path.as_posix()}?mode=rw", uri=True,
                                    isolation_level=None, check_same_thread=False)
+        # Schema 2 denies inserts on every connection until a future service
+        # append implementation explicitly owns this connection's write guard.
+        self._append_allowed = False
+        self._db.create_function("authority_deletion_v2_append_allowed", 0,
+                                 lambda: int(self._append_allowed))
         try:
             self._db.execute("PRAGMA busy_timeout=5000")
             if self._db.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
@@ -80,7 +104,9 @@ class AuthorityV2DeletionGuard:
             ("trigger", "authority_deletion_v2_no_update"),
             ("trigger", "authority_deletion_v2_no_delete"),
         }
-        if set(objects) not in (legacy, v2):
+        v2_schema2 = (v2 - {("trigger", "authority_deletion_v2_no_insert")}
+                      | {("trigger", "authority_deletion_v2_guarded_insert")})
+        if set(objects) not in (legacy, v2, v2_schema2):
             raise AuthorityUnavailable("malformed or mixed deletion journal schema")
         columns = tuple(row[1] for row in self._db.execute(
             "PRAGMA table_info(deletion_events)"))
@@ -92,17 +118,19 @@ class AuthorityV2DeletionGuard:
             raise AuthorityUnavailable("malformed deletion journal identity")
         if set(objects) == legacy:
             return "legacy", meta[0][1], None
+        schema2 = set(objects) == v2_schema2
         expected_sql = {
             ("table", "authority_deletion_v2_meta"): _V2_META_DDL,
-            ("table", "authority_deletion_v2_tail"): _V2_TAIL_DDL,
+            ("table", "authority_deletion_v2_tail"): (_V2_TAIL_DDL_V2 if schema2 else _V2_TAIL_DDL),
             **{("trigger", name): ddl for name, ddl in
-               {**_PREFIX_TRIGGERS, **_TAIL_TRIGGERS}.items()},
+               {**_PREFIX_TRIGGERS, **(_TAIL_TRIGGERS_V2 if schema2 else _TAIL_TRIGGERS)}.items()},
         }
         if any(objects[key] != ddl for key, ddl in expected_sql.items()):
             raise AuthorityUnavailable("unsafe v2 deletion schema migration")
         values = dict(self._db.execute("SELECT key,value FROM authority_deletion_v2_meta"))
         if (set(values) != {"schema_version", "journal_id", "namespace", "cut_seq", "cut_digest"}
-                or values["schema_version"] != "1" or values["journal_id"] != meta[0][1]
+                or values["schema_version"] != ("2" if schema2 else "1")
+                or values["journal_id"] != meta[0][1]
                 or not values["namespace"]):
             raise AuthorityUnavailable("unknown v2 deletion metadata")
         try:
@@ -112,6 +140,14 @@ class AuthorityV2DeletionGuard:
         if cut_seq < 0 or str(cut_seq) != values["cut_seq"]:
             raise AuthorityUnavailable("invalid v2 deletion cut sequence")
         return "v2", meta[0][1], values
+
+    def schema_version(self) -> int:
+        if self._db is None or not self._db.in_transaction:
+            raise AuthorityUnavailable("deletion schema query requires writer guard")
+        kind, _, metadata = self._check_schema()
+        if kind != "v2":
+            raise AuthorityUnavailable("deletion journal has no v2 tail")
+        return int(metadata["schema_version"])
 
     def schema_kind(self) -> str:
         if self._db is None or not self._db.in_transaction:
@@ -169,11 +205,16 @@ class AuthorityV2DeletionGuard:
             if (seq, previous) != (int(metadata["cut_seq"]), metadata["cut_digest"]):
                 raise AuthorityUnavailable("v2 deletion historical cut differs")
             try:
+                version = int(metadata["schema_version"])
+                extra = "schema,kind,append_id," if version == 2 else ""
                 for row in self._db.execute(
-                    "SELECT seq,mutation_id,request_digest,namespace,operation_id,phase,"
+                    "SELECT seq," + extra + "mutation_id,request_digest,namespace,operation_id,phase,"
                     "subject,holder,token_digest,fence_epoch,revision,before_seq,before_digest,"
                     "evidence_digest,roots_json,epoch,policy_ref,prev_digest,chain_digest "
                     "FROM authority_deletion_v2_tail ORDER BY seq"):
+                    if version == 2:
+                        number, schema, event_kind, append_id, *rest = row
+                        row = (number, *rest)
                     (number, mutation_id, request_digest, namespace, operation, phase,
                      subject, holder, token_digest, fence_epoch, revision, before_seq,
                      before_digest, evidence_digest, roots_json, epoch, policy, prior,
@@ -194,6 +235,11 @@ class AuthorityV2DeletionGuard:
                                 before_seq=before_seq, before_digest=before_digest,
                                 evidence_digest=evidence_digest, roots=roots,
                                 epoch=epoch, policy_ref=policy, previous=prior)
+                    if version == 2:
+                        if (schema != "sylanne3.deletion-tail.v2" or event_kind != "deletion"
+                                or type(append_id) is not str or not append_id):
+                            raise AuthorityUnavailable("v2 deletion tail event identity is malformed")
+                        body.update(schema=schema, kind=event_kind, append_id=append_id)
                     calculated = "sha256:" + hashlib.sha256(json.dumps(
                         body, sort_keys=True, separators=(",", ":"),
                         ensure_ascii=True).encode()).hexdigest()
