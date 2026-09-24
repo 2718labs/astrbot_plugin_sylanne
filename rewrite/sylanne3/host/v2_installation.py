@@ -15,6 +15,7 @@ from .authority_client import (
 )
 from .authority_profile import (
     AdminIngressClockPolicy, AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    AdminInstallationBundle,
     load_admin_installation_bundle,
 )
 from .installed_package import verify_installed_package
@@ -38,6 +39,7 @@ class V2InstallationAssembly:
     ingress_encoding: AdminIngressEncodingPolicy | None = None
     workbench_origin: str | None = None
     ingress_model: AdminIngressModelPolicy | None = None
+    admin_bundle: AdminInstallationBundle | None = None
 
 
 async def assemble_v2_installation(
@@ -116,6 +118,7 @@ async def assemble_v2_installation(
         root, data, available_cpu_features, bundle.ingress_clock,
         bundle.ingress_encoding, bundle.workbench_origin,
         getattr(bundle, "ingress_model", None),
+        bundle,
     )
 
 

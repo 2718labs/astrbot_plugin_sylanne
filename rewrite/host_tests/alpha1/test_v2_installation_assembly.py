@@ -67,6 +67,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(assembled.workbench_origin,
                              "https://workbench.example.org:8443")
             self.assertIs(assembled.ingress_model, bundle.ingress_model)
+            self.assertIs(assembled.admin_bundle, bundle)
             port_type.assert_not_called()
             await asyncio.to_thread(assembled.fence_port_factory)
             request, profiles, selected_grant = port_type.call_args.args

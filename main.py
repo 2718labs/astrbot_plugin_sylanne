@@ -19,10 +19,13 @@ from .rewrite.sylanne3.host import (
 from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
 from .rewrite.sylanne3.host.context_scheme_asset import load_verified_context_scheme
 from .rewrite.sylanne3.host.authority_profile import (
-    AdminIngressModelPolicy, AuthorityProfileUnavailable,
+    AdminIngressModelPolicy, AdminInstallationBundle,
+    AuthorityProfileUnavailable,
 )
+from .rewrite.sylanne3.host.v2_installation import V2InstallationAssembly
 from .rewrite.sylanne3.host.installed_scene_identity import InstalledSceneIdentityPort
 from .rewrite.sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
+from .rewrite.sylanne3.installation_policy import AdminInstallationPolicy
 from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, SceneCandidateCatalog
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
@@ -47,6 +50,28 @@ def _settings(config: object) -> tuple[bool, AuthoritySelection]:
         raise ValueError("enabled must be boolean")
     profile = values.get("authority_profile", "default")
     return enabled, AuthoritySelection(profile)
+
+
+def _installed_model_port(
+    context: Context, host_loop: asyncio.AbstractEventLoop,
+    installation: object,
+) -> InstalledModelCapabilityPort | None:
+    """Keep the selected model tied to the exact administrator snapshot."""
+    if type(installation) is not V2InstallationAssembly:
+        return None
+    bundle = installation.admin_bundle
+    if (type(bundle) is not AdminInstallationBundle
+            or installation.installation_policy is not bundle.installation_policy
+            or installation.ingress_encoding is not bundle.ingress_encoding
+            or installation.ingress_model is not bundle.ingress_model
+            or type(bundle.installation_policy) is not AdminInstallationPolicy
+            or type(bundle.ingress_model) is not AdminIngressModelPolicy):
+        return None
+    return InstalledModelCapabilityPort(
+        context=context, host_loop=host_loop,
+        installed_namespace=bundle.installation_policy.namespace,
+        installation_bundle=bundle,
+    )
 
 
 class Sylanne3Plugin(Star):
@@ -186,15 +211,14 @@ class Sylanne3Plugin(Star):
             context=self.context, host_loop=asyncio.get_running_loop(),
             candidates=self._scene_candidates,
         )
-        model_port = None
-        if type(getattr(installation, "ingress_model", None)) is AdminIngressModelPolicy:
-            try:
-                model_port = InstalledModelCapabilityPort(
-                    context=self.context, host_loop=asyncio.get_running_loop(),
-                    installed_namespace=installation.installation_policy.namespace,
-                )
-            except (AttributeError, TypeError, ValueError):
-                logger.warning("Sylanne 3 installed model config cannot be checked; HOLD")
+        try:
+            model_port = _installed_model_port(
+                self.context, asyncio.get_running_loop(), installation)
+        except (AttributeError, TypeError, ValueError):
+            model_port = None
+            logger.warning("Sylanne 3 installed model selection cannot be checked; HOLD")
+        # A UMO exists only for a verified event. Keep provider construction
+        # behind the future Authority executor; selection alone permits no call.
         try:
             self._runtime = RuntimeContext(
                 data_dir, package_root=PACKAGE_ROOT, dependencies=None,

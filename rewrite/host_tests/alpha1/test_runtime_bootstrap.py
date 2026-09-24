@@ -171,6 +171,48 @@ class _IngressContext:
 
 
 class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    async def test_v2_model_port_uses_the_same_admin_bundle_snapshot(self) -> None:
+        module = load_plugin_module()
+        package = module.__package__ + ".rewrite.sylanne3"
+        profile = importlib.import_module(package + ".host.authority_profile")
+        budget = importlib.import_module(package + ".runtime.budget")
+        issuers = importlib.import_module(package + ".runtime.issuers")
+        namespace = module.NamespaceId("bot", "persona")
+        lease = budget.BudgetLease(
+            "root", None, "bot", "persona", "USD",
+            {"output_tokens": 128}, {}, {}, {}, 1, "active")
+        grant = issuers.BudgetLeaseGrant(
+            "grant", 1, "bot", "persona", "root", "USD",
+            {"output_tokens": 128}, ("reply",), 4102444800, "budget-policy")
+        policy = module.AdminInstallationPolicy(
+            namespace, "bot/persona", "install", "a" * 64,
+            "holder", "authority", "b" * 64, "scheme", "operator",
+            "policy", lease, grant)
+        digest = "c" * 64
+        model = profile.AdminIngressModelPolicy(
+            "provider", "model",
+            profile.installed_model_config_ref("provider", "model", digest),
+            digest, 2, 64, ("text",), "private",
+            ("proposal",), ("owner",), ("private",))
+        encoding = profile.AdminIngressEncodingPolicy(
+            3, {"output_tokens": 128}, "snapshot", "resource", "interval")
+        bundle = profile.AdminInstallationBundle(
+            types.SimpleNamespace(), policy, b"k" * 32, b"d" * 32,
+            ingress_encoding=encoding, ingress_model=model)
+        installation = module.V2InstallationAssembly(
+            policy, object(), b"k" * 32, b"d" * 32, lambda: None,
+            Path.cwd(), Path.cwd(), ingress_encoding=encoding,
+            ingress_model=model, admin_bundle=bundle)
+        context = Context(asyncio.Queue(), {}, None, None, None, None,
+                          None, None, None, None, None)
+        port = module._installed_model_port(
+            context, asyncio.get_running_loop(), installation)
+        self.assertIsInstance(port, module.InstalledModelCapabilityPort)
+        self.assertIs(port._installation_bundle, bundle)
+        self.assertIsNone(module._installed_model_port(
+            context, asyncio.get_running_loop(),
+            replace(installation, ingress_model=replace(model, privacy_tier="public"))))
+
     async def test_runtime_context_accepts_host_scene_verify_port_without_sdk_type(self) -> None:
         class ScenePort:
             def verify(self, namespace, scene_ref, visibility):

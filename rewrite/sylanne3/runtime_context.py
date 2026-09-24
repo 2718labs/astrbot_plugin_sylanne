@@ -143,9 +143,10 @@ class RuntimeContext:
         self._domains = domains or discover_domain_registry()
         self._owner_principal_resolver = owner_principal_resolver
         self._scene_identity_port = scene_identity_port
-        if model_selection_port is not None and not callable(
-                getattr(model_selection_port, "verify_admin_config", None)):
-            raise TypeError("model_selection_port must verify installed model config")
+        if model_selection_port is not None and (
+                not callable(getattr(model_selection_port, "verify_admin_config", None))
+                or not callable(getattr(model_selection_port, "verify_admin_selection", None))):
+            raise TypeError("model_selection_port must verify installed selection")
         self._model_selection_port = model_selection_port
         self._store: ProductionGraphStore | None = None
         self._coordinator: GraphCoordinator | None = None
@@ -236,9 +237,10 @@ class RuntimeContext:
             ingress = None
             owner_runtime = None
             model_config_matched = False
+            model_selected = False
 
             def make_coordinator(store, port):
-                nonlocal provision, ingress, owner_runtime, model_config_matched
+                nonlocal provision, ingress, owner_runtime, model_config_matched, model_selected
                 if port.installation_grant != installation_grant:
                     raise RuntimeError("v2 port installation grant changed")
                 bootstrap = object()
@@ -282,8 +284,12 @@ class RuntimeContext:
                         model_config_matched = (
                             self._model_selection_port.verify_admin_config(
                                 policy.namespace, installation.ingress_model) is True)
+                        model_selected = (
+                            self._model_selection_port.verify_admin_selection(
+                                policy.namespace, installation.ingress_model) is True)
                     except Exception:
                         model_config_matched = False
+                        model_selected = False
                 coordinator = GraphCoordinator(
                     store, bootstrap, holder=installation_grant.administrator_holder,
                     content_fence_v2=port,
@@ -332,6 +338,8 @@ class RuntimeContext:
             self._v2_provision = provision
             self._v2_ingress = ingress
             self._v2_installed_model_config_matched = model_config_matched
+            # Selection is an installation diagnostic, never an egress permit.
+            self._v2_installed_model_selected = model_selected
             self._v2_namespace = policy.namespace
             if owner_runtime is not None:
                 (self._v2_coordinator, self._v2_bootstrap, port,
@@ -453,7 +461,7 @@ class RuntimeContext:
 
     @property
     def v2_installed_model_selected(self) -> bool:
-        """HOLD until capability, privacy and limit policy has trusted proof."""
+        """Installed selection eligibility only; model egress remains fenced/HOLD."""
         return self._v2_installed_model_selected
 
     @property
