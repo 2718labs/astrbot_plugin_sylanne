@@ -524,11 +524,11 @@ class SourceQualification:
             object.__setattr__(self, "subjective_confidence", confidence)
         if self.internal_activity_actuality not in _ACTUALITY:
             raise ValueError(f"unknown internal_activity_actuality: {self.internal_activity_actuality!r}")
-        if self.source_family in {"authored", "simulated"}:
+        if self.source_family in {"authored", "simulated", "derived"}:
             if self.content_reality in {"external_observation", "external_report"}:
-                raise ValueError("authored/simulated sources cannot claim external reality")
-            if self.evidence_eligibility == "eligible":
-                raise ValueError("authored/simulated sources cannot be unqualified external evidence")
+                raise ValueError("authored/simulated/derived sources cannot claim external reality")
+            if self.evidence_eligibility != "ineligible":
+                raise ValueError("authored/simulated/derived sources cannot qualify as external evidence")
 
 
 @dataclass(frozen=True)

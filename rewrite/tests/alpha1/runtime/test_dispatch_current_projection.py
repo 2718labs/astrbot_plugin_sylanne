@@ -1,12 +1,17 @@
 """Current D03/D05 inventory must be complete inside one graph transaction."""
 
 import sqlite3
+from dataclasses import asdict, replace
 
 import pytest
 
 from sylanne3.contracts import canonical_json
+from sylanne3.domains.d03.context import ContextProvider, RoleBinding, RoleBindingRequest
+from sylanne3.domains.d05.relationship import BoundaryRule
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch, Owner
-from sylanne3.runtime.dispatch_current_projection import read_current_dispatch_projection
+from sylanne3.runtime.dispatch_current_projection import (
+    derive_current_domain_reads, read_current_dispatch_projection,
+)
 from sylanne3.runtime_contracts import NamespaceId, QueryEpoch
 
 
@@ -64,5 +69,89 @@ def test_missing_domain_row_or_changed_epoch_rejects_projection():
         db.execute("UPDATE graph_epochs SET revision=6")
         with pytest.raises(ValueError, match="epoch changed"):
             read_current_dispatch_projection(db, namespace, snapshot, query)
+    finally:
+        db.close()
+
+
+def _typed_case():
+    db, namespace, _, query = _case()
+    binding = RoleBinding(
+        "binding:one", "persona:persona", "friend", "entity:user", None,
+        "scene:one", "direct", "private", (), 1, None, 1,
+        ("source:one",), 2, "active",
+    )
+    rule = BoundaryRule(
+        "boundary:one", "persona:persona", "entity:user", "message",
+        "conversation", "scene:one", "allow", "self_internal",
+        ("source:one",), (), (), 1, None, 1, "actor", (), "active",
+    )
+    atoms = (
+        GraphAtom(
+            AtomKey(Owner("scene", "bot", "persona", "scene:one"),
+                    "d03.role_binding", "binding:one"),
+            2, {**asdict(binding), "norm_refs": list(binding.norm_refs),
+                "source_refs": list(binding.source_refs)},
+        ),
+        GraphAtom(
+            AtomKey(Owner("relation", "bot", "persona", "entity:user"),
+                    "d05.boundary_rule", "boundary:one"),
+            1, {**asdict(rule), **{
+                name: list(getattr(rule, name)) for name in (
+                    "source_refs", "communicated_refs", "acknowledged_refs", "exception_refs",
+                )
+            }},
+        ),
+    )
+    for atom in atoms:
+        db.execute("UPDATE graph_atoms SET value=? WHERE token=?", (
+            canonical_json(atom.value), atom.key.token,
+        ))
+    snapshot = GraphSnapshot(atoms, (NamespaceEpoch("bot", "persona", 5),))
+    provider = ContextProvider()
+    provider.compile_scheme({
+        "schema": "d03.context.scheme.v1", "roles": ("friend",), "norms": (),
+    }, None)
+    request = RoleBindingRequest(
+        "persona:persona", "entity:user", None, "scene:one", "message",
+        "respond", 2, True,
+    )
+    return db, namespace, snapshot, query, provider, request
+
+
+def test_typed_domain_reads_from_one_complete_sqlite_transaction():
+    db, namespace, snapshot, query, provider, request = _typed_case()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        projection = read_current_dispatch_projection(db, namespace, snapshot, query)
+        role, boundary = derive_current_domain_reads(db, projection, request, provider)
+        assert role.status == "complete"
+        assert role.matched_bindings == ("binding:one",)
+        assert role.query_epoch == QueryEpoch(namespace, "d03.role_binding", 5)
+        assert role.read_versions[0].key == snapshot.atoms[0].key
+        assert role.request == request
+        assert boundary.coverage == "full"
+        assert boundary.rules[0].rule_id == "boundary:one"
+        assert boundary.query_epoch == QueryEpoch(namespace, "d05.boundary", 5)
+        assert {(ref.ref, ref.version) for ref in boundary.input_versions} == {
+            ("d05.boundary", 5), ("boundary:one", 1),
+        }
+    finally:
+        db.close()
+
+
+def test_typed_reads_reject_omitted_or_changed_current_rows():
+    db, namespace, snapshot, query, provider, request = _typed_case()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        projection = read_current_dispatch_projection(db, namespace, snapshot, query)
+        with pytest.raises(ValueError, match="digest changed"):
+            derive_current_domain_reads(
+                db, replace(projection, boundary_rules=()), request, provider,
+            )
+        db.execute("UPDATE graph_atoms SET revision=2 WHERE token=?", (
+            snapshot.atoms[1].key.token,
+        ))
+        with pytest.raises(ValueError, match="row changed"):
+            derive_current_domain_reads(db, projection, request, provider)
     finally:
         db.close()

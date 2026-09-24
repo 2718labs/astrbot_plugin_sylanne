@@ -10,11 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
+from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..graph_types import GraphPage
 from ..graph_coordinator import RoleInitializationReceiptV1, SceneBindingReceiptV1
 from ..domains.d01 import ActiveRoleQualification
-from ..domains.d03.context import RoleBinding, RoleBindingResolution
-from ..runtime_contracts import AuthorityContext, DomainProposal
+from ..domains.d03.context import RoleBindingResolution
+from ..runtime_contracts import AuthorityContext
 from .domain_registry import PROJECTION_CONTEXT_V1
 from .onboarding import OnboardingPolicyResolver, TrustedBindScene, TrustedCreateCharacter
 from .d01_onboarding import VerifiedCreationResources
@@ -213,8 +214,14 @@ class GraphWorkbenchIssuer:
     def _bind_scene(self, *, session: AuthenticatedSession, scope: str,
                     purpose: str, audience: str, operation_id: str,
                     input_data: Mapping[str, Any]) -> Mapping[str, Any]:
+        from ..host.current_scene import CurrentHostScene
+
         if not session.allows(scope, "workbench.bind_scene", purpose, audience):
             return _unavailable("authority_unavailable")
+        if (type(session.owner_session_token) is not str
+                or not session.owner_session_token
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1):
+            return _unavailable("signed_owner_session_unavailable")
         resolver = self._onboarding
         commit = getattr(self._coordinator, "commit_scene_binding_v2", None)
         if resolver is None or not callable(commit):
@@ -223,47 +230,61 @@ class GraphWorkbenchIssuer:
             "action": "bind_scene", "scope": scope, "purpose": purpose,
             "audience": audience, "operation_id": operation_id, "input": input_data,
         })
-        resolved = resolver.resolve_bind_scene(
+        selected_scene = input_data.get("scene_ref")
+        selected_visibility = input_data.get("visibility")
+        if (type(selected_scene) is not str or type(selected_visibility) is not str
+                or input_data.get("acknowledgement") is not True):
+            return _unavailable("scene_binding_policy_unavailable")
+        replay = getattr(resolver, "replay_committed_bind_scene", None)
+        result = (replay(
             coordinator=self._coordinator, session=session, scope=scope,
             purpose=purpose, audience=audience, operation_id=operation_id,
-            request_digest=digest, input_data=input_data,
-        )
-        if (not isinstance(resolved, TrustedBindScene)
-                or resolved.actor_id != session.actor_id
-                or resolved.session_id != session.session_id
-                or resolved.scope != scope or resolved.operation_id != operation_id
-                or resolved.request_digest != digest
-                or not isinstance(resolved.binding, RoleBinding)
-                or not isinstance(resolved.active_role, ActiveRoleQualification)
-                or not isinstance(resolved.proposal, DomainProposal)
-                or not isinstance(resolved.prior, RoleBindingResolution)
-                or resolved.binding.scene_ref != input_data["scene_ref"]
-                or resolved.binding.visibility_scope != input_data["visibility"]
-                or resolved.binding.subject_persona_ref
-                != f"persona:{resolved.active_role.namespace.persona_id}"
-                or resolved.proposal.domain != "d03"
-                or resolved.proposal.envelope.identity.operation_id != operation_id
-                or resolved.proposal.envelope.authority.namespace != resolved.active_role.namespace
-                or resolved.prior.status != "no_applicable_binding"
-                or resolved.prior.request is None
-                or resolved.prior.request.scene_ref != input_data["scene_ref"]):
-            return _unavailable("scene_binding_policy_unavailable")
-        result = commit(namespace=resolved.active_role.namespace,
-                        operation_id=operation_id, proposal=resolved.proposal,
-                        prior=resolved.prior, principal=resolved.principal,
-                        request_digest=digest)
+            request_digest=digest,
+        ) if callable(replay) else None)
+        resolved = None
+        if result is None:
+            resolved = resolver.resolve_bind_scene(
+                coordinator=self._coordinator, session=session, scope=scope,
+                purpose=purpose, audience=audience, operation_id=operation_id,
+                request_digest=digest, input_data=input_data,
+            )
+            if (not isinstance(resolved, TrustedBindScene)
+                    or resolved.actor_id != session.actor_id
+                    or resolved.session_id != session.session_id
+                    or resolved.scope != scope or resolved.operation_id != operation_id
+                    or resolved.request_digest != digest
+                    or type(resolved.scene) is not CurrentHostScene
+                    or not isinstance(resolved.active_role, ActiveRoleQualification)
+                    or not isinstance(resolved.prior, RoleBindingResolution)
+                    or resolved.scene.namespace != resolved.active_role.namespace
+                    or resolved.scene.scene_ref != selected_scene
+                    or resolved.scene.visibility != selected_visibility
+                    or resolved.prior.status != "no_applicable_binding"
+                    or resolved.prior.request is None
+                    or resolved.prior.request.scene_ref != selected_scene):
+                return _unavailable("scene_binding_policy_unavailable")
+            result = commit(namespace=resolved.active_role.namespace,
+                            operation_id=operation_id, scene=resolved.scene,
+                            prior=resolved.prior, principal=resolved.principal,
+                            actor_id=resolved.actor_id, request_digest=digest,
+                            owner_session_token=session.owner_session_token,
+                            owner_session_request=session.owner_session_request)
         if (not isinstance(result, SceneBindingReceiptV1)
-                or result.namespace != resolved.active_role.namespace
+                or scope != f"{result.namespace.bot_id}/{result.namespace.persona_id}"
                 or result.operation_id != operation_id
                 or result.request_digest != digest
-                or result.scene_ref != input_data["scene_ref"]
-                or result.binding_id != resolved.binding.role_binding_id
-                or result.role_head_id != resolved.active_role.head_id):
+                or result.scene_ref != selected_scene
+                or not result.binding_id or not result.role_head_id
+                or not result.owner_authorization_head.startswith("sha256:")
+                or (resolved is not None and (
+                    result.namespace != resolved.active_role.namespace
+                    or result.role_head_id != resolved.active_role.head_id
+                    or result.owner_authorization_head != resolved.authorization_head))):
             return _unavailable("scene_binding_receipt_invalid")
         return {"status": "ready", "receipt": {
             "operation_id": operation_id, "phase": "scene_bound",
             "scene_ref": result.scene_ref, "binding_id": result.binding_id,
-            "binding_revision": resolved.binding.binding_version,
+            "binding_revision": 1,
             "role_head_id": result.role_head_id,
             "graph_revision": result.graph_revision,
         }}

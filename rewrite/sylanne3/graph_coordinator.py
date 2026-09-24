@@ -20,19 +20,19 @@ from .contracts import Event, EventConflict, Scope, StaleRead, canonical_json
 from .graph_store import GraphStore, ProductionGraphStore
 from .graph_types import (
     AtomKey, GraphCandidate, GraphSnapshot, GraphAtom, GraphVersion, GraphWrite,
-    NamespaceEpoch, owner_grant_key, owner_grant_policy_digest_v1,
+    NamespaceEpoch, Owner, owner_grant_key, owner_grant_policy_digest_v1,
     validate_owner_grant_v1,
 )
 from .memory_types import access_key, source_key
 from .runtime_contracts import (
     AuthorityContext, CommitReceipt, ContentFencePortV2, DomainBundle, FenceScope,
-    NamespaceId, ProductAdvanceEvidenceV1, canonical_digest,
+    NamespaceId, ProductAdvanceEvidenceV1, canonical_digest, canonical_serialize,
 )
 from .runtime.restore_anchor import (
     ExecutionJournalPort, SnapshotRequirements, validate_restore,
 )
 from .runtime.budget import (
-    BudgetLease, BudgetReceipt, create_budget_lease, get_budget_lease,
+    BudgetError, BudgetLease, BudgetReceipt, create_budget_lease, get_budget_lease,
     reserve_budget, settle_budget,
 )
 from .runtime.jobs import (
@@ -57,6 +57,7 @@ from .authority_service.v2_owner_contract import (
 
 if TYPE_CHECKING:
     from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
+    from .workbench_api.d01_onboarding import VerifiedBudgetLease
 
 
 @dataclass(frozen=True)
@@ -212,6 +213,19 @@ class SceneBindingReceiptV1:
     fence_attempt_id: str
     finish_request_id: str
     finish_request_digest: str
+
+
+@dataclass(frozen=True)
+class CreationBudgetProofV1:
+    """A fenced read of a D11 lease and its current signed grant, not spend authority."""
+
+    budget: VerifiedBudgetLease
+    grant_id: str
+    grant_version: int
+    grant_digest: str
+    graph_revision: int
+    graph_epoch: int
+    owner_authorization_head: str
 
 
 @dataclass(frozen=True)
@@ -449,7 +463,8 @@ class GraphCoordinator:
                  closure_verifier=None, d02_issuer=None, d11_issuer=None,
                  ingress_policy=None, ingress_clock=None,
                  owner_principal_resolver=None,
-                 dispatch_admission_issuer=None, dispatch_clock_policy=None):
+                 dispatch_admission_issuer=None, dispatch_clock_policy=None,
+                 scene_identity_port=None, scene_clock_policy=None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -474,6 +489,8 @@ class GraphCoordinator:
         self.__holder = holder
         self.__content_fence = content_fence
         self.__content_fence_v2 = content_fence_v2
+        self.__scene_identity_port = scene_identity_port
+        self.__scene_clock_policy = scene_clock_policy
         self.__closure_verifier = closure_verifier
         self.__d02_issuer = d02_issuer
         self.__d11_issuer = d11_issuer
@@ -1770,6 +1787,114 @@ class GraphCoordinator:
             principal=principal, request_digest=request_digest,
             resources=resources)
 
+    def read_current_creation_budget_v2(
+            self, *, namespace: NamespaceId, budget_ref: str,
+            actor_id: str, principal: OwnerPrincipalV1,
+            owner_session_token: str,
+            owner_session_request: OwnerSessionLoginRequestV1,
+            expected: VerifiedBudgetLease | None = None) -> CreationBudgetProofV1:
+        """Read an existing D11 lease/grant under current Owner and Authority fences.
+
+        The ref is the durable lease ID. This read does not reserve budget or
+        make a later D01 commit safe without its own lease-version check.
+        """
+        from .authority_service.contract import identifier
+        from .runtime.issuers import IssuerAuthorityDenied
+        from .workbench_api.d01_onboarding import VerifiedBudgetLease
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or type(namespace) is not NamespaceId
+                or type(principal) is not OwnerPrincipalV1):
+            raise UnavailableGuard("creation budget requires production v2 Owner")
+        identifier(budget_ref, "budget_ref")
+        identifier(actor_id, "actor_id")
+        from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
+        if (type(owner_session_token) is not str or not owner_session_token
+                or type(owner_session_request) is not OwnerSessionLoginRequestV1):
+            raise UnavailableGuard("signed creation Owner session is unavailable")
+        if expected is not None and type(expected) is not VerifiedBudgetLease:
+            raise TypeError("expected creation budget must be a verified lease")
+        grant_reader = getattr(self.__d11_issuer, "current_budget_grant", None)
+        if not callable(grant_reader):
+            raise UnavailableGuard("current signed D11 budget grant is unavailable")
+        store = self.__store
+        port = self.__content_fence_v2
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        if target.namespace != namespace or target.activation_generation != 1:
+            raise UnavailableGuard("creation budget graph identity differs")
+        if (owner_session_request.principal != principal
+                or owner_session_request.authority_id != target.authority_id
+                or owner_session_request.authority_namespace
+                != target.authority_namespace
+                or owner_session_request.installation_id
+                != port.installation_grant.installation_id
+                or owner_session_request.audience != "owner"):
+            raise UnavailableGuard("creation Owner session identity differs")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("creation budget Authority anchor differs")
+        attempt_id = "creation-budget-read-" + secrets.token_hex(16)
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=1, operation="read",
+            operation_id=attempt_id, expected_anchor=anchor)
+        scope = FenceScope(namespace, target.authority_namespace, 1, "read",
+                           attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        authority = AuthorityContext(
+            actor_id, "d12", "creation-budget-read", namespace, ("persona",),
+            "workbench_user_action", ("owner",), "owner-grant-v1", 1)
+        try:
+            guard, owner = self._owner_binding_in_fence(
+                authority, scope, principal, None,
+                (owner_session_token, owner_session_request))
+            if "workbench.create" not in owner.capabilities:
+                raise AuthorityDenied("Owner grant lacks creation permission")
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("creation budget read permit changed")
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("creation budget graph stamp changed")
+                db = store._db
+                try:
+                    lease = get_budget_lease(db, budget_ref)
+                    grant = grant_reader(db, budget_ref)
+                except (BudgetError, IssuerAuthorityDenied) as exc:
+                    raise UnavailableGuard("current D11 budget lease/grant is absent") from exc
+                if (lease.lease_id != budget_ref
+                        or (lease.bot_id, lease.persona_id) != namespace.as_tuple
+                        or lease.state != "active"
+                        or grant.lease_id != lease.lease_id
+                        or (grant.bot_id, grant.persona_id) != namespace.as_tuple
+                        or grant.currency != lease.currency):
+                    raise UnavailableGuard("D11 budget lease/grant differs or is inactive")
+                budget = VerifiedBudgetLease(
+                    namespace, budget_ref, lease.lease_id, lease.version,
+                    "sha256:" + canonical_digest(asdict(lease)))
+                if expected is not None and budget != expected:
+                    raise UnavailableGuard("creation budget selection changed")
+                result = CreationBudgetProofV1(
+                    budget, grant.grant_id, grant.version,
+                    "sha256:" + canonical_digest(asdict(grant)),
+                    metadata.graph_revision, epoch.revision,
+                    guard.authorization_head)
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("creation budget read permit changed")
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("creation budget graph stamp changed after read")
+            return result
+        finally:
+            port.finish_fence(
+                scope, request_id="finish:" + attempt_id,
+                request_digest="sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_creation_budget_read",
+                }))
+
     def commit_role_initialization_v2(self, *, namespace: NamespaceId,
                                       operation_id: str, plan, principal,
                                       request_digest: str, resources):
@@ -2355,10 +2480,139 @@ class GraphCoordinator:
             return role, tuple(bindings), epoch, tuple(versions)
         return role, tuple(bindings), epoch
 
+    def _check_scene_owner_session_v2(self, *, namespace, principal, actor_id,
+                                      token, request, target):
+        from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
+
+        port = self.__content_fence_v2
+        if (type(actor_id) is not str or not actor_id
+                or type(token) is not str or not token
+                or type(request) is not OwnerSessionLoginRequestV1
+                or request.principal != principal
+                or request.authority_id != target.authority_id
+                or request.authority_namespace != target.authority_namespace
+                or request.installation_id
+                != port.installation_grant.installation_id
+                or request.audience != "owner"
+                or self._current_owner_principal(actor_id, namespace) != principal):
+            raise UnavailableGuard("current signed scene Owner session differs")
+
+    def _read_scene_owner_session_v2(self, *, namespace, principal, actor_id,
+                                     token, request):
+        """Recheck a completed scene replay with a new signed Owner read fence."""
+        port = self.__content_fence_v2
+        store = self.__store
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        self._check_scene_owner_session_v2(
+            namespace=namespace, principal=principal, actor_id=actor_id,
+            token=token, request=request, target=target)
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("scene replay Authority anchor differs")
+        attempt_id = "scene-replay-read-" + secrets.token_hex(16)
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=1, operation="read",
+            operation_id=attempt_id, expected_anchor=anchor)
+        scope = FenceScope(namespace, target.authority_namespace, 1, "read",
+                           attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        authority = AuthorityContext(
+            actor_id, "d12", "scene-replay-read", namespace,
+            ("persona", "scene"), "workbench_user_action", ("owner",),
+            "owner-grant-v1", 1)
+        try:
+            _, owner = self._owner_binding_in_fence(
+                authority, scope, principal, None, (token, request))
+            if "workbench.bind_scene" not in owner.capabilities:
+                raise AuthorityDenied("Owner grant lacks scene binding permission")
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("scene replay read permit changed")
+        finally:
+            port.finish_fence(
+                scope, request_id="finish:" + attempt_id,
+                request_digest="sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_scene_replay_read",
+                }))
+
+    def replay_committed_scene_binding_v2(
+            self, *, namespace: NamespaceId, operation_id: str,
+            request_digest: str, principal: OwnerPrincipalV1,
+            actor_id: str, owner_session_token: str,
+            owner_session_request: OwnerSessionLoginRequestV1):
+        """Read a completed Owner scene operation from its original frozen input."""
+        from .domains.d03 import RoleBindingRequest, RoleBindingResolution
+        from .host.current_scene import CurrentHostScene
+        from .runtime_contracts import QueryEpoch
+
+        if type(namespace) is not NamespaceId or type(principal) is not OwnerPrincipalV1:
+            raise TypeError("typed scene replay identity is required")
+        with self.__store._lock:
+            db = self.__store._db
+            saved = db.execute(
+                "SELECT 1 FROM graph_scene_binding_receipts_v1 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if saved is None:
+                return None
+            proof = db.execute(
+                "SELECT request_digest,principal_json,frozen_json "
+                "FROM graph_scene_binding_request_proofs_v1 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+        if proof is None:
+            raise UnavailableGuard("committed scene lacks original request proof; HOLD")
+        if (proof[0] != request_digest
+                or proof[1] != canonical_json(asdict(principal))):
+            raise AuthorityDenied("scene operation request or principal differs")
+        try:
+            frozen = json.loads(proof[2])
+            scene_data = frozen["scene"]
+            scene = CurrentHostScene(
+                NamespaceId(**scene_data["namespace"]),
+                scene_data["platform_ref"], scene_data["conversation_ref"],
+                scene_data["visibility"], scene_data["scene_ref"],
+            )
+            prior_data = frozen["prior"]
+            query = prior_data["query_epoch"]
+            versions = tuple(GraphVersion(
+                AtomKey(Owner(**item["key"]["owner"]),
+                        item["key"]["type_name"], item["key"]["name"]),
+                item["revision"],
+            ) for item in prior_data["read_versions"])
+            prior = RoleBindingResolution(
+                prior_data["status"], tuple(prior_data["matched_bindings"]),
+                tuple(prior_data["applicable_norm_refs"]),
+                tuple(prior_data["missing_items"]), versions,
+                QueryEpoch(NamespaceId(**query["namespace"]),
+                           query["scope_ref"], query["revision"]),
+                prior_data["valid_until"],
+                RoleBindingRequest(**prior_data["request"]),
+            )
+            if (proof[2] != canonical_json(frozen)
+                    or frozen["prior_digest"] != canonical_digest(asdict(prior))):
+                raise ValueError("frozen prior digest differs")
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("committed scene frozen input is invalid") from exc
+        return self.commit_scene_binding_v2(
+            namespace=namespace, operation_id=operation_id, scene=scene,
+            prior=prior, principal=principal, actor_id=actor_id,
+            owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request,
+            request_digest=request_digest,
+        )
+
     def commit_scene_binding_v2(self, *, namespace: NamespaceId,
-                                operation_id: str, proposal, prior,
-                                principal, request_digest: str):
-        """Commit one D03 scene binding with current Owner, D01 and query guards."""
+                                operation_id: str, scene, prior, principal,
+                                actor_id: str, request_digest: str,
+                                owner_session_token: str,
+                                owner_session_request: OwnerSessionLoginRequestV1):
+        """Commit one Owner-configured scene and two D06 provenance sources."""
         from .authority_service.contract import identifier
         from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
         from .authority_service.v2_owner_contract import (
@@ -2366,17 +2620,21 @@ class GraphCoordinator:
             canonical_digest as owner_contract_digest,
         )
         from .domains.d03 import ContextProvider, RoleBinding, RoleBindingResolution
+        from .host.current_scene import CurrentHostScene
+        from .host.authority_profile import AdminIngressClockPolicy
         from .runtime.restore_anchor import RestoreAnchor
-        from .runtime_contracts import DomainProposal, QueryEpoch
+        from .runtime_contracts import QueryEpoch
+        from .workbench_api.scene_binding_evidence import build_scene_binding_evidence
 
         if (not isinstance(self.__store, ProductionGraphStore)
                 or self.__content_fence_v2 is None):
             raise UnavailableGuard("scene binding requires production v2")
-        if (type(namespace) is not NamespaceId or type(proposal) is not DomainProposal
+        if (type(namespace) is not NamespaceId or type(scene) is not CurrentHostScene
                 or type(prior) is not RoleBindingResolution
                 or type(principal) is not OwnerPrincipalV1):
-            raise TypeError("scene binding requires typed D03 and Owner inputs")
+            raise TypeError("scene binding requires typed scene, D03 and Owner inputs")
         identifier(operation_id, "operation_id")
+        identifier(actor_id, "actor_id")
         if (type(request_digest) is not str or len(request_digest) != 71
                 or not request_digest.startswith("sha256:")
                 or any(char not in "0123456789abcdef" for char in request_digest[7:])):
@@ -2385,31 +2643,15 @@ class GraphCoordinator:
         if registration is None or type(registration[0]) is not ContextProvider:
             raise UnavailableGuard("trusted D03 scene provider is unavailable")
         provider = registration[0]
-        provider.validate(proposal, None)
-        envelope = proposal.envelope
-        if (envelope.authority.namespace != namespace
-                or envelope.identity.operation_id != operation_id
-                or envelope.authority.activation_generation != 1
-                or len(proposal.typed_writes) != 1
-                or proposal.typed_writes[0].key.type_name != "d03.role_binding"
-                or prior.request is None or not prior.request.scope_complete
+        if (scene.namespace != namespace or prior.request is None
+                or not prior.request.scope_complete
                 or prior.status != "no_applicable_binding"
                 or prior.matched_bindings or prior.missing_items
-                or prior.query_epoch is None):
-            raise AuthorityDenied("scene binding proposal is not a complete first binding")
-        write = proposal.typed_writes[0]
-        value = write.value
-        try:
-            binding = RoleBinding(**{
-                **value, "norm_refs": tuple(value["norm_refs"]),
-                "source_refs": tuple(value["source_refs"]),
-            })
-        except (TypeError, ValueError, KeyError) as exc:
-            raise AuthorityDenied("D03 scene binding value is invalid") from exc
-        if (write.key.owner.kind != "scene"
-                or write.key.owner.subject != binding.scene_ref
-                or binding.scene_ref != prior.request.scene_ref):
-            raise AuthorityDenied("D03 scene binding scope differs")
+                or prior.query_epoch is None
+                or prior.request.requested_action_kind != "bind_scene"
+                or prior.request.purpose != "workbench_user_action"
+                or scene.scene_ref != prior.request.scene_ref):
+            raise AuthorityDenied("scene request is not a complete first binding")
         port = self.__content_fence_v2
         guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
         if not callable(guard_reader):
@@ -2440,6 +2682,11 @@ class GraphCoordinator:
                 "FROM graph_scene_binding_intents_v1 WHERE bot=? AND persona=? "
                 "AND operation_id=?", namespace.as_tuple + (operation_id,),
             ).fetchone()
+            request_proof = db.execute(
+                "SELECT request_digest,principal_json,frozen_json,input_digest "
+                "FROM graph_scene_binding_request_proofs_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
             saved = db.execute(
                 "SELECT input_digest,permit_json,receipt_json,pre_graph_revision,"
                 "pre_graph_epoch,post_graph_revision,post_graph_epoch,"
@@ -2462,6 +2709,10 @@ class GraphCoordinator:
             namespace, proof_row[0], proof_row[1], proof_row[2], proof_row[3],
             proof_row[4], 1, proof_row[5], proof_row[6], proof_row[7])
         target = metadata.requirements
+        self._check_scene_owner_session_v2(
+            namespace=namespace, principal=principal, actor_id=actor_id,
+            token=owner_session_token, request=owner_session_request,
+            target=target)
         if (proof_row[8] != canonical_json(asdict(proof))
                 or grant_row[1] != canonical_json(grant)
                 or "sha256:" + canonical_digest(grant) != proof.grant_digest
@@ -2479,13 +2730,84 @@ class GraphCoordinator:
                 or "workbench_user_action" not in grant["purposes"]
                 or "owner" not in grant["audiences"]):
             raise AuthorityDenied("Owner grant lacks scene binding permission")
+        if intent is not None and request_proof is None:
+            raise UnavailableGuard("legacy scene intent lacks original request proof; HOLD")
+        if request_proof is not None:
+            if (request_proof[0] != request_digest
+                    or request_proof[1] != canonical_json(asdict(principal))):
+                raise AuthorityDenied("scene operation request or principal differs")
+            try:
+                frozen = json.loads(request_proof[2])
+                original_scene = CurrentHostScene(**{
+                    **frozen["scene"], "namespace": NamespaceId(**frozen["scene"]["namespace"]),
+                })
+                observed_at = frozen["observed_at"]
+                original_actor = frozen["actor_id"]
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("scene frozen request proof is invalid") from exc
+            if (request_proof[2] != canonical_json(frozen)
+                    or original_actor != actor_id
+                    or original_scene.namespace != namespace
+                    or original_scene.scene_ref != scene.scene_ref):
+                raise AuthorityDenied("scene frozen request identity differs")
+            pending_input_changed = (saved is None and (
+                original_scene != scene
+                or frozen["prior_digest"] != canonical_digest(asdict(prior))))
+        else:
+            verifier = getattr(self.__scene_identity_port, "verify", None)
+            if not callable(verifier) or verifier(namespace, scene.scene_ref,
+                                                 scene.visibility) != scene:
+                raise UnavailableGuard("current scene identity is unavailable; HOLD")
+            if type(self.__scene_clock_policy) is not AdminIngressClockPolicy:
+                raise UnavailableGuard("paired scene clock policy is unavailable; HOLD")
+            try:
+                reading = port.read_ingress_clock(self.__scene_clock_policy)
+                observed_at = reading.utc_upper_bound_seconds
+            except Exception as exc:
+                raise UnavailableGuard("paired scene clock is unavailable; HOLD") from exc
+            original_scene = scene
+            original_actor = actor_id
+            frozen = {
+                "scene": asdict(scene), "observed_at": observed_at,
+                "actor_id": actor_id, "prior_digest": canonical_digest(asdict(prior)),
+                "prior": json.loads(canonical_serialize(asdict(prior))),
+                "at_time": prior.request.at_time,
+            }
+            pending_input_changed = False
+        evidence = build_scene_binding_evidence(
+            namespace=namespace, scene=original_scene, owner_actor=original_actor,
+            operation_id=operation_id, request_digest=request_digest,
+            authorization_head=owner_contract_digest(proof),
+            observed_at=observed_at,
+        )
+        source_writes = tuple(
+            GraphWrite(key, value) for source in (
+                evidence.owner_config, evidence.host_identity)
+            for key, value in ((source.source_key, source.source_value),
+                               (source.access_key, source.access_value))
+        )
+        binding = RoleBinding(
+            "binding:" + canonical_digest({"operation_id": operation_id,
+                                            "scene_ref": original_scene.scene_ref})[:48],
+            f"persona:{namespace.persona_id}", "scene_participant", None, None,
+            original_scene.scene_ref, "scene", original_scene.visibility, (),
+            frozen["at_time"], None, 0,
+            (evidence.owner_config.source_key.token,
+             evidence.host_identity.source_key.token), 1, "active",
+        )
+        write_key = AtomKey(Owner("scene", *namespace.as_tuple, binding.scene_ref),
+                            "d03.role_binding", binding.role_binding_id)
+        value = asdict(binding)
+        value["norm_refs"] = list(binding.norm_refs)
+        value["source_refs"] = list(binding.source_refs)
         input_digest = "sha256:" + canonical_digest({
             "schema": "sylanne3.graph.scene_binding.v1",
             "namespace": list(namespace.as_tuple), "operation_id": operation_id,
-            "request_digest": request_digest,
-            "proposal": asdict(proposal), "prior": asdict(prior),
+            "request_digest": request_digest, "frozen": frozen,
             "principal": asdict(principal), "owner_proof": asdict(proof),
         })
+        if request_proof is not None and request_proof[3] != input_digest:
+            raise UnavailableGuard("scene frozen input digest differs")
         attempt_id = "scene-write-" + canonical_digest({
             "namespace": list(namespace.as_tuple), "operation_id": operation_id,
             "input_digest": input_digest,
@@ -2554,12 +2876,15 @@ class GraphCoordinator:
                     or permit.generation != 1 or permit.pinned_anchor != anchor):
                 raise UnavailableGuard("durable scene receipt differs")
             with store._lock:
-                atom = store._db.execute(
-                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                    (write.key.token,),
-                ).fetchone()
-                if atom != (1, canonical_json(value), 1):
-                    raise UnavailableGuard("durable D03 binding atom differs")
+                for key, expected_value in (
+                        *((item.key, item.value) for item in source_writes),
+                        (write_key, value)):
+                    atom = store._db.execute(
+                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                        (key.token,),
+                    ).fetchone()
+                    if atom != (1, canonical_json(expected_value), 1):
+                        raise UnavailableGuard("durable scene source or binding atom differs")
             observed, state = port.get_fence_operation(
                 namespace=namespace, authority_namespace=target.authority_namespace,
                 operation_id=attempt_id)
@@ -2579,6 +2904,9 @@ class GraphCoordinator:
             elif (metadata.graph_revision < saved[5]
                   or epoch.revision < saved[6]):
                 raise UnavailableGuard("finished scene lost business stamp")
+            self._read_scene_owner_session_v2(
+                namespace=namespace, principal=principal, actor_id=actor_id,
+                token=owner_session_token, request=owner_session_request)
             return receipt
         # This command only creates the first binding for a scene. D03's
         # no_applicable_binding can also describe a revoked or out-of-window
@@ -2595,6 +2923,14 @@ class GraphCoordinator:
             raise StaleRead("D03 negative query versions or epoch changed")
         if intent is not None and (metadata.graph_revision, epoch.revision) != intent[6:8]:
             raise UnavailableGuard("uncommitted scene graph stamp changed")
+        if intent is not None:
+            with store._lock:
+                if any(store._db.execute(
+                    "SELECT 1 FROM graph_atoms WHERE token=?", (key.token,),
+                ).fetchone() is not None for key in (
+                    *(item.key for item in source_writes), write_key,
+                )):
+                    raise UnavailableGuard("pending scene has a business atom; HOLD")
         if intent is None:
             with store._lock:
                 db = store._db
@@ -2609,6 +2945,15 @@ class GraphCoordinator:
                         "graph_revision,graph_epoch) VALUES(?,?,?,?,?,?,?,?,?,?)",
                         namespace.as_tuple + identity + (
                             metadata.graph_revision, epoch.revision),
+                    )
+                    db.execute(
+                        "INSERT INTO graph_scene_binding_request_proofs_v1"
+                        "(bot,persona,operation_id,request_digest,principal_json,"
+                        "frozen_json,input_digest) VALUES(?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            operation_id, request_digest,
+                            canonical_json(asdict(principal)),
+                            canonical_json(frozen), input_digest),
                     )
                     db.execute("COMMIT")
                 except BaseException:
@@ -2634,9 +2979,18 @@ class GraphCoordinator:
         scope = FenceScope(namespace, target.authority_namespace, 1, "write",
                            attempt_id, permit, anchor, epoch, metadata.graph_revision)
         try:
+            if pending_input_changed:
+                raise UnavailableGuard("pending scene proof differs from original")
+            verifier = getattr(self.__scene_identity_port, "verify", None)
+            if (not callable(verifier)
+                    or verifier(namespace, original_scene.scene_ref,
+                                original_scene.visibility) != original_scene):
+                raise UnavailableGuard("current scene identity changed")
             guarded = guard_reader(
                 namespace=namespace, authority_namespace=target.authority_namespace,
-                permit=permit)
+                permit=permit, owner_actor_id=actor_id,
+                owner_session_token=owner_session_token,
+                owner_session_request=owner_session_request)
             if (type(guarded) is not tuple or len(guarded) != 2
                     or type(guarded[0]) is not OwnerAuthorizationGuardV1
                     or guarded[1] != permit):
@@ -2688,29 +3042,22 @@ class GraphCoordinator:
                     prior.request, bindings)
                 if observed_negative.status != "no_applicable_binding":
                     raise AuthorityDenied("scene has an applicable binding")
-                rebuilt = provider.build_scene_binding_proposal(
-                    envelope, binding, role, guard, prior)
-                if rebuilt != proposal:
-                    raise AuthorityDenied("D03 proposal differs from current qualifications")
-                version_guard = envelope.version_guard
+                write = provider.build_owner_scene_binding_write(
+                    binding, role, guard, prior,
+                    owner_config_source_key=evidence.owner_config.source_key,
+                    host_identity_source_key=evidence.host_identity.source_key,
+                )
+                if (write.key != write_key or write.value != value
+                        or write.key.type_name != "d03.role_binding"):
+                    raise AuthorityDenied("D03 Owner binding write differs")
                 expected_versions = (
                     set(role.read_versions) | set(prior.read_versions)
                     | {GraphVersion(write.key, 0)}
+                    | {GraphVersion(item.key, 0) for item in source_writes}
                 )
-                if (len(version_guard.read_versions) != len(expected_versions)
-                        or set(version_guard.read_versions) != expected_versions
-                        or version_guard.query_epochs != (QueryEpoch(
-                            namespace, "d03.role_binding", epoch.revision),)
-                        or version_guard.access_epoch != 1
-                        or version_guard.delete_epoch != 0
-                        or version_guard.catalogue_version != store._registry.catalogue_hash
-                        or version_guard.scheme_version != self._version(
-                            db, namespace, "scheme", "current")
-                        or version_guard.operator_version != self._version(
-                            db, namespace, "operator", "current")
-                        or version_guard.policy_version != self._version(
-                            db, namespace, "policy", "current")):
-                    raise AuthorityDenied("D03 command guard differs from current graph")
+                if prior.query_epoch != QueryEpoch(
+                        namespace, "d03.role_binding", epoch.revision):
+                    raise StaleRead("D03 negative query changed")
                 candidate = GraphCandidate(
                     Event(Scope(*namespace.as_tuple, "d03-scene-binding"),
                           operation_id, 0, "scene_binding", {
@@ -2718,13 +3065,16 @@ class GraphCoordinator:
                               "input_digest": input_digest,
                               "role_head_id": role.head_id,
                           }),
-                    version_guard.read_versions, proposal.typed_writes,
+                    tuple(sorted(expected_versions, key=lambda item: item.key.token)),
+                    source_writes + (write,),
                     (epoch,),
                 )
                 graph_receipt = GraphStore._graph_commit_in_transaction(
                     store, candidate, _capability=self.__graph_capability)
                 if (graph_receipt.status != "committed"
-                        or graph_receipt.revisions != (GraphVersion(write.key, 1),)
+                        or set(graph_receipt.revisions) != {
+                            GraphVersion(item.key, 1) for item in source_writes + (write,)
+                        }
                         or graph_receipt.epoch.revision != epoch.revision + 1):
                     raise UnavailableGuard("D03 scene binding graph commit differed")
                 store.cas_graph_recovery_metadata(

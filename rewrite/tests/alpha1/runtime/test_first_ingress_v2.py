@@ -23,7 +23,7 @@ from sylanne3.host.authority_profile import (
 from sylanne3.runtime.issuers import build_runtime_issuers
 
 from test_graph_v2_provisioning import AuthorityPort, _owner_issue_case
-from test_scene_binding_v2 import _scene_case
+from test_scene_binding_v2 import _bind_scene, _scene_case
 
 
 def _ingress_inputs(namespace):
@@ -41,12 +41,9 @@ def _ingress_inputs(namespace):
 
 @pytest.fixture
 def ingress_system(tmp_path):
-    (store, authority_db, port, coordinator, namespace, principal,
-     proposal, prior, request_digest, _key, policy, bootstrap) = _scene_case(
-         tmp_path, enable_ingress=True)
-    coordinator.commit_scene_binding_v2(
-        namespace=namespace, operation_id="scene-bind-1", proposal=proposal,
-        prior=prior, principal=principal, request_digest=request_digest)
+    case = _scene_case(tmp_path, enable_ingress=True)
+    store, authority_db, port, coordinator, namespace, _, _, policy, bootstrap = case
+    _bind_scene(case)
     host, clock, encoding = _ingress_inputs(namespace)
 
     try:
@@ -106,7 +103,7 @@ def test_ingress_requires_current_d01_role(tmp_path):
 
 def test_ingress_requires_fenced_scene_binding(tmp_path):
     (store, authority_db, _port, coordinator, namespace, _principal,
-     _proposal, _prior, _request_digest, _key, policy, bootstrap) = (
+     _prior, policy, bootstrap) = (
          _scene_case(tmp_path, enable_ingress=True))
     try:
         host, clock, encoding = _ingress_inputs(namespace)

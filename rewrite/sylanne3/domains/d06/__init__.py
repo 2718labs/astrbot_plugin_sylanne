@@ -222,6 +222,9 @@ class SourceAdmission:
             raise ValueError("unknown content_reality")
         if self.evidence_eligibility not in _EVIDENCE_ELIGIBILITY:
             raise ValueError("unknown evidence_eligibility")
+        if (self.source_kind in {"authored", "simulated", "internal"}
+                and self.evidence_eligibility in {"external_fact", "reported_claim"}):
+            raise ValueError("authored/simulated/internal sources cannot qualify as external evidence")
         if self.internal_activity_actuality not in _ACTUALITIES:
             raise ValueError("unknown internal_activity_actuality")
         _optional_time(self.occurred_at, "occurred_at")

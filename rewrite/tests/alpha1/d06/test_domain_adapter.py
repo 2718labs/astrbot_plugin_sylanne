@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from sylanne3.contracts import Event, Scope
@@ -84,6 +85,27 @@ class D06DomainAdapterTests(unittest.TestCase):
         )
         self.assertEqual(proposal.source.assertion_status, "unknown")
         self.assertTrue(proposal.encoding_pending)
+
+    def test_nonexternal_source_kinds_cannot_claim_external_evidence(self):
+        base = SourceAdmission(
+            "source-subjective", "这是主观内容", "persona", "authored", "authored",
+            "subjective_only", "not_applicable", None, 10.0, "family-1",
+            ("owner",), ("context",),
+        )
+        for kind in ("authored", "simulated", "internal"):
+            for eligibility in ("external_fact", "reported_claim"):
+                with self.subTest(kind=kind, eligibility=eligibility):
+                    with self.assertRaises(ValueError):
+                        replace(base, source_kind=kind, evidence_eligibility=eligibility)
+        for kind, reality in (("observed", "observed"), ("reported", "reported")):
+            eligibility = "external_fact" if kind == "observed" else "reported_claim"
+            with self.subTest(kind=kind):
+                admitted = self.domain.admit_source(replace(
+                    base, source_kind=kind, content_reality=reality,
+                    evidence_eligibility=eligibility,
+                ))
+                expected = "eligible" if kind == "observed" else "qualified"
+                self.assertEqual(admitted.qualification.evidence_eligibility, expected)
 
     def test_encoding_and_recollection_are_candidates_until_runtime_commits_bundle(self):
         encoding = self.domain.prepare_encoding(

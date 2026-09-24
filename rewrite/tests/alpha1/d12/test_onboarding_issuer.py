@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import uuid4
 from threading import get_ident
 
@@ -7,8 +8,10 @@ import pytest
 
 from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
 from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
+from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.domains.d01 import ActiveRoleQualification, PersonaBlock, PersonaPlan
 from sylanne3.domains.d03 import ContextProvider, RoleBinding, RoleBindingRequest, RoleBindingResolution
+from sylanne3.host.current_scene import CurrentHostScene
 from sylanne3.graph_coordinator import RoleInitializationReceiptV1, SceneBindingReceiptV1
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.graph_worker import GraphWorker
@@ -217,54 +220,31 @@ def scene_command(operation_id: str | None = None) -> dict:
 
 
 class ScenePolicy:
+    def __init__(self):
+        self.replay = None
+        self.calls = []
+
+    def replay_committed_bind_scene(self, **kwargs):
+        self.calls.append(("replay", kwargs))
+        return self.replay
+
     def resolve_bind_scene(self, **kwargs):
+        self.calls.append(("resolve", kwargs))
         namespace = PLAN.namespace
-        operation_id = kwargs["operation_id"]
-        source = "source:scene-authority"
-        binding = RoleBinding(
-            "binding:project", "persona:persona", "collaborator", None, None,
-            "scene:project", "scene", "private", ("norm:project",), 1.0,
-            None, 10, (source,), 1, "active",
-        )
-        role_reads = tuple(GraphVersion(
-            AtomKey(Owner("persona", "bot", "persona"), type_name, name), 1,
-        ) for type_name, name in (
-            ("d01.persona_activation.v1", "current"),
-            ("d01.persona_plan.v1", PLAN.plan_id),
-            ("d11.owner_grant.v1", "primary"),
-        ))
-        active = ActiveRoleQualification(namespace, PLAN.head_id, PLAN, role_reads, 0, 1)
-        guard = OwnerAuthorizationGuardV1(
-            "authority", "installation", namespace, 1, "sha256:" + "a" * 64, 0, 0,
-        )
-        key = AtomKey(Owner("scene", "bot", "persona", binding.scene_ref),
-                      "d03.role_binding", binding.role_binding_id)
-        query = QueryEpoch(namespace, "d03.role_binding", 0)
+        active = ActiveRoleQualification(namespace, PLAN.head_id, PLAN, (), 0, 1)
         prior = RoleBindingResolution(
-            "no_applicable_binding", (), (), (), (), query, None,
-            RoleBindingRequest("persona:persona", None, None, binding.scene_ref,
+            "no_applicable_binding", (), (), (), (),
+            QueryEpoch(namespace, "d03.role_binding", 0), None,
+            RoleBindingRequest("persona:persona", None, None, "scene:project",
                                "bind_scene", kwargs["purpose"], 1.0, True),
         )
-        envelope = CommandEnvelope(
-            "sylanne.runtime.v1",
-            OperationIdentity("activity:scene", None, "attempt:scene", "prepare",
-                              operation_id, canonical_digest({"input_refs": [source]})),
-            AuthorityContext("creator", "d11", "capability:scene", namespace,
-                             ("persona", "scene"), kwargs["purpose"],
-                             ("owner",), "policy", 1),
-            VersionGuard(role_reads + (GraphVersion(key, 0),), (query,), 0, 0,
-                         "catalogue", "scheme", "operator", "policy", (), (), ()),
-            SourceQualification((source,), "authored", None, 1.0,
-                                "authored_content", "qualified", None, "not_applicable"),
-            (source,), "budget:scene", 10.0, 10.0, "interval:scene", (),
+        scene = CurrentHostScene(namespace, "platform", "conversation",
+                                 "private", "scene:project")
+        return TrustedBindScene(
+            kwargs["session"].actor_id, kwargs["session"].session_id,
+            kwargs["scope"], kwargs["operation_id"], kwargs["request_digest"],
+            scene, active, prior, PRINCIPAL, "sha256:" + "2" * 64,
         )
-        d03 = ContextProvider()
-        d03.compile_scheme({"schema": "d03.context.scheme.v1",
-                            "roles": ("collaborator",), "norms": ("norm:project",)}, None)
-        proposal = d03.build_scene_binding_proposal(envelope, binding, active, guard, prior)
-        return TrustedBindScene(kwargs["session"].actor_id, kwargs["session"].session_id,
-                                kwargs["scope"], operation_id, kwargs["request_digest"],
-                                binding, active, proposal, prior, PRINCIPAL)
 
 
 class SceneGraph(Graph):
@@ -278,32 +258,73 @@ class SceneGraph(Graph):
         )
 
 
-def test_bind_scene_uses_trusted_d03_candidate_and_graph_receipt():
-    graph = SceneGraph()
-    session = AuthenticatedSession(
+def _scene_session():
+    return AuthenticatedSession(
         "creator", "server-session", {SCOPE: frozenset({"workbench.bind_scene"})},
         {SCOPE: frozenset({"owner"})},
         {SCOPE: frozenset({"workbench_user_action"})},
+        owner_session_token="x" * 43,
+        owner_session_request=OwnerSessionLoginRequestV1(
+            "authority", "authority-ns", "installation", PRINCIPAL,
+            "credential", 1, "owner", "http://localhost:6185"),
     )
-    service = WorkbenchService(GraphWorkbenchIssuer(graph, Grants(), Views(), ScenePolicy()))
+
+
+def test_bind_scene_passes_host_identity_to_dedicated_graph_commit():
+    graph, policy = SceneGraph(), ScenePolicy()
+    service = WorkbenchService(GraphWorkbenchIssuer(graph, Grants(), Views(), policy))
     payload = scene_command()
-    answer = service.handle(payload, session=session, context=CONTEXT)
+    answer = service.handle(payload, session=_scene_session(), context=CONTEXT)
     assert answer.status == "ready"
     assert answer.receipt["scene_ref"] == "scene:project"
     assert answer.receipt["binding_id"] == "binding:project"
+    assert graph.calls[0]["scene"].scene_ref == "scene:project"
+    assert graph.calls[0]["actor_id"] == "creator"
     assert graph.calls[0]["prior"].status == "no_applicable_binding"
-    assert graph.calls[0]["proposal"].domain == "d03"
+    assert graph.calls[0]["owner_session_token"] == _scene_session().owner_session_token
+    assert graph.calls[0]["owner_session_request"] == _scene_session().owner_session_request
+    assert _scene_session().owner_session_token not in repr(answer.receipt)
+    assert [kind for kind, _ in policy.calls] == ["replay", "resolve"]
+
+
+def test_committed_bind_scene_replays_before_current_host_or_negative_proof():
+    graph, policy = SceneGraph(), ScenePolicy()
+    policy.replay = SceneBindingReceiptV1(
+        PLAN.namespace, "placeholder", "placeholder",
+        "sha256:" + "1" * 64, "scene:project", "binding:project", PLAN.head_id,
+        "owner-grant", "sha256:" + "2" * 64, "graph-incarnation",
+        3, 3, "scene-write", "finish-scene", "sha256:" + "3" * 64,
+    )
+    def replay(**kwargs):
+        policy.calls.append(("replay", kwargs))
+        return replace(policy.replay, operation_id=kwargs["operation_id"],
+                       request_digest=kwargs["request_digest"])
+    policy.replay_committed_bind_scene = replay
+    answer = WorkbenchService(GraphWorkbenchIssuer(
+        graph, Grants(), Views(), policy)).handle(
+            scene_command(), session=_scene_session(), context=CONTEXT)
+    assert answer.status == "ready"
+    assert [kind for kind, _ in policy.calls] == ["replay"]
+    assert graph.calls == []
+
+
+def test_bind_scene_replay_requires_signed_owner_session():
+    graph, policy = SceneGraph(), ScenePolicy()
+    answer = WorkbenchService(GraphWorkbenchIssuer(
+        graph, Grants(), Views(), policy)).handle(
+            scene_command(), session=replace(_scene_session(), owner_session_token=None),
+            context=CONTEXT,
+        )
+    assert answer.status == "unavailable"
+    assert answer.problem["code"] == "signed_owner_session_unavailable"
+    assert policy.calls == [] and graph.calls == []
 
 
 def test_bind_scene_without_graph_commit_is_unavailable():
     graph = Graph()
-    session = AuthenticatedSession(
-        "creator", "server-session", {SCOPE: frozenset({"workbench.bind_scene"})},
-        {SCOPE: frozenset({"owner"})},
-        {SCOPE: frozenset({"workbench_user_action"})},
-    )
-    service = WorkbenchService(GraphWorkbenchIssuer(graph, Grants(), Views(), ScenePolicy()))
-    answer = service.handle(scene_command(), session=session, context=CONTEXT)
+    service = WorkbenchService(GraphWorkbenchIssuer(
+        graph, Grants(), Views(), ScenePolicy()))
+    answer = service.handle(scene_command(), session=_scene_session(), context=CONTEXT)
     assert answer.status == "unavailable" and answer.receipt is None
     assert answer.problem["code"] == "scene_binding_unavailable"
 

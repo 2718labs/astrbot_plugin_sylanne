@@ -29,7 +29,7 @@ from sylanne3.runtime_contracts import (
 
 from test_dispatch_admission_preflight import _candidates
 from test_graph_v2_provisioning import AuthorityPort
-from test_scene_binding_v2 import _scene_case
+from test_scene_binding_v2 import _bind_scene, _scene_case
 
 
 class _Resources:
@@ -225,15 +225,12 @@ def test_v2_fenced_candidate_commit_and_cold_recovery(tmp_path):
     extra_specs = tuple(
         spec for provider in providers[1:]
         for spec in provider.register_types())
-    (store, authority_db, port, coordinator, namespace, principal,
-     scene_proposal, scene_prior, scene_digest, _scene_key, policy,
-     bootstrap) = _scene_case(
-         tmp_path, enable_ingress=True, extra_specs=extra_specs)
+    scene_case = _scene_case(
+        tmp_path, enable_ingress=True, extra_specs=extra_specs)
+    (store, authority_db, port, coordinator, namespace, _principal,
+     _scene_prior, policy, bootstrap) = scene_case
     registry = store._registry
-    coordinator.commit_scene_binding_v2(
-        namespace=namespace, operation_id="scene-bind-1",
-        proposal=scene_proposal, prior=scene_prior, principal=principal,
-        request_digest=scene_digest)
+    _bind_scene(scene_case)
     for domain, provider in zip(("d08", "d09"), providers[1:]):
         coordinator.register_provider(
             bootstrap, domain, provider,
@@ -254,7 +251,9 @@ def test_v2_fenced_candidate_commit_and_cold_recovery(tmp_path):
     assert coordinator.commit_first_ingress_v2(
         bootstrap, host, policy, clock, encoding).status == "committed"
     source_row = store._db.execute(
-        "SELECT subject FROM graph_atoms WHERE type_name='memory.source'"
+        "SELECT subject FROM graph_atoms WHERE type_name='memory.source' "
+        "AND subject NOT LIKE 'scene-owner-config:%' "
+        "AND subject NOT LIKE 'scene-host-identity:%'"
     ).fetchone()
     assert source_row is not None
     d11.admit_runtime = lambda _bundle, db, **_kwargs: RuntimeAdmission(

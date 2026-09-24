@@ -17,12 +17,15 @@ from .rewrite.sylanne3.host import (
     build_astrbot_ingress,
 )
 from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
+from .rewrite.sylanne3.host.context_scheme_asset import load_verified_context_scheme
 from .rewrite.sylanne3.host.authority_profile import AuthorityProfileUnavailable
+from .rewrite.sylanne3.host.installed_scene_identity import InstalledSceneIdentityPort
 from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, SceneCandidateCatalog
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
 from .rewrite.sylanne3.runtime_contracts import NamespaceId, canonical_digest
 from .rewrite.sylanne3.workbench_api.current_onboarding import CurrentOnboardingResolver
+from .rewrite.sylanne3.workbench_api.d03_onboarding import CurrentD03OnboardingResolver
 from .rewrite.sylanne3.workbench_api.http_transport import CurrentOwnerPairingPort
 from .rewrite.sylanne3.workbench_api.onboarding import OnboardingPolicyResolver
 from .rewrite.sylanne3.workbench_api.owner_grant import CurrentOwnerGrantPort
@@ -154,10 +157,36 @@ class Sylanne3Plugin(Star):
             logger.error("Sylanne 3 startup blocked: D04 scheme verification failed")
             return
         try:
+            context_scheme = await asyncio.to_thread(
+                load_verified_context_scheme,
+                PACKAGE_ROOT,
+                installation.installation_policy.manifest_digest,
+                available_cpu_features=installation.available_cpu_features,
+            )
+            provider = verified.registry.registrations["d03"].provider
+            compile_scheme = getattr(provider, "compile_scheme", None)
+            if not callable(compile_scheme):
+                raise TypeError("installed D03 provider is unavailable")
+            compiled = compile_scheme(context_scheme.draft(), None)
+            if compiled != {
+                "schema": "d03.context.scheme.v1",
+                "roles": ("scene_participant",), "norms": (),
+            }:
+                raise ValueError("installed D03 scheme did not compile to neutral policy")
+        except Exception:
+            self.runtime_health = RuntimeHealth("blocked", ("context_scheme_verification",))
+            logger.error("Sylanne 3 startup blocked: D03 scheme verification failed")
+            return
+        scene_port = InstalledSceneIdentityPort(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            candidates=self._scene_candidates,
+        )
+        try:
             self._runtime = RuntimeContext(
                 data_dir, package_root=PACKAGE_ROOT, dependencies=None,
                 domains=verified.registry,
                 owner_principal_resolver=self._owner_principal_resolver,
+                scene_identity_port=scene_port,
             )
             health = await self._runtime.start_v2(installation)
             self._installed_namespace = installation.installation_policy.namespace
@@ -185,7 +214,15 @@ class Sylanne3Plugin(Star):
         pairing, grants, onboarding, origin = self._workbench_dependencies
         origin = origin or installation.workbench_origin
         if onboarding is None and pairing is None and grants is None and origin is not None:
-            onboarding = CurrentOnboardingResolver()
+            try:
+                owner_ports = self._runtime.installed_owner_onboarding_ports()
+                onboarding = CurrentOnboardingResolver(
+                    d03=CurrentD03OnboardingResolver(
+                        namespaces=owner_ports, owners=owner_ports, scenes=scene_port,
+                    ),
+                )
+            except Exception:
+                logger.error("Sylanne D03 onboarding authority could not be attached")
         if onboarding is not None and origin is not None:
             try:
                 transport = self._runtime.workbench_transport(

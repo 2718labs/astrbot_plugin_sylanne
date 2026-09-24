@@ -44,6 +44,29 @@ def _proposal(domain):
 
 
 class ContextDomainTests(unittest.TestCase):
+    def test_neutral_first_scene_binding_accepts_empty_norms_but_not_unknown_role(self):
+        provider = ContextProvider()
+        provider.compile_scheme(
+            {"schema": "d03.context.scheme.v1",
+             "roles": ("scene_participant",), "norms": ()}, snapshot=None)
+        binding = RoleBinding(
+            "binding:first", "persona:sylanne", "scene_participant",
+            None, None, "scene:first", "scene", "private", (),
+            1.0, None, 1, ("source:first",), 1, "active",
+        )
+        request = RoleBindingRequest(
+            "persona:sylanne", None, None, "scene:first", "bind_scene",
+            "respond", 2.0, True,
+        )
+        resolved = provider.resolve_role_binding(request, (binding,))
+        self.assertEqual(resolved.status, "complete")
+        self.assertEqual(resolved.matched_bindings, ("binding:first",))
+        self.assertEqual(resolved.applicable_norm_refs, ())
+        unknown = RoleBinding(**{**binding.__dict__, "social_role": "invented_role"})
+        rejected = provider.resolve_role_binding(request, (unknown,))
+        self.assertEqual(rejected.status, "partial")
+        self.assertEqual(rejected.missing_items, ("role_catalogue",))
+
     def test_type_specs_are_authorized_strict_and_preserve_unknown_event_time(self):
         provider = ContextProvider()
         specs = provider.type_specs()

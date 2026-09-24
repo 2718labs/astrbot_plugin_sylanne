@@ -168,6 +168,26 @@ class RuntimeContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dataclasses.replace(qualification(), source_family="authored",
                                 evidence_eligibility="eligible")
+        for family in ("authored", "simulated", "derived"):
+            for eligibility in ("eligible", "qualified"):
+                with self.subTest(family=family, eligibility=eligibility):
+                    with self.assertRaises(ValueError):
+                        dataclasses.replace(qualification(), source_family=family,
+                                            content_reality="unknown",
+                                            evidence_eligibility=eligibility)
+            with self.subTest(family=family, reality="external_report"):
+                with self.assertRaises(ValueError):
+                    dataclasses.replace(qualification(), source_family=family,
+                                        content_reality="external_report",
+                                        evidence_eligibility="ineligible")
+            self.assertEqual(dataclasses.replace(
+                qualification(), source_family=family, content_reality="unknown",
+                evidence_eligibility="ineligible",
+            ).evidence_eligibility, "ineligible")
+        self.assertEqual(dataclasses.replace(
+            qualification(), source_family="reported", content_reality="external_report",
+            evidence_eligibility="qualified",
+        ).evidence_eligibility, "qualified")
 
     def test_proposal_and_bundle_preserve_dependency_classes_and_one_namespace(self):
         atom_key = key()

@@ -1,38 +1,29 @@
-"""Resolve a first D03 scene binding from host and graph facts.
+"""Resolve Owner scene selection from current host identity and graph facts.
 
-The browser only selects a scene and acknowledges the proposed visibility.
-The scene policy is host supplied; the D01 head and negative D03 query must
-come from one current graph-worker proof.  This adapter owns no graph state.
+The browser selects a scene and acknowledges visibility. The D01 head and
+negative D03 query come from one graph-worker proof. This adapter owns no graph.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import TYPE_CHECKING, Mapping, Protocol
 from uuid import UUID
 
 from ..authority_service.v2_owner_contract import OwnerAuthorizationGuardV1, OwnerPrincipalV1
 from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..domains.d01 import ActiveRoleQualification
-from ..domains.d03 import ContextProvider, RoleBinding, RoleBindingResolution
-from ..graph_types import AtomKey, GraphVersion, Owner
-from ..runtime_contracts import CommandEnvelope, NamespaceId
+from ..domains.d03 import RoleBindingResolution
+from ..graph_coordinator import SceneBindingReceiptV1
+from ..runtime_contracts import NamespaceId
 from .d01_onboarding import (
     CurrentOwnerIdentity, CurrentOwnerIdentityPort, InstalledNamespacePort,
 )
 from .onboarding import TrustedBindScene
 from .service import AuthenticatedSession
 
-
-@dataclass(frozen=True, slots=True)
-class VerifiedHostScenePolicy:
-    """Host-qualified scene identity, D03 policy and source-bearing command."""
-
-    namespace: NamespaceId
-    scene_ref: str
-    visibility: str
-    binding: RoleBinding
-    envelope: CommandEnvelope
+if TYPE_CHECKING:
+    from ..host.current_scene import CurrentHostScene
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,12 +73,9 @@ class CurrentFirstBindingProof:
             raise ValueError("first binding graph guard differs from read epoch")
 
 
-class HostScenePolicyPort(Protocol):
-    def resolve_current_scene(
-        self, *, namespace: NamespaceId, scene_ref: str, visibility: str,
-        purpose: str, audience: str, operation_id: str,
-        request_digest: str, proof: CurrentFirstBindingProof,
-    ) -> VerifiedHostScenePolicy | None: ...
+class HostSceneIdentityPort(Protocol):
+    def verify(self, namespace: NamespaceId, scene_ref: str,
+               visibility: str) -> CurrentHostScene | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,18 +85,51 @@ class SceneBindDecision:
 
 
 class CurrentD03OnboardingResolver:
-    """Prepare a D03 candidate; W01 still owns admission and the final write."""
+    """Prepare typed Owner inputs; the graph worker owns the final write."""
 
     def __init__(
         self, *, namespaces: InstalledNamespacePort | None = None,
         owners: CurrentOwnerIdentityPort | None = None,
-        scenes: HostScenePolicyPort | None = None,
-        provider: ContextProvider | None = None,
+        scenes: HostSceneIdentityPort | None = None,
     ) -> None:
         self._namespaces = namespaces
         self._owners = owners
         self._scenes = scenes
-        self._provider = provider
+
+    def replay_committed_bind_scene(
+        self, *, coordinator: object, session: AuthenticatedSession,
+        scope: str, purpose: str, audience: str, operation_id: str,
+        request_digest: str,
+    ) -> SceneBindingReceiptV1 | None:
+        """Replay a durable receipt before a now-stale negative query or host check."""
+        if (not isinstance(session, AuthenticatedSession)
+                or not session.allows(scope, "workbench.bind_scene", purpose, audience)
+                or not session.owner_session_token
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
+                or self._namespaces is None or self._owners is None):
+            return None
+        namespace = self._namespaces.resolve_installed_namespace(scope=scope)
+        if not isinstance(namespace, NamespaceId) or scope != f"{namespace.bot_id}/{namespace.persona_id}":
+            return None
+        owner = self._owners.resolve_current_owner_identity(
+            session=session, scope=scope, namespace=namespace)
+        if (not isinstance(owner, CurrentOwnerIdentity)
+                or owner.actor_id != session.actor_id
+                or owner.session_id != session.session_id
+                or owner.scope != scope or owner.namespace != namespace
+                or not isinstance(owner.principal, OwnerPrincipalV1)
+                or not isinstance(owner.guard, OwnerAuthorizationGuardV1)
+                or owner.guard.namespace != namespace
+                or owner.guard.pending_revoke_operation_id is not None):
+            return None
+        replay = getattr(coordinator, "replay_committed_scene_binding_v2", None)
+        if not callable(replay):
+            return None
+        return replay(namespace=namespace, operation_id=operation_id,
+                      request_digest=request_digest, principal=owner.principal,
+                      actor_id=owner.actor_id,
+                      owner_session_token=session.owner_session_token,
+                      owner_session_request=session.owner_session_request)
 
     def resolve_create_character(self, **_kwargs: object) -> None:
         """D01 onboarding has a separate resolver."""
@@ -130,6 +151,8 @@ class CurrentD03OnboardingResolver:
         scope: str, purpose: str, audience: str, operation_id: str,
         request_digest: str, input_data: Mapping[str, object],
     ) -> SceneBindDecision:
+        from ..host.current_scene import CurrentHostScene
+
         def hold(reason: str) -> SceneBindDecision:
             return SceneBindDecision(None, reason)
 
@@ -140,8 +163,7 @@ class CurrentD03OnboardingResolver:
                 or not session.owner_session_token
                 or type(session.owner_session_request) is not OwnerSessionLoginRequestV1):
             return hold("signed_owner_session_unavailable")
-        if (self._namespaces is None or self._owners is None
-                or self._scenes is None or not isinstance(self._provider, ContextProvider)):
+        if (self._namespaces is None or self._owners is None or self._scenes is None):
             return hold("trusted_scene_ports_uninstalled")
         try:
             UUID(operation_id)
@@ -209,64 +231,19 @@ class CurrentD03OnboardingResolver:
                 or proof.prior.request.requested_action_kind != "bind_scene"
                 or proof.prior.request.purpose != purpose):
             return hold("current_graph_negative_proof_invalid")
-        policy = self._scenes.resolve_current_scene(
-            namespace=namespace, scene_ref=scene_ref, visibility=visibility,
-            purpose=purpose, audience=audience, operation_id=operation_id,
-            request_digest=request_digest, proof=proof)
-        if (not isinstance(policy, VerifiedHostScenePolicy)
-                or policy.namespace != namespace
-                or policy.scene_ref != scene_ref
-                or policy.visibility != visibility
-                or policy.binding.scene_ref != scene_ref
-                or policy.binding.visibility_scope != visibility
-                or policy.binding.subject_persona_ref != f"persona:{namespace.persona_id}"
-                or policy.binding.scope_selector != "scene"
-                or policy.binding.target_entity_ref is not None
-                or policy.binding.group_ref is not None
-                or policy.binding.status != "active"
-                or policy.binding.binding_version != 1):
-            return hold("host_scene_policy_unavailable")
-        envelope = policy.envelope
-        key = AtomKey(Owner("scene", *namespace.as_tuple, scene_ref),
-                      "d03.role_binding", policy.binding.role_binding_id)
-        expected_reads = (set(proof.active_role.read_versions)
-                          | set(proof.prior.read_versions) | {GraphVersion(key, 0)})
-        graph_guard = proof.graph_guard
-        version_guard = envelope.version_guard
-        if (envelope.authority.namespace != namespace
-                or envelope.authority.actor != session.actor_id
-                or envelope.authority.issuer_domain != "d11"
-                or envelope.authority.purpose != purpose
-                or audience not in envelope.authority.audience
-                or envelope.identity.operation_id != operation_id
-                or len(version_guard.read_versions) != len(expected_reads)
-                or set(version_guard.read_versions) != expected_reads
-                or version_guard.query_epochs != (proof.prior.query_epoch,)
-                or version_guard.access_epoch != graph_guard.access_epoch
-                or version_guard.delete_epoch != graph_guard.delete_epoch
-                or version_guard.catalogue_version != graph_guard.catalogue_version
-                or version_guard.scheme_version != graph_guard.scheme_version
-                or version_guard.operator_version != graph_guard.operator_version
-                or version_guard.policy_version != graph_guard.policy_version
-                or envelope.source_qualification.evidence_eligibility != "qualified"
-                or not set(policy.binding.source_refs).issubset(
-                    envelope.source_qualification.source_refs)):
-            return hold("scene_command_policy_unavailable")
-        try:
-            proposal = self._provider.build_scene_binding_proposal(
-                envelope, policy.binding, proof.active_role,
-                proof.owner_guard, proof.prior)
-            self._provider.validate(proposal, None)
-        except (TypeError, ValueError):
-            return hold("d03_scene_proposal_unavailable")
+        scene = self._scenes.verify(namespace, scene_ref, visibility)
+        if (type(scene) is not CurrentHostScene
+                or scene.namespace != namespace or scene.scene_ref != scene_ref
+                or scene.visibility != visibility):
+            return hold("current_host_scene_unavailable")
         return SceneBindDecision(TrustedBindScene(
             session.actor_id, session.session_id, scope, operation_id,
-            request_digest, policy.binding, proof.active_role,
-            proposal, proof.prior, owner.principal), None)
+            request_digest, scene, proof.active_role, proof.prior,
+            owner.principal, proof.owner_guard.authorization_head), None)
 
 
 __all__ = (
     "CurrentD03OnboardingResolver", "CurrentFirstBindingProof",
     "CurrentGraphGuardMetadata",
-    "HostScenePolicyPort", "SceneBindDecision", "VerifiedHostScenePolicy",
+    "HostSceneIdentityPort", "SceneBindDecision",
 )

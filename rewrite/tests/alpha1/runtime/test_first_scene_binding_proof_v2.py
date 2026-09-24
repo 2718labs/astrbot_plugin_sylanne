@@ -8,7 +8,7 @@ from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequest
 from sylanne3.graph_coordinator import AuthorityDenied, StaleRead, UnavailableGuard
 from sylanne3.workbench_api.d03_onboarding import CurrentFirstBindingProof
 
-from test_scene_binding_v2 import _scene_case
+from test_scene_binding_v2 import _bind_scene, _scene_case
 
 
 ACTOR = "paired-owner"
@@ -24,7 +24,7 @@ def _pair(coordinator, namespace, principal):
 
 def test_current_first_binding_proof_reads_full_query_at_one_epoch(tmp_path):
     (store, authority_db, _port, coordinator, namespace, principal,
-     _proposal, _prior, _digest, _key) = _scene_case(tmp_path)
+     _prior, _policy, _bootstrap) = _scene_case(tmp_path, enable_ingress=False)
     try:
         _pair(coordinator, namespace, principal)
         proof = coordinator.read_first_scene_binding_proof_v2(
@@ -60,7 +60,7 @@ def test_current_first_binding_proof_reads_full_query_at_one_epoch(tmp_path):
 
 def test_guard_version_change_during_read_rejects_proof(tmp_path, monkeypatch):
     (store, authority_db, port, coordinator, namespace, principal,
-     _proposal, _prior, _digest, _key) = _scene_case(tmp_path)
+     _prior, _policy, _bootstrap) = _scene_case(tmp_path, enable_ingress=False)
     try:
         _pair(coordinator, namespace, principal)
         original_validate = port.validate_fence
@@ -93,7 +93,7 @@ def test_guard_version_change_during_read_rejects_proof(tmp_path, monkeypatch):
 
 def test_signed_owner_session_is_rechecked_at_both_guard_reads(tmp_path, monkeypatch):
     (store, authority_db, port, coordinator, namespace, principal,
-     _proposal, _prior, _digest, _key) = _scene_case(tmp_path)
+     _prior, _policy, _bootstrap) = _scene_case(tmp_path, enable_ingress=False)
     try:
         _pair(coordinator, namespace, principal)
         anchor = port.anchors[namespace]
@@ -137,16 +137,15 @@ def test_signed_owner_session_is_rechecked_at_both_guard_reads(tmp_path, monkeyp
 
 
 def test_existing_scene_binding_denies_negative_proof(tmp_path):
+    case = _scene_case(tmp_path, enable_ingress=True)
     (store, authority_db, _port, coordinator, namespace, principal,
-     proposal, prior, digest, _key) = _scene_case(tmp_path)
+     prior, _policy, _bootstrap) = case
     try:
         _pair(coordinator, namespace, principal)
-        coordinator.commit_scene_binding_v2(
-            namespace=namespace, operation_id="scene-bind-1", proposal=proposal,
-            prior=prior, principal=principal, request_digest=digest)
+        _bind_scene(case)
         with pytest.raises(AuthorityDenied, match="already has"):
             coordinator.read_first_scene_binding_proof_v2(
-                namespace=namespace, scene_ref="scene:private",
+                namespace=namespace, scene_ref=prior.request.scene_ref,
                 purpose="workbench_user_action", principal=principal, actor_id=ACTOR)
     finally:
         store.close()
@@ -155,7 +154,7 @@ def test_existing_scene_binding_denies_negative_proof(tmp_path):
 
 def test_changed_principal_and_revoked_owner_head_deny_proof(tmp_path):
     (store, authority_db, port, coordinator, namespace, principal,
-     _proposal, _prior, _digest, _key) = _scene_case(tmp_path)
+     _prior, _policy, _bootstrap) = _scene_case(tmp_path, enable_ingress=False)
     try:
         paired = _pair(coordinator, namespace, principal)
         with pytest.raises(UnavailableGuard, match="pairing"):

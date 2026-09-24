@@ -74,6 +74,8 @@ _VERSION_PATTERN = re.compile(
     r'^version\s*:\s*["\']?([^\s"\']+)["\']?\s*$', re.MULTILINE
 )
 _D04_ASSET_PATH = "resources/catalogue/d04-affect-scheme.json"
+_D03_ASSET_PATH = "resources/catalogue/d03-neutral-context-scheme.json"
+_D03_SCHEME = {"schema": "d03.context.scheme.v1", "roles": ["scene_participant"], "norms": []}
 _D04_OPERATOR_PATH = "resources/catalogue/d04-fixed-block-operator.json"
 _D04_CATALOGUE_CAPABILITY = "d04.affect.scheme.v1"
 _D04_VERSION_FIELDS = (
@@ -161,6 +163,20 @@ def _d04_binding(payload: dict[str, bytes]) -> dict[str, object]:
         "bytes": len(content),
         "catalogue_capability": _D04_CATALOGUE_CAPABILITY,
         **versions,
+    }
+
+
+def _d03_binding(payload: dict[str, bytes]) -> dict[str, object]:
+    """Bind the exact neutral scene role without implying trust or send rights."""
+
+    content = payload.get(_D03_ASSET_PATH)
+    if content is None:
+        raise RuntimeError("formal alpha1 requires a D03 neutral context scheme asset")
+    if _strict_json_object(content, "D03 context scheme asset") != _D03_SCHEME:
+        raise ValueError("D03 context scheme must contain only the neutral scene role and no norms")
+    return {
+        "path": _D03_ASSET_PATH, "sha256": _sha256(content),
+        "bytes": len(content), "schema": _D03_SCHEME["schema"],
     }
 
 
@@ -466,6 +482,7 @@ def _manifest(
     payload: dict[str, bytes],
     native_path: str,
     formal: bool,
+    context_scheme: dict[str, object] | None = None,
     affect_scheme: dict[str, object] | None = None,
     fixed_block_operator: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -497,6 +514,8 @@ def _manifest(
         },
         "files": files,
     }
+    if context_scheme is not None:
+        manifest["context_scheme"] = context_scheme
     if affect_scheme is not None:
         manifest["affect_scheme"] = affect_scheme
     if fixed_block_operator is not None:
@@ -559,6 +578,7 @@ def build_package(
         )
     payload = _read_allowlisted_payload(root, formal=formal)
     _verify_workbench_source(root, payload, formal=formal)
+    context_scheme = _d03_binding(payload) if formal else None
     affect_scheme = _d04_binding(payload) if formal else None
     fixed_block_operator = _d04_operator_binding(payload) if formal else None
     native_path = (
@@ -578,6 +598,7 @@ def build_package(
         payload=payload,
         native_path=native_path,
         formal=formal,
+        context_scheme=context_scheme,
         affect_scheme=affect_scheme,
         fixed_block_operator=fixed_block_operator,
     )
@@ -700,12 +721,22 @@ def verify_package(package: Path | str) -> None:
                         for member in (
                             "resources/catalogue/current.json",
                             "resources/migrations/v1.json",
+                            _D03_ASSET_PATH,
                             _D04_ASSET_PATH,
                             _D04_OPERATOR_PATH,
                         )
                         if member in listed
                     }
                     _validate_formal_resources(resources)
+                    expected_context = _d03_binding(resources)
+                    context_binding = manifest.get("context_scheme")
+                    context_entry = listed.get(_D03_ASSET_PATH)
+                    if (not isinstance(context_binding, dict)
+                            or context_binding != expected_context
+                            or context_entry is None
+                            or any(context_binding.get(field) != context_entry.get(field)
+                                   for field in ("path", "sha256", "bytes"))):
+                        raise ValueError("formal alpha1 D03 context scheme binding is invalid")
                     expected_binding = _d04_binding(resources)
                     binding = manifest.get("affect_scheme")
                     asset_entry = listed.get(_D04_ASSET_PATH)

@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import inspect
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
 
 from .authority_service.v2_owner_contract import OwnerActorBindingV1, OwnerPrincipalV1
 from .contracts import StaleRead
@@ -39,6 +39,15 @@ from .workbench_api.owner_grant import (
     CurrentOwnerGrantPort, DurableOwnerGrantResolver, GraphCurrentOwnerGrantPort,
 )
 from .workbench_api.owner_session_resolver import BoundOwnerSessions
+from .workbench_api.installed_owner_ports import InstalledOwnerOnboardingPorts
+
+if TYPE_CHECKING:
+    from .host.current_scene import CurrentHostScene
+
+
+class SceneIdentityPort(Protocol):
+    def verify(self, namespace: NamespaceId, scene_ref: str,
+               visibility: str) -> CurrentHostScene | None: ...
 
 
 @dataclass(frozen=True)
@@ -113,9 +122,12 @@ class RuntimeContext:
         domains: DomainRegistry | None = None,
         authority_state: str = "unavailable",
         owner_principal_resolver: Callable[[str, NamespaceId], OwnerPrincipalV1 | None] | None = None,
+        scene_identity_port: SceneIdentityPort | None = None,
     ) -> None:
         if owner_principal_resolver is not None and not callable(owner_principal_resolver):
             raise TypeError("owner_principal_resolver must be callable")
+        if scene_identity_port is not None and not callable(getattr(scene_identity_port, "verify", None)):
+            raise TypeError("scene_identity_port must verify current scenes")
         self._data_dir = Path(data_dir)
         self._package_root = (
             Path(package_root).resolve()
@@ -126,6 +138,7 @@ class RuntimeContext:
         self._authority_state = authority_state
         self._domains = domains or discover_domain_registry()
         self._owner_principal_resolver = owner_principal_resolver
+        self._scene_identity_port = scene_identity_port
         self._store: ProductionGraphStore | None = None
         self._coordinator: GraphCoordinator | None = None
         self._worker: GraphWorker | None = None
@@ -262,6 +275,8 @@ class RuntimeContext:
                                               if self._owner_principal_resolver is not None
                                               else current_principal if current_binding_available
                                               else None),
+                    scene_identity_port=self._scene_identity_port,
+                    scene_clock_policy=installation.ingress_clock,
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(
@@ -418,6 +433,17 @@ class RuntimeContext:
     @property
     def workbench_owner_sessions(self) -> BoundOwnerSessions | None:
         return self._workbench_owner_sessions
+
+    def installed_owner_onboarding_ports(self) -> InstalledOwnerOnboardingPorts:
+        """Expose only the installed, live V2 Owner facts for onboarding."""
+        if (self._worker is None or not self._v2_namespace_provisioned
+                or self._v2_policy is None or self._v2_port is None
+                or self._v2_coordinator is None or self._v2_bootstrap is None):
+            raise RuntimeError("installed Owner onboarding authority is unavailable")
+        return InstalledOwnerOnboardingPorts(
+            policy=self._v2_policy, authority=self._v2_port,
+            coordinator=self._v2_coordinator, bootstrap=self._v2_bootstrap,
+        )
 
     def workbench_transport(self, *, pairing: CurrentOwnerPairingPort | None = None,
                             owner_grants: CurrentOwnerGrantPort | None = None,

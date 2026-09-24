@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING, Mapping, Protocol
 
 from ..authority_service.v2_owner_contract import OwnerPrincipalV1
 from ..domains.d01 import ActiveRoleQualification, PersonaPlan
-from ..domains.d03.context import RoleBinding, RoleBindingResolution
-from ..runtime_contracts import DomainProposal
+from ..domains.d03.context import RoleBindingResolution
 from .service import AuthenticatedSession
 
 if TYPE_CHECKING:
+    from ..host.current_scene import CurrentHostScene
     from .d01_onboarding import VerifiedCreationResources
 
 
@@ -39,11 +39,11 @@ class TrustedBindScene:
     scope: str
     operation_id: str
     request_digest: str
-    binding: RoleBinding
+    scene: CurrentHostScene
     active_role: ActiveRoleQualification
-    proposal: DomainProposal
     prior: RoleBindingResolution
     principal: OwnerPrincipalV1
+    authorization_head: str
 
 
 class OnboardingPolicyResolver(Protocol):

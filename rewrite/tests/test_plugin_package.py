@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import platform
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ import zipfile
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "build_plugin_package.py"
 WORKBENCH_VERIFIER = Path(__file__).resolve().parents[2] / "scripts" / "alpha1" / "verify_delivery_assets.py"
+D03_ASSET = Path(__file__).resolve().parents[2] / "resources" / "catalogue" / "d03-neutral-context-scheme.json"
 
 
 def _load_builder():
@@ -157,6 +159,7 @@ class PluginPackageTests(unittest.TestCase):
             "resources/workbench/index.html": workbench_index,
             "resources/workbench/workbench-manifest.json": json.dumps(workbench_manifest).encode(),
             "resources/catalogue/current.json": json.dumps(catalogue).encode() + b"\n",
+            "resources/catalogue/d03-neutral-context-scheme.json": D03_ASSET.read_bytes(),
             "resources/catalogue/d04-affect-scheme.json": json.dumps(affect_scheme).encode() + b"\n",
             "resources/catalogue/d04-fixed-block-operator.json": json.dumps(operator).encode() + b"\n",
             "resources/migrations/v1.json": json.dumps(migrations).encode() + b"\n",
@@ -229,6 +232,7 @@ class PluginPackageTests(unittest.TestCase):
             self.assertEqual(manifest["package_version"], "3.0.0-dev.1")
             self.assertEqual(manifest["source"]["dirty"], True)
             self.assertEqual(manifest["build_mode"], "dev-probe")
+            self.assertNotIn("context_scheme", manifest)
             self.assertNotIn("affect_scheme", manifest)
             self.assertEqual(manifest["platform"]["os"], "windows")
             self.assertEqual(manifest["platform"]["arch"], "x86_64")
@@ -359,6 +363,9 @@ class PluginPackageTests(unittest.TestCase):
         self.assertEqual(manifest["platform"]["cpu_features"], ["neon"])
         self.assertEqual(manifest["platform"]["abi_version"], 2)
         binding = manifest["affect_scheme"]
+        context_binding = manifest["context_scheme"]
+        self.assertEqual(context_binding["path"], "resources/catalogue/d03-neutral-context-scheme.json")
+        self.assertEqual(context_binding["schema"], "d03.context.scheme.v1")
         self.assertEqual(binding["path"], "resources/catalogue/d04-affect-scheme.json")
         self.assertEqual(binding["catalogue_capability"], "d04.affect.scheme.v1")
         self.assertEqual(binding["scheme_version"], "fixture:scheme:1")
@@ -367,6 +374,7 @@ class PluginPackageTests(unittest.TestCase):
             {
                 "resources/workbench/index.html",
                 "resources/catalogue/current.json",
+                "resources/catalogue/d03-neutral-context-scheme.json",
                 "resources/catalogue/d04-affect-scheme.json",
                 "resources/migrations/v1.json",
                 "THIRD_PARTY_NOTICES",
@@ -484,6 +492,81 @@ class PluginPackageTests(unittest.TestCase):
                 native_library=self._native(),
                 output_dir=self.base / "missing-d04",
             )
+
+    def test_formal_build_requires_d03_asset_and_cold_package_loads_it(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        asset_path = self.project / "resources/catalogue/d03-neutral-context-scheme.json"
+        original = asset_path.read_bytes()
+        asset_path.unlink()
+        _run_git(self.project, "add", "-A")
+        _run_git(self.project, "commit", "--quiet", "-m", "without D03 scheme")
+        with self.assertRaisesRegex(RuntimeError, "requires a D03 neutral context scheme asset"):
+            self.builder.build_package(
+                project_root=self.project, target_os="windows", target_arch="x86_64",
+                native_library=self._native(), output_dir=self.base / "missing-d03",
+            )
+        asset_path.write_bytes(original)
+        _run_git(self.project, "add", ".")
+        _run_git(self.project, "commit", "--quiet", "-m", "restore D03 scheme")
+        os_name = {"Windows": "windows", "Linux": "linux", "Darwin": "macos"}[platform.system()]
+        arch = {"AMD64": "x86_64", "x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}[
+            platform.machine()
+        ]
+        package = self.builder.build_package(
+            project_root=self.project, target_os=os_name, target_arch=arch,
+            native_library=self._native(self.builder.TARGETS[os_name]),
+            output_dir=self.base / "local-formal",
+            target_libc=platform.libc_ver()[0] if os_name == "linux" else None,
+        )
+        installed = self.base / "installed"
+        installed.mkdir()
+        with zipfile.ZipFile(package) as archive:
+            archive.extractall(installed)
+        digest = hashlib.sha256((installed / "release-manifest.json").read_bytes()).hexdigest()
+        from sylanne3.host.context_scheme_asset import load_verified_context_scheme
+
+        verified = load_verified_context_scheme(installed, digest)
+        self.assertEqual(verified.manifest_sha256, digest)
+        self.assertEqual(verified.draft()["roles"], ("scene_participant",))
+        self.assertEqual(verified.draft()["norms"], ())
+
+        probe = self.builder.build_package(
+            project_root=self.project, target_os=os_name, target_arch=arch,
+            native_library=self._native(self.builder.TARGETS[os_name]),
+            output_dir=self.base / "local-probe", allow_dirty_dev_probe=True,
+            target_libc=platform.libc_ver()[0] if os_name == "linux" else None,
+        )
+        probe_root = self.base / "installed-probe"
+        probe_root.mkdir()
+        with zipfile.ZipFile(probe) as archive:
+            probe_manifest = json.loads(archive.read("release-manifest.json"))
+            self.assertIn("resources/catalogue/d03-neutral-context-scheme.json",
+                          {entry["path"] for entry in probe_manifest["files"]})
+            self.assertNotIn("context_scheme", probe_manifest)
+            archive.extractall(probe_root)
+        probe_digest = hashlib.sha256((probe_root / "release-manifest.json").read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "formal-alpha1"):
+            load_verified_context_scheme(probe_root, probe_digest)
+
+    def test_formal_verifier_rejects_missing_d03_binding(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        package = self.builder.build_package(
+            project_root=self.project, target_os="windows", target_arch="x86_64",
+            native_library=self._native(), output_dir=self.base / "d03-bound-formal",
+        )
+        with zipfile.ZipFile(package) as source:
+            members = {name: source.read(name) for name in source.namelist()}
+        manifest = json.loads(members["release-manifest.json"])
+        del manifest["context_scheme"]
+        members["release-manifest.json"] = json.dumps(manifest).encode("utf-8")
+        forged = self.base / "missing-d03-binding.zip"
+        with zipfile.ZipFile(forged, "w") as archive:
+            for name, content in members.items():
+                archive.writestr(name, content)
+        with self.assertRaisesRegex(ValueError, "D03 context scheme binding"):
+            self.builder.verify_package(forged)
 
     def test_formal_build_holds_when_d04_operator_is_absent(self) -> None:
         self._set_formal_version()

@@ -288,6 +288,20 @@ class GraphStore(Store):
                 requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
                 graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
                 PRIMARY KEY(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_scene_binding_request_proofs_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+                principal_json TEXT NOT NULL, frozen_json TEXT NOT NULL,
+                input_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id),
+                FOREIGN KEY(bot,persona,operation_id)
+                    REFERENCES graph_scene_binding_intents_v1(bot,persona,operation_id));
+            CREATE TRIGGER IF NOT EXISTS graph_scene_binding_request_proof_no_update_v1
+                BEFORE UPDATE ON graph_scene_binding_request_proofs_v1
+                BEGIN SELECT RAISE(ABORT, 'scene request proof is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_scene_binding_request_proof_no_delete_v1
+                BEFORE DELETE ON graph_scene_binding_request_proofs_v1
+                BEGIN SELECT RAISE(ABORT, 'scene request proof is immutable'); END;
             CREATE TABLE IF NOT EXISTS graph_scene_binding_receipts_v1 (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 operation_id TEXT NOT NULL, input_digest TEXT NOT NULL,

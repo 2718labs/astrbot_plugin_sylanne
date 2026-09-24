@@ -1,4 +1,4 @@
-"""D12 scene selection needs a host policy and a current graph proof."""
+"""Owner binding requires a signed session, negative graph proof and current host scene."""
 
 from dataclasses import replace
 from uuid import uuid4
@@ -8,19 +8,14 @@ import pytest
 from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationGuardV1, OwnerPrincipalV1
 from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.domains.d01 import ActiveRoleQualification, PersonaBlock, PersonaPlan
-from sylanne3.domains.d03 import ContextProvider, RoleBinding, RoleBindingRequest, RoleBindingResolution
-from sylanne3.graph_types import AtomKey, GraphVersion, Owner
-from sylanne3.runtime_contracts import (
-    AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
-    QueryEpoch, SourceQualification, VersionGuard, canonical_digest,
-)
+from sylanne3.domains.d03 import RoleBindingRequest, RoleBindingResolution
+from sylanne3.host.current_scene import CurrentHostScene
+from sylanne3.runtime_contracts import NamespaceId, QueryEpoch
 from sylanne3.workbench_api.d01_onboarding import CurrentOwnerIdentity
 from sylanne3.workbench_api.d03_onboarding import (
-    CurrentD03OnboardingResolver, CurrentFirstBindingProof,
-    CurrentGraphGuardMetadata, VerifiedHostScenePolicy,
+    CurrentD03OnboardingResolver, CurrentFirstBindingProof, CurrentGraphGuardMetadata,
 )
 from sylanne3.workbench_api.service import AuthenticatedSession
-
 
 NAMESPACE = NamespaceId("bot", "persona")
 SCOPE = "bot/persona"
@@ -40,6 +35,7 @@ SESSION = AuthenticatedSession(
 )
 INPUT = {"scene_ref": SCENE, "visibility": "private", "acknowledgement": True}
 DIGEST = "sha256:" + "b" * 64
+HOST_SCENE = CurrentHostScene(NAMESPACE, "platform-ref", "conversation-ref", "private", SCENE)
 
 
 class Namespaces:
@@ -53,185 +49,124 @@ class Owners:
                                     scope, namespace, PRINCIPAL, GUARD)
 
 
-def _qualified(operation_id):
+def proof():
     plan = PersonaPlan("plan:one", NAMESPACE, 1,
                        (PersonaBlock("identity", "semantic_identity", "companion", "read_only"),),
                        (), True)
-    reads = tuple(GraphVersion(
-        AtomKey(Owner("persona", "bot", "persona"), type_name, name), 1,
-    ) for type_name, name in (
-        ("d01.persona_activation.v1", "current"),
-        ("d01.persona_plan.v1", plan.plan_id),
-        ("d11.owner_grant.v1", "primary"),
-    ))
-    active = ActiveRoleQualification(NAMESPACE, plan.head_id, plan, reads, 0, 1)
-    binding = RoleBinding("binding:project", "persona:persona", "collaborator",
-                          None, None, SCENE, "scene", "private", ("norm:project",),
-                          1.0, None, 10, ("source:scene",), 1, "active")
+    active = ActiveRoleQualification(NAMESPACE, plan.head_id, plan, (), 0, 1)
     prior = RoleBindingResolution(
         "no_applicable_binding", (), (), (), (),
         QueryEpoch(NAMESPACE, "d03.role_binding", 0), None,
         RoleBindingRequest("persona:persona", None, None, SCENE, "bind_scene",
                            "workbench_user_action", 1.0, True),
     )
-    key = AtomKey(Owner("scene", "bot", "persona", SCENE),
-                  "d03.role_binding", binding.role_binding_id)
-    envelope = CommandEnvelope(
-        "sylanne.runtime.v1",
-        OperationIdentity("activity:scene", None, "attempt:scene", "prepare",
-                          operation_id, canonical_digest({"input_refs": ["source:scene"]})),
-        AuthorityContext(SESSION.actor_id, "d11", "capability:scene", NAMESPACE,
-                         ("persona", "scene"), "workbench_user_action",
-                         ("owner",), "policy", 1),
-        VersionGuard(reads + (GraphVersion(key, 0),), (prior.query_epoch,),
-                     1, 0, "catalogue", "scheme", "operator", "policy", (), (), ()),
-        SourceQualification(("source:scene",), "authored", None, 1.0,
-                            "authored_content", "qualified", None, "not_applicable"),
-        ("source:scene",), "budget:scene", 10.0, 10.0, "interval:scene", (),
+    return CurrentFirstBindingProof(
+        active, prior, GUARD,
+        CurrentGraphGuardMetadata(NAMESPACE, 0, 0, 0,
+                                  "catalogue", "scheme", "operator", "policy"),
     )
-    return (VerifiedHostScenePolicy(NAMESPACE, SCENE, "private", binding, envelope),
-            CurrentFirstBindingProof(
-                active, prior, GUARD,
-                CurrentGraphGuardMetadata(
-                    NAMESPACE, 0, 1, 0, "catalogue", "scheme", "operator", "policy"),
-            ))
 
 
 class Scenes:
-    def __init__(self, policy, events=None, proof=None):
-        self.policy = policy
-        self.events = events
-        self.proof = proof
+    def __init__(self, result=HOST_SCENE):
+        self.result = result
+        self.calls = []
 
-    def resolve_current_scene(self, **kwargs):
-        if self.events is not None:
-            self.events.append("policy")
-            assert kwargs["proof"] is self.proof
-        return self.policy
+    def verify(self, namespace, scene_ref, visibility):
+        self.calls.append((namespace, scene_ref, visibility))
+        return self.result
 
 
 class Graph:
-    def __init__(self, proof, events=None):
-        self.proof = proof
-        self.calls = 0
-        self.events = events
+    def __init__(self, current):
+        self.current = current
+        self.calls = []
 
     def read_first_scene_binding_proof_v2(self, **kwargs):
-        self.calls += 1
-        if self.events is not None:
-            self.events.append("graph")
-        assert kwargs == {"namespace": NAMESPACE, "scene_ref": SCENE,
-                          "purpose": "workbench_user_action", "principal": PRINCIPAL,
-                          "actor_id": SESSION.actor_id,
-                          "owner_session_token": SESSION.owner_session_token,
-                          "owner_session_request": OWNER_REQUEST}
-        return self.proof
+        self.calls.append(kwargs)
+        return self.current
 
 
-def _resolver(policy, scenes=None):
-    provider = ContextProvider()
-    provider.compile_scheme({"schema": "d03.context.scheme.v1",
-                             "roles": ("collaborator",), "norms": ("norm:project",)}, None)
-    return CurrentD03OnboardingResolver(namespaces=Namespaces(), owners=Owners(),
-                                        scenes=scenes or Scenes(policy), provider=provider)
-
-
-def _resolve(resolver, graph, operation_id, input_data=INPUT, session=SESSION):
-    return resolver.resolve_bind_scene_decision(
+def resolve(*, scenes=None, graph=None, session=SESSION, input_data=INPUT):
+    scenes = scenes or Scenes()
+    graph = graph or Graph(proof())
+    resolver = CurrentD03OnboardingResolver(
+        namespaces=Namespaces(), owners=Owners(), scenes=scenes)
+    decision = resolver.resolve_bind_scene_decision(
         coordinator=graph, session=session, scope=SCOPE,
         purpose="workbench_user_action", audience="owner",
-        operation_id=operation_id, request_digest=DIGEST, input_data=input_data)
+        operation_id=str(uuid4()), request_digest=DIGEST, input_data=input_data,
+    )
+    return decision, scenes, graph
 
 
-def test_host_scene_and_same_epoch_graph_proof_build_d03_candidate():
-    operation_id = str(uuid4())
-    policy, proof = _qualified(operation_id)
-    events = []
-    graph = Graph(proof, events)
-    result = _resolve(_resolver(policy, Scenes(policy, events, proof)), graph, operation_id)
-    assert result.hold_reason is None
-    assert result.trusted.binding == policy.binding
-    assert result.trusted.active_role == proof.active_role
-    assert result.trusted.prior == proof.prior
-    assert result.trusted.proposal.domain == "d03"
-    assert result.trusted.principal == PRINCIPAL
-    assert graph.calls == 1
-    assert events == ["graph", "policy"]
+def test_current_scene_and_negative_proof_produce_owner_inputs():
+    decision, scenes, graph = resolve()
+    assert decision.hold_reason is None
+    assert decision.trusted.scene is HOST_SCENE
+    assert decision.trusted.active_role == graph.current.active_role
+    assert decision.trusted.prior == graph.current.prior
+    assert decision.trusted.principal == PRINCIPAL
+    assert decision.trusted.authorization_head == GUARD.authorization_head
+    assert scenes.calls == [(NAMESPACE, SCENE, "private")]
+    assert graph.calls[0]["owner_session_token"] == SESSION.owner_session_token
 
 
-def test_signed_owner_session_is_required_before_graph_or_policy_read():
-    operation_id = str(uuid4())
-    policy, proof = _qualified(operation_id)
-    graph = Graph(proof)
-    resolver = _resolver(policy)
-    for session in (replace(SESSION, owner_session_token=None),
-                    replace(SESSION, owner_session_request=None)):
-        result = _resolve(resolver, graph, operation_id, session=session)
-        assert result.trusted is None
-        assert result.hold_reason == "signed_owner_session_unavailable"
-    assert graph.calls == 0
-
-
-def test_stock_coordinator_without_negative_proof_stays_on_hold():
-    operation_id = str(uuid4())
-    policy, _proof = _qualified(operation_id)
-    result = _resolve(_resolver(policy), object(), operation_id)
-    assert result.trusted is None
-    assert result.hold_reason == "current_graph_negative_proof_uninstalled"
-    assert _resolve(CurrentD03OnboardingResolver(), object(), operation_id).hold_reason == (
-        "trusted_scene_ports_uninstalled")
-
-
-def test_browser_acknowledgement_and_host_scene_identity_are_not_inferred():
-    operation_id = str(uuid4())
-    policy, proof = _qualified(operation_id)
-    graph = Graph(proof)
-    resolver = _resolver(policy)
-    assert _resolve(resolver, graph, operation_id,
-                    {**INPUT, "acknowledgement": False}).hold_reason == (
-        "scene_selection_or_acknowledgement_invalid")
-    assert _resolve(_resolver(replace(policy, scene_ref="scene:other")),
-                    graph, operation_id).hold_reason == (
-        "host_scene_policy_unavailable")
-    assert graph.calls == 1
-
-
-def test_stale_graph_proof_is_rejected_and_unqualified_source_holds():
-    operation_id = str(uuid4())
-    policy, proof = _qualified(operation_id)
-    with pytest.raises(ValueError, match="differs from read epoch"):
-        replace(proof, prior=replace(proof.prior,
-                                     query_epoch=QueryEpoch(NAMESPACE, "d03.role_binding", 1)))
-    unqualified = replace(policy, envelope=replace(
-        policy.envelope, source_qualification=replace(
-            policy.envelope.source_qualification, evidence_eligibility="ineligible")))
-    assert _resolve(_resolver(unqualified), Graph(proof), operation_id).hold_reason == (
-        "scene_command_policy_unavailable")
-
-
-@pytest.mark.parametrize("field,value", [
-    ("access_epoch", 2), ("delete_epoch", 1),
-    ("catalogue_version", "old"), ("scheme_version", "old"),
-    ("operator_version", "old"), ("policy_version", "old"),
-])
-def test_host_envelope_must_match_every_current_graph_guard_field(field, value):
-    operation_id = str(uuid4())
-    policy, proof = _qualified(operation_id)
-    stale_guard = replace(policy.envelope.version_guard, **{field: value})
-    stale_policy = replace(policy, envelope=replace(policy.envelope, version_guard=stale_guard))
-    assert _resolve(_resolver(stale_policy), Graph(proof), operation_id).hold_reason == (
-        "scene_command_policy_unavailable")
-
-
-def test_host_envelope_must_match_complete_graph_read_set_and_query_epoch():
-    operation_id = str(uuid4())
-    policy, proof = _qualified(operation_id)
-    guard = policy.envelope.version_guard
-    for stale_guard in (
-        replace(guard, read_versions=guard.read_versions[:-1]),
-        replace(guard, query_epochs=(QueryEpoch(NAMESPACE, "d03.role_binding", 1),)),
+def test_signed_session_and_acknowledgement_precede_host_read():
+    for session, input_data in (
+        (replace(SESSION, owner_session_token=None), INPUT),
+        (SESSION, {**INPUT, "acknowledgement": False}),
     ):
-        stale_policy = replace(policy, envelope=replace(policy.envelope,
-                                                       version_guard=stale_guard))
-        assert _resolve(_resolver(stale_policy), Graph(proof), operation_id).hold_reason == (
-            "scene_command_policy_unavailable")
+        decision, scenes, _ = resolve(session=session, input_data=input_data)
+        assert decision.trusted is None
+        assert not scenes.calls
+
+
+def test_missing_or_mismatched_host_scene_holds():
+    for scene in (None, replace(HOST_SCENE, scene_ref="scene:other"),
+                  replace(HOST_SCENE, visibility="group")):
+        decision, scenes, _ = resolve(scenes=Scenes(scene))
+        assert decision.hold_reason == "current_host_scene_unavailable"
+        assert scenes.calls == [(NAMESPACE, SCENE, "private")]
+
+
+def test_stale_or_missing_negative_proof_holds_without_host_read():
+    current = proof()
+    with pytest.raises(ValueError, match="differs from read epoch"):
+        replace(current, prior=replace(current.prior,
+                                       query_epoch=QueryEpoch(NAMESPACE, "d03.role_binding", 1)))
+    scenes = Scenes()
+    decision, _, _ = resolve(scenes=scenes, graph=Graph(replace(
+        current, prior=replace(current.prior, status="ready"))))
+    assert decision.hold_reason == "current_graph_negative_proof_invalid"
+    assert not scenes.calls
+
+
+def test_committed_replay_uses_current_signed_owner_without_host_lookup():
+    class ReplayGraph:
+        def __init__(self):
+            self.calls = []
+
+        def replay_committed_scene_binding_v2(self, **kwargs):
+            self.calls.append(kwargs)
+            return "committed-receipt"
+
+    scenes, graph = Scenes(), ReplayGraph()
+    resolver = CurrentD03OnboardingResolver(
+        namespaces=Namespaces(), owners=Owners(), scenes=scenes)
+    args = {"coordinator": graph, "scope": SCOPE,
+            "purpose": "workbench_user_action", "audience": "owner",
+            "operation_id": str(uuid4()), "request_digest": DIGEST}
+    assert resolver.replay_committed_bind_scene(
+        **args, session=replace(SESSION, owner_session_token=None)) is None
+    assert not graph.calls
+    assert resolver.replay_committed_bind_scene(
+        **args, session=SESSION) == "committed-receipt"
+    assert graph.calls == [{
+        "namespace": NAMESPACE, "operation_id": args["operation_id"],
+        "request_digest": DIGEST, "principal": PRINCIPAL,
+        "actor_id": SESSION.actor_id,
+        "owner_session_token": SESSION.owner_session_token,
+        "owner_session_request": OWNER_REQUEST,
+    }]
+    assert not scenes.calls

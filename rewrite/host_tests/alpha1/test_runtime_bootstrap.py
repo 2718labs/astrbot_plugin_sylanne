@@ -24,6 +24,7 @@ from astrbot.core.star.star_handler import star_handlers_registry
 
 from sylanne3.domain_registry import REQUIRED_DOMAINS, discover_domain_registry
 from sylanne3.domains.d04 import AffectAxis, AffectScheme
+from sylanne3.domains.d03 import ContextProvider
 from sylanne3.domains.d06 import D06DomainProvider
 from sylanne3.graph_coordinator import (
     GraphCoordinator, IngressClockSample, IngressIssuancePolicy,
@@ -63,6 +64,18 @@ from sylanne3.runtime_context import RuntimeContext, RuntimeDependencies, Runtim
 
 ROOT = Path(__file__).resolve().parents[3]
 MODULE = "data.plugins.sylanne3_alpha1.main"
+
+
+def _neutral_context_scheme():
+    return types.SimpleNamespace(draft=lambda: {
+        "schema": "d03.context.scheme.v1", "roles": ("scene_participant",), "norms": (),
+    })
+
+
+def _mock_context_registry():
+    return types.SimpleNamespace(registrations={
+        "d03": types.SimpleNamespace(provider=ContextProvider()),
+    })
 
 
 def registry_with_test_affect_scheme():
@@ -158,6 +171,22 @@ class _IngressContext:
 
 
 class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_context_accepts_host_scene_verify_port_without_sdk_type(self) -> None:
+        class ScenePort:
+            def verify(self, namespace, scene_ref, visibility):
+                return None
+
+        port = ScenePort()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = RuntimeContext(
+                Path(directory), dependencies=None, scene_identity_port=port,
+            )
+            self.assertIs(runtime._scene_identity_port, port)
+            with self.assertRaisesRegex(TypeError, "verify current scenes"):
+                RuntimeContext(
+                    Path(directory), dependencies=None, scene_identity_port=object(),
+                )
+
     def test_default_catalogue_registers_types_but_requires_an_active_d04_scheme(self) -> None:
         registry = discover_domain_registry()
         self.assertEqual(set(registry.required_domains), set(REQUIRED_DOMAINS))
@@ -788,7 +817,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_verified_v2_startup_orders_installation_scheme_and_worker(self) -> None:
         module = load_plugin_module()
         order = []
-        registry = object()
+        registry = _mock_context_registry()
         policy = types.SimpleNamespace(
             manifest_digest="a" * 64,
             namespace=NamespaceId("bot", "persona"),
@@ -817,10 +846,11 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         class ControlledRuntime:
             def __init__(self, data_dir, *, package_root, dependencies, domains,
-                         owner_principal_resolver=None):
+                         owner_principal_resolver=None, scene_identity_port=None):
                 order.append("context")
                 self.arguments = (data_dir, package_root, dependencies, domains)
                 self_outer.assertIsNone(owner_principal_resolver)
+                self_outer.assertIsInstance(scene_identity_port, module.InstalledSceneIdentityPort)
 
             async def start_v2(self, assembled):
                 order.append("start_v2")
@@ -845,6 +875,8 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(StarTools, "get_data_dir", return_value=Path(directory)), \
                     patch.object(module, "assemble_v2_installation", side_effect=assemble), \
                     patch.object(module, "load_verified_affect_scheme", side_effect=load_scheme), \
+                    patch.object(module, "load_verified_context_scheme",
+                                 return_value=_neutral_context_scheme()), \
                     patch.object(module, "RuntimeContext", ControlledRuntime):
                 plugin = module.Sylanne3Plugin(
                     Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None, None),
@@ -914,6 +946,12 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.binding = binding
 
+            def current_anchor(self, **_kwargs):
+                return types.SimpleNamespace(
+                    authority_id="authority", namespace=policy.authority_namespace,
+                    activation_generation=1,
+                )
+
             def current_owner_actor_binding(self, *, namespace, authority_namespace,
                                             actor_id):
                 lookups.append(("actor", namespace, authority_namespace, actor_id))
@@ -950,6 +988,8 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, _store, bootstrap, **kwargs):
                 self.bootstrap = bootstrap
                 self.owner_resolver = kwargs["owner_principal_resolver"]
+                self.scene_identity_port = kwargs["scene_identity_port"]
+                self.scene_clock_policy = kwargs["scene_clock_policy"]
 
             def register_provider(self, *_args):
                 pass
@@ -963,7 +1003,10 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         domains = types.SimpleNamespace(
             complete=True, type_registry=object(),
-            registrations={"d11": types.SimpleNamespace(
+            registrations={"d03": types.SimpleNamespace(
+                domain="d03", provider=ContextProvider(), proposal_schema="d03.test",
+                proposal_schema_hash="c" * 64,
+            ), "d11": types.SimpleNamespace(
                 domain="d11", provider=object(), proposal_schema="d11.test",
                 proposal_schema_hash="b" * 64,
             )},
@@ -979,7 +1022,9 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(module, "assemble_v2_installation",
                                  new=AsyncMock(return_value=installation)) as assemble, \
                     patch.object(module, "load_verified_affect_scheme",
-                                 return_value=types.SimpleNamespace(registry=domains)), \
+                                  return_value=types.SimpleNamespace(registry=domains)), \
+                    patch.object(module, "load_verified_context_scheme",
+                                 return_value=_neutral_context_scheme()), \
                     patch.object(runtime_module, "verify_installed_package",
                                  return_value=host_package.InstalledPackageVerification(
                                      True, "verified", "a" * 64, "3.0.0-alpha1",
@@ -1014,6 +1059,18 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                     )
                     onboarding = plugin._workbench._transport._service._onboarding
                     self.assertIsInstance(onboarding, module.CurrentOnboardingResolver)
+                    self.assertIsInstance(
+                        onboarding._d03, module.CurrentD03OnboardingResolver,
+                    )
+                    self.assertIs(
+                        onboarding._d03._scenes,
+                        plugin._runtime._scene_identity_port,
+                    )
+                    self.assertIs(onboarding._d03._namespaces, onboarding._d03._owners)
+                    self.assertEqual(
+                        domains.registrations["d03"].provider._roles,
+                        frozenset({"scene_participant"}),
+                    )
                     self.assertIsNone(onboarding.resolve_create_character(
                         session=None, scope="bot/persona", purpose="workbench_user_action",
                         audience="owner", operation_id="creation", request_digest="digest",
@@ -1034,6 +1091,11 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                         owner_grants, runtime_module.GraphCurrentOwnerGrantPort,
                     )
                     worker = plugin._runtime._worker
+                    self.assertIs(await worker.call(
+                        lambda graph: graph.scene_identity_port),
+                        plugin._runtime._scene_identity_port)
+                    self.assertIsNone(await worker.call(
+                        lambda graph: graph.scene_clock_policy))
                     sessions = plugin._workbench._owner_sessions
                     self.assertEqual(
                         await worker.call(
@@ -1115,7 +1177,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         class ControlledRuntime:
             def __init__(self, data_dir, *, package_root, dependencies, domains,
-                         owner_principal_resolver=None):
+                         owner_principal_resolver=None, scene_identity_port=None):
                 self.assert_no_owner_resolver = owner_principal_resolver is None
 
             async def start_v2(self, assembled):
@@ -1133,7 +1195,9 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(module, "assemble_v2_installation",
                                  new=AsyncMock(return_value=installation)), \
                     patch.object(module, "load_verified_affect_scheme",
-                                 return_value=types.SimpleNamespace(registry=object())), \
+                                 return_value=types.SimpleNamespace(registry=_mock_context_registry())), \
+                    patch.object(module, "load_verified_context_scheme",
+                                 return_value=_neutral_context_scheme()), \
                     patch.object(module, "RuntimeContext", ControlledRuntime):
                 plugin = module.Sylanne3Plugin(
                     Context(asyncio.Queue(), {}, None, None, None, None,
@@ -1174,6 +1238,34 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plugin.runtime_health.detail, "")
             self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())
 
+    async def test_d03_verification_failure_blocks_before_runtime(self) -> None:
+        module = load_plugin_module()
+        installation = types.SimpleNamespace(
+            installation_policy=types.SimpleNamespace(manifest_digest="a" * 64),
+            available_cpu_features=None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(StarTools, "get_data_dir", return_value=Path(directory)), \
+                    patch.object(module, "assemble_v2_installation",
+                                 new=AsyncMock(return_value=installation)), \
+                    patch.object(module, "load_verified_affect_scheme",
+                                 return_value=types.SimpleNamespace(
+                                     registry=_mock_context_registry())), \
+                    patch.object(module, "load_verified_context_scheme",
+                                 side_effect=ValueError("untrusted D03 asset")), \
+                    patch.object(module, "RuntimeContext") as runtime:
+                plugin = module.Sylanne3Plugin(
+                    Context(asyncio.Queue(), {}, None, None, None, None,
+                            None, None, None, None, None, None),
+                    {"enabled": True},
+                )
+                await plugin.initialize()
+            runtime.assert_not_called()
+            self.assertEqual(plugin.runtime_health.status, "blocked")
+            self.assertEqual(plugin.runtime_health.missing_capabilities,
+                             ("context_scheme_verification",))
+            self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())
+
     async def test_v2_bootstrap_cannot_publish_ready_from_runtime_result(self) -> None:
         module = load_plugin_module()
         installation = types.SimpleNamespace(
@@ -1181,13 +1273,15 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             available_cpu_features=None,
             workbench_origin=None,
         )
-        registry = object()
+        registry = _mock_context_registry()
         runtime = types.SimpleNamespace(start_v2=AsyncMock(return_value=RuntimeHealth("ready")))
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(StarTools, "get_data_dir", return_value=Path(directory)), \
                     patch.object(module, "assemble_v2_installation", new=AsyncMock(return_value=installation)), \
                     patch.object(module, "load_verified_affect_scheme",
                                  return_value=types.SimpleNamespace(scheme=object(), registry=registry)), \
+                    patch.object(module, "load_verified_context_scheme",
+                                 return_value=_neutral_context_scheme()), \
                     patch.object(module, "RuntimeContext", return_value=runtime):
                 plugin = module.Sylanne3Plugin(
                     Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),

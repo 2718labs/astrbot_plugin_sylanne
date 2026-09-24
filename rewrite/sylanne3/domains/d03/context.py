@@ -11,6 +11,7 @@ from ...authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
 from ...domains.d01 import ActiveRoleQualification
 from ...domains.d08 import ActionIntent
 from ...graph_types import AtomKey, GraphVersion, GraphWrite, NamespaceEpoch, Owner, TypeSpec
+from ...memory_types import access_key, source_key
 from ...runtime_contracts import (
     AuthorityContext, CheckReceipt, CommandEnvelope, DependencySet, DomainProposal,
     ProviderDescriptor, QueryEpoch, VersionedRef, schema_hash,
@@ -169,7 +170,7 @@ class RoleBinding:
             _id(self.scene_ref, "scene_ref", "scene:")
         _id(self.scope_selector, "scope_selector")
         _id(self.visibility_scope, "visibility_scope")
-        _refs(self.norm_refs, "norm_refs")
+        _refs(self.norm_refs, "norm_refs", nonempty=False)
         start = _time(self.effective_from, "effective_from")
         if self.effective_until is not None and _time(self.effective_until, "effective_until") < start:
             raise ValueError("effective_until precedes effective_from")
@@ -482,6 +483,8 @@ class ContextProvider:
         self, envelope: CommandEnvelope, binding: RoleBinding,
         active_role: ActiveRoleQualification, owner_guard: OwnerAuthorizationGuardV1,
         prior: RoleBindingResolution,
+        *, owner_config_source_ref: str | None = None,
+        host_identity_source_ref: str | None = None,
     ) -> DomainProposal:
         """Build a first scene-binding candidate for D11's guarded transaction.
 
@@ -528,10 +531,34 @@ class ContextProvider:
         if (binding.social_role not in self._roles
                 or not set(binding.norm_refs).issubset(self._norms)):
             raise ValueError("scene binding role or norms are not in the active D03 scheme")
-        if (envelope.source_qualification.evidence_eligibility == "ineligible"
-                or not set(binding.source_refs).issubset(envelope.source_qualification.source_refs)
-                or not set(binding.source_refs).issubset(envelope.input_refs)):
-            raise ValueError("scene binding lacks qualified source references")
+        if owner_config_source_ref is None and host_identity_source_ref is None:
+            if (envelope.source_qualification.evidence_eligibility == "ineligible"
+                    or not set(binding.source_refs).issubset(envelope.source_qualification.source_refs)
+                    or not set(binding.source_refs).issubset(envelope.input_refs)):
+                raise ValueError("scene binding lacks qualified source references")
+        else:
+            refs = (owner_config_source_ref, host_identity_source_ref)
+            if (any(type(ref) is not str for ref in refs)
+                    or owner_config_source_ref == host_identity_source_ref
+                    or binding.source_refs != refs
+                    or not set(refs).issubset(envelope.input_refs)
+                    or envelope.source_qualification.source_refs != (host_identity_source_ref,)
+                    or (envelope.source_qualification.source_family,
+                        envelope.source_qualification.content_reality,
+                        envelope.source_qualification.evidence_eligibility)
+                    != ("observed", "external_observation", "eligible")):
+                raise ValueError("scene binding needs distinct Owner and host identity sources")
+            guarded = set(envelope.version_guard.read_versions)
+            for ref in refs:
+                try:
+                    parsed = AtomKey.from_token(ref)
+                    expected = source_key(*namespace.as_tuple, parsed.owner.subject or "")
+                    access = access_key(*namespace.as_tuple, parsed.owner.subject or "")
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("scene binding source key is invalid") from exc
+                if (parsed != expected or GraphVersion(expected, 0) not in guarded
+                        or GraphVersion(access, 0) not in guarded):
+                    raise ValueError("scene binding lacks source and access revision-0 guards")
 
         key = AtomKey(
             Owner("scene", namespace.bot_id, namespace.persona_id, binding.scene_ref),
@@ -556,6 +583,64 @@ class ContextProvider:
             DependencySet(current_invalidation=active_role.read_versions),
             (), (),
         )
+
+    def build_owner_scene_binding_write(
+        self, binding: RoleBinding, active_role: ActiveRoleQualification,
+        owner_guard: OwnerAuthorizationGuardV1, prior: RoleBindingResolution,
+        *, owner_config_source_key: AtomKey, host_identity_source_key: AtomKey,
+    ) -> GraphWrite:
+        """Prepare one first-scene Owner write; the graph owns its CAS commit."""
+        if (type(binding) is not RoleBinding
+                or type(active_role) is not ActiveRoleQualification
+                or type(owner_guard) is not OwnerAuthorizationGuardV1
+                or type(prior) is not RoleBindingResolution):
+            raise TypeError("typed first-scene binding evidence is required")
+        namespace = active_role.namespace
+        request = prior.request
+        if (owner_guard.namespace != namespace
+                or owner_guard.authorization_revision != active_role.authorization_revision
+                or owner_guard.pending_revoke_operation_id is not None
+                or owner_guard.minimum_revocation_revision >= 1
+                or owner_guard.minimum_revocation_epoch >= 1
+                or prior.query_epoch is None
+                or prior.query_epoch.namespace != namespace
+                or active_role.graph_epoch != prior.query_epoch.revision):
+            raise ValueError("active role and Owner guard differ from scene query")
+        if (prior.status != "no_applicable_binding"
+                or prior.query_epoch.scope_ref != "d03.role_binding"
+                or any(item.key.name == binding.role_binding_id
+                       for item in prior.read_versions)
+                or request is None or not request.scope_complete
+                or request.subject_persona_ref != binding.subject_persona_ref
+                or request.subject_persona_ref != f"persona:{namespace.persona_id}"
+                or request.scene_ref != binding.scene_ref
+                or request.target_entity_ref is not None or request.group_ref is not None
+                or request.requested_action_kind != "bind_scene"):
+            raise ValueError("negative query does not cover this first scene binding")
+        if (binding.scene_ref is None or binding.target_entity_ref is not None
+                or binding.group_ref is not None or binding.scope_selector != "scene"
+                or binding.visibility_scope not in {"private", "group"}
+                or binding.binding_version != 1 or binding.status != "active"
+                or not binding.applies_to(request)):
+            raise ValueError("first scene binding must be active and scene scoped")
+        if (binding.social_role not in self._roles
+                or not set(binding.norm_refs).issubset(self._norms)):
+            raise ValueError("scene binding role or norms are not in the active D03 scheme")
+        sources = (owner_config_source_key, host_identity_source_key)
+        if (any(type(key) is not AtomKey for key in sources)
+                or owner_config_source_key == host_identity_source_key
+                or binding.source_refs != tuple(key.token for key in sources)
+                or any(key != source_key(
+                    *namespace.as_tuple, key.owner.subject or "") for key in sources)):
+            raise ValueError("first scene binding requires distinct Owner and host source keys")
+        key = AtomKey(
+            Owner("scene", *namespace.as_tuple, binding.scene_ref),
+            "d03.role_binding", binding.role_binding_id,
+        )
+        value = asdict(binding)
+        value["norm_refs"] = list(binding.norm_refs)
+        value["source_refs"] = list(binding.source_refs)
+        return GraphWrite(key, value, tuple(item.key for item in active_role.read_versions))
 
     def project(self, query: RoleBindingRequest, snapshot: tuple[RoleBinding, ...]) -> RoleBindingResolution:
         return self.resolve_role_binding(query, snapshot)
