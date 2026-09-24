@@ -25,7 +25,8 @@ from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
 from .host.authority_profile import (
     AdminD03ArrivalPolicy, AdminD03SelfIdentityProjectionPolicy,
-    AdminD04EncodingBaselinePolicy, AdminIngressClockPolicy, AdminIngressEncodingPolicy,
+    AdminD04EncodingBaselinePolicy, AdminD06FirstIngressC02Policy,
+    AdminIngressClockPolicy, AdminIngressEncodingPolicy,
     AdminIngressModelPolicy, AdminInstallationBundle, AdminModelWorkflowsV2,
     AdminModelWorkflowV2,
 )
@@ -1191,6 +1192,46 @@ class RuntimeContext:
                 return
             yield PreparedFirstIngressWorkerResultV1(
                 egress, context, read_request, result_read)
+
+    async def commit_first_ingress_c02_v1(
+        self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
+        executor: HostModelEgressExecutor,
+    ) -> CommitReceipt | None:
+        """Commit C02 while the original V3 worker lease and read remain live."""
+        bundle = self._v2_model_bundle
+        policy = self._v2_policy
+        if (type(bundle) is not AdminInstallationBundle
+                or type(policy) is not AdminInstallationPolicy
+                or bundle.installation_policy != policy
+                or type(bundle.d06_first_ingress_c02)
+                   is not AdminD06FirstIngressC02Policy
+                or type(bundle.ingress_clock) is not AdminIngressClockPolicy
+                or self._worker is None or self._v2_bootstrap is None
+                or self._v2_cost_transport is None):
+            return None
+        async with self.prepared_first_ingress_worker_result_v1(
+                envelope, receipt, executor=executor) as prepared:
+            if prepared is None:
+                return None
+            try:
+                committed = await self._worker.call(
+                    lambda graph: graph.commit_first_ingress_c02_v1(
+                        self._v2_bootstrap, prepared.egress.intent,
+                        prepared.result_read, policy,
+                        bundle.d06_first_ingress_c02, bundle.ingress_clock))
+            except Exception:
+                return None
+            if (type(committed) is not CommitReceipt
+                    or committed.status not in {"committed", "duplicate"}
+                    or committed.operation_id !=
+                       prepared.read_request.consumer_operation_id
+                    or not {"memory.episode.v1", "memory.subjective_trace.v2"}
+                           <= {version.key.type_name
+                               for version in committed.write_versions}
+                    or any(NamespaceId.from_key(version.key) != policy.namespace
+                           for version in committed.write_versions)):
+                return None
+            return committed
 
     async def run_committed_first_ingress_encoding_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,

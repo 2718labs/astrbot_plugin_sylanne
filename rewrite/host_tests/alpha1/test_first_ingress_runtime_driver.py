@@ -1,5 +1,6 @@
 """The host retains the original D11 lease through result-read preparation."""
 
+import asyncio
 from dataclasses import replace
 from types import MethodType, SimpleNamespace
 
@@ -11,12 +12,13 @@ from rewrite.host_tests.alpha1.test_host_model_egress_executor import fixture_va
 from sylanne3.host.ingress import HostIngressEnvelope, IngressReceipt, SourceLineage
 from sylanne3.host.authority_profile import (
     AdminD03SelfIdentityProjectionPolicy, AdminD04EncodingBaselinePolicy,
-    AdminIngressClockPolicy,
+    AdminD06FirstIngressC02Policy, AdminIngressClockPolicy,
 )
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.host.model_egress_executor import (
     FrozenEncodingEgressResult, HostModelEgressExecutor,
 )
+from sylanne3.host.astrbot_model_call import AstrBotModelProvider
 from sylanne3.host.worker_result_identity import first_ingress_worker_result_request_v1
 from sylanne3.authority_service.v2_model_egress_contract import (
     ModelEgressObservationV1, ModelTerminalReceiptV2,
@@ -240,7 +242,7 @@ async def test_new_encoding_path_holds_legacy_v2_binding_before_egress(tmp_path)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("read_mode", ("original", "wrong_consumer"))
+@pytest.mark.parametrize("read_mode", ("original", "wrong_consumer", "unknown_c02"))
 async def test_committed_ingress_acquires_original_job_then_reads_preparation(
     tmp_path, read_mode,
 ):
@@ -248,7 +250,21 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
         methodName="test_one_http_request_on_host_loop_with_usage")
     await host.asyncSetUp()
     try:
-        bundle, adapter, _ = host.v2_adapters()
+        bundle, _, _ = host.v2_adapters()
+        bundle = replace(
+            bundle,
+            ingress_clock=AdminIngressClockPolicy("clock", 1.0, 1.0),
+            d06_first_ingress_c02=AdminD06FirstIngressC02Policy(
+                30.0, {"graph_write": 1}, "snapshot", "resource"),
+        )
+        workflow = bundle.model_workflows.encode
+        adapter = AstrBotModelProvider(
+            context=host.context, host_loop=asyncio.get_running_loop(),
+            trusted_umo=model_fixture.UMO,
+            descriptor=replace(
+                host.descriptor, purposes=frozenset({workflow.purpose})),
+            admin_model=workflow, installation_bundle=bundle,
+        )
         binding, draft, anchor, request = frozen_case(
             host, bundle, with_baseline=True)
         assert binding.request["schema"] == "sylanne.first-ingress-encoding-call.v3"
@@ -313,6 +329,23 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
                 order.append("context")
                 return original_context
 
+            def commit_first_ingress_c02_v1(
+                self, bootstrap, original_intent, read, installation_policy,
+                admin_policy, clock_policy,
+            ):
+                assert bootstrap is runtime._v2_bootstrap
+                assert original_intent == intent
+                assert read.request == first_ingress_worker_result_request_v1(
+                    original_context)
+                assert read.observation == observation
+                assert read.terminal_receipt == terminal_receipt
+                assert installation_policy is bundle.installation_policy
+                assert admin_policy is bundle.d06_first_ingress_c02
+                assert clock_policy is bundle.ingress_clock
+                assert self.releases == 2
+                order.append("c02")
+                return self.c02_result
+
         graph = Graph()
         graph.baseline_committed = True
         worker = Worker(graph)
@@ -323,6 +356,7 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
         runtime._v2_bootstrap = object()
         runtime._v2_installation_grant = grant
         runtime._v2_model_bundle = bundle
+        runtime._v2_cost_transport = object()
         runtime._v2_namespace = envelope.namespace
         runtime._v2_namespace_provisioned = True
 
@@ -348,6 +382,16 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
         assert graph.releases == 2
 
         graph.baseline_committed = True
+        runtime._v2_cost_transport = None
+        assert await runtime.commit_first_ingress_c02_v1(
+            envelope, receipt, executor=executor) is None
+        assert worker.calls == 3 and graph.releases == 2
+        runtime._v2_cost_transport = object()
+        runtime._v2_model_bundle = replace(bundle, d06_first_ingress_c02=None)
+        assert await runtime.commit_first_ingress_c02_v1(
+            envelope, receipt, executor=executor) is None
+        assert worker.calls == 3 and graph.releases == 2
+        runtime._v2_model_bundle = bundle
         intent = replace(
             original_intent, authority_id=anchor.authority_id,
             namespace=anchor.namespace, subject=grant.subject,
@@ -374,6 +418,21 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
             intent.source_refs[0], intent.source_revisions[0][1],
             intent.access_revisions[0][1], grant.subject, 1,
             "2099-01-01T00:00:00Z", anchor)
+        consumer_id = first_ingress_worker_result_request_v1(
+            original_context).consumer_operation_id
+        c02_receipt = CommitReceipt(
+            "committed", consumer_id, "a" * 64, "activity", None, 1, (),
+            (
+                GraphVersion(AtomKey(Owner("event", *envelope.namespace.as_tuple,
+                                           "episode"), "memory.episode.v1", "record"), 1),
+                GraphVersion(AtomKey(Owner("event", *envelope.namespace.as_tuple,
+                                           "trace"), "memory.subjective_trace.v2",
+                                     "record"), 1),
+            ), (), (), (),
+        )
+        graph.c02_result = (replace(
+            c02_receipt, status="pending_confirmation", commit_seq=None)
+            if read_mode == "unknown_c02" else c02_receipt)
 
         async def execute_observed(self, **_):
             order.append("egress")
@@ -401,22 +460,11 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
 
         prepared_intent = intent
         executor.read_original_for_worker = MethodType(read_original, executor)
-        async with runtime.prepared_first_ingress_worker_result_v1(
-                envelope, receipt, executor=executor) as prepared:
-            if read_mode == "wrong_consumer":
-                assert prepared is None
-            else:
-                assert prepared is not None
-                assert prepared.egress.intent == intent
-                assert prepared.result_context == original_context
-                assert prepared.read_request.consumer_operation_id.startswith(
-                    "first-ingress-c02-")
-                assert prepared.read_request == first_ingress_worker_result_request_v1(
-                    replace(original_context, graph_revision=99, graph_epoch=99))
-                assert prepared.result_read.observation == observation
-                assert prepared.result_read.terminal_receipt == terminal_receipt
-            assert graph.releases == 2
-        assert order == ["egress", "cost", "context", "read"]
+        committed = await runtime.commit_first_ingress_c02_v1(
+            envelope, receipt, executor=executor)
+        assert committed == (c02_receipt if read_mode == "original" else None)
+        assert order == ["egress", "cost", "context", "read"] + (
+            ["c02"] if read_mode != "wrong_consumer" else [])
         assert graph.releases == 3
         assert host.requests == []
     finally:
