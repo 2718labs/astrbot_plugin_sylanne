@@ -497,6 +497,71 @@ test("D06 memory rejects partial or malformed source coverage and clears prior s
   } finally { ui.restore(); }
 });
 
+test("D06 correction sends the versioned request and displays server HOLD without adoption", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await opened;
+    const memory = ui.clickView("memory");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: { view_type: "d06.memory_sources.v1", data: {
+      sources: [{ source_id: "visible-source", source_kind: "reported", assertion_status: "asserted", recorded_at: 2, qualification: "not_recorded" }],
+      coverage: "complete"
+    } } });
+    await memory;
+    assert.match(ui.app.innerHTML, /visible-source/);
+    ui.setPageFields({ statement: "更正说明", source_refs: "source-a, source-b", target_refs: "target-a",
+      access_epoch: "3", deletion_epoch: "4", impact_preview_ref: "preview-1" });
+    const submitted = ui.clickCommand("memory-correction");
+    const request = await ui.nextRequest(2);
+    assert.equal(request.payload.action, "correct_or_edit");
+    assert.equal(request.payload.scope, "bot/persona");
+    assert.deepEqual(request.payload.input, {
+      schema: "d12.source_correction.v1", correction_kind: "source_claim", statement: "更正说明",
+      source_refs: ["source-a", "source-b"], target_refs: ["target-a"],
+      access_epoch: 3, deletion_epoch: 4, impact_preview_ref: "preview-1"
+    });
+    request.resolve({ status: "unavailable", problem: {
+      schema: "d12.source_correction_response.v1", code: "source_correction_commit_unavailable",
+      message: "来源纠错提交尚未接入权威协调器；未修改来源或解释。", retryable: false
+    } });
+    await submitted;
+    assert.match(ui.app.innerHTML, /更正待接入（HOLD）/);
+    assert.match(ui.app.innerHTML, /未修改来源或解释/);
+    assert.doesNotMatch(ui.app.innerHTML, /visible-source|<dd>source_claim<\/dd>|<dd>correction_committed<\/dd>/);
+    assert.equal(ui.requests.length, 3, "HOLD does not trigger a refresh that could imply a commit");
+  } finally { ui.restore(); }
+});
+
+test("D06 correction permission denial clears the projection and locks Owner", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await opened;
+    const memory = ui.clickView("memory");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: { view_type: "d06.memory_sources.v1", data: {
+      sources: [{ source_id: "private-source", source_kind: "reported", assertion_status: "asserted", recorded_at: 2, qualification: "not_recorded" }],
+      coverage: "complete"
+    } } });
+    await memory;
+    ui.setPageFields({ statement: "更正说明", source_refs: "source-a", target_refs: "target-a", access_epoch: "3", deletion_epoch: "4" });
+    const submitted = ui.clickCommand("memory-correction");
+    await ui.nextRequest(2);
+    ui.requests[2].resolve({ status: "unauthorized", problem: { code: "capability_denied", message: "当前会话无权更正。" } });
+    await submitted;
+    assert.match(ui.app.innerHTML, /当前会话无权更正/);
+    assert.match(ui.app.innerHTML, /Sylanne Owner 锁定/);
+    assert.doesNotMatch(ui.app.innerHTML, /private-source/);
+  } finally { ui.restore(); }
+});
+
 test("overview keeps absent and malformed service catalogues distinct", async () => {
   const ui = await mountWorkbench();
   try {
