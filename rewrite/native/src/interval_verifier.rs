@@ -534,11 +534,34 @@ pub(crate) fn verify_joint_error_bounds(
         )?;
         defect_at_x.push(finite_interval(displacement[index].div(step)?.sub(force)?)?);
     }
-    let defect = finite_interval(
+    let defect_upper = if input.a.rows == 0 {
+        // With a quadratic potential and fixed drive, F is affine. Along the
+        // linear reconstruction d(s)=(1-s)d(0)+s d(1); convexity of the norm
+        // bounds its supremum by the larger endpoint norm. Both endpoint
+        // forces are independently enclosed using the complete CSR block.
+        let gradient_at_y = matvec(input.k, &y)?;
+        let j_gradient_at_y = matvec(input.j, &gradient_at_y)?;
+        let r_gradient_at_y = matvec(input.r, &gradient_at_y)?;
+        let mut defect_at_y = Vec::with_capacity(x.len());
+        for index in 0..x.len() {
+            let force = finite_interval(
+                j_gradient_at_y[index]
+                    .sub(r_gradient_at_y[index])?
+                    .add(drive[index])?,
+            )?;
+            defect_at_y.push(finite_interval(displacement[index].div(step)?.sub(force)?)?);
+        }
         interval_l2_norm(&defect_at_x)?
-            .add(vector_field_lipschitz.mul(interval_l2_norm(&displacement)?)?)?,
-    )?;
-    let reconstruction_defect = Interval::new(0.0, defect.upper())?;
+            .upper()
+            .max(interval_l2_norm(&defect_at_y)?.upper())
+    } else {
+        finite_interval(
+            interval_l2_norm(&defect_at_x)?
+                .add(vector_field_lipschitz.mul(interval_l2_norm(&displacement)?)?)?,
+        )?
+        .upper()
+    };
+    let reconstruction_defect = Interval::new(0.0, defect_upper)?;
 
     // Existing analytic Interval::exp is valid only through argument 2.
     // Integral_0^h exp(Ls) ds <= h exp(Lh), including L=0. This is wider than
@@ -1015,6 +1038,47 @@ mod tests {
             bounds.time_error.upper() >= (input.y[0] - exact_flow).abs() + (-input.h).exp() * 0.01
         );
         assert!(bounds.time_error.lower() >= 0.0);
+    }
+
+    #[test]
+    fn coupled_quadratic_reconstruction_uses_endpoint_defects() {
+        // For constant forcing and a quadratic potential, F is affine. The
+        // midpoint candidate makes endpoint defects almost opposite, so the
+        // generic Lipschitz path bound is roughly three times too wide.
+        let diagonal = [1.0, 1.0];
+        let j_values = [0.2, -0.2];
+        let x = [1.0, 0.0];
+        let h = 0.1;
+        let denominator = 1.05_f64.powi(2) + 0.01_f64.powi(2);
+        let y = [
+            (1.05 * 0.95 - 0.0001) / denominator,
+            (-0.01 * 0.95 - 1.05 * 0.01) / denominator,
+        ];
+        let input = JointVerificationInput {
+            k: SparseMatrix::new(2, 2, &[0, 1, 2], &[0, 1], &diagonal),
+            r: SparseMatrix::new(2, 2, &[0, 1, 2], &[0, 1], &diagonal),
+            j: SparseMatrix::new(2, 2, &[0, 1, 2], &[1, 0], &j_values),
+            a: SparseMatrix::new(0, 2, &[0], &[], &[]),
+            alpha: &[],
+            x: &x,
+            y: &y,
+            h,
+            drive: &[0.0, 0.0],
+        };
+        let bounds = verify_joint_error_bounds(&input, Interval::point(0.0).unwrap()).unwrap();
+        for index in 0..=100 {
+            let s = index as f64 / 100.0;
+            let z = [x[0] + s * (y[0] - x[0]), x[1] + s * (y[1] - x[1])];
+            let force = [-z[0] + 0.2 * z[1], -0.2 * z[0] - z[1]];
+            let defect = (((y[0] - x[0]) / h - force[0]).powi(2)
+                + ((y[1] - x[1]) / h - force[1]).powi(2))
+            .sqrt();
+            assert!(bounds.reconstruction_defect.upper() >= defect);
+        }
+        assert!(bounds.reconstruction_defect.upper() < 0.08);
+        let exact = [(-h).exp() * (0.2 * h).cos(), -(-h).exp() * (0.2 * h).sin()];
+        let endpoint_error = ((y[0] - exact[0]).powi(2) + (y[1] - exact[1]).powi(2)).sqrt();
+        assert!(bounds.time_error.upper() >= endpoint_error);
     }
 
     #[test]
