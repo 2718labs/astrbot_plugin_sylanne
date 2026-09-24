@@ -141,7 +141,7 @@ class DeletionJournal:
             try:
                 previous = self._db.execute(
                     "SELECT seq,namespace,operation_id,roots_json,epoch,policy_ref,phase "
-                    "FROM deletion_events WHERE operation_id=? AND phase='pending'",
+                    "FROM deletion_events WHERE operation_id=? ORDER BY seq DESC LIMIT 1",
                     (operation_id,)).fetchone()
                 if previous:
                     existing = self._decode(previous)
@@ -151,7 +151,7 @@ class DeletionJournal:
                     self._db.execute("COMMIT")
                     return existing
                 row = self._db.execute(
-                    "SELECT MAX(epoch) FROM deletion_events WHERE namespace=? AND phase='pending'",
+                    "SELECT MAX(epoch) FROM deletion_events WHERE namespace=?",
                     (namespace,)).fetchone()
                 if row[0] is not None and epoch <= row[0]:
                     raise DeletionConflict("deletion epoch must increase")

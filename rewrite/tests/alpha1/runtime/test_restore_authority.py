@@ -10,7 +10,7 @@ from rewrite.sylanne3.runtime.activation import (
     ActivationDenied, SqliteMigrationAuthority, TransferPlan,
 )
 from rewrite.sylanne3.runtime.deletion import (
-    DeletionBlocked, DeletionJournal, DeletionJournalUnavailable,
+    DeletionBlocked, DeletionConflict, DeletionJournal, DeletionJournalUnavailable,
 )
 from rewrite.sylanne3.runtime.restore_anchor import (
     RestoreAnchor, RestoreQuarantined, SnapshotRequirements,
@@ -107,6 +107,26 @@ def test_pending_deletion_is_durable_and_blocks_before_acceptance(tmp_path):
     with pytest.raises(DeletionBlocked):
         reopened.advance("erase-1", "closed")
     reopened.close()
+
+
+def test_deletion_replay_keeps_latest_phase_and_epoch_never_rewinds(tmp_path):
+    journal = DeletionJournal(tmp_path / "deletion.sqlite", create=True)
+    kwargs = dict(namespace="bot/persona", operation_id="erase-1",
+                  closure_roots=("root-1",), epoch=1, policy_ref="policy-1")
+    pending = journal.append_intent(**kwargs)
+    accepted = journal.advance("erase-1", "accepted", business_barrier=lambda _: True)
+    closed = journal.advance("erase-1", "closed", cleanup_verifier=lambda _: True)
+    head = journal.latest_head()
+
+    assert pending.seq < accepted.seq < closed.seq
+    assert journal.append_intent(**kwargs) == closed
+    assert journal.latest_head() == head
+    with pytest.raises(DeletionConflict):
+        journal.append_intent(**(kwargs | {"closure_roots": ("other",)}))
+    with pytest.raises(DeletionConflict):
+        journal.append_intent(**(kwargs | {"operation_id": "erase-2"}))
+    assert journal.append_intent(**(kwargs | {"operation_id": "erase-2", "epoch": 2})).phase == "pending"
+    journal.close()
 
 
 def test_restore_rejects_old_deletion_or_execution_journal(tmp_path):
