@@ -142,10 +142,16 @@ def test_coordinator_candidate_includes_current_and_historical_d06_dependencies(
     assert interpretation.token in result.current_dependency_refs
     assert interpretation.token in result.interpretation_refs
     assert GraphVersion(interpretation, 1) in result.historical_read_versions
-    assert "graph_cache_index" in result.missing_facets
+    assert result.storage_path_status == "graph_atoms_only"
+    assert "memory_retriever_direct_graph_atom_path" in result.covered_facets
+    assert "source_derived_cache_inventory_unavailable" in result.missing_facets
+    assert "retrieval_index_inventory_unavailable" in result.missing_facets
+    assert "process_local_cache_inventory_unavailable" in result.missing_facets
     assert "independent_deletion_intent" in result.missing_facets
     assert "request_authorization" in result.missing_facets
     assert not hasattr(result, "deletion_permit")
+    assert not any(spec.storage_role in {"cache", "projection"}
+                   for spec in D06DomainProvider.type_specs())
 
     limited = read_deletion_closure_candidate_from_coordinator(
         coordinator, authority, lease,

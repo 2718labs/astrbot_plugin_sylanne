@@ -19,7 +19,10 @@ from . import ErasureRequest
 _MISSING_AUTHORITY_FACETS = (
     "request_authorization", "access_deletion_epoch",
     "current_reverse_dependency_snapshot", "historical_graph_values",
-    "historical_reverse_dependency_snapshot", "graph_cache_index",
+    "historical_reverse_dependency_snapshot",
+    "source_derived_cache_inventory_unavailable",
+    "retrieval_index_inventory_unavailable",
+    "process_local_cache_inventory_unavailable",
     "other_domain_history", "independent_deletion_intent",
 )
 
@@ -27,6 +30,7 @@ _COVERED_D06_FACETS = (
     "current_source_parent_refs", "current_episode_refs", "current_trace_refs",
     "current_association_refs", "current_interpretation_refs",
     "current_recollection_refs",
+    "memory_retriever_direct_graph_atom_path",
 )
 
 
@@ -51,6 +55,7 @@ class DeletionReadCandidate:
     access_epoch: int | None = None
     delete_epoch: int | None = None
     current_dependency_refs: tuple[str, ...] = ()
+    storage_path_status: str = "unverified"
 
 
 def read_deletion_closure_candidate(
@@ -235,8 +240,11 @@ def read_deletion_closure_candidate_from_coordinator(
         raise ValueError("deletion read requires unique same-namespace source targets")
 
     missing = [
-        "graph_cache_index", "other_domain_history",
-        "independent_deletion_intent", "request_authorization",
+        "source_derived_cache_inventory_unavailable",
+        "retrieval_index_inventory_unavailable",
+        "process_local_cache_inventory_unavailable",
+        "other_domain_history", "independent_deletion_intent",
+        "request_authorization",
     ]
     try:
         first = coordinator.read_deletion_snapshot_candidate(
@@ -530,8 +538,10 @@ def read_deletion_closure_candidate_from_coordinator(
         tuple(sorted(read_versions.values(), key=lambda item: item.key.token)),
         epoch, complete, None,
         ("current_d06_values", "current_reverse_dependency_edges",
-         "historical_graph_values", "historical_dependency_edges"),
+         "historical_graph_values", "historical_dependency_edges",
+         "memory_retriever_direct_graph_atom_path"),
         unique_missing, "hold" if complete else "partial_hold",
         historical_versions, *access_delete_epochs,
         tuple(sorted(key.token for key in current_dependency_keys)),
+        "graph_atoms_only",
     )

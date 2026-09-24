@@ -154,6 +154,8 @@ class DeletionClosureTests(unittest.TestCase):
             self.assertEqual(result.recollection_refs, (recollection.token,))
             self.assertIn("current_reverse_dependency_snapshot", result.missing_facets)
             self.assertIn("historical_graph_values", result.missing_facets)
+            self.assertIn("source_derived_cache_inventory_unavailable", result.missing_facets)
+            self.assertIn("retrieval_index_inventory_unavailable", result.missing_facets)
             self.assertIn("current_episode_refs", result.covered_facets)
             self.assertFalse(any("dependency" in item for item in result.covered_facets))
             self.assertFalse(hasattr(result, "request_authorized"))
