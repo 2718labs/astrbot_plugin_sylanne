@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from sylanne3.contracts import Event, Scope
-from sylanne3.domains.d04 import AffectAxis, AffectCoupling, AffectProvider, AffectScheme, MoodField
+from sylanne3.domains.d04 import AffectAxis, AffectCoupling, AffectProvider, AffectScheme, FeelingState, MoodField
 from sylanne3.domains.d06 import D06DomainAdapter, RecallIntent, RecollectionContext, SelectionTicket, TriggerKind
 from sylanne3.domains.d06.pipeline import D06MemoryPipeline, SearchPlan
 from sylanne3.graph_store import GraphStore
@@ -66,7 +66,7 @@ class AffectivePipelineTests(unittest.TestCase):
         self.refresh()
         return result
 
-    def prepare(self, snapshot):
+    def prepare(self, snapshot, *, encoding_trace_id=None):
         return self.pipeline.prepare_affective_recollection(
             self.outcome, self.ticket, RecollectionContext((), (), ()),
             audience="owner", purpose="context", mood_snapshot=snapshot,
@@ -76,6 +76,8 @@ class AffectivePipelineTests(unittest.TestCase):
                 "external_report", "eligible", 0.6, "not_applicable"),
             base_salience=(0.4, 0.6), base_tone=(-0.1, 0.1),
             detail_cues=(DetailCue("waiting", (0, 8), 0.65),), temporal_focus=True,
+            encoding_trace_id=encoding_trace_id,
+            encoding_trace_version=2,
         )
 
     def test_mood_changes_subjective_candidate_without_changing_literal_source(self):
@@ -85,6 +87,78 @@ class AffectivePipelineTests(unittest.TestCase):
         self.assertNotEqual(warm.subjective_tone, guarded.subjective_tone)
         self.assertNotEqual(warm.subjective_weight, guarded.subjective_weight)
         self.assertEqual(warm.status, "candidate_hold")
+
+    def test_committed_then_feeling_stays_separate_from_current_mood_and_source(self):
+        source_ref = source_key("bot", "persona", "message-1").token
+        feeling = AtomKey(Owner("persona", "bot", "persona"),
+                          "d04.feeling_state.v1", "then")
+        episode = episode_key("bot", "persona", "episode-then")
+        trace = subjective_trace_v2_key("bot", "persona", "trace-then")
+        event = AtomKey(Owner("event", "bot", "persona", "event-then"),
+                        "d03.world_event", "current")
+        baseline = AtomKey(Owner("event", "bot", "persona", "event-then"),
+                           "d04.encoding_baseline.v1", "record")
+        perspective = AtomKey(Owner("scene", "bot", "persona", "scene-then"),
+                              "d03.role_binding", "current")
+        state = FeelingState(
+            "process:then", source_ref, "scheme-1", "operator-1",
+            (("warmth", 0.2),), ("meaning:then",), ("interpretation:then",),
+            (), (source_ref,), "parameters-1", "coupling-1", 2.0,
+        )
+        prior = self.store.graph_snapshot((feeling, episode, trace, baseline))
+        self.store.graph_commit(GraphCandidate(
+            Event(self.scope, "encoding-then", 2, "encoding", {}), prior.versions,
+            (GraphWrite(feeling, {
+                **state.__dict__,
+                "coordinates": [list(item) for item in state.coordinates],
+                "meaning_refs": list(state.meaning_refs),
+                "interpretation_refs": list(state.interpretation_refs),
+                "active_driver_refs": list(state.active_driver_refs),
+                "historical_source_refs": list(state.historical_source_refs),
+            }),
+             GraphWrite(episode, {"episode_id": "episode-then", "source_refs": [source_ref],
+                                  "event_ref": event.token}),
+             GraphWrite(trace, {"trace_id": "trace-then", "episode_ref": episode.token,
+                                "perspective_ref": perspective.token,
+                                "then_feeling_refs": [feeling.token],
+                                "interpretation_refs": [], "detail_weights": [],
+                                "encoding_baseline_ref": baseline.token}),
+             GraphWrite(baseline, {
+                 "baseline_id": "baseline-then", "source_refs": [source_ref],
+                 "perspective_ref": perspective.token,
+                 "then_feeling_versions": [{"ref": feeling.token, "revision": 1}],
+                 "interpretation_versions": [], "as_known_at": None,
+                 "projection_policy_ref": "policy-unresolved",
+                 "projection_policy_version": "policy-v1", "basis_version": "scheme-1",
+                 "parameter_version": "parameters-1", "salience_interval": None,
+                 "tone_interval": None,
+                 "unknown_reasons": ["salience_interval:unknown", "tone_interval:unknown"],
+             })),
+            prior.epochs,
+        ))
+        warm = self.prepare(self.mood(0.8, "warm"), encoding_trace_id="trace-then")
+        guarded = self.prepare(self.mood(-0.8, "guarded"), encoding_trace_id="trace-then")
+        self.assertEqual(warm.source_fields, guarded.source_fields)
+        self.assertEqual(warm.then_feeling_refs, (feeling.token,))
+        self.assertEqual(warm.then_feeling_refs, guarded.then_feeling_refs)
+        self.assertEqual(warm.then_feeling_status, "baseline_versioned_refs")
+        self.assertEqual(warm.encoding_trace_ref, trace.token)
+        self.assertNotEqual(warm.subjective_tone, guarded.subjective_tone)
+        self.assertIn(feeling, (version.key for version in warm.read_versions))
+        self.assertIn(trace, (version.key for version in guarded.read_versions))
+        self.assertNotEqual(
+            next(version.revision for version in warm.read_versions if version.key == self.mood_key),
+            next(version.revision for version in guarded.read_versions if version.key == self.mood_key),
+        )
+        current = self.store.graph_snapshot((feeling,))
+        self.store.graph_commit(GraphCandidate(
+            Event(self.scope, "feeling-update", 3, "feeling", {}), current.versions,
+            (GraphWrite(feeling, {
+                **current.get(feeling).value, "cursor": 3.0, "revision": 2,
+            }),), current.epochs,
+        ))
+        with self.assertRaisesRegex(RuntimeError, "encoding source, access, or trace changed"):
+            self.prepare(self.mood(0.2, "after-feeling-update"), encoding_trace_id="trace-then")
 
     def test_withdrawal_and_stale_mood_stop_preparation(self):
         old_mood = self.mood(0.8, "warm")

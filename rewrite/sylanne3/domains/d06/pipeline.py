@@ -209,6 +209,7 @@ class CommittedEncodingEvidence:
     trace_ref: str
     encoding_baseline_ref: str | None
     then_feeling_refs: tuple[str, ...]
+    then_feeling_versions: tuple[GraphVersion, ...]
     detail_weights: tuple[tuple[str, float], ...]
     proof_versions: tuple[GraphVersion, ...]
     epoch: NamespaceEpoch
@@ -267,6 +268,7 @@ class D06MemoryPipeline:
             raise ValueError("memory episode does not contain this source")
         baseline_snapshot = None
         baseline_key = None
+        then_feeling_versions: tuple[GraphVersion, ...] = ()
         source_proofs = [source_proof]
         if trace_version == 2:
             baseline_key = AtomKey.from_token(trace.value["encoding_baseline_ref"])
@@ -280,6 +282,14 @@ class D06MemoryPipeline:
             decoded = spec.validator(baseline.value)
             if source_key(*namespace, source_ref).token not in decoded.source_refs:
                 raise ValueError("encoding baseline does not qualify this source")
+            then_feeling_versions = tuple(
+                GraphVersion(AtomKey.from_token(item.ref), item.revision)
+                for item in decoded.then_feeling_versions
+            )
+            if tuple(version.key.token for version in then_feeling_versions) != tuple(
+                trace.value["then_feeling_refs"]
+            ):
+                raise ValueError("encoding trace differs from D04 then-feeling versions")
             for baseline_source in decoded.source_refs:
                 linked = AtomKey.from_token(baseline_source)
                 record, proof = self.repository.read_source_evidence(
@@ -291,12 +301,17 @@ class D06MemoryPipeline:
         current = self.repository.store.graph_snapshot(tuple(dict.fromkeys(
             (*[version.key for proof in source_proofs for version in proof.versions],
              trace_key, episode_ref,
-             *((baseline_key,) if baseline_key is not None else ()))
+             *((baseline_key,) if baseline_key is not None else ()),
+             *(version.key for version in then_feeling_versions))
         )))
         if (current.epochs != source_proof.epochs or
                 current.get(trace_key) != trace or current.get(episode_ref) != episode or
                 (baseline_key is not None and
                  current.get(baseline_key) != baseline_snapshot.get(baseline_key)) or
+                any(current.get(version.key) is None or
+                    not current.get(version.key).valid or
+                    current.get(version.key).revision != version.revision
+                    for version in then_feeling_versions) or
                 any(current.get(version.key) is None or
                     current.get(version.key).revision != version.revision or
                     not current.get(version.key).valid
@@ -306,11 +321,13 @@ class D06MemoryPipeline:
             source_ref, episode_ref.token, trace_key.token,
             trace.value.get("encoding_baseline_ref"),
             tuple(trace.value["then_feeling_refs"]),
+            then_feeling_versions,
             tuple((detail, weight) for detail, weight in trace.value["detail_weights"]),
             tuple(dict.fromkeys((*(version for proof in source_proofs for version in proof.versions),
                                   *episode_snapshot.versions,
                                   *trace_snapshot.versions,
-                                  *(baseline_snapshot.versions if baseline_snapshot is not None else ())))),
+                                  *(baseline_snapshot.versions if baseline_snapshot is not None else ()),
+                                  *then_feeling_versions))),
             source_proof.epochs[0],
         )
 
@@ -332,12 +349,17 @@ class D06MemoryPipeline:
         detail_cues: tuple[DetailCue, ...],
         then_meaning_refs: tuple[str, ...] = (),
         temporal_focus: bool = False,
+        encoding_trace_id: str | None = None,
+        encoding_trace_version: int = 2,
     ) -> RecollectionReconstruction:
         """Prepare one selected source as a mood-shaped C04 candidate.
 
         The source and access are read again after retrieval. A final graph
         snapshot checks the mood and every read version before returning.
         Actual recollection and experience submission belong to C04/D11.
+        A versioned C02 trace can identify the then-feeling references, but
+        caller-supplied base intervals remain unqualified projection inputs.
+        This method never turns them into a D04-certified encoding baseline.
         """
         if outcome.status != "candidate" or outcome.candidates is None or outcome.epoch is None:
             raise ValueError("a qualified D06 retrieval outcome is required")
@@ -350,6 +372,15 @@ class D06MemoryPipeline:
                          if item.candidate_id == ticket.selected_candidate_ids[0]), None)
         if selected is None:
             raise ValueError("D07 ticket does not select a D06 candidate")
+        if encoding_trace_id is not None and encoding_trace_version != 2:
+            raise ValueError("then-feeling comparison requires a versioned D04 baseline")
+        encoding = (self.read_committed_encoding(
+            selected.content_ref, encoding_trace_id,
+            audience=audience, purpose=purpose,
+            trace_version=encoding_trace_version,
+        ) if encoding_trace_id is not None else None)
+        if encoding is not None and encoding.epoch != outcome.epoch:
+            raise RuntimeError("committed encoding and D06 retrieval epochs differ")
         hit = next((hit for batch in outcome.batches for hit in batch.hits
                     if isinstance(hit, MemoryHit) and hit.key == source_key(
                         *self.adapter.namespace.as_tuple, selected.content_ref)), None)
@@ -378,8 +409,26 @@ class D06MemoryPipeline:
             proposal=proposal, view=view, detail_cues=detail_cues,
             then_meaning_refs=then_meaning_refs, temporal_focus=temporal_focus,
         )
+        if encoding is not None:
+            feeling_keys = tuple(version.key for version in encoding.then_feeling_versions)
+            if any(key.type_name != "d04.feeling_state.v1"
+                   or key.owner.kind != "persona"
+                   or (key.owner.bot, key.owner.persona) != self.adapter.namespace.as_tuple
+                   for key in feeling_keys):
+                raise ValueError("committed encoding has invalid D04 then-feeling refs")
+            result = replace(
+                result, encoding_trace_ref=encoding.trace_ref,
+                then_feeling_refs=encoding.then_feeling_refs,
+                then_feeling_status="baseline_versioned_refs",
+                read_versions=tuple(dict.fromkeys((
+                    *result.read_versions, *encoding.proof_versions,
+                ))),
+            )
         current = self.repository.store.graph_snapshot(
-            tuple(dict.fromkeys((*proof_by_key, mood_key)))
+            tuple(dict.fromkeys((
+                *proof_by_key, mood_key,
+                *(version.key for version in result.read_versions),
+            )))
         )
         if (current.epochs != (outcome.epoch,) or
                 current.get(mood_key) != mood_snapshot.get(mood_key) or any(
