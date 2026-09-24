@@ -325,14 +325,16 @@ def _validate_verified_batch_value_v1(value: dict) -> None:
             claim_use = ClaimUse(use["claim_ref"], use["start"], use["end"], ClaimKind(use["asserted_as"]))
             if claim_use.start < cursor or claim_use.end > len(segment["body"]):
                 raise ValueError("verified claim spans overlap or exceed the body")
-            if any(char.isalnum() for char in segment["body"][cursor:claim_use.start]):
+            if any(not char.isspace() for char in segment["body"][cursor:claim_use.start]):
                 raise ValueError("verified segment contains unmapped content")
             if segment["body"][claim_use.start:claim_use.end] != mapped["text"]:
                 raise ValueError("verified claim span differs from frozen text")
+            if not set(value["audiences"]).issubset(set(mapped["allowed_audiences"])):
+                raise ValueError("verified claim exceeds its audience scope")
             uses.append(claim_use)
             source_refs.update(mapped["source_refs"])
             cursor = claim_use.end
-        if any(char.isalnum() for char in segment["body"][cursor:]):
+        if any(not char.isspace() for char in segment["body"][cursor:]):
             raise ValueError("verified segment contains unmapped content")
         for name in ("source_refs", "covered_slots", "media_refs", "allowed_media"):
             parts = segment[name]
@@ -672,14 +674,14 @@ class D09ExpressionProvider:
                 if use.start < cursor or use.end > len(candidate.body):
                     failures.append("claim_span")
                     continue
-                if any(ch.isalnum() for ch in candidate.body[cursor:use.start]):
+                if any(not ch.isspace() for ch in candidate.body[cursor:use.start]):
                     failures.append("unmapped_content")
                 if candidate.body[use.start:use.end] != mapped.text:
                     failures.append("claim_text_mismatch")
                 if use.asserted_as is not mapped.kind:
                     failures.append("eligibility_upgrade")
                 cursor = use.end
-            if any(ch.isalnum() for ch in candidate.body[cursor:]):
+            if any(not ch.isspace() for ch in candidate.body[cursor:]):
                 failures.append("unmapped_content")
             covered.extend(candidate.covered_slots)
             payload_digest = segment_payload_digest(candidate.body, candidate.media_refs, uses)

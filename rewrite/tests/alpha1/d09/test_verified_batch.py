@@ -127,3 +127,50 @@ def test_verified_batch_type_spec_rejects_self_declared_qualification_and_missin
     altered["batch_digest"] = canonical_digest({key: item for key, item in altered.items() if key != "batch_digest"})
     with pytest.raises(ValueError, match="segment fields"):
         spec.validator(altered)
+
+
+def test_visible_emoji_requires_claim_mapping_even_when_d08_digest_matches() -> None:
+    intent, _, candidates = _inputs()
+    body = "First 👍"
+    uses = candidates[0].claim_uses
+    changed_first = replace(candidates[0], body=body)
+    changed_grant = replace(
+        intent.segment_grants[0], payload_digest=segment_payload_digest(body, (), uses),
+    )
+    intent = replace(intent, segment_grants=(changed_grant, intent.segment_grants[1]))
+    provider = D09ExpressionProvider()
+    claims = (
+        ExpressionClaim("claim:one", "First", ClaimKind.EXTERNAL_FACT, ("source:first",),
+                        ("entity:one",), ("expression",), "disclosure:one"),
+        ExpressionClaim("claim:two", "Second", ClaimKind.REPORTED_CLAIM, ("source:second",),
+                        ("entity:one",), ("expression",), "disclosure:two"),
+    )
+    blueprint = provider.prepare_blueprint(intent, "scene:one", 3, claims, now=1.0).blueprint
+    assert blueprint is not None
+    staged = provider.verify_and_stage(blueprint, (changed_first, candidates[1]))
+    assert staged.status == "rejected" and "unmapped_content" in staged.failures
+
+
+def test_serialized_batch_rechecks_each_used_claim_audience() -> None:
+    intent, blueprint, candidates = _inputs()
+    provider = D09ExpressionProvider()
+    spec = next(spec for spec in provider.register_types() if spec.name == "d09.verified_segment_batch.v1")
+    value = provider.build_verified_batch_v1(intent, blueprint, candidates, now=1.0)
+    altered = deepcopy(value)
+    altered["claims"][0]["allowed_audiences"] = ["entity:private"]
+    altered["batch_digest"] = canonical_digest({
+        key: item for key, item in altered.items() if key != "batch_digest"
+    })
+    with pytest.raises(ValueError, match="audience scope"):
+        spec.validator(altered)
+
+    altered = deepcopy(value)
+    altered["segments"][0]["body"] = "First 👍"
+    altered["segments"][0]["payload_digest"] = segment_payload_digest(
+        "First 👍", (), candidates[0].claim_uses,
+    )
+    altered["batch_digest"] = canonical_digest({
+        key: item for key, item in altered.items() if key != "batch_digest"
+    })
+    with pytest.raises(ValueError, match="unmapped content"):
+        spec.validator(altered)
