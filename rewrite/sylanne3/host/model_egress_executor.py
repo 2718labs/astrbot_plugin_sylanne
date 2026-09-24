@@ -16,6 +16,9 @@ from ..authority_service.v2_model_egress_contract import (
 )
 from ..authority_service.v2_model_egress_wire import from_wire as model_from_wire
 from ..authority_service.v2_model_result_read_contract import ModelResultReadRequestV1
+from ..authority_service.v2_worker_model_result_contract import (
+    WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
+)
 from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..graph_types import AtomKey
 from ..model_broker.broker import ModelCallRequest, ProviderResponse
@@ -178,11 +181,12 @@ class HostModelEgressExecutor:
         except Exception:
             return None
         intent = record.intent
-        if (record.state != "prepared"
-                or ModelEgressDraftV1.from_intent(intent) != draft
+        if (ModelEgressDraftV1.from_intent(intent) != draft
                 or permit.operation != "model_egress"
                 or permit.operation_id != draft.operation_id
                 or permit.pinned_anchor != expected_anchor):
+            return FrozenEncodingEgressResult(intent, None)
+        if record.state != "prepared":
             return FrozenEncodingEgressResult(intent, None)
         terminal = await self.execute_once(
             intent=intent, expected_anchor=expected_anchor, request=request)
@@ -305,6 +309,56 @@ class HostModelEgressExecutor:
             return None
         return OriginalFirstIngressRead(
             intent, record, permit, admission, terminal, read_request, read)
+
+    async def read_original_for_worker(
+        self, *, read_request: WorkerModelResultReadRequestV1,
+        intent: ModelEgressIntentV1, terminal: ModelTerminalReceiptV2,
+    ) -> WorkerModelResultReadV1 | None:
+        """Read the original completed body with the installed worker identity.
+
+        An uncertain read response is closed by its original read attempt and
+        remains HOLD; it never retries the model or treats finish as content.
+        """
+        if (type(read_request) is not WorkerModelResultReadRequestV1
+                or type(intent) is not ModelEgressIntentV1
+                or type(terminal) is not ModelTerminalReceiptV2
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.namespace, read_request.installation_id,
+                    read_request.job_id, read_request.acquire_operation_id,
+                    read_request.call_id, read_request.model_request_digest) != (
+                    intent.authority_id, intent.namespace,
+                    self._bundle.installation_policy.namespace,
+                    self._grant.installation_id, intent.job_id,
+                    intent.operation_id, intent.call_id, intent.request_digest)):
+            return None
+        try:
+            record, permit, admission, original_terminal = (
+                await self._authority.model_terminal_fact_v2(
+                    self._bundle, self._grant, intent=intent))
+        except Exception:
+            return None
+        if (record.intent != intent or record.state != "observed"
+                or original_terminal != terminal
+                or permit.operation_id != intent.operation_id
+                or admission.installation_id != self._grant.installation_id):
+            return None
+        try:
+            read = await self._authority.worker_model_result_read_v1(
+                self._bundle, self._grant, read_request=read_request)
+        except Exception:
+            try:
+                await self._authority.worker_model_result_recover_finish_v1(
+                    self._bundle, self._grant, read_request=read_request)
+            except Exception:
+                pass
+            return None
+        if (read.request != read_request
+                or read.terminal_receipt != terminal
+                or read.observation.digest != record.observation_digest
+                or read.observation.usage != record.usage
+                or read.observation.cost != record.cost):
+            return None
+        return read
 
     async def execute_once(
         self, *, intent: ModelEgressIntentV1, expected_anchor: RestoreAnchor,

@@ -151,6 +151,18 @@ async def test_frozen_v2_binding_prepares_then_dispatches_once():
         assert await executor.execute_frozen_encoding_once(
             binding=binding, draft=draft, expected_anchor=anchor) is None
         assert len(prepared) == len(calls) == 1
+
+        # A fresh host executor cannot reopen a finished original Authority
+        # fence; an unknown response must never turn into a second send.
+        async def finished(self, *args, **kwargs):
+            raise RuntimeError("original model fence already finished")
+
+        authority.model_prepare_fenced_v1 = MethodType(finished, authority)
+        restarted = HostModelEgressExecutor(
+            authority=authority, bundle=bundle, grant=grant, adapter=adapter)
+        assert await restarted.execute_frozen_encoding_once(
+            binding=binding, draft=draft, expected_anchor=anchor) is None
+        assert len(calls) == 1 and host.requests == []
     finally:
         await host.asyncTearDown()
 

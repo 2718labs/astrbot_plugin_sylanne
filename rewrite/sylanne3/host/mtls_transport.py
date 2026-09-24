@@ -53,6 +53,10 @@ from ..authority_service.v2_model_result_read_contract import (
 from ..authority_service.v2_model_result_read_wire import (
     from_wire as result_from_wire, to_wire as result_to_wire,
 )
+from ..authority_service.v2_worker_model_result_contract import (
+    WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
+    from_wire as worker_result_from_wire, to_wire as worker_result_to_wire,
+)
 from ..authority_service.v2_accounting_contract import (
     AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
 )
@@ -727,6 +731,51 @@ class MtlsAuthorityTransport:
         if (set(response) != {"finished", "channel_binding_sha256"}
                 or response["finished"] is not True):
             raise RuntimeError("authority Owner read finish is unresolved")
+        return True
+
+    async def worker_model_result_read_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: WorkerModelResultReadRequestV1,
+    ) -> WorkerModelResultReadV1:
+        if (type(read_request) is not WorkerModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed worker result read identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "worker_model_result_read_v1",
+            {"namespace": namespace,
+             "read_request": worker_result_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("authority worker result response is invalid")
+        try:
+            result = worker_result_from_wire(response["result"], WorkerModelResultReadV1)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority worker result response is invalid") from exc
+        if result.request != read_request:
+            raise RuntimeError("authority worker result attempt identity differs")
+        return result
+
+    async def worker_model_result_recover_finish_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: WorkerModelResultReadRequestV1,
+    ) -> bool:
+        if (type(read_request) is not WorkerModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed worker result read identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "worker_model_result_recover_finish_v1",
+            {"namespace": namespace,
+             "read_request": worker_result_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"finished", "channel_binding_sha256"}
+                or response["finished"] is not True):
+            raise RuntimeError("authority worker read finish is unresolved")
         return True
 
     async def _accounting_rpc(

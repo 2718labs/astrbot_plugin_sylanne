@@ -16,6 +16,9 @@ from ..authority_service.v2_model_egress_contract import (
 from ..authority_service.v2_model_result_read_contract import (
     ModelResultReadRequestV1, ModelResultReadV1,
 )
+from ..authority_service.v2_worker_model_result_contract import (
+    WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
+)
 from ..authority_service.v2_accounting_contract import (
     AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
 )
@@ -215,7 +218,13 @@ class AuthorityTransport(Protocol):
                                    read_request, owner_session_token): ...
 
     async def model_result_read_recover_finish_v1(self, request, handshake, grant,
-                                                   *, namespace, read_request): ...
+                                                    *, namespace, read_request): ...
+
+    async def worker_model_result_read_v1(self, request, handshake, grant,
+                                           *, namespace, read_request): ...
+
+    async def worker_model_result_recover_finish_v1(self, request, handshake, grant,
+                                                     *, namespace, read_request): ...
 
 
 class AuthorityClient:
@@ -448,6 +457,34 @@ class AuthorityClient:
                 or read_request.installation_id != grant.installation_id):
             raise RuntimeError("Owner result read differs from installed namespace")
         return await self._transport.model_result_read_recover_finish_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def worker_model_result_read_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: WorkerModelResultReadRequestV1,
+    ) -> WorkerModelResultReadV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not WorkerModelResultReadRequestV1
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id):
+            raise RuntimeError("worker result read differs from installed namespace")
+        return await self._transport.worker_model_result_read_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def worker_model_result_recover_finish_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: WorkerModelResultReadRequestV1,
+    ) -> bool:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not WorkerModelResultReadRequestV1
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id):
+            raise RuntimeError("worker result read differs from installed namespace")
+        return await self._transport.worker_model_result_recover_finish_v1(
             request, handshake, grant, namespace=policy.authority_namespace,
             read_request=read_request)
 
