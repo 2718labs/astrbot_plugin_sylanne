@@ -1,4 +1,4 @@
-"""Boundary contract for a future administrator-certified persona/self pairing.
+"""Boundary contract for a future Authority-current persona/self pairing.
 
 No production port currently implements this contract.  A namespace, an Owner
 principal, and an AstrBot sender account cannot substitute for its result.
@@ -6,14 +6,11 @@ principal, and an AstrBot sender account cannot substitute for its result.
 
 from __future__ import annotations
 
-import base64
-import binascii
-from dataclasses import dataclass
-from datetime import datetime
-import re
 from typing import Protocol
 
+from ...authority_service.v2_contract import FencePermitV2
 from ...authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
+from ...authority_service.v2_self_identity_contract import AuthorityCurrentSelfIdentityV1
 from ...domains.d01 import ActiveRoleQualification
 from ...graph_types import AtomKey, GraphAtom, Owner
 from ...installation_policy import AdminInstallationPolicy
@@ -21,129 +18,46 @@ from ...runtime_contracts import InstallationGrantV2, NamespaceId, canonical_dig
 from .self_perspective import SelfIdentityMapping
 
 
-_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+class AuthorityCurrentSelfIdentityPort(Protocol):
+    """Paired Authority current read under W01's actual write permit.
 
-
-@dataclass(frozen=True, slots=True)
-class AdminSelfIdentityAttestationV1:
-    """Exact administrator assertion consumed only after current verification.
-
-    ``signature`` is opaque here. The installation/Authority port must check
-    its cryptographic validity, signer, expiry and revocation on every read.
-    Constructing this DTO alone proves none of those properties.
+    Select by namespace and operation, never by a caller-proposed self entity.
+    The implementation returns None after replacement or revocation.
     """
 
-    namespace: NamespaceId
-    authority_id: str
-    installation_id: str
-    manifest_digest: str
-    graph_incarnation: str
-    role_head_id: str
-    persona_ref: str
-    self_entity_ref: str
-    attestation_id: str
-    revision: int
-    revocation_epoch: int
-    valid_until_utc: str
-    signer_key_id: str
-    signature: str
-    schema: str = "d03.admin_self_identity_attestation.v1"
-    signature_scheme: str = "ed25519-canonical-json-v1"
-
-    def __post_init__(self) -> None:
-        if (type(self.namespace) is not NamespaceId
-                or self.schema != "d03.admin_self_identity_attestation.v1"
-                or self.signature_scheme != "ed25519-canonical-json-v1"):
-            raise ValueError("self identity attestation schema or namespace is invalid")
-        for name in ("authority_id", "installation_id", "graph_incarnation", "role_head_id",
-                     "attestation_id", "signer_key_id", "signature"):
-            value = getattr(self, name)
-            if type(value) is not str or not value:
-                raise ValueError(f"self identity attestation {name} is missing")
-        try:
-            signature_bytes = base64.urlsafe_b64decode(self.signature + "==")
-            canonical_signature = base64.urlsafe_b64encode(signature_bytes).decode("ascii").rstrip("=")
-        except (ValueError, UnicodeEncodeError, binascii.Error) as exc:
-            raise ValueError("self identity attestation signature encoding is invalid") from exc
-        if len(signature_bytes) != 64 or canonical_signature != self.signature:
-            raise ValueError("self identity attestation signature encoding is invalid")
-        if type(self.manifest_digest) is not str or _SHA256.fullmatch(self.manifest_digest) is None:
-            raise ValueError("self identity attestation manifest digest is invalid")
-        if self.persona_ref != f"persona:{self.namespace.persona_id}":
-            raise ValueError("self identity attestation persona differs from namespace")
-        if (type(self.self_entity_ref) is not str
-                or not self.self_entity_ref.startswith("entity:")
-                or self.self_entity_ref.startswith("entity:account-v1:")):
-            raise ValueError("self identity attestation needs a role entity, not an account")
-        if type(self.revision) is not int or self.revision < 1:
-            raise ValueError("self identity attestation revision must be positive")
-        if type(self.revocation_epoch) is not int or self.revocation_epoch < 0:
-            raise ValueError("self identity attestation revocation epoch is invalid")
-        try:
-            if (type(self.valid_until_utc) is not str
-                    or datetime.strptime(self.valid_until_utc, "%Y-%m-%dT%H:%M:%SZ")
-                    .strftime("%Y-%m-%dT%H:%M:%SZ") != self.valid_until_utc):
-                raise ValueError("expiry is not canonical")
-        except ValueError as exc:
-            raise ValueError("self identity attestation expiry is invalid") from exc
-
-    @property
-    def signing_payload(self) -> dict[str, object]:
-        """Canonical fields that the future issuer must bind into its signature."""
-        return {
-            "schema": self.schema,
-            "signature_scheme": self.signature_scheme,
-            "namespace": list(self.namespace.as_tuple),
-            "authority_id": self.authority_id,
-            "installation_id": self.installation_id,
-            "manifest_digest": self.manifest_digest,
-            "graph_incarnation": self.graph_incarnation,
-            "role_head_id": self.role_head_id,
-            "persona_ref": self.persona_ref,
-            "self_entity_ref": self.self_entity_ref,
-            "attestation_id": self.attestation_id,
-            "revision": self.revision,
-            "revocation_epoch": self.revocation_epoch,
-            "valid_until_utc": self.valid_until_utc,
-            "signer_key_id": self.signer_key_id,
-        }
+    def current_self_identity(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        request_operation_id: str, permit: FencePermitV2,
+    ) -> AuthorityCurrentSelfIdentityV1 | None: ...
 
 
-class CurrentAdminSelfIdentityPort(Protocol):
-    """Fresh independently verified lookup, implemented by W09/D11 only.
-
-    Select by namespace; never echo a caller-supplied proposed entity. The
-    implementation must return None after replacement, expiry or revocation.
-    """
-
-    def current_attestation(
-        self, namespace: NamespaceId,
-    ) -> AdminSelfIdentityAttestationV1 | None: ...
-
-
-def qualify_admin_self_identity(
+def qualify_authority_current_self_identity(
     *,
     role: ActiveRoleQualification,
     activation_atom: GraphAtom,
     policy: AdminInstallationPolicy,
     installation_grant: InstallationGrantV2,
     owner_guard: OwnerAuthorizationGuardV1,
-    port: CurrentAdminSelfIdentityPort | None,
+    request_operation_id: str,
+    permit: FencePermitV2,
+    port: AuthorityCurrentSelfIdentityPort | None,
 ) -> SelfIdentityMapping:
     """Qualify one mapping candidate; graph issuance remains unavailable.
 
-    ``policy`` must come from the protected administrator profile, ``grant``
-    from the authenticated Authority channel, ``role`` from a current D01 read,
-    and ``port`` from a future administrator pairing store. This function does
-    not claim those trust boundaries merely because values have these types.
+    ``policy`` comes from the protected installation, ``grant`` and ``port``
+    from the paired Authority, and ``role`` from a current D01 read. W01 must
+    still validate the fence and source while committing; this DTO does not
+    grant a capability.
     """
-    if port is None or not callable(getattr(port, "current_attestation", None)):
-        raise ValueError("current administrator self identity port is unavailable")
+    if port is None or not callable(getattr(port, "current_self_identity", None)):
+        raise ValueError("current Authority self identity port is unavailable")
     if (type(role) is not ActiveRoleQualification or type(activation_atom) is not GraphAtom
             or type(policy) is not AdminInstallationPolicy
             or type(installation_grant) is not InstallationGrantV2
-            or type(owner_guard) is not OwnerAuthorizationGuardV1):
-        raise TypeError("current D01, installation, Authority, and Owner proofs are required")
+            or type(owner_guard) is not OwnerAuthorizationGuardV1
+            or type(permit) is not FencePermitV2
+            or type(request_operation_id) is not str or not request_operation_id):
+        raise TypeError("current D01, installation, Authority, Owner, and fence proofs are required")
     namespace = role.namespace
     activation_key = AtomKey(Owner("persona", *namespace.as_tuple),
                              "d01.persona_activation.v1", "current")
@@ -158,40 +72,55 @@ def qualify_admin_self_identity(
             or installation_grant.authority_id != policy.expected_authority_id
             or installation_grant.installation_id != policy.installation_id
             or installation_grant.manifest_digest != policy.manifest_digest
+            or permit.authority_id != policy.expected_authority_id
+            or permit.namespace != policy.authority_namespace
+            or permit.subject != installation_grant.subject
+            or permit.operation != "write"
+            or permit.generation != activation.get("activation_generation")
             or owner_guard.namespace != namespace
             or owner_guard.authority_id != policy.expected_authority_id
             or owner_guard.installation_id != policy.installation_id
             or owner_guard.authorization_revision != role.authorization_revision
             or owner_guard.pending_revoke_operation_id is not None
-            or owner_guard.minimum_revocation_revision >= owner_guard.authorization_revision
-            or owner_guard.minimum_revocation_epoch > 0):
+            or owner_guard.minimum_revocation_revision >= owner_guard.authorization_revision):
         raise ValueError("current installed persona or Owner proof differs")
     try:
-        attestation = port.current_attestation(namespace)
+        current = port.current_self_identity(
+            namespace=namespace, authority_namespace=policy.authority_namespace,
+            request_operation_id=request_operation_id, permit=permit,
+        )
     except Exception as exc:
-        raise ValueError("current administrator self identity attestation is unavailable") from exc
-    if type(attestation) is not AdminSelfIdentityAttestationV1:
-        raise ValueError("current administrator self identity attestation is unavailable")
-    if (attestation.namespace != namespace
-            or attestation.authority_id != policy.expected_authority_id
-            or attestation.installation_id != policy.installation_id
-            or attestation.manifest_digest != policy.manifest_digest
-            or attestation.graph_incarnation != activation["graph_incarnation"]
-            or attestation.role_head_id != role.head_id):
-        raise ValueError("administrator self identity attestation differs from current role")
-    digest = canonical_digest(attestation.signing_payload)
+        raise ValueError("current Authority self identity is unavailable") from exc
+    if type(current) is not AuthorityCurrentSelfIdentityV1:
+        raise ValueError("current Authority self identity is unavailable")
+    if (current.namespace != namespace
+            or current.authority_namespace != policy.authority_namespace
+            or current.authority_id != policy.expected_authority_id
+            or current.installation_id != policy.installation_id
+            or current.manifest_digest != policy.manifest_digest
+            or current.activation_generation != activation["activation_generation"]
+            or current.graph_incarnation != activation["graph_incarnation"]
+            or current.role_head_id != role.head_id
+            or current.owner_authorization_revision != owner_guard.authorization_revision
+            or current.owner_authorization_head != owner_guard.authorization_head
+            or current.owner_minimum_revocation_revision != owner_guard.minimum_revocation_revision
+            or current.owner_revocation_epoch != owner_guard.minimum_revocation_epoch
+            or current.request_operation_id != request_operation_id
+            or current.permit != permit):
+        raise ValueError("Authority self identity differs from current role or fence")
+    digest = canonical_digest(current)
     return SelfIdentityMapping(
-        "self-map:" + digest,
-        attestation.persona_ref,
-        attestation.self_entity_ref,
-        "d11:self-identity:" + digest,
-        attestation.role_head_id,
-        attestation.graph_incarnation,
+        current.mapping_id,
+        current.persona_ref,
+        current.self_entity_ref,
+        "authority:self-identity:" + digest,
+        current.role_head_id,
+        current.graph_incarnation,
         "active",
     )
 
 
 __all__ = (
-    "AdminSelfIdentityAttestationV1", "CurrentAdminSelfIdentityPort",
-    "qualify_admin_self_identity",
+    "AuthorityCurrentSelfIdentityV1", "AuthorityCurrentSelfIdentityPort",
+    "qualify_authority_current_self_identity",
 )

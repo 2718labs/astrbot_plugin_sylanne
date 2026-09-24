@@ -1,15 +1,15 @@
 """D03's conditional post-arrival self perspective contract."""
 
-import base64
 from dataclasses import asdict, replace
 
 import pytest
 
 from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
+from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.domains.d01 import ActiveRoleQualification, PersonaBlock, PersonaDomain, PersonaPlan
 from sylanne3.domains.d03.context import ContextProvider, WorldEvent
 from sylanne3.domains.d03.self_identity_qualification import (
-    AdminSelfIdentityAttestationV1, qualify_admin_self_identity,
+    AuthorityCurrentSelfIdentityV1, qualify_authority_current_self_identity,
 )
 from sylanne3.domains.d03.self_perspective import (
     SelfIdentityMapping, build_self_perspective_bundle, build_self_perspective_proposal,
@@ -24,6 +24,7 @@ from sylanne3.memory_types import source_key
 from sylanne3.installation_policy import AdminInstallationPolicy
 from sylanne3.runtime.budget import BudgetLease
 from sylanne3.runtime.issuers import BudgetLeaseGrant
+from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, InstallationGrantV2, NamespaceId, OperationIdentity, QueryEpoch,
     RUNTIME_SCHEMA, SourceQualification, VersionGuard, canonical_digest,
@@ -46,7 +47,7 @@ def _fixture():
     event_key = AtomKey(Owner("event", *namespace.as_tuple, event.event_id),
                         "d03.world_event", "current")
     mapping = SelfIdentityMapping("self-map:one", "persona:persona", "entity:role-self",
-                                  "d11:self-identity:certified", plan.head_id,
+                                  "authority:self-identity:certified", plan.head_id,
                                   "graph-incarnation", "active")
     mapping_key = self_mapping_key(namespace)
     role_versions = (GraphVersion(activation_key, 1), GraphVersion(plan_key, 1),
@@ -72,6 +73,7 @@ def _fixture():
             "plan_id": plan.plan_id, "plan_version": 1, "head_id": plan.head_id,
             "owner_grant_id": "grant", "owner_grant_revision": 1,
             "graph_incarnation": "graph-incarnation",
+            "activation_generation": 1,
         }),
         GraphAtom(plan_key, 1, PersonaDomain.plan_write(plan).value),
         GraphAtom(grant_key, 1, {"grant_id": "grant"}),
@@ -141,64 +143,97 @@ def _admin_inputs():
         "authority", "installation", namespace, 1,
         "sha256:" + "d" * 64, 0, 0,
     )
-    attestation = AdminSelfIdentityAttestationV1(
-        namespace, "authority", "installation", "a" * 64,
-        "graph-incarnation", role.head_id, "persona:persona", "entity:role-self",
-        "attestation", 1, 0, "2099-01-01T00:00:00Z",
-        "admin-key", base64.urlsafe_b64encode(bytes(64)).decode("ascii").rstrip("="),
+    anchor = RestoreAnchor(
+        "authority", "authority-namespace", 1, "deletion", 0, "genesis",
+        "execution", 0, "genesis", 0, "proof",
     )
-    return role, atoms[0], policy, grant, guard, attestation
+    permit = FencePermitV2(
+        "authority", "authority-namespace", "subject", "holder", 1,
+        "write", "fence-operation", "x" * 32, 1, 1, anchor,
+    )
+    current = AuthorityCurrentSelfIdentityV1(
+        namespace, "authority-namespace", "authority", "installation", "a" * 64,
+        1, "graph-incarnation", role.head_id, "persona:persona", "entity:role-self",
+        "self-map:mapping", 1, 0, "registration-operation", "e" * 64,
+        1, "sha256:" + "d" * 64, 0, 0, "mapping-operation", permit,
+    )
+    return role, atoms[0], policy, grant, guard, permit, current
 
 
-def test_admin_self_identity_qualification_holds_without_independent_port():
-    role, activation, policy, grant, guard, _ = _admin_inputs()
+def test_authority_self_identity_qualification_holds_without_current_port():
+    role, activation, policy, grant, guard, permit, _ = _admin_inputs()
     with pytest.raises(ValueError, match="port is unavailable"):
-        qualify_admin_self_identity(
+        qualify_authority_current_self_identity(
             role=role, activation_atom=activation, policy=policy,
-            installation_grant=grant, owner_guard=guard, port=None,
+            installation_grant=grant, owner_guard=guard,
+            request_operation_id="mapping-operation", permit=permit, port=None,
         )
 
 
-def test_admin_self_identity_qualification_binds_exact_installed_role():
-    role, activation, policy, grant, guard, attestation = _admin_inputs()
+def test_authority_self_identity_qualification_binds_exact_installed_role_and_fence():
+    role, activation, policy, grant, guard, permit, current = _admin_inputs()
 
     class CurrentPort:
         def __init__(self, value):
             self.value = value
 
-        def current_attestation(self, namespace):
+        def current_self_identity(self, *, namespace, authority_namespace,
+                                  request_operation_id, permit):
             assert namespace == role.namespace
+            assert authority_namespace == policy.authority_namespace
+            assert request_operation_id == "mapping-operation"
+            assert permit == current.permit
             return self.value
 
-    mapping = qualify_admin_self_identity(
-        role=role, activation_atom=activation, policy=policy,
-        installation_grant=grant, owner_guard=guard, port=CurrentPort(attestation),
-    )
+    def qualify(value=current, *, current_role=role, current_guard=guard,
+                current_grant=grant, current_permit=permit, current_activation=activation):
+        return qualify_authority_current_self_identity(
+            role=current_role, activation_atom=current_activation, policy=policy,
+            installation_grant=current_grant, owner_guard=current_guard,
+            request_operation_id="mapping-operation", permit=current_permit,
+            port=CurrentPort(value),
+        )
+
+    mapping = qualify()
     assert mapping.self_entity_ref == "entity:role-self"
     assert mapping.graph_incarnation == "graph-incarnation"
-    assert mapping.certification_ref.startswith("d11:self-identity:")
-    with pytest.raises(ValueError, match="differs from current role"):
-        qualify_admin_self_identity(
-            role=role, activation_atom=activation, policy=policy,
-            installation_grant=grant, owner_guard=guard,
-            port=CurrentPort(replace(attestation, graph_incarnation="old-graph")),
-        )
+    assert mapping.certification_ref.startswith("authority:self-identity:")
+    with pytest.raises(ValueError, match="differs from current role or fence"):
+        qualify(replace(current, graph_incarnation="old-graph"))
     with pytest.raises(ValueError, match="installed persona or Owner proof"):
-        qualify_admin_self_identity(
-            role=role, activation_atom=activation, policy=policy,
-            installation_grant=replace(grant, installation_id="another-installation"),
-            owner_guard=guard, port=CurrentPort(attestation),
-        )
+        qualify(current_grant=replace(grant, installation_id="another-installation"))
     with pytest.raises(ValueError, match="installed persona or Owner proof"):
-        qualify_admin_self_identity(
-            role=role, activation_atom=activation, policy=policy,
-            installation_grant=grant,
-            owner_guard=replace(guard, pending_revoke_operation_id="revoke"),
-            port=CurrentPort(attestation),
-        )
-    with pytest.raises(ValueError, match="role entity, not an account"):
-        replace(attestation, self_entity_ref="entity:account-v1:sender")
-    with pytest.raises(ValueError, match="signature encoding"):
-        replace(attestation, signature="unverified")
-    assert canonical_digest(attestation.signing_payload) != canonical_digest(
-        replace(attestation, self_entity_ref="entity:another-role").signing_payload)
+        qualify(current_guard=replace(guard, pending_revoke_operation_id="revoke"))
+    with pytest.raises(ValueError, match="non-account entity reference"):
+        replace(current, self_entity_ref="entity:account-v1:sender")
+    with pytest.raises(ValueError, match="differs from current role or fence"):
+        qualify(replace(current, request_operation_id="another-operation"))
+    assert canonical_digest(current) != canonical_digest(
+        replace(current, self_entity_ref="entity:another-role"))
+
+
+def test_authority_self_identity_allows_current_reregistration_after_revocation():
+    role, activation, policy, grant, guard, permit, current = _admin_inputs()
+    renewed_guard = replace(
+        guard, authorization_revision=2, authorization_head="sha256:" + "f" * 64,
+        minimum_revocation_revision=1, minimum_revocation_epoch=1,
+    )
+    renewed_role = replace(role, authorization_revision=2)
+    renewed_current = replace(
+        current, mapping_revision=2, mapping_revocation_epoch=1,
+        owner_authorization_revision=2,
+        owner_authorization_head=renewed_guard.authorization_head,
+        owner_minimum_revocation_revision=1, owner_revocation_epoch=1,
+    )
+
+    class CurrentPort:
+        def current_self_identity(self, *, namespace, authority_namespace,
+                                  request_operation_id, permit):
+            return renewed_current
+
+    mapping = qualify_authority_current_self_identity(
+        role=renewed_role, activation_atom=activation, policy=policy,
+        installation_grant=grant, owner_guard=renewed_guard,
+        request_operation_id="mapping-operation", permit=permit, port=CurrentPort(),
+    )
+    assert mapping.self_entity_ref == "entity:role-self"

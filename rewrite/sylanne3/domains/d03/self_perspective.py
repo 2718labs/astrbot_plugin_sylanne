@@ -35,8 +35,8 @@ class SelfIdentityMapping:
                 or not self.self_entity_ref.startswith("entity:")
                 or self.self_entity_ref.startswith("entity:account-v1:")):
             raise ValueError("self mapping needs persona and entity references")
-        if not self.certification_ref.startswith("d11:self-identity:"):
-            raise ValueError("self mapping needs a D11 certification reference")
+        if not self.certification_ref.startswith("authority:self-identity:"):
+            raise ValueError("self mapping needs an Authority current reference")
         if (not self.role_head_id or not self.graph_incarnation
                 or self.status not in {"active", "revoked"}):
             raise ValueError("self mapping state is invalid")

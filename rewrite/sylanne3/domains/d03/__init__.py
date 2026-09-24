@@ -28,9 +28,9 @@ from .self_perspective import (
     self_perspective_id,
 )
 from .self_identity_qualification import (
-    AdminSelfIdentityAttestationV1,
-    CurrentAdminSelfIdentityPort,
-    qualify_admin_self_identity,
+    AuthorityCurrentSelfIdentityV1,
+    AuthorityCurrentSelfIdentityPort,
+    qualify_authority_current_self_identity,
 )
 
 __all__ = (
@@ -53,7 +53,7 @@ __all__ = (
     "build_self_perspective_bundle",
     "build_self_perspective_proposal",
     "self_perspective_id",
-    "AdminSelfIdentityAttestationV1",
-    "CurrentAdminSelfIdentityPort",
-    "qualify_admin_self_identity",
+    "AuthorityCurrentSelfIdentityV1",
+    "AuthorityCurrentSelfIdentityPort",
+    "qualify_authority_current_self_identity",
 )
