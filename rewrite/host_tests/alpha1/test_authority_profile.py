@@ -82,6 +82,94 @@ def _schema2_payload() -> dict[str, object]:
     }
 
 
+def _model_workflow_payload(work_kind: str, purpose: str,
+                            template: str) -> dict[str, object]:
+    digest = "c" * 64
+    return {
+        "work_kind": work_kind, "provider_id": "provider-a",
+        "model_id": "model-a",
+        "provider_config_ref": authority_profile.installed_model_config_ref(
+            "provider-a", "model-a", digest),
+        "provider_config_digest": digest, "purpose": purpose,
+        "audiences": ["private"], "privacy_tier": "private",
+        "template_version": template, "required_capabilities": ["text"],
+        "timeout_seconds": 20, "max_output_tokens": 32,
+        "quote_ceiling": {"output_tokens": 32},
+    }
+
+
+def _workflow_profile_payload() -> dict[str, object]:
+    payload = _schema2_payload()
+    installation = payload["installation_policy"]
+    installation["root_lease"]["limits"]["output_tokens"] = 128
+    installation["root_grant"]["max_ceiling"]["output_tokens"] = 64
+    installation["root_grant"]["allowed_work_kinds"] = [
+        "d06.encode_source", "reply"]
+    payload["ingress_encoding"] = {
+        "deadline_after_seconds": 60, "quote_ceiling": {"output_tokens": 64},
+        "snapshot_ref": "snapshot-a", "resource_ref": "resource-a",
+        "character_interval_ref": "interval-a",
+    }
+    payload["model_workflows"] = {
+        "version": 2,
+        "encode": _model_workflow_payload(
+            "d06.encode_source", "consolidation", "encode-template-v1"),
+        "reply": _model_workflow_payload(
+            "reply", "proposal", "reply-template-v1"),
+    }
+    return payload
+
+
+def test_model_workflows_are_separate_bounded_admin_authorities() -> None:
+    payload = _workflow_profile_payload()
+    authority_profile._policy_from_payload(payload)
+    workflows = authority_profile._model_workflows_from_payload(payload)
+    assert workflows.version == 2
+    assert workflows.encode.work_kind == "d06.encode_source"
+    assert workflows.reply.work_kind == "reply"
+    assert workflows.encode.template_version != workflows.reply.template_version
+    assert workflows.encode.provider_config_ref == workflows.reply.provider_config_ref
+    with pytest.raises(TypeError):
+        workflows.encode.quote_ceiling["output_tokens"] = 100
+    assert authority_profile._model_workflows_from_payload(_schema2_payload()) is None
+
+
+def test_legacy_ingress_model_remains_parseable_without_encoding_authority() -> None:
+    payload = _schema2_payload()
+    legacy = _model_workflow_payload("reply", "proposal", "reply-template-v1")
+    payload["ingress_model"] = {
+        key: value for key, value in legacy.items()
+        if key in authority_profile._INGRESS_MODEL_FIELDS
+    }
+    payload["ingress_model"].update(
+        allowed_purposes=["proposal"], allowed_audiences=["private"],
+        allowed_privacy_tiers=["private"],
+    )
+    authority_profile._policy_from_payload(payload)
+    assert authority_profile._ingress_model_from_payload(payload) is not None
+    assert authority_profile._model_workflows_from_payload(payload) is None
+
+
+@pytest.mark.parametrize("mutation", (
+    lambda p: p["model_workflows"].update(version=1),
+    lambda p: p["model_workflows"]["encode"].update(work_kind="reply"),
+    lambda p: p["model_workflows"]["encode"].update(purpose="proposal"),
+    lambda p: p["model_workflows"]["encode"].update(provider_config_digest="0" * 64),
+    lambda p: p["model_workflows"]["encode"].update(quote_ceiling={"output_tokens": 65}),
+    lambda p: p["model_workflows"]["reply"].update(quote_ceiling={"output_tokens": 65}),
+    lambda p: p["model_workflows"]["reply"].update(audiences=[]),
+    lambda p: p["model_workflows"].pop("encode"),
+    lambda p: p["installation_policy"]["root_grant"].update(
+        allowed_work_kinds=["reply"]),
+    lambda p: p.update(ingress_model={}),
+))
+def test_model_workflows_fail_closed_on_invalid_scope(mutation) -> None:
+    payload = _workflow_profile_payload()
+    mutation(payload)
+    with pytest.raises((ValueError, TypeError)):
+        authority_profile._policy_from_payload(payload)
+
+
 @pytest.mark.parametrize("origin", (
     "https://workbench.example.org",
     "https://workbench.example.org:8443",

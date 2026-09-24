@@ -54,6 +54,12 @@ _INGRESS_MODEL_FIELDS = frozenset({
 _INGRESS_MODEL_SCOPE_FIELDS = frozenset({
     "allowed_purposes", "allowed_audiences", "allowed_privacy_tiers",
 })
+_MODEL_WORKFLOW_FIELDS = frozenset({
+    "work_kind", "provider_id", "model_id", "provider_config_ref",
+    "provider_config_digest", "purpose", "audiences", "privacy_tier",
+    "template_version", "required_capabilities", "timeout_seconds",
+    "max_output_tokens", "quote_ceiling",
+})
 _RESOURCE_DIMENSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 _INSTALLATION_FIELDS = frozenset({
     "namespace", "authority_namespace", "installation_id", "manifest_digest",
@@ -265,6 +271,81 @@ class AdminIngressModelPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class AdminModelWorkflowV2:
+    """One administrator-selected model work item, without an egress grant."""
+
+    work_kind: str
+    provider_id: str
+    model_id: str
+    provider_config_ref: str
+    provider_config_digest: str
+    purpose: str
+    audiences: tuple[str, ...]
+    privacy_tier: str
+    template_version: str
+    required_capabilities: tuple[str, ...]
+    timeout_seconds: float
+    max_output_tokens: int
+    quote_ceiling: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        from ..runtime.issuers import MAX_DIMENSIONS, MAX_QUANTITY
+
+        for name in ("work_kind", "provider_id", "model_id", "purpose",
+                     "privacy_tier", "template_version"):
+            value = getattr(self, name)
+            if type(value) is not str or not value.strip() or len(value) > 256:
+                raise ValueError(f"model workflow {name} must be bounded")
+        digest = self.provider_config_digest
+        if (type(digest) is not str or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+                or self.provider_config_ref != installed_model_config_ref(
+                    self.provider_id, self.model_id, digest)):
+            raise ValueError("model workflow configuration identity is invalid")
+        for name in ("audiences", "required_capabilities"):
+            values = getattr(self, name)
+            if (type(values) is not tuple or not 0 < len(values) <= 16
+                    or len(set(values)) != len(values)
+                    or any(type(value) is not str or not value.strip()
+                           or len(value) > 128 for value in values)):
+                raise ValueError(f"model workflow {name} is invalid")
+        if (type(self.timeout_seconds) not in (int, float)
+                or not math.isfinite(self.timeout_seconds)
+                or not 0 < self.timeout_seconds <= 300
+                or type(self.max_output_tokens) is not int
+                or self.max_output_tokens < 1):
+            raise ValueError("model workflow timeout or output bound is invalid")
+        ceiling = self.quote_ceiling
+        if (not isinstance(ceiling, Mapping) or not 0 < len(ceiling) <= MAX_DIMENSIONS
+                or any(type(name) is not str
+                       or _RESOURCE_DIMENSION.fullmatch(name) is None
+                       or type(amount) is not int or not 0 < amount <= MAX_QUANTITY
+                       for name, amount in ceiling.items())
+                or ceiling.get("output_tokens", 0) < self.max_output_tokens):
+            raise ValueError("model workflow quote ceiling is invalid")
+        object.__setattr__(self, "quote_ceiling", MappingProxyType(dict(ceiling)))
+
+
+@dataclass(frozen=True, slots=True)
+class AdminModelWorkflowsV2:
+    """Separate encoding and reply authority in one checked profile snapshot."""
+
+    version: int
+    encode: AdminModelWorkflowV2
+    reply: AdminModelWorkflowV2
+
+    def __post_init__(self) -> None:
+        if (type(self.version) is not int or self.version != 2
+                or type(self.encode) is not AdminModelWorkflowV2
+                or type(self.reply) is not AdminModelWorkflowV2
+                or (self.encode.work_kind, self.encode.purpose)
+                != ("d06.encode_source", "consolidation")
+                or (self.reply.work_kind, self.reply.purpose)
+                != ("reply", "proposal")):
+            raise ValueError("model workflows need distinct version-2 encode and reply authority")
+
+
+@dataclass(frozen=True, slots=True)
 class AdminInstallationBundle:
     """One verified installation snapshot for Authority client assembly."""
 
@@ -277,6 +358,7 @@ class AdminInstallationBundle:
     workbench_origin: str | None = None
     ingress_model: AdminIngressModelPolicy | None = None
     d03_arrival: AdminD03ArrivalPolicy | None = None
+    model_workflows: AdminModelWorkflowsV2 | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -582,7 +664,7 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "model_workflows"}
     )
 
 
@@ -713,6 +795,28 @@ def _ingress_model_from_payload(payload: dict[str, object]) -> AdminIngressModel
     })
 
 
+def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkflowsV2 | None:
+    if "model_workflows" not in payload:
+        return None
+    if payload.get("schema") != 2 or "ingress_model" in payload:
+        raise ValueError("model workflows require an unambiguous schema-2 profile")
+    raw = _exact_object(payload["model_workflows"],
+                        frozenset({"version", "encode", "reply"}), "model workflows")
+    workflows = {}
+    for name in ("encode", "reply"):
+        item = _exact_object(raw[name], _MODEL_WORKFLOW_FIELDS,
+                             f"model {name} workflow")
+        if (type(item["audiences"]) is not list
+                or type(item["required_capabilities"]) is not list
+                or type(item["quote_ceiling"]) is not dict):
+            raise ValueError(f"model {name} workflow arrays or quote are invalid")
+        workflows[name] = AdminModelWorkflowV2(**{
+            **item, "audiences": tuple(item["audiences"]),
+            "required_capabilities": tuple(item["required_capabilities"]),
+        })
+    return AdminModelWorkflowsV2(raw["version"], **workflows)
+
+
 def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     """Parse schema 2 after the enclosing profile passed its trusted read gate."""
     from ..runtime.issuers import BudgetLeaseGrant
@@ -724,6 +828,7 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     encoding = _ingress_encoding_from_payload(payload)
     arrival = _d03_arrival_from_payload(payload)
     model = _ingress_model_from_payload(payload)
+    workflows = _model_workflows_from_payload(payload)
     _workbench_origin_from_payload(payload)
     values = _exact_object(payload["installation_policy"], _INSTALLATION_FIELDS,
                            "installation policy")
@@ -769,6 +874,19 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
                 or policy.root_lease.limits.get("output_tokens", 0) < output
                 or policy.root_grant.max_ceiling.get("output_tokens", 0) < output):
             raise ValueError("ingress output_tokens exceeds quote or root budget")
+    if workflows is not None:
+        if encoding is None:
+            raise ValueError("encoding workflow requires an installed encoding quote")
+        for workflow in (workflows.encode, workflows.reply):
+            if workflow.work_kind not in policy.root_grant.allowed_work_kinds:
+                raise ValueError("model workflow lacks its own root grant work kind")
+            if any(amount > policy.root_grant.max_ceiling.get(name, 0)
+                   or amount > policy.root_lease.limits.get(name, 0)
+                   for name, amount in workflow.quote_ceiling.items()):
+                raise ValueError("model workflow quote exceeds root budget")
+        if any(amount > encoding.quote_ceiling.get(name, 0)
+               for name, amount in workflows.encode.quote_ceiling.items()):
+            raise ValueError("encoding workflow exceeds installed encoding quote")
     return policy
 
 
@@ -920,7 +1038,8 @@ def _load_installation_bundle_from_root(
                                    _ingress_encoding_from_payload(payload),
                                    _workbench_origin_from_payload(payload),
                                    _ingress_model_from_payload(payload),
-                                   _d03_arrival_from_payload(payload))
+                                   _d03_arrival_from_payload(payload),
+                                   _model_workflows_from_payload(payload))
 
 
 def _load_windows_installation_bundle(
@@ -946,7 +1065,8 @@ def _load_windows_installation_bundle(
                                    _ingress_encoding_from_payload(payload),
                                    _workbench_origin_from_payload(payload),
                                    _ingress_model_from_payload(payload),
-                                   _d03_arrival_from_payload(payload))
+                                   _d03_arrival_from_payload(payload),
+                                   _model_workflows_from_payload(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -999,6 +1119,7 @@ def load_admin_d11_signing_key(profile_id: str) -> bytes:
 
 __all__ = (
     "AdminD03ArrivalPolicy", "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
+    "AdminModelWorkflowV2", "AdminModelWorkflowsV2",
     "AdminInstallationBundle",
     "AdminInstallationPolicy",
     "AuthorityProfileUnavailable",
