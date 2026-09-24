@@ -1248,6 +1248,24 @@ class RuntimeContext:
                 return None
             return committed
 
+    async def first_ingress_c02_accounting_installed_v1(self) -> bool:
+        """Admit automatic handoff only with W01's installed cost continuation."""
+        bundle = self._v2_model_bundle
+        if (self._worker is None or not self._v2_namespace_provisioned
+                or self._v2_cost_transport is None
+                or type(bundle) is not AdminInstallationBundle
+                or bundle.installation_policy != self._v2_policy
+                or type(bundle.d06_first_ingress_c02)
+                   is not AdminD06FirstIngressC02Policy
+                or type(bundle.ingress_clock) is not AdminIngressClockPolicy):
+            return False
+        try:
+            return (await self._worker.call(
+                lambda graph: graph.first_ingress_c02_accounting_installed_v1()
+            )) is True
+        except Exception:
+            return False
+
     async def run_committed_first_ingress_encoding_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
         executor: HostModelEgressExecutor,

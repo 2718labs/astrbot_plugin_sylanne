@@ -47,6 +47,44 @@ class Worker:
 
 
 @pytest.mark.asyncio
+async def test_auto_c02_handoff_requires_paired_cost_and_w01_continuation(tmp_path):
+    host = model_fixture.AstrBotModelCallTests(
+        methodName="test_one_http_request_on_host_loop_with_usage")
+    await host.asyncSetUp()
+    try:
+        bundle, _, _ = host.v2_adapters()
+        bundle = replace(
+            bundle,
+            ingress_clock=AdminIngressClockPolicy("clock", 1.0, 1.0),
+            d06_first_ingress_c02=AdminD06FirstIngressC02Policy(
+                30.0, {"graph_write": 1}, "snapshot", "resource"),
+        )
+
+        class Graph:
+            installed = True
+
+            def first_ingress_c02_accounting_installed_v1(self):
+                return self.installed
+
+        graph = Graph()
+        runtime = RuntimeContext(tmp_path, dependencies=None)
+        runtime._worker = Worker(graph)
+        runtime._v2_namespace_provisioned = True
+        runtime._v2_model_bundle = bundle
+        runtime._v2_policy = bundle.installation_policy
+        runtime._v2_cost_transport = object()
+        assert await runtime.first_ingress_c02_accounting_installed_v1() is True
+        graph.installed = False
+        assert await runtime.first_ingress_c02_accounting_installed_v1() is False
+        runtime._v2_cost_transport = None
+        assert await runtime.first_ingress_c02_accounting_installed_v1() is False
+        assert runtime._worker.calls == 2
+        assert host.requests == []
+    finally:
+        await host.asyncTearDown()
+
+
+@pytest.mark.asyncio
 async def test_accepted_ingress_commits_d03_before_d04_and_holds_on_unknown(tmp_path):
     host = model_fixture.AstrBotModelCallTests(
         methodName="test_one_http_request_on_host_loop_with_usage")
