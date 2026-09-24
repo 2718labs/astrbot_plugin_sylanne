@@ -41,6 +41,54 @@ class GraphRecoveryMetadataV2:
             raise ValueError("graph_revision must be a nonnegative integer")
 
 
+@dataclass(frozen=True, slots=True)
+class DeletionHistoryCursor:
+    """Last completed history row, or the next edge offset in a split row."""
+
+    key: AtomKey
+    revision: int
+    edge_offset: int = 0
+
+    def __post_init__(self):
+        if not isinstance(self.key, AtomKey):
+            raise TypeError("cursor key must be AtomKey")
+        if type(self.revision) is not int or self.revision < 1:
+            raise ValueError("cursor revision must be positive")
+        if type(self.edge_offset) is not int or self.edge_offset < 0:
+            raise ValueError("cursor edge offset must be nonnegative")
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionDependencyEdge:
+    dependent: GraphVersion
+    dependency: GraphVersion
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionHistoryRow:
+    atom: GraphAtom
+    event_session: str
+    event_id: str
+    dependency_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionSnapshotPage:
+    """Internal evidence only; the coordinator must supply production read admission."""
+
+    snapshot: GraphSnapshot
+    read_set: tuple[GraphVersion, ...]
+    current_reverse_edges: tuple[DeletionDependencyEdge, ...]
+    history_rows: tuple[DeletionHistoryRow, ...]
+    history_edges: tuple[DeletionDependencyEdge, ...]
+    next_after: DeletionHistoryCursor | None
+    complete: bool
+
+    @property
+    def epoch(self) -> NamespaceEpoch:
+        return self.snapshot.epochs[0]
+
+
 class GraphStore(Store):
     """Adds a typed, multi-owner graph to :class:`Store`'s database and lock."""
 
@@ -965,6 +1013,152 @@ class GraphStore(Store):
                 return GraphPage(GraphSnapshot(atoms, (epoch,)), next_after)
             except BaseException:
                 self._db.execute('ROLLBACK')
+                raise
+
+    def _deletion_snapshot_page(self, namespace: NamespaceId, keys: tuple[AtomKey, ...], *,
+                                after: DeletionHistoryCursor | None = None,
+                                expected_epoch: NamespaceEpoch | None = None,
+                                limit: int = 100, edge_limit: int = 512,
+                                _capability=None) -> DeletionSnapshotPage:
+        """Read a same-namespace deletion candidate in one SQLite read transaction.
+
+        History is a namespace-wide scan: old reverse edges can belong to atoms
+        whose current dependency was replaced. The page proves no deletion or
+        Authority intent; a production caller must use its existing read fence.
+        """
+        self._require_recovery_capability(_capability)
+        if not isinstance(namespace, NamespaceId):
+            raise TypeError("namespace must be NamespaceId")
+        keys = tuple(keys)
+        if not keys or len(keys) > 512 or len(set(keys)) != len(keys):
+            raise ValueError("keys must be a unique tuple of 1 to 512 graph keys")
+        for key in keys:
+            self._validate_key(key)
+            if self._namespace(key) != namespace.as_tuple:
+                raise ValueError("key crosses namespace")
+        if type(limit) is not int or not 1 <= limit <= 512:
+            raise ValueError("limit must be an integer from 1 to 512")
+        if type(edge_limit) is not int or not 1 <= edge_limit <= 512:
+            raise ValueError("edge_limit must be an integer from 1 to 512")
+        if after is not None:
+            if not isinstance(after, DeletionHistoryCursor):
+                raise TypeError("after must be DeletionHistoryCursor")
+            if self._namespace(after.key) != namespace.as_tuple:
+                raise ValueError("cursor crosses namespace")
+            if expected_epoch is None:
+                raise ValueError("expected_epoch is required for continuation")
+        if expected_epoch is not None:
+            if not isinstance(expected_epoch, NamespaceEpoch):
+                raise TypeError("expected_epoch must be NamespaceEpoch")
+            if (expected_epoch.bot, expected_epoch.persona) != namespace.as_tuple:
+                raise ValueError("epoch crosses namespace")
+
+        with self._lock:
+            self._ensure_open()
+            self._db.execute("BEGIN")
+            try:
+                epoch = GraphStore.graph_epoch(
+                    self, *namespace.as_tuple, _capability=_capability)
+                if expected_epoch is not None and epoch != expected_epoch:
+                    raise StaleRead("deletion snapshot namespace epoch changed")
+                if after is not None:
+                    cursor_row = self._db.execute(
+                        "SELECT dependencies FROM graph_history WHERE token=? AND revision=? "
+                        "AND event_bot=? AND event_persona=?",
+                        (after.key.token, after.revision, *namespace.as_tuple),
+                    ).fetchone()
+                    if cursor_row is None:
+                        raise StaleRead("deletion history cursor is absent")
+                    if after.edge_offset:
+                        cursor_dependencies = json.loads(cursor_row[0])
+                        if (type(cursor_dependencies) is not list
+                                or after.edge_offset >= len(cursor_dependencies)):
+                            raise StaleRead("deletion history cursor edge offset is invalid")
+
+                atoms = []
+                for key in keys:
+                    row = self._db.execute(
+                        "SELECT revision,value,valid FROM graph_atoms "
+                        "WHERE token=? AND bot=? AND persona=?",
+                        (key.token, *namespace.as_tuple)).fetchone()
+                    atoms.append(GraphAtom(key, row[0], json.loads(row[1]), bool(row[2]))
+                                 if row else GraphAtom(key, 0, {}, False))
+                placeholders = ",".join("?" for _ in keys)
+                reverse_rows = self._db.execute(
+                    "SELECT d.dependent_token,d.dependency_token,d.dependency_revision,"
+                    "a.revision,a.value,a.valid FROM graph_dependencies d "
+                    "JOIN graph_atoms a ON a.token=d.dependent_token "
+                    f"WHERE d.dependency_token IN ({placeholders}) "
+                    "AND a.bot=? AND a.persona=? "
+                    "ORDER BY d.dependent_token,d.dependency_token",
+                    tuple(key.token for key in keys) + namespace.as_tuple).fetchall()
+                known = set(keys)
+                reverse_edges = []
+                for dependent_token, dependency_token, dependency_revision, revision, value, valid in reverse_rows:
+                    dependent = AtomKey.from_token(dependent_token)
+                    dependency = AtomKey.from_token(dependency_token)
+                    if (self._namespace(dependent) != namespace.as_tuple
+                            or self._namespace(dependency) != namespace.as_tuple):
+                        raise StaleRead("cross-namespace current dependency")
+                    if dependent not in known:
+                        atoms.append(GraphAtom(dependent, revision, json.loads(value), bool(valid)))
+                        known.add(dependent)
+                    reverse_edges.append(DeletionDependencyEdge(
+                        GraphVersion(dependent, revision),
+                        GraphVersion(dependency, dependency_revision)))
+
+                history_where = "h.event_bot=? AND h.event_persona=?"
+                history_args = list(namespace.as_tuple)
+                if after is not None:
+                    history_where += (" AND (h.token>? OR (h.token=? AND h.revision>?)"
+                                      " OR (h.token=? AND h.revision=? AND ?>0))")
+                    history_args.extend((after.key.token, after.key.token, after.revision,
+                                         after.key.token, after.revision, after.edge_offset))
+                history_rows_sql = self._db.execute(
+                    "SELECT h.token,h.revision,h.value,h.valid,h.dependencies,"
+                    "h.event_session,h.event_id FROM graph_history h WHERE "
+                    + history_where + " ORDER BY h.token,h.revision LIMIT ?",
+                    tuple(history_args) + (limit + 1,)).fetchall()
+                result_rows = []
+                history_edges = []
+                position = after
+                for token, revision, value, valid, encoded, session, event_id in history_rows_sql[:limit]:
+                    key = AtomKey.from_token(token)
+                    if self._namespace(key) != namespace.as_tuple:
+                        raise StaleRead("cross-namespace history row")
+                    dependencies = json.loads(encoded)
+                    if type(dependencies) is not list:
+                        raise StaleRead("invalid history dependencies")
+                    offset = (after.edge_offset if after is not None and after.edge_offset
+                              and key == after.key and revision == after.revision else 0)
+                    if offset >= len(dependencies) and offset:
+                        raise StaleRead("history edge cursor is out of range")
+                    result_rows.append(DeletionHistoryRow(
+                        GraphAtom(key, revision, json.loads(value), bool(valid)),
+                        session, event_id, len(dependencies)))
+                    capacity = edge_limit - len(history_edges)
+                    end = min(len(dependencies), offset + capacity)
+                    for dependency_token, dependency_revision in dependencies[offset:end]:
+                        dependency = AtomKey.from_token(dependency_token)
+                        if self._namespace(dependency) != namespace.as_tuple:
+                            raise StaleRead("cross-namespace history dependency")
+                        history_edges.append(DeletionDependencyEdge(
+                            GraphVersion(key, revision),
+                            GraphVersion(dependency, dependency_revision)))
+                    if end < len(dependencies):
+                        position = DeletionHistoryCursor(key, revision, end)
+                        break
+                    position = DeletionHistoryCursor(key, revision)
+                    if len(history_edges) == edge_limit:
+                        break
+                more = bool(position and position.edge_offset) or len(history_rows_sql) > len(result_rows)
+                snapshot = GraphSnapshot(tuple(atoms), (epoch,))
+                self._db.execute("COMMIT")
+                return DeletionSnapshotPage(
+                    snapshot, snapshot.versions, tuple(reverse_edges), tuple(result_rows),
+                    tuple(history_edges), position if more else None, not more)
+            except BaseException:
+                self._db.execute("ROLLBACK")
                 raise
 
     def _current_revision(self, token):
