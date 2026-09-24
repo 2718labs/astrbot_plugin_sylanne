@@ -92,9 +92,19 @@ function overviewCatalogueMarkup(projection) {
         && typeof item.reason === "string")) {
     return `<section class="empty-state" role="alert"><h2>能力目录不可用</h2><p>服务未返回可确认的视图与领域状态；请重新请求当前目录。</p></section>`;
   }
-  return `<section class="overview-view" aria-label="服务返回的能力目录"><h2>当前角色能力目录</h2><p>以下仅表示服务在当前 Owner 权限下公布的读取能力，不代表领域内容或真实对话已经就绪。</p>
+  return `<section class="overview-view" aria-label="服务返回的能力目录"><h2>当前角色能力目录</h2><p>以下仅表示服务在当前 Owner 权限下公布的读取能力，不代表领域内容或真实对话已经就绪。可读取的已知页面可以直接打开；进入后仍会重新请求当前投影。</p>
     <h3>视图状态</h3>${views.length
-      ? `<ul class="catalogue-list">${views.map((item) => `<li><strong>${escapeHtml(item.view_type)}</strong><span>${item.status === "available" ? "可读取" : "暂不可用"}</span></li>`).join("")}</ul>`
+      ? `<ul class="catalogue-list">${views.map((item) => {
+        const page = pages.find(([id]) => id === item.view_type && id !== "overview");
+        const label = page ? `${page[1]} (${item.view_type})` : item.view_type;
+        const link = item.status === "available" && page
+          ? `<button type="button" class="catalogue-link" data-view="${page[0]}" aria-label="打开${escapeHtml(page[1])}视图">${escapeHtml(label)}</button>`
+          : `<strong>${escapeHtml(label)}</strong>`;
+        const status = item.status === "available"
+          ? page ? "可读取，打开时重新核验" : "服务声明可读取；当前客户端没有对应页面"
+          : "暂不可用；没有可读取内容";
+        return `<li>${link}<span>${status}</span></li>`;
+      }).join("")}</ul>`
       : `<p class="catalogue-empty">服务当前未公布可读取视图。</p>`}
     <h3>不可用领域</h3>${unavailable.length
       ? `<ul class="catalogue-list">${unavailable.map((item) => `<li><strong>${escapeHtml(item.domain)}</strong><span>暂不可用 · ${escapeHtml(item.reason)}</span></li>`).join("")}</ul>`

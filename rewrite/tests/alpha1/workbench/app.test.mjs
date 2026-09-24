@@ -373,12 +373,51 @@ test("overview reads the Owner-authorized service catalogue without inventing do
     } });
     await selected;
     assert.match(ui.app.innerHTML, /服务返回的能力目录/);
-    assert.match(ui.app.innerHTML, /creation<\/strong><span>可读取/);
-    assert.match(ui.app.innerHTML, /memory<\/strong><span>暂不可用/);
+    assert.match(ui.app.innerHTML, /data-view="creation" aria-label="打开创作视图"/);
+    assert.match(ui.app.innerHTML, /memory\)<\/strong><span>暂不可用；没有可读取内容/);
     assert.match(ui.app.innerHTML, /d06&lt;script&gt;/);
     assert.match(ui.app.innerHTML, /no_public_projection_contract/);
     assert.doesNotMatch(ui.app.innerHTML, /<script>/);
     assert.match(ui.app.innerHTML, /不代表领域内容或真实对话已经就绪/);
+  } finally { ui.restore(); }
+});
+
+test("catalogue opens only a service-available known page and requests its fresh projection", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: {
+      views: [
+        { view_type: "creation", status: "available" },
+        { view_type: "memory", status: "unavailable" },
+        { view_type: "future-view", status: "available" }
+      ], unavailable_domains: []
+    } });
+    await opened;
+    const overview = ui.clickView("overview");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: {
+      views: [
+        { view_type: "creation", status: "available" },
+        { view_type: "memory", status: "unavailable" },
+        { view_type: "future-view", status: "available" }
+      ], unavailable_domains: []
+    } });
+    await overview;
+    assert.match(ui.app.innerHTML, /data-view="creation" aria-label="打开创作视图"/);
+    assert.doesNotMatch(ui.app.innerHTML, /data-view="memory" aria-label="打开记忆视图"/);
+    assert.match(ui.app.innerHTML, /future-view<\/strong><span>服务声明可读取；当前客户端没有对应页面/);
+
+    const selected = ui.clickView("creation");
+    const request = await ui.nextRequest(2);
+    assert.equal(request.payload.action, "read_character_view");
+    assert.equal(request.payload.input.view_type, "creation");
+    assert.equal(request.payload.scope, "bot/persona");
+    request.resolve({ status: "ready", projection: { view_type: "creation", data: { candidates: [] } } });
+    await selected;
+    assert.match(ui.app.innerHTML, /当前范围内没有已保存的角色方案/);
   } finally { ui.restore(); }
 });
 
