@@ -194,13 +194,20 @@ def test_unfinished_original_write_recovers_before_new_read_or_job_check(
     assert _commit(case).status == "duplicate"
 
 
-def test_precommit_active_write_is_closed_without_replaying_business(
+def test_precommit_active_write_is_closed_before_distinct_retry(
         projection_case, monkeypatch):
     case = projection_case
     store, coordinator, *_ = case
     port = coordinator._GraphCoordinator__content_fence_v2
     begin = port.begin_fence
+    commit_bundle = coordinator._commit_domain_bundle_v2
+    frozen = {}
     lost = {"once": True}
+
+    def capture_original(bundle, lease, **kwargs):
+        if not frozen:
+            frozen.update(bundle=bundle, lease=lease, kwargs=kwargs)
+        return commit_bundle(bundle, lease, **kwargs)
 
     def lose_after_begin(**kwargs):
         permit = begin(**kwargs)
@@ -210,13 +217,23 @@ def test_precommit_active_write_is_closed_without_replaying_business(
         return permit
 
     monkeypatch.setattr(port, "begin_fence", lose_after_begin)
+    monkeypatch.setattr(coordinator, "_commit_domain_bundle_v2", capture_original)
     with pytest.raises(RuntimeError, match="process stopped"):
         _commit(case)
-    with pytest.raises(UnavailableGuard, match="no-commit fence closed"):
-        _commit(case)
+    retry_receipt = _commit(case)
+    assert retry_receipt.status == "committed"
+    with pytest.raises(UnavailableGuard):
+        commit_bundle(frozen["bundle"], frozen["lease"], **frozen["kwargs"])
+    assert retry_receipt.operation_id != store._db.execute(
+        "SELECT previous_operation_id FROM graph_stage_retry_lineage_v1"
+    ).fetchone()[0]
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_bundle_rejections_v2 "
+        "WHERE status='rejected_no_commit'"
+    ).fetchone() == (1,)
     assert store._db.execute(
         "SELECT COUNT(*) FROM graph_atoms WHERE type_name='d03.self_perspective.v1'"
-    ).fetchone() == (0,)
+    ).fetchone() == (1,)
 
 
 def test_crashed_candidate_read_recovers_before_retry(projection_case, monkeypatch):
@@ -354,7 +371,7 @@ def test_d04_crashed_queued_read_recovers_before_retry(projection_case, monkeypa
         policy, baseline_policy, clock).status == "committed"
 
 
-def test_d03_no_start_intent_keeps_unknown_fence_on_hold(
+def test_d03_no_start_intent_retries_after_original_fence_closed(
         projection_case, monkeypatch):
     case = projection_case
     store, coordinator, *_ = case
@@ -371,18 +388,21 @@ def test_d03_no_start_intent_keeps_unknown_fence_on_hold(
     monkeypatch.setattr(port, "begin_fence", stop_before_write_begin)
     with pytest.raises(RuntimeError, match="before Authority begin"):
         _commit(case)
-    with pytest.raises(UnavailableGuard, match="cannot prove absence; HOLD"):
-        _commit(case)
+    retry_receipt = _commit(case)
+    assert retry_receipt.status == "committed"
     assert store._db.execute(
         "SELECT COUNT(*) FROM graph_d03_self_projection_intents_v1"
     ).fetchone() == (1,)
     assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_stage_retry_lineage_v1 WHERE stage='d03'"
+    ).fetchone() == (1,)
+    assert store._db.execute(
         "SELECT COUNT(*) FROM graph_bundle_operations "
         "WHERE operation_id LIKE 'd03-self-projection-%'"
-    ).fetchone() == (0,)
+    ).fetchone() == (1,)
 
 
-def test_d04_no_start_intent_keeps_unknown_fence_on_hold(
+def test_d04_no_start_intent_retries_after_original_fence_closed(
         projection_case, monkeypatch):
     case = projection_case
     store, coordinator, bootstrap, namespace, job_id, original_operation_id, policy, _, clock, _ = case
@@ -404,13 +424,16 @@ def test_d04_no_start_intent_keeps_unknown_fence_on_hold(
         coordinator.commit_d04_encoding_baseline_v1(
             bootstrap, namespace, job_id, original_operation_id,
             policy, baseline_policy, clock)
-    with pytest.raises(UnavailableGuard, match="cannot prove absence; HOLD"):
-        coordinator.commit_d04_encoding_baseline_v1(
-            bootstrap, namespace, job_id, original_operation_id,
-            policy, baseline_policy, clock)
+    retry_receipt = coordinator.commit_d04_encoding_baseline_v1(
+        bootstrap, namespace, job_id, original_operation_id,
+        policy, baseline_policy, clock)
+    assert retry_receipt.status == "committed"
     assert store._db.execute(
         "SELECT COUNT(*) FROM graph_d04_baseline_intents_v1"
     ).fetchone() == (1,)
     assert store._db.execute(
         "SELECT COUNT(*) FROM graph_atoms WHERE type_name='d04.encoding_baseline.v1'"
-    ).fetchone() == (0,)
+    ).fetchone() == (1,)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_stage_retry_lineage_v1 WHERE stage='d04'"
+    ).fetchone() == (1,)

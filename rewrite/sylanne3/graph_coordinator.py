@@ -269,6 +269,15 @@ class JobAcquireOutcomeUnknown(UnavailableGuard):
 
 
 @dataclass(frozen=True, slots=True)
+class _StageRetry:
+    previous_operation_id: str
+    previous_bundle_digest: str
+    previous_attempt_id: str
+    previous_rejection_digest: str
+    retry_index: int
+
+
+@dataclass(frozen=True, slots=True)
 class FirstIngressEncodingInputsV1:
     """Fenced, current inputs for a trusted fixed-template request issuer."""
 
@@ -9410,26 +9419,108 @@ class GraphCoordinator:
                   or epoch.revision < saved[5]):
                 raise UnavailableGuard("D03 self projection graph receipt regressed")
             return replace(prior, status="duplicate")
-        try:
-            observed, state = port.get_fence_operation(
-                namespace=namespace,
-                authority_namespace=target.authority_namespace,
-                operation_id=intent[1])
-        except Exception as exc:
-            raise UnavailableGuard(
-                "D03 self projection original fence cannot prove absence; HOLD") from exc
-        if observed is None:
-            return None
-        if (state != "active" or (metadata.graph_revision, epoch.revision)
-                != (intent[4], intent[5])):
-            raise UnavailableGuard("D03 self projection uncertain write requires HOLD")
-        rejection = self._record_rejected_bundle_v2(
-            namespace, operation_id, intent[0], intent[1], metadata, epoch,
-            intent, observed)
+        return self._reconcile_stage_retry(
+            namespace, "d03", source_ref, original_operation_id,
+            operation_id, intent, metadata, epoch, anchor)
+
+    def _reconcile_stage_retry(self, namespace, stage, source_ref,
+                               original_operation_id, operation_id,
+                               intent, metadata, epoch, anchor) -> _StageRetry:
+        """Finish the frozen no-commit attempt before pricing a new operation."""
+        store, port = self.__store, self.__content_fence_v2
+        target = metadata.requirements
+        attempt_id = "graph-write-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "bundle_digest": intent[0],
+        })[:48]
+        if (intent[1] != attempt_id
+                or intent[2] != canonical_json(asdict(target))
+                or intent[3] != canonical_json(asdict(anchor))
+                or intent[4] > metadata.graph_revision
+                or intent[5] > epoch.revision):
+            raise UnavailableGuard("stage frozen attempt identity differs; HOLD")
+        with store._lock:
+            db = store._db
+            rejection = db.execute(
+                "SELECT digest,status,permit_json,graph_revision,graph_epoch,"
+                "finish_request_id,finish_request_digest FROM graph_bundle_rejections_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+        if rejection is None:
+            permit = port.begin_fence(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                holder=self.__holder, generation=target.activation_generation,
+                operation="write", operation_id=attempt_id,
+                expected_anchor=anchor, retain_on_unknown=True)
+            scope = FenceScope(
+                namespace, target.authority_namespace,
+                target.activation_generation, "write", attempt_id,
+                permit, anchor, epoch, metadata.graph_revision)
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("stage original write permit changed; HOLD")
+            rejection = self._record_rejected_bundle_v2(
+                namespace, operation_id, intent[0], attempt_id, metadata,
+                epoch, intent, permit, allow_advanced_graph=True)
         self._finish_rejected_bundle_v2(
-            namespace, metadata, epoch, anchor, intent[1], intent[0],
-            operation_id, rejection)
-        raise UnavailableGuard("D03 self projection previous no-commit fence closed; HOLD")
+            namespace, metadata, epoch, anchor, attempt_id, intent[0],
+            operation_id, rejection, allow_advanced_graph=True)
+        table = ("graph_d03_self_projection_intents_v1" if stage == "d03" else
+                 "graph_d04_baseline_intents_v1")
+        from .runtime.issuers import (
+            d03_self_identity_projection_quote_id, d04_baseline_quote_id,
+        )
+        quote_id = (d03_self_identity_projection_quote_id(namespace, operation_id)
+                    if stage == "d03" else
+                    d04_baseline_quote_id(namespace, operation_id))
+        with store._lock:
+            db = store._db
+            if (db.execute(
+                    f"SELECT operation_id,bundle_digest FROM {table} "
+                    "WHERE bot=? AND persona=? AND source_ref=? "
+                    "AND original_operation_id=?",
+                    namespace.as_tuple + (source_ref, original_operation_id),
+                ).fetchone() != (operation_id, intent[0])
+                    or db.execute(
+                        "SELECT 1 FROM graph_bundle_operations WHERE bot=? "
+                        "AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone() is not None
+                    or db.execute(
+                        "SELECT 1 FROM graph_bundle_fences_v2 WHERE bot=? "
+                        "AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone() is not None
+                    or db.execute(
+                        "SELECT 1 FROM runtime_budget_reservations "
+                        "WHERE operation_id=?", (operation_id,),
+                    ).fetchone() is not None
+                    or db.execute(
+                        "SELECT 1 FROM runtime_resource_quotes "
+                        "WHERE quote_id=?", (quote_id,),
+                    ).fetchone() is not None
+                    or db.execute(
+                        "SELECT 1 FROM runtime_budget_operations "
+                        "WHERE bot_id=? AND persona_id=? AND operation_id=? "
+                        "AND phase='reserve'",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone() is not None):
+                raise UnavailableGuard("stage original no-commit differs; HOLD")
+            previous = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_stage_retry_lineage_v1'",
+            ).fetchone()
+            prior_lineage = (db.execute(
+                "SELECT retry_index FROM graph_stage_retry_lineage_v1 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone() if previous else None)
+        next_retry_index = prior_lineage[0] + 1 if prior_lineage else 1
+        if next_retry_index > 64:
+            raise UnavailableGuard("stage retry bound reached; HOLD")
+        return _StageRetry(
+            operation_id, intent[0], attempt_id,
+            canonical_digest(list(rejection)), next_retry_index)
 
     def _recover_stage_candidate_read(self, namespace, read_key,
                                       metadata, epoch, anchor) -> None:
@@ -9548,6 +9639,7 @@ class GraphCoordinator:
         from .runtime.d03_self_identity_projection_identity import (
             d03_self_identity_projection_activity_id_v1,
             d03_self_identity_projection_operation_id_v1,
+            d03_self_identity_projection_retry_operation_id_v2,
         )
         from .runtime.first_ingress_v2 import trusted_upper
         from .runtime.issuers import (
@@ -9577,8 +9669,9 @@ class GraphCoordinator:
         store, port = self.__store, self.__content_fence_v2
         recovered = self._recover_d03_self_projection_before_read(
             namespace, original_operation_id, policy, admin_policy)
-        if recovered is not None:
+        if type(recovered) is CommitReceipt:
             return recovered
+        retry = recovered if type(recovered) is _StageRetry else None
         try:
             reading = port.read_ingress_clock(clock_policy)
             now_utc = trusted_upper(reading)
@@ -9729,8 +9822,16 @@ class GraphCoordinator:
                               }))
             self._close_stage_candidate_read(
                 namespace, original_operation_id, read_operation)
-        operation_id = d03_self_identity_projection_operation_id_v1(
+        base_operation_id = d03_self_identity_projection_operation_id_v1(
             namespace, source_ref, candidate_mapping.certification_ref)
+        if retry is not None and retry.retry_index == 1 and (
+                retry.previous_operation_id != base_operation_id):
+            raise UnavailableGuard("D03 Authority registration changed before retry; HOLD")
+        operation_id = (
+            d03_self_identity_projection_retry_operation_id_v2(
+                namespace, source_ref, candidate_mapping.certification_ref,
+                retry.previous_operation_id, retry.retry_index)
+            if retry is not None else base_operation_id)
         activity_id = d03_self_identity_projection_activity_id_v1(namespace, source_ref)
         lease, capability = self.grant(
             bootstrap, actor="host", issuer_domain="d11", namespace=namespace,
@@ -9770,7 +9871,8 @@ class GraphCoordinator:
             return self._commit_domain_bundle_v2(
                 bundle, lease, self_identity_issuance=(
                     policy, admin_policy, policy.installation_id, now_utc,
-                    source_ref, candidate_mapping, job_id, original_operation_id))
+                    source_ref, candidate_mapping, job_id, original_operation_id,
+                    retry))
         finally:
             self.release_authority_lease(bootstrap, lease)
 
@@ -9856,15 +9958,11 @@ class GraphCoordinator:
             namespace=namespace, authority_namespace=target.authority_namespace)
         if not self._anchor_matches(target, anchor):
             raise UnavailableGuard("D04 baseline recovery anchor differs")
-        try:
+        if issued:
             observed, state = port.get_fence_operation(
                 namespace=namespace,
                 authority_namespace=target.authority_namespace,
                 operation_id=intent[1])
-        except Exception as exc:
-            raise UnavailableGuard(
-                "D04 baseline original fence cannot prove absence; HOLD") from exc
-        if issued:
             original_permit = from_wire(json.loads(saved[1]))
             if (observed != original_permit or state not in {"active", "finished"}
                     or original_permit.operation_id != intent[1]
@@ -9888,18 +9986,9 @@ class GraphCoordinator:
                   or epoch.revision < saved[5]):
                 raise UnavailableGuard("D04 baseline graph receipt regressed")
             return replace(prior, status="duplicate")
-        if observed is None:
-            return None
-        if (state != "active" or (metadata.graph_revision, epoch.revision)
-                != (intent[4], intent[5])):
-            raise UnavailableGuard("D04 baseline uncertain write requires HOLD")
-        rejection = self._record_rejected_bundle_v2(
-            namespace, operation_id, intent[0], intent[1], metadata, epoch,
-            intent, observed)
-        self._finish_rejected_bundle_v2(
-            namespace, metadata, epoch, anchor, intent[1], intent[0],
-            operation_id, rejection)
-        raise UnavailableGuard("D04 baseline previous no-commit fence closed; HOLD")
+        return self._reconcile_stage_retry(
+            namespace, "d04", source_ref, original_operation_id,
+            operation_id, intent, metadata, epoch, anchor)
 
     def commit_d04_encoding_baseline_v1(
         self, bootstrap: object, namespace: NamespaceId, job_id: str,
@@ -9913,6 +10002,9 @@ class GraphCoordinator:
             AdminD04EncodingBaselinePolicy, AdminIngressClockPolicy,
         )
         from .installation_policy import AdminInstallationPolicy
+        from .runtime.d04_baseline_retry_identity import (
+            d04_baseline_retry_operation_id_v2,
+        )
         from .runtime.first_ingress_v2 import trusted_upper
         from .runtime.issuers import D04_BASELINE_WORK_KIND, d04_baseline_quote_id
         from .runtime_contracts import (
@@ -9941,8 +10033,9 @@ class GraphCoordinator:
         store, port = self.__store, self.__content_fence_v2
         recovered = self._recover_d04_baseline_before_read(
             namespace, original_operation_id, policy, admin_policy)
-        if recovered is not None:
+        if type(recovered) is CommitReceipt:
             return recovered
+        retry = recovered if type(recovered) is _StageRetry else None
         with store._lock:
             original_metadata, _ = self._v2_graph_stamp(namespace)
             identity = store._db.execute(
@@ -10045,11 +10138,20 @@ class GraphCoordinator:
                 "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
                 "WHERE bot=? AND persona=?", namespace.as_tuple,
             ).fetchone() or (0, 0)
-        operation_id = "d04-baseline-" + canonical_digest({
+        base_operation_id = "d04-baseline-" + canonical_digest({
             "namespace": namespace.as_tuple, "source": inputs.source_ref,
             "event": event_key.token, "perspective": perspective_token,
             "perspective_revision": perspective_revision,
         })[:40]
+        if retry is not None and retry.retry_index == 1 and (
+                retry.previous_operation_id != base_operation_id):
+            raise UnavailableGuard("D04 original perspective changed before retry; HOLD")
+        operation_id = (
+            d04_baseline_retry_operation_id_v2(
+                namespace, inputs.source_ref, event_key.token,
+                perspective_token, perspective_revision,
+                retry.previous_operation_id, retry.retry_index)
+            if retry is not None else base_operation_id)
         activity_id = "d04-baseline-activity-" + canonical_digest({
             "namespace": namespace.as_tuple, "source": inputs.source_ref,
         })[:40]
@@ -10090,7 +10192,7 @@ class GraphCoordinator:
                 bundle, lease, baseline_issuance=(
                     admin_policy, policy.installation_id, now_utc,
                     inputs.source_ref, event_key.token, job_id, policy,
-                    original_operation_id))
+                    original_operation_id, retry))
         finally:
             self.release_authority_lease(bootstrap, lease)
 
@@ -10113,6 +10215,97 @@ class GraphCoordinator:
                             for write in proposal.typed_writes),
                 )
             return self._commit_domain_bundle_fenced(bundle, lease)
+
+    def _stage_retry_intent_locked(self, db, namespace, stage, source_ref,
+                                   original_operation_id, operation_id, digest,
+                                   retry: _StageRetry) -> None:
+        """CAS the current stage head while retaining the rejected predecessor."""
+        table = ("graph_d03_self_projection_intents_v1" if stage == "d03" else
+                 "graph_d04_baseline_intents_v1")
+        old = db.execute(
+            f"SELECT operation_id,bundle_digest FROM {table} "
+            "WHERE bot=? AND persona=? AND source_ref=? "
+            "AND original_operation_id=?",
+            namespace.as_tuple + (source_ref, original_operation_id),
+        ).fetchone()
+        previous_intent = db.execute(
+            "SELECT digest,fence_attempt_id FROM graph_bundle_intents_v2 "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (retry.previous_operation_id,),
+        ).fetchone()
+        previous_rejection = db.execute(
+            "SELECT digest,status,permit_json,graph_revision,graph_epoch,"
+            "finish_request_id,finish_request_digest "
+            "FROM graph_bundle_rejections_v2 WHERE bot=? AND persona=? "
+            "AND operation_id=?",
+            namespace.as_tuple + (retry.previous_operation_id,),
+        ).fetchone()
+        if (old != (retry.previous_operation_id, retry.previous_bundle_digest)
+                or previous_intent != (retry.previous_bundle_digest,
+                                       retry.previous_attempt_id)
+                or previous_rejection is None
+                or previous_rejection[1] != "rejected_no_commit"
+                or canonical_digest(list(previous_rejection))
+                != retry.previous_rejection_digest
+                or db.execute(
+                    "SELECT 1 FROM graph_bundle_operations WHERE bot=? "
+                    "AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (retry.previous_operation_id,),
+                ).fetchone() is not None
+                or db.execute(
+                    "SELECT 1 FROM graph_bundle_fences_v2 WHERE bot=? "
+                    "AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (retry.previous_operation_id,),
+                ).fetchone() is not None):
+            raise EventConflict("stage retry predecessor is not a rejected no-commit")
+        db.execute("""CREATE TABLE IF NOT EXISTS graph_stage_retry_lineage_v1(
+            bot TEXT NOT NULL, persona TEXT NOT NULL,
+            stage TEXT NOT NULL CHECK(stage IN ('d03','d04')),
+            source_ref TEXT NOT NULL, original_operation_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL, previous_operation_id TEXT NOT NULL,
+            retry_index INTEGER NOT NULL CHECK(retry_index > 0),
+            previous_bundle_digest TEXT NOT NULL,
+            previous_attempt_id TEXT NOT NULL,
+            previous_rejection_digest TEXT NOT NULL,
+            PRIMARY KEY(bot,persona,operation_id),
+            UNIQUE(bot,persona,stage,source_ref,original_operation_id,retry_index))""")
+        db.execute("""CREATE TRIGGER IF NOT EXISTS graph_stage_retry_lineage_no_update_v1
+            BEFORE UPDATE ON graph_stage_retry_lineage_v1
+            BEGIN SELECT RAISE(ABORT, 'stage retry lineage is immutable'); END""")
+        db.execute("""CREATE TRIGGER IF NOT EXISTS graph_stage_retry_lineage_no_delete_v1
+            BEFORE DELETE ON graph_stage_retry_lineage_v1
+            BEGIN SELECT RAISE(ABORT, 'stage retry lineage is immutable'); END""")
+        predecessor = db.execute(
+            "SELECT retry_index FROM graph_stage_retry_lineage_v1 "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (retry.previous_operation_id,),
+        ).fetchone()
+        if retry.retry_index != (predecessor[0] + 1 if predecessor else 1):
+            raise EventConflict("stage retry ordinal is not consecutive")
+        if retry.retry_index > 64:
+            raise UnavailableGuard("stage retry bound reached; HOLD")
+        db.execute(
+            "INSERT INTO graph_stage_retry_lineage_v1"
+            "(bot,persona,stage,source_ref,original_operation_id,operation_id,"
+            "previous_operation_id,retry_index,previous_bundle_digest,"
+            "previous_attempt_id,previous_rejection_digest) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            namespace.as_tuple + (
+                stage, source_ref, original_operation_id, operation_id,
+                retry.previous_operation_id, retry.retry_index,
+                retry.previous_bundle_digest, retry.previous_attempt_id,
+                retry.previous_rejection_digest),
+        )
+        updated = db.execute(
+            f"UPDATE {table} SET operation_id=?,bundle_digest=? "
+            "WHERE bot=? AND persona=? AND source_ref=? "
+            "AND original_operation_id=? AND operation_id=? AND bundle_digest=?",
+            (operation_id, digest) + namespace.as_tuple
+            + (source_ref, original_operation_id,
+               retry.previous_operation_id, retry.previous_bundle_digest),
+        )
+        if updated.rowcount != 1:
+            raise EventConflict("stage retry head changed")
 
     def _commit_domain_bundle_v2(self, bundle: DomainBundle,
                                  lease: object, *, arrival_issuance=None,
@@ -10177,14 +10370,20 @@ class GraphCoordinator:
                             source_ref TEXT NOT NULL, original_operation_id TEXT NOT NULL,
                             operation_id TEXT NOT NULL, bundle_digest TEXT NOT NULL,
                             PRIMARY KEY(bot,persona,source_ref,original_operation_id))""")
-                        db.execute(
-                            "INSERT OR IGNORE INTO graph_d03_self_projection_intents_v1"
-                            "(bot,persona,source_ref,original_operation_id,operation_id,bundle_digest) "
-                            "VALUES(?,?,?,?,?,?)",
-                            namespace.as_tuple + (self_identity_issuance[4],
-                                                  self_identity_issuance[7],
-                                                  operation_id, digest),
-                        )
+                        if self_identity_issuance[8] is None:
+                            db.execute(
+                                "INSERT OR IGNORE INTO graph_d03_self_projection_intents_v1"
+                                "(bot,persona,source_ref,original_operation_id,"
+                                "operation_id,bundle_digest) VALUES(?,?,?,?,?,?)",
+                                namespace.as_tuple + (self_identity_issuance[4],
+                                                      self_identity_issuance[7],
+                                                      operation_id, digest),
+                            )
+                        else:
+                            self._stage_retry_intent_locked(
+                                db, namespace, "d03", self_identity_issuance[4],
+                                self_identity_issuance[7], operation_id, digest,
+                                self_identity_issuance[8])
                         indexed = db.execute(
                             "SELECT operation_id,bundle_digest FROM "
                             "graph_d03_self_projection_intents_v1 WHERE bot=? AND persona=? "
@@ -10200,14 +10399,20 @@ class GraphCoordinator:
                             source_ref TEXT NOT NULL, original_operation_id TEXT NOT NULL,
                             operation_id TEXT NOT NULL, bundle_digest TEXT NOT NULL,
                             PRIMARY KEY(bot,persona,source_ref,original_operation_id))""")
-                        db.execute(
-                            "INSERT OR IGNORE INTO graph_d04_baseline_intents_v1"
-                            "(bot,persona,source_ref,original_operation_id,operation_id,bundle_digest) "
-                            "VALUES(?,?,?,?,?,?)",
-                            namespace.as_tuple + (baseline_issuance[3],
-                                                  baseline_issuance[7],
-                                                  operation_id, digest),
-                        )
+                        if baseline_issuance[8] is None:
+                            db.execute(
+                                "INSERT OR IGNORE INTO graph_d04_baseline_intents_v1"
+                                "(bot,persona,source_ref,original_operation_id,"
+                                "operation_id,bundle_digest) VALUES(?,?,?,?,?,?)",
+                                namespace.as_tuple + (baseline_issuance[3],
+                                                      baseline_issuance[7],
+                                                      operation_id, digest),
+                            )
+                        else:
+                            self._stage_retry_intent_locked(
+                                db, namespace, "d04", baseline_issuance[3],
+                                baseline_issuance[7], operation_id, digest,
+                                baseline_issuance[8])
                         indexed = db.execute(
                             "SELECT operation_id,bundle_digest FROM "
                             "graph_d04_baseline_intents_v1 WHERE bot=? AND persona=? "
@@ -10359,7 +10564,7 @@ class GraphCoordinator:
             current_self_policy = (
                 self_identity_issuance[0] if self_identity_issuance is not None else
                 baseline_issuance[6] if baseline_issuance is not None
-                and len(baseline_issuance) == 8 else None)
+                and len(baseline_issuance) == 9 else None)
             if current_self_policy is not None:
                 from .domains.d03.self_identity_qualification import (
                     qualify_authority_current_self_identity,
@@ -10453,7 +10658,8 @@ class GraphCoordinator:
         return receipt
 
     def _record_rejected_bundle_v2(self, namespace, operation_id, digest,
-                                   attempt_id, metadata, epoch, intent, permit):
+                                   attempt_id, metadata, epoch, intent, permit,
+                                   *, allow_advanced_graph=False):
         """Record a proven rollback before any Authority abort finish."""
         from .authority_service.v2_contract import to_wire
 
@@ -10480,6 +10686,9 @@ class GraphCoordinator:
                 ).fetchone()
                 if (current_intent != intent
                         or self._v2_graph_stamp(namespace) != (metadata, epoch)
+                        or (allow_advanced_graph and
+                            (intent[4] > metadata.graph_revision
+                             or intent[5] > epoch.revision))
                         or db.execute(
                             "SELECT 1 FROM graph_bundle_operations WHERE bot=? "
                             "AND persona=? AND operation_id=?",
@@ -10513,7 +10722,8 @@ class GraphCoordinator:
         return expected
 
     def _finish_rejected_bundle_v2(self, namespace, metadata, epoch, anchor,
-                                   attempt_id, digest, operation_id, rejection):
+                                   attempt_id, digest, operation_id, rejection,
+                                   *, allow_advanced_graph=False):
         from .authority_service.v2_contract import FencePermitV2, from_wire
 
         port = self.__content_fence_v2
@@ -10531,8 +10741,12 @@ class GraphCoordinator:
                 or permit.namespace != target.authority_namespace
                 or permit.generation != target.activation_generation
                 or permit.pinned_anchor != anchor
-                or (rejection[3], rejection[4]) != (
-                    metadata.graph_revision, epoch.revision)
+                or (not allow_advanced_graph and
+                    (rejection[3], rejection[4]) !=
+                    (metadata.graph_revision, epoch.revision))
+                or (allow_advanced_graph and
+                    (rejection[3] > metadata.graph_revision
+                     or rejection[4] > epoch.revision))
                 or rejection[5] != "abort:" + attempt_id
                 or rejection[6] != "sha256:" + canonical_digest({
                     "operation_id": attempt_id, "permit_token": permit.token,
@@ -10545,10 +10759,15 @@ class GraphCoordinator:
             operation_id=attempt_id)
         if observed != permit or state not in {"active", "finished"}:
             raise UnavailableGuard("rejected v2 Authority fence status differs")
-        scope = FenceScope(namespace, target.authority_namespace,
-                           target.activation_generation, "write", attempt_id,
-                           permit, anchor, epoch, metadata.graph_revision)
-        if state == "active" and port.validate_fence(scope) != permit:
+        scope = FenceScope(
+            namespace, target.authority_namespace,
+            target.activation_generation, "write", attempt_id,
+            permit, anchor,
+            NamespaceEpoch(*namespace.as_tuple, rejection[4]), rejection[3])
+        if (state == "active" and
+                ((rejection[3], rejection[4]) !=
+                 (metadata.graph_revision, epoch.revision)
+                 or port.validate_fence(scope) != permit)):
             raise UnavailableGuard("rejected v2 write permit changed")
         port.finish_fence(scope, request_id=rejection[5], request_digest=rejection[6])
 
@@ -10719,6 +10938,23 @@ class GraphCoordinator:
                         namespace.as_tuple + (identity.operation_id,),
                 ).fetchone() is not None:
                     raise UnavailableGuard("v2 bundle is terminal rejected_no_commit")
+                if self_identity_issuance is not None or baseline_issuance is not None:
+                    stage_table = ("graph_d03_self_projection_intents_v1"
+                                   if self_identity_issuance is not None else
+                                   "graph_d04_baseline_intents_v1")
+                    stage_source = (self_identity_issuance[4]
+                                    if self_identity_issuance is not None else
+                                    baseline_issuance[3])
+                    original_op = (self_identity_issuance[7]
+                                   if self_identity_issuance is not None else
+                                   baseline_issuance[7])
+                    if db.execute(
+                            f"SELECT operation_id,bundle_digest FROM {stage_table} "
+                            "WHERE bot=? AND persona=? AND source_ref=? "
+                            "AND original_operation_id=?",
+                            namespace.as_tuple + (stage_source, original_op),
+                    ).fetchone() != (identity.operation_id, digest):
+                        raise EventConflict("stage current attempt changed")
             elif not v2_read:
                 self._admit_content(
                     namespace, envelope.authority.activation_generation, "write",
@@ -10776,7 +11012,7 @@ class GraphCoordinator:
             if baseline_issuance is not None:
                 (admin_policy, installation_id, baseline_now, source_ref,
                  event_ref, job_id, installation_policy,
-                 original_operation_id) = baseline_issuance
+                 original_operation_id, _retry) = baseline_issuance
                 if (v2_write is None or len(bundle.proposals) != 1
                         or bundle.proposals[0].domain != "d04"
                         or envelope.input_refs != (source_ref, event_ref)
@@ -10844,7 +11080,7 @@ class GraphCoordinator:
                 )
             if self_identity_issuance is not None:
                 (installation_policy, admin_policy, installation_id, stage_now,
-                 source_ref, candidate, job_id, original_operation_id) = (
+                 source_ref, candidate, job_id, original_operation_id, _retry) = (
                     self_identity_issuance)
                 if (v2_write is None or qualified_self is None
                         or len(bundle.proposals) != 1
