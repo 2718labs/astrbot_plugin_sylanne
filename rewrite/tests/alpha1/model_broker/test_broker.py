@@ -28,6 +28,18 @@ def request(**changes):
     values.update(changes); return ModelCallRequest(**values)
 
 
+def test_call_digest_binds_timeout_and_required_capabilities():
+    original = request()
+    shorter_timeout = request(timeout_seconds=0.01)
+    changed_capabilities = request(
+        required_capabilities=frozenset({"structured", "tool"}))
+    assert original.digest != shorter_timeout.digest
+    assert original.digest != changed_capabilities.digest
+    assert shorter_timeout.digest != changed_capabilities.digest
+    assert request(timeout_seconds=0.05).digest == original.digest
+    assert request(required_capabilities=frozenset({"structured"})).digest == original.digest
+
+
 class Provider:
     def __init__(self, response=None, delay=0, test=False): self.response, self.delay, self.cancelled, self.invoked = response, delay, False, False; self._descriptor = ModelProviderDescriptor("provider", "v1", "model", frozenset({"structured"}), frozenset({"proposal"}), frozenset({"private"}), "credential:provider", "reported", True, True, test)
     @property

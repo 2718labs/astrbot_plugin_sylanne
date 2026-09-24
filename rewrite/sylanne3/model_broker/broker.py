@@ -192,8 +192,10 @@ class ModelCallRequest:
         return canonical_digest({"envelope": self.envelope, "call_id": self.call_id,
                                  "provider_id": self.provider_id, "model_id": self.model_id,
                                  "purpose": self.envelope.authority.purpose,
+                                 "required_capabilities": sorted(self.required_capabilities),
                                  "privacy_tier": self.privacy_tier,
-                                 "template": self.prompt_template_digest, "payload": dict(self.payload)})
+                                 "template": self.prompt_template_digest, "payload": dict(self.payload),
+                                 "timeout_seconds": float(self.timeout_seconds)})
 
 
 @dataclass(frozen=True)
