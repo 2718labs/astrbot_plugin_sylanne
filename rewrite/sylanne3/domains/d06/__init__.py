@@ -20,6 +20,7 @@ from ...memory_types import (
     validate_subjective_trace, validate_subjective_trace_v2,
 )
 from ...memory_types import access_key, validate_access, validate_association
+from ...memory_types import InterpretationRecord, SourceRecord
 from ...memory_retrieval import MemoryBatch
 from ...graph_types import AtomKey, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec
 from ...runtime_contracts import (
@@ -61,6 +62,8 @@ _RECOLLECTION_SCHEMA_HASH = schema_hash({
     "storage_role": "source",
     "fields": sorted(_RECOLLECTION_FIELDS),
 })
+_WORKBENCH_VIEW = "d06.memory_sources.v1"
+_WORKBENCH_FIELDS = frozenset({"sources", "coverage"})
 
 
 def _nonempty(value: object, label: str) -> str:
@@ -490,6 +493,101 @@ class D06DomainProvider:
     @staticmethod
     def provide_required_check(intent, read: SourceGrantRead, *, valid_until: float):
         return provide_source_grant_check(intent, read, valid_until=valid_until)
+
+    @property
+    def workbench_view_contract(self):
+        # All three types are queried together through the caller's single
+        # event-owner graph snapshot. The D12 issuer currently caps that read
+        # at 100 atoms and hides its truncation bit for context-filtered views;
+        # the projector therefore rejects a full page rather than asserting
+        # completeness it cannot prove.
+        return {
+            _WORKBENCH_VIEW: {
+                "types": ("memory.source", "memory.access", "memory.interpretation"),
+                "fields": _WORKBENCH_FIELDS,
+                "projection_context": "d12.projection_context.v1",
+            },
+        }
+
+    @staticmethod
+    def project_workbench(view_type, atoms, *, context):
+        from ...workbench_api.domain_registry import PROJECTION_CONTEXT_V1, ProjectionContextV1
+
+        if view_type != _WORKBENCH_VIEW or not isinstance(context, ProjectionContextV1):
+            raise ValueError("unsupported D06 workbench projection context")
+        if context.schema_version != PROJECTION_CONTEXT_V1:
+            raise ValueError("unsupported D06 workbench projection context version")
+        if len(atoms) >= 100:
+            raise ValueError("D06 workbench snapshot completeness is not proven")
+
+        sources = {}
+        accesses = {}
+        interpretations = {}
+        for atom in atoms:
+            key_token = atom.get("key")
+            if not isinstance(key_token, str):
+                raise ValueError("D06 projection requires canonical atom identity")
+            key = AtomKey.from_token(key_token)
+            if ((key.owner.bot, key.owner.persona) != context.authority.namespace.as_tuple
+                    or key.owner.kind != "event"):
+                raise ValueError("D06 projection atom identity crosses authority scope")
+            atom_type = atom.get("type")
+            value = atom.get("value")
+            if key.type_name != atom_type:
+                raise ValueError("D06 projection atom identity/type mismatch")
+            if atom_type == "memory.source":
+                record = SourceRecord.from_dict(value)
+                if key.owner.subject != record.source_id or key.name != "record":
+                    raise ValueError("D06 source identity does not match graph key")
+                sources[record.source_id] = record
+            elif atom_type == "memory.access":
+                validate_access(value)
+                source_id = value["source_id"]
+                if key.owner.subject != source_id or key.name != "access":
+                    raise ValueError("D06 access identity does not match graph key")
+                if source_id in accesses:
+                    raise ValueError("duplicate D06 source access state")
+                accesses[source_id] = value
+            elif atom_type == "memory.interpretation":
+                record = InterpretationRecord.from_dict(value)
+                if key.owner.subject != record.interpretation_id or key.name != "current":
+                    raise ValueError("D06 interpretation identity does not match graph key")
+                interpretations[record.interpretation_id] = record
+            else:
+                raise ValueError("D06 projection input contains an undeclared type")
+
+        if set(accesses) != set(sources):
+            raise ValueError("D06 source/access closure is incomplete")
+        for interpretation in interpretations.values():
+            if not set(interpretation.source_ids).issubset(sources):
+                raise ValueError("D06 interpretation references an absent source")
+        retracted_sources = {
+            source_id
+            for interpretation in interpretations.values()
+            if interpretation.status == "retracted"
+            for source_id in interpretation.source_ids
+        }
+
+        projected = []
+        for source_id, source in sorted(sources.items()):
+            access = accesses[source_id]
+            if access["status"] != "active" or source_id in retracted_sources:
+                continue
+            if (context.audience not in source.audiences
+                    or context.purpose not in source.purposes
+                    or context.audience not in access["audiences"]
+                    or context.purpose not in access["purposes"]):
+                continue
+            # SourceRecord has no evidence-eligibility field. Expose only
+            # source metadata; do not infer a qualification from its status.
+            projected.append({
+                "source_id": source.source_id,
+                "source_kind": source.source_kind,
+                "assertion_status": source.assertion_status,
+                "recorded_at": source.recorded_at,
+                "qualification": "not_recorded",
+            })
+        return {"sources": projected, "coverage": "complete"}
 
     @property
     def descriptor(self) -> ProviderDescriptor:
