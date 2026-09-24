@@ -25,6 +25,7 @@ class SelfIdentityMapping:
     self_entity_ref: str
     certification_ref: str
     role_head_id: str
+    graph_incarnation: str
     status: str
 
     def __post_init__(self) -> None:
@@ -36,7 +37,8 @@ class SelfIdentityMapping:
             raise ValueError("self mapping needs persona and entity references")
         if not self.certification_ref.startswith("d11:self-identity:"):
             raise ValueError("self mapping needs a D11 certification reference")
-        if not self.role_head_id or self.status not in {"active", "revoked"}:
+        if (not self.role_head_id or not self.graph_incarnation
+                or self.status not in {"active", "revoked"}):
             raise ValueError("self mapping state is invalid")
 
 
@@ -106,6 +108,7 @@ def build_self_perspective_proposal(
     })
     if (mapping.status != "active" or mapping.persona_ref != f"persona:{namespace.persona_id}"
             or mapping.role_head_id != role.head_id
+            or not mapping.graph_incarnation
             or arrival_atom.key != AtomKey(Owner("event", *namespace.as_tuple, event.event_id),
                                           "d03.world_event", "current")
             or event.kind != "message_received" or event.reality != "host_observed"
@@ -191,6 +194,7 @@ def validate_self_perspective_snapshot(proposal: DomainProposal, snapshot: Graph
             or identity.persona_ref != value.persona_ref == f"persona:{namespace.persona_id}"
             or identity.self_entity_ref != value.self_entity_ref
             or identity.role_head_id != value.role_head_id
+            or identity.graph_incarnation != activation.value.get("graph_incarnation")
             or activation.value.get("head_id") != value.role_head_id
             or activation.value.get("owner_grant_id") != grant.value.get("grant_id")
             or activation.value.get("owner_grant_revision") != grant.revision
