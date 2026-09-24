@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
 
 from .authority_service.v2_owner_contract import OwnerActorBindingV1, OwnerPrincipalV1
-from .contracts import StaleRead
+from .contracts import StaleRead, canonical_json
 from .domain_registry import DomainRegistry, discover_domain_registry
 from .domains.d01 import ActiveRoleQualification
 from .domains.d03.context import RoleBinding
@@ -32,6 +32,10 @@ from .host.installed_package import verify_installed_package
 from .host.model_egress_executor import (
     FrozenEncodingEgressResult, HostModelEgressExecutor,
 )
+from .host.accounting_maintenance_port import InstalledAccountingMaintenancePort
+from .host.authority_client import AuthorityClient, AuthoritySelection
+from .host.model_terminal_cost_port import InstalledModelTerminalCostPort
+from .host.mtls_transport import MtlsAuthorityTransport
 from .host.first_ingress_result import OriginalFirstIngressRead
 from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
 from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
@@ -171,6 +175,7 @@ class RuntimeContext:
         self._v2_policy: AdminInstallationPolicy | None = None
         self._v2_installation_grant: InstallationGrantV2 | None = None
         self._v2_model_bundle: AdminInstallationBundle | None = None
+        self._v2_cost_transport: MtlsAuthorityTransport | None = None
         self._v2_owner_actor: Callable[[OwnerPrincipalV1, NamespaceId], str | None] | None = None
         self._workbench_owner_sessions: BoundOwnerSessions | None = None
         self._v2_provision: Callable | None = None
@@ -242,6 +247,34 @@ class RuntimeContext:
                 return self.health
 
             self._data_dir.mkdir(parents=True, exist_ok=True)
+
+            cost_transport = None
+            terminal_cost_port = None
+            accounting_port = None
+            bundle = installation.admin_bundle
+            if type(bundle) is AdminInstallationBundle:
+                cost_transport = MtlsAuthorityTransport({
+                    bundle.tls_profile.profile_id: bundle.tls_profile})
+                try:
+                    client = AuthorityClient(
+                        AuthoritySelection(bundle.tls_profile.profile_id),
+                        package_root=installation.package_root,
+                        data_dir=installation.data_dir,
+                        transport=cost_transport)
+                    status = await client.status_v2()
+                    if (status.state != "paired"
+                            or await client.installation_grant_v2() != installation_grant):
+                        raise RuntimeError("installed accounting observer is unpaired")
+                    loop = asyncio.get_running_loop()
+                    terminal_cost_port = InstalledModelTerminalCostPort(
+                        client=client, bundle=bundle,
+                        grant=installation_grant, owner_loop=loop)
+                    accounting_port = InstalledAccountingMaintenancePort(
+                        client=client, bundle=bundle,
+                        grant=installation_grant, owner_loop=loop)
+                except Exception:
+                    await cost_transport.close()
+                    cost_transport = None
 
             def make_store():
                 return ProductionGraphStore(
@@ -368,6 +401,8 @@ class RuntimeContext:
                     scene_identity_port=self._scene_identity_port,
                     scene_clock_policy=installation.ingress_clock,
                     encoding_request_issuer=encoding_request_issuer,
+                    model_terminal_cost_port=terminal_cost_port,
+                    accounting_maintenance_port=accounting_port,
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(
@@ -407,6 +442,8 @@ class RuntimeContext:
                     fence_port_factory=installation.fence_port_factory, capacity=capacity,
                 )
             except Exception:
+                if cost_transport is not None:
+                    await cost_transport.close()
                 self.health = RuntimeHealth(
                     "blocked", ("graph_worker",), "v2 graph worker could not initialize",
                 )
@@ -423,6 +460,7 @@ class RuntimeContext:
                 self._v2_port = port if isinstance(port, V2FencePort) else None
             self._v2_installation_grant = installation_grant
             self._v2_model_bundle = installation.admin_bundle
+            self._v2_cost_transport = cost_transport
             self._v2_role_probe = lambda graph: graph.read_active_role_v2(
                 namespace=policy.namespace,
             )
@@ -822,6 +860,42 @@ class RuntimeContext:
             owner_session_request=owner_session_request,
             owner_session_token=owner_session_token)
 
+    async def commit_first_ingress_model_cost_v1(
+        self, result: FrozenEncodingEgressResult,
+    ):
+        """Settle only the original observed call through W01's cost transaction.
+
+        An unresolved fence or lost graph response is HOLD. Re-entry with the
+        same intent uses W01's persisted call ID and fence attempt; it never
+        re-admits the model and never implies D06 candidate adoption.
+        """
+        if (type(result) is not FrozenEncodingEgressResult
+                or result.terminal is None
+                or self._worker is None or self._v2_bootstrap is None
+                or self._v2_namespace is None
+                or self._v2_cost_transport is None):
+            return None
+        intent = result.intent
+        namespace = self._v2_namespace
+        policy = self._v2_policy
+        if (type(intent) is not ModelEgressIntentV1
+                or policy is None
+                or (intent.authority_id, intent.namespace) !=
+                   (policy.expected_authority_id, policy.authority_namespace)
+                or result.terminal.call_id != intent.call_id
+                or result.terminal.request_digest != intent.request_digest):
+            return None
+        quote_id = "ingress-q-" + hashlib.sha256(canonical_json([
+            *namespace.as_tuple, intent.budget_reservation_operation_id,
+        ]).encode()).hexdigest()[:40]
+        try:
+            return await self._worker.call(
+                lambda graph: graph.commit_first_ingress_model_cost_v1(
+                    self._v2_bootstrap, namespace, intent,
+                    quote_id=quote_id, quote_version=1))
+        except Exception:
+            return None
+
     async def run_committed_first_ingress_encoding_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
         executor: HostModelEgressExecutor,
@@ -946,6 +1020,7 @@ class RuntimeContext:
             self._v2_policy = None
             self._v2_installation_grant = None
             self._v2_model_bundle = None
+            cost_transport, self._v2_cost_transport = self._v2_cost_transport, None
             self._v2_owner_actor = None
             self._workbench_owner_sessions = None
             self._v2_role_probe = None
@@ -960,11 +1035,15 @@ class RuntimeContext:
                 try:
                     await worker.close()
                 except V2FenceOutcomeUnknown:
+                    if cost_transport is not None:
+                        await cost_transport.close()
                     self.health = RuntimeHealth(
                         "blocked", ("v2_fence_recovery",),
                         "v2 Authority fence outcome is unresolved",
                     )
                     raise
+            if cost_transport is not None:
+                await cost_transport.close()
             if store is not None:
                 await asyncio.to_thread(store.close)
             self.health = RuntimeHealth("stopped")

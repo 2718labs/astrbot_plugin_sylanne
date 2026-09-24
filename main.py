@@ -379,6 +379,10 @@ class Sylanne3Plugin(Star):
             return
         if result is None or result.terminal is None:
             logger.warning("Sylanne 3 first encoding unresolved; HOLD")
+            return
+        cost = await runtime.commit_first_ingress_model_cost_v1(result)
+        if cost is None:
+            logger.warning("Sylanne 3 original model cost unresolved; upper bound retained")
 
 
 __all__ = ("Sylanne3Plugin",)

@@ -16,6 +16,9 @@ from ..authority_service.v2_model_egress_contract import (
 from ..authority_service.v2_model_result_read_contract import (
     ModelResultReadRequestV1, ModelResultReadV1,
 )
+from ..authority_service.v2_accounting_contract import (
+    AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
+)
 from ..model_broker.broker import ModelCallRequest
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.restore_anchor import RestoreAnchor
@@ -447,6 +450,47 @@ class AuthorityClient:
         return await self._transport.model_result_read_recover_finish_v1(
             request, handshake, grant, namespace=policy.authority_namespace,
             read_request=read_request)
+
+    async def accounting_begin_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        accounting_request: AccountingMaintenanceRequestV1,
+    ) -> AccountingMaintenanceGrantV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.accounting_begin_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            holder=policy.administrator_holder,
+            accounting_request=accounting_request)
+
+    async def accounting_validate_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        accounting_request: AccountingMaintenanceRequestV1,
+        accounting_grant: AccountingMaintenanceGrantV1,
+    ) -> bool:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.accounting_validate_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            holder=policy.administrator_holder, accounting_request=accounting_request,
+            accounting_grant=accounting_grant)
+
+    async def accounting_finish_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        accounting_request: AccountingMaintenanceRequestV1,
+        accounting_grant: AccountingMaintenanceGrantV1,
+    ) -> bool:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.accounting_finish_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            holder=policy.administrator_holder, accounting_request=accounting_request,
+            accounting_grant=accounting_grant)
+
+    async def accounting_recover_finish_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        accounting_request: AccountingMaintenanceRequestV1,
+    ) -> bool:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.accounting_recover_finish_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            holder=policy.administrator_holder, accounting_request=accounting_request)
 
     async def capability_grant(self) -> AuthorityCapabilityGrant | None:
         """Return a complete runtime grant; enrollment-only facts remain blocked."""

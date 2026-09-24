@@ -53,6 +53,12 @@ from ..authority_service.v2_model_result_read_contract import (
 from ..authority_service.v2_model_result_read_wire import (
     from_wire as result_from_wire, to_wire as result_to_wire,
 )
+from ..authority_service.v2_accounting_contract import (
+    AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
+)
+from ..authority_service.v2_accounting_wire import (
+    from_wire as accounting_from_wire, to_wire as accounting_to_wire,
+)
 from ..model_broker.broker import ModelCallRequest
 from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
@@ -722,6 +728,79 @@ class MtlsAuthorityTransport:
                 or response["finished"] is not True):
             raise RuntimeError("authority Owner read finish is unresolved")
         return True
+
+    async def _accounting_rpc(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str, holder: str,
+        method: str, accounting_request: AccountingMaintenanceRequestV1,
+        accounting_grant: AccountingMaintenanceGrantV1 | None = None,
+    ):
+        if type(accounting_request) is not AccountingMaintenanceRequestV1:
+            raise TypeError("original accounting maintenance request required")
+        self._model_identity(
+            request, handshake, grant, namespace, holder,
+            accounting_request.intent)
+        if (accounting_request.expected_anchor.authority_id != grant.authority_id
+                or accounting_request.expected_anchor.namespace != namespace):
+            raise RuntimeError("accounting anchor differs from installation")
+        command = {"namespace": namespace,
+                   "request": accounting_to_wire(accounting_request)}
+        if method in {"accounting_validate_v1", "accounting_finish_v1"}:
+            if type(accounting_grant) is not AccountingMaintenanceGrantV1:
+                raise TypeError("accounting grant required")
+            command["grant"] = accounting_to_wire(accounting_grant)
+        response = await self._content_rpc(
+            request, handshake, method, command,
+            protocol=AUTHORITY_V2_PROTOCOL)
+        expected = ({"grant", "channel_binding_sha256"}
+                    if method == "accounting_begin_v1" else
+                    {"valid", "channel_binding_sha256"}
+                    if method == "accounting_validate_v1" else
+                    {"finished", "channel_binding_sha256"})
+        if set(response) != expected:
+            raise RuntimeError("authority accounting response is invalid")
+        if method == "accounting_begin_v1":
+            observed = accounting_from_wire(
+                response["grant"], AccountingMaintenanceGrantV1)
+            if (observed.call_id != accounting_request.intent.call_id
+                    or observed.permit.operation_id != accounting_request.operation_id
+                    or observed.permit.pinned_anchor !=
+                       accounting_request.expected_anchor):
+                raise RuntimeError("authority accounting grant identity differs")
+            return observed
+        field = "valid" if method == "accounting_validate_v1" else "finished"
+        if response[field] is not True:
+            raise RuntimeError("authority accounting fence is unresolved")
+        return True
+
+    async def accounting_begin_v1(self, request, handshake, grant, *,
+                                  namespace, holder, accounting_request):
+        return await self._accounting_rpc(
+            request, handshake, grant, namespace=namespace, holder=holder,
+            method="accounting_begin_v1", accounting_request=accounting_request)
+
+    async def accounting_validate_v1(self, request, handshake, grant, *,
+                                     namespace, holder, accounting_request,
+                                     accounting_grant):
+        return await self._accounting_rpc(
+            request, handshake, grant, namespace=namespace, holder=holder,
+            method="accounting_validate_v1", accounting_request=accounting_request,
+            accounting_grant=accounting_grant)
+
+    async def accounting_finish_v1(self, request, handshake, grant, *,
+                                   namespace, holder, accounting_request,
+                                   accounting_grant):
+        return await self._accounting_rpc(
+            request, handshake, grant, namespace=namespace, holder=holder,
+            method="accounting_finish_v1", accounting_request=accounting_request,
+            accounting_grant=accounting_grant)
+
+    async def accounting_recover_finish_v1(self, request, handshake, grant, *,
+                                           namespace, holder, accounting_request):
+        return await self._accounting_rpc(
+            request, handshake, grant, namespace=namespace, holder=holder,
+            method="accounting_recover_finish_v1",
+            accounting_request=accounting_request)
 
     async def ingress_clock_sample_v2(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

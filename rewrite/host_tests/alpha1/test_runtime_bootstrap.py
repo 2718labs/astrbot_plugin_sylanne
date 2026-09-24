@@ -717,11 +717,16 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         class ControlledRuntime:
             def __init__(self):
                 self.calls = 0
+                self.cost_calls = 0
 
             async def handle_ingress(self, _envelope):
                 self.calls += 1
                 return IngressReceipt(
                     "accepted" if self.calls == 1 else "duplicate", "ingress-op")
+
+            async def commit_first_ingress_model_cost_v1(self, result):
+                self.cost_calls += 1
+                return object()
 
         plugin = module.Sylanne3Plugin(
             Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),
@@ -743,6 +748,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(run.await_count, 1)
             self.assertEqual(run.await_args.kwargs["trusted_umo"], event.unified_msg_origin)
             self.assertEqual(run.await_args.kwargs["receipt"].status, "accepted")
+            self.assertEqual(plugin._runtime.cost_calls, 1)
         self.assertFalse(event.is_stopped())
         self.assertEqual(event.sent, [])
 
