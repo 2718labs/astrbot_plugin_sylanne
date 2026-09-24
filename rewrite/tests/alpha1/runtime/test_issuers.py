@@ -3,11 +3,14 @@ import json
 import time
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sylanne3.graph_coordinator import budget_operation_digest
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.host.authority_profile import (
-    AdminD04EncodingBaselinePolicy, _d04_baseline_from_payload,
+    AdminD04EncodingBaselinePolicy, AdminD06FirstIngressC02Policy,
+    _d04_baseline_from_payload,
     _policy_from_payload,
 )
 from sylanne3.runtime import install_schema as install_runtime_schema
@@ -22,6 +25,7 @@ from sylanne3.runtime.issuers import (
     ResourceOutcome,
     ResourceQuote,
     D04_BASELINE_WORK_KIND,
+    D06_FIRST_INGRESS_C02_WORK_KIND,
     d04_baseline_quote_id,
     build_runtime_issuers,
     install_schema as install_issuer_schema,
@@ -379,6 +383,78 @@ class ProductionIssuerTests(unittest.TestCase):
             _policy_from_payload(profile)
         profile.pop("d04_encoding_baseline")
         self.assertIsNone(_d04_baseline_from_payload(profile))
+
+    def test_d06_c02_stage_has_own_signed_price_and_consumer_identity(self):
+        source = AtomKey(Owner("event", "bot", "persona", "source-event"),
+                         "memory.source", "record")
+        event = AtomKey(Owner("event", "bot", "persona", "arrival-event"),
+                        "d03.world_event", "current")
+        baseline = AtomKey(source.owner, "d04.encoding_baseline.v1", "baseline")
+        refs = (source.token, event.token, baseline.token)
+        identity = replace(
+            self.envelope.identity, phase="first_ingress_c02",
+            operation_id="first-ingress-c02-consumer",
+            canonical_input_digest=canonical_digest({"input_refs": list(refs)}),
+        )
+        envelope = replace(
+            self.envelope, identity=identity,
+            authority=replace(self.envelope.authority, issuer_domain="d06",
+                              owner_scope=("event",), worker_fence=1),
+            version_guard=replace(self.envelope.version_guard,
+                read_versions=(GraphVersion(source, 1), GraphVersion(event, 1),
+                               GraphVersion(baseline, 1)),
+                resource_lease_versions=()),
+            source_qualification=replace(
+                self.envelope.source_qualification, source_refs=(source.token,)),
+            input_refs=refs,
+        )
+        origin = SimpleNamespace(
+            job_id="job-1", activity_id="activity-1", operation_id="op-1",
+            acquire_operation_id="acquire-1", call_id="call-1",
+            binding_digest="a" * 64, model_request_digest="b" * 64,
+            cost_operation_id="model-cost-1", cost_receipt_digest="c" * 64,
+            source_ref=source.token,
+            consumer_operation_id=identity.operation_id,
+            installation_id="installation-1",
+        )
+        grant = replace(self.grant(), allowed_work_kinds=(
+            D06_FIRST_INGRESS_C02_WORK_KIND,))
+        policy = AdminD06FirstIngressC02Policy(
+            60.0, {"cpu_ms": 5}, "c02-snapshot", "c02-resource")
+        now = envelope.deadline_utc - 30.0
+        with patch("sylanne3.runtime.issuers._d06_c02_origin", return_value=origin):
+            with self.assertRaisesRegex(IssuerAuthorityDenied, "grant is absent"):
+                self.d11.issue_d06_first_ingress_c02_quote(
+                    self.db, envelope, policy, installation_id="installation-1",
+                    job_id="job-1", now_utc=now)
+            self.d11.issue_budget_grant(self.db, grant)
+            quote = self.d11.issue_d06_first_ingress_c02_quote(
+                self.db, envelope, policy, installation_id="installation-1",
+                job_id="job-1", now_utc=now)
+            self.assertEqual(quote.work_kind, D06_FIRST_INGRESS_C02_WORK_KIND)
+            self.assertEqual(quote.operation_id, origin.consumer_operation_id)
+            self.assertEqual(quote.ceiling, {"cpu_ms": 5})
+            self.assertIsNone(quote.graph_job_ref)
+            self.assertEqual((quote.outbox_refs, quote.d02_settlement_refs), ((), ()))
+            guarded = replace(envelope, version_guard=replace(
+                envelope.version_guard,
+                resource_lease_versions=(VersionedRef(quote.quote_id, 1),)))
+            self.assertEqual(self.d11._admission_state(
+                guarded, self.db, now_utc=now)[0], quote)
+            with self.assertRaisesRegex(IssuerAuthorityDenied, "consumer"):
+                self.d11.issue_d06_first_ingress_c02_quote(
+                    self.db, replace(envelope, identity=replace(
+                        identity, operation_id="client-chosen")), policy,
+                    installation_id="installation-1", job_id="job-1", now_utc=now)
+            self.db.execute("UPDATE runtime_d06_c02_quote_policies SET policy_json="
+                            "replace(policy_json,'\"cpu_ms\":5','\"cpu_ms\":6')")
+            with self.assertRaisesRegex(IssuerAuthorityDenied, "signature is invalid"):
+                self.d11._admission_state(guarded, self.db, now_utc=now)
+
+    def test_d06_c02_price_never_rebills_original_model(self):
+        with self.assertRaisesRegex(ValueError, "already-settled model"):
+            AdminD06FirstIngressC02Policy(
+                60.0, {"output_tokens": 5}, "c02-snapshot", "c02-resource")
 
 
 if __name__ == "__main__":

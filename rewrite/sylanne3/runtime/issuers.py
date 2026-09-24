@@ -182,6 +182,10 @@ class BudgetLeaseGrant:
 
 D03_ARRIVAL_WORK_KIND = "d03.message_received"
 D04_BASELINE_WORK_KIND = "d04.encoding_baseline"
+D06_FIRST_INGRESS_C02_WORK_KIND = "d06.first_ingress_c02"
+_MODEL_COST_DIMENSIONS = frozenset({
+    "input_tokens", "output_tokens", "model_tokens", "model_microusd",
+})
 
 
 @dataclass(frozen=True)
@@ -244,6 +248,64 @@ class D04BaselineQuotePolicy:
             raise ValueError("D04 baseline deadline bound must be positive")
         object.__setattr__(self, "deadline_after_seconds", deadline)
         object.__setattr__(self, "quote_ceiling", _amounts(self.quote_ceiling))
+
+
+@dataclass(frozen=True)
+class D06FirstIngressC02QuotePolicy:
+    """D02 signature binds one independently priced C02 to its original call."""
+
+    policy_id: str
+    bot_id: str
+    persona_id: str
+    installation_id: str
+    grant_id: str
+    grant_version: int
+    lease_id: str
+    provider_policy_ref: str
+    quote_ceiling: Mapping[str, int]
+    deadline_after_seconds: float
+    snapshot_ref: str
+    resource_ref: str
+    job_id: str
+    original_activity_id: str
+    original_operation_id: str
+    acquire_operation_id: str
+    original_call_id: str
+    binding_digest: str
+    model_request_digest: str
+    cost_operation_id: str
+    cost_receipt_digest: str
+    source_ref: str
+    baseline_ref: str
+    baseline_revision: int
+    consumer_operation_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("policy_id", "bot_id", "persona_id", "installation_id",
+                     "grant_id", "lease_id", "provider_policy_ref",
+                     "snapshot_ref", "resource_ref", "job_id",
+                     "original_activity_id", "original_operation_id",
+                     "acquire_operation_id", "original_call_id",
+                     "cost_operation_id", "consumer_operation_id"):
+            _id(getattr(self, name), name)
+        for name in ("source_ref", "baseline_ref"):
+            _ref(getattr(self, name), name)
+        for name in ("binding_digest", "model_request_digest", "cost_receipt_digest"):
+            digest = getattr(self, name)
+            if type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError(f"D06 C02 {name} must be SHA-256")
+        if type(self.grant_version) is not int or self.grant_version < 1:
+            raise ValueError("D06 C02 grant version is invalid")
+        if type(self.baseline_revision) is not int or self.baseline_revision < 1:
+            raise ValueError("D06 C02 baseline revision is invalid")
+        deadline = _finite(self.deadline_after_seconds, "deadline_after_seconds")
+        if deadline <= 0:
+            raise ValueError("D06 C02 deadline bound must be positive")
+        ceiling = _amounts(self.quote_ceiling)
+        if _MODEL_COST_DIMENSIONS & ceiling.keys():
+            raise ValueError("D06 C02 cannot price the original model call again")
+        object.__setattr__(self, "deadline_after_seconds", deadline)
+        object.__setattr__(self, "quote_ceiling", ceiling)
 
 
 def _d03_policy_id(installation_id: str, grant: BudgetLeaseGrant) -> str:
@@ -339,6 +401,271 @@ def _d04_baseline_input_keys(envelope: CommandEnvelope) -> tuple[AtomKey, AtomKe
     return source, event
 
 
+def _d06_c02_policy_id(installation_id: str, grant: BudgetLeaseGrant,
+                       operation_id: str) -> str:
+    return "d06-c02-policy-" + canonical_digest({
+        "installation_id": installation_id,
+        "namespace": [grant.bot_id, grant.persona_id],
+        "grant_id": grant.grant_id, "grant_version": grant.version,
+        "operation_id": operation_id,
+    })[:40]
+
+
+def d06_first_ingress_c02_quote_id(namespace, operation_id: str) -> str:
+    return "d06-c02-q-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+    })[:40]
+
+
+def _d06_c02_quote_refs(policy: D06FirstIngressC02QuotePolicy,
+                        envelope: CommandEnvelope) -> tuple[str, str]:
+    snapshot = "d06c02snap:" + policy.policy_id + ":" + canonical_digest({
+        "policy": _payload(policy),
+        "guard": replace(envelope.version_guard, resource_lease_versions=()),
+        "identity": envelope.identity,
+        "source_qualification": envelope.source_qualification,
+        "input_refs": envelope.input_refs,
+    })[:32]
+    resource = "d06c02src:" + canonical_digest({
+        "policy_id": policy.policy_id, "resource_ref": policy.resource_ref,
+        "input_refs": envelope.input_refs,
+    })[:56]
+    return snapshot, resource
+
+
+def _d06_c02_input_keys(envelope: CommandEnvelope) -> tuple[AtomKey, AtomKey, AtomKey]:
+    identity = envelope.identity
+    authority = envelope.authority
+    if (authority.issuer_domain != "d06" or authority.worker_fence is None
+            or "event" not in authority.owner_scope
+            or identity.phase != "first_ingress_c02"
+            or identity.effect_id is not None
+            or len(envelope.input_refs) != 3
+            or envelope.source_qualification.source_refs != envelope.input_refs[:1]
+            or identity.canonical_input_digest != canonical_digest({
+                "input_refs": list(envelope.input_refs),
+            })):
+        raise IssuerAuthorityDenied("D06 C02 requires exact worker stage identity")
+    try:
+        source, event, baseline = (
+            AtomKey.from_token(ref) for ref in envelope.input_refs
+        )
+    except (TypeError, ValueError) as exc:
+        raise IssuerAuthorityDenied("D06 C02 input reference is invalid") from exc
+    namespace = authority.namespace.as_tuple
+    if (source.type_name != "memory.source" or source.owner.kind != "event"
+            or source.name != "record"
+            or event.type_name != "d03.world_event" or event.owner.kind != "event"
+            or baseline.type_name != "d04.encoding_baseline.v1"
+            or baseline.owner != source.owner
+            or any((key.owner.bot, key.owner.persona) != namespace
+                   for key in (source, event, baseline))):
+        raise IssuerAuthorityDenied("D06 C02 inputs cross source or namespace")
+    guarded = {item.key: item.revision for item in envelope.version_guard.read_versions}
+    if (len(guarded) != len(envelope.version_guard.read_versions)
+            or any(guarded.get(key, 0) < 1 for key in (source, event, baseline))):
+        raise IssuerAuthorityDenied("D06 C02 input refs need committed guards")
+    return source, event, baseline
+
+
+@dataclass(frozen=True)
+class _D06C02Origin:
+    job_id: str
+    activity_id: str
+    operation_id: str
+    acquire_operation_id: str
+    call_id: str
+    binding_digest: str
+    model_request_digest: str
+    cost_operation_id: str
+    cost_receipt_digest: str
+    source_ref: str
+    consumer_operation_id: str
+    installation_id: str
+
+
+def _d06_c02_origin(db, envelope: CommandEnvelope, job_id: str,
+                    d02_issuer: "D02ResourceIssuer", *, now_utc: float) -> _D06C02Origin:
+    """Read original committed identities; this is no Authority result grant."""
+    from ..memory_types import access_key
+    from .encoding_call_binding import binding_to_json, load_binding
+    from .first_ingress_c02_identity import first_ingress_c02_consumer_operation_id_v1
+    from .model_cost_settlement import OriginalModelCostCommitV1
+
+    source, event, baseline = _d06_c02_input_keys(envelope)
+    namespace = envelope.authority.namespace
+    try:
+        job = get_job(db, job_id)
+        binding = load_binding(db, namespace, job_id)
+        if binding is None:
+            raise IssuerAuthorityDenied("D06 C02 original call binding is absent")
+        acquire_id = binding.request["acquire_operation_id"]
+        acquire = db.execute(
+            "SELECT i.job_id,i.original_operation_id,i.actor,i.encoding_binding_json,"
+            "i.requirements_json,r.job_json FROM graph_job_acquire_intents_v2 AS i "
+            "JOIN graph_job_acquire_receipts_v2 AS r "
+            "ON r.bot=i.bot AND r.persona=i.persona "
+            "AND r.acquire_operation_id=i.acquire_operation_id "
+            "WHERE i.bot=? AND i.persona=? AND i.acquire_operation_id=?",
+            namespace.as_tuple + (acquire_id,),
+        ).fetchone()
+        metadata = db.execute(
+            "SELECT requirements_json FROM graph_recovery_metadata_v2 "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        provision = db.execute(
+            "SELECT receipt_json FROM graph_namespace_provisioning_v2 "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        original_quote_ref = job.operator_versions["resource_quote"]
+        original_quote_id, version_text = original_quote_ref.rsplit(":", 1)
+        original_quote_version = int(version_text)
+        original_quote = d02_issuer.original_signed_quote(
+            db, original_quote_id, original_quote_version)
+        lease_expires = datetime.fromisoformat(
+            job.lease_expires_utc.replace("Z", "+00:00"))
+    except (KeyError, ValueError, TypeError, IndexError, AttributeError) as exc:
+        raise IssuerAuthorityDenied("D06 C02 original identity is incomplete") from exc
+    if (acquire is None or metadata is None or provision is None
+            or job.work_kind != "d06.encode_source" or job.phase != "running"
+            or job.cancel_epoch != 0 or job.fence < 1
+            or lease_expires.tzinfo is None
+            or lease_expires.timestamp() <= now_utc
+            or (job.bot_id, job.persona_id) != namespace.as_tuple
+            or job.activity_id != envelope.identity.activity_id
+            or job.operation_id != binding.budget_reservation_operation_id
+            or job.budget_ref != binding.budget_lease_id
+            or envelope.parent_budget_lease_ref != job.budget_ref
+            or job.lease_holder != envelope.authority.actor
+            or job.fence != envelope.authority.worker_fence
+            or binding.source_id != source.owner.subject
+            or (original_quote.bot_id, original_quote.persona_id,
+                original_quote.activity_id, original_quote.operation_id,
+                original_quote.parent_budget_lease_ref, original_quote.work_kind)
+            != (*namespace.as_tuple, job.activity_id, job.operation_id,
+                job.budget_ref, "d06.encode_source")
+            or acquire[:4] != (job_id, job.operation_id,
+                               job.lease_holder, binding_to_json(binding))):
+        raise IssuerAuthorityDenied("D06 C02 differs from current original job")
+    try:
+        frozen_job = json.loads(acquire[5])
+        historical_requirements = json.loads(acquire[4])
+        requirements = json.loads(metadata[0])
+        genesis = json.loads(provision[0])
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise IssuerAuthorityDenied("D06 C02 original graph identity is invalid") from exc
+    if (type(frozen_job) is not dict or type(historical_requirements) is not dict
+            or type(requirements) is not dict or type(genesis) is not dict
+            or frozen_job.get("job_id") != job_id
+            or frozen_job.get("fence") != job.fence
+            or frozen_job.get("lease_holder") != job.lease_holder
+            or frozen_job.get("lease_expires_utc") != job.lease_expires_utc
+            or historical_requirements.get("graph_incarnation")
+            != requirements.get("graph_incarnation")
+            or genesis.get("graph_incarnation") != requirements.get("graph_incarnation")
+            or genesis.get("authority_id") != requirements.get("authority_id")
+            or genesis.get("authority_namespace")
+            != requirements.get("authority_namespace")
+            or genesis.get("namespace") != {
+                "bot_id": namespace.bot_id, "persona_id": namespace.persona_id,
+            }):
+        raise IssuerAuthorityDenied("D06 C02 original acquire or installation differs")
+    if db.execute(
+            "SELECT 1 FROM runtime_encoding_call_redactions_v1 "
+            "WHERE bot=? AND persona=? AND (call_id=? OR source_id=?)",
+            namespace.as_tuple + (binding.call_id, binding.source_id),
+    ).fetchone() is not None:
+        raise IssuerAuthorityDenied("D06 C02 original call has been redacted")
+    source_row = db.execute(
+        "SELECT revision,valid FROM graph_atoms WHERE token=?", (source.token,),
+    ).fetchone()
+    access = access_key(*namespace.as_tuple, binding.source_id)
+    access_row = db.execute(
+        "SELECT revision,valid FROM graph_atoms WHERE token=?", (access.token,),
+    ).fetchone()
+    event_row = db.execute(
+        "SELECT revision,valid,value FROM graph_atoms WHERE token=?", (event.token,),
+    ).fetchone()
+    baseline_row = db.execute(
+        "SELECT revision,valid,value FROM graph_atoms WHERE token=?", (baseline.token,),
+    ).fetchone()
+    guarded = {item.key: item.revision for item in envelope.version_guard.read_versions}
+    if (source_row != (binding.source_revision, 1)
+            or access_row != (binding.access_revision, 1)
+            or guarded.get(source) != binding.source_revision
+            or guarded.get(access) != binding.access_revision
+            or event_row is None or event_row[:2] != (guarded[event], 1)
+            or baseline_row is None or baseline_row[:2] != (guarded[baseline], 1)):
+        raise IssuerAuthorityDenied("D06 C02 source, access or baseline is stale")
+    try:
+        event_value = json.loads(event_row[2])
+        baseline_value = json.loads(baseline_row[2])
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise IssuerAuthorityDenied("D06 C02 D03/D04 evidence is invalid") from exc
+    if (type(event_value) is not dict or type(baseline_value) is not dict
+            or event_value.get("event_id") != event.owner.subject
+            or event_value.get("kind") != "message_received"
+            or event_value.get("reality") != "host_observed"
+            or event_value.get("source_refs") != [source.token]
+            or baseline_value.get("baseline_id") != baseline.name
+            or baseline_value.get("source_refs") != [source.token]):
+        raise IssuerAuthorityDenied("D06 C02 D03/D04 evidence differs from source")
+    cost_operation_id = "model-cost-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "call_id": binding.call_id,
+    })[:48]
+    cost_row = db.execute(
+        "SELECT activity_id,commit_seq,receipt_json FROM graph_bundle_operations "
+        "WHERE bot=? AND persona=? AND operation_id=?",
+        namespace.as_tuple + (cost_operation_id,),
+    ).fetchone()
+    if cost_row is None or cost_row[0] != job.activity_id:
+        raise IssuerAuthorityDenied("D06 C02 original model cost receipt is absent")
+    try:
+        cost_data = json.loads(cost_row[2])
+        if type(cost_data) is not dict:
+            raise ValueError("model cost receipt must be an object")
+        cost = OriginalModelCostCommitV1(**cost_data["original_model_cost"])
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        raise IssuerAuthorityDenied("D06 C02 original model cost receipt is invalid") from exc
+    cost_atom = db.execute(
+        "SELECT valid FROM graph_atoms WHERE token=?", (cost.cost_ref,),
+    ).fetchone()
+    settled = db.execute(
+        "SELECT state FROM runtime_budget_reservations "
+        "WHERE lease_id=? AND operation_id=?",
+        (job.budget_ref, job.operation_id),
+    ).fetchone()
+    settle_op = db.execute(
+        "SELECT 1 FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? "
+        "AND operation_id=? AND phase='settle'",
+        namespace.as_tuple + (job.operation_id,),
+    ).fetchone()
+    if (cost.status != "committed" or cost.operation_id != cost_operation_id
+            or cost.call_id != binding.call_id
+            or (cost.quote_id, cost.quote_version)
+            != (original_quote_id, original_quote_version)
+            or cost.commit_seq != cost_row[1]
+            or cost_atom != (1,) or settled != ("settled",)
+            or settle_op is None):
+        raise IssuerAuthorityDenied("D06 C02 original model cost is not fully settled")
+    consumer = first_ingress_c02_consumer_operation_id_v1(
+        namespace=namespace,
+        authority_id=requirements["authority_id"],
+        authority_namespace=requirements["authority_namespace"],
+        installation_id=genesis["installation_id"],
+        job_id=job_id, acquire_operation_id=acquire_id,
+        original_operation_id=job.operation_id, call_id=binding.call_id,
+        binding_digest=binding.binding_digest,
+        model_request_digest=binding.model_request_digest,
+    )
+    return _D06C02Origin(
+        job_id, job.activity_id, job.operation_id, acquire_id,
+        binding.call_id, binding.binding_digest, binding.model_request_digest,
+        cost_operation_id, canonical_digest(cost_data), source.token,
+        consumer, genesis["installation_id"],
+    )
+
+
 @dataclass(frozen=True)
 class ResourceOutcome:
     outcome_id: str
@@ -387,6 +714,10 @@ def _decode_d03_policy(payload: str) -> D03ArrivalQuotePolicy:
 
 def _decode_d04_policy(payload: str) -> D04BaselineQuotePolicy:
     return D04BaselineQuotePolicy(**json.loads(payload))
+
+
+def _decode_d06_c02_policy(payload: str) -> D06FirstIngressC02QuotePolicy:
+    return D06FirstIngressC02QuotePolicy(**json.loads(payload))
 
 
 def _decode_outcome(payload: str) -> ResourceOutcome:
@@ -449,6 +780,14 @@ def install_schema(db) -> None:
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS runtime_d04_baseline_quote_policies(
+            policy_id TEXT PRIMARY KEY,
+            policy_json TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            status TEXT NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_d06_c02_quote_policies(
             policy_id TEXT PRIMARY KEY,
             policy_json TEXT NOT NULL,
             signature TEXT NOT NULL,
@@ -633,6 +972,68 @@ class D02ResourceIssuer:
                     envelope.authority.namespace, envelope.identity.operation_id)
                 or dict(quote.ceiling) != dict(policy.quote_ceiling)):
             raise IssuerAuthorityDenied("D04 baseline quote differs from signed policy")
+        return policy
+
+    def _install_d06_c02_policy(self, db, policy: D06FirstIngressC02QuotePolicy) -> str:
+        payload = canonical_serialize(_payload(policy))
+        signature = self._signer.sign("d06-first-ingress-c02-policy.v1", payload)
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM runtime_d06_c02_quote_policies "
+            "WHERE policy_id=?", (policy.policy_id,),
+        ).fetchone()
+        if row is not None:
+            self._signer.verify("d06-first-ingress-c02-policy.v1", row[0], row[1])
+            if row != (payload, signature, "active"):
+                raise IssuerAuthorityDenied("D06 C02 policy replay differs")
+            return signature
+        db.execute(
+            "INSERT INTO runtime_d06_c02_quote_policies"
+            "(policy_id,policy_json,signature,status) VALUES(?,?,?,'active')",
+            (policy.policy_id, payload, signature),
+        )
+        return signature
+
+    def _load_d06_c02_policy(self, db, policy_id: str) -> D06FirstIngressC02QuotePolicy:
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM runtime_d06_c02_quote_policies "
+            "WHERE policy_id=?", (policy_id,),
+        ).fetchone()
+        if row is None or row[2] != "active":
+            raise IssuerAuthorityDenied("active signed D06 C02 policy is absent")
+        self._signer.verify("d06-first-ingress-c02-policy.v1", row[0], row[1])
+        try:
+            policy = _decode_d06_c02_policy(row[0])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("signed D06 C02 policy is invalid") from exc
+        if policy.policy_id != policy_id:
+            raise IssuerAuthorityDenied("signed D06 C02 policy identity differs")
+        return policy
+
+    def _qualified_d06_c02_policy(self, db, envelope: CommandEnvelope,
+                                  quote: ResourceQuote,
+                                  grant: BudgetLeaseGrant) -> D06FirstIngressC02QuotePolicy:
+        parts = quote.snapshot_ref.split(":")
+        if len(parts) != 3 or parts[0] != "d06c02snap":
+            raise IssuerAuthorityDenied("D06 C02 quote lacks policy binding")
+        policy = self._load_d06_c02_policy(db, parts[1])
+        snapshot_ref, resource_ref = _d06_c02_quote_refs(policy, envelope)
+        if (policy.policy_id != _d06_c02_policy_id(
+                    policy.installation_id, grant, envelope.identity.operation_id)
+                or (policy.bot_id, policy.persona_id)
+                != envelope.authority.namespace.as_tuple
+                or (policy.grant_id, policy.grant_version, policy.lease_id,
+                    policy.provider_policy_ref) != (
+                    grant.grant_id, grant.version, grant.lease_id, grant.policy_ref)
+                or quote.snapshot_ref != snapshot_ref
+                or quote.resource_ref != resource_ref
+                or quote.quote_id != d06_first_ingress_c02_quote_id(
+                    envelope.authority.namespace, envelope.identity.operation_id)
+                or quote.activity_id != policy.original_activity_id
+                or quote.operation_id != policy.consumer_operation_id
+                or quote.graph_job_ref is not None or quote.outbox_refs
+                or quote.d02_settlement_refs
+                or dict(quote.ceiling) != dict(policy.quote_ceiling)):
+            raise IssuerAuthorityDenied("D06 C02 quote differs from signed policy")
         return policy
 
     def issue_outcome(self, db, outcome: ResourceOutcome) -> str:
@@ -1009,6 +1410,86 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         self._d02._issue_bound_stage_quote(db, quote)
         return quote
 
+    def issue_d06_first_ingress_c02_quote(
+            self, db, envelope: CommandEnvelope, admin_policy, *,
+            installation_id: str, job_id: str,
+            now_utc: float | None = None) -> ResourceQuote:
+        """Price one C02 stage after independently settled original model work.
+
+        This signs no C02 adoption, graph write, or zero-cost outcome. The
+        caller still needs a fresh Authority result and fenced graph commit.
+        """
+        from ..host.authority_profile import AdminD06FirstIngressC02Policy
+
+        if type(admin_policy) is not AdminD06FirstIngressC02Policy:
+            raise IssuerAuthorityDenied("installed D06 C02 policy is required")
+        if not isinstance(envelope, CommandEnvelope):
+            raise TypeError("envelope must be CommandEnvelope")
+        _id(installation_id, "installation_id")
+        _id(job_id, "job_id")
+        if envelope.version_guard.resource_lease_versions:
+            raise IssuerAuthorityDenied("D06 C02 quote request has prior resource refs")
+        _, _, baseline = _d06_c02_input_keys(envelope)
+        now = _now_utc(now_utc)
+        origin = _d06_c02_origin(db, envelope, job_id, self._d02, now_utc=now)
+        grant = self._load_grant(db, envelope.parent_budget_lease_ref)
+        lease = get_budget_lease(db, grant.lease_id)
+        authority = envelope.authority
+        if (origin.installation_id != installation_id
+                or origin.consumer_operation_id != envelope.identity.operation_id
+                or D06_FIRST_INGRESS_C02_WORK_KIND not in grant.allowed_work_kinds
+                or (grant.bot_id, grant.persona_id) != authority.namespace.as_tuple
+                or (lease.bot_id, lease.persona_id, lease.currency)
+                != (grant.bot_id, grant.persona_id, grant.currency)
+                or lease.state != "active"
+                or grant.policy_ref != authority.provider_policy_ref
+                or grant.valid_until_utc <= now
+                or not now < envelope.deadline_utc <= min(
+                    now + admin_policy.deadline_after_seconds,
+                    grant.valid_until_utc)):
+            raise IssuerAuthorityDenied("D06 C02 lacks original consumer or current grant")
+        if any(amount > grant.max_ceiling.get(name, 0)
+               for name, amount in admin_policy.quote_ceiling.items()):
+            raise IssuerAuthorityDenied("D06 C02 quote exceeds signed grant")
+        policy = D06FirstIngressC02QuotePolicy(
+            _d06_c02_policy_id(installation_id, grant, origin.consumer_operation_id),
+            *authority.namespace.as_tuple, installation_id,
+            grant.grant_id, grant.version, grant.lease_id, grant.policy_ref,
+            dict(admin_policy.quote_ceiling), admin_policy.deadline_after_seconds,
+            admin_policy.snapshot_ref, admin_policy.resource_ref,
+            origin.job_id, origin.activity_id, origin.operation_id,
+            origin.acquire_operation_id, origin.call_id,
+            origin.binding_digest, origin.model_request_digest,
+            origin.cost_operation_id, origin.cost_receipt_digest,
+            origin.source_ref, baseline.token,
+            next(item.revision for item in envelope.version_guard.read_versions
+                 if item.key == baseline), origin.consumer_operation_id,
+        )
+        snapshot_ref, resource_ref = _d06_c02_quote_refs(policy, envelope)
+        quote = ResourceQuote(
+            d06_first_ingress_c02_quote_id(authority.namespace,
+                                           origin.consumer_operation_id),
+            1, *authority.namespace.as_tuple, origin.activity_id,
+            origin.consumer_operation_id, None, grant.lease_id,
+            D06_FIRST_INGRESS_C02_WORK_KIND, snapshot_ref,
+            envelope.deadline_utc, resource_ref, None, (), (),
+            dict(policy.quote_ceiling), authority.worker_fence,
+            envelope.deadline_utc,
+        )
+        install_schema(db)
+        existing = db.execute(
+            "SELECT 1 FROM runtime_resource_quotes WHERE quote_id=? AND version=1",
+            (quote.quote_id,),
+        ).fetchone()
+        if existing is None and any(
+                amount > lease.limits.get(name, 0) - lease.used.get(name, 0)
+                - lease.reserved.get(name, 0) - lease.unconfirmed.get(name, 0)
+                for name, amount in policy.quote_ceiling.items()):
+            raise IssuerAuthorityDenied("D06 C02 budget has insufficient capacity")
+        self._d02._install_d06_c02_policy(db, policy)
+        self._d02._issue_bound_stage_quote(db, quote)
+        return quote
+
     def authorize_existing_encoding_job(self, db, job: PersistentJob, *,
                                         now_utc: float) -> bool:
         """Recheck the original signed grant and quote without reserving again."""
@@ -1070,6 +1551,29 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
                     or quote.d02_settlement_refs):
                 raise IssuerAuthorityDenied("D04 baseline quote contains unrelated runtime refs")
             self._d02._qualified_d04_baseline_policy(db, envelope, quote, grant)
+        if quote.work_kind == D06_FIRST_INGRESS_C02_WORK_KIND:
+            _, _, baseline = _d06_c02_input_keys(envelope)
+            policy = self._d02._qualified_d06_c02_policy(db, envelope, quote, grant)
+            origin = _d06_c02_origin(
+                db, envelope, policy.job_id, self._d02, now_utc=now_utc)
+            baseline_revision = next(
+                item.revision for item in envelope.version_guard.read_versions
+                if item.key == baseline)
+            if (policy.installation_id != origin.installation_id
+                    or (policy.job_id, policy.original_activity_id,
+                        policy.original_operation_id, policy.acquire_operation_id,
+                        policy.original_call_id, policy.binding_digest,
+                        policy.model_request_digest, policy.cost_operation_id,
+                        policy.cost_receipt_digest, policy.source_ref,
+                        policy.baseline_ref, policy.baseline_revision,
+                        policy.consumer_operation_id) != (
+                        origin.job_id, origin.activity_id, origin.operation_id,
+                        origin.acquire_operation_id, origin.call_id,
+                        origin.binding_digest, origin.model_request_digest,
+                        origin.cost_operation_id, origin.cost_receipt_digest,
+                        origin.source_ref, baseline.token, baseline_revision,
+                        origin.consumer_operation_id)):
+                raise IssuerAuthorityDenied("D06 C02 original signed binding changed")
         return quote, grant, lease
 
     @staticmethod
@@ -1184,7 +1688,7 @@ def build_runtime_issuers(signing_key: bytes, *,
 
 
 __all__ = [
-    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D04BaselineQuotePolicy", "D04_BASELINE_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id", "d04_baseline_quote_id",
+    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D04BaselineQuotePolicy", "D04_BASELINE_WORK_KIND", "D06FirstIngressC02QuotePolicy", "D06_FIRST_INGRESS_C02_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id", "d04_baseline_quote_id", "d06_first_ingress_c02_quote_id",
     "IssuerAuthorityDenied", "ResourceOutcome", "ResourceQuote",
     "build_runtime_issuers", "install_schema",
 ]
