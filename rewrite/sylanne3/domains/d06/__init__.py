@@ -698,6 +698,14 @@ class D06DomainProvider:
                 raise ValueError("C02 must include exactly one episode and one trace")
             episode = encoding["memory.episode.v1"]
             trace = encoding[next(iter(traces))]
+            self_mapping = ()
+            if trace.key.type_name == "memory.subjective_trace.v2":
+                from ..d03.self_perspective import self_mapping_key
+                perspective = AtomKey.from_token(trace.value["perspective_ref"])
+                if (perspective.type_name != "d03.self_perspective.v1"
+                        or perspective.owner.kind != "persona"):
+                    raise ValueError("C02 v2 requires the D03 self perspective")
+                self_mapping = (self_mapping_key(proposal.envelope.authority.namespace),)
             source_refs = tuple(AtomKey.from_token(token) for token in episode.value["source_refs"])
             if (len(source_refs) != 1
                     or proposal.envelope.source_qualification.source_refs != (source_refs[0].token,)
@@ -705,7 +713,7 @@ class D06DomainProvider:
                 raise ValueError("C02 episode, trace and qualified source do not agree")
             source = source_refs[0]
             access = access_key(source.owner.bot, source.owner.persona, source.owner.subject)
-            required = (source, access, *(AtomKey.from_token(token) for token in (
+            required = (source, access, *self_mapping, *(AtomKey.from_token(token) for token in (
                 episode.value["event_ref"], trace.value["perspective_ref"],
                 *trace.value["then_feeling_refs"], *trace.value["interpretation_refs"],
                 *((trace.value["encoding_baseline_ref"],)
@@ -1052,7 +1060,11 @@ class D06DomainAdapter:
     def compile_encoding_v2(
         self, envelope: CommandEnvelope, prepared: object, *, encoding_baseline_ref: str,
     ) -> DomainProposal:
-        """Compile C02 with a committed D04 baseline reference, never raw intervals."""
+        """Compile C02 with D04 baseline and a committed D03 self perspective.
+
+        A sender entity or scene binding cannot stand in for the role's self.
+        The legacy unversioned compiler remains for historical fixture data.
+        """
         return self._compile_encoding(
             envelope, prepared, encoding_baseline_ref=encoding_baseline_ref,
         )
@@ -1103,10 +1115,19 @@ class D06DomainAdapter:
             return key
 
         event = graph_ref(proposal.episode.event_ref, "event_ref", frozenset({"d03.world_event"}))
-        perspective = graph_ref(
-            proposal.trace.perspective_ref, "perspective_ref",
-            frozenset({"d03.role_binding", "d03.entity_anchor"}),
-        )
+        perspective_types = (frozenset({"d03.self_perspective.v1"})
+                             if encoding_baseline_ref is not None else
+                             frozenset({"d03.role_binding", "d03.entity_anchor"}))
+        perspective = graph_ref(proposal.trace.perspective_ref,
+                                "perspective_ref", perspective_types)
+        if encoding_baseline_ref is not None and perspective.owner.kind != "persona":
+            raise ValueError("C02 self perspective must be persona-owned")
+        mapping = None
+        if encoding_baseline_ref is not None:
+            from ..d03.self_perspective import self_mapping_key
+            mapping = graph_ref(self_mapping_key(self.namespace).token,
+                                "self_mapping_ref",
+                                frozenset({"d03.self_identity_mapping.v1"}))
         feelings = tuple(graph_ref(
             ref, "then_feeling_ref", frozenset({"d04.feeling_state.v1", "d04.appraisal_bundle.v1"})
         )
@@ -1120,7 +1141,9 @@ class D06DomainAdapter:
             encoding_baseline_ref, "encoding_baseline_ref",
             frozenset({"d04.encoding_baseline.v1"}),
         ) if encoding_baseline_ref is not None else None)
-        required = (source, event, perspective, *feelings, *interpretations,
+        required = (source, event, perspective,
+                    *((mapping,) if mapping is not None else ()),
+                    *feelings, *interpretations,
                     *((baseline,) if baseline is not None else ()))
         context_versions: dict[AtomKey, int] = {}
         for ref, revision in proposal.read_versions:
@@ -1163,7 +1186,9 @@ class D06DomainAdapter:
         )
         historical = tuple(dict.fromkeys((
             *prepared.proof_versions,
-            *(guarded[key] for key in (event, perspective, *feelings, *interpretations,
+            *(guarded[key] for key in (event, perspective,
+                                      *((mapping,) if mapping is not None else ()),
+                                      *feelings, *interpretations,
                                       *((baseline,) if baseline is not None else ()))),
         )))
         return self.wrap_runtime_proposal(

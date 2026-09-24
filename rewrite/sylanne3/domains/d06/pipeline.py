@@ -524,6 +524,9 @@ class D06MemoryPipeline:
         baseline = spec.validator(baseline_atom.value)
         if not isinstance(baseline, EncodingBaseline):
             raise ValueError("committed D04 baseline is invalid")
+        perspective_key = AtomKey.from_token(baseline.perspective_ref)
+        if perspective_key.type_name != "d03.self_perspective.v1":
+            raise ValueError("first-ingress C02 requires a committed D03 self perspective")
         source_key_ref = source_key(*self.adapter.namespace.as_tuple, source_ref)
         if (source_key_ref.token not in baseline.source_refs
                 or baseline.perspective_ref != context.perspective_ref
@@ -552,6 +555,10 @@ class D06MemoryPipeline:
             *context_versions)))
         snapshot = self.repository.store.graph_snapshot(keys)
         baseline.verify_committed_refs(snapshot)
+        perspective_atom = snapshot.get(perspective_key)
+        if (perspective_atom is None
+                or perspective_atom.value.get("arrival_event_ref") != context.event_ref):
+            raise ValueError("encoding event differs from D03 self perspective arrival")
         if (snapshot.epochs != proof.epochs or snapshot.get(baseline_key) != baseline_atom
                 or any(snapshot.get(key) is None or not snapshot.get(key).valid
                        or snapshot.get(key).revision != revision

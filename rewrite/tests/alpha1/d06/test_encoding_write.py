@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from sylanne3.contracts import Event, Scope, StaleRead
@@ -9,6 +9,11 @@ from sylanne3.domains.d06 import (
 )
 from sylanne3.domains.d06.pipeline import D06MemoryPipeline
 from sylanne3.domains.d04.encoding_baseline import decode_encoding_baseline
+from sylanne3.domains.d03.context import WorldEvent
+from sylanne3.domains.d03.self_perspective import (
+    SelfIdentityMapping, SelfPerspective, self_mapping_key,
+    self_perspective_id, self_perspective_key,
+)
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import (
     AtomKey, GraphCandidate, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec,
@@ -33,6 +38,8 @@ class EncodingWriteTests(unittest.TestCase):
         register_memory_types(self.registry)
         for name, owner in (
             ("d03.world_event", "event"), ("d03.role_binding", "scene"),
+            ("d03.self_identity_mapping.v1", "persona"),
+            ("d03.self_perspective.v1", "persona"),
             ("d04.feeling_state.v1", "persona"), ("d07.belief_revision.v1", "persona"),
         ):
             self.registry.register(TypeSpec(name, (owner,), "state", lambda _: None))
@@ -57,6 +64,12 @@ class EncodingWriteTests(unittest.TestCase):
         self.interpretation = AtomKey(Owner("persona", "bot", "persona"), "d07.belief_revision.v1", "current")
         self.baseline = AtomKey(Owner("event", "bot", "persona", "world-1"),
                                 "d04.encoding_baseline.v1", "record")
+        self.self_event = AtomKey(Owner("event", "bot", "persona", "world:1"),
+                                  "d03.world_event", "current")
+        self.self_mapping = self_mapping_key(self.namespace)
+        self.self_perspective = self_perspective_key(
+            self.namespace, self_perspective_id(
+                self.namespace, "scene:1", self.self_event.token))
 
     def event(self, kind):
         self.sequence += 1
@@ -83,14 +96,58 @@ class EncodingWriteTests(unittest.TestCase):
         )
         return prepared
 
+    def seed_self_graph(self):
+        mapping = SelfIdentityMapping(
+            "self-map:fixture", "persona:persona", "entity:self",
+            "authority:self-identity:fixture", "head-1", "inc-1", "active",
+        )
+        event = WorldEvent(
+            "world:1", "message_received", (("entity:account:1", "sender_account"),),
+            None, None, 2.0, "scene:1", (self.source.token,), "host_observed",
+        )
+        perspective = SelfPerspective(
+            self.self_perspective.name, "persona:persona", "entity:self", "scene:1",
+            self.self_mapping.token, self.self_event.token, "head-1",
+        )
+        writes = (
+            GraphWrite(self.self_mapping, asdict(mapping)),
+            GraphWrite(self.self_event, {
+                **asdict(event),
+                "participant_roles": [list(item) for item in event.participant_roles],
+                "source_refs": list(event.source_refs),
+            }),
+            GraphWrite(self.self_perspective, asdict(perspective)),
+        )
+        self.store.graph_commit(GraphCandidate(
+            self.event("self-context"), tuple(GraphVersion(write.key, 0) for write in writes),
+            writes,
+        ))
+
+    def seed_self(self):
+        self.seed()
+        self.seed_self_graph()
+        context = EncodingContext(
+            self.self_event.token, self.self_perspective.token,
+            (self.feeling.token,), (self.interpretation.token,),
+            (("promise", 0.9), ("weather", 0.2)),
+            tuple((key.token, 1) for key in (
+                self.source, self.self_event, self.self_perspective,
+                self.self_mapping, self.feeling, self.interpretation)),
+        )
+        return self.pipeline.prepare_encoding(
+            "source-1", context, audience="owner", purpose="context")
+
     def envelope(self, prepared, *, missing=(), baseline=False):
         episode = prepared.proposal.episode.episode_id
         trace = prepared.proposal.trace.trace_id
         from sylanne3.memory_types import episode_key, subjective_trace_key
+        event_ref = AtomKey.from_token(prepared.proposal.episode.event_ref)
+        perspective_ref = AtomKey.from_token(prepared.proposal.trace.perspective_ref)
+        self_refs = ((self.self_mapping,) if perspective_ref.type_name == "d03.self_perspective.v1" else ())
         reads = tuple(version for version in (
             *prepared.proof_versions,
             *(GraphVersion(key, 1) for key in
-              (self.event_ref, self.perspective, self.feeling, self.interpretation)),
+              (event_ref, perspective_ref, *self_refs, self.feeling, self.interpretation)),
             GraphVersion(episode_key("bot", "persona", episode), 0),
             GraphVersion((subjective_trace_v2_key if baseline else subjective_trace_key)(
                 "bot", "persona", trace), 0),
@@ -175,7 +232,7 @@ class EncodingWriteTests(unittest.TestCase):
             D06DomainProvider().validate(replace(proposal, typed_writes=(episode, detached)))
 
     def test_v2_baseline_is_typed_and_bound_to_read_and_historical_proofs(self):
-        prepared = self.seed()
+        prepared = self.seed_self()
         with_baseline = replace(prepared, proposal=replace(
             prepared.proposal,
             read_versions=(*prepared.proposal.read_versions, (self.baseline.token, 1)),
@@ -208,8 +265,49 @@ class EncodingWriteTests(unittest.TestCase):
                 envelope, with_baseline, encoding_baseline_ref=wrong_namespace.token,
             )
 
+    def test_v2_rejects_sender_scene_and_missing_self_mapping_proof(self):
+        legacy = self.seed()
+        legacy = replace(legacy, proposal=replace(
+            legacy.proposal,
+            read_versions=(*legacy.proposal.read_versions, (self.baseline.token, 1)),
+        ))
+        with self.assertRaisesRegex(ValueError, "perspective_ref"):
+            self.adapter.compile_encoding_v2(
+                self.envelope(legacy, baseline=True), legacy,
+                encoding_baseline_ref=self.baseline.token,
+            )
+        self.seed_self_graph()
+        context = EncodingContext(
+            self.self_event.token, self.self_perspective.token,
+            (self.feeling.token,), (self.interpretation.token,), (),
+            tuple((key.token, 1) for key in (
+                self.source, self.self_event, self.self_perspective,
+                self.self_mapping, self.feeling, self.interpretation,
+                self.baseline,
+            )),
+        )
+        self_prepared = self.pipeline.prepare_encoding(
+            "source-1", context, audience="owner", purpose="context")
+        guarded = self.envelope(self_prepared, baseline=True)
+        missing_mapping = replace(guarded.version_guard, read_versions=tuple(
+            version for version in guarded.version_guard.read_versions
+            if version.key != self.self_mapping))
+        with self.assertRaisesRegex(ValueError, "self_mapping_ref"):
+            self.adapter.compile_encoding_v2(
+                replace(guarded, version_guard=missing_mapping), self_prepared,
+                encoding_baseline_ref=self.baseline.token,
+            )
+        complete = self.adapter.compile_encoding_v2(
+            guarded, self_prepared, encoding_baseline_ref=self.baseline.token)
+        stripped = replace(complete, dependencies=replace(
+            complete.dependencies, historical_provenance=tuple(
+                version for version in complete.dependencies.historical_provenance
+                if version.key != self.self_mapping)))
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            D06DomainProvider().validate(stripped)
+
     def test_first_ingress_result_requires_committed_d04_baseline_and_keeps_feelings_hypothetical(self):
-        self.seed()
+        self.seed_self()
         result = {"text": ('{"event_summary":"A promise was reported",'
                            '"quoted_details":[{"quote":"promise","salience":0.8}],'
                            '"possible_meanings":["trust"],"possible_feelings":["relief"]}')}
@@ -217,10 +315,11 @@ class EncodingWriteTests(unittest.TestCase):
                               "digest-1", "provider-1", "model-1", "provider-call-1",
                               {}, {}, "confirmed", "eligible", False, "start-1", "finish-1")
         context = EncodingContext(
-            self.event_ref.token, self.perspective.token, (self.feeling.token,),
+            self.self_event.token, self.self_perspective.token, (self.feeling.token,),
             (self.interpretation.token,), (),
             tuple((key.token, 1) for key in
-                  (self.source, self.event_ref, self.perspective, self.feeling,
+                  (self.source, self.self_event, self.self_perspective, self.self_mapping,
+                   self.feeling,
                    self.interpretation, self.baseline)),
         )
         with self.assertRaisesRegex(ValueError, "D04 baseline"):
@@ -231,10 +330,10 @@ class EncodingWriteTests(unittest.TestCase):
             )
         baseline_value = {
             "baseline_id": "baseline-1", "source_refs": [self.source.token],
-            "perspective_ref": self.perspective.token,
+            "perspective_ref": self.self_perspective.token,
             "then_feeling_versions": [{"ref": self.feeling.token, "revision": 1}],
             "interpretation_versions": [{"ref": self.interpretation.token, "revision": 1}],
-            "as_known_at": None, "projection_policy_ref": "policy-1",
+            "as_known_at": 2.0, "projection_policy_ref": "policy-1",
             "projection_policy_version": "v1", "basis_version": "scheme-1",
             "parameter_version": "params-1", "salience_interval": None,
             "tone_interval": None,
@@ -244,6 +343,13 @@ class EncodingWriteTests(unittest.TestCase):
             self.event("baseline"), (GraphVersion(self.baseline, 0),),
             (GraphWrite(self.baseline, baseline_value),),
         ))
+        with self.assertRaisesRegex(ValueError, "arrival"):
+            self.pipeline.prepare_first_ingress_encoding(
+                "source-1", result, receipt,
+                replace(context, event_ref=self.event_ref.token),
+                encoding_baseline_ref=self.baseline.token,
+                audience="owner", purpose="context",
+            )
         model_prepared = self.pipeline.prepare_first_ingress_encoding(
             "source-1", result, receipt, context,
             encoding_baseline_ref=self.baseline.token,
@@ -266,9 +372,10 @@ class EncodingWriteTests(unittest.TestCase):
                 receipt, context, encoding_baseline_ref=self.baseline.token,
                 audience="owner", purpose="context",
             )
+        event_value = self.store.graph_snapshot((self.self_event,)).get(self.self_event).value
         self.store.graph_commit(GraphCandidate(
-            self.event("event-update"), (GraphVersion(self.event_ref, 1),),
-            (GraphWrite(self.event_ref, {"committed": "new"}),),
+            self.event("event-update"), (GraphVersion(self.self_event, 1),),
+            (GraphWrite(self.self_event, event_value),),
         ))
         with self.assertRaisesRegex(RuntimeError, "changed during encoding"):
             self.pipeline.prepare_first_ingress_encoding(
@@ -299,13 +406,13 @@ class EncodingWriteTests(unittest.TestCase):
         from sylanne3.authority_service.v2_model_result_read_contract import ModelResultReadV1
         from sylanne3.runtime_contracts import DomainProposal
 
-        self.seed()
+        self.seed_self()
         baseline_value = {
             "baseline_id": "baseline-1", "source_refs": [self.source.token],
-            "perspective_ref": self.perspective.token,
+            "perspective_ref": self.self_perspective.token,
             "then_feeling_versions": [{"ref": self.feeling.token, "revision": 1}],
             "interpretation_versions": [{"ref": self.interpretation.token, "revision": 1}],
-            "as_known_at": None, "projection_policy_ref": "policy-1",
+            "as_known_at": 2.0, "projection_policy_ref": "policy-1",
             "projection_policy_version": "v1", "basis_version": "scheme-1",
             "parameter_version": "params-1", "salience_interval": None,
             "tone_interval": None,
@@ -316,10 +423,11 @@ class EncodingWriteTests(unittest.TestCase):
             (GraphWrite(self.baseline, baseline_value),),
         ))
         context = EncodingContext(
-            self.event_ref.token, self.perspective.token, (self.feeling.token,),
+            self.self_event.token, self.self_perspective.token, (self.feeling.token,),
             (self.interpretation.token,), (),
             tuple((key.token, 1) for key in
-                  (self.source, self.event_ref, self.perspective, self.feeling,
+                  (self.source, self.self_event, self.self_perspective, self.self_mapping,
+                   self.feeling,
                    self.interpretation, self.baseline)),
         )
         result = {"text": json.dumps({
@@ -402,14 +510,15 @@ class EncodingWriteTests(unittest.TestCase):
             self.event("context"), tuple(GraphVersion(key, 0) for key in refs),
             tuple(GraphWrite(key, {"committed": True}) for key in refs),
         ))
+        self.seed_self_graph()
         self.store.graph_commit(GraphCandidate(
             self.event("baseline"), (GraphVersion(self.baseline, 0),),
             (GraphWrite(self.baseline, {
                 "baseline_id": "baseline-1", "source_refs": [self.source.token],
-                "perspective_ref": self.perspective.token,
+                "perspective_ref": self.self_perspective.token,
                 "then_feeling_versions": [{"ref": self.feeling.token, "revision": 1}],
                 "interpretation_versions": [{"ref": self.interpretation.token, "revision": 1}],
-                "as_known_at": None, "projection_policy_ref": "policy-1",
+                "as_known_at": 2.0, "projection_policy_ref": "policy-1",
                 "projection_policy_version": "v1", "basis_version": "scheme-1",
                 "parameter_version": "params-1", "salience_interval": None,
                 "tone_interval": None,
@@ -417,10 +526,11 @@ class EncodingWriteTests(unittest.TestCase):
             }),),
         ))
         context = EncodingContext(
-            self.event_ref.token, self.perspective.token, (self.feeling.token,),
+            self.self_event.token, self.self_perspective.token, (self.feeling.token,),
             (self.interpretation.token,), (),
             tuple((key.token, 1) for key in
-                  (self.source, self.event_ref, self.perspective, self.feeling,
+                  (self.source, self.self_event, self.self_perspective, self.self_mapping,
+                   self.feeling,
                    self.interpretation, self.baseline)),
         )
         payload, template = build_first_ingress_encoding_payload(original)
