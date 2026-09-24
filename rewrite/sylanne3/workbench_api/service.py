@@ -211,7 +211,8 @@ class WorkbenchService:
         except (TypeError, ValueError) as exc:
             raise ValueError("input must be JSON-safe") from exc
         if action == "read_character_view" and input_data.get("view_type") not in {
-                "overview", "creation", "relations", "memory", "cognition", "action", "expression", "diagnostics", "lifecycle"}:
+                "overview", "creation", "relations", "memory", "d06.memory_sources.v1",
+                "cognition", "action", "expression", "diagnostics", "lifecycle"}:
             raise ValueError("read_character_view requires a known view_type")
         if action == "open_workspace" and input_data.get("client_protocol") != D12_SCHEMA:
             raise ValueError("open_workspace requires the current client protocol")

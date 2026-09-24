@@ -46,6 +46,33 @@ def test_rejects_unknown_action_input_and_unbounded_page_size():
     assert answer.problem["code"] == "invalid_request"
 
 
+def test_real_d06_source_view_reaches_issuer_only_with_read_grant():
+    calls = []
+
+    class SourceReader:
+        def read_projection(self, **kwargs):
+            calls.append(kwargs)
+            return {"status": "unavailable", "problem": {"code": "view_unsupported"}}
+
+    payload = request(view_type="d06.memory_sources.v1")
+    denied = WorkbenchService(SourceReader()).handle(
+        payload, session=session("workbench.correct"), context=CONTEXT)
+    assert denied.problem["code"] == "capability_denied" and not calls
+
+    answer = WorkbenchService(SourceReader()).handle(
+        payload, session=session("workbench.read"), context=CONTEXT)
+    assert answer.problem["code"] == "view_unsupported"
+    assert len(calls) == 1
+    assert calls[0]["view_type"] == "d06.memory_sources.v1"
+    assert calls[0]["scope"] == SCOPE
+
+    unsupported = WorkbenchService(SourceReader()).handle(
+        request(view_type="d06.private_memory.v1"),
+        session=session("workbench.read"), context=CONTEXT)
+    assert unsupported.problem["code"] == "invalid_request"
+    assert len(calls) == 1
+
+
 def test_scope_capability_purpose_and_audience_are_all_server_enforced():
     denied = WorkbenchService().handle(request("compile_scheme"), session=session("workbench.read"), context=CONTEXT)
     assert denied.status == "unauthorized"
