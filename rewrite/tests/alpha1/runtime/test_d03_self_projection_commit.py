@@ -8,8 +8,10 @@ from sylanne3.authority_service.v2_self_identity_contract import (
     AuthorityCurrentSelfIdentityV1,
 )
 from sylanne3.graph_coordinator import UnavailableGuard
+from sylanne3.domains.d04 import AffectAxis, AffectProvider, AffectScheme
 from sylanne3.host.authority_profile import (
     AdminD03ArrivalPolicy, AdminD03SelfIdentityProjectionPolicy,
+    AdminD04EncodingBaselinePolicy,
 )
 
 from test_first_ingress_v2 import _ingress_inputs
@@ -54,10 +56,18 @@ class FixtureCurrentSelf:
 
 @pytest.fixture
 def projection_case(tmp_path):
+    d04 = AffectProvider(active_scheme=AffectScheme(
+        "d04.affect.scheme.v1", "scheme-1", "operator-1",
+        "parameter:fixture", "coupling:fixture",
+        (AffectAxis("care", "normalized", "care"),), ()))
     case = _scene_case(
         tmp_path, enable_ingress=True, arrival_allowed=True,
-        extra_work_kinds=("d03.self_identity_projection",))
+        extra_specs=d04.type_specs(),
+        extra_work_kinds=("d03.self_identity_projection", "d04.encoding_baseline"))
     store, authority_db, port, coordinator, namespace, _, _, policy, bootstrap = case
+    coordinator.register_provider(
+        bootstrap, "d04", d04, "d04.proposal.v1",
+        d04.descriptor.request_schema_hash)
     _bind_scene(case)
     host, clock, encoding = _ingress_inputs(namespace)
     coordinator.commit_first_ingress_v2(
@@ -151,3 +161,194 @@ def test_quote_guard_mismatch_rolls_back_signed_quote_and_graph(
     assert store._db.execute(
         "SELECT COUNT(*) FROM graph_atoms WHERE type_name='d03.self_perspective.v1'"
     ).fetchone() == (0,)
+
+
+def test_unfinished_original_write_recovers_before_new_read_or_job_check(
+        projection_case, monkeypatch):
+    case = projection_case
+    store, coordinator, _, _, job_id, _, _, _, _, _ = case
+    port = coordinator._GraphCoordinator__content_fence_v2
+    finish = port.finish_fence
+    lost = {"once": True}
+
+    def lose_original_finish(scope, **kwargs):
+        if scope.operation == "write" and lost["once"]:
+            lost["once"] = False
+            raise RuntimeError("original finish response lost")
+        return finish(scope, **kwargs)
+
+    monkeypatch.setattr(port, "finish_fence", lose_original_finish)
+    with pytest.raises(RuntimeError, match="original finish response lost"):
+        _commit(case)
+    store._db.execute("UPDATE runtime_jobs SET phase='running' WHERE job_id=?",
+                      (job_id,))
+    store._db.commit()
+    begin = port.begin_fence
+
+    def no_second_read(**kwargs):
+        if kwargs["operation"] == "read":
+            raise AssertionError("replay must not open a new content read")
+        return begin(**kwargs)
+
+    monkeypatch.setattr(port, "begin_fence", no_second_read)
+    assert _commit(case).status == "duplicate"
+
+
+def test_precommit_active_write_is_closed_without_replaying_business(
+        projection_case, monkeypatch):
+    case = projection_case
+    store, coordinator, *_ = case
+    port = coordinator._GraphCoordinator__content_fence_v2
+    begin = port.begin_fence
+    lost = {"once": True}
+
+    def lose_after_begin(**kwargs):
+        permit = begin(**kwargs)
+        if kwargs["operation"] == "write" and lost["once"]:
+            lost["once"] = False
+            raise RuntimeError("process stopped after Authority begin")
+        return permit
+
+    monkeypatch.setattr(port, "begin_fence", lose_after_begin)
+    with pytest.raises(RuntimeError, match="process stopped"):
+        _commit(case)
+    with pytest.raises(UnavailableGuard, match="no-commit fence closed"):
+        _commit(case)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_atoms WHERE type_name='d03.self_perspective.v1'"
+    ).fetchone() == (0,)
+
+
+def test_crashed_candidate_read_recovers_before_retry(projection_case, monkeypatch):
+    case = projection_case
+    _, coordinator, *_ = case
+    port = coordinator._GraphCoordinator__content_fence_v2
+    begin = port.begin_fence
+    lost = {"once": True}
+
+    def lose_after_read_begin(**kwargs):
+        permit = begin(**kwargs)
+        if (kwargs["operation"] == "read"
+                and kwargs["operation_id"].startswith("d03-self-read-")
+                and lost["once"]):
+            lost["once"] = False
+            raise RuntimeError("process stopped after candidate read begin")
+        return permit
+
+    monkeypatch.setattr(port, "begin_fence", lose_after_read_begin)
+    with pytest.raises(RuntimeError, match="candidate read begin"):
+        _commit(case)
+    assert _commit(case).status == "committed"
+
+
+def test_d04_baseline_commits_only_after_real_self_stage(projection_case):
+    case = projection_case
+    store, coordinator, bootstrap, namespace, job_id, original_operation_id, policy, _, clock, _ = case
+    baseline_policy = AdminD04EncodingBaselinePolicy(
+        30.0, {"cpu_ms": 2}, "baseline-snapshot", "baseline-resource")
+    with pytest.raises(UnavailableGuard, match="self perspective"):
+        coordinator.commit_d04_encoding_baseline_v1(
+            bootstrap, namespace, job_id, original_operation_id,
+            policy, baseline_policy, clock)
+    _commit(case)
+    receipt = coordinator.commit_d04_encoding_baseline_v1(
+        bootstrap, namespace, job_id, original_operation_id,
+        policy, baseline_policy, clock)
+    assert receipt.status == "committed"
+    assert coordinator.commit_d04_encoding_baseline_v1(
+        bootstrap, namespace, job_id, original_operation_id,
+        policy, baseline_policy, clock).status == "duplicate"
+    with store._lock:
+        row = store._db.execute(
+            "SELECT value FROM graph_atoms WHERE type_name='d04.encoding_baseline.v1' "
+            "AND valid=1").fetchone()
+        assert row is not None
+        assert '"salience_interval":null' in row[0]
+        assert '"tone_interval":null' in row[0]
+        assert store._db.execute(
+            "SELECT state FROM runtime_budget_reservations WHERE operation_id=?",
+            (receipt.operation_id,)).fetchone() == ("reserved",)
+
+
+def test_d04_unfinished_original_write_replays_after_job_changes(
+        projection_case, monkeypatch):
+    case = projection_case
+    store, coordinator, bootstrap, namespace, job_id, original_operation_id, policy, _, clock, _ = case
+    _commit(case)
+    baseline_policy = AdminD04EncodingBaselinePolicy(
+        30.0, {"cpu_ms": 2}, "baseline-snapshot", "baseline-resource")
+    port = coordinator._GraphCoordinator__content_fence_v2
+    finish = port.finish_fence
+    lost = {"once": True}
+
+    def lose_baseline_finish(scope, **kwargs):
+        if scope.operation == "write" and lost["once"]:
+            lost["once"] = False
+            raise RuntimeError("baseline finish response lost")
+        return finish(scope, **kwargs)
+
+    monkeypatch.setattr(port, "finish_fence", lose_baseline_finish)
+    with pytest.raises(RuntimeError, match="baseline finish response lost"):
+        coordinator.commit_d04_encoding_baseline_v1(
+            bootstrap, namespace, job_id, original_operation_id,
+            policy, baseline_policy, clock)
+    store._db.execute("UPDATE runtime_jobs SET phase='running' WHERE job_id=?",
+                      (job_id,))
+    store._db.commit()
+    begin = port.begin_fence
+
+    def no_new_read(**kwargs):
+        if kwargs["operation"] == "read":
+            raise AssertionError("baseline replay must not read current content")
+        return begin(**kwargs)
+
+    monkeypatch.setattr(port, "begin_fence", no_new_read)
+    assert coordinator.commit_d04_encoding_baseline_v1(
+        bootstrap, namespace, job_id, original_operation_id,
+        policy, baseline_policy, clock).status == "duplicate"
+
+
+def test_d04_current_self_replacement_blocks_baseline(projection_case):
+    case = projection_case
+    store, coordinator, bootstrap, namespace, job_id, original_operation_id, policy, _, clock, current_self = case
+    _commit(case)
+    current_self.write_self_ref = "entity:replacement-self"
+    baseline_policy = AdminD04EncodingBaselinePolicy(
+        30.0, {"cpu_ms": 2}, "baseline-snapshot", "baseline-resource")
+    with pytest.raises(UnavailableGuard, match="current Authority self differs"):
+        coordinator.commit_d04_encoding_baseline_v1(
+            bootstrap, namespace, job_id, original_operation_id,
+            policy, baseline_policy, clock)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_atoms WHERE type_name='d04.encoding_baseline.v1'"
+    ).fetchone() == (0,)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM runtime_resource_quotes WHERE quote_id LIKE 'd04-baseline-q-%'"
+    ).fetchone() == (0,)
+
+
+def test_d04_crashed_queued_read_recovers_before_retry(projection_case, monkeypatch):
+    case = projection_case
+    _, coordinator, bootstrap, namespace, job_id, original_operation_id, policy, _, clock, _ = case
+    _commit(case)
+    baseline_policy = AdminD04EncodingBaselinePolicy(
+        30.0, {"cpu_ms": 2}, "baseline-snapshot", "baseline-resource")
+    port = coordinator._GraphCoordinator__content_fence_v2
+    begin = port.begin_fence
+    lost = {"once": True}
+
+    def lose_queued_read(**kwargs):
+        permit = begin(**kwargs)
+        if kwargs["operation"] == "read" and lost["once"]:
+            lost["once"] = False
+            raise RuntimeError("process stopped after queued read begin")
+        return permit
+
+    monkeypatch.setattr(port, "begin_fence", lose_queued_read)
+    with pytest.raises(UnavailableGuard, match="v2 content authority is unavailable"):
+        coordinator.commit_d04_encoding_baseline_v1(
+            bootstrap, namespace, job_id, original_operation_id,
+            policy, baseline_policy, clock)
+    assert coordinator.commit_d04_encoding_baseline_v1(
+        bootstrap, namespace, job_id, original_operation_id,
+        policy, baseline_policy, clock).status == "committed"

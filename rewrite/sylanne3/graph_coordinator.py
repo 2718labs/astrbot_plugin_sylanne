@@ -771,7 +771,8 @@ class GraphCoordinator:
                  owner_binding: OwnerLeaseBindingV1 | None = None,
                  owner_view: bool = False,
                  owner_session_proof: tuple[str, object] | None = None,
-                 final_check=None, return_recovery_context: bool = False):
+                 final_check=None, return_recovery_context: bool = False,
+                 durable_read_key: str | None = None):
         """Keep every Authority RPC outside the business graph lock."""
         if owner_view and owner_principal is None:
             raise ValueError("Owner view requires an expected principal")
@@ -788,7 +789,14 @@ class GraphCoordinator:
                 namespace=namespace, authority_namespace=target.authority_namespace)
             if not self._anchor_matches(target, anchor):
                 raise UnavailableGuard("v2 graph recovery anchor differs")
+            if durable_read_key is not None:
+                self._recover_stage_candidate_read(
+                    namespace, durable_read_key, metadata, epoch, anchor)
             operation_id = "graph-read-" + secrets.token_hex(16)
+            if durable_read_key is not None:
+                self._record_stage_candidate_read(
+                    namespace, durable_read_key, operation_id, metadata, epoch,
+                    anchor)
             permit = port.begin_fence(
                 namespace=namespace, authority_namespace=target.authority_namespace,
                 holder=self.__holder, generation=authority.activation_generation,
@@ -837,6 +845,9 @@ class GraphCoordinator:
                         "operation_id": operation_id, "permit_token": permit.token,
                         "action": "finish_read",
                     }))
+                if durable_read_key is not None:
+                    self._close_stage_candidate_read(
+                        namespace, durable_read_key, operation_id)
         except UnavailableGuard:
             raise
         except Exception as exc:
@@ -6135,7 +6146,8 @@ class GraphCoordinator:
                     json.loads(intent[1])["graph_incarnation"])
 
         prepared, anchor, metadata, graph_epoch = self._read_v2(
-            authority, reader, return_recovery_context=True)
+            authority, reader, return_recovery_context=True,
+            durable_read_key="d04-baseline:" + original_operation_id)
         job, source_version, access_version, qualification, epochs, original_incarnation = prepared
         if metadata.requirements.graph_incarnation != original_incarnation:
             raise UnavailableGuard("baseline graph incarnation differs from original ingress; HOLD")
@@ -9288,6 +9300,223 @@ class GraphCoordinator:
                 arrival_policy, policy.installation_id, now_utc, source_ref,
                 policy_digest))
 
+    def _recover_d03_self_projection_before_read(
+        self, namespace, original_operation_id, installation_policy,
+        admin_policy,
+    ) -> CommitReceipt | None:
+        """Resolve the original stage fence before opening another content read."""
+        from .authority_service.v2_contract import from_wire
+
+        store, port = self.__store, self.__content_fence_v2
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            identity = store._db.execute(
+                "SELECT source_ref FROM graph_first_ingress_identity_v1 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (original_operation_id,),
+            ).fetchone()
+            if identity is None:
+                raise UnavailableGuard("D03 original ingress is unavailable; HOLD")
+            source_ref = source_key(*namespace.as_tuple, identity[0]).token
+            has_index = store._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_d03_self_projection_intents_v1'",
+            ).fetchone() is not None
+            indexed = (store._db.execute(
+                "SELECT operation_id,bundle_digest FROM "
+                "graph_d03_self_projection_intents_v1 WHERE bot=? AND persona=? "
+                "AND source_ref=? AND original_operation_id=?",
+                namespace.as_tuple + (source_ref, original_operation_id),
+            ).fetchone() if has_index else None)
+            has_issued = store._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_d03_self_projection_issuance_v1'",
+            ).fetchone() is not None
+            issued = (store._db.execute(
+                "SELECT operation_id,certification_ref,quote_id,bundle_digest "
+                "FROM graph_d03_self_projection_issuance_v1 WHERE bot=? "
+                "AND persona=? AND source_ref=?",
+                namespace.as_tuple + (source_ref,),
+            ).fetchall() if has_issued else [])
+            if len(issued) > 1:
+                raise UnavailableGuard("D03 self projection has multiple original receipts")
+            if not issued and indexed is None:
+                return None
+            operation_id = issued[0][0] if issued else indexed[0]
+            intent = store._db.execute(
+                "SELECT digest,fence_attempt_id,requirements_json,anchor_json,"
+                "graph_revision,graph_epoch FROM graph_bundle_intents_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if intent is None or (indexed is not None
+                                  and indexed != (operation_id, intent[0])):
+                raise UnavailableGuard("D03 self projection durable intent differs")
+            saved = store._db.execute(
+                "SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,"
+                "post_graph_revision,post_graph_epoch,finish_request_id,"
+                "finish_request_digest FROM graph_bundle_fences_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            prior = self._get_operation_fenced(
+                AuthorityContext("host", "d11", "recovery", namespace,
+                                 ("persona", "event"), "context", (),
+                                 installation_policy.root_grant.policy_ref,
+                                 metadata.requirements.activation_generation),
+                operation_id, v2=True)
+            if issued:
+                quote = self.__d02_issuer._load_quote(store._db, issued[0][2], 1)
+                if (prior is None or saved is None
+                        or issued[0][3] != prior.operation_digest
+                        or saved[0] != prior.operation_digest
+                        or quote.operation_id != operation_id
+                        or quote.work_kind != "d03.self_identity_projection"
+                        or dict(quote.ceiling) != dict(admin_policy.quote_ceiling)
+                        or not any(item.key.type_name == "d03.self_perspective.v1"
+                                   for item in prior.write_versions)):
+                    raise UnavailableGuard("D03 self projection receipt differs")
+            elif prior is not None or saved is not None:
+                raise UnavailableGuard("D03 self projection lacks sealed issuance")
+        target = metadata.requirements
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("D03 self projection recovery anchor differs")
+        if issued:
+            original_permit = from_wire(json.loads(saved[1]))
+            observed, state = port.get_fence_operation(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                operation_id=intent[1])
+            if (observed != original_permit or state not in {"active", "finished"}
+                    or original_permit.operation_id != intent[1]
+                    or original_permit.pinned_anchor != anchor
+                    or saved[4] != saved[2] + 1
+                    or saved[5] != prior.invalidated_epochs[0].revision):
+                raise UnavailableGuard("D03 self projection original fence differs")
+            if state == "active":
+                if (metadata.graph_revision, epoch.revision) != saved[4:6]:
+                    raise UnavailableGuard("D03 self projection active graph changed")
+                scope = FenceScope(
+                    namespace, target.authority_namespace,
+                    target.activation_generation, "write", intent[1],
+                    original_permit, anchor,
+                    NamespaceEpoch(*namespace.as_tuple, saved[3]), saved[2])
+                if port.validate_fence(scope) != original_permit:
+                    raise UnavailableGuard("D03 self projection original permit changed")
+                port.finish_fence(scope, request_id=saved[6],
+                                  request_digest=saved[7])
+            elif (metadata.graph_revision < saved[4]
+                  or epoch.revision < saved[5]):
+                raise UnavailableGuard("D03 self projection graph receipt regressed")
+            return replace(prior, status="duplicate")
+        observed, state = port.get_fence_operation(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            operation_id=intent[1])
+        if observed is None:
+            return None
+        if (state != "active" or (metadata.graph_revision, epoch.revision)
+                != (intent[4], intent[5])):
+            raise UnavailableGuard("D03 self projection uncertain write requires HOLD")
+        rejection = self._record_rejected_bundle_v2(
+            namespace, operation_id, intent[0], intent[1], metadata, epoch,
+            intent, observed)
+        self._finish_rejected_bundle_v2(
+            namespace, metadata, epoch, anchor, intent[1], intent[0],
+            operation_id, rejection)
+        raise UnavailableGuard("D03 self projection previous no-commit fence closed; HOLD")
+
+    def _recover_stage_candidate_read(self, namespace, read_key,
+                                      metadata, epoch, anchor) -> None:
+        """Finish a durable content-free candidate read left active by a crash."""
+        store, port = self.__store, self.__content_fence_v2
+        with store._lock:
+            exists = store._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_stage_candidate_reads_v1'",
+            ).fetchone()
+            open_rows = (store._db.execute(
+                "SELECT attempt_id,graph_revision,graph_epoch,anchor_json "
+                "FROM graph_stage_candidate_reads_v1 WHERE bot=? AND persona=? "
+                "AND read_key=? AND state='open'",
+                namespace.as_tuple + (read_key,),
+            ).fetchall() if exists else [])
+        if len(open_rows) > 1:
+            raise UnavailableGuard("stage candidate has multiple active read attempts")
+        if not open_rows:
+            return
+        attempt_id, revision, read_epoch, anchor_json = open_rows[0]
+        if (anchor_json != canonical_json(asdict(anchor))
+                or metadata.graph_revision < revision
+                or epoch.revision < read_epoch):
+            raise UnavailableGuard("stage candidate read recovery anchor changed")
+        permit, state = port.get_fence_operation(
+            namespace=namespace,
+            authority_namespace=metadata.requirements.authority_namespace,
+            operation_id=attempt_id)
+        if state == "active":
+            if (metadata.graph_revision, epoch.revision) != (revision, read_epoch):
+                raise UnavailableGuard("stage candidate active read graph changed")
+            scope = FenceScope(
+                namespace, metadata.requirements.authority_namespace,
+                metadata.requirements.activation_generation, "read", attempt_id,
+                permit, anchor, NamespaceEpoch(*namespace.as_tuple, read_epoch), revision)
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("stage candidate read permit changed")
+            port.finish_fence(scope, request_id="finish:" + attempt_id,
+                              request_digest="sha256:" + canonical_digest({
+                                  "operation_id": attempt_id,
+                                  "permit_token": permit.token,
+                                  "action": "finish_read",
+                              }))
+        elif state not in {"finished", "absent"}:
+            raise UnavailableGuard("stage candidate read recovery state differs")
+        with store._lock:
+            store._db.execute(
+                "UPDATE graph_stage_candidate_reads_v1 SET state='closed' "
+                "WHERE bot=? AND persona=? AND read_key=? "
+                "AND attempt_id=? AND state='open'",
+                namespace.as_tuple + (read_key, attempt_id),
+            )
+
+    def _record_stage_candidate_read(self, namespace, read_key, attempt_id,
+                                     metadata, epoch, anchor) -> None:
+        store = self.__store
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("stage candidate graph changed before read intent")
+                db.execute("""CREATE TABLE IF NOT EXISTS graph_stage_candidate_reads_v1(
+                    bot TEXT NOT NULL, persona TEXT NOT NULL,
+                    read_key TEXT NOT NULL, attempt_id TEXT NOT NULL,
+                    graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                    anchor_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('open','closed')),
+                    PRIMARY KEY(bot,persona,read_key,attempt_id))""")
+                db.execute(
+                    "INSERT INTO graph_stage_candidate_reads_v1"
+                    "(bot,persona,read_key,attempt_id,graph_revision,"
+                    "graph_epoch,anchor_json,state) VALUES(?,?,?,?,?,?,?,'open')",
+                    namespace.as_tuple + (read_key, attempt_id,
+                                          metadata.graph_revision, epoch.revision,
+                                          canonical_json(asdict(anchor))),
+                )
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+
+    def _close_stage_candidate_read(self, namespace, read_key, attempt_id) -> None:
+        with self.__store._lock:
+            self.__store._db.execute(
+                "UPDATE graph_stage_candidate_reads_v1 SET state='closed' "
+                "WHERE bot=? AND persona=? AND read_key=? "
+                "AND attempt_id=? AND state='open'",
+                namespace.as_tuple + (read_key, attempt_id),
+            )
+
     def commit_d03_self_identity_projection_v1(
         self, bootstrap: object, namespace: NamespaceId, job_id: str,
         original_operation_id: str, installation_policy, admin_policy,
@@ -9341,6 +9570,10 @@ class GraphCoordinator:
                 or D03_SELF_IDENTITY_PROJECTION_WORK_KIND not in grant.allowed_work_kinds):
             raise UnavailableGuard("installed D03 self projection grant differs; HOLD")
         store, port = self.__store, self.__content_fence_v2
+        recovered = self._recover_d03_self_projection_before_read(
+            namespace, original_operation_id, policy, admin_policy)
+        if recovered is not None:
+            return recovered
         try:
             reading = port.read_ingress_clock(clock_policy)
             now_utc = trusted_upper(reading)
@@ -9366,7 +9599,11 @@ class GraphCoordinator:
             namespace=namespace, authority_namespace=target.authority_namespace)
         if not self._anchor_matches(target, anchor):
             raise UnavailableGuard("D03 self projection recovery anchor differs; HOLD")
+        self._recover_stage_candidate_read(
+            namespace, original_operation_id, metadata, epoch, anchor)
         read_operation = "d03-self-read-" + secrets.token_hex(16)
+        self._record_stage_candidate_read(
+            namespace, original_operation_id, read_operation, metadata, epoch, anchor)
         permit = port.begin_fence(
             namespace=namespace, authority_namespace=target.authority_namespace,
             holder=self.__holder, generation=target.activation_generation,
@@ -9485,6 +9722,8 @@ class GraphCoordinator:
                                   "permit_token": permit.token,
                                   "action": "finish_read",
                               }))
+            self._close_stage_candidate_read(
+                namespace, original_operation_id, read_operation)
         operation_id = d03_self_identity_projection_operation_id_v1(
             namespace, source_ref, candidate_mapping.certification_ref)
         activity_id = d03_self_identity_projection_activity_id_v1(namespace, source_ref)
@@ -9499,72 +9738,7 @@ class GraphCoordinator:
                 target.activation_generation)
             quote_id = d03_self_identity_projection_quote_id(namespace, operation_id)
             if perspective_row is not None:
-                from .authority_service.v2_contract import from_wire
-
-                def replay_reader():
-                    prior = self._get_operation_fenced(authority, operation_id, v2=True)
-                    if prior is None:
-                        raise UnavailableGuard("D03 perspective exists without stage receipt")
-                    db = store._db
-                    issued = db.execute(
-                        "SELECT source_ref,certification_ref,quote_id,bundle_digest "
-                        "FROM graph_d03_self_projection_issuance_v1 WHERE bot=? "
-                        "AND persona=? AND operation_id=?",
-                        namespace.as_tuple + (operation_id,),
-                    ).fetchone()
-                    saved = db.execute(
-                        "SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,"
-                        "post_graph_revision,post_graph_epoch,finish_request_id,"
-                        "finish_request_digest FROM graph_bundle_fences_v2 "
-                        "WHERE bot=? AND persona=? AND operation_id=?",
-                        namespace.as_tuple + (operation_id,),
-                    ).fetchone()
-                    if (issued != (source_ref, candidate_mapping.certification_ref,
-                                   quote_id, prior.operation_digest)
-                            or saved is None or saved[0] != prior.operation_digest
-                            or saved[4] != saved[2] + 1
-                            or saved[5] != prior.invalidated_epochs[0].revision
-                            or mapping_atom.value != asdict(candidate_mapping)
-                            or not any(item.key == perspective_key
-                                       and item.revision == perspective_row[0]
-                                       for item in prior.write_versions)):
-                        raise UnavailableGuard("D03 self projection replay receipt differs")
-                    quote = self.__d02_issuer._load_quote(db, quote_id, 1)
-                    if (quote.operation_id != operation_id
-                            or quote.work_kind != D03_SELF_IDENTITY_PROJECTION_WORK_KIND
-                            or dict(quote.ceiling) != dict(admin_policy.quote_ceiling)):
-                        raise UnavailableGuard("D03 self projection replay quote differs")
-                    return prior, saved
-
-                prior, saved = self._read_v2(authority, replay_reader)
-                attempt_id = "graph-write-" + canonical_digest({
-                    "namespace": list(namespace.as_tuple),
-                    "operation_id": operation_id,
-                    "bundle_digest": prior.operation_digest,
-                })[:48]
-                original_permit = from_wire(json.loads(saved[1]))
-                observed, state = port.get_fence_operation(
-                    namespace=namespace, authority_namespace=target.authority_namespace,
-                    operation_id=attempt_id)
-                if (observed != original_permit or state not in {"active", "finished"}
-                        or original_permit.operation_id != attempt_id
-                        or original_permit.pinned_anchor != anchor):
-                    raise UnavailableGuard("D03 self projection replay fence differs")
-                if state == "active":
-                    with store._lock:
-                        current_metadata, current_epoch = self._v2_graph_stamp(namespace)
-                    if (current_metadata.graph_revision, current_epoch.revision) != saved[4:6]:
-                        raise UnavailableGuard("D03 self projection replay graph changed")
-                    original_scope = FenceScope(
-                        namespace, target.authority_namespace,
-                        target.activation_generation, "write", attempt_id,
-                        original_permit, anchor,
-                        NamespaceEpoch(*namespace.as_tuple, saved[3]), saved[2])
-                    if port.validate_fence(original_scope) != original_permit:
-                        raise UnavailableGuard("D03 self projection replay permit changed")
-                    port.finish_fence(original_scope, request_id=saved[6],
-                                      request_digest=saved[7])
-                return replace(prior, status="duplicate")
+                raise UnavailableGuard("D03 perspective exists without original stage receipt")
             read_versions = tuple(dict.fromkeys((
                 *role.read_versions, source_version, access_version,
                 GraphVersion(event_atom.key, event_atom.revision),
@@ -9592,6 +9766,321 @@ class GraphCoordinator:
                 bundle, lease, self_identity_issuance=(
                     policy, admin_policy, policy.installation_id, now_utc,
                     source_ref, candidate_mapping, job_id, original_operation_id))
+        finally:
+            self.release_authority_lease(bootstrap, lease)
+
+    def _recover_d04_baseline_before_read(
+        self, namespace, original_operation_id, installation_policy,
+        admin_policy,
+    ) -> CommitReceipt | None:
+        """Recover an original baseline write without requiring a queued job."""
+        from .authority_service.v2_contract import from_wire
+
+        store, port = self.__store, self.__content_fence_v2
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            identity = store._db.execute(
+                "SELECT source_ref FROM graph_first_ingress_identity_v1 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (original_operation_id,),
+            ).fetchone()
+            if identity is None:
+                raise UnavailableGuard("D04 original ingress is unavailable; HOLD")
+            source_ref = source_key(*namespace.as_tuple, identity[0]).token
+            has_index = store._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_d04_baseline_intents_v1'",
+            ).fetchone() is not None
+            indexed = (store._db.execute(
+                "SELECT operation_id,bundle_digest FROM graph_d04_baseline_intents_v1 "
+                "WHERE bot=? AND persona=? AND source_ref=? AND original_operation_id=?",
+                namespace.as_tuple + (source_ref, original_operation_id),
+            ).fetchone() if has_index else None)
+            has_issued = store._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_d04_baseline_issuance_v1'",
+            ).fetchone() is not None
+            issued = (store._db.execute(
+                "SELECT operation_id,event_ref,quote_id,bundle_digest FROM "
+                "graph_d04_baseline_issuance_v1 WHERE bot=? AND persona=? "
+                "AND source_ref=?",
+                namespace.as_tuple + (source_ref,),
+            ).fetchall() if has_issued else [])
+            if len(issued) > 1:
+                raise UnavailableGuard("D04 baseline has multiple original receipts")
+            if not issued and indexed is None:
+                return None
+            operation_id = issued[0][0] if issued else indexed[0]
+            intent = store._db.execute(
+                "SELECT digest,fence_attempt_id,requirements_json,anchor_json,"
+                "graph_revision,graph_epoch FROM graph_bundle_intents_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if intent is None or (indexed is not None
+                                  and indexed != (operation_id, intent[0])):
+                raise UnavailableGuard("D04 baseline durable intent differs")
+            prior = self._get_operation_fenced(
+                AuthorityContext("host", "d11", "recovery", namespace,
+                                 ("persona", "event"), "context", (),
+                                 installation_policy.root_grant.policy_ref,
+                                 metadata.requirements.activation_generation),
+                operation_id, v2=True)
+            saved = store._db.execute(
+                "SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,"
+                "post_graph_revision,post_graph_epoch,finish_request_id,"
+                "finish_request_digest FROM graph_bundle_fences_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if issued:
+                quote = self.__d02_issuer._load_quote(store._db, issued[0][2], 1)
+                if (prior is None or saved is None
+                        or issued[0][3] != prior.operation_digest
+                        or saved[0] != prior.operation_digest
+                        or quote.operation_id != operation_id
+                        or quote.work_kind != "d04.encoding_baseline"
+                        or dict(quote.ceiling) != dict(admin_policy.quote_ceiling)
+                        or not any(item.key.type_name == "d04.encoding_baseline.v1"
+                                   for item in prior.write_versions)):
+                    raise UnavailableGuard("D04 baseline original receipt differs")
+            elif prior is not None or saved is not None:
+                raise UnavailableGuard("D04 baseline lacks sealed issuance")
+        target = metadata.requirements
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("D04 baseline recovery anchor differs")
+        observed, state = port.get_fence_operation(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            operation_id=intent[1])
+        if issued:
+            original_permit = from_wire(json.loads(saved[1]))
+            if (observed != original_permit or state not in {"active", "finished"}
+                    or original_permit.operation_id != intent[1]
+                    or original_permit.pinned_anchor != anchor
+                    or saved[4] != saved[2] + 1
+                    or saved[5] != prior.invalidated_epochs[0].revision):
+                raise UnavailableGuard("D04 baseline original fence differs")
+            if state == "active":
+                if (metadata.graph_revision, epoch.revision) != saved[4:6]:
+                    raise UnavailableGuard("D04 baseline active graph changed")
+                scope = FenceScope(
+                    namespace, target.authority_namespace,
+                    target.activation_generation, "write", intent[1],
+                    original_permit, anchor,
+                    NamespaceEpoch(*namespace.as_tuple, saved[3]), saved[2])
+                if port.validate_fence(scope) != original_permit:
+                    raise UnavailableGuard("D04 baseline original permit changed")
+                port.finish_fence(scope, request_id=saved[6],
+                                  request_digest=saved[7])
+            elif (metadata.graph_revision < saved[4]
+                  or epoch.revision < saved[5]):
+                raise UnavailableGuard("D04 baseline graph receipt regressed")
+            return replace(prior, status="duplicate")
+        if observed is None:
+            return None
+        if (state != "active" or (metadata.graph_revision, epoch.revision)
+                != (intent[4], intent[5])):
+            raise UnavailableGuard("D04 baseline uncertain write requires HOLD")
+        rejection = self._record_rejected_bundle_v2(
+            namespace, operation_id, intent[0], intent[1], metadata, epoch,
+            intent, observed)
+        self._finish_rejected_bundle_v2(
+            namespace, metadata, epoch, anchor, intent[1], intent[0],
+            operation_id, rejection)
+        raise UnavailableGuard("D04 baseline previous no-commit fence closed; HOLD")
+
+    def commit_d04_encoding_baseline_v1(
+        self, bootstrap: object, namespace: NamespaceId, job_id: str,
+        original_operation_id: str, installation_policy, admin_policy,
+        clock_policy,
+    ) -> CommitReceipt:
+        """Commit an unknown-valued D04 baseline from the original self view."""
+        from .domains.d03.self_perspective import SelfPerspective
+        from .domains.d04 import AffectProvider
+        from .host.authority_profile import (
+            AdminD04EncodingBaselinePolicy, AdminIngressClockPolicy,
+        )
+        from .installation_policy import AdminInstallationPolicy
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D04_BASELINE_WORK_KIND, d04_baseline_quote_id
+        from .runtime_contracts import (
+            CommandEnvelope, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA,
+            VersionedRef,
+        )
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId
+                or type(installation_policy) is not AdminInstallationPolicy
+                or type(admin_policy) is not AdminD04EncodingBaselinePolicy
+                or type(clock_policy) is not AdminIngressClockPolicy
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__self_identity_port is None):
+            raise UnavailableGuard("installed D04 baseline authorities required; HOLD")
+        provider_entry = self.__providers.get("d04")
+        if provider_entry is None or type(provider_entry[0]) is not AffectProvider:
+            raise UnavailableGuard("current D04 baseline provider unavailable; HOLD")
+        provider = provider_entry[0]
+        policy = installation_policy
+        grant = policy.root_grant
+        if (policy.namespace != namespace
+                or D04_BASELINE_WORK_KIND not in grant.allowed_work_kinds):
+            raise UnavailableGuard("installed D04 baseline grant differs; HOLD")
+        store, port = self.__store, self.__content_fence_v2
+        recovered = self._recover_d04_baseline_before_read(
+            namespace, original_operation_id, policy, admin_policy)
+        if recovered is not None:
+            return recovered
+        with store._lock:
+            original_metadata, _ = self._v2_graph_stamp(namespace)
+            identity = store._db.execute(
+                "SELECT conversation_ref FROM graph_first_ingress_identity_v1 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (original_operation_id,),
+            ).fetchone()
+        if identity is None:
+            raise UnavailableGuard("D04 baseline original ingress is absent; HOLD")
+        original_lease, original_capability = self.grant(
+            bootstrap, actor=self.__holder, issuer_domain="d11", namespace=namespace,
+            domains=("d11",),
+            activation_generation=original_metadata.requirements.activation_generation,
+            operation_id=original_operation_id)
+        try:
+            original_authority = AuthorityContext(
+                self.__holder, "d11", original_capability, namespace,
+                ("activity",), "context", (identity[0],), grant.policy_ref,
+                original_metadata.requirements.activation_generation)
+            inputs = self.read_first_ingress_baseline_inputs_v1(
+                original_authority, original_lease, job_id, original_operation_id)
+        finally:
+            self.release_authority_lease(bootstrap, original_lease)
+        try:
+            reading = port.read_ingress_clock(clock_policy)
+            now_utc = trusted_upper(reading)
+        except Exception as exc:
+            raise UnavailableGuard("paired D04 baseline clock unavailable; HOLD") from exc
+        deadline = min(math.nextafter(math.fsum((
+            now_utc, admin_policy.deadline_after_seconds)), -math.inf),
+            grant.valid_until_utc)
+        if deadline <= now_utc:
+            raise UnavailableGuard("D04 baseline deadline unavailable; HOLD")
+        monotonic_deadline = reading.monotonic_after_seconds + (
+            deadline - reading.utc_upper_bound_seconds)
+        if not math.isfinite(monotonic_deadline):
+            raise UnavailableGuard("D04 baseline monotonic deadline differs")
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            if (metadata.graph_revision != inputs.graph_revision
+                    or epoch.revision != inputs.graph_epoch):
+                raise StaleRead("D04 baseline original graph changed")
+            db = store._db
+            perspectives = db.execute(
+                "SELECT token,revision,value FROM graph_atoms WHERE bot=? "
+                "AND persona=? AND type_name='d03.self_perspective.v1' AND valid=1",
+                namespace.as_tuple,
+            ).fetchall()
+            matched = []
+            for token, revision, encoded in perspectives:
+                value = SelfPerspective(**json.loads(encoded))
+                event_key = AtomKey.from_token(value.arrival_event_ref)
+                event_row = db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (event_key.token,),
+                ).fetchone()
+                if (event_row is not None and event_row[2] == 1
+                        and json.loads(event_row[1]).get("source_refs")
+                        == [inputs.source_ref]):
+                    matched.append((token, revision, value, event_key, event_row))
+            if len(matched) != 1:
+                raise UnavailableGuard("D04 baseline needs one committed self perspective")
+            perspective_token, perspective_revision, perspective, event_key, event_row = (
+                matched[0])
+            perspective_key = AtomKey.from_token(perspective_token)
+            origin = db.execute(
+                "SELECT h.event_id,o.digest,i.source_ref,i.bundle_digest "
+                "FROM graph_history AS h JOIN graph_bundle_operations AS o "
+                "ON o.bot=h.event_bot AND o.persona=h.event_persona "
+                "AND o.operation_id=h.event_id "
+                "JOIN graph_d03_self_projection_issuance_v1 AS i "
+                "ON i.bot=h.event_bot AND i.persona=h.event_persona "
+                "AND i.operation_id=h.event_id "
+                "WHERE h.token=? AND h.revision=?",
+                (perspective_token, perspective_revision),
+            ).fetchone()
+            if (origin is None or origin[1] != origin[3]
+                    or origin[2] != inputs.source_ref):
+                raise UnavailableGuard("D04 baseline self perspective lacks stage receipt")
+            mapping_key = AtomKey.from_token(perspective.identity_mapping_ref)
+            keys = (AtomKey.from_token(inputs.source_ref),
+                    access_key(*namespace.as_tuple,
+                               AtomKey.from_token(inputs.source_ref).owner.subject),
+                    event_key, perspective_key, mapping_key)
+            atoms = []
+            for key in keys:
+                row = db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (key.token,),
+                ).fetchone()
+                if row is None:
+                    raise UnavailableGuard("D04 baseline prerequisite graph atom absent")
+                atoms.append(GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])))
+            snapshot = GraphSnapshot(tuple(atoms), (epoch,))
+            guard_versions = dict(db.execute(
+                "SELECT kind,version FROM graph_guard_versions WHERE bot=? "
+                "AND persona=? AND ref='current'", namespace.as_tuple,
+            ).fetchall())
+            authority_epochs = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone() or (0, 0)
+        operation_id = "d04-baseline-" + canonical_digest({
+            "namespace": namespace.as_tuple, "source": inputs.source_ref,
+            "event": event_key.token, "perspective": perspective_token,
+            "perspective_revision": perspective_revision,
+        })[:40]
+        activity_id = "d04-baseline-activity-" + canonical_digest({
+            "namespace": namespace.as_tuple, "source": inputs.source_ref,
+        })[:40]
+        lease, capability = self.grant(
+            bootstrap, actor="host", issuer_domain="d11", namespace=namespace,
+            domains=("d04",),
+            activation_generation=metadata.requirements.activation_generation,
+            operation_id=operation_id)
+        try:
+            authority = AuthorityContext(
+                "host", "d11", capability, namespace, ("persona", "event"),
+                "context", (identity[0],), grant.policy_ref,
+                metadata.requirements.activation_generation)
+            quote_id = d04_baseline_quote_id(namespace, operation_id)
+            input_refs = (inputs.source_ref, event_key.token)
+            envelope = CommandEnvelope(
+                RUNTIME_SCHEMA,
+                OperationIdentity(activity_id, None, "baseline-attempt",
+                                  "encoding_baseline", operation_id,
+                                  canonical_digest({"input_refs": list(input_refs)})),
+                authority,
+                VersionGuard(
+                    tuple(GraphVersion(atom.key, atom.revision) for atom in atoms),
+                    (QueryEpoch(namespace, "all", epoch.revision),),
+                    *authority_epochs, store._registry.catalogue_hash,
+                    guard_versions["scheme"], guard_versions["operator"],
+                    guard_versions["policy"], (), (), (VersionedRef(quote_id, 1),)),
+                inputs.qualification, input_refs, grant.lease_id,
+                deadline, monotonic_deadline, "character-v1",
+                (original_operation_id, origin[0]),
+            )
+            proposal = provider.propose_encoding_baseline(
+                envelope, snapshot, source_refs=(inputs.source_ref,),
+                perspective_ref=perspective_token,
+                projection_policy_ref=admin_policy.snapshot_ref)
+            bundle = DomainBundle(proposal.envelope, (proposal,), (), (), (), (), (), (), ())
+            return self._commit_domain_bundle_v2(
+                bundle, lease, baseline_issuance=(
+                    admin_policy, policy.installation_id, now_utc,
+                    inputs.source_ref, event_key.token, job_id, policy,
+                    original_operation_id))
         finally:
             self.release_authority_lease(bootstrap, lease)
 
@@ -9672,6 +10161,52 @@ class GraphCoordinator:
                 try:
                     if self._v2_graph_stamp(namespace) != (metadata, epoch):
                         raise StaleRead("v2 graph recovery stamp changed before intent")
+                    if self_identity_issuance is not None:
+                        db.execute("""CREATE TABLE IF NOT EXISTS graph_d03_self_projection_intents_v1(
+                            bot TEXT NOT NULL, persona TEXT NOT NULL,
+                            source_ref TEXT NOT NULL, original_operation_id TEXT NOT NULL,
+                            operation_id TEXT NOT NULL, bundle_digest TEXT NOT NULL,
+                            PRIMARY KEY(bot,persona,source_ref,original_operation_id))""")
+                        db.execute(
+                            "INSERT OR IGNORE INTO graph_d03_self_projection_intents_v1"
+                            "(bot,persona,source_ref,original_operation_id,operation_id,bundle_digest) "
+                            "VALUES(?,?,?,?,?,?)",
+                            namespace.as_tuple + (self_identity_issuance[4],
+                                                  self_identity_issuance[7],
+                                                  operation_id, digest),
+                        )
+                        indexed = db.execute(
+                            "SELECT operation_id,bundle_digest FROM "
+                            "graph_d03_self_projection_intents_v1 WHERE bot=? AND persona=? "
+                            "AND source_ref=? AND original_operation_id=?",
+                            namespace.as_tuple + (self_identity_issuance[4],
+                                                  self_identity_issuance[7]),
+                        ).fetchone()
+                        if indexed != (operation_id, digest):
+                            raise EventConflict("D03 self stage recovery identity differs")
+                    if baseline_issuance is not None:
+                        db.execute("""CREATE TABLE IF NOT EXISTS graph_d04_baseline_intents_v1(
+                            bot TEXT NOT NULL, persona TEXT NOT NULL,
+                            source_ref TEXT NOT NULL, original_operation_id TEXT NOT NULL,
+                            operation_id TEXT NOT NULL, bundle_digest TEXT NOT NULL,
+                            PRIMARY KEY(bot,persona,source_ref,original_operation_id))""")
+                        db.execute(
+                            "INSERT OR IGNORE INTO graph_d04_baseline_intents_v1"
+                            "(bot,persona,source_ref,original_operation_id,operation_id,bundle_digest) "
+                            "VALUES(?,?,?,?,?,?)",
+                            namespace.as_tuple + (baseline_issuance[3],
+                                                  baseline_issuance[7],
+                                                  operation_id, digest),
+                        )
+                        indexed = db.execute(
+                            "SELECT operation_id,bundle_digest FROM "
+                            "graph_d04_baseline_intents_v1 WHERE bot=? AND persona=? "
+                            "AND source_ref=? AND original_operation_id=?",
+                            namespace.as_tuple + (baseline_issuance[3],
+                                                  baseline_issuance[7]),
+                        ).fetchone()
+                        if indexed != (operation_id, digest):
+                            raise EventConflict("D04 baseline recovery identity differs")
                     db.execute(
                         "INSERT OR IGNORE INTO graph_bundle_intents_v2"
                         "(bot,persona,operation_id,digest,fence_attempt_id,"
@@ -9811,7 +10346,11 @@ class GraphCoordinator:
                     raise UnavailableGuard("current scene Owner guard is unavailable")
                 scene_owner_guard = guarded[0]
             qualified_self = None
-            if self_identity_issuance is not None:
+            current_self_policy = (
+                self_identity_issuance[0] if self_identity_issuance is not None else
+                baseline_issuance[6] if baseline_issuance is not None
+                and len(baseline_issuance) == 8 else None)
+            if current_self_policy is not None:
                 from .domains.d03.self_identity_qualification import (
                     qualify_authority_current_self_identity,
                 )
@@ -9856,16 +10395,18 @@ class GraphCoordinator:
                 )
                 qualified_mapping = qualify_authority_current_self_identity(
                     role=role, activation_atom=activation_atom,
-                    policy=self_identity_issuance[0],
+                    policy=current_self_policy,
                     installation_grant=port.installation_grant,
                     owner_guard=scene_owner_guard,
                     request_operation_id=operation_id, permit=permit,
                     port=SimpleNamespace(current_self_identity=lambda **_: current),
                 )
-                if (qualified_mapping != self_identity_issuance[5]
-                        or current.graph_revision != metadata.graph_revision
+                if (current.graph_revision != metadata.graph_revision
                         or current.graph_epoch != epoch.revision
                         or port.validate_fence(scope) != permit):
+                    raise UnavailableGuard("current self identity changed; HOLD")
+                if (self_identity_issuance is not None
+                        and qualified_mapping != self_identity_issuance[5]):
                     raise UnavailableGuard("current self identity changed; HOLD")
                 qualified_self = (role, qualified_mapping, current)
             receipt = self._commit_domain_bundle_fenced(
@@ -10223,17 +10764,40 @@ class GraphCoordinator:
                                           quote.quote_id, policy_digest, digest),
                 )
             if baseline_issuance is not None:
-                admin_policy, installation_id, baseline_now, source_ref, event_ref, job_id = (
-                    baseline_issuance)
+                (admin_policy, installation_id, baseline_now, source_ref,
+                 event_ref, job_id, installation_policy,
+                 original_operation_id) = baseline_issuance
                 if (v2_write is None or len(bundle.proposals) != 1
                         or bundle.proposals[0].domain != "d04"
                         or envelope.input_refs != (source_ref, event_ref)
                         or bundle.persistent_job_refs or bundle.outbox_refs
-                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs
+                        or qualified_self is None
+                        or installation_policy.installation_id != installation_id):
                     raise AuthorityDenied("D04 baseline stage identity differs")
+                baseline_write = bundle.proposals[0].typed_writes[0]
+                perspective_key = AtomKey.from_token(
+                    baseline_write.value["perspective_ref"])
+                perspective_row = db.execute(
+                    "SELECT value,valid FROM graph_atoms WHERE token=?",
+                    (perspective_key.token,),
+                ).fetchone()
+                if (perspective_key.type_name != "d03.self_perspective.v1"
+                        or perspective_row is None or perspective_row[1] != 1):
+                    raise UnavailableGuard("D04 baseline lacks current self perspective; HOLD")
+                mapping_key = AtomKey.from_token(
+                    json.loads(perspective_row[0])["identity_mapping_ref"])
+                mapping_row = db.execute(
+                    "SELECT value,valid FROM graph_atoms WHERE token=?",
+                    (mapping_key.token,),
+                ).fetchone()
+                if (mapping_row is None or mapping_row[1] != 1
+                        or json.loads(mapping_row[0]) != asdict(qualified_self[1])):
+                    raise UnavailableGuard("D04 baseline current Authority self differs; HOLD")
                 job, _, _, outbox, _, _, source_version, access_version = (
                     self._first_ingress_encoding_job_locked(namespace, job_id))
-                if (job.phase != "queued" or job.cancel_epoch != 0
+                if (job.operation_id != original_operation_id
+                        or job.phase != "queued" or job.cancel_epoch != 0
                         or job.fence != 0 or job.lease_holder is not None
                         or source_version.key.token != source_ref
                         or outbox.payload_ref != source_version.key.owner.subject
