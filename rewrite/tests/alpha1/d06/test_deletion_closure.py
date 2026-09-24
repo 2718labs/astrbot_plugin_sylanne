@@ -1,8 +1,14 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 from sylanne3.domains.d06 import D06DomainAdapter, ErasureRequest
-from sylanne3.graph_types import AtomKey, Owner
-from sylanne3.memory_types import source_key
+from sylanne3.domains.d06.deletion_read import read_deletion_closure_candidate
+from sylanne3.contracts import Event, Scope
+from sylanne3.graph_store import GraphStore
+from sylanne3.graph_types import AtomKey, GraphCandidate, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec
+from sylanne3.memory_repository import MemoryRepository
+from sylanne3.memory_types import SourceRecord, association_key, episode_key, register_memory_types, source_key, subjective_trace_key
 from sylanne3.runtime_contracts import NamespaceId
 
 
@@ -66,6 +72,61 @@ class DeletionClosureTests(unittest.TestCase):
         plan = self.domain.plan_erasure(request)
         self.assertEqual(plan.status, "pending_runtime_authority")
         self.assertNotIn(plan.status, {"accepted", "closed", "barrier_installed"})
+
+    def test_graph_read_finds_source_descendants_episode_trace_and_association_across_pages(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        if True:
+            registry = TypeRegistry()
+            register_memory_types(registry)
+            registry.register(TypeSpec("d03.world_event", ("event",), "state", lambda _: None))
+            store = GraphStore(Path(tmp.name) / "memory.db", registry)
+            self.addCleanup(store.close)
+            repository = MemoryRepository(store, "bot", "persona")
+            scope = Scope("bot", "persona", "session")
+            def source(source_id, parents=()):
+                return SourceRecord(source_id, source_id, "speaker", "reported", "reported",
+                                    None, 1.0, "family", ("owner",), ("context",), parents)
+            repository.ingest(Event(scope, "root", 1, "ingest", {}), source("source-1"))
+            repository.ingest(Event(scope, "child", 2, "ingest", {}), source("child-1", ("source-1",)))
+            repository.ingest(Event(scope, "other", 3, "ingest", {}), source("other-1"))
+            child = source_key("bot", "persona", "child-1")
+            other = source_key("bot", "persona", "other-1")
+            episode = episode_key("bot", "persona", "episode-1")
+            trace = subjective_trace_key("bot", "persona", "trace-1")
+            association = association_key("bot", "persona", "other-1", "association-1")
+            event_ref = AtomKey(Owner("event", "bot", "persona", "event-1"), "d03.world_event", "current")
+            perspective = AtomKey(Owner("scene", "bot", "persona", "scene-1"), "d03.role_binding", "current")
+            writes = (
+                GraphWrite(episode, {"episode_id": "episode-1", "source_refs": [child.token],
+                                     "event_ref": event_ref.token}),
+                GraphWrite(trace, {"trace_id": "trace-1", "episode_ref": episode.token,
+                                   "perspective_ref": perspective.token, "then_feeling_refs": [],
+                                   "interpretation_refs": [], "detail_weights": []}),
+                GraphWrite(association, {"association_id": "association-1",
+                                         "source_ref": other.token, "target_ref": child.token,
+                                         "kind": "similarity", "weight": 0.5,
+                                         "context_tags": [], "basis_source_refs": [other.token],
+                                         "content_reality": "reported"}),
+            )
+            store.graph_commit(GraphCandidate(
+                Event(scope, "derived", 4, "derived", {}),
+                tuple(GraphVersion(write.key, 0) for write in writes), writes,
+            ))
+            request = ErasureRequest("erase-1", (self.root.token,), "all_derived", 1, 1)
+            result = read_deletion_closure_candidate(repository, request, page_limit=1)
+            self.assertTrue(result.scan_complete)
+            self.assertEqual(result.status, "hold")
+            self.assertEqual(result.source_descendant_refs, (child.token,))
+            self.assertEqual(result.episode_refs, (episode.token,))
+            self.assertEqual(result.trace_refs, (trace.token,))
+            self.assertEqual(result.association_refs, (association.token,))
+            self.assertIn("current_dependency_index", result.missing_facets)
+            self.assertFalse(hasattr(result, "request_authorized"))
+            partial = read_deletion_closure_candidate(repository, request, page_limit=1, max_pages=2)
+            self.assertFalse(partial.scan_complete)
+            self.assertEqual(partial.status, "partial_hold")
+            self.assertIsNotNone(partial.next_after)
 
 
 if __name__ == "__main__":
