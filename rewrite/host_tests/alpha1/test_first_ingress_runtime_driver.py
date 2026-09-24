@@ -9,6 +9,11 @@ from rewrite.host_tests.alpha1 import test_astrbot_model_call as model_fixture
 from rewrite.host_tests.alpha1.test_first_ingress_encoding_egress import frozen_case
 from rewrite.host_tests.alpha1.test_host_model_egress_executor import fixture_values
 from sylanne3.host.ingress import HostIngressEnvelope, IngressReceipt, SourceLineage
+from sylanne3.host.authority_profile import (
+    AdminD03SelfIdentityProjectionPolicy, AdminD04EncodingBaselinePolicy,
+    AdminIngressClockPolicy,
+)
+from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.host.model_egress_executor import (
     FrozenEncodingEgressResult, HostModelEgressExecutor,
 )
@@ -19,7 +24,7 @@ from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequest
 from sylanne3.runtime.first_ingress_v2 import ingress_ids
 from sylanne3.runtime.original_model_result_context import OriginalModelResultContextV1
 from sylanne3.runtime_context import RuntimeContext
-from sylanne3.runtime_contracts import AuthorityContext
+from sylanne3.runtime_contracts import AuthorityContext, CommitReceipt
 
 
 class Worker:
@@ -30,6 +35,110 @@ class Worker:
     async def call(self, fn, *args):
         self.calls += 1
         return fn(self.graph, *args)
+
+
+@pytest.mark.asyncio
+async def test_accepted_ingress_commits_d03_before_d04_and_holds_on_unknown(tmp_path):
+    host = model_fixture.AstrBotModelCallTests(
+        methodName="test_one_http_request_on_host_loop_with_usage")
+    await host.asyncSetUp()
+    try:
+        bundle, _, _ = host.v2_adapters()
+        clock = AdminIngressClockPolicy("clock", 1.0, 1.0)
+        d03_policy = AdminD03SelfIdentityProjectionPolicy(
+            30.0, {"graph_write": 1}, "snapshot", "resource")
+        d04_policy = AdminD04EncodingBaselinePolicy(
+            30.0, {"graph_write": 1}, "snapshot", "resource")
+        bundle = replace(
+            bundle, ingress_clock=clock,
+            d03_self_identity_projection=d03_policy,
+            d04_encoding_baseline=d04_policy,
+        )
+        namespace = bundle.installation_policy.namespace
+        source_ref = "a" * 64
+        envelope = HostIngressEnvelope(
+            namespace, "platform", "owner", "sender", "message", "text",
+            None, 1.0, "private", SourceLineage(
+                source_ref, "reported", "platform", "external_report",
+                "reported_claim"),
+        )
+        _, _, ingress_id, job_id, _, _ = ingress_ids(source_ref)
+        accepted = IngressReceipt("accepted", ingress_id)
+
+        def receipt(operation_id, *types):
+            return CommitReceipt(
+                "committed", operation_id, "a" * 64, "activity", None, 1,
+                (), tuple(GraphVersion(
+                    AtomKey(Owner("persona", *namespace.as_tuple), name, "record"), 1,
+                ) for name in types), (), (), (),
+            )
+
+        d03 = receipt("d03-self-projection-original",
+                      "d03.self_identity_mapping.v1", "d03.self_perspective.v1")
+        d04 = receipt("d04-baseline-original", "d04.encoding_baseline.v1")
+        calls = []
+
+        class Graph:
+            def commit_d03_self_identity_projection_v1(self, *args):
+                calls.append(("d03", args))
+                if getattr(self, "identity_unavailable", False):
+                    raise RuntimeError("Authority current self unavailable")
+                return self.d03_result
+
+            def commit_d04_encoding_baseline_v1(self, *args):
+                calls.append(("d04", args))
+                return self.d04_result
+
+        graph = Graph()
+        graph.d03_result = d03
+        graph.d04_result = d04
+        runtime = RuntimeContext(tmp_path, dependencies=None)
+        runtime._worker = Worker(graph)
+        runtime._v2_bootstrap = object()
+        runtime._v2_model_bundle = bundle
+        runtime._v2_policy = bundle.installation_policy
+        runtime._v2_namespace = namespace
+        runtime._v2_namespace_provisioned = True
+        result = await runtime.commit_first_ingress_pre_encoding_stages_v1(
+            envelope, accepted)
+        assert result is not None
+        assert (result.ingress_operation_id, result.job_id,
+                result.d03_receipt, result.d04_receipt) == (
+                ingress_id, job_id, d03, d04)
+        assert [name for name, _ in calls] == ["d03", "d04"]
+        assert all(args[:4] == (runtime._v2_bootstrap, namespace, job_id, ingress_id)
+                   for _, args in calls)
+        assert calls[0][1][4:] == (bundle.installation_policy, d03_policy, clock)
+        assert calls[1][1][4:] == (bundle.installation_policy, d04_policy, clock)
+
+        calls.clear()
+        graph.d03_result = replace(d03, status="pending_confirmation", commit_seq=None)
+        assert await runtime.commit_first_ingress_pre_encoding_stages_v1(
+            envelope, accepted) is None
+        assert [name for name, _ in calls] == ["d03"]
+        calls.clear()
+        graph.d03_result = d03
+        graph.d04_result = None
+        assert await runtime.commit_first_ingress_pre_encoding_stages_v1(
+            envelope, accepted) is None
+        assert [name for name, _ in calls] == ["d03", "d04"]
+        calls.clear()
+        graph.identity_unavailable = True
+        assert await runtime.commit_first_ingress_pre_encoding_stages_v1(
+            envelope, accepted) is None
+        assert [name for name, _ in calls] == ["d03"]
+        graph.identity_unavailable = False
+        calls.clear()
+        runtime._v2_model_bundle = replace(bundle, d03_self_identity_projection=None)
+        assert await runtime.commit_first_ingress_pre_encoding_stages_v1(
+            envelope, accepted) is None
+        assert calls == []
+        runtime._v2_model_bundle = bundle
+        assert await runtime.commit_first_ingress_pre_encoding_stages_v1(
+            envelope, IngressReceipt("duplicate", ingress_id)) is None
+        assert calls == []
+    finally:
+        await host.asyncTearDown()
 
 
 @pytest.mark.asyncio

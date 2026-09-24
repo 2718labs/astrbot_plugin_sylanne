@@ -24,7 +24,8 @@ from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
 from .host.authority_profile import (
-    AdminD03ArrivalPolicy, AdminIngressClockPolicy, AdminIngressEncodingPolicy,
+    AdminD03ArrivalPolicy, AdminD03SelfIdentityProjectionPolicy,
+    AdminD04EncodingBaselinePolicy, AdminIngressClockPolicy, AdminIngressEncodingPolicy,
     AdminIngressModelPolicy, AdminInstallationBundle, AdminModelWorkflowsV2,
     AdminModelWorkflowV2,
 )
@@ -53,7 +54,7 @@ from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.first_ingress_v2 import ingress_ids
 from .runtime.original_model_result_context import OriginalModelResultContextV1
 from .runtime.restore_anchor import ExecutionJournalPort
-from .runtime_contracts import AuthorityContext, InstallationGrantV2, NamespaceId
+from .runtime_contracts import AuthorityContext, CommitReceipt, InstallationGrantV2, NamespaceId
 from .workbench_api.async_service import AsyncGraphWorkbenchService
 from .workbench_api.domain_registry import CurrentDomainViewRegistry
 from .workbench_api.http_transport import (
@@ -81,6 +82,15 @@ class RuntimeHealth:
     status: str
     missing_capabilities: tuple[str, ...] = ()
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class FirstIngressPreEncodingStagesV1:
+    namespace: NamespaceId
+    ingress_operation_id: str
+    job_id: str
+    d03_receipt: CommitReceipt
+    d04_receipt: CommitReceipt
 
 
 @dataclass(frozen=True)
@@ -851,6 +861,68 @@ class RuntimeContext:
             return None
         return await executor.execute_frozen_encoding_once(
             binding=binding, draft=draft, expected_anchor=expected_anchor)
+
+    async def commit_first_ingress_pre_encoding_stages_v1(
+        self, envelope: HostIngressEnvelope, receipt: IngressReceipt,
+    ) -> FirstIngressPreEncodingStagesV1 | None:
+        """Commit D03 then D04 for the original accepted C01 job.
+
+        W01 obtains its own current Authority receipts and write fences. A
+        missing policy, unresolved stage, or unverifiable receipt stays HOLD.
+        This method does not acquire the job or call the model.
+        """
+        bundle = self._v2_model_bundle
+        policy = self._v2_policy
+        if (type(envelope) is not HostIngressEnvelope
+                or type(receipt) is not IngressReceipt
+                or receipt.status != "accepted"
+                or self._worker is None or self._v2_bootstrap is None
+                or not self._v2_namespace_provisioned
+                or type(bundle) is not AdminInstallationBundle
+                or type(policy) is not AdminInstallationPolicy
+                or bundle.installation_policy != policy
+                or envelope.namespace != policy.namespace
+                or type(bundle.ingress_clock) is not AdminIngressClockPolicy
+                or type(bundle.d03_self_identity_projection)
+                   is not AdminD03SelfIdentityProjectionPolicy
+                or type(bundle.d04_encoding_baseline)
+                   is not AdminD04EncodingBaselinePolicy):
+            return None
+        _, _, ingress_id, job_id, _, _ = ingress_ids(
+            envelope.lineage.source_ref)
+        if receipt.operation_id != ingress_id:
+            return None
+
+        def committed_stage(value, prefix, required_types):
+            return (type(value) is CommitReceipt
+                    and value.status in {"committed", "duplicate"}
+                    and value.operation_id.startswith(prefix)
+                    and {version.key.type_name for version in value.write_versions}
+                    >= required_types
+                    and all(NamespaceId.from_key(version.key) == policy.namespace
+                            for version in value.write_versions))
+
+        try:
+            d03 = await self._worker.call(
+                lambda graph: graph.commit_d03_self_identity_projection_v1(
+                    self._v2_bootstrap, policy.namespace, job_id, ingress_id,
+                    policy, bundle.d03_self_identity_projection,
+                    bundle.ingress_clock))
+            if not committed_stage(
+                    d03, "d03-self-projection-",
+                    {"d03.self_identity_mapping.v1", "d03.self_perspective.v1"}):
+                return None
+            d04 = await self._worker.call(
+                lambda graph: graph.commit_d04_encoding_baseline_v1(
+                    self._v2_bootstrap, policy.namespace, job_id, ingress_id,
+                    policy, bundle.d04_encoding_baseline,
+                    bundle.ingress_clock))
+        except Exception:
+            return None
+        if not committed_stage(d04, "d04-baseline-", {"d04.encoding_baseline.v1"}):
+            return None
+        return FirstIngressPreEncodingStagesV1(
+            policy.namespace, ingress_id, job_id, d03, d04)
 
     async def read_first_ingress_encoding_for_owner_v2(
         self, authority: AuthorityContext, lease: object,

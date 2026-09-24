@@ -354,9 +354,14 @@ class Sylanne3Plugin(Star):
         if receipt.status == "deferred":
             logger.warning("Sylanne 3 ingress outcome pending confirmation")
         elif receipt.status == "accepted" and self._v2_installation is not None:
-            # The worker may start only after C01, legal D03 perspective and
-            # the D04 baseline are committed under the new ingress contract.
-            logger.warning("Sylanne 3 first encoding awaits committed baseline; HOLD")
+            stages = await runtime.commit_first_ingress_pre_encoding_stages_v1(
+                envelope, receipt)
+            if stages is None:
+                logger.warning("Sylanne 3 first encoding awaits D03/D04 stages; HOLD")
+            else:
+                # No provider attempt is made until the separate original-job
+                # acquire and result lifecycle are installed end to end.
+                logger.info("Sylanne 3 first encoding baseline committed; egress HOLD")
 
 
 __all__ = ("Sylanne3Plugin",)

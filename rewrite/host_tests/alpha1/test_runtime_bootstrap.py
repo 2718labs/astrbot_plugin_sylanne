@@ -718,6 +718,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.calls = 0
                 self.cost_calls = 0
+                self.stage_calls = 0
 
             async def handle_ingress(self, _envelope):
                 self.calls += 1
@@ -727,6 +728,10 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             async def commit_first_ingress_model_cost_v1(self, result):
                 self.cost_calls += 1
                 return object()
+
+            async def commit_first_ingress_pre_encoding_stages_v1(self, envelope, receipt):
+                self.stage_calls += 1
+                return None
 
         plugin = module.Sylanne3Plugin(
             Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),
@@ -742,6 +747,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         await plugin.ingress(event)
         await plugin.ingress(event)
         self.assertEqual(plugin._runtime.calls, 2)
+        self.assertEqual(plugin._runtime.stage_calls, 1)
         self.assertEqual(plugin._runtime.cost_calls, 0)
         self.assertEqual(plugin._encoding_tasks, set())
         self.assertFalse(event.is_stopped())
