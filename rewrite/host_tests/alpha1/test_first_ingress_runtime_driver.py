@@ -201,6 +201,45 @@ async def test_owner_result_reads_current_job_before_authority_query(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_new_encoding_path_holds_legacy_v2_binding_before_egress(tmp_path):
+    host = model_fixture.AstrBotModelCallTests(
+        methodName="test_one_http_request_on_host_loop_with_usage")
+    await host.asyncSetUp()
+    try:
+        bundle, adapter, _ = host.v2_adapters()
+        binding, draft, anchor, request = frozen_case(host, bundle)
+        assert binding.request["schema"] == "sylanne.first-ingress-encoding-call.v2"
+        _, _, _, _, grant, client = fixture_values(host, request)
+        executor = HostModelEgressExecutor(
+            authority=client, bundle=bundle, grant=grant, adapter=adapter)
+
+        class Graph:
+            def read_first_ingress_model_egress_preparation_v2(self, *_):
+                return binding, draft, anchor
+
+        async def forbidden(self, **_):
+            pytest.fail("legacy V2 binding reached new provider path")
+
+        executor.execute_frozen_encoding_once = MethodType(forbidden, executor)
+        runtime = RuntimeContext(tmp_path, dependencies=None)
+        runtime._worker = Worker(Graph())
+        runtime._v2_namespace = bundle.installation_policy.namespace
+        runtime._v2_namespace_provisioned = True
+        runtime._v2_policy = bundle.installation_policy
+        runtime._v2_installation_grant = grant
+        runtime._v2_model_bundle = bundle
+        authority = AuthorityContext(
+            grant.subject, "d11", "capability", runtime._v2_namespace,
+            ("activity",), "consolidation", ("owner",), "policy", 1, 1)
+        assert await runtime.execute_first_ingress_encoding_v2(
+            authority, object(), binding.job_id, "acquire-1",
+            executor=executor) is None
+        assert host.requests == []
+    finally:
+        await host.asyncTearDown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("read_mode", ("original", "wrong_consumer"))
 async def test_committed_ingress_acquires_original_job_then_reads_preparation(
     tmp_path, read_mode,
@@ -210,19 +249,18 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
     await host.asyncSetUp()
     try:
         bundle, adapter, _ = host.v2_adapters()
-        binding, draft, anchor, request = frozen_case(host, bundle)
+        binding, draft, anchor, request = frozen_case(
+            host, bundle, with_baseline=True)
+        assert binding.request["schema"] == "sylanne.first-ingress-encoding-call.v3"
         original_intent, _anchor, _permit, _admission, grant, authority = fixture_values(
             host, request)
         executor = HostModelEgressExecutor(
             authority=authority, bundle=bundle, grant=grant, adapter=adapter)
-        seen = []
-        terminal = object()
 
-        async def execute(self, *, binding, draft, expected_anchor):
-            seen.append((binding, draft, expected_anchor))
-            return terminal
+        async def forbidden(self, **_):
+            pytest.fail("retired runner or missing baseline reached model egress")
 
-        executor.execute_frozen_encoding_once = MethodType(execute, executor)
+        executor.execute_frozen_encoding_once = MethodType(forbidden, executor)
         source_ref = "a" * 64
         envelope = HostIngressEnvelope(
             bundle.installation_policy.namespace, "platform", "owner", "sender",
@@ -249,14 +287,14 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
                 assert lease is self.lease
                 self.releases = getattr(self, "releases", 0) + 1
 
-            def acquire_first_ingress_encoding_job_v2(
+            def acquire_first_ingress_encoding_job_v3(
                 self, auth, lease, acquired_job, acquire_id, *, lease_seconds,
             ):
                 assert acquired_job == job_id and acquire_id == self.acquire_id
                 assert auth.actor == grant.subject and auth.worker_fence is None
                 assert 120 < lease_seconds <= 420
-                if getattr(self, "fail_acquire", False):
-                    raise RuntimeError("original acquire outcome unknown")
+                if not getattr(self, "baseline_committed", False):
+                    raise RuntimeError("committed D03/D04 baseline unavailable")
                 return SimpleNamespace(fence=1)
 
             def read_first_ingress_model_egress_preparation_v2(
@@ -276,6 +314,7 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
                 return original_context
 
         graph = Graph()
+        graph.baseline_committed = True
         worker = Worker(graph)
         runtime = RuntimeContext(tmp_path, dependencies=None)
         runtime._worker = worker
@@ -288,22 +327,27 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
         runtime._v2_namespace_provisioned = True
 
         assert await runtime.run_committed_first_ingress_encoding_v2(
-            envelope, receipt, executor=executor) is terminal
-        assert seen == [(binding, draft, anchor)]
-        assert worker.calls == 3 and graph.releases == 1
+            envelope, receipt, executor=executor) is None
+        assert worker.calls == 0 and host.requests == []
+        async with runtime.acquired_first_ingress_encoding_v2(
+                envelope, receipt, executor=executor) as acquired:
+            assert acquired is not None and acquired.job_id == job_id
+            assert getattr(graph, "releases", 0) == 0
+        assert worker.calls == 2 and graph.releases == 1
         assert await runtime.run_committed_first_ingress_encoding_v2(
             envelope, IngressReceipt("duplicate", ingress_op),
             executor=executor) is None
-        assert worker.calls == 3
+        assert worker.calls == 2
         first_acquire_id = graph.acquire_id
-        graph.fail_acquire = True
-        assert await runtime.run_committed_first_ingress_encoding_v2(
-            envelope, receipt, executor=executor) is None
+        graph.baseline_committed = False
+        async with runtime.acquired_first_ingress_encoding_v2(
+                envelope, receipt, executor=executor) as acquired:
+            assert acquired is None
         assert graph.acquire_id == first_acquire_id
-        assert seen == [(binding, draft, anchor)]
+        assert host.requests == []
         assert graph.releases == 2
 
-        graph.fail_acquire = False
+        graph.baseline_committed = True
         intent = replace(
             original_intent, authority_id=anchor.authority_id,
             namespace=anchor.namespace, subject=grant.subject,

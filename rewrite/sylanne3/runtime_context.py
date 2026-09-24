@@ -873,6 +873,8 @@ class RuntimeContext:
             )
         except Exception:
             return None
+        if binding.request.get("schema") != "sylanne.first-ingress-encoding-call.v3":
+            return None
         return await executor.execute_frozen_encoding_once(
             binding=binding, draft=draft, expected_anchor=expected_anchor)
 
@@ -1016,7 +1018,7 @@ class RuntimeContext:
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
         executor: HostModelEgressExecutor,
     ) -> AsyncIterator[AcquiredFirstIngressEncodingV2 | None]:
-        """Keep the original D11 lease alive across the entire host workflow.
+        """Acquire only baseline-backed V3 work and keep its D11 lease alive.
 
         The caller may settle the original cost and read its result context
         before leaving this scope. No model call occurs merely by acquiring it.
@@ -1074,7 +1076,7 @@ class RuntimeContext:
                     ("activity",), workflow.purpose,
                     (envelope.conversation_ref,), workflow.provider_config_ref,
                     generation)
-                job = graph.acquire_first_ingress_encoding_job_v2(
+                job = graph.acquire_first_ingress_encoding_job_v3(
                     authority, lease, job_id, acquire_id,
                     lease_seconds=lease_seconds)
             except BaseException:
@@ -1194,19 +1196,8 @@ class RuntimeContext:
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
         executor: HostModelEgressExecutor,
     ) -> FrozenEncodingEgressResult | None:
-        """Attempt the one frozen call; unresolved outcomes remain HOLD.
-
-        Automatic dispatch is gated in the host until the committed D04
-        baseline precedes this acquisition. A later orchestration must keep
-        this acquired scope open through cost and worker result consumption.
-        """
-        async with self.acquired_first_ingress_encoding_v2(
-                envelope, receipt, executor=executor) as acquired:
-            if acquired is None:
-                return None
-            return await self.execute_first_ingress_encoding_v2(
-                acquired.authority, acquired.lease, acquired.job_id,
-                acquired.acquire_operation_id, executor=executor)
+        """Retired half-flow: release-before-cost would strand the original call."""
+        return None
 
     async def handle_ingress(self, envelope: HostIngressEnvelope) -> IngressReceipt:
         if not isinstance(envelope, HostIngressEnvelope):
