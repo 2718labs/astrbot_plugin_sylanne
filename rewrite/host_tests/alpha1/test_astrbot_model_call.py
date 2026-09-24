@@ -18,12 +18,18 @@ from openai import AsyncOpenAI
 
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.host.astrbot_model_call import AstrBotModelProvider, LocalModelAdmission
+from sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
 from sylanne3.host.authority_profile import (
     AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    AdminModelWorkflowV2, AdminModelWorkflowsV2,
     AdminInstallationBundle, installed_model_config_ref,
 )
 from sylanne3.installation_policy import AdminInstallationPolicy
 from sylanne3.model_broker.broker import ModelCallRequest, ModelProviderDescriptor
+from sylanne3.model_broker.first_ingress_encoding import (
+    FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
+    FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+)
 from sylanne3.runtime.budget import BudgetLease
 from sylanne3.runtime.issuers import BudgetLeaseGrant
 from sylanne3.runtime_contracts import (
@@ -162,6 +168,82 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.shared_client.close()
+
+    def v2_adapters(self):
+        config = self.admin_model
+        shared = dict(
+            provider_id=config.provider_id, model_id=config.model_id,
+            provider_config_ref=config.provider_config_ref,
+            provider_config_digest=config.provider_config_digest,
+            privacy_tier="private", required_capabilities=("text",),
+            timeout_seconds=0.2, max_output_tokens=64,
+        )
+        encode = AdminModelWorkflowV2(
+            work_kind="d06.encode_source", purpose="consolidation",
+            audiences=("owner",),
+            template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+            quote_ceiling={"output_tokens": 64}, **shared)
+        reply = AdminModelWorkflowV2(
+            work_kind="reply", purpose="proposal", audiences=("owner",),
+            template_version="d09.reply.v1",
+            quote_ceiling={"output_tokens": 32},
+            **{**shared, "max_output_tokens": 32})
+        grant = replace(self.bundle.installation_policy.root_grant,
+                        allowed_work_kinds=("d06.encode_source", "reply"))
+        policy = replace(self.bundle.installation_policy, root_grant=grant)
+        bundle = replace(
+            self.bundle, installation_policy=policy, ingress_model=None,
+            model_workflows=AdminModelWorkflowsV2(2, encode, reply))
+        def adapter(workflow):
+            descriptor = replace(
+                self.descriptor, purposes=frozenset({workflow.purpose}))
+            return AstrBotModelProvider(
+                context=self.context, host_loop=asyncio.get_running_loop(),
+                trusted_umo=UMO, descriptor=descriptor,
+                admin_model=workflow, installation_bundle=bundle)
+        return bundle, adapter(encode), adapter(reply)
+
+    async def test_v2_same_model_has_distinct_encoding_and_reply_scope(self):
+        bundle, encoder, replier = self.v2_adapters()
+        port = InstalledModelCapabilityPort(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            installed_namespace=bundle.installation_policy.namespace,
+            installation_bundle=bundle)
+        assert await asyncio.to_thread(
+            port.verify_admin_selection, bundle.installation_policy.namespace,
+            bundle.model_workflows.encode)
+        assert await asyncio.to_thread(
+            port.verify_admin_selection, bundle.installation_policy.namespace,
+            bundle.model_workflows.reply)
+        request = call_request()
+        encode_authority = replace(request.envelope.authority,
+                                   purpose="consolidation")
+        encode_request = replace(
+            request, envelope=replace(request.envelope,
+                                      authority=encode_authority),
+            prompt_template_digest=FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST)
+        assert encoder._request_allowed(encode_request)
+        assert not encoder._request_allowed(request)
+        assert not replier._request_allowed(encode_request)
+        assert not replier._request_allowed(request)  # reply template is HOLD
+        narrow = replace(bundle.model_workflows.encode,
+                         audiences=("private",))
+        narrow_bundle = replace(bundle, model_workflows=AdminModelWorkflowsV2(
+            2, narrow, bundle.model_workflows.reply))
+        narrow_encoder = AstrBotModelProvider(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            trusted_umo=UMO, descriptor=encoder.descriptor,
+            admin_model=narrow, installation_bundle=narrow_bundle)
+        assert not narrow_encoder._request_allowed(encode_request)
+        reduced = replace(bundle.model_workflows.encode, max_output_tokens=32,
+                          quote_ceiling={"output_tokens": 32})
+        reduced_bundle = replace(bundle, model_workflows=AdminModelWorkflowsV2(
+            2, reduced, bundle.model_workflows.reply))
+        reduced_encoder = AstrBotModelProvider(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            trusted_umo=UMO, descriptor=encoder.descriptor,
+            admin_model=reduced, installation_bundle=reduced_bundle)
+        assert not reduced_encoder._request_allowed(encode_request)
 
     async def invoke_on_worker(self, request=None):
         request = request or call_request()

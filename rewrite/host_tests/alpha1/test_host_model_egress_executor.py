@@ -1,6 +1,7 @@
 """Executor control-flow fixture; the paired RPC has a separate real TLS test."""
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from types import MethodType
 
@@ -14,6 +15,9 @@ from sylanne3.authority_service.v2_model_egress_contract import (
 )
 from sylanne3.host.authority_client import AuthorityClient, AuthoritySelection
 from sylanne3.host.model_egress_executor import HostModelEgressExecutor
+from sylanne3.model_broker.first_ingress_encoding import (
+    FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
+)
 from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime_contracts import InstallationGrantV2
 
@@ -81,6 +85,43 @@ async def test_executor_reports_only_actual_completed_response():
         assert observed[0] == "admit"
         assert observed[1].result_json == '{"text":"hello"}'
         assert len(host.requests) == 1
+    finally:
+        await host.asyncTearDown()
+
+
+@pytest.mark.asyncio
+async def test_v2_executor_rejects_borrowed_workflow_quote_before_authority():
+    host = model_fixture.AstrBotModelCallTests(
+        methodName="test_one_http_request_on_host_loop_with_usage")
+    await host.asyncSetUp()
+    try:
+        bundle, encoder, replier = host.v2_adapters()
+        request = model_fixture.call_request()
+        request = replace(request, envelope=replace(
+            request.envelope, authority=replace(
+                request.envelope.authority, purpose="consolidation")),
+            prompt_template_digest=FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST)
+        intent, anchor, _permit, _admission, grant, authority = fixture_values(
+            host, request)
+        called = []
+
+        async def forbidden_admit(self, *args, **kwargs):
+            called.append(True)
+            raise AssertionError("borrowed quote must not reach Authority")
+
+        authority.model_admit_dispatch_once_v2 = MethodType(
+            forbidden_admit, authority)
+        encoder_executor = HostModelEgressExecutor(
+            authority=authority, bundle=bundle, grant=grant, adapter=encoder)
+        assert encoder._request_allowed(request)
+        assert await encoder_executor.execute_once(
+            intent=intent, expected_anchor=anchor, request=request) is None
+        assert not called and not host.requests
+        replier_executor = HostModelEgressExecutor(
+            authority=authority, bundle=bundle, grant=grant, adapter=replier)
+        assert await replier_executor.execute_once(
+            intent=intent, expected_anchor=anchor, request=request) is None
+        assert not called and not host.requests
     finally:
         await host.asyncTearDown()
 

@@ -25,8 +25,12 @@ from ..runtime_contracts import canonical_digest
 from ..model_broker.broker import (
     ModelCallRequest, ModelProviderDescriptor, ProviderResponse,
 )
+from ..model_broker.first_ingress_encoding import (
+    FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
+    FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+)
 from .authority_profile import (
-    AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    AdminIngressEncodingPolicy, AdminIngressModelPolicy, AdminModelWorkflowV2,
     AdminInstallationBundle, installed_model_config_ref,
 )
 from ..installation_policy import AdminInstallationPolicy
@@ -79,7 +83,7 @@ class AstrBotModelProvider:
     def __init__(
         self, *, context: Context, host_loop: asyncio.AbstractEventLoop,
         trusted_umo: str, descriptor: ModelProviderDescriptor,
-        admin_model: AdminIngressModelPolicy,
+        admin_model: AdminIngressModelPolicy | AdminModelWorkflowV2,
         installation_bundle: AdminInstallationBundle,
     ) -> None:
         if (not isinstance(context, Context)
@@ -90,15 +94,23 @@ class AstrBotModelProvider:
                 or descriptor.supports_idempotency
                 or descriptor.cost_reporting != "unknown"):
             raise ValueError("trusted non-retrying AstrBot model binding is required")
-        if (type(admin_model) is not AdminIngressModelPolicy
+        if (type(admin_model) not in (AdminIngressModelPolicy, AdminModelWorkflowV2)
                 or admin_model.provider_id != descriptor.provider_id
                 or admin_model.model_id != descriptor.model_id
                 or admin_model.provider_config_ref != installed_model_config_ref(
                     descriptor.provider_id, descriptor.model_id,
                     admin_model.provider_config_digest)
-                or type(installation_bundle) is not AdminInstallationBundle
-                or admin_model is not installation_bundle.ingress_model):
+                or type(installation_bundle) is not AdminInstallationBundle):
             raise ValueError("exact administrator model configuration is required")
+        workflows = installation_bundle.model_workflows
+        if type(admin_model) is AdminIngressModelPolicy:
+            installed = admin_model is installation_bundle.ingress_model
+        else:
+            installed = (workflows is not None and
+                         (admin_model is workflows.encode
+                          or admin_model is workflows.reply))
+        if not installed:
+            raise ValueError("model selection is absent from installed administrator snapshot")
         self._context = context
         self._host_loop = host_loop
         self._trusted_umo = trusted_umo
@@ -107,7 +119,9 @@ class AstrBotModelProvider:
         self._installation_bundle = installation_bundle
         self._binding = (context, host_loop, trusted_umo,
                          descriptor.provider_id, descriptor.model_id,
-                         admin_model.provider_config_ref)
+                         admin_model.provider_config_ref,
+                         (admin_model.work_kind, admin_model.template_version)
+                         if type(admin_model) is AdminModelWorkflowV2 else "legacy")
 
     @property
     def host_incarnation(self) -> str:
@@ -130,6 +144,43 @@ class AstrBotModelProvider:
         encoding = bundle.ingress_encoding
         authority = request.envelope.authority
         descriptor = self._descriptor
+        if type(model) is AdminModelWorkflowV2:
+            workflows = bundle.model_workflows
+            if (workflows is None
+                    or (model is not workflows.encode
+                        and model is not workflows.reply)
+                    or type(policy) is not AdminInstallationPolicy
+                    or policy.namespace != authority.namespace
+                    or model.work_kind not in policy.root_grant.allowed_work_kinds
+                    or request.provider_id != model.provider_id
+                    or request.model_id != model.model_id
+                    or descriptor.capabilities != frozenset({"text"})
+                    or not request.required_capabilities
+                    or not request.required_capabilities <= descriptor.capabilities
+                    or not request.required_capabilities <= set(model.required_capabilities)
+                    or descriptor.purposes != frozenset({model.purpose})
+                    or authority.purpose != model.purpose
+                    or not authority.audience
+                    or not set(authority.audience) <= set(model.audiences)
+                    or descriptor.privacy_tiers != frozenset({model.privacy_tier})
+                    or request.privacy_tier != model.privacy_tier
+                    or request.timeout_seconds > model.timeout_seconds
+                    or request.max_output_tokens > model.max_output_tokens):
+                return False
+            for dimension, amount in model.quote_ceiling.items():
+                if (amount > policy.root_lease.limits.get(dimension, 0)
+                        or amount > policy.root_grant.max_ceiling.get(dimension, 0)):
+                    return False
+            if model is workflows.encode:
+                return (type(encoding) is AdminIngressEncodingPolicy
+                        and all(amount <= encoding.quote_ceiling.get(dimension, 0)
+                                for dimension, amount in model.quote_ceiling.items())
+                        and model.template_version
+                        == FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
+                        and request.prompt_template_digest
+                        == FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST)
+            # No trusted D09 reply template registry is installed in this slice.
+            return False
         if (model is not bundle.ingress_model
                 or type(policy) is not AdminInstallationPolicy
                 or type(encoding) is not AdminIngressEncodingPolicy

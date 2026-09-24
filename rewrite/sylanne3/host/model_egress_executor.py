@@ -16,7 +16,9 @@ from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import InstallationGrantV2, canonical_serialize
 from .astrbot_model_call import AstrBotModelProvider, LocalModelAdmission
 from .authority_client import AuthorityClient
-from .authority_profile import AdminInstallationBundle
+from .authority_profile import (
+    AdminIngressModelPolicy, AdminInstallationBundle, AdminModelWorkflowV2,
+)
 
 
 class HostModelEgressExecutor:
@@ -28,9 +30,19 @@ class HostModelEgressExecutor:
                 or type(bundle) is not AdminInstallationBundle
                 or type(grant) is not InstallationGrantV2
                 or type(adapter) is not AstrBotModelProvider
-                or adapter._installation_bundle is not bundle
-                or adapter._admin_model is not bundle.ingress_model):
+                or adapter._installation_bundle is not bundle):
             raise ValueError("trusted installed model executor binding is required")
+        model = adapter._admin_model
+        workflows = bundle.model_workflows
+        if type(model) is AdminIngressModelPolicy:
+            installed = model is bundle.ingress_model
+        else:
+            installed = (type(model) is AdminModelWorkflowV2
+                         and workflows is not None
+                         and (model is workflows.encode
+                              or model is workflows.reply))
+        if not installed:
+            raise ValueError("executor model workflow is not installed")
         self._authority = authority
         self._bundle = bundle
         self._grant = grant
@@ -49,6 +61,21 @@ class HostModelEgressExecutor:
                 or type(expected_anchor) is not RestoreAnchor
                 or type(request) is not ModelCallRequest):
             return None
+        model = self._adapter._admin_model
+        if type(model) is AdminModelWorkflowV2:
+            if (intent.request_digest != request.digest
+                    or intent.operation_id != request.identity.operation_id
+                    or intent.call_id != request.call_id
+                    or intent.provider_id != model.provider_id
+                    or intent.model_id != model.model_id
+                    or intent.provider_config_digest != model.provider_config_digest
+                    or intent.max_output_tokens != request.max_output_tokens
+                    or intent.budget_lease_id
+                       != request.envelope.parent_budget_lease_ref
+                    or any(amount > model.quote_ceiling.get(dimension, 0)
+                           for dimension, amount in intent.budget_ceiling)
+                    or not self._adapter._request_allowed(request)):
+                return None
         try:
             record, permit, admission = await self._authority.model_admit_dispatch_once_v2(
                 self._bundle, self._grant, intent=intent,

@@ -15,7 +15,7 @@ from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from .authority_profile import (
-    AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    AdminIngressEncodingPolicy, AdminIngressModelPolicy, AdminModelWorkflowV2,
     AdminInstallationBundle, installed_model_config_ref,
 )
 from ..installation_policy import AdminInstallationPolicy
@@ -133,7 +133,7 @@ class InstalledModelCapabilityPort:
         return self.verify(namespace, capability_ref)
 
     async def _verify_admin_config_on_host_loop(
-        self, selection: AdminIngressModelPolicy,
+        self, selection: AdminIngressModelPolicy | AdminModelWorkflowV2,
     ) -> bool:
         """Check installed adapter/config identity, not capability or policy fitness."""
         try:
@@ -166,11 +166,12 @@ class InstalledModelCapabilityPort:
             return False
 
     def verify_admin_config(
-        self, namespace: NamespaceId, selection: AdminIngressModelPolicy,
+        self, namespace: NamespaceId,
+        selection: AdminIngressModelPolicy | AdminModelWorkflowV2,
     ) -> bool:
         if (type(namespace) is not NamespaceId
                 or namespace != self._installed_namespace
-                or type(selection) is not AdminIngressModelPolicy
+                or type(selection) not in (AdminIngressModelPolicy, AdminModelWorkflowV2)
                 or not self._host_loop.is_running()):
             return False
         try:
@@ -192,7 +193,8 @@ class InstalledModelCapabilityPort:
             return False
 
     def verify_admin_selection(
-        self, namespace: NamespaceId, selection: AdminIngressModelPolicy,
+        self, namespace: NamespaceId,
+        selection: AdminIngressModelPolicy | AdminModelWorkflowV2,
     ) -> bool:
         """Check installed selection eligibility; each request still needs scope checks.
 
@@ -205,6 +207,29 @@ class InstalledModelCapabilityPort:
                   if type(bundle) is AdminInstallationBundle else None)
         encoding = (bundle.ingress_encoding
                     if type(bundle) is AdminInstallationBundle else None)
+        if type(selection) is AdminModelWorkflowV2:
+            workflows = (bundle.model_workflows
+                         if type(bundle) is AdminInstallationBundle else None)
+            if (type(namespace) is not NamespaceId
+                    or namespace != self._installed_namespace
+                    or type(bundle) is not AdminInstallationBundle
+                    or workflows is None
+                    or (selection is not workflows.encode
+                        and selection is not workflows.reply)
+                    or type(policy) is not AdminInstallationPolicy
+                    or policy.namespace != namespace
+                    or selection.work_kind not in policy.root_grant.allowed_work_kinds
+                    or not set(selection.required_capabilities) <= {"text"}
+                    or (selection is workflows.encode
+                        and type(encoding) is not AdminIngressEncodingPolicy)):
+                return False
+            for dimension, amount in selection.quote_ceiling.items():
+                if (amount > policy.root_lease.limits.get(dimension, 0)
+                        or amount > policy.root_grant.max_ceiling.get(dimension, 0)
+                        or (selection is workflows.encode
+                            and amount > encoding.quote_ceiling.get(dimension, 0))):
+                    return False
+            return self.verify_admin_config(namespace, selection)
         if (type(namespace) is not NamespaceId
                 or namespace != self._installed_namespace
                 or type(selection) is not AdminIngressModelPolicy
