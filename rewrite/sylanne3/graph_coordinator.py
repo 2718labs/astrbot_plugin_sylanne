@@ -644,7 +644,7 @@ class GraphCoordinator:
                  dispatch_admission_issuer=None, dispatch_clock_policy=None,
                  scene_identity_port=None, scene_clock_policy=None,
                  encoding_request_issuer=None, model_terminal_cost_port=None,
-                 accounting_maintenance_port=None):
+                 accounting_maintenance_port=None, self_identity_port=None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -685,6 +685,10 @@ class GraphCoordinator:
                         for name in ("begin", "validate", "finish", "recover_finish"))):
             raise TypeError("accounting maintenance port requires four operations")
         self.__accounting_maintenance_port = accounting_maintenance_port
+        if (self_identity_port is not None
+                and not callable(getattr(self_identity_port, "current_self_identity", None))):
+            raise TypeError("self identity port requires current_self_identity")
+        self.__self_identity_port = self_identity_port
         if accounting_maintenance_port is not None:
             # Persist the fence attempt before asking Authority to begin it.
             # A process restart must never invent a second active attempt.
@@ -7831,7 +7835,10 @@ class GraphCoordinator:
                               now_utc: float | None = None,
                               require_arrival_quote: bool = False) -> RuntimeAdmission:
         """Apply D02/D11 decisions in the graph's existing SQLite transaction."""
-        from .runtime.issuers import D03_ARRIVAL_WORK_KIND, D04_BASELINE_WORK_KIND
+        from .runtime.issuers import (
+            D03_ARRIVAL_WORK_KIND, D03_SELF_IDENTITY_PROJECTION_WORK_KIND,
+            D04_BASELINE_WORK_KIND,
+        )
 
         if self.__d02_issuer is None or self.__d11_issuer is None:
             raise UnavailableGuard("D02 and D11 runtime issuers are required")
@@ -7889,6 +7896,30 @@ class GraphCoordinator:
                     or bundle.persistent_job_refs or bundle.outbox_refs
                     or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
                 raise AuthorityDenied("D04 baseline quote cannot authorize a mixed bundle")
+        if quote is not None and quote.work_kind == D03_SELF_IDENTITY_PROJECTION_WORK_KIND:
+            if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='graph_d03_self_projection_issuance_v1'",
+            ).fetchone() is None:
+                raise AuthorityDenied("D03 self projection lacks sealed graph issuance")
+            row = db.execute(
+                "SELECT source_ref,certification_ref,quote_id,bundle_digest "
+                "FROM graph_d03_self_projection_issuance_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=?",
+                bundle.envelope.authority.namespace.as_tuple
+                + (bundle.envelope.identity.operation_id,),
+            ).fetchone()
+            if (len(bundle.proposals) != 1 or bundle.proposals[0].domain != "d03"
+                    or not bundle.proposals[0].typed_writes
+                    or bundle.proposals[0].typed_writes[-1].key.type_name
+                    != "d03.self_perspective.v1"
+                    or len(bundle.envelope.input_refs) != 1
+                    or row is None
+                    or row[0] != bundle.envelope.input_refs[0]
+                    or row[2:] != (quote.quote_id, bundle.digest)
+                    or bundle.persistent_job_refs or bundle.outbox_refs
+                    or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+                raise AuthorityDenied("D03 self projection quote cannot authorize a mixed bundle")
         admission = self.__d11_issuer.admit_runtime(bundle, db, **time_kwargs)
         if not isinstance(admission, RuntimeAdmission):
             raise AuthorityDenied("D11 did not issue a typed runtime admission")
@@ -9257,6 +9288,313 @@ class GraphCoordinator:
                 arrival_policy, policy.installation_id, now_utc, source_ref,
                 policy_digest))
 
+    def commit_d03_self_identity_projection_v1(
+        self, bootstrap: object, namespace: NamespaceId, job_id: str,
+        original_operation_id: str, installation_policy, admin_policy,
+        clock_policy,
+    ) -> CommitReceipt:
+        """Project the paired Authority self and first-arrival perspective atomically.
+
+        The initial read only constructs a candidate. The write fence obtains a
+        fresh current Authority value and the graph transaction checks its stamp.
+        """
+        from .authority_service.v2_contract import FencePermitV2
+        from .authority_service.v2_self_identity_contract import AuthorityCurrentSelfIdentityV1
+        from .domains.d03.self_identity_qualification import (
+            self_identity_mapping_from_current,
+        )
+        from .domains.d03.self_perspective import (
+            build_self_identity_projection_bundle, self_mapping_key,
+            self_perspective_id, self_perspective_key,
+        )
+        from .host.authority_profile import (
+            AdminD03SelfIdentityProjectionPolicy, AdminIngressClockPolicy,
+        )
+        from .installation_policy import AdminInstallationPolicy
+        from .runtime.d03_self_identity_projection_identity import (
+            d03_self_identity_projection_activity_id_v1,
+            d03_self_identity_projection_operation_id_v1,
+        )
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import (
+            D03_SELF_IDENTITY_PROJECTION_WORK_KIND,
+            d03_self_identity_projection_quote_id,
+        )
+        from .runtime_contracts import (
+            CommandEnvelope, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA,
+            VersionedRef,
+        )
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId
+                or type(installation_policy) is not AdminInstallationPolicy
+                or type(admin_policy) is not AdminD03SelfIdentityProjectionPolicy
+                or type(clock_policy) is not AdminIngressClockPolicy
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__self_identity_port is None
+                or self.__d02_issuer is None or self.__d11_issuer is None):
+            raise UnavailableGuard("installed D03 self projection authorities required; HOLD")
+        policy = installation_policy
+        grant = policy.root_grant
+        if (namespace != policy.namespace
+                or D03_SELF_IDENTITY_PROJECTION_WORK_KIND not in grant.allowed_work_kinds):
+            raise UnavailableGuard("installed D03 self projection grant differs; HOLD")
+        store, port = self.__store, self.__content_fence_v2
+        try:
+            reading = port.read_ingress_clock(clock_policy)
+            now_utc = trusted_upper(reading)
+        except Exception as exc:
+            raise UnavailableGuard("paired D03 self projection clock unavailable; HOLD") from exc
+        deadline = min(math.nextafter(math.fsum((
+            now_utc, admin_policy.deadline_after_seconds)), -math.inf),
+            grant.valid_until_utc)
+        if deadline <= now_utc:
+            raise UnavailableGuard("D03 self projection deadline unavailable; HOLD")
+        monotonic_deadline = reading.monotonic_after_seconds + (
+            deadline - reading.utc_upper_bound_seconds)
+        if not math.isfinite(monotonic_deadline):
+            raise UnavailableGuard("D03 self projection monotonic deadline differs")
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        if (target.authority_id != policy.expected_authority_id
+                or target.authority_namespace != policy.authority_namespace
+                or port.installation_grant.installation_id != policy.installation_id):
+            raise UnavailableGuard("D03 self projection installation differs; HOLD")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("D03 self projection recovery anchor differs; HOLD")
+        read_operation = "d03-self-read-" + secrets.token_hex(16)
+        permit = port.begin_fence(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=target.activation_generation,
+            operation="read", operation_id=read_operation, expected_anchor=anchor)
+        scope = FenceScope(namespace, target.authority_namespace,
+                           target.activation_generation, "read", read_operation,
+                           permit, anchor, epoch, metadata.graph_revision)
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("D03 self projection read permit changed")
+            guarded = port.get_current_owner_guard_for_fence(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                permit=permit)
+            if (type(guarded) is not tuple or len(guarded) != 2
+                    or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                    or guarded[1] != permit):
+                raise UnavailableGuard("D03 self projection Owner head unavailable")
+            current = self.__self_identity_port.current_self_identity(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                request_operation_id=read_operation, permit=permit)
+            if (type(current) is not AuthorityCurrentSelfIdentityV1
+                    or current.permit != permit
+                    or current.request_operation_id != read_operation
+                    or current.graph_revision != metadata.graph_revision
+                    or current.graph_epoch != epoch.revision):
+                raise UnavailableGuard("D03 self projection current read differs; HOLD")
+            candidate_mapping = self_identity_mapping_from_current(current)
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("D03 self projection graph changed during read")
+                db = store._db
+                role, _, role_epoch, _ = self._scene_binding_state_locked(
+                    namespace, guarded[0])
+                if (role_epoch != epoch
+                        or current.role_head_id != role.head_id
+                        or current.owner_authorization_revision
+                        != guarded[0].authorization_revision
+                        or current.owner_authorization_head
+                        != guarded[0].authorization_head
+                        or current.graph_incarnation != target.graph_incarnation
+                        or current.installation_id != policy.installation_id
+                        or current.manifest_digest != policy.manifest_digest):
+                    raise UnavailableGuard("D03 self projection current role differs; HOLD")
+                job, _, _, outbox, _, _, source_version, access_version = (
+                    self._first_ingress_encoding_job_locked(namespace, job_id))
+                if (job.operation_id != original_operation_id
+                        or job.phase != "queued" or job.cancel_epoch != 0
+                        or job.fence != 0 or job.lease_holder is not None
+                        or outbox.payload_ref != source_version.key.owner.subject):
+                    raise UnavailableGuard("D03 self projection job is no longer queued; HOLD")
+                source_ref = source_version.key.token
+                qualification = self._original_first_ingress_qualification_locked(
+                    namespace, original_operation_id, source_ref)
+                arrivals = db.execute(
+                    "SELECT operation_id,bundle_digest FROM "
+                    "graph_d03_arrival_issuance_v2 WHERE bot=? AND persona=? "
+                    "AND source_ref=?", namespace.as_tuple
+                    + (source_version.key.owner.subject,),
+                ).fetchall()
+                if len(arrivals) != 1:
+                    raise UnavailableGuard("D03 self projection needs one original arrival")
+                arrival_rows = db.execute(
+                    "SELECT a.token,a.revision,a.value,a.valid FROM graph_atoms AS a "
+                    "JOIN graph_history AS h ON h.token=a.token AND h.revision=a.revision "
+                    "WHERE h.event_bot=? AND h.event_persona=? AND h.event_id=? "
+                    "AND a.type_name='d03.world_event'",
+                    namespace.as_tuple + (arrivals[0][0],),
+                ).fetchall()
+                arrival_receipt = db.execute(
+                    "SELECT digest FROM graph_bundle_operations WHERE bot=? AND persona=? "
+                    "AND operation_id=?", namespace.as_tuple + (arrivals[0][0],),
+                ).fetchone()
+                if len(arrival_rows) != 1 or arrival_receipt != (arrivals[0][1],):
+                    raise UnavailableGuard("D03 self projection arrival receipt differs")
+                event_row = arrival_rows[0]
+                event_atom = GraphAtom(AtomKey.from_token(event_row[0]),
+                                       event_row[1], json.loads(event_row[2]),
+                                       bool(event_row[3]))
+                mapping_key = self_mapping_key(namespace)
+                mapping_row = db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (mapping_key.token,),
+                ).fetchone()
+                mapping_atom = (GraphAtom(mapping_key, mapping_row[0],
+                                          json.loads(mapping_row[1]), bool(mapping_row[2]))
+                                if mapping_row else GraphAtom(mapping_key, 0, {}, False))
+                perspective_key = self_perspective_key(namespace,
+                    self_perspective_id(namespace, event_atom.value["scene_ref"],
+                                        event_atom.key.token))
+                perspective_row = db.execute(
+                    "SELECT revision FROM graph_atoms WHERE token=?",
+                    (perspective_key.token,),
+                ).fetchone()
+                identity_row = db.execute(
+                    "SELECT conversation_ref FROM graph_first_ingress_identity_v1 "
+                    "WHERE bot=? AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (original_operation_id,),
+                ).fetchone()
+                if identity_row is None:
+                    raise UnavailableGuard("D03 self projection original ingress absent")
+                guard_versions = dict(db.execute(
+                    "SELECT kind,version FROM graph_guard_versions WHERE bot=? "
+                    "AND persona=? AND ref='current'", namespace.as_tuple,
+                ).fetchall())
+                authority_epochs = db.execute(
+                    "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                    "WHERE bot=? AND persona=?", namespace.as_tuple,
+                ).fetchone() or (0, 0)
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("D03 self projection read permit changed")
+        finally:
+            port.finish_fence(scope, request_id="finish:" + read_operation,
+                              request_digest="sha256:" + canonical_digest({
+                                  "operation_id": read_operation,
+                                  "permit_token": permit.token,
+                                  "action": "finish_read",
+                              }))
+        operation_id = d03_self_identity_projection_operation_id_v1(
+            namespace, source_ref, candidate_mapping.certification_ref)
+        activity_id = d03_self_identity_projection_activity_id_v1(namespace, source_ref)
+        lease, capability = self.grant(
+            bootstrap, actor="host", issuer_domain="d11", namespace=namespace,
+            domains=("d03",), activation_generation=target.activation_generation,
+            operation_id=operation_id)
+        try:
+            authority = AuthorityContext(
+                "host", "d11", capability, namespace, ("persona", "event"),
+                "context", (identity_row[0],), grant.policy_ref,
+                target.activation_generation)
+            quote_id = d03_self_identity_projection_quote_id(namespace, operation_id)
+            if perspective_row is not None:
+                from .authority_service.v2_contract import from_wire
+
+                def replay_reader():
+                    prior = self._get_operation_fenced(authority, operation_id, v2=True)
+                    if prior is None:
+                        raise UnavailableGuard("D03 perspective exists without stage receipt")
+                    db = store._db
+                    issued = db.execute(
+                        "SELECT source_ref,certification_ref,quote_id,bundle_digest "
+                        "FROM graph_d03_self_projection_issuance_v1 WHERE bot=? "
+                        "AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone()
+                    saved = db.execute(
+                        "SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,"
+                        "post_graph_revision,post_graph_epoch,finish_request_id,"
+                        "finish_request_digest FROM graph_bundle_fences_v2 "
+                        "WHERE bot=? AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone()
+                    if (issued != (source_ref, candidate_mapping.certification_ref,
+                                   quote_id, prior.operation_digest)
+                            or saved is None or saved[0] != prior.operation_digest
+                            or saved[4] != saved[2] + 1
+                            or saved[5] != prior.invalidated_epochs[0].revision
+                            or mapping_atom.value != asdict(candidate_mapping)
+                            or not any(item.key == perspective_key
+                                       and item.revision == perspective_row[0]
+                                       for item in prior.write_versions)):
+                        raise UnavailableGuard("D03 self projection replay receipt differs")
+                    quote = self.__d02_issuer._load_quote(db, quote_id, 1)
+                    if (quote.operation_id != operation_id
+                            or quote.work_kind != D03_SELF_IDENTITY_PROJECTION_WORK_KIND
+                            or dict(quote.ceiling) != dict(admin_policy.quote_ceiling)):
+                        raise UnavailableGuard("D03 self projection replay quote differs")
+                    return prior, saved
+
+                prior, saved = self._read_v2(authority, replay_reader)
+                attempt_id = "graph-write-" + canonical_digest({
+                    "namespace": list(namespace.as_tuple),
+                    "operation_id": operation_id,
+                    "bundle_digest": prior.operation_digest,
+                })[:48]
+                original_permit = from_wire(json.loads(saved[1]))
+                observed, state = port.get_fence_operation(
+                    namespace=namespace, authority_namespace=target.authority_namespace,
+                    operation_id=attempt_id)
+                if (observed != original_permit or state not in {"active", "finished"}
+                        or original_permit.operation_id != attempt_id
+                        or original_permit.pinned_anchor != anchor):
+                    raise UnavailableGuard("D03 self projection replay fence differs")
+                if state == "active":
+                    with store._lock:
+                        current_metadata, current_epoch = self._v2_graph_stamp(namespace)
+                    if (current_metadata.graph_revision, current_epoch.revision) != saved[4:6]:
+                        raise UnavailableGuard("D03 self projection replay graph changed")
+                    original_scope = FenceScope(
+                        namespace, target.authority_namespace,
+                        target.activation_generation, "write", attempt_id,
+                        original_permit, anchor,
+                        NamespaceEpoch(*namespace.as_tuple, saved[3]), saved[2])
+                    if port.validate_fence(original_scope) != original_permit:
+                        raise UnavailableGuard("D03 self projection replay permit changed")
+                    port.finish_fence(original_scope, request_id=saved[6],
+                                      request_digest=saved[7])
+                return replace(prior, status="duplicate")
+            read_versions = tuple(dict.fromkeys((
+                *role.read_versions, source_version, access_version,
+                GraphVersion(event_atom.key, event_atom.revision),
+                GraphVersion(mapping_key, mapping_atom.revision),
+                GraphVersion(perspective_key, perspective_row[0] if perspective_row else 0),
+            )))
+            envelope = CommandEnvelope(
+                RUNTIME_SCHEMA,
+                OperationIdentity(activity_id, None, "self-projection-attempt",
+                                  D03_SELF_IDENTITY_PROJECTION_WORK_KIND,
+                                  operation_id, canonical_digest({
+                                      "input_refs": [source_ref]})),
+                authority,
+                VersionGuard(
+                    read_versions, (QueryEpoch(namespace, "all", epoch.revision),),
+                    *authority_epochs, store._registry.catalogue_hash,
+                    guard_versions["scheme"], guard_versions["operator"],
+                    guard_versions["policy"], (), (), (VersionedRef(quote_id, 1),)),
+                qualification, (source_ref,), grant.lease_id, deadline,
+                monotonic_deadline, "character-v1", (original_operation_id,),
+            )
+            bundle = build_self_identity_projection_bundle(
+                envelope, role, candidate_mapping, mapping_atom, event_atom)
+            return self._commit_domain_bundle_v2(
+                bundle, lease, self_identity_issuance=(
+                    policy, admin_policy, policy.installation_id, now_utc,
+                    source_ref, candidate_mapping, job_id, original_operation_id))
+        finally:
+            self.release_authority_lease(bootstrap, lease)
+
     def commit_domain_bundle(self, bundle: DomainBundle, lease: object) -> CommitReceipt:
         if not isinstance(bundle, DomainBundle):
             raise TypeError("bundle must be DomainBundle")
@@ -9279,7 +9617,8 @@ class GraphCoordinator:
 
     def _commit_domain_bundle_v2(self, bundle: DomainBundle,
                                  lease: object, *, arrival_issuance=None,
-                                 baseline_issuance=None) -> CommitReceipt:
+                                 baseline_issuance=None,
+                                 self_identity_issuance=None) -> CommitReceipt:
         """Commit under a durable write attempt; reconcile before any duplicate read."""
         from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
 
@@ -9471,6 +9810,64 @@ class GraphCoordinator:
                         or port.validate_fence(scope) != permit):
                     raise UnavailableGuard("current scene Owner guard is unavailable")
                 scene_owner_guard = guarded[0]
+            qualified_self = None
+            if self_identity_issuance is not None:
+                from .domains.d03.self_identity_qualification import (
+                    qualify_authority_current_self_identity,
+                )
+
+                if self.__self_identity_port is None:
+                    raise UnavailableGuard("current Authority self identity port unavailable; HOLD")
+                reader = getattr(port, "get_current_owner_guard_for_fence", None)
+                if not callable(reader):
+                    raise UnavailableGuard("current Owner guard port unavailable; HOLD")
+                guarded = reader(
+                    namespace=namespace,
+                    authority_namespace=target.authority_namespace,
+                    permit=permit)
+                if (type(guarded) is not tuple or len(guarded) != 2
+                        or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                        or guarded[1] != permit):
+                    raise UnavailableGuard("current Owner guard unavailable; HOLD")
+                scene_owner_guard = guarded[0]
+                with store._lock:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("self identity graph changed before Authority read")
+                    role, _, role_epoch, _ = self._scene_binding_state_locked(
+                        namespace, scene_owner_guard)
+                    activation_key = AtomKey(
+                        Owner("persona", *namespace.as_tuple),
+                        "d01.persona_activation.v1", "current")
+                    row = store._db.execute(
+                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                        (activation_key.token,),
+                    ).fetchone()
+                    if row is None:
+                        raise UnavailableGuard("current D01 activation unavailable; HOLD")
+                    activation_atom = GraphAtom(
+                        activation_key, row[0], json.loads(row[1]), bool(row[2]))
+                if role_epoch != epoch:
+                    raise StaleRead("current D01 epoch changed before Authority read")
+                current = self.__self_identity_port.current_self_identity(
+                    namespace=namespace,
+                    authority_namespace=target.authority_namespace,
+                    request_operation_id=operation_id,
+                    permit=permit,
+                )
+                qualified_mapping = qualify_authority_current_self_identity(
+                    role=role, activation_atom=activation_atom,
+                    policy=self_identity_issuance[0],
+                    installation_grant=port.installation_grant,
+                    owner_guard=scene_owner_guard,
+                    request_operation_id=operation_id, permit=permit,
+                    port=SimpleNamespace(current_self_identity=lambda **_: current),
+                )
+                if (qualified_mapping != self_identity_issuance[5]
+                        or current.graph_revision != metadata.graph_revision
+                        or current.graph_epoch != epoch.revision
+                        or port.validate_fence(scope) != permit):
+                    raise UnavailableGuard("current self identity changed; HOLD")
+                qualified_self = (role, qualified_mapping, current)
             receipt = self._commit_domain_bundle_fenced(
                 bundle, lease, v2_write=(metadata, epoch, finish_id,
                                          finish_digest, canonical_json(to_wire(permit))),
@@ -9478,9 +9875,12 @@ class GraphCoordinator:
                 dispatch_clock_reading=dispatch_clock_reading,
                 scene_owner_guard=scene_owner_guard,
                 now_utc=(arrival_issuance[2] if arrival_issuance else
-                         baseline_issuance[2] if baseline_issuance else None),
+                         baseline_issuance[2] if baseline_issuance else
+                         self_identity_issuance[3] if self_identity_issuance else None),
                 arrival_issuance=arrival_issuance,
-                baseline_issuance=baseline_issuance)
+                baseline_issuance=baseline_issuance,
+                self_identity_issuance=self_identity_issuance,
+                qualified_self=qualified_self)
         except Exception:
             if transaction_state["phase"] in {"before_transaction", "rolled_back"}:
                 rejection = self._record_rejected_bundle_v2(
@@ -9610,7 +10010,9 @@ class GraphCoordinator:
                                      ingress_deadline_check=None,
                                      scene_owner_guard=None,
                                       arrival_issuance=None,
-                                      baseline_issuance=None) -> CommitReceipt:
+                                      baseline_issuance=None,
+                                      self_identity_issuance=None,
+                                      qualified_self=None) -> CommitReceipt:
         """Join a caller-owned graph transaction when ``in_transaction`` is set.
 
         The caller holds the store lock and owns COMMIT or ROLLBACK.
@@ -9866,6 +10268,63 @@ class GraphCoordinator:
                     namespace.as_tuple + (identity.operation_id, source_ref,
                                           event_ref, quote.quote_id, digest),
                 )
+            if self_identity_issuance is not None:
+                (installation_policy, admin_policy, installation_id, stage_now,
+                 source_ref, candidate, job_id, original_operation_id) = (
+                    self_identity_issuance)
+                if (v2_write is None or qualified_self is None
+                        or len(bundle.proposals) != 1
+                        or bundle.proposals[0].domain != "d03"
+                        or envelope.identity.phase != "d03.self_identity_projection"
+                        or envelope.input_refs != (source_ref,)
+                        or bundle.persistent_job_refs or bundle.outbox_refs
+                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+                    raise AuthorityDenied("D03 self projection issuance identity differs")
+                role, qualified_mapping, current_self = qualified_self
+                expected_metadata, expected_epoch = v2_write[:2]
+                if (qualified_mapping != candidate
+                        or current_self.graph_revision != expected_metadata.graph_revision
+                        or current_self.graph_epoch != expected_epoch.revision
+                        or installation_policy.installation_id != installation_id):
+                    raise UnavailableGuard("D03 current self proof changed; HOLD")
+                job, _, _, _, _, _, source_version, access_version = (
+                    self._first_ingress_encoding_job_locked(namespace, job_id))
+                if (job.operation_id != original_operation_id or job.phase != "queued"
+                        or job.cancel_epoch != 0 or job.fence != 0
+                        or job.lease_holder is not None
+                        or source_version.key.token != source_ref
+                        or source_version not in envelope.version_guard.read_versions
+                        or access_version not in envelope.version_guard.read_versions):
+                    raise UnavailableGuard("D03 self projection job/source changed; HOLD")
+                pre_quote = replace(envelope, version_guard=replace(
+                    envelope.version_guard, resource_lease_versions=()))
+                quote = self.__d11_issuer.issue_d03_self_identity_projection_quote(
+                    db, pre_quote, admin_policy, installation_id=installation_id,
+                    qualified_mapping=qualified_mapping, now_utc=stage_now)
+                refs = envelope.version_guard.resource_lease_versions
+                if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
+                        quote.quote_id, quote.version):
+                    raise AuthorityDenied("D03 self projection quote guard differs")
+                db.execute(
+                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                    "VALUES(?,?,?,?,?)",
+                    namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                          str(quote.version)),
+                )
+                db.execute("""CREATE TABLE IF NOT EXISTS graph_d03_self_projection_issuance_v1(
+                    bot TEXT NOT NULL, persona TEXT NOT NULL,
+                    operation_id TEXT NOT NULL, source_ref TEXT NOT NULL,
+                    certification_ref TEXT NOT NULL, quote_id TEXT NOT NULL,
+                    bundle_digest TEXT NOT NULL,
+                    PRIMARY KEY(bot,persona,operation_id))""")
+                db.execute(
+                    "INSERT INTO graph_d03_self_projection_issuance_v1"
+                    "(bot,persona,operation_id,source_ref,certification_ref,quote_id,bundle_digest) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (identity.operation_id, source_ref,
+                                          qualified_mapping.certification_ref,
+                                          quote.quote_id, digest),
+                )
             snapshot = self._check_guard(
                 db, bundle, ingress_deadline_check=ingress_deadline_check,
                 scene_owner_guard=scene_owner_guard)
@@ -9923,12 +10382,20 @@ class GraphCoordinator:
                                      if write.key.type_name == "d09.verified_segment_batch.v1"),
                 ))
             for proposal in bundle.proposals:
-                provider = self.__providers[proposal.domain][0]
-                # Providers may return approval or the exact unchanged proposal.
-                # A transformed candidate would need its own validation pass.
-                validated = provider.validate(proposal, snapshot)
-                if validated is not True and validated != proposal:
-                    raise AuthorityDenied("domain validation did not approve proposal")
+                if self_identity_issuance is not None:
+                    from .domains.d03.self_perspective import (
+                        validate_self_identity_projection_snapshot,
+                    )
+
+                    validate_self_identity_projection_snapshot(
+                        proposal, snapshot, qualified_self[0], qualified_self[1])
+                else:
+                    provider = self.__providers[proposal.domain][0]
+                    # Providers may return approval or the exact unchanged proposal.
+                    # A transformed candidate would need its own validation pass.
+                    validated = provider.validate(proposal, snapshot)
+                    if validated is not True and validated != proposal:
+                        raise AuthorityDenied("domain validation did not approve proposal")
             runtime_admissions.append(self._admit_runtime_bundle(
                 db, bundle, now_utc=(
                     self._dispatch_clock_upper(dispatch_clock_reading)
