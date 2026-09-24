@@ -34,6 +34,7 @@ from .self_identity_qualification import (
     AuthorityCurrentSelfIdentityV1,
     AuthorityCurrentSelfIdentityPort,
     qualify_authority_current_self_identity,
+    self_identity_mapping_from_current,
 )
 
 __all__ = (
@@ -62,4 +63,5 @@ __all__ = (
     "AuthorityCurrentSelfIdentityV1",
     "AuthorityCurrentSelfIdentityPort",
     "qualify_authority_current_self_identity",
+    "self_identity_mapping_from_current",
 )

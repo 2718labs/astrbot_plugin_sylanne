@@ -10,6 +10,7 @@ from sylanne3.domains.d01 import ActiveRoleQualification, PersonaBlock, PersonaD
 from sylanne3.domains.d03.context import ContextProvider, WorldEvent
 from sylanne3.domains.d03.self_identity_qualification import (
     AuthorityCurrentSelfIdentityV1, qualify_authority_current_self_identity,
+    self_identity_mapping_from_current,
 )
 from sylanne3.domains.d03.self_perspective import (
     SelfIdentityMapping, build_self_identity_projection_bundle,
@@ -261,6 +262,7 @@ def test_authority_self_identity_qualification_binds_exact_installed_role_and_fe
 
     mapping = qualify()
     assert mapping.self_entity_ref == "entity:role-self"
+    assert mapping == self_identity_mapping_from_current(current)
     assert mapping.graph_incarnation == "graph-incarnation"
     assert mapping.certification_ref.startswith("authority:self-identity:")
     with pytest.raises(ValueError, match="differs from current role or fence"):
@@ -335,6 +337,7 @@ def test_authority_self_identity_projection_stable_across_current_permits():
     next_request = replace(current, request_operation_id="mapping-operation-2",
                            permit=next_permit)
     assert canonical_digest(current) != canonical_digest(next_request)
+    assert self_identity_mapping_from_current(next_request) == first
     assert qualify(next_request) == first
 
     replacement = replace(next_request, mapping_revision=2,
