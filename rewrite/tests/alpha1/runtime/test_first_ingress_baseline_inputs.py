@@ -33,10 +33,31 @@ def _queued(token_ingress_system):
 def test_queued_first_ingress_read_has_original_source_and_no_new_work(
         token_ingress_system):
     db, coordinator, authority, lease, job, operation_id = _queued(token_ingress_system)
-    before = db.total_changes
+    def business_state():
+        return (
+            db.execute("SELECT * FROM runtime_jobs WHERE job_id=?",
+                       (job.job_id,)).fetchone(),
+            tuple(db.execute(
+                "SELECT token,revision,value,valid FROM graph_atoms "
+                "WHERE type_name IN ('memory.source','memory.access','runtime.job') "
+                "ORDER BY token")),
+            db.execute("SELECT * FROM runtime_budget_leases WHERE lease_id=?",
+                       (job.budget_ref,)).fetchone(),
+            db.execute("SELECT COUNT(*) FROM graph_events").fetchone(),
+            db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone(),
+            db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
+                       (job.bot_id, job.persona_id)).fetchone(),
+        )
+
+    before = business_state()
     inputs = coordinator.read_first_ingress_baseline_inputs_v1(
         authority, lease, job.job_id, operation_id)
-    assert db.total_changes == before
+    assert business_state() == before
+    assert db.execute(
+        "SELECT state FROM graph_stage_candidate_reads_v1 "
+        "WHERE bot=? AND persona=? AND read_key=?",
+        (job.bot_id, job.persona_id, "d04-baseline:" + operation_id),
+    ).fetchall() == [("closed",)]
     assert (inputs.job_id, inputs.original_operation_id) == (
         job.job_id, operation_id)
     assert inputs.qualification.source_refs == (inputs.source_ref,)
