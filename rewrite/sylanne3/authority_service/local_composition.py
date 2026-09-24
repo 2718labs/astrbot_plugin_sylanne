@@ -40,6 +40,7 @@ def compose_local_owner_authority(
     installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2],
     namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
     v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
+    model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
     owner_proofs: AuthorityV2OwnerProofStore | None = None,
@@ -144,6 +145,7 @@ def compose_local_owner_authority(
     )
     return AuthorityRpcServer(
         core, v2_fences=services, v2_model_egress=v2_model_egress,
+        model_observers_v2=model_observers_v2,
         v2_owner_tickets=owner_tickets,
         v2_owner_proofs=owner_proofs,
         v2_owner_sessions=owner_sessions,

@@ -33,7 +33,10 @@ from .v2_contract import (
     SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
 )
 from .v2_fence_service import AuthorityV2FenceService
-from .v2_model_egress_contract import ModelEgressDraftV1, ModelEgressIntentV1
+from .v2_model_egress_contract import (
+    ModelEgressDraftV1, ModelEgressIntentV1, ModelAdmissionV2,
+    HostObservedModelCompletionV2,
+)
 from .v2_model_egress_service import AuthorityV2ModelEgressService
 from .v2_model_egress_wire import from_wire as model_from_wire, to_wire as model_to_wire
 from .v2_execution_bridge import AuthorityV2ExecutionBridge
@@ -174,6 +177,7 @@ class AuthorityRpcServer:
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
         v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
+        model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_owner_tickets: AuthorityV2OwnerTicketStore | None = None,
         v2_owner_proofs: AuthorityV2OwnerProofStore | None = None,
         v2_owner_sessions: AuthorityV2OwnerSessionStore | None = None,
@@ -278,6 +282,16 @@ class AuthorityRpcServer:
             namespace_to_role[namespace] = role
             role_to_namespace[role] = namespace
         self._namespace_bindings_v2 = bindings
+        observers = dict(model_observers_v2 or {})
+        if any(namespace not in model_services
+               or type(observer) is not tuple or len(observer) != 2
+               or observer not in installed
+               or not any(peer == observer[0] and profile == observer[1]
+                              and mapped == namespace
+                              for (peer, profile, _), mapped in bindings.items())
+               for namespace, observer in observers.items()):
+            raise TypeError("model observers require an installed namespace-bound peer")
+        self._model_observers_v2 = observers
         self._sessions: dict[str, tuple[float, str, str]] = {}
         self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="authority-rpc")
         self._worker_slots = threading.BoundedSemaphore(max_inflight_dispatches)
@@ -535,6 +549,54 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method in {"model_admit_dispatch_once_v2", "model_complete_observed_v2"}:
+                expected = ({"namespace", "holder", "intent", "expected_anchor",
+                             "request", "host_incarnation"}
+                            if method == "model_admit_dispatch_once_v2" else
+                            {"namespace", "holder", "intent", "expected_anchor",
+                             "admission", "report"})
+                if set(command) != expected:
+                    raise AuthorityUnavailable("model v2 command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[(credential.certificate_sha256, profile_id)]
+                holder = identifier(command["holder"], "holder")
+                model = self._v2_model_egress.get(namespace)
+                if (model is None or holder != installed.administrator_holder
+                        or self._model_observers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("designated model observer unavailable")
+                intent = model_from_wire(command["intent"], ModelEgressIntentV1)
+                anchor = self._anchor_from_command({"anchor": command["expected_anchor"]})
+                if method == "model_admit_dispatch_once_v2":
+                    from ..model_broker.broker import ModelCallRequest
+                    request = model_from_wire(command["request"], ModelCallRequest)
+                    if not any(peer == credential.certificate_sha256
+                               and profile == profile_id
+                               and role == request.envelope.authority.namespace
+                               and mapped == namespace
+                               for (peer, profile, role), mapped in self._namespace_bindings_v2.items()):
+                        raise AuthorityUnavailable("model request namespace differs")
+                    record, permit, admission = model.admit_dispatch_once_v2(
+                        credential=credential, subject=subject, holder=holder,
+                        intent=intent, expected_anchor=anchor, request=request,
+                        installation_id=installed.installation_id,
+                        observer_peer_sha256=credential.certificate_sha256,
+                        observer_profile_id=profile_id,
+                        manifest_digest=manifest_digest,
+                        host_incarnation=command["host_incarnation"])
+                    return {"record": model_to_wire(record), "permit": to_wire(permit),
+                            "admission": model_to_wire(admission)}
+                admission = model_from_wire(command["admission"], ModelAdmissionV2)
+                report = model_from_wire(command["report"], HostObservedModelCompletionV2)
+                record, permit, receipt = model.complete_observed_v2(
+                    credential=credential, subject=subject, holder=holder,
+                    intent=intent, expected_anchor=anchor, admission=admission,
+                    report=report, installation_id=installed.installation_id,
+                    observer_peer_sha256=credential.certificate_sha256,
+                    observer_profile_id=profile_id, manifest_digest=manifest_digest)
+                return {"record": model_to_wire(record), "permit": to_wire(permit),
+                        "receipt": model_to_wire(receipt)}
             if method in {"model_prepare_fenced_v1", "model_admit_dispatch_once_v1",
                           "model_recover_fenced_v1"}:
                 expected = ({"namespace", "holder", "draft", "expected_anchor"}

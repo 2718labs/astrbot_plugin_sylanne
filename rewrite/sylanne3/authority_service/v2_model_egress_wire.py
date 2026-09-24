@@ -18,6 +18,7 @@ from ..runtime_contracts import (
 )
 from .v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
+    ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
 )
 
 
@@ -39,7 +40,9 @@ def _plain(value):
 
 def to_wire(value):
     if type(value) not in {ModelEgressDraftV1, ModelEgressIntentV1,
-                           ModelEgressRecoveryV1, ModelCallRequest}:
+                           ModelEgressRecoveryV1, ModelCallRequest,
+                           ModelAdmissionV2, HostObservedModelCompletionV2,
+                           ModelTerminalReceiptV2}:
         raise ValueError("unsupported model wire type")
     plain = _plain(value)
     # Reject NaN and other values that cannot cross the stdlib JSON transport.
@@ -73,6 +76,13 @@ def from_wire(value, kind):
     elif kind is ModelEgressRecoveryV1:
         shaped = _shape(value, kind)
         shaped["intent"] = from_wire(shaped["intent"], ModelEgressIntentV1)
+        shaped["usage"] = _pairs(shaped["usage"])
+        shaped["cost"] = _pairs(shaped["cost"])
+        result = kind(**shaped)
+    elif kind in {ModelAdmissionV2, ModelTerminalReceiptV2}:
+        result = kind(**_shape(value, kind))
+    elif kind is HostObservedModelCompletionV2:
+        shaped = _shape(value, kind)
         shaped["usage"] = _pairs(shaped["usage"])
         shaped["cost"] = _pairs(shaped["cost"])
         result = kind(**shaped)

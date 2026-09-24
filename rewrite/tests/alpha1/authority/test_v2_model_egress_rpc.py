@@ -22,6 +22,7 @@ from sylanne3.authority_service.mtls_server import AuthorityServerTlsConfig, Mtl
 from sylanne3.authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
 from sylanne3.authority_service.v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
+    ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
 )
 from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
 from sylanne3.authority_service.v2_model_egress_store import AuthorityV2ModelEgressStore
@@ -159,6 +160,7 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
             administrator_authorizer=base._administrator_authorizer,
             publisher_manifest_verifier=base._publisher_manifest_verifier,
             v2_fences=fences, v2_model_egress={"ns-a": model},
+            model_observers_v2={"ns-a": (_PEER_A.certificate_sha256, "profile-a")},
             installations_v2=base._installations_v2,
             namespace_bindings_v2=base._namespace_bindings_v2,
         )
@@ -189,6 +191,72 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
                        {"graph_current": True}):
             with pytest.raises(RuntimeError, match="authority unavailable"):
                 call("model_prepare_fenced_v1", {**prepared_command, **change})
+        # Versioned admission binds one host observer. A later v1 admission
+        # cannot acquire a v2 terminal receipt.
+        request2 = replace(
+            request, call_id="call-2",
+            envelope=replace(request.envelope,
+                             identity=replace(request.identity,
+                                              operation_id="job-operation-2")))
+        draft2 = replace(draft, call_id="call-2", job_id="job-2",
+                         operation_id="job-operation-2", request_digest=request2.digest)
+        prepared2 = call("model_prepare_fenced_v1", {
+            **prepared_command, "draft": to_wire(draft2)})
+        intent2 = from_wire(prepared2["record"], ModelEgressRecoveryV1).intent
+        admit2 = {"namespace": "ns-a", "holder": "holder-a",
+                  "intent": to_wire(intent2), "expected_anchor": anchor_wire,
+                  "request": to_wire(request2), "host_incarnation": "a" * 64}
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            other("model_admit_dispatch_once_v2", admit2)
+        admitted2 = call("model_admit_dispatch_once_v2", admit2)
+        admission = from_wire(admitted2["admission"], ModelAdmissionV2)
+        assert admission.provider_config_digest == intent2.provider_config_digest
+        assert admission.host_incarnation == "a" * 64
+        assert admitted2["record"]["state"] == "dispatch_started"
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            call("model_admit_dispatch_once_v2", admit2)
+        report = HostObservedModelCompletionV2(
+            admission.admission_id, admission.host_incarnation,
+            intent2.call_id, intent2.request_digest, intent2.provider_id,
+            intent2.model_id, intent2.provider_config_digest,
+            '{"answer":"ok"}', (("input_tokens", 1),),
+            (("micro_usd", 2),), "provider-ref")
+        complete = {"namespace": "ns-a", "holder": "holder-a",
+                    "intent": to_wire(intent2), "expected_anchor": anchor_wire,
+                    "admission": to_wire(admission), "report": to_wire(report)}
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            other("model_complete_observed_v2", complete)
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            call("model_complete_observed_v2", {
+                **complete, "report": to_wire(replace(report, host_incarnation="b" * 64))})
+        original_finish = fences.fences.finish_terminal_model_egress_locked
+
+        def fail_after_finish(*args, **kwargs):
+            original_finish(*args, **kwargs)
+            raise RuntimeError("lost terminal commit")
+
+        monkeypatch.setattr(fences.fences, "finish_terminal_model_egress_locked",
+                            fail_after_finish)
+        with pytest.raises(RuntimeError, match="lost terminal commit"):
+            call("model_complete_observed_v2", complete)
+        assert call("model_recover_fenced_v1", {
+            "namespace": "ns-a", "holder": "holder-a",
+            "intent": to_wire(intent2)})["record"]["state"] == "dispatch_started"
+        assert fences.fences._row(fences.core._db, intent2.operation_id)[6] == "active"
+        monkeypatch.setattr(fences.fences, "finish_terminal_model_egress_locked",
+                            original_finish)
+        completed = call("model_complete_observed_v2", complete)
+        receipt = from_wire(completed["receipt"], ModelTerminalReceiptV2)
+        assert completed["record"]["state"] == "observed"
+        assert receipt.report_digest == report.digest
+        assert fences.fences._row(fences.core._db, intent2.operation_id)[6] == "finished"
+        assert call("model_complete_observed_v2", complete) == completed
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            call("model_complete_observed_v2", {
+                **complete, "report": to_wire(replace(report, result_json='{"answer":"other"}'))})
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            call("model_complete_observed_v2", {
+                **complete, "report": {**to_wire(report), "status": "unknown"}})
         prepared = call("model_prepare_fenced_v1", json.loads(json.dumps(prepared_command)))
         assert call("model_prepare_fenced_v1", prepared_command)["record"] == prepared["record"]
         record = from_wire(prepared["record"], ModelEgressRecoveryV1)
@@ -215,14 +283,17 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
                 **admit, "request": {**to_wire(request), "graph_current": True}})
         result = call("model_admit_dispatch_once_v1", json.loads(json.dumps(admit)))
         assert result["record"]["state"] == "dispatch_started"
-        assert "result" not in result and len(observed) == 1
+        assert "result" not in result and len(observed) == 2
         with pytest.raises(RuntimeError, match="authority unavailable"):
             call("model_admit_dispatch_once_v1", admit)
         with pytest.raises(RuntimeError, match="authority unavailable"):
             call("model_admit_dispatch_once_v1", {
                 **admit, "request": {**to_wire(request), "provider_id": "other"}})
-        assert len(observed) == 1
+        assert len(observed) == 2
         assert call("model_recover_fenced_v1", recover)["record"]["state"] == "dispatch_started"
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            call("model_complete_observed_v2", {
+                **complete, "intent": to_wire(record.intent)})
         for method in ("model_finish_v1", "model_execute_call_v1"):
             with pytest.raises(RuntimeError, match="authority unavailable"):
                 call(method, admit)
@@ -232,6 +303,8 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         malformed["envelope"]["authority"]["namespace"]["persona_id"] = "persona-b"
         with pytest.raises(RuntimeError, match="authority unavailable"):
             call("model_admit_dispatch_once_v1", {**admit, "request": malformed})
+
+
     finally:
         if server is not None:
             asyncio.run(server.aclose())

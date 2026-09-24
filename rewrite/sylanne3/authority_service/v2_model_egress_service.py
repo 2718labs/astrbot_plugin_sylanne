@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import secrets
 
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest
@@ -12,6 +13,7 @@ from .contract import AuthorityUnavailable, identifier
 from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
 from .v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressObservationV1,
+    ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
 )
 from .v2_model_egress_store import AuthorityV2ModelEgressStore
 from .v2_fence_service import AuthorityV2FenceService
@@ -239,10 +241,11 @@ class AuthorityV2ModelEgressService:
                 db, intent, permit, self._fences.fences, anchor)
             return record, permit
 
-    def admit_dispatch_once(self, *, credential, subject: str, holder: str,
+    def _admit_dispatch(self, *, credential, subject: str, holder: str,
                             intent: ModelEgressIntentV1,
                             expected_anchor: RestoreAnchor,
-                            request: ModelCallRequest | None = None):
+                            request: ModelCallRequest | None = None,
+                            admission: ModelAdmissionV2 | None = None):
         """Grant one internal dispatch admission after graph and policy checks.
 
         A model fence is held across the independent graph read. Any failure
@@ -304,6 +307,8 @@ class AuthorityV2ModelEgressService:
                     raise AuthorityUnavailable("original model dispatch permit changed")
                 record = self._store._record_dispatch_started_fenced_locked(
                     db, intent, permit, self._fences.fences, anchor)
+                if admission is not None:
+                    self._store.record_admission_locked(db, intent, admission)
                 return record, permit
         except AuthorityUnavailable:
             # A competing successful CAS must never be reclassified as unsent.
@@ -314,6 +319,120 @@ class AuthorityV2ModelEgressService:
             except AuthorityUnavailable:
                 pass
             raise
+
+    def admit_dispatch_once(self, *, credential, subject: str, holder: str,
+                            intent: ModelEgressIntentV1,
+                            expected_anchor: RestoreAnchor,
+                            request: ModelCallRequest | None = None):
+        """Legacy admission; no v2 observer binding, so terminal report stays HOLD."""
+        return self._admit_dispatch(
+            credential=credential, subject=subject, holder=holder,
+            intent=intent, expected_anchor=expected_anchor, request=request)
+
+    def admit_dispatch_once_v2(self, *, credential, subject: str, holder: str,
+                               intent: ModelEgressIntentV1,
+                               expected_anchor: RestoreAnchor,
+                               request: ModelCallRequest,
+                               installation_id: str, observer_peer_sha256: str,
+                               observer_profile_id: str, manifest_digest: str,
+                               host_incarnation: str):
+        """Atomically grant one dispatch and bind its designated host observer."""
+        if type(intent) is not ModelEgressIntentV1:
+            raise AuthorityUnavailable("typed original model intent required")
+        admission = ModelAdmissionV2(
+            secrets.token_hex(32), intent.authority_id, intent.namespace,
+            intent.subject, intent.operation_id, intent.call_id,
+            intent.request_digest, intent.provider_config_digest,
+            installation_id, observer_peer_sha256, observer_profile_id,
+            manifest_digest, host_incarnation)
+        record, permit = self._admit_dispatch(
+            credential=credential, subject=subject, holder=holder,
+            intent=intent, expected_anchor=expected_anchor, request=request,
+            admission=admission)
+        return record, permit, admission
+
+    def complete_observed_v2(self, *, credential, subject: str, holder: str,
+                             intent: ModelEgressIntentV1,
+                             expected_anchor: RestoreAnchor,
+                             admission: ModelAdmissionV2,
+                             report: HostObservedModelCompletionV2,
+                             installation_id: str, observer_peer_sha256: str,
+                             observer_profile_id: str, manifest_digest: str):
+        """Commit the designated mTLS host's complete report, finish, and receipt once.
+
+        The host adapter is in the trust boundary. This does not independently
+        attest its provider HTTP exchange; incomplete evidence leaves the fence.
+        """
+        if (self._fences is None or type(intent) is not ModelEgressIntentV1
+                or type(expected_anchor) is not RestoreAnchor
+                or type(admission) is not ModelAdmissionV2
+                or type(report) is not HostObservedModelCompletionV2):
+            raise AuthorityUnavailable("typed v2 model completion required")
+        identifier(subject, "subject")
+        identifier(holder, "holder")
+        if (subject, intent.namespace) != (intent.subject, self._fences.namespace):
+            raise AuthorityUnavailable("model completion subject or namespace mismatch")
+        if (admission.installation_id, admission.observer_peer_sha256,
+                admission.observer_profile_id, admission.manifest_digest) != (
+                installation_id, observer_peer_sha256, observer_profile_id,
+                manifest_digest):
+            raise AuthorityUnavailable("designated model observer differs")
+        if (report.admission_id, report.host_incarnation, report.call_id,
+                report.request_digest, report.provider_config_digest) != (
+                admission.admission_id, admission.host_incarnation,
+                intent.call_id, intent.request_digest,
+                admission.provider_config_digest):
+            raise AuthorityUnavailable("model report differs from admission")
+        observation = report.observation_for(intent)
+        self._fences.core._require(
+            credential, "model_egress", self._fences.namespace, holder)
+
+        def checked_replay(db):
+            saved, report_digest, receipt = self._store.read_admission_locked(db, intent)
+            if saved != admission:
+                raise AuthorityUnavailable("original model admission differs")
+            if receipt is None:
+                return None
+            record = self._store.read_locked(db, intent)
+            row = self._fences.fences._row(db, intent.operation_id)
+            if (report_digest != report.digest or record.state != "observed"
+                    or record.observation_digest != observation.digest
+                    or receipt.observation_digest != observation.digest
+                    or row is None or row[6] != "finished"
+                    or (row[8], row[9]) != (intent.call_id, receipt.finish_digest)):
+                raise AuthorityUnavailable("model terminal replay conflicts")
+            return record, self._fences.fences._permit(row), receipt
+
+        with self._fences.core._tx() as db:
+            replay = checked_replay(db)
+            if replay is not None:
+                return replay
+        with self._fences._frozen() as (db, deletion_head, execution_head,
+                                       deletion_history):
+            replay = checked_replay(db)
+            if replay is not None:
+                return replay
+            anchor = self._fences._current_locked(
+                db, deletion_head, execution_head, holder=holder,
+                generation=expected_anchor.activation_generation)
+            if anchor != expected_anchor or deletion_history:
+                raise AuthorityUnavailable("model completion anchor changed or deletion history exists")
+            row = self._fences.fences._row(db, intent.operation_id)
+            if row is None or row[6] != "active":
+                raise AuthorityUnavailable("original model fence is not active")
+            permit = self._fences.fences._permit(row)
+            self._fences.fences.validate_fence_locked(
+                db, permit, subject=subject, current_anchor=anchor)
+            record = self._store._finish_terminal_observation_fenced_locked(
+                db, intent, observation, permit, self._fences.fences, anchor)
+            receipt = ModelTerminalReceiptV2(
+                admission.admission_id, intent.call_id, intent.request_digest,
+                report.digest, observation.digest,
+                self._fences.fences.model_terminal_finish_digest(
+                    intent, permit, "completed", observation.digest),
+                admission.installation_id, admission.host_incarnation)
+            self._store.record_terminal_receipt_locked(db, admission, receipt)
+            return record, permit, receipt
 
     async def begin_handoff(self, request, request_digest):
         raise AuthorityUnavailable(

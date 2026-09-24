@@ -12,7 +12,8 @@ from .contract import AuthorityUnavailable, identifier
 from .v2_contract import FencePermitV2
 from ..runtime_contracts import canonical_digest, canonical_serialize
 from .v2_model_egress_contract import (
-    ModelEgressIntentV1, ModelEgressObservationV1, ModelEgressRecoveryV1,
+    ModelAdmissionV2, ModelEgressIntentV1, ModelEgressObservationV1,
+    ModelEgressRecoveryV1, ModelTerminalReceiptV2,
 )
 
 
@@ -41,6 +42,14 @@ _OBSERVATION_STATUS_DDL = """CREATE TABLE authority_model_egress_observation_sta
     status TEXT NOT NULL CHECK(status IN ('completed','unknown')),
     usage_json TEXT NOT NULL, cost_json TEXT NOT NULL,
     content_erased INTEGER NOT NULL CHECK(content_erased IN (0,1)),
+    FOREIGN KEY(call_id) REFERENCES authority_model_egress_v1(call_id)
+)"""
+_ADMISSION_DDL = """CREATE TABLE authority_model_admissions_v2(
+    call_id TEXT PRIMARY KEY, admission_id TEXT NOT NULL UNIQUE,
+    admission_json TEXT NOT NULL,
+    report_digest TEXT, receipt_json TEXT,
+    CHECK((report_digest IS NULL AND receipt_json IS NULL)
+       OR (report_digest IS NOT NULL AND receipt_json IS NOT NULL)),
     FOREIGN KEY(call_id) REFERENCES authority_model_egress_v1(call_id)
 )"""
 
@@ -164,6 +173,15 @@ class AuthorityV2ModelEgressStore:
                     raise AuthorityUnavailable("digest-only model observation cannot be upgraded")
             elif status != (_OBSERVATION_STATUS_DDL,):
                 raise AuthorityUnavailable("unknown model egress observation status schema")
+            admission = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='authority_model_admissions_v2'"
+            ).fetchone()
+            if admission is None:
+                # Pre-v2 dispatches remain HOLD: no observer identity may be
+                # manufactured retroactively from their passive records.
+                db.execute(_ADMISSION_DDL)
+            elif admission != (_ADMISSION_DDL,):
+                raise AuthorityUnavailable("unknown model admission schema")
 
     @contextmanager
     def _tx(self):
@@ -371,6 +389,95 @@ class AuthorityV2ModelEgressStore:
         target = ModelEgressRecoveryV1(intent, "dispatch_started")
         self._transition_locked(db, target)
         return target
+
+    def record_admission_locked(self, db: sqlite3.Connection,
+                                intent: ModelEgressIntentV1,
+                                admission: ModelAdmissionV2) -> None:
+        """Bind the v2 observer in the same transaction as the one-way CAS."""
+        if (db is not self._db or not db.in_transaction
+                or type(intent) is not ModelEgressIntentV1
+                or type(admission) is not ModelAdmissionV2
+                or (admission.authority_id, admission.namespace,
+                    admission.subject, admission.operation_id,
+                    admission.call_id, admission.request_digest,
+                    admission.provider_config_digest) !=
+                   (intent.authority_id, intent.namespace, intent.subject,
+                    intent.operation_id, intent.call_id, intent.request_digest,
+                    intent.provider_config_digest)
+                or self.read_locked(db, intent).state != "dispatch_started"):
+            raise AuthorityUnavailable("v2 admission lacks original dispatch identity")
+        try:
+            db.execute(
+                "INSERT INTO authority_model_admissions_v2 "
+                "(call_id,admission_id,admission_json) VALUES(?,?,?)",
+                (intent.call_id, admission.admission_id,
+                 canonical_serialize(asdict(admission))))
+        except sqlite3.IntegrityError as exc:
+            raise AuthorityUnavailable("model admission cannot repeat") from exc
+
+    def read_admission_locked(self, db: sqlite3.Connection,
+                              intent: ModelEgressIntentV1) -> tuple[ModelAdmissionV2, str | None, ModelTerminalReceiptV2 | None]:
+        if db is not self._db or not db.in_transaction:
+            raise AuthorityUnavailable("Authority admission transaction required")
+        self.read_locked(db, intent)
+        row = db.execute(
+            "SELECT admission_id,admission_json,report_digest,receipt_json "
+            "FROM authority_model_admissions_v2 WHERE call_id=?",
+            (intent.call_id,),
+        ).fetchone()
+        if row is None:
+            raise AuthorityUnavailable("v2 admission is absent; legacy dispatch remains HOLD")
+        try:
+            admission = ModelAdmissionV2(**json.loads(row[1]))
+            receipt = (None if row[3] is None else
+                       ModelTerminalReceiptV2(**json.loads(row[3])))
+            if (admission.admission_id != row[0]
+                    or canonical_serialize(asdict(admission)) != row[1]
+                    or (admission.authority_id, admission.namespace,
+                        admission.subject, admission.operation_id,
+                        admission.call_id, admission.request_digest,
+                        admission.provider_config_digest) !=
+                       (intent.authority_id, intent.namespace, intent.subject,
+                        intent.operation_id, intent.call_id, intent.request_digest,
+                        intent.provider_config_digest)
+                    or (row[2] is None) != (receipt is None)
+                    or (receipt is not None and (
+                        canonical_serialize(asdict(receipt)) != row[3]
+                        or receipt.report_digest != row[2]
+                        or (receipt.admission_id, receipt.call_id,
+                            receipt.request_digest, receipt.installation_id,
+                            receipt.host_incarnation) !=
+                           (admission.admission_id, admission.call_id,
+                            admission.request_digest, admission.installation_id,
+                            admission.host_incarnation)))):
+                raise ValueError("admission or receipt identity differs")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise AuthorityUnavailable("persisted model admission is invalid") from exc
+        return admission, row[2], receipt
+
+    def record_terminal_receipt_locked(
+            self, db: sqlite3.Connection, admission: ModelAdmissionV2,
+            receipt: ModelTerminalReceiptV2) -> None:
+        if (db is not self._db or not db.in_transaction
+                or type(admission) is not ModelAdmissionV2
+                or type(receipt) is not ModelTerminalReceiptV2
+                or (receipt.admission_id, receipt.call_id,
+                    receipt.request_digest, receipt.installation_id,
+                    receipt.host_incarnation) !=
+                   (admission.admission_id, admission.call_id,
+                    admission.request_digest, admission.installation_id,
+                    admission.host_incarnation)):
+            raise AuthorityUnavailable("terminal receipt differs from admission")
+        changed = db.execute(
+            "UPDATE authority_model_admissions_v2 SET report_digest=?,receipt_json=? "
+            "WHERE call_id=? AND admission_id=? AND admission_json=? "
+            "AND report_digest IS NULL AND receipt_json IS NULL",
+            (receipt.report_digest, canonical_serialize(asdict(receipt)),
+             admission.call_id, admission.admission_id,
+             canonical_serialize(asdict(admission))),
+        )
+        if changed.rowcount != 1:
+            raise AuthorityUnavailable("terminal receipt cannot repeat or change")
 
     def record_dispatch_started(self, intent: ModelEgressIntentV1) -> ModelEgressRecoveryV1:
         """Legacy unfenced entrypoint is forbidden; use Authority admission."""

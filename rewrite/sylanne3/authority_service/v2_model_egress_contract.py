@@ -264,4 +264,119 @@ class ModelEgressRecoveryV1:
                 _integer(amount, f"{name} amount")
 
 
-__all__ = ["ModelEgressDraftV1", "ModelEgressIntentV1", "ModelEgressObservationV1", "ModelEgressRecoveryV1"]
+@dataclass(frozen=True, slots=True)
+class ModelAdmissionV2:
+    """Authority-issued once-only marker for one installed host incarnation."""
+
+    admission_id: str
+    authority_id: str
+    namespace: str
+    subject: str
+    operation_id: str
+    call_id: str
+    request_digest: str
+    provider_config_digest: str
+    installation_id: str
+    observer_peer_sha256: str
+    observer_profile_id: str
+    manifest_digest: str
+    host_incarnation: str
+
+    def __post_init__(self) -> None:
+        for name in ("admission_id", "request_digest", "provider_config_digest", "observer_peer_sha256",
+                     "manifest_digest", "host_incarnation"):
+            _digest(getattr(self, name), name)
+        for name in ("authority_id", "namespace", "subject", "operation_id",
+                     "call_id", "installation_id", "observer_profile_id"):
+            identifier(getattr(self, name), name)
+
+
+@dataclass(frozen=True, slots=True)
+class HostObservedModelCompletionV2:
+    """Full completed response asserted by the designated mTLS host adapter.
+
+    Its transport proves the installed observer identity, not an independent
+    HTTP/provider receipt. Unknown and not_dispatched are not terminal reports.
+    """
+
+    admission_id: str
+    host_incarnation: str
+    call_id: str
+    request_digest: str
+    provider_id: str
+    model_id: str
+    provider_config_digest: str
+    result_json: str
+    usage: tuple[tuple[str, int], ...]
+    cost: tuple[tuple[str, int], ...]
+    provider_call_ref: str | None
+
+    def __post_init__(self) -> None:
+        for name in ("admission_id", "host_incarnation", "request_digest",
+                     "provider_config_digest"):
+            _digest(getattr(self, name), name)
+        for name in ("call_id", "provider_id", "model_id"):
+            identifier(getattr(self, name), name)
+        if self.provider_call_ref is not None:
+            identifier(self.provider_call_ref, "provider_call_ref")
+        if type(self.result_json) is not str:
+            raise ValueError("completed host observation requires result JSON")
+        result = json.loads(self.result_json)
+        if type(result) is not dict or canonical_serialize(result) != self.result_json:
+            raise ValueError("noncanonical completed result JSON")
+        for name in ("usage", "cost"):
+            amounts = getattr(self, name)
+            if (type(amounts) is not tuple or tuple(sorted(amounts)) != amounts
+                    or len({key for key, _ in amounts}) != len(amounts)):
+                raise ValueError(f"invalid {name}")
+            for key, amount in amounts:
+                identifier(key, name)
+                _integer(amount, f"{name} amount")
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(asdict(self))
+
+    def observation_for(self, intent: ModelEgressIntentV1) -> ModelEgressObservationV1:
+        if (type(intent) is not ModelEgressIntentV1
+                or (self.call_id, self.request_digest, self.provider_id,
+                    self.model_id, self.provider_config_digest) !=
+                   (intent.call_id, intent.request_digest, intent.provider_id,
+                    intent.model_id, intent.provider_config_digest)):
+            raise ValueError("host completion differs from original model call")
+        return ModelEgressObservationV1(
+            intent.authority_id, intent.namespace, intent.subject,
+            intent.operation_id, intent.call_id, intent.request_digest,
+            "completed", self.result_json, self.usage, self.cost,
+            self.provider_call_ref)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelTerminalReceiptV2:
+    """Content-free durable receipt for one bound host observation and finish."""
+
+    admission_id: str
+    call_id: str
+    request_digest: str
+    report_digest: str
+    observation_digest: str
+    finish_digest: str
+    installation_id: str
+    host_incarnation: str
+
+    def __post_init__(self) -> None:
+        for name in ("admission_id", "request_digest", "report_digest",
+                     "observation_digest", "host_incarnation"):
+            _digest(getattr(self, name), name)
+        if (type(self.finish_digest) is not str
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.finish_digest)):
+            raise ValueError("invalid terminal finish digest")
+        for name in ("call_id", "installation_id"):
+            identifier(getattr(self, name), name)
+
+
+__all__ = [
+    "ModelEgressDraftV1", "ModelEgressIntentV1", "ModelEgressObservationV1",
+    "ModelEgressRecoveryV1", "ModelAdmissionV2", "HostObservedModelCompletionV2",
+    "ModelTerminalReceiptV2",
+]
