@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hashlib
 import hmac
 import inspect
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
+from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Protocol
 
 from .authority_service.v2_owner_contract import OwnerActorBindingV1, OwnerPrincipalV1
 from .contracts import StaleRead, canonical_json
@@ -37,7 +38,9 @@ from .host.authority_client import AuthorityClient, AuthoritySelection
 from .host.model_terminal_cost_port import InstalledModelTerminalCostPort
 from .host.mtls_transport import MtlsAuthorityTransport
 from .host.first_ingress_result import OriginalFirstIngressRead
+from .host.worker_result_identity import first_ingress_worker_result_request_v1
 from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
+from .authority_service.v2_worker_model_result_contract import WorkerModelResultReadRequestV1
 from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from .host.v2_installation import V2InstallationAssembly
 from .host.v2_fence_port import V2FenceOutcomeUnknown, V2FencePort
@@ -47,6 +50,7 @@ from .model_broker.first_ingress_encoding import (
 )
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.first_ingress_v2 import ingress_ids
+from .runtime.original_model_result_context import OriginalModelResultContextV1
 from .runtime.restore_anchor import ExecutionJournalPort
 from .runtime_contracts import AuthorityContext, InstallationGrantV2, NamespaceId
 from .workbench_api.async_service import AsyncGraphWorkbenchService
@@ -76,6 +80,25 @@ class RuntimeHealth:
     status: str
     missing_capabilities: tuple[str, ...] = ()
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class AcquiredFirstIngressEncodingV2:
+    """One live D11 lease shared by egress, cost and result consumption."""
+
+    authority: AuthorityContext
+    lease: object
+    job_id: str
+    acquire_operation_id: str
+
+
+@dataclass(frozen=True)
+class PreparedFirstIngressWorkerResultV1:
+    """Content-free original facts, held under the live D11 worker scope."""
+
+    egress: FrozenEncodingEgressResult
+    result_context: OriginalModelResultContextV1
+    read_request: WorkerModelResultReadRequestV1
 
 
 @dataclass(frozen=True)
@@ -896,16 +919,15 @@ class RuntimeContext:
         except Exception:
             return None
 
-    async def run_committed_first_ingress_encoding_v2(
+    @asynccontextmanager
+    async def acquired_first_ingress_encoding_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
         executor: HostModelEgressExecutor,
-    ) -> FrozenEncodingEgressResult | None:
-        """Consume one committed ingress job through its installed D11 identity.
+    ) -> AsyncIterator[AcquiredFirstIngressEncodingV2 | None]:
+        """Keep the original D11 lease alive across the entire host workflow.
 
-        Only a newly committed ingress is scheduled here. The deterministic
-        first-attempt ID preserves the original acquire identity after an
-        uncertain response; a later recovery must inspect that operation and
-        model terminal before considering any new attempt.
+        The caller may settle the original cost and read its result context
+        before leaving this scope. No model call occurs merely by acquiring it.
         """
         if (type(envelope) is not HostIngressEnvelope
                 or type(receipt) is not IngressReceipt
@@ -918,15 +940,18 @@ class RuntimeContext:
                 or self._v2_model_bundle is None
                 or self._v2_model_bundle.model_workflows is None
                 or envelope.namespace != self._v2_namespace):
-            return None
+            yield None
+            return
         _, _, ingress_operation_id, job_id, _, _ = ingress_ids(
             envelope.lineage.source_ref)
         if receipt.operation_id != ingress_operation_id:
-            return None
+            yield None
+            return
         workflow = self._v2_model_bundle.model_workflows.encode
         if (type(workflow) is not AdminModelWorkflowV2
                 or envelope.conversation_ref not in workflow.audiences):
-            return None
+            yield None
+            return
         policy = self._v2_policy
         port = self._v2_port
         bootstrap = self._v2_bootstrap
@@ -972,13 +997,104 @@ class RuntimeContext:
         try:
             authority, lease, acquire_id = await self._worker.call(acquire)
         except Exception:
-            return None
+            yield None
+            return
         try:
-            return await self.execute_first_ingress_encoding_v2(
-                authority, lease, job_id, acquire_id, executor=executor)
+            yield AcquiredFirstIngressEncodingV2(
+                authority, lease, job_id, acquire_id)
         finally:
             await self._worker.call(
                 lambda graph: graph.release_authority_lease(bootstrap, lease))
+
+    async def read_first_ingress_original_model_result_context_v1(
+        self, acquired: AcquiredFirstIngressEncodingV2,
+    ) -> OriginalModelResultContextV1 | None:
+        """Read W01's historical identity while the same worker lease is live."""
+        if (type(acquired) is not AcquiredFirstIngressEncodingV2
+                or self._worker is None
+                or acquired.authority.namespace != self._v2_namespace):
+            return None
+        try:
+            return await self._worker.call(
+                lambda graph: graph.read_first_ingress_original_model_result_context_v1(
+                    acquired.authority, acquired.lease, acquired.job_id,
+                    acquired.acquire_operation_id))
+        except Exception:
+            return None
+
+    @asynccontextmanager
+    async def prepared_first_ingress_worker_result_v1(
+        self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
+        executor: HostModelEgressExecutor,
+    ) -> AsyncIterator[PreparedFirstIngressWorkerResultV1 | None]:
+        """Hold the one worker lease through egress, accounting and result read.
+
+        The caller may use the yielded request only while this scope remains
+        open. Authority's worker read and D06 adoption are separate gates.
+        This scope is not scheduled until the upstream D04 baseline is committed.
+        """
+        async with self.acquired_first_ingress_encoding_v2(
+                envelope, receipt, executor=executor) as acquired:
+            if acquired is None:
+                yield None
+                return
+            egress = await self.execute_first_ingress_encoding_v2(
+                acquired.authority, acquired.lease, acquired.job_id,
+                acquired.acquire_operation_id, executor=executor)
+            if (type(egress) is not FrozenEncodingEgressResult
+                    or egress.terminal is None):
+                yield None
+                return
+            cost = await self.commit_first_ingress_model_cost_v1(egress)
+            if (cost is None or getattr(cost, "status", None) != "committed"
+                    or getattr(cost, "call_id", None) != egress.intent.call_id):
+                yield None
+                return
+            context = await self.read_first_ingress_original_model_result_context_v1(
+                acquired)
+            if (type(context) is not OriginalModelResultContextV1
+                    or (context.authority_id, context.authority_namespace,
+                        context.installation_id, context.job_id,
+                        context.acquire_operation_id, context.call_id,
+                        context.original_operation_id, context.model_request_digest,
+                        context.worker_actor,
+                        context.worker_fence) != (
+                        egress.intent.authority_id, egress.intent.namespace,
+                        self._v2_installation_grant.installation_id,
+                        acquired.job_id, acquired.acquire_operation_id,
+                        egress.intent.call_id,
+                        egress.intent.budget_reservation_operation_id,
+                        egress.intent.request_digest,
+                        egress.intent.subject, egress.intent.worker_fence)
+                    or (context.worker_actor, context.worker_fence,
+                        context.source_id, context.source_revision,
+                        context.access_revision) != (
+                        acquired.authority.actor, acquired.authority.worker_fence,
+                        egress.intent.source_refs[0],
+                        egress.intent.source_revisions[0][1],
+                        egress.intent.access_revisions[0][1])):
+                yield None
+                return
+            yield PreparedFirstIngressWorkerResultV1(
+                egress, context, first_ingress_worker_result_request_v1(context))
+
+    async def run_committed_first_ingress_encoding_v2(
+        self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
+        executor: HostModelEgressExecutor,
+    ) -> FrozenEncodingEgressResult | None:
+        """Attempt the one frozen call; unresolved outcomes remain HOLD.
+
+        Automatic dispatch is gated in the host until the committed D04
+        baseline precedes this acquisition. A later orchestration must keep
+        this acquired scope open through cost and worker result consumption.
+        """
+        async with self.acquired_first_ingress_encoding_v2(
+                envelope, receipt, executor=executor) as acquired:
+            if acquired is None:
+                return None
+            return await self.execute_first_ingress_encoding_v2(
+                acquired.authority, acquired.lease, acquired.job_id,
+                acquired.acquire_operation_id, executor=executor)
 
     async def handle_ingress(self, envelope: HostIngressEnvelope) -> IngressReceipt:
         if not isinstance(envelope, HostIngressEnvelope):
@@ -1050,4 +1166,7 @@ class RuntimeContext:
             return self.health
 
 
-__all__ = ("RuntimeContext", "RuntimeDependencies", "RuntimeHealth")
+__all__ = (
+    "AcquiredFirstIngressEncodingV2", "PreparedFirstIngressWorkerResultV1",
+    "RuntimeContext", "RuntimeDependencies", "RuntimeHealth",
+)

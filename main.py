@@ -25,9 +25,6 @@ from .rewrite.sylanne3.host.authority_profile import (
 from .rewrite.sylanne3.host.v2_installation import V2InstallationAssembly
 from .rewrite.sylanne3.host.installed_scene_identity import InstalledSceneIdentityPort
 from .rewrite.sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
-from .rewrite.sylanne3.host.first_ingress_encoding_driver import (
-    run_installed_first_ingress_encoding_v2,
-)
 from .rewrite.sylanne3.installation_policy import AdminInstallationPolicy
 from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, SceneCandidateCatalog
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
@@ -357,32 +354,9 @@ class Sylanne3Plugin(Star):
         if receipt.status == "deferred":
             logger.warning("Sylanne 3 ingress outcome pending confirmation")
         elif receipt.status == "accepted" and self._v2_installation is not None:
-            task = asyncio.create_task(self._run_first_ingress_encoding(
-                runtime, self._v2_installation, event.unified_msg_origin,
-                envelope, receipt))
-            self._encoding_tasks.add(task)
-            task.add_done_callback(self._encoding_tasks.discard)
-
-    async def _run_first_ingress_encoding(
-        self, runtime: RuntimeContext, installation: V2InstallationAssembly,
-        trusted_umo: str, envelope, receipt,
-    ) -> None:
-        try:
-            result = await run_installed_first_ingress_encoding_v2(
-                runtime, installation, context=self.context,
-                trusted_umo=trusted_umo, envelope=envelope, receipt=receipt)
-        except asyncio.CancelledError:
-            logger.warning("Sylanne 3 first encoding interrupted; terminal HOLD")
-            raise
-        except Exception:
-            logger.exception("Sylanne 3 first encoding unresolved; HOLD")
-            return
-        if result is None or result.terminal is None:
-            logger.warning("Sylanne 3 first encoding unresolved; HOLD")
-            return
-        cost = await runtime.commit_first_ingress_model_cost_v1(result)
-        if cost is None:
-            logger.warning("Sylanne 3 original model cost unresolved; upper bound retained")
+            # The worker may start only after C01, legal D03 perspective and
+            # the D04 baseline are committed under the new ingress contract.
+            logger.warning("Sylanne 3 first encoding awaits committed baseline; HOLD")
 
 
 __all__ = ("Sylanne3Plugin",)

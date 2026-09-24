@@ -711,7 +711,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controlled.envelopes[0].lineage.source_ref.__len__(), 64)
         self.assertEqual(len(plugin.observed_scene_candidates(expected.namespace)), 1)
 
-    async def test_committed_v2_ingress_schedules_once_without_claiming_reply(self) -> None:
+    async def test_committed_v2_ingress_holds_without_baseline_or_model_call(self) -> None:
         module = load_plugin_module()
 
         class ControlledRuntime:
@@ -739,16 +739,11 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         event = Event()
         expected = await module.build_astrbot_ingress(event, plugin.context)
         plugin._installed_namespace = expected.namespace
-        with patch.object(module, "run_installed_first_ingress_encoding_v2",
-                          new=AsyncMock(return_value=types.SimpleNamespace(
-                              terminal=object()))) as run:
-            await plugin.ingress(event)
-            await asyncio.gather(*plugin._encoding_tasks)
-            await plugin.ingress(event)
-            self.assertEqual(run.await_count, 1)
-            self.assertEqual(run.await_args.kwargs["trusted_umo"], event.unified_msg_origin)
-            self.assertEqual(run.await_args.kwargs["receipt"].status, "accepted")
-            self.assertEqual(plugin._runtime.cost_calls, 1)
+        await plugin.ingress(event)
+        await plugin.ingress(event)
+        self.assertEqual(plugin._runtime.calls, 2)
+        self.assertEqual(plugin._runtime.cost_calls, 0)
+        self.assertEqual(plugin._encoding_tasks, set())
         self.assertFalse(event.is_stopped())
         self.assertEqual(event.sent, [])
 

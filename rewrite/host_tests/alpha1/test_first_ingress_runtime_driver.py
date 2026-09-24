@@ -1,5 +1,6 @@
-"""The host schedules only the original committed D11 encoding job."""
+"""The host retains the original D11 lease through result-read preparation."""
 
+from dataclasses import replace
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -8,10 +9,15 @@ from rewrite.host_tests.alpha1 import test_astrbot_model_call as model_fixture
 from rewrite.host_tests.alpha1.test_first_ingress_encoding_egress import frozen_case
 from rewrite.host_tests.alpha1.test_host_model_egress_executor import fixture_values
 from sylanne3.host.ingress import HostIngressEnvelope, IngressReceipt, SourceLineage
-from sylanne3.host.model_egress_executor import HostModelEgressExecutor
+from sylanne3.host.model_egress_executor import (
+    FrozenEncodingEgressResult, HostModelEgressExecutor,
+)
+from sylanne3.host.worker_result_identity import first_ingress_worker_result_request_v1
+from sylanne3.authority_service.v2_model_egress_contract import ModelTerminalReceiptV2
 from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
 from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.runtime.first_ingress_v2 import ingress_ids
+from sylanne3.runtime.original_model_result_context import OriginalModelResultContextV1
 from sylanne3.runtime_context import RuntimeContext
 from sylanne3.runtime_contracts import AuthorityContext
 
@@ -86,7 +92,7 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(tm
     try:
         bundle, adapter, _ = host.v2_adapters()
         binding, draft, anchor, request = frozen_case(host, bundle)
-        _intent, _anchor, _permit, _admission, grant, authority = fixture_values(
+        original_intent, _anchor, _permit, _admission, grant, authority = fixture_values(
             host, request)
         executor = HostModelEgressExecutor(
             authority=authority, bundle=bundle, grant=grant, adapter=adapter)
@@ -107,6 +113,8 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(tm
         )
         _, _, ingress_op, job_id, _, _ = ingress_ids(source_ref)
         receipt = IngressReceipt("accepted", ingress_op)
+        original_context = None
+        order = []
 
         class Graph:
             def grant(self, _bootstrap, **kwargs):
@@ -139,6 +147,15 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(tm
                 assert auth.worker_fence == 1
                 return binding, draft, anchor
 
+            def read_first_ingress_original_model_result_context_v1(
+                self, auth, lease, acquired_job, acquire_id,
+            ):
+                assert acquired_job == job_id and acquire_id == self.acquire_id
+                assert lease is self.lease and auth.worker_fence == 1
+                assert self.releases == 2
+                order.append("context")
+                return original_context
+
         graph = Graph()
         worker = Worker(graph)
         runtime = RuntimeContext(tmp_path, dependencies=None)
@@ -166,5 +183,52 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(tm
         assert graph.acquire_id == first_acquire_id
         assert seen == [(binding, draft, anchor)]
         assert graph.releases == 2
+
+        graph.fail_acquire = False
+        intent = replace(
+            original_intent, authority_id=anchor.authority_id,
+            namespace=anchor.namespace, subject=grant.subject,
+            operation_id=graph.acquire_id, job_id=job_id, worker_fence=1,
+            source_refs=(binding.source_id,),
+            source_revisions=((binding.source_id, binding.source_revision),),
+            access_revisions=((binding.source_id, binding.access_revision),),
+            budget_reservation_operation_id=ingress_op)
+        terminal_receipt = ModelTerminalReceiptV2(
+            "a" * 64, intent.call_id, intent.request_digest,
+            "b" * 64, "c" * 64, "sha256:" + "d" * 64,
+            grant.installation_id, "e" * 64)
+        original_context = OriginalModelResultContextV1(
+            envelope.namespace, intent.authority_id, intent.namespace,
+            grant.installation_id, "incarnation", 3, 2, 0, 0,
+            job_id, graph.acquire_id, ingress_op, intent.call_id,
+            binding.binding_digest, intent.request_digest,
+            intent.source_refs[0], intent.source_revisions[0][1],
+            intent.access_revisions[0][1], grant.subject, 1,
+            "2099-01-01T00:00:00Z", anchor)
+
+        async def execute_observed(self, **_):
+            order.append("egress")
+            return FrozenEncodingEgressResult(intent, terminal_receipt)
+
+        async def settle_cost(self, result):
+            order.append("cost")
+            assert result.intent == intent and graph.releases == 2
+            return SimpleNamespace(status="committed", call_id=intent.call_id)
+
+        executor.execute_frozen_encoding_once = MethodType(execute_observed, executor)
+        runtime.commit_first_ingress_model_cost_v1 = MethodType(settle_cost, runtime)
+        async with runtime.prepared_first_ingress_worker_result_v1(
+                envelope, receipt, executor=executor) as prepared:
+            assert prepared is not None
+            assert graph.releases == 2
+            assert prepared.egress.intent == intent
+            assert prepared.result_context == original_context
+            assert prepared.read_request.consumer_operation_id.startswith(
+                "first-ingress-c02-")
+            assert prepared.read_request == first_ingress_worker_result_request_v1(
+                replace(original_context, graph_revision=99, graph_epoch=99))
+            assert graph.releases == 2
+        assert order == ["egress", "cost", "context"]
+        assert graph.releases == 3
     finally:
         await host.asyncTearDown()
