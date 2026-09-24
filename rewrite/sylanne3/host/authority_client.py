@@ -22,6 +22,9 @@ from ..authority_service.v2_worker_model_result_contract import (
 from ..authority_service.v2_self_identity_contract import (
     AuthorityCurrentSelfIdentityV1, SelfIdentityCurrentRequestV1,
 )
+from ..authority_service.v2_worker_result_read_fact_contract import (
+    WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+)
 from ..authority_service.v2_accounting_contract import (
     AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
 )
@@ -231,6 +234,9 @@ class AuthorityTransport(Protocol):
 
     async def self_identity_current_v1(self, request, handshake, grant,
                                        *, namespace, current_request): ...
+
+    async def worker_result_read_fact_v1(self, request, handshake, grant,
+                                         *, namespace, fact_request): ...
 
 
 class AuthorityClient:
@@ -513,6 +519,29 @@ class AuthorityClient:
         return await self._transport.self_identity_current_v1(
             request, handshake, grant, namespace=policy.authority_namespace,
             current_request=current_request)
+
+    async def worker_result_read_fact_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        fact_request: WorkerResultReadFactRequestV1,
+    ) -> WorkerResultReadFactV1:
+        """Read the content-free original handoff fact under a live C02 fence."""
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(fact_request) is not WorkerResultReadFactRequestV1
+                or (fact_request.read_request.authority_id,
+                    fact_request.read_request.authority_namespace,
+                    fact_request.read_request.namespace,
+                    fact_request.read_request.installation_id,
+                    fact_request.write_permit.subject,
+                    fact_request.write_permit.holder,
+                    fact_request.write_permit.operation_id) !=
+                   (grant.authority_id, policy.authority_namespace,
+                    policy.namespace, grant.installation_id,
+                    grant.subject, grant.administrator_holder,
+                    fact_request.read_request.consumer_operation_id)):
+            raise RuntimeError("worker result fact differs from installed C02 fence")
+        return await self._transport.worker_result_read_fact_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            fact_request=fact_request)
 
     async def accounting_begin_v1(
         self, bundle, grant: InstallationGrantV2, *,

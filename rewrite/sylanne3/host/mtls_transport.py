@@ -61,6 +61,10 @@ from ..authority_service.v2_self_identity_contract import (
     AuthorityCurrentSelfIdentityV1, SelfIdentityCurrentRequestV1,
     from_wire as self_identity_from_wire, to_wire as self_identity_to_wire,
 )
+from ..authority_service.v2_worker_result_read_fact_contract import (
+    WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+    from_wire as worker_fact_from_wire, to_wire as worker_fact_to_wire,
+)
 from ..authority_service.v2_accounting_contract import (
     AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
 )
@@ -824,6 +828,38 @@ class MtlsAuthorityTransport:
                     current_request.permit)):
             raise RuntimeError("authority self identity receipt differs")
         return current
+
+    async def worker_result_read_fact_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        fact_request: WorkerResultReadFactRequestV1,
+    ) -> WorkerResultReadFactV1:
+        if (type(fact_request) is not WorkerResultReadFactRequestV1
+                or (fact_request.read_request.authority_id,
+                    fact_request.read_request.authority_namespace,
+                    fact_request.read_request.installation_id,
+                    fact_request.write_permit.subject,
+                    fact_request.write_permit.holder,
+                    fact_request.write_permit.operation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id,
+                    grant.subject, grant.administrator_holder,
+                    fact_request.read_request.consumer_operation_id)):
+            raise RuntimeError("installed worker result fact identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "worker_result_read_fact_v1",
+            {"namespace": namespace,
+             "fact_request": worker_fact_to_wire(fact_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"fact", "channel_binding_sha256"}:
+            raise RuntimeError("authority worker result fact response is invalid")
+        try:
+            fact = worker_fact_from_wire(response["fact"], WorkerResultReadFactV1)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority worker result fact response is invalid") from exc
+        if (fact.read_request != fact_request.read_request
+                or fact.write_permit != fact_request.write_permit):
+            raise RuntimeError("authority worker result fact differs")
+        return fact
 
     async def _accounting_rpc(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
