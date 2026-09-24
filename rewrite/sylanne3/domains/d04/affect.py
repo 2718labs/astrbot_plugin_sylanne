@@ -945,7 +945,8 @@ class AffectProvider:
             ),
         )
         baseline_key = AtomKey(source_key.owner, "d04.encoding_baseline.v1", baseline.baseline_id)
-        if snapshot.get(baseline_key) is not None:
+        existing = snapshot.get(baseline_key)
+        if existing is not None and (existing.revision != 0 or existing.valid):
             raise ValueError("baseline identity already exists in the graph read")
         absent = GraphVersion(baseline_key, 0)
         if baseline_key in guarded and guarded[baseline_key] != absent:
@@ -1428,8 +1429,7 @@ class AffectProvider:
                 source = AtomKey.from_token(decoded.source_refs[0])
                 if (write.key.name != decoded.baseline_id
                         or write.key.owner.kind != "event"
-                        or (write.key.owner.bot, write.key.owner.persona)
-                        != (source.owner.bot, source.owner.persona)):
+                        or write.key.owner != source.owner):
                     raise ValueError("encoding baseline identity differs from its graph write")
                 if not set(decoded.source_refs) <= set(proposal.envelope.source_qualification.source_refs):
                     raise ValueError("encoding baseline sources exceed source qualification")

@@ -149,6 +149,12 @@ class EncodingBaselineTests(unittest.TestCase):
         self.assertEqual(write.dependencies, ())
         self.assertEqual(proposal.dependencies.historical_provenance, snapshot.versions)
         self.assertIn(GraphVersion(write.key, 0), proposal.envelope.version_guard.read_versions)
+        absent_snapshot = GraphSnapshot(
+            (*snapshot.atoms, GraphAtom(write.key, 0, {}, False)), snapshot.epochs,
+        )
+        self.assertEqual(provider.propose_encoding_baseline(
+            prior.envelope, absent_snapshot, **kwargs,
+        ), proposal)
 
         initial = provider.propose_encoding_baseline(
             prior.envelope, snapshot, source_refs=(SOURCE,), perspective_ref=PERSPECTIVE,
@@ -229,6 +235,18 @@ class EncodingBaselineTests(unittest.TestCase):
     def test_graph_write_requires_exact_committed_read_and_provenance_proofs(self):
         provider, proposal, snapshot = _proposal_and_snapshot()
         self.assertEqual(provider.validate(proposal, snapshot=snapshot), proposal)
+        original = proposal.typed_writes[0]
+        wrong_event = AtomKey(Owner("event", "bot", "persona", "event:other"),
+                              original.key.type_name, original.key.name)
+        wrong_guard = replace(proposal.envelope.version_guard, read_versions=tuple(
+            GraphVersion(wrong_event, 0) if item.key == original.key else item
+            for item in proposal.envelope.version_guard.read_versions
+        ))
+        with self.assertRaisesRegex(ValueError, "identity differs"):
+            provider.validate(replace(
+                proposal, envelope=replace(proposal.envelope, version_guard=wrong_guard),
+                typed_writes=(replace(original, key=wrong_event),),
+            ), snapshot=snapshot)
         with self.assertRaisesRegex(ValueError, "committed graph snapshot"):
             provider.validate(proposal, snapshot=_scheme())
         with self.assertRaisesRegex(ValueError, "committed guarded provenance"):
