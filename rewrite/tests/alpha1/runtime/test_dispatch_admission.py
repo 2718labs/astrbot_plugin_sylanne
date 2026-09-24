@@ -34,7 +34,7 @@ from sylanne3.runtime.d11_types import (
 )
 from sylanne3.runtime.dispatch_admission import (
     DispatchAdmissionReceiptV1, DispatchAdmissionV1, install_schema,
-    load_admission,
+    load_admission, load_request,
 )
 from sylanne3.runtime.dispatch_candidate import dispatch_segment_payload_ref
 from sylanne3.runtime_contracts import (
@@ -310,14 +310,27 @@ def test_typed_receipt_round_trip_and_corrupt_digest_rejected():
     })
     receipt = DispatchAdmissionReceiptV1(admission, 2, 3, digest)
     db = sqlite3.connect(":memory:")
-    install_schema(db)
+    db.execute("""CREATE TABLE graph_dispatch_admissions (
+        bot TEXT NOT NULL, persona TEXT NOT NULL, admission_ref TEXT NOT NULL,
+        operation_id TEXT NOT NULL, effect_id TEXT NOT NULL,
+        admission_digest TEXT NOT NULL, admission_json TEXT NOT NULL,
+        graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+        receipt_digest TEXT NOT NULL,
+        PRIMARY KEY(bot, persona, admission_ref),
+        UNIQUE(bot, persona, operation_id, effect_id)
+    )""")
     db.execute(
-        "INSERT INTO graph_dispatch_admissions VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO graph_dispatch_admissions(bot,persona,admission_ref,"
+        "operation_id,effect_id,admission_digest,admission_json,graph_revision,"
+        "graph_epoch,receipt_digest) VALUES(?,?,?,?,?,?,?,?,?,?)",
         ("bot", "persona", admission.admission_ref, admission.operation_id,
          admission.effect_id, admission.digest, json.dumps(asdict(admission)),
          2, 3, digest),
     )
+    assert load_request(db, NamespaceId("bot", "persona"), "admission:one") is None
+    install_schema(db)
     assert load_admission(db, NamespaceId("bot", "persona"), "admission:one") == receipt
+    assert load_request(db, NamespaceId("bot", "persona"), "admission:one") is None
     db.execute(
         "UPDATE graph_dispatch_admissions SET receipt_digest=?",
         ("f" * 64,),
@@ -565,6 +578,8 @@ def test_current_d03_d05_projection_preserves_admission_transaction_test(
         stored = load_admission(store._db, authority.namespace, "admission:one")
     assert stored is not None and stored.admission == issuer.admission
     assert stored.graph_epoch == committed.invalidated_epochs[0].revision
+    assert coordinator.get_committed_dispatch_request(
+        authority, lease, "admission:one") == issuer.request
     # The fixture admission uses abstract account/destination strings. It
     # proves D11 persistence, but cannot authorize an AstrBot UMO route.
     with pytest.raises(UnavailableGuard, match="route"):
@@ -576,8 +591,53 @@ def test_current_d03_d05_projection_preserves_admission_transaction_test(
     reopened = sqlite3.connect(tmp_path / "candidate.db")
     try:
         assert load_admission(reopened, authority.namespace, "admission:one") == stored
+        assert load_request(reopened, authority.namespace, "admission:one") == (
+            stored, issuer.request)
     finally:
         reopened.close()
+
+
+def test_committed_request_rejects_same_id_changed_command_and_graph_receipt(tmp_path):
+    store, coordinator, authority, lease, bundle, issuer = _issuer_case(
+        tmp_path, with_projection=True)
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic - 0.01, monotonic, time.time() + 0.2,
+    )
+    assert coordinator._commit_domain_bundle_fenced(
+        bundle, lease, dispatch_clock_reading=reading).status == "committed"
+    assert coordinator.get_committed_dispatch_request(
+        authority, lease, "admission:one") == issuer.request
+    changed = replace(issuer.request, worker_fence=issuer.request.worker_fence + 1)
+    with store._lock:
+        store._db.execute(
+            "UPDATE graph_dispatch_admissions SET request_json=? WHERE admission_ref=?",
+            (json.dumps(asdict(changed), sort_keys=True, separators=(",", ":")),
+             "admission:one"),
+        )
+    with pytest.raises(ValueError, match="request identity differs"):
+        coordinator.get_committed_dispatch_request(authority, lease, "admission:one")
+    with store._lock:
+        store._db.execute(
+            "UPDATE graph_dispatch_admissions SET request_json=? WHERE admission_ref=?",
+            (json.dumps(asdict(issuer.request), sort_keys=True, separators=(",", ":")),
+             "admission:one"),
+        )
+        row = store._db.execute(
+            "SELECT receipt_json FROM graph_bundle_operations WHERE operation_id=?",
+            (issuer.request.operation_id,),
+        ).fetchone()
+        graph_receipt = json.loads(row[0])
+        graph_receipt["dispatch_admission"]["digest"] = "f" * 64
+        store._db.execute(
+            "UPDATE graph_bundle_operations SET receipt_json=? WHERE operation_id=?",
+            (json.dumps(graph_receipt), issuer.request.operation_id),
+        )
+    with pytest.raises(UnavailableGuard, match="graph receipt"):
+        coordinator.get_committed_dispatch_request(authority, lease, "admission:one")
+    store.close()
 
 
 def test_committed_astrbot_text_segment_uses_exact_batch_and_route(tmp_path):

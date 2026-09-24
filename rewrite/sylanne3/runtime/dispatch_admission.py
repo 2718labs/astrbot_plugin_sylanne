@@ -6,12 +6,21 @@ or a matching digest is evidence to inspect, never permission to send.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
+import json
 import re
 from typing import Mapping
 
-from ..runtime_contracts import CheckReceipt, NamespaceId, VersionedRef, canonical_digest
+from ..contracts import canonical_json
+from ..dispatch_runtime import DispatchRequest
+from ..runtime_contracts import (
+    CheckReceipt, NamespaceId, VersionedRef, canonical_digest,
+)
+from ..runtime_journal import (
+    BudgetConstraint, QuotaOccupancy, RecoveryConstraintFootprint,
+    ReservationConstraint,
+)
 
 
 SCHEMA = "sylanne.d11.dispatch_admission.v1"
@@ -216,10 +225,104 @@ def install_schema(db) -> None:
         operation_id TEXT NOT NULL, effect_id TEXT NOT NULL,
         admission_digest TEXT NOT NULL, admission_json TEXT NOT NULL,
         graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
-        receipt_digest TEXT NOT NULL,
+        receipt_digest TEXT NOT NULL, request_json TEXT,
         PRIMARY KEY(bot, persona, admission_ref),
         UNIQUE(bot, persona, operation_id, effect_id)
     )""")
+    if "request_json" not in {row[1] for row in db.execute(
+            "PRAGMA table_info(graph_dispatch_admissions)")}:
+        db.execute("ALTER TABLE graph_dispatch_admissions ADD COLUMN request_json TEXT")
+
+
+def insert_admission(db, receipt: DispatchAdmissionReceiptV1,
+                     request: DispatchRequest) -> None:
+    """Persist the proven command in the admission's existing graph transaction."""
+    admission = receipt.admission
+    if type(request) is not DispatchRequest or not _request_matches(admission, request):
+        raise ValueError("dispatch request differs from admission")
+    namespace = namespace_of(admission)
+    install_schema(db)
+    db.execute(
+        "INSERT INTO graph_dispatch_admissions(bot,persona,admission_ref,"
+        "operation_id,effect_id,admission_digest,admission_json,graph_revision,"
+        "graph_epoch,receipt_digest,request_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        namespace.as_tuple + (
+            admission.admission_ref, admission.operation_id, admission.effect_id,
+            admission.digest, _stored_json(admission), receipt.graph_revision,
+            receipt.graph_epoch, receipt.receipt_digest, _stored_json(request),
+        ),
+    )
+
+
+def _stored_json(value: object) -> str:
+    return canonical_json(json.loads(json.dumps(asdict(value), allow_nan=False)))
+
+
+def _request_matches(admission: DispatchAdmissionV1,
+                     request: DispatchRequest) -> bool:
+    return (
+        request.namespace == admission.namespace
+        and (request.activity_id, request.effect_id, request.attempt_id,
+             request.operation_id) == (
+                 admission.activity_id, admission.effect_id, admission.attempt_id,
+                 admission.operation_id)
+        and canonical_digest(request) == admission.request_digest
+        and request.dispatch_generation == admission.dispatch_generation
+        and request.segment_index == admission.segment_index
+        and request.payload_digest == admission.payload_digest
+    )
+
+
+def _decode_request(raw: str) -> DispatchRequest:
+    data = json.loads(raw)
+    if type(data) is not dict or set(data) != {field.name for field in fields(DispatchRequest)}:
+        raise ValueError("invalid stored dispatch request")
+    footprint = data["footprint"]
+    if type(footprint) is not dict or set(footprint) != {
+            field.name for field in fields(RecoveryConstraintFootprint)}:
+        raise ValueError("invalid stored dispatch footprint")
+    for name, item_type in (
+        ("quota_occupancies", QuotaOccupancy),
+        ("reservations", ReservationConstraint),
+        ("budgets", BudgetConstraint),
+    ):
+        if type(footprint[name]) is not list:
+            raise ValueError("invalid stored dispatch footprint")
+        footprint[name] = tuple(item_type(**item) for item in footprint[name])
+    for name in ("conflict_keys", "object_gate_keys"):
+        if type(footprint[name]) is not list:
+            raise ValueError("invalid stored dispatch footprint")
+        footprint[name] = tuple(footprint[name])
+    data["footprint"] = RecoveryConstraintFootprint(**footprint)
+    if type(data["required_check_refs"]) is not list:
+        raise ValueError("invalid stored dispatch request")
+    data["required_check_refs"] = tuple(data["required_check_refs"])
+    request = DispatchRequest(**data)
+    if _stored_json(request) != raw:
+        raise ValueError("stored dispatch request is not canonical")
+    return request
+
+
+def load_request(db, namespace: NamespaceId,
+                 admission_ref: str) -> tuple[DispatchAdmissionReceiptV1, DispatchRequest] | None:
+    """Read historical command evidence; this grants no current send authority."""
+    receipt = load_admission(db, namespace, admission_ref)
+    if receipt is None:
+        return None
+    if "request_json" not in {row[1] for row in db.execute(
+            "PRAGMA table_info(graph_dispatch_admissions)")}:
+        return None
+    raw = db.execute(
+        "SELECT request_json FROM graph_dispatch_admissions "
+        "WHERE bot=? AND persona=? AND admission_ref=?",
+        namespace.as_tuple + (admission_ref,),
+    ).fetchone()[0]
+    if raw is None:  # Legacy admission rows never stored the issued command.
+        return None
+    request = _decode_request(raw)
+    if not _request_matches(receipt.admission, request):
+        raise ValueError("stored dispatch request identity differs")
+    return receipt, request
 
 
 def _decode_check(data: object) -> CheckReceipt:
@@ -250,8 +353,6 @@ def load_admission(db, namespace: NamespaceId,
     ).fetchone()
     if row is None:
         return None
-    import json
-
     data = json.loads(row[3])
     if type(data) is not dict or type(data.get("check_receipts")) is not list:
         raise ValueError("invalid stored dispatch admission")
@@ -274,5 +375,5 @@ def load_admission(db, namespace: NamespaceId,
 __all__ = [
     "SCHEMA", "DispatchAdmissionV1", "DispatchAdmissionReceiptV1",
     "check_receipts_against_specs", "namespace_of",
-    "install_schema", "load_admission",
+    "install_schema", "insert_admission", "load_admission", "load_request",
 ]

@@ -41,8 +41,7 @@ from .runtime.jobs import (
 from .runtime.d11_types import reconcile_runtime_write
 from .runtime.dispatch_admission import (
     DispatchAdmissionV1, DispatchAdmissionReceiptV1,
-    check_receipts_against_specs, install_schema as install_dispatch_admission_schema,
-    load_admission,
+    check_receipts_against_specs, insert_admission, load_admission, load_request,
 )
 from .runtime.dispatch_admission_preflight import preflight_dispatch_admission
 from .runtime.dispatch_candidate import (
@@ -5881,6 +5880,75 @@ class GraphCoordinator:
                                     authority.activation_generation, "read")
                 return reader()
 
+    def get_committed_dispatch_request(self, authority: AuthorityContext,
+                                       lease: object, admission_ref: str):
+        """Recover a historical D11 command, never a current platform send permit."""
+        self._authorize(lease, authority, frozenset({"d08", "d09", "d11"}))
+        reader = lambda: self._get_committed_dispatch_request_locked(
+            authority.namespace, admission_ref)
+        if (isinstance(self.__store, ProductionGraphStore)
+                and self.__content_fence_v2 is not None):
+            return self._read_v2(authority, reader)
+        with self._content_fence(authority.namespace,
+                                 authority.activation_generation, "read"):
+            with self.__store._lock:
+                self._admit_content(authority.namespace,
+                                    authority.activation_generation, "read")
+                return reader()
+
+    def _get_committed_dispatch_request_locked(self, namespace, admission_ref):
+        db = self.__store._db
+        loaded = load_request(db, namespace, admission_ref)
+        if loaded is None:
+            return None
+        receipt, request = loaded
+        admission = receipt.admission
+        candidate = self._get_dispatch_candidate_evidence_locked(
+            namespace, request.operation_id)
+        row = db.execute(
+            "SELECT receipt_json FROM graph_bundle_operations "
+            "WHERE bot=? AND persona=? AND operation_id=? AND effect_id=?",
+            namespace.as_tuple + (request.operation_id, request.effect_id),
+        ).fetchone()
+        graph_admission = json.loads(row[0]).get("dispatch_admission") if row else None
+        if (candidate is None or candidate.evidence.status != "source_qualified"
+                or graph_admission != {
+                    "schema": admission.schema, "ref": admission_ref,
+                    "digest": receipt.receipt_digest,
+                }
+                or admission.candidate_digest != candidate.evidence.digest
+                or admission.batch_digest != candidate.evidence.batch_digest
+                or receipt.graph_epoch != candidate.graph_epoch
+                or receipt.graph_revision != (
+                    candidate.graph_revision if candidate.graph_revision is not None
+                    else candidate.graph_epoch)
+                or admission.graph_incarnation != (
+                    candidate.graph_incarnation or "nonproduction-graphstore")
+                or request.payload_ref != dispatch_segment_payload_ref(
+                    candidate.evidence.batch_ref, request.segment_index)):
+            raise UnavailableGuard("stored dispatch request differs from graph receipt")
+        batch_ref, batch_revision = candidate.write_versions[3]
+        batch_row = db.execute(
+            "SELECT value,valid FROM graph_history WHERE token=? AND revision=? "
+            "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
+            (batch_ref, batch_revision) + namespace.as_tuple + (
+                request.activity_id, request.operation_id),
+        ).fetchone()
+        if batch_row is None or batch_row[1] != 1:
+            raise UnavailableGuard("stored dispatch request batch is unavailable")
+        batch = json.loads(batch_row[0])
+        index = request.segment_index
+        if (type(index) is not int or not 0 <= index < len(batch["segments"])
+                or batch["batch_digest"] != admission.batch_digest
+                or batch["segments"][index]["effect_id"] != request.effect_id
+                or batch["segments"][index]["payload_digest"] != request.payload_digest
+                or batch["segments"][index]["segment_authorization_ref"]
+                != request.segment_authorization_ref
+                or batch["grant_manifest_digest"] != request.segment_manifest_digest
+                or len(batch["segments"]) != request.segment_count):
+            raise UnavailableGuard("stored dispatch request segment differs")
+        return request
+
     def get_dispatch_text_segment(self, authority: AuthorityContext,
                                   lease: object, request):
         """Read one D09 body through its committed D11 admission and graph fence.
@@ -6202,18 +6270,7 @@ class GraphCoordinator:
                 "graph_epoch": graph_receipt.epoch.revision,
             }),
         )
-        install_dispatch_admission_schema(db)
-        db.execute(
-            "INSERT INTO graph_dispatch_admissions(bot,persona,admission_ref,"
-            "operation_id,effect_id,admission_digest,admission_json,graph_revision,"
-            "graph_epoch,receipt_digest) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            envelope.authority.namespace.as_tuple + (
-                admission.admission_ref, identity.operation_id, identity.effect_id,
-                admission.digest,
-                canonical_json(json.loads(json.dumps(asdict(admission), allow_nan=False))),
-                receipt.graph_revision, receipt.graph_epoch, receipt.receipt_digest,
-            ),
-        )
+        insert_admission(db, receipt, request)
         return receipt
 
     def commit_domain_bundle(self, bundle: DomainBundle, lease: object) -> CommitReceipt:
