@@ -59,6 +59,10 @@ class ModelEgressIntentV1:
     model_id: str
     provider_config_digest: str
     max_output_tokens: int
+    # V2 original-identity extension. Legacy rows have neither field and are
+    # ineligible for original-intent lookup.
+    acquire_operation_id: str | None = None
+    binding_digest: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -74,6 +78,13 @@ class ModelEgressIntentV1:
         for name in ("request_digest", "anchor_digest", "budget_reservation_digest",
                      "provider_config_digest"):
             _digest(getattr(self, name), name)
+        if (self.acquire_operation_id is None) != (self.binding_digest is None):
+            raise ValueError("incomplete original model binding")
+        if self.acquire_operation_id is not None:
+            identifier(self.acquire_operation_id, "acquire_operation_id")
+            if self.acquire_operation_id != self.operation_id:
+                raise ValueError("model operation differs from original acquire")
+            _digest(self.binding_digest, "binding_digest")
         for name in (
             "worker_fence", "fence_epoch", "fence_revision", "access_epoch",
             "delete_epoch", "graph_epoch", "graph_revision",
@@ -143,6 +154,8 @@ class ModelEgressDraftV1:
     model_id: str
     provider_config_digest: str
     max_output_tokens: int
+    acquire_operation_id: str | None = None
+    binding_digest: str | None = None
 
     def __post_init__(self) -> None:
         # Keep one validation contract for the shared call fields. The dummy

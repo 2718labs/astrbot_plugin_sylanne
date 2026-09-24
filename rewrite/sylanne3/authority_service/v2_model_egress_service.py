@@ -124,7 +124,8 @@ class AuthorityV2ModelEgressService:
 
     def prepare_fenced(self, *, credential, subject: str, holder: str,
                        draft: ModelEgressDraftV1,
-                       expected_anchor: RestoreAnchor):
+                       expected_anchor: RestoreAnchor,
+                       installation_id: str | None = None):
         """Create a typed record and a fresh model fence in one SQLite commit.
 
         This is a recovery identity only. It does not attest the complete graph
@@ -183,7 +184,87 @@ class AuthorityV2ModelEgressService:
             record = self._store.prepare_locked(db, intent)
             if old is None:
                 self._store.bind_fence_locked(db, intent)
+            if intent.binding_digest is not None:
+                if installation_id is None:
+                    raise AuthorityUnavailable("original model installation is absent")
+                self._store.bind_original_identity_locked(
+                    db, intent, installation_id)
             return record, permit
+
+    def lookup_original_intent_v1(
+        self, *, credential, subject: str, holder: str, authority_id: str,
+        installation_id: str,
+        namespace: str, job_id: str, acquire_operation_id: str,
+        original_model_operation_id: str, call_id: str,
+        request_digest: str, binding_digest: str,
+    ):
+        """Read the Authority's V2 original key; never issue a send or content."""
+        if self._fences is None or namespace != self._fences.namespace:
+            raise AuthorityUnavailable("original model namespace unavailable")
+        identifier(subject, "subject")
+        identifier(holder, "holder")
+        for name, value in (("authority_id", authority_id), ("namespace", namespace),
+                            ("installation_id", installation_id),
+                            ("job_id", job_id),
+                            ("acquire_operation_id", acquire_operation_id),
+                            ("original_model_operation_id", original_model_operation_id),
+                            ("call_id", call_id)):
+            identifier(value, name)
+        if (type(request_digest) is not str or len(request_digest) != 64
+                or any(c not in "0123456789abcdef" for c in request_digest)
+                or type(binding_digest) is not str or len(binding_digest) != 64
+                or any(c not in "0123456789abcdef" for c in binding_digest)
+                or acquire_operation_id != original_model_operation_id):
+            raise AuthorityUnavailable("invalid original model lookup key")
+        self._fences.core._require(credential, "current", namespace)
+        with self._fences._frozen() as (db, deletion_head, execution_head,
+                                       deletion_history):
+            anchor = self._fences._current_locked(
+                db, deletion_head, execution_head, holder=holder)
+            if (deletion_history or anchor.authority_id != authority_id):
+                raise AuthorityUnavailable("original model Authority changed")
+            record = self._store.lookup_original_locked(
+                db, authority_id=authority_id, namespace=namespace,
+                installation_id=installation_id,
+                job_id=job_id, acquire_operation_id=acquire_operation_id,
+                operation_id=original_model_operation_id, call_id=call_id,
+                request_digest=request_digest, binding_digest=binding_digest)
+            if record is None:
+                return None
+            intent = record.intent
+            if (intent.subject != subject or
+                    intent.authority_activation_generation !=
+                    anchor.activation_generation or
+                    intent.authority_revocation_epoch != anchor.revocation_epoch):
+                raise AuthorityUnavailable("original model activation or subject changed")
+            if not self._store.is_fence_bound_locked(db, intent):
+                raise AuthorityUnavailable("original model fence binding absent")
+            row = self._fences.fences._row(db, intent.operation_id)
+            if row is None:
+                raise AuthorityUnavailable("original model fence absent")
+            permit = self._fences.fences._permit(row)
+            if (permit.operation != "model_egress" or permit.subject != subject
+                    or permit.namespace != namespace
+                    or row[6] not in {"active", "finished"}
+                    or (intent.fence_token, intent.fence_epoch,
+                        intent.fence_revision, intent.anchor_digest) !=
+                       (permit.token, permit.fence_epoch, permit.revision,
+                        canonical_digest(asdict(permit.pinned_anchor)))):
+                raise AuthorityUnavailable("original model fence identity changed")
+            if row[6] == "finished":
+                status = {"prepared": "not_dispatched", "observed": "completed",
+                          "unknown": "unknown"}.get(record.state)
+                if (status is None or row[10] is not None or
+                        (row[8], row[9]) != (
+                            intent.call_id,
+                            self._fences.fences.model_terminal_finish_digest(
+                                intent, permit, status, record.observation_digest))):
+                    raise AuthorityUnavailable("original model terminal state changed")
+            admission = terminal = None
+            if db.execute("SELECT 1 FROM authority_model_admissions_v2 WHERE call_id=?",
+                          (call_id,)).fetchone():
+                admission, _, terminal = self._store.read_admission_locked(db, intent)
+            return record, permit, admission, terminal
 
     def recover_fenced(self, *, credential, subject: str,
                        intent: ModelEgressIntentV1):

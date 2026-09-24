@@ -52,6 +52,14 @@ _ADMISSION_DDL = """CREATE TABLE authority_model_admissions_v2(
        OR (report_digest IS NOT NULL AND receipt_json IS NOT NULL)),
     FOREIGN KEY(call_id) REFERENCES authority_model_egress_v1(call_id)
 )"""
+_ORIGINAL_IDENTITY_DDL = """CREATE TABLE authority_model_original_identity_v2(
+    call_id TEXT PRIMARY KEY, authority_id TEXT NOT NULL,
+    installation_id TEXT NOT NULL,
+    namespace TEXT NOT NULL, job_id TEXT NOT NULL,
+    acquire_operation_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+    request_digest TEXT NOT NULL, binding_digest TEXT NOT NULL,
+    FOREIGN KEY(call_id) REFERENCES authority_model_egress_v1(call_id)
+)"""
 
 
 def _encoded(intent: ModelEgressIntentV1) -> str:
@@ -60,14 +68,17 @@ def _encoded(intent: ModelEgressIntentV1) -> str:
 
 def _decoded(value: str) -> ModelEgressIntentV1:
     data = json.loads(value)
-    if type(data) is not dict or set(data) != set(ModelEgressIntentV1.__dataclass_fields__):
+    current = set(ModelEgressIntentV1.__dataclass_fields__)
+    legacy = current - {"acquire_operation_id", "binding_digest"}
+    if type(data) is not dict or set(data) not in (current, legacy):
         raise ValueError("egress identity fields changed")
     data["source_refs"] = tuple(data["source_refs"])
     data["source_revisions"] = tuple(tuple(item) for item in data["source_revisions"])
     data["access_revisions"] = tuple(tuple(item) for item in data["access_revisions"])
     data["budget_ceiling"] = tuple(tuple(item) for item in data["budget_ceiling"])
     result = ModelEgressIntentV1(**data)
-    if _encoded(result) != value:
+    if ((json.dumps({key: item for key, item in asdict(result).items() if key in data},
+                    sort_keys=True, separators=(",", ":"), ensure_ascii=True)) != value):
         raise ValueError("noncanonical egress identity")
     return result
 
@@ -182,6 +193,16 @@ class AuthorityV2ModelEgressStore:
                 db.execute(_ADMISSION_DDL)
             elif admission != (_ADMISSION_DDL,):
                 raise AuthorityUnavailable("unknown model admission schema")
+            original = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='authority_model_original_identity_v2'"
+            ).fetchone()
+            if original is None:
+                # Historical rows have no verifiable binding digest. They stay
+                # ineligible; never backfill from a current graph snapshot.
+                db.execute(_ORIGINAL_IDENTITY_DDL)
+            elif original != (_ORIGINAL_IDENTITY_DDL,):
+                raise AuthorityUnavailable("unknown original model identity schema")
 
     @contextmanager
     def _tx(self):
@@ -310,6 +331,67 @@ class AuthorityV2ModelEgressStore:
              intent.subject, _encoded(intent)),
         )
         return ModelEgressRecoveryV1(intent, "prepared")
+
+    def bind_original_identity_locked(self, db: sqlite3.Connection,
+                                      intent: ModelEgressIntentV1,
+                                      installation_id: str) -> None:
+        """Persist the V2 original key in the same transaction as preparation."""
+        if (db is not self._db or not db.in_transaction
+                or type(intent) is not ModelEgressIntentV1
+                or intent.acquire_operation_id is None
+                or intent.binding_digest is None):
+            raise AuthorityUnavailable("complete original model identity required")
+        identifier(installation_id, "installation_id")
+        self.read_locked(db, intent)
+        identity = (intent.call_id, intent.authority_id, installation_id,
+                    intent.namespace,
+                    intent.job_id, intent.acquire_operation_id,
+                    intent.operation_id, intent.request_digest,
+                    intent.binding_digest)
+        old = db.execute(
+            "SELECT call_id,authority_id,installation_id,namespace,job_id,acquire_operation_id,"
+            "operation_id,request_digest,binding_digest "
+            "FROM authority_model_original_identity_v2 WHERE call_id=?",
+            (intent.call_id,),
+        ).fetchone()
+        if old is None:
+            db.execute(
+                "INSERT INTO authority_model_original_identity_v2 "
+                "(call_id,authority_id,installation_id,namespace,job_id,acquire_operation_id,"
+                "operation_id,request_digest,binding_digest) VALUES(?,?,?,?,?,?,?,?,?)",
+                identity,
+            )
+        elif old != identity:
+            raise AuthorityUnavailable("original model identity changed")
+
+    def lookup_original_locked(self, db: sqlite3.Connection, *, authority_id: str,
+                               installation_id: str,
+                               namespace: str, job_id: str,
+                               acquire_operation_id: str, operation_id: str,
+                               call_id: str, request_digest: str,
+                               binding_digest: str) -> ModelEgressRecoveryV1 | None:
+        if db is not self._db or not db.in_transaction:
+            raise AuthorityUnavailable("Authority original lookup transaction required")
+        row = db.execute(
+            "SELECT call_id,authority_id,installation_id,namespace,job_id,acquire_operation_id,"
+            "operation_id,request_digest,binding_digest "
+            "FROM authority_model_original_identity_v2 WHERE call_id=?",
+            (call_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row != (call_id, authority_id, installation_id, namespace, job_id,
+                   acquire_operation_id, operation_id, request_digest,
+                   binding_digest):
+            raise AuthorityUnavailable("original model lookup identity differs")
+        record = self._read(db, call_id)
+        if (record is None or (record.intent.call_id, record.intent.authority_id,
+                record.intent.namespace, record.intent.job_id,
+                record.intent.acquire_operation_id, record.intent.operation_id,
+                record.intent.request_digest,
+                record.intent.binding_digest) != (row[0], row[1], *row[3:])):
+            raise AuthorityUnavailable("original model identity and ledger differ")
+        return record
 
     def read_locked(self, db: sqlite3.Connection, intent: ModelEgressIntentV1) -> ModelEgressRecoveryV1:
         if type(intent) is not ModelEgressIntentV1 or db is not self._db or not db.in_transaction:

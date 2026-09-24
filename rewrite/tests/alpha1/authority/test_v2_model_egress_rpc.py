@@ -219,10 +219,34 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
                              identity=replace(request.identity,
                                               operation_id="job-operation-2")))
         draft2 = replace(draft, call_id="call-2", job_id="job-2",
-                         operation_id="job-operation-2", request_digest=request2.digest)
+                         operation_id="job-operation-2", request_digest=request2.digest,
+                         acquire_operation_id="job-operation-2",
+                         binding_digest="e" * 64)
         prepared2 = call("model_prepare_fenced_v1", {
             **prepared_command, "draft": to_wire(draft2)})
         intent2 = from_wire(prepared2["record"], ModelEgressRecoveryV1).intent
+        lookup = {
+            "namespace": "ns-a",
+            "installation_id": base._installations_v2[
+                (_PEER_A.certificate_sha256, "profile-a")].installation_id,
+            "job_id": draft2.job_id,
+            "acquire_operation_id": draft2.acquire_operation_id,
+            "original_model_operation_id": draft2.operation_id,
+            "call_id": draft2.call_id,
+            "request_digest": draft2.request_digest,
+            "binding_digest": draft2.binding_digest,
+        }
+        assert call("model_original_intent_lookup_v1", lookup)["status"] == "prepared"
+        assert call("model_original_intent_lookup_v1", {
+            **lookup, "call_id": "absent-call"})["status"] == "absent"
+        for changed in ({"binding_digest": "f" * 64},
+                        {"job_id": "other-job"},
+                        {"installation_id": "other-installation"},
+                        {"namespace": "ns-b"}):
+            with pytest.raises(RuntimeError, match="authority unavailable"):
+                call("model_original_intent_lookup_v1", {**lookup, **changed})
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            other("model_original_intent_lookup_v1", lookup)
         admit2 = {"namespace": "ns-a", "holder": "holder-a",
                   "intent": to_wire(intent2), "expected_anchor": anchor_wire,
                   "request": to_wire(request2), "host_incarnation": "a" * 64}
@@ -233,6 +257,7 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         assert admission.provider_config_digest == intent2.provider_config_digest
         assert admission.host_incarnation == "a" * 64
         assert admitted2["record"]["state"] == "dispatch_started"
+        assert call("model_original_intent_lookup_v1", lookup)["status"] == "dispatch_started"
         accounting_request = AccountingMaintenanceRequestV1(
             "accounting-original-call", intent2, anchor)
         with pytest.raises(AuthorityUnavailable, match="unresolved"):
@@ -281,6 +306,10 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         assert completed["record"]["state"] == "observed"
         assert receipt.report_digest == report.digest
         assert fences.fences._row(fences.core._db, intent2.operation_id)[6] == "finished"
+        recovered_lookup = call("model_original_intent_lookup_v1", lookup)
+        assert recovered_lookup["status"] == "terminal"
+        assert recovered_lookup["terminal"] == to_wire(receipt)
+        assert "result_json" not in json.dumps(recovered_lookup)
         terminal = call("model_terminal_fact_v2", terminal_query)
         assert terminal["record"]["state"] == "observed"
         assert terminal["record"]["usage"] == [["input_tokens", 1]]

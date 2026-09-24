@@ -991,6 +991,46 @@ class AuthorityRpcServer:
                     observer_profile_id=profile_id, manifest_digest=manifest_digest)
                 return {"record": model_to_wire(record), "permit": to_wire(permit),
                         "receipt": model_to_wire(receipt)}
+            if method == "model_original_intent_lookup_v1":
+                expected = {"namespace", "installation_id", "job_id",
+                            "acquire_operation_id", "call_id",
+                            "original_model_operation_id", "request_digest",
+                            "binding_digest"}
+                if set(command) != expected:
+                    raise AuthorityUnavailable("original model lookup fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                model = self._v2_model_egress.get(namespace)
+                if (model is None or self._model_observers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)
+                        or command["installation_id"] != installed.installation_id):
+                    raise AuthorityUnavailable("designated original model observer differs")
+                found = model.lookup_original_intent_v1(
+                    credential=credential, subject=subject,
+                    holder=installed.administrator_holder,
+                    authority_id=self._authority_id(), namespace=namespace,
+                    installation_id=installed.installation_id,
+                    job_id=command["job_id"],
+                    acquire_operation_id=command["acquire_operation_id"],
+                    original_model_operation_id=
+                        command["original_model_operation_id"],
+                    call_id=command["call_id"],
+                    request_digest=command["request_digest"],
+                    binding_digest=command["binding_digest"])
+                if found is None:
+                    return {"status": "absent"}
+                record, permit, admission, terminal = found
+                return {
+                    "status": ("terminal" if terminal is not None else
+                               "unknown" if record.state == "unknown" else
+                               record.state),
+                    "record": model_to_wire(record), "permit": to_wire(permit),
+                    "admission": None if admission is None else model_to_wire(admission),
+                    "terminal": None if terminal is None else model_to_wire(terminal),
+                }
             if method in {"model_prepare_fenced_v1", "model_admit_dispatch_once_v1",
                           "model_recover_fenced_v1"}:
                 expected = ({"namespace", "holder", "draft", "expected_anchor"}
@@ -1012,7 +1052,8 @@ class AuthorityRpcServer:
                     anchor = self._anchor_from_command({"anchor": command["expected_anchor"]})
                     record, permit = model.prepare_fenced(
                         credential=credential, subject=subject, holder=holder,
-                        draft=draft, expected_anchor=anchor)
+                        draft=draft, expected_anchor=anchor,
+                        installation_id=installed.installation_id)
                 elif method == "model_admit_dispatch_once_v1":
                     from ..model_broker.broker import ModelCallRequest
                     intent = model_from_wire(command["intent"], ModelEgressIntentV1)

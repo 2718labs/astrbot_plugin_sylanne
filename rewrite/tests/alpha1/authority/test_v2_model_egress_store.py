@@ -63,6 +63,49 @@ def test_reopen_exact_identity_and_conflict(tmp_path):
             store.read("call-1", subject="another", namespace="bot:persona")
 
 
+def test_original_identity_is_atomic_durable_and_legacy_cannot_be_inferred(tmp_path):
+    path = tmp_path / "authority.db"
+    original = intent(acquire_operation_id="job-operation",
+                      binding_digest="e" * 64)
+    key = dict(authority_id=original.authority_id,
+               installation_id="installation-1",
+               namespace=original.namespace, job_id=original.job_id,
+               acquire_operation_id=original.acquire_operation_id,
+               operation_id=original.operation_id, call_id=original.call_id,
+               request_digest=original.request_digest,
+               binding_digest=original.binding_digest)
+    with connection(path) as db:
+        store = AuthorityV2ModelEgressStore(db, create=True)
+        with pytest.raises(RuntimeError, match="rollback"):
+            with store._tx() as tx:
+                store.prepare_locked(tx, original)
+                store.bind_original_identity_locked(tx, original, "installation-1")
+                raise RuntimeError("rollback")
+        assert db.execute("SELECT 1 FROM authority_model_egress_v1").fetchone() is None
+        with store._tx() as tx:
+            store.prepare_locked(tx, original)
+            store.bind_original_identity_locked(tx, original, "installation-1")
+        with store._tx() as tx:
+            assert store.lookup_original_locked(tx, **key).intent == original
+            with pytest.raises(AuthorityUnavailable, match="identity differs"):
+                store.lookup_original_locked(tx, **{**key, "binding_digest": "f" * 64})
+            with pytest.raises(AuthorityUnavailable, match="identity differs"):
+                store.lookup_original_locked(tx, **{**key, "installation_id": "installation-2"})
+    with connection(path) as db:
+        store = AuthorityV2ModelEgressStore(db)
+        with store._tx() as tx:
+            assert store.lookup_original_locked(tx, **key).intent == original
+
+    legacy_path = tmp_path / "legacy.db"
+    with connection(legacy_path) as db:
+        store = AuthorityV2ModelEgressStore(db, create=True)
+        store.prepare(intent())
+    with connection(legacy_path) as db:
+        store = AuthorityV2ModelEgressStore(db)
+        with store._tx() as tx:
+            assert store.lookup_original_locked(tx, **key) is None
+
+
 def test_same_job_cannot_prepare_different_call_id(tmp_path):
     path = tmp_path / "authority.db"
     with connection(path) as db:
