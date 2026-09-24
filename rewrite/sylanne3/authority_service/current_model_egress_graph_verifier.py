@@ -18,6 +18,7 @@ from typing import Callable
 from .v2_contract import FencePermitV2, from_wire
 from .v2_model_egress_contract import ModelEgressIntentV1
 from ..contracts import canonical_json
+from ..graph_types import GraphVersion
 from ..memory_types import SourceRecord, access_key, source_key, validate_access
 from ..model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
@@ -29,7 +30,10 @@ from ..runtime.encoding_call_binding import load_binding
 from ..runtime.first_ingress_v2 import ingress_ids
 from ..runtime.issuers import D11BudgetJobIssuer
 from ..runtime.jobs import get_job
-from ..runtime_contracts import NamespaceId, SnapshotRequirementsV2, canonical_serialize
+from ..runtime_contracts import (
+    NamespaceId, SnapshotRequirementsV2, SourceQualification, VersionGuard,
+    canonical_serialize,
+)
 
 
 def _canonical(value: str):
@@ -85,14 +89,16 @@ class PinnedCurrentModelEgressGraphVerifier:
                 db.execute("BEGIN")
                 try:
                     return (self._check(db, intent, float(now))
-                            and (not include_binding or self._check_binding(db, intent)))
+                            and (not include_binding or self._check_binding(
+                                db, intent, float(now))))
                 finally:
                     db.execute("ROLLBACK")
         except Exception:
             return False
 
     @staticmethod
-    def _check_binding(db: sqlite3.Connection, intent: ModelEgressIntentV1) -> bool:
+    def _check_binding(db: sqlite3.Connection, intent: ModelEgressIntentV1,
+                       now: float) -> bool:
         job = get_job(db, intent.job_id)
         namespace = NamespaceId(job.bot_id, job.persona_id)
         binding = load_binding(db, namespace, intent.job_id)
@@ -107,9 +113,83 @@ class PinnedCurrentModelEgressGraphVerifier:
         if source_row is None or source_row[2] != 1:
             return False
         source = SourceRecord.from_dict(_canonical(source_row[1]))
+        access_key_value = access_key(*namespace.as_tuple, source_id)
+        access_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (access_key_value.token,),
+        ).fetchone()
+        if (access_row is None or access_row[2] != 1
+                or access_row[0] != binding.access_revision):
+            return False
+        access = _canonical(access_row[1])
+        validate_access(access)
+        if access["status"] != "active" or access["source_id"] != source_id:
+            return False
         payload, template_digest = build_first_ingress_encoding_payload(source)
         frozen = binding.request
         envelope = frozen["envelope"]
+        request_authority = envelope["authority"]
+        purpose = request_authority["purpose"]
+        audience = request_authority["audience"]
+        request_deadline = envelope["deadline_utc"]
+        if (type(purpose) is not str or type(audience) is not list
+                or not audience or any(type(item) is not str for item in audience)
+                or type(request_deadline) not in (int, float)
+                or not now < request_deadline
+                <= min(datetime.fromisoformat(job.deadline_utc.replace(
+                    "Z", "+00:00")).timestamp(),
+                       datetime.fromisoformat(job.lease_expires_utc.replace(
+                           "Z", "+00:00")).timestamp())
+                or purpose not in source.purposes
+                or purpose not in access["purposes"]
+                or not set(audience).issubset(source.audiences)
+                or not set(audience).issubset(access["audiences"])):
+            return False
+        # Only the identically named reservation dimension is a proof for
+        # max_completion_tokens. cpu_ms or currency cannot be converted here.
+        output_token_limit = dict(intent.budget_ceiling).get("output_tokens")
+        if (type(output_token_limit) is not int
+                or output_token_limit < intent.max_output_tokens):
+            return False
+        versions = db.execute(
+            "SELECT kind,version FROM graph_guard_versions WHERE bot=? AND persona=? "
+            "AND kind IN ('scheme','operator','policy') AND ref='current'",
+            namespace.as_tuple,
+        ).fetchall()
+        if len(versions) != 3 or len({kind for kind, _ in versions}) != 3:
+            return False
+        current = dict(versions)
+        provisions = db.execute(
+            "SELECT receipt_json FROM graph_namespace_provisioning_v2 "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchall()
+        if len(provisions) != 1:
+            return False
+        catalogue = _canonical(provisions[0][0]).get("catalogue_hash")
+        expected_guard = VersionGuard(
+            (GraphVersion(source_key(*namespace.as_tuple, source_id), source_row[0]),
+             GraphVersion(access_key_value, access_row[0])), (),
+            intent.access_epoch, intent.delete_epoch, catalogue,
+            current["scheme"], current["operator"], current["policy"],
+            (), (), (),
+        )
+        original = db.execute(
+            "SELECT source_qualification_json FROM runtime_ingress_issuance "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (job.operation_id,),
+        ).fetchone()
+        if original is None or original[0] is None:
+            return False
+        qualification_data = _canonical(original[0])
+        qualification_data["source_refs"] = tuple(qualification_data["source_refs"])
+        qualification = SourceQualification(**qualification_data)
+        if (canonical_serialize(asdict(qualification)) != original[0]
+                or qualification.source_refs != (source_token,)
+                or envelope["version_guard"]
+                != json.loads(canonical_serialize(expected_guard))
+                or envelope["source_qualification"]
+                != json.loads(canonical_serialize(qualification))):
+            return False
         return (
             binding.call_id == intent.call_id
             and binding.model_request_digest == intent.request_digest
@@ -126,11 +206,17 @@ class PinnedCurrentModelEgressGraphVerifier:
             and frozen["prompt_template_digest"] == template_digest
             and frozen["payload"] == payload
             and envelope["identity"]["operation_id"] == intent.operation_id
+            and envelope["identity"]["activity_id"] == job.activity_id
+            and envelope["schema"] == "sylanne.runtime.v1"
             and envelope["authority"]["actor"] == intent.subject
+            and envelope["authority"]["issuer_domain"] == "d11"
             and envelope["authority"]["worker_fence"] == intent.worker_fence
+            and envelope["authority"]["activation_generation"]
+            == intent.authority_activation_generation
             and envelope["authority"]["namespace"] == json.loads(canonical_serialize(namespace))
             and envelope["source_qualification"]["source_refs"] == [source_token]
             and envelope["input_refs"] == [source_token]
+            and envelope["parent_budget_lease_ref"] == intent.budget_lease_id
         )
 
     def _check(self, db: sqlite3.Connection, intent: ModelEgressIntentV1,

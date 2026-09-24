@@ -4,6 +4,8 @@ from dataclasses import asdict, replace
 import json
 import time
 
+import pytest
+
 from sylanne3.authority_service.current_model_egress_graph_verifier import (
     PinnedCurrentModelEgressGraphVerifier,
 )
@@ -25,6 +27,37 @@ from sylanne3.runtime_contracts import (
 )
 
 from test_first_ingress_v2 import ingress_system  # noqa: F401
+from test_first_ingress_v2 import _ingress_inputs
+from test_scene_binding_v2 import _bind_scene, _scene_case
+import test_graph_v2_provisioning
+
+
+@pytest.fixture
+def token_ingress_system(tmp_path, monkeypatch):
+    original = test_graph_v2_provisioning.policy_for
+
+    def token_policy(store):
+        policy = original(store)
+        return replace(
+            policy,
+            root_lease=replace(policy.root_lease, limits={
+                "cpu_ms": 200, "output_tokens": 512}),
+            root_grant=replace(policy.root_grant, max_ceiling={
+                "cpu_ms": 100, "output_tokens": 256}),
+        )
+
+    monkeypatch.setattr(test_graph_v2_provisioning, "policy_for", token_policy)
+    case = _scene_case(tmp_path, enable_ingress=True)
+    _bind_scene(case)
+    store, authority_db, port, coordinator, namespace, _, _, policy, bootstrap = case
+    host, clock, encoding = _ingress_inputs(namespace)
+    encoding = replace(encoding, quote_ceiling={
+        "cpu_ms": 20, "output_tokens": 128})
+    try:
+        yield store, coordinator, bootstrap, port, policy, clock, encoding, host
+    finally:
+        store.close()
+        authority_db.close()
 
 
 def _case(ingress_system):
@@ -121,9 +154,9 @@ def test_access_epoch_or_original_ceiling_change_holds(ingress_system):
     assert not verifier.graph_facts_current(intent)
 
 
-def test_complete_graph_facts_require_exact_durable_model_request(ingress_system):
-    db, verifier, intent = _case(ingress_system)
-    assert not verifier.complete_graph_current(intent)
+def _bind_request(db, intent, *, purpose="consolidation", audience=("conversation",),
+                  guard_policy=None, guard_catalogue=None,
+                  qualification_shift=0):
     source_id = intent.source_refs[0]
     namespace = NamespaceId("bot", "persona")
     source_token = source_key(*namespace.as_tuple, source_id).token
@@ -132,13 +165,30 @@ def test_complete_graph_facts_require_exact_durable_model_request(ingress_system
         "SELECT value FROM graph_atoms WHERE token=?", (source_token,)).fetchone()[0]))
     job = get_job(db, intent.job_id)
     payload, template_digest = build_first_ingress_encoding_payload(source)
+    versions = dict(db.execute(
+        "SELECT kind,version FROM graph_guard_versions WHERE bot=? AND persona=? "
+        "AND kind IN ('scheme','operator','policy') AND ref='current'",
+        namespace.as_tuple).fetchall())
+    (provision_json,) = db.execute(
+        "SELECT receipt_json FROM graph_namespace_provisioning_v2 "
+        "WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
+    (qualification_json,) = db.execute(
+        "SELECT source_qualification_json FROM runtime_ingress_issuance "
+        "WHERE bot=? AND persona=? AND operation_id=?",
+        namespace.as_tuple + (job.operation_id,)).fetchone()
+    qualification_data = json.loads(qualification_json)
+    qualification_data["source_refs"] = tuple(qualification_data["source_refs"])
+    qualification = SourceQualification(**qualification_data)
+    if qualification_shift:
+        qualification = replace(
+            qualification, learned_at=qualification.learned_at + qualification_shift)
     envelope = CommandEnvelope(
         "sylanne.runtime.v1",
         OperationIdentity(job.activity_id, None, "model-attempt", "encode",
                           intent.operation_id,
                           canonical_digest({"input_refs": [source_token]})),
-        AuthorityContext(intent.subject, "d06", "model-capability", namespace,
-                         ("activity",), "consolidation", ("conversation",),
+        AuthorityContext(intent.subject, "d11", "model-capability", namespace,
+                         ("activity",), purpose, audience,
                          "model-policy", intent.authority_activation_generation,
                          worker_fence=job.fence),
         VersionGuard((GraphVersion(source_key(*namespace.as_tuple, source_id),
@@ -146,11 +196,12 @@ def test_complete_graph_facts_require_exact_durable_model_request(ingress_system
                       GraphVersion(access_key(*namespace.as_tuple, source_id),
                                    intent.access_revisions[0][1])),
                      (), intent.access_epoch, intent.delete_epoch,
-                     "catalogue", "scheme", "operator", "policy", (), (), ()),
-        SourceQualification((source_token,), "reported", source.occurred_at,
-                            source.recorded_at, "external_report", "qualified",
-                            None, "not_applicable"),
-        (source_token,), job.budget_ref, 100.0, 100.0, "interval", (job.operation_id,),
+                     guard_catalogue or json.loads(provision_json)["catalogue_hash"],
+                     versions["scheme"], versions["operator"],
+                     guard_policy or versions["policy"], (), (), ()),
+        qualification,
+        (source_token,), job.budget_ref,
+        time.time() + 20, 100.0, "interval", (job.operation_id,),
     )
     request = ModelCallRequest(
         envelope, intent.call_id, intent.provider_id, intent.model_id,
@@ -165,9 +216,56 @@ def test_complete_graph_facts_require_exact_durable_model_request(ingress_system
         provider_config_digest=intent.provider_config_digest,
     )
     insert_binding(db, binding)
-    matching = replace(intent, request_digest=request.digest)
+    return replace(intent, request_digest=request.digest)
+
+
+def test_complete_graph_facts_require_exact_durable_model_request(token_ingress_system):
+    db, verifier, intent = _case(token_ingress_system)
+    intent = replace(intent, max_output_tokens=128)
+    assert not verifier.complete_graph_current(intent)
+    matching = _bind_request(db, intent)
     assert verifier.complete_graph_current(matching)
     assert not verifier.complete_graph_current(intent)
     assert not verifier.complete_graph_current(replace(
         matching, provider_config_digest="2" * 64))
     assert verifier(matching) is False  # Authority fence and provider gate remain HOLD.
+
+
+def test_cpu_budget_cannot_be_treated_as_output_tokens(ingress_system):
+    db, verifier, intent = _case(ingress_system)
+    matching = _bind_request(db, intent)
+    assert verifier.graph_facts_current(matching)
+    assert not verifier.complete_graph_current(matching)
+
+
+@pytest.mark.parametrize("failure", [
+    "access_audience", "access_purpose", "policy_version",
+    "catalogue_version",
+    "original_qualification", "output_tokens_exceeded",
+])
+def test_complete_graph_rejects_scope_version_and_token_drift(
+    token_ingress_system, failure,
+):
+    db, verifier, intent = _case(token_ingress_system)
+    if failure == "output_tokens_exceeded":
+        intent = replace(intent, max_output_tokens=129)
+    matching = _bind_request(
+        db, intent,
+        purpose="context" if failure == "access_purpose" else "consolidation",
+        guard_policy="stale-policy" if failure == "policy_version" else None,
+        guard_catalogue="stale-catalogue" if failure == "catalogue_version" else None,
+        qualification_shift=1 if failure == "original_qualification" else 0,
+    )
+    if failure in {"access_audience", "access_purpose"}:
+        token, value = db.execute(
+            "SELECT token,value FROM graph_atoms WHERE type_name='memory.access' "
+            "AND subject=?", (intent.source_refs[0],)).fetchone()
+        access = json.loads(value)
+        if failure == "access_audience":
+            access["audiences"] = []
+        else:
+            access["purposes"] = ["consolidation"]
+        db.execute("UPDATE graph_atoms SET value=? WHERE token=?",
+                   (json.dumps(access, sort_keys=True, separators=(",", ":")), token))
+    assert verifier.graph_facts_current(matching)
+    assert not verifier.complete_graph_current(matching)
