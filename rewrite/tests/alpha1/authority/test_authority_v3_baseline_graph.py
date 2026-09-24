@@ -26,7 +26,7 @@ from sylanne3.runtime_contracts import SnapshotRequirementsV2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))
 from test_current_model_egress_graph_verifier import _case, token_ingress_system
-from test_current_d04_baseline_graph_proof import _seed_d03_stage
+from test_current_d04_baseline_graph_proof import _seed_d03_stage, _stage_quote
 import time
 
 
@@ -41,12 +41,34 @@ def _v3_case(system):
     ).fetchone()
     graph_revision, graph_epoch, anchor_json, requirements_json = original
     assert graph_revision >= 1 and graph_epoch >= 1
-    operation_id, bundle_digest, activity_id = (
-        "d04-v3-op", "d" * 64, "d04-v3-activity")
+    bundle_digest, activity_id = "d" * 64, "d04-v3-activity"
+    original_operation_id = db.execute(
+        "SELECT operation_id FROM runtime_jobs WHERE job_id=?",
+        (intent.job_id,),
+    ).fetchone()[0]
+    lease_id = db.execute(
+        "SELECT lease_id FROM runtime_budget_leases WHERE parent_id IS NULL"
+    ).fetchone()[0]
+    issuer = system[1]._GraphCoordinator__d11_issuer
     anchor = from_wire(json.loads(db.execute(
         "SELECT permit_json FROM graph_job_acquire_receipts_v2 "
         "WHERE job_json LIKE ? LIMIT 1", ("%" + intent.job_id + "%",),
     ).fetchone()[0])).pinned_anchor
+    frozen_requirements = json.loads(requirements_json)
+    requirements = SnapshotRequirementsV2(**{
+        **frozen_requirements,
+        "namespace": NamespaceId(**frozen_requirements["namespace"]),
+    })
+    perspective, event, mapping = _seed_d03_stage(
+        db, ns, source, requirements, anchor, issuer=issuer,
+        pre_revision=graph_revision-1, pre_epoch=graph_epoch-1,
+        source_revision=intent.source_revisions[0][1],
+        original_operation_id=original_operation_id, lease_id=lease_id)
+    operation_id = "d04-baseline-" + canonical_digest({
+        "namespace": ns.as_tuple, "source": source.token,
+        "event": event.token, "perspective": perspective.token,
+        "perspective_revision": 1,
+    })[:40]
     attempt = "graph-write-" + canonical_digest({
         "namespace": list(ns.as_tuple), "operation_id": operation_id,
         "bundle_digest": bundle_digest})[:48]
@@ -56,15 +78,6 @@ def _v3_case(system):
             "WHERE job_json LIKE ? LIMIT 1", ("%" + intent.job_id + "%",),
         ).fetchone()[0])), operation="write", operation_id=attempt,
         token="w" * 32, pinned_anchor=anchor)
-    frozen_requirements = json.loads(requirements_json)
-    requirements = SnapshotRequirementsV2(**{
-        **frozen_requirements,
-        "namespace": NamespaceId(**frozen_requirements["namespace"]),
-    })
-    perspective, event, mapping = _seed_d03_stage(
-        db, ns, source, requirements, anchor,
-        pre_revision=graph_revision-1, pre_epoch=graph_epoch-1,
-        source_revision=intent.source_revisions[0][1])
     value = EncodingBaseline(
         "baseline:v3-fixture", (source.token,), perspective.token, (), (),
         1.0, "projection-policy", "1", "1", "1", None, None,
@@ -76,9 +89,17 @@ def _v3_case(system):
     db.execute("""CREATE TABLE IF NOT EXISTS graph_d04_baseline_issuance_v1(
         bot TEXT,persona TEXT,operation_id TEXT,source_ref TEXT,event_ref TEXT,
         quote_id TEXT,bundle_digest TEXT)""")
+    quote_id = _stage_quote(db, issuer, ns, operation_id, activity_id,
+                            "d04", lease_id=lease_id)
     db.execute("INSERT INTO graph_d04_baseline_issuance_v1 VALUES(?,?,?,?,?,?,?)",
                (*ns.as_tuple, operation_id, source.token, event.token,
-                "signed-d04-quote", bundle_digest))
+                quote_id, bundle_digest))
+    db.execute("""CREATE TABLE IF NOT EXISTS graph_d04_baseline_intents_v1(
+        bot TEXT,persona TEXT,source_ref TEXT,original_operation_id TEXT,
+        operation_id TEXT,bundle_digest TEXT)""")
+    db.execute("INSERT INTO graph_d04_baseline_intents_v1 VALUES(?,?,?,?,?,?)",
+               (*ns.as_tuple, source.token, original_operation_id,
+                operation_id, bundle_digest))
     sequence = db.execute(
         "SELECT MAX(commit_seq) FROM graph_bundle_operations").fetchone()[0] + 1
     db.execute("INSERT INTO graph_bundle_operations VALUES(?,?,?,?,?,?,?,?)",
@@ -158,15 +179,14 @@ def _v3_case(system):
 def test_v3_egress_requires_real_committed_baseline(token_ingress_system):
     db, verifier, intent, key = _v3_case(token_ingress_system)
     assert verifier.complete_graph_current(intent)
-    original_digest = db.execute(
-        "SELECT bundle_digest FROM graph_d04_baseline_issuance_v1 "
-        "WHERE operation_id='d04-v3-op'",
-    ).fetchone()[0]
+    baseline_operation, original_digest = db.execute(
+        "SELECT operation_id,bundle_digest FROM graph_d04_baseline_issuance_v1"
+    ).fetchone()
     db.execute("UPDATE graph_d04_baseline_issuance_v1 SET bundle_digest='wrong' "
-               "WHERE operation_id='d04-v3-op'")
+               "WHERE operation_id=?", (baseline_operation,))
     assert not verifier.complete_graph_current(intent)
     db.execute("UPDATE graph_d04_baseline_issuance_v1 SET bundle_digest=? "
-               "WHERE operation_id='d04-v3-op'", (original_digest,))
+               "WHERE operation_id=?", (original_digest, baseline_operation))
     assert verifier.complete_graph_current(intent)
     db.execute("DELETE FROM graph_history WHERE token=?", (key.token,))
     assert not verifier.complete_graph_current(intent)

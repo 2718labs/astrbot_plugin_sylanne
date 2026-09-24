@@ -118,8 +118,7 @@ class PinnedCurrentModelEgressGraphVerifier:
         except Exception:
             return False
 
-    @staticmethod
-    def _check_binding(db: sqlite3.Connection, intent: ModelEgressIntentV1,
+    def _check_binding(self, db: sqlite3.Connection, intent: ModelEgressIntentV1,
                        now: float, clock_epoch: str) -> bool:
         job = get_job(db, intent.job_id)
         namespace = NamespaceId(job.bot_id, job.persona_id)
@@ -239,7 +238,8 @@ class PinnedCurrentModelEgressGraphVerifier:
                     current_graph_revision=recovery[1],
                     current_graph_epoch=epoch[0],
                     acquire_graph_revision=acquire_stamp[0],
-                    acquire_graph_epoch=acquire_stamp[1]):
+                    acquire_graph_epoch=acquire_stamp[1],
+                    issuer=self._issuer):
                 return False
             baseline_version = (
                 GraphVersion(AtomKey.from_token(baseline.baseline_ref),

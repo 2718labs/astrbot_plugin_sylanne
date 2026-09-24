@@ -228,7 +228,8 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
                     current_graph_revision=meta[2],
                     current_graph_epoch=graph_epoch[0],
                     acquire_graph_revision=acquire_stamp[0],
-                    acquire_graph_epoch=acquire_stamp[1]):
+                    acquire_graph_epoch=acquire_stamp[1],
+                    issuer=self._issuer):
                 return False
         original = db.execute(
             "SELECT activity_id,effect_id,receipt_json FROM graph_bundle_operations "
