@@ -26,7 +26,7 @@ from ..model_broker.first_ingress_encoding import (
 )
 from ..runtime.budget import get_budget_lease
 from ..runtime.d11_types import RuntimeOutboxValue, job_graph_write, runtime_job_key, runtime_outbox_key
-from ..runtime.encoding_call_binding import load_binding
+from ..runtime.encoding_call_binding import binding_to_json, load_binding
 from ..runtime.first_ingress_v2 import ingress_ids
 from ..runtime.issuers import D11BudgetJobIssuer
 from ..runtime.jobs import get_job
@@ -59,7 +59,8 @@ class PinnedCurrentModelEgressGraphVerifier:
 
     def __init__(self, graph_db_path: str | Path, *,
                  d11_issuer: D11BudgetJobIssuer,
-                 trusted_now_utc: Callable[[], float]):
+                 trusted_now_utc: Callable[[], float],
+                 trusted_paired_clock: Callable[[], tuple[float, str]] | None = None):
         path = Path(graph_db_path)
         if not path.is_absolute():
             raise ValueError("graph database path must be administrator-pinned and absolute")
@@ -70,6 +71,7 @@ class PinnedCurrentModelEgressGraphVerifier:
             raise ValueError("pinned graph database is not a file")
         self._issuer = d11_issuer
         self._clock = trusted_now_utc
+        self._paired_clock = trusted_paired_clock
 
     def __call__(self, intent: ModelEgressIntentV1) -> bool:
         # A graph row alone cannot authenticate the live Authority model fence
@@ -86,16 +88,28 @@ class PinnedCurrentModelEgressGraphVerifier:
         if type(intent) is not ModelEgressIntentV1:
             return False
         try:
-            now = self._clock()
+            if include_binding:
+                if self._paired_clock is None:
+                    return False
+                reading = self._paired_clock()
+                if type(reading) is not tuple or len(reading) != 2:
+                    return False
+                now, clock_epoch = reading
+                if type(clock_epoch) is not str or not clock_epoch:
+                    return False
+            else:
+                now, clock_epoch = self._clock(), None
             if type(now) not in (float, int) or not math.isfinite(now):
                 return False
+            # UTC upper bound and epoch must come from one trusted sample.
+            # The persisted monotonic deadline is only request identity.
             with closing(sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True)) as db:
                 db.execute("PRAGMA query_only=ON")
                 db.execute("BEGIN")
                 try:
                     return (self._check(db, intent, float(now))
                             and (not include_binding or self._check_binding(
-                                db, intent, float(now))))
+                                db, intent, float(now), clock_epoch)))
                 finally:
                     db.execute("ROLLBACK")
         except Exception:
@@ -103,12 +117,31 @@ class PinnedCurrentModelEgressGraphVerifier:
 
     @staticmethod
     def _check_binding(db: sqlite3.Connection, intent: ModelEgressIntentV1,
-                       now: float) -> bool:
+                       now: float, clock_epoch: str) -> bool:
         job = get_job(db, intent.job_id)
         namespace = NamespaceId(job.bot_id, job.persona_id)
         binding = load_binding(db, namespace, intent.job_id)
         if binding is None:
             return False
+        frozen = binding.request
+        if frozen.get("schema") != "sylanne.first-ingress-encoding-call.v2":
+            return False
+        acquire = db.execute(
+            "SELECT i.acquire_operation_id,i.job_id,i.original_operation_id,"
+            "i.actor,i.encoding_binding_json,r.job_json "
+            "FROM graph_job_acquire_intents_v2 AS i "
+            "JOIN graph_job_acquire_receipts_v2 AS r ON "
+            "r.bot=i.bot AND r.persona=i.persona "
+            "AND r.acquire_operation_id=i.acquire_operation_id "
+            "WHERE i.bot=? AND i.persona=? AND i.job_id=?",
+            namespace.as_tuple + (job.job_id,),
+        ).fetchall()
+        if (len(acquire) != 1 or acquire[0][1:4] != (
+                job.job_id, job.operation_id, job.lease_holder)
+                or acquire[0][4] != binding_to_json(binding)
+                or _canonical(acquire[0][5]) != asdict(job)):
+            return False
+        acquire_operation_id = acquire[0][0]
         source_id = intent.source_refs[0]
         source_token = source_key(*namespace.as_tuple, source_id).token
         source_row = db.execute(
@@ -131,7 +164,6 @@ class PinnedCurrentModelEgressGraphVerifier:
         if access["status"] != "active" or access["source_id"] != source_id:
             return False
         payload, template_digest = build_first_ingress_encoding_payload(source)
-        frozen = binding.request
         envelope = frozen["envelope"]
         request_authority = envelope["authority"]
         purpose = request_authority["purpose"]
@@ -179,12 +211,14 @@ class PinnedCurrentModelEgressGraphVerifier:
             (), (), (),
         )
         original = db.execute(
-            "SELECT source_qualification_json FROM runtime_ingress_issuance "
+            "SELECT source_qualification_json,policy_json "
+            "FROM runtime_ingress_issuance "
             "WHERE bot=? AND persona=? AND operation_id=?",
             namespace.as_tuple + (job.operation_id,),
         ).fetchone()
         if original is None or original[0] is None:
             return False
+        issue_policy = _canonical(original[1])
         qualification_data = _canonical(original[0])
         qualification_data["source_refs"] = tuple(qualification_data["source_refs"])
         qualification = SourceQualification(**qualification_data)
@@ -203,6 +237,15 @@ class PinnedCurrentModelEgressGraphVerifier:
             and binding.access_revision == intent.access_revisions[0][1]
             and binding.budget_lease_id == intent.budget_lease_id
             and binding.budget_reservation_operation_id == intent.budget_reservation_operation_id
+            and frozen["job_id"] == job.job_id
+            and frozen["acquire_operation_id"] == acquire_operation_id
+            and frozen["original_operation_id"] == job.operation_id
+            and frozen["budget_reservation_operation_id"] == job.operation_id
+            and frozen["budget_lease_id"] == job.budget_ref
+            and frozen["work_kind"] == job.work_kind
+            and frozen["worker_fence"] == job.fence
+            and frozen["worker_lease_expires_utc"] == job.lease_expires_utc
+            and frozen["clock_epoch"] == clock_epoch
             and frozen["provider_id"] == intent.provider_id
             and frozen["model_id"] == intent.model_id
             and frozen["provider_config_digest"] == intent.provider_config_digest
@@ -210,7 +253,8 @@ class PinnedCurrentModelEgressGraphVerifier:
             and frozen["prompt_template_version"] == FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
             and frozen["prompt_template_digest"] == template_digest
             and frozen["payload"] == payload
-            and envelope["identity"]["operation_id"] == intent.operation_id
+            and envelope["identity"]["operation_id"] == acquire_operation_id
+            and envelope["identity"]["phase"] == "encode"
             and envelope["identity"]["activity_id"] == job.activity_id
             and envelope["schema"] == "sylanne.runtime.v1"
             and envelope["authority"]["actor"] == intent.subject
@@ -222,6 +266,10 @@ class PinnedCurrentModelEgressGraphVerifier:
             and envelope["source_qualification"]["source_refs"] == [source_token]
             and envelope["input_refs"] == [source_token]
             and envelope["parent_budget_lease_ref"] == intent.budget_lease_id
+            and request_deadline == min(
+                datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp(),
+                datetime.fromisoformat(job.lease_expires_utc.replace("Z", "+00:00")).timestamp())
+            and envelope["character_interval_ref"] == issue_policy["character_interval_ref"]
         )
 
     def _check(self, db: sqlite3.Connection, intent: ModelEgressIntentV1,

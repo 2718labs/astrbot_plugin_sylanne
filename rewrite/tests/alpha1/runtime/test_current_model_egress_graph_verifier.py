@@ -3,6 +3,7 @@
 from dataclasses import asdict, replace
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +20,7 @@ from sylanne3.model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
     build_first_ingress_encoding_payload,
 )
-from sylanne3.runtime.encoding_call_binding import insert_binding, prepare_binding
+from sylanne3.runtime.encoding_call_binding import insert_binding, load_binding, prepare_binding
 from sylanne3.runtime.jobs import get_job
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
@@ -28,6 +29,7 @@ from sylanne3.runtime_contracts import (
 
 from test_first_ingress_v2 import ingress_system  # noqa: F401
 from test_first_ingress_v2 import _ingress_inputs
+from test_first_ingress_job_acquire_v2 import FixedEncodingRequestIssuer
 from test_scene_binding_v2 import _bind_scene, _scene_case
 import test_graph_v2_provisioning
 
@@ -50,6 +52,15 @@ def token_ingress_system(tmp_path, monkeypatch):
     case = _scene_case(tmp_path, enable_ingress=True)
     _bind_scene(case)
     store, authority_db, port, coordinator, namespace, _, _, policy, bootstrap = case
+    original_clock = port.read_ingress_clock
+
+    def paired_clock(clock_policy):
+        reading = original_clock(clock_policy)
+        reading.sample = SimpleNamespace(
+            epoch="fixture-clock-epoch", source_id=clock_policy.source_id)
+        return reading
+
+    port.read_ingress_clock = paired_clock
     host, clock, encoding = _ingress_inputs(namespace)
     encoding = replace(encoding, quote_ceiling={
         "cpu_ms": 20, "output_tokens": 128})
@@ -60,9 +71,11 @@ def token_ingress_system(tmp_path, monkeypatch):
         authority_db.close()
 
 
-def _case(ingress_system):
+def _case(ingress_system, *, production=False):
     store, coordinator, bootstrap, _port, policy, clock, encoding, host = ingress_system
     coordinator._GraphCoordinator__scene_clock_policy = clock
+    if production:
+        coordinator._GraphCoordinator__encoding_request_issuer = FixedEncodingRequestIssuer()
     coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
     db = store._db
     job_id, original_id = db.execute(
@@ -77,7 +90,8 @@ def _case(ingress_system):
 
     authority = AuthorityContext(
         "encoding-worker", "d11", capability, policy.namespace, ("activity",),
-        "encode", ("internal",), "policy-1", 1)
+        "consolidation" if production else "encode",
+        ("conversation",) if production else ("internal",), "policy-1", 1)
     job = coordinator.acquire_first_ingress_encoding_job_v2(
         authority, lease, job_id, acquire_id, lease_seconds=30)
     source_ref = db.execute(
@@ -122,11 +136,24 @@ def _case(ingress_system):
         requirements["execution_seq"], job.budget_ref, original_id,
         reservation[0], tuple(sorted(json.loads(reservation[1]).items())),
         "provider", "model", "1" * 64, 100)
+    if production:
+        binding = load_binding(db, policy.namespace, job_id)
+        assert binding is not None
+        frozen = binding.request
+        intent = replace(
+            intent, call_id=binding.call_id,
+            request_digest=binding.model_request_digest,
+            provider_id=frozen["provider_id"], model_id=frozen["model_id"],
+            provider_config_digest=frozen["provider_config_digest"],
+            max_output_tokens=frozen["max_output_tokens"],
+        )
     path = db.execute("PRAGMA database_list").fetchone()[2]
     # The fixture installs a signing key shared by D02/D11 issuers.
     issuer = coordinator._GraphCoordinator__d11_issuer
     verifier = PinnedCurrentModelEgressGraphVerifier(
-        path, d11_issuer=issuer, trusted_now_utc=time.time)
+        path, d11_issuer=issuer, trusted_now_utc=time.time,
+        trusted_paired_clock=(lambda: (time.time(), "fixture-clock-epoch"))
+        if production else None)
     assert quote["ceiling"] == dict(intent.budget_ceiling)
     assert intent.fence_token != acquire_permit.token
     return db, verifier, intent
@@ -224,11 +251,22 @@ def test_complete_graph_facts_require_exact_durable_model_request(token_ingress_
     intent = replace(intent, max_output_tokens=128)
     assert not verifier.complete_graph_current(intent)
     matching = _bind_request(db, intent)
-    assert verifier.complete_graph_current(matching)
+    assert not verifier.complete_graph_current(matching)  # V1 cannot admit egress.
     assert not verifier.complete_graph_current(intent)
     assert not verifier.complete_graph_current(replace(
         matching, provider_config_digest="2" * 64))
     assert verifier(matching) is False  # Authority fence and provider gate remain HOLD.
+
+
+def test_v2_binding_requires_current_epoch_and_exact_acquire(token_ingress_system):
+    db, verifier, intent = _case(token_ingress_system, production=True)
+    assert verifier.complete_graph_current(intent)
+    assert not verifier.complete_graph_current(replace(
+        intent, request_digest="f" * 64))
+    verifier._paired_clock = lambda: (time.time(), "new-clock-epoch")
+    assert not verifier.complete_graph_current(intent)
+    verifier._paired_clock = None
+    assert not verifier.complete_graph_current(intent)
 
 
 def test_cpu_budget_cannot_be_treated_as_output_tokens(ingress_system):
