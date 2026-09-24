@@ -477,7 +477,7 @@ def test_unsupported_context_version_does_not_fall_back_to_legacy_projection():
     class UnsupportedProvider:
         workbench_view_contract = {"memory": {
             "types": ("memory.source",), "fields": ("items",),
-            "projection_context": "d12.projection_context.v2",
+            "projection_context": "d12.projection_context.v3",
         }}
 
         @staticmethod

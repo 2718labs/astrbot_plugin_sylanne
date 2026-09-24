@@ -364,7 +364,7 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
             complete = store._read_observation_locked(db, original)
         assert complete.result == parsed.result
         assert complete.digest == observed.observation_digest
-        with pytest.raises(AuthorityUnavailable, match="HOLD: trusted current graph"):
+        with pytest.raises(AuthorityUnavailable, match="HOLD: current Owner-qualified model result read proof is unavailable"):
             service.read_observation_fenced(
                 credential=_PEER_A, subject="worker", intent=original)
         monkeypatch.setattr(fences.deletion, "has_deletion_history", lambda _: True)
