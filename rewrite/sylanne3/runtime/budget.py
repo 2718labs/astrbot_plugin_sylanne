@@ -152,7 +152,7 @@ class BudgetReceipt:
     unconfirmed: Mapping[str, int]
 
     def __post_init__(self) -> None:
-        if self.status not in {"created", "reserved", "settled", "overrun", "pending_confirmation", "closed", "duplicate"}:
+        if self.status not in {"created", "reserved", "settled", "overrun", "pending_confirmation", "pending_overrun", "closed", "duplicate"}:
             raise ValueError("invalid budget receipt status")
         _identifier(self.operation_id, "operation_id")
         _digest(self.digest)
@@ -320,6 +320,60 @@ def _settle_transition(
     return updated, status, actual_json, reservation_state
 
 
+def _partial_transition(
+    lease: BudgetLease, ceiling: Mapping[str, int],
+    known_actual: Mapping[str, int], unknown_dimensions: tuple[str, ...],
+    execution_revoked: bool,
+) -> tuple[BudgetLease, str, str, str]:
+    """Account known dimensions now and retain only unknown upper bounds."""
+    if (type(unknown_dimensions) is not tuple or not unknown_dimensions
+            or len(set(unknown_dimensions)) != len(unknown_dimensions)
+            or not set(unknown_dimensions) <= set(ceiling)
+            or set(known_actual) | set(unknown_dimensions) != set(ceiling)
+            or set(known_actual) & set(unknown_dimensions)):
+        raise BudgetConflict("partial cost must partition the original ceiling")
+    charged = _amounts(known_actual)
+    if any(dimension not in lease.limits for dimension in known_actual):
+        raise BudgetUnavailable("partial cost uses an undeclared lease dimension")
+    if (not execution_revoked and any(
+            known_actual[dimension] < ceiling[dimension]
+            for dimension in known_actual)):
+        raise BudgetUnavailable("unused known ceiling requires revoked execution authority")
+    unknown_ceiling = {dimension: ceiling[dimension]
+                       for dimension in unknown_dimensions}
+    overrun = any(known_actual[dimension] > ceiling[dimension]
+                  for dimension in known_actual)
+    updated = BudgetLease(
+        lease.lease_id, lease.parent_id, lease.bot_id, lease.persona_id,
+        lease.currency, lease.limits, _plus(lease.used, charged),
+        _minus(lease.reserved, ceiling),
+        _plus(lease.unconfirmed, unknown_ceiling), lease.version + 1, lease.state,
+    )
+    return (updated, "pending_overrun" if overrun else "pending_confirmation",
+            json.dumps(dict(sorted(known_actual.items())), separators=(",", ":")),
+            "partial_overrun" if overrun else "partial_unknown")
+
+
+def predict_budget_partial_settlement(
+    lease: BudgetLease, operation_id: str, digest: str,
+    ceiling: Mapping[str, int], known_actual: Mapping[str, int],
+    unknown_dimensions: tuple[str, ...], *, reservation: BudgetReservation,
+    execution_revoked: bool,
+) -> BudgetPrediction:
+    """Pure prediction for a fresh, partially observed original reservation."""
+    requested = _amounts(ceiling, allow_empty=False)
+    if (type(reservation) is not BudgetReservation
+            or (reservation.lease_id, reservation.operation_id,
+                reservation.digest, reservation.ceiling)
+            != (lease.lease_id, operation_id, digest, requested)):
+        raise BudgetConflict("partial budget reservation differs")
+    updated, status, _, _ = _partial_transition(
+        lease, requested, known_actual, unknown_dimensions, execution_revoked)
+    receipt = _receipt(updated, status, operation_id, digest)
+    return BudgetPrediction(
+        receipt, hashlib.sha256(_receipt_json(receipt).encode("utf-8")).hexdigest())
+
+
 def predict_budget_settlement(
     lease: BudgetLease, operation_id: str, digest: str,
     ceiling: Mapping[str, int], actual: Mapping[str, int] | None,
@@ -483,6 +537,101 @@ def settle_budget(db, lease_id: str, operation_id: str, digest: str,
     return receipt
 
 
+def settle_budget_partial(
+    db, lease_id: str, operation_id: str, digest: str,
+    known_actual: Mapping[str, int], unknown_dimensions: tuple[str, ...], *,
+    execution_revoked: bool,
+) -> BudgetReceipt:
+    """Settle measured dimensions while holding each unmeasured upper bound."""
+    _identifier(operation_id, "operation_id")
+    _digest(digest)
+    lease = get_budget_lease(db, lease_id)
+    prior = _prior(db, lease, operation_id, "settle", digest)
+    if prior is not None:
+        row = db.execute(
+            "SELECT ceiling_json,actual_json,state FROM runtime_budget_reservations "
+            "WHERE lease_id=? AND operation_id=?", (lease_id, operation_id),
+        ).fetchone()
+        if (row is None or prior.status not in {
+                "pending_confirmation", "pending_overrun"}
+                or row[2] not in {"partial_unknown", "partial_overrun",
+                                   "settled", "overrun"}
+                or set(unknown_dimensions) != set(json.loads(row[0])) - set(known_actual)
+                or any(json.loads(row[1]).get(key) != value
+                       for key, value in known_actual.items())):
+            raise BudgetConflict("replayed partial cost differs from original")
+        return prior
+    row = db.execute(
+        "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
+        "WHERE lease_id=? AND operation_id=?", (lease_id, operation_id),
+    ).fetchone()
+    if row is None or row[0] != digest or row[2] != "reserved":
+        raise BudgetConflict("no settleable original budget reservation")
+    ceiling = _amounts(json.loads(row[1]), allow_empty=False)
+    updated, status, actual_json, reservation_state = _partial_transition(
+        lease, ceiling, known_actual, unknown_dimensions, execution_revoked)
+    _save_lease(db, updated)
+    db.execute(
+        "UPDATE runtime_budget_reservations SET state=?,actual_json=? "
+        "WHERE lease_id=? AND operation_id=?",
+        (reservation_state, actual_json, lease_id, operation_id),
+    )
+    receipt = _receipt(updated, status, operation_id, digest)
+    _record(db, updated, operation_id, "settle", digest, receipt)
+    return receipt
+
+
+def resolve_partial_budget(
+    db, lease_id: str, original_operation_id: str,
+    resolution_operation_id: str, digest: str,
+    newly_known_actual: Mapping[str, int], *, execution_revoked: bool,
+) -> BudgetReceipt:
+    """Resolve only previously unknown dimensions; never charge known ones twice."""
+    _identifier(original_operation_id, "original_operation_id")
+    _identifier(resolution_operation_id, "resolution_operation_id")
+    _digest(digest)
+    lease = get_budget_lease(db, lease_id)
+    prior = _prior(db, lease, resolution_operation_id, "resolve", digest)
+    if prior is not None:
+        return prior
+    row = db.execute(
+        "SELECT ceiling_json,state,actual_json FROM runtime_budget_reservations "
+        "WHERE lease_id=? AND operation_id=?", (lease_id, original_operation_id),
+    ).fetchone()
+    if row is None or row[1] not in {"partial_unknown", "partial_overrun"}:
+        raise BudgetConflict("reservation is not partially unconfirmed")
+    ceiling = _amounts(json.loads(row[0]), allow_empty=False)
+    known = json.loads(row[2])
+    unknown = set(ceiling) - set(known)
+    if set(newly_known_actual) != unknown:
+        raise BudgetConflict("resolution may name only unknown dimensions")
+    charged = _amounts(newly_known_actual)
+    if (not execution_revoked and any(
+            newly_known_actual[dimension] < ceiling[dimension]
+            for dimension in unknown)):
+        raise BudgetUnavailable("unused unknown ceiling requires revoked execution authority")
+    status = ("overrun" if row[1] == "partial_overrun" or any(
+        newly_known_actual[dimension] > ceiling[dimension]
+        for dimension in unknown) else "settled")
+    updated = BudgetLease(
+        lease.lease_id, lease.parent_id, lease.bot_id, lease.persona_id,
+        lease.currency, lease.limits, _plus(lease.used, charged), lease.reserved,
+        _minus(lease.unconfirmed, {
+            dimension: ceiling[dimension] for dimension in unknown}),
+        lease.version + 1, lease.state,
+    )
+    _save_lease(db, updated)
+    db.execute(
+        "UPDATE runtime_budget_reservations SET state=?,actual_json=? "
+        "WHERE lease_id=? AND operation_id=?",
+        (status, json.dumps(dict(sorted({**known, **newly_known_actual}.items())),
+                            separators=(",", ":")), lease_id, original_operation_id),
+    )
+    receipt = _receipt(updated, status, resolution_operation_id, digest)
+    _record(db, updated, resolution_operation_id, "resolve", digest, receipt)
+    return receipt
+
+
 def resolve_unconfirmed(db, lease_id: str, original_operation_id: str,
                         resolution_operation_id: str, digest: str,
                         actual: Mapping[str, int] | None,
@@ -585,6 +734,7 @@ __all__ = [
     "BudgetConflict", "BudgetError", "BudgetLease", "BudgetPrediction",
     "BudgetReceipt", "BudgetReservation",
     "BudgetUnavailable", "close_budget_lease", "create_budget_lease", "get_budget_lease",
-    "install_schema", "predict_budget_settlement", "reserve_budget",
-    "resolve_unconfirmed", "settle_budget",
+    "install_schema", "predict_budget_partial_settlement",
+    "predict_budget_settlement", "reserve_budget", "resolve_partial_budget",
+    "resolve_unconfirmed", "settle_budget", "settle_budget_partial",
 ]

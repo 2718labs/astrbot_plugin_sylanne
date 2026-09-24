@@ -9,14 +9,16 @@ from sylanne3.authority_service.v2_model_egress_contract import (
     ModelTerminalReceiptV2,
 )
 from sylanne3.runtime.budget import (
-    BudgetLease, create_budget_lease, get_budget_lease, install_schema,
-    reserve_budget, resolve_unconfirmed, settle_budget,
+    BudgetConflict, BudgetLease, create_budget_lease, get_budget_lease, install_schema,
+    reserve_budget, resolve_partial_budget, resolve_unconfirmed,
+    settle_budget, settle_budget_partial,
 )
 from sylanne3.runtime.d11_types import cost_settlement_from_runtime, runtime_job_key
 from sylanne3.runtime.model_cost_settlement import (
     ModelCostUnavailable, OriginalModelCostFactV1,
     apply_original_model_budget_in_transaction,
-    original_model_budget_actual, outcome_from_original_model_cost,
+    original_model_budget_actual, original_model_budget_measurement,
+    outcome_from_original_model_cost,
     prepare_original_model_cost_plan,
 )
 from sylanne3.runtime.issuers import (
@@ -118,9 +120,43 @@ class IndependentCostTests(unittest.TestCase):
     def test_missing_price_keeps_entire_original_ceiling(self):
         fact = self.original_fact(usage={"input_tokens": 40, "output_tokens": 20})
         self.assertIsNone(original_model_budget_actual(fact, self.quote()))
+        self.assertEqual(original_model_budget_measurement(fact, self.quote()),
+                         ({"model_tokens": 60}, ("model_microusd",)))
         outcome = outcome_from_original_model_cost(fact, self.quote())
         self.assertIsNone(outcome.actual)
         self.assertTrue(outcome.execution_revoked)
+
+    def test_known_overrun_with_unknown_price_blocks_new_tokens(self):
+        receipt = settle_budget_partial(
+            self.db, "lease", "original", "b" * 64,
+            {"model_tokens": 120}, ("model_microusd",),
+            execution_revoked=True)
+        self.assertEqual(receipt.status, "pending_overrun")
+        lease = get_budget_lease(self.db, "lease")
+        self.assertEqual(lease.used, {"model_tokens": 120})
+        self.assertEqual(lease.unconfirmed, {"model_microusd": 80})
+        self.assertEqual(lease.available("model_tokens"), 0)
+        atom = cost_settlement_from_runtime(
+            self.db, bot_id="bot", persona_id="persona", activity_id="activity",
+            bundle_operation_id="accounting", effect_id=None,
+            settlement_id="cost-call", lease_id="lease",
+            cost_operation_id="original", budget_operation_id="original",
+            budget_phase="settle", prior_unknown_ref=None,
+            execution_revoked=True)
+        self.assertEqual(atom.status, "pending_overrun")
+        self.assertEqual(atom.actual, {"model_tokens": 120})
+        self.assertEqual(atom.unconfirmed, {"model_microusd": 80})
+        with self.assertRaises(BudgetConflict):
+            resolve_partial_budget(
+                self.db, "lease", "original", "resolve-wrong", "c" * 64,
+                {"model_tokens": 120, "model_microusd": 90},
+                execution_revoked=True)
+        resolved = resolve_partial_budget(
+            self.db, "lease", "original", "resolve", "d" * 64,
+            {"model_microusd": 90}, execution_revoked=True)
+        self.assertEqual(resolved.status, "overrun")
+        self.assertEqual(get_budget_lease(self.db, "lease").used,
+                         {"model_tokens": 120, "model_microusd": 90})
 
     def test_full_terminal_cost_maps_without_double_counting_cached_tokens(self):
         fact = self.original_fact(
@@ -212,7 +248,7 @@ class IndependentCostTests(unittest.TestCase):
             self.db, issuer, namespace, fact,
             quote_id=quote.quote_id, quote_version=quote.version,
         )
-        self.assertEqual(plan.schema, "sylanne.d11.original-model-cost-plan.v1")
+        self.assertEqual(plan.schema, "sylanne.d11.original-model-cost-plan.v2")
         self.assertEqual(plan.predicted_budget.receipt.status, "overrun")
         self.assertEqual(plan.outcome.actual,
                          {"model_tokens": 120, "model_microusd": 90})
@@ -237,9 +273,11 @@ class IndependentCostTests(unittest.TestCase):
         self.db.execute("BEGIN IMMEDIATE")
         unknown = apply_original_model_budget_in_transaction(
             self.db, issuer, unknown_plan, missing_price)
-        self.assertEqual(unknown.receipt.status, "pending_confirmation")
+        self.assertEqual(unknown.receipt.status, "pending_overrun")
+        self.assertEqual(unknown.cost_write.value["actual"],
+                         {"model_tokens": 120})
         self.assertEqual(get_budget_lease(self.db, "lease").unconfirmed,
-                         self.ceiling)
+                         {"model_microusd": 80})
         self.db.execute("ROLLBACK")
 
 

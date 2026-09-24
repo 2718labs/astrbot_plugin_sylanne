@@ -220,11 +220,31 @@ class RuntimeCostSettlement:
         if not isinstance(self.execution_revoked, bool):
             raise ValueError("execution_revoked must be boolean")
         if self.status == "pending_confirmation":
-            if (actual is not None or unconfirmed != ceiling
+            if (not unconfirmed or any(unconfirmed.get(name) != amount
+                                       for name, amount in ceiling.items()
+                                       if name in unconfirmed)
+                    or (actual is None and unconfirmed != ceiling)
+                    or (actual is not None and
+                        (set(actual) & set(unconfirmed)
+                         or not set(actual) <= set(ceiling)
+                         or not _within(actual, ceiling)))
                     or self.budget_phase != "settle"
                     or self.budget_operation_id != self.cost_operation_id
                     or self.prior_unknown_ref is not None):
-                raise ValueError("unknown cost must retain its full original ceiling")
+                raise ValueError("unknown cost must retain every unknown ceiling")
+        elif self.status == "pending_overrun":
+            if (actual is None or not unconfirmed
+                    or any(unconfirmed.get(name) != amount
+                           for name, amount in ceiling.items()
+                           if name in unconfirmed)
+                    or not set(actual) <= set(ceiling)
+                    or set(actual) & set(unconfirmed)
+                    or not any(amount > ceiling[name]
+                               for name, amount in actual.items())
+                    or self.budget_phase != "settle"
+                    or self.budget_operation_id != self.cost_operation_id
+                    or self.prior_unknown_ref is not None):
+                raise ValueError("pending overrun must retain measured debt and unknown ceiling")
         elif self.status in {"settled", "overrun"}:
             if actual is None or unconfirmed:
                 raise ValueError("known cost requires actual and no unknown balance")
@@ -241,7 +261,7 @@ class RuntimeCostSettlement:
                   or self.budget_operation_id == self.cost_operation_id):
                 raise ValueError("unknown resolution requires an independent resolve receipt")
         else:
-            raise ValueError("cost status must be settled, overrun or pending_confirmation")
+            raise ValueError("unsupported cost settlement status")
         object.__setattr__(self, "ceiling", ceiling)
         object.__setattr__(self, "actual", actual)
         object.__setattr__(self, "unconfirmed", unconfirmed)
@@ -536,7 +556,8 @@ def cost_settlement_from_runtime(
     prior_settle = _budget_operation(
         db, bot_id, persona_id, cost_operation_id, "settle",
     )
-    prior_was_unknown = json.loads(prior_settle[2])["status"] == "pending_confirmation"
+    prior_was_unknown = json.loads(prior_settle[2])["status"] in {
+        "pending_confirmation", "pending_overrun"}
     if reservation[1] == "unknown":
         if (budget_phase != "settle" or budget_operation_id != cost_operation_id
                 or receipt["status"] != "pending_confirmation"
@@ -545,6 +566,15 @@ def cost_settlement_from_runtime(
         status = "pending_confirmation"
         actual = None
         unconfirmed = ceiling
+    elif reservation[1] in {"partial_unknown", "partial_overrun"}:
+        status = ("pending_overrun" if reservation[1] == "partial_overrun"
+                  else "pending_confirmation")
+        if (budget_phase != "settle" or budget_operation_id != cost_operation_id
+                or receipt["status"] != status or prior_unknown_ref is not None):
+            raise ValueError("partial cost lacks its original pending receipt")
+        actual = json.loads(reservation[2])
+        unconfirmed = {name: amount for name, amount in ceiling.items()
+                       if name not in actual}
     elif reservation[1] in {"settled", "overrun"}:
         if receipt["status"] != reservation[1]:
             raise ValueError("known cost lacks its independent matching receipt")

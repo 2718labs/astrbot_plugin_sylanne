@@ -59,7 +59,10 @@ from .authority_service.v2_owner_contract import (
 )
 
 if TYPE_CHECKING:
+    from .authority_service.v2_model_egress_contract import ModelEgressDraftV1
     from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
+    from .runtime.encoding_call_binding import EncodingCallBinding
+    from .runtime.restore_anchor import RestoreAnchor
     from .workbench_api.d01_onboarding import VerifiedBudgetLease
 
 
@@ -746,7 +749,7 @@ class GraphCoordinator:
                  owner_binding: OwnerLeaseBindingV1 | None = None,
                  owner_view: bool = False,
                  owner_session_proof: tuple[str, object] | None = None,
-                 final_check=None):
+                 final_check=None, return_recovery_context: bool = False):
         """Keep every Authority RPC outside the business graph lock."""
         if owner_view and owner_principal is None:
             raise ValueError("Owner view requires an expected principal")
@@ -802,6 +805,8 @@ class GraphCoordinator:
                         final_check(result)
                 if owner_view:
                     return CurrentOwnerViewV1(observed_guard, observed_owner)
+                if return_recovery_context:
+                    return result, anchor, metadata, epoch
                 return result
             finally:
                 port.finish_fence(
@@ -6079,10 +6084,7 @@ class GraphCoordinator:
         This content read is fenced and requires current source access. Cost
         reconciliation must use an independent content-free terminal query.
         """
-        from datetime import datetime
-
         from .host.authority_profile import AdminIngressClockPolicy
-        from .runtime.encoding_call_binding import binding_from_json, load_binding
         from .runtime.first_ingress_v2 import trusted_upper
         from .runtime.issuers import D11BudgetJobIssuer
 
@@ -6106,46 +6108,163 @@ class GraphCoordinator:
             raise UnavailableGuard("encoding binding trusted clock unavailable; HOLD") from exc
 
         def reader():
-            db = self.__store._db
-            (job, _, _, outbox, _, _, source_version, access_version) = (
-                self._first_ingress_encoding_job_locked(authority.namespace, job_id))
-            if (not _job_acquire_id_matches(
-                    acquire_operation_id, authority.namespace, job_id,
-                    job.operation_id, authority.actor,
-                    authority.activation_generation)
-                    or job.phase != "running" or job.lease_holder != authority.actor
-                    or job.cancel_epoch or job.fence < 1
-                    or authority.worker_fence != job.fence):
-                raise UnavailableGuard("encoding binding job lease is not current; HOLD")
-            expiry = datetime.fromisoformat(
-                job.lease_expires_utc.replace("Z", "+00:00")).timestamp()
-            if now >= expiry:
-                raise UnavailableGuard("encoding binding job lease expired; HOLD")
-            self.__d11_issuer.authorize_existing_encoding_job(db, job, now_utc=now)
-            intent = db.execute(
-                "SELECT encoding_binding_json FROM graph_job_acquire_intents_v2 "
-                "WHERE bot=? AND persona=? AND acquire_operation_id=? "
-                "AND job_id=? AND original_operation_id=? AND actor=?",
-                authority.namespace.as_tuple + (
-                    acquire_operation_id, job_id, job.operation_id, authority.actor),
-            ).fetchone()
-            receipt = db.execute(
-                "SELECT 1 FROM graph_job_acquire_receipts_v2 WHERE bot=? "
-                "AND persona=? AND acquire_operation_id=?",
-                authority.namespace.as_tuple + (acquire_operation_id,),
-            ).fetchone()
-            binding = load_binding(db, authority.namespace, job_id)
-            if (intent is None or intent[0] is None or receipt is None
-                    or binding is None or binding != binding_from_json(intent[0])
-                    or binding.request.get("schema")
-                    != "sylanne.first-ingress-encoding-call.v2"):
-                raise UnavailableGuard("committed original encoding binding is absent; HOLD")
-            self._validate_first_ingress_encoding_binding_context(
-                authority.namespace, job, outbox, source_version, access_version,
-                authority, now, acquire_operation_id, clock, binding)
-            return binding
+            return self._first_ingress_encoding_binding_locked(
+                authority, job_id, acquire_operation_id, clock, now)[0]
 
         return self._read_v2(authority, reader)
+
+    def _first_ingress_encoding_binding_locked(
+        self, authority: AuthorityContext, job_id: str,
+        acquire_operation_id: str, clock, now: float,
+    ):
+        """Qualify the original binding and current worker under the graph lock."""
+        from datetime import datetime
+
+        from .runtime.encoding_call_binding import binding_from_json, load_binding
+
+        db = self.__store._db
+        (job, _, _, outbox, outbox_key, _, source_version, access_version) = (
+            self._first_ingress_encoding_job_locked(authority.namespace, job_id))
+        if (not _job_acquire_id_matches(
+                acquire_operation_id, authority.namespace, job_id,
+                job.operation_id, authority.actor,
+                authority.activation_generation)
+                or job.phase != "running" or job.lease_holder != authority.actor
+                or job.cancel_epoch or job.fence < 1 or job.result_ref is not None
+                or authority.worker_fence != job.fence):
+            raise UnavailableGuard("encoding binding job lease is not current; HOLD")
+        expiry = datetime.fromisoformat(
+            job.lease_expires_utc.replace("Z", "+00:00")).timestamp()
+        if now >= expiry:
+            raise UnavailableGuard("encoding binding job lease expired; HOLD")
+        self.__d11_issuer.authorize_existing_encoding_job(db, job, now_utc=now)
+        intent = db.execute(
+            "SELECT encoding_binding_json FROM graph_job_acquire_intents_v2 "
+            "WHERE bot=? AND persona=? AND acquire_operation_id=? "
+            "AND job_id=? AND original_operation_id=? AND actor=?",
+            authority.namespace.as_tuple + (
+                acquire_operation_id, job_id, job.operation_id, authority.actor),
+        ).fetchone()
+        receipt = db.execute(
+            "SELECT 1 FROM graph_job_acquire_receipts_v2 WHERE bot=? "
+            "AND persona=? AND acquire_operation_id=?",
+            authority.namespace.as_tuple + (acquire_operation_id,),
+        ).fetchone()
+        binding = load_binding(db, authority.namespace, job_id)
+        if (intent is None or intent[0] is None or receipt is None
+                or binding is None or binding != binding_from_json(intent[0])
+                or binding.request.get("schema")
+                != "sylanne.first-ingress-encoding-call.v2"):
+            raise UnavailableGuard("committed original encoding binding is absent; HOLD")
+        self._validate_first_ingress_encoding_binding_context(
+            authority.namespace, job, outbox, source_version, access_version,
+            authority, now, acquire_operation_id, clock, binding)
+        return binding, job, outbox, outbox_key
+
+    def read_first_ingress_model_egress_preparation_v2(
+        self, authority: AuthorityContext, lease: object, job_id: str,
+        acquire_operation_id: str,
+    ) -> tuple[EncodingCallBinding, ModelEgressDraftV1, RestoreAnchor]:
+        """Return one current binding, Authority draft, and pinned restore anchor.
+
+        The paired clock and all Authority fence RPCs run outside the graph
+        lock. No graph version, budget ceiling, or Authority head is supplied by
+        the host. The later Authority prepare independently verifies currentness.
+        """
+        from .authority_service.v2_model_egress_contract import ModelEgressDraftV1
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .runtime.budget import get_budget_lease
+        from .runtime.d11_types import runtime_job_key
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or type(self.__d02_issuer) is not D02ResourceIssuer
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("v2 model preparation requires installed graph authorities")
+        self._authorize(lease, authority, frozenset({"d11"}), owner_read=True)
+        if (authority.issuer_domain != "d11" or "activity" not in authority.owner_scope
+                or type(acquire_operation_id) is not str
+                or authority.capability_ref != _operation_capability_ref(
+                    authority.namespace, authority.actor, "d11", frozenset({"d11"}),
+                    authority.activation_generation, acquire_operation_id)):
+            raise AuthorityDenied("model preparation requires the job-bound D11 lease")
+        try:
+            clock = self.__content_fence_v2.read_ingress_clock(
+                self.__scene_clock_policy)
+            now = trusted_upper(clock)
+        except Exception as exc:
+            raise UnavailableGuard("model preparation trusted clock unavailable; HOLD") from exc
+
+        def reader():
+            db = self.__store._db
+            binding, job, outbox, outbox_key = (
+                self._first_ingress_encoding_binding_locked(
+                    authority, job_id, acquire_operation_id, clock, now))
+            quote_ref = job.operator_versions["resource_quote"]
+            quote_id, version_text = quote_ref.rsplit(":", 1)
+            quote = self.__d02_issuer.original_signed_quote(
+                db, quote_id, int(version_text))
+            reservation = db.execute(
+                "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
+                "WHERE lease_id=? AND operation_id=?",
+                (job.budget_ref, job.operation_id),
+            ).fetchone()
+            reserve_receipt = db.execute(
+                "SELECT digest FROM runtime_budget_operations WHERE bot_id=? "
+                "AND persona_id=? AND operation_id=? AND phase='reserve'",
+                authority.namespace.as_tuple + (job.operation_id,),
+            ).fetchone()
+            lease = get_budget_lease(db, job.budget_ref)
+            epochs = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", authority.namespace.as_tuple,
+            ).fetchone()
+            ceiling = quote.ceiling
+            if (reservation is None or reserve_receipt is None or epochs is None
+                    or reservation[2] != "reserved"
+                    or reservation[0] != reserve_receipt[0]
+                    or reservation[1] != canonical_json(ceiling)
+                    or (lease.bot_id, lease.persona_id)
+                    != authority.namespace.as_tuple or lease.state != "active"
+                    or any(lease.reserved.get(key, 0) < amount
+                           for key, amount in ceiling.items())
+                    or (quote.bot_id, quote.persona_id, quote.activity_id,
+                        quote.operation_id, quote.effect_id, quote.graph_job_ref,
+                        quote.outbox_refs, quote.parent_budget_lease_ref,
+                        quote.work_kind, quote.snapshot_ref, quote.resource_ref)
+                    != (*authority.namespace.as_tuple, job.activity_id,
+                        job.operation_id, None,
+                        runtime_job_key(*authority.namespace.as_tuple,
+                                        job.activity_id, job.job_id).token,
+                        (outbox_key.token,), job.budget_ref, job.work_kind,
+                        job.snapshot_ref, job.resource_ref)
+                    or binding.budget_lease_id != job.budget_ref
+                    or binding.budget_reservation_operation_id != job.operation_id):
+                raise UnavailableGuard("original model budget or quote changed; HOLD")
+            return binding, job, reservation[0], tuple(sorted(ceiling.items())), epochs
+
+        (prepared, anchor, metadata, epoch) = self._read_v2(
+            authority, reader, return_recovery_context=True)
+        binding, job, reservation_digest, ceiling, epochs = prepared
+        target = metadata.requirements
+        frozen = binding.request
+        draft = ModelEgressDraftV1(
+            target.authority_id, target.authority_namespace, authority.actor,
+            acquire_operation_id, binding.call_id, binding.model_request_digest,
+            job_id, job.fence, (binding.source_id,),
+            ((binding.source_id, binding.source_revision),),
+            ((binding.source_id, binding.access_revision),),
+            epochs[0], epochs[1], epoch.revision, metadata.graph_revision,
+            target.activation_generation, target.revocation_epoch,
+            target.deletion_seq, target.execution_seq,
+            job.budget_ref, job.operation_id, reservation_digest, ceiling,
+            frozen["provider_id"], frozen["model_id"],
+            frozen["provider_config_digest"], frozen["max_output_tokens"],
+        )
+        return binding, draft, anchor
 
     def prepare_first_ingress_model_cost_v1(
         self, bootstrap: object, namespace: NamespaceId, original_intent,

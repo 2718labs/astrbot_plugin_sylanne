@@ -19,7 +19,8 @@ from ..authority_service.v2_contract import FencePermitV2
 from ..runtime_contracts import NamespaceId, canonical_digest
 from .budget import (
     BudgetPrediction, BudgetReceipt, BudgetReservation, get_budget_lease,
-    predict_budget_settlement, settle_budget,
+    predict_budget_partial_settlement, predict_budget_settlement,
+    settle_budget, settle_budget_partial,
 )
 from .d11_types import (
     cost_settlement_from_runtime, cost_settlement_graph_write,
@@ -90,11 +91,19 @@ def read_original_model_cost(
 def original_model_budget_actual(
     fact: OriginalModelCostFactV1, quote: ResourceQuote,
 ) -> dict[str, int] | None:
-    """Map only declared D11 units. Missing prices keep the whole upper bound.
+    """Return a complete cost only when every declared dimension is measured.
 
     Provider token and currency counters are never D02 body energy. Cached
     input tokens are already included in input_tokens and are not added twice.
     """
+    known, unknown = original_model_budget_measurement(fact, quote)
+    return None if unknown else known
+
+
+def original_model_budget_measurement(
+    fact: OriginalModelCostFactV1, quote: ResourceQuote,
+) -> tuple[dict[str, int], tuple[str, ...]]:
+    """Keep known dimensions even when another declared dimension is unknown."""
     if type(fact) is not OriginalModelCostFactV1 or type(quote) is not ResourceQuote:
         raise TypeError("typed original cost and signed resource quote required")
     intent = fact.intent
@@ -107,28 +116,29 @@ def original_model_budget_actual(
     if dict(intent.budget_ceiling) != dict(quote.ceiling):
         raise ModelCostUnavailable("Authority ceiling differs from original quote")
     if fact.recovery.state != "observed":
-        return None
+        return {}, tuple(sorted(quote.ceiling))
     usage, money = dict(fact.recovery.usage), dict(fact.recovery.cost)
     actual: dict[str, int] = {}
+    unknown = []
     for dimension in quote.ceiling:
         if dimension in {"input_tokens", "output_tokens"}:
-            if dimension not in usage:
-                return None
-            actual[dimension] = usage[dimension]
+            if dimension in usage:
+                actual[dimension] = usage[dimension]
+            else:
+                unknown.append(dimension)
         elif dimension == "model_tokens":
-            if not {"input_tokens", "output_tokens"} <= usage.keys():
-                return None
-            actual[dimension] = usage["input_tokens"] + usage["output_tokens"]
+            if {"input_tokens", "output_tokens"} <= usage.keys():
+                actual[dimension] = usage["input_tokens"] + usage["output_tokens"]
+            else:
+                unknown.append(dimension)
         elif dimension == "model_microusd":
-            if dimension not in money:
-                return None
-            actual[dimension] = money[dimension]
+            if dimension in money:
+                actual[dimension] = money[dimension]
+            else:
+                unknown.append(dimension)
         else:
-            return None
-    if any(name not in {"input_tokens", "output_tokens", "cached_input_tokens"}
-           for name in usage) or any(name not in quote.ceiling for name in money):
-        return None
-    return actual
+            unknown.append(dimension)
+    return actual, tuple(sorted(unknown))
 
 
 def outcome_from_original_model_cost(
@@ -163,7 +173,9 @@ class OriginalModelCostPlanV1:
     original_reservation_digest: str
     terminal_receipt_digest: str
     predicted_budget: BudgetPrediction
-    schema: str = "sylanne.d11.original-model-cost-plan.v1"
+    known_actual: dict[str, int]
+    unknown_dimensions: tuple[str, ...]
+    schema: str = "sylanne.d11.original-model-cost-plan.v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,14 +239,20 @@ def prepare_original_model_cost_plan(
     if json.loads(reservation[1]) != dict(quote.ceiling):
         raise ModelCostUnavailable("original D11 reservation ceiling differs")
     outcome = outcome_from_original_model_cost(fact, quote)
-    predicted = predict_budget_settlement(
-        lease, quote.operation_id, intent.budget_reservation_digest,
-        quote.ceiling, outcome.actual,
-        reservation=BudgetReservation(
-            lease.lease_id, quote.operation_id,
-            intent.budget_reservation_digest, quote.ceiling),
-        execution_revoked=outcome.execution_revoked,
-    )
+    known, unknown = original_model_budget_measurement(fact, quote)
+    budget_reservation = BudgetReservation(
+        lease.lease_id, quote.operation_id,
+        intent.budget_reservation_digest, quote.ceiling)
+    if known and unknown:
+        predicted = predict_budget_partial_settlement(
+            lease, quote.operation_id, intent.budget_reservation_digest,
+            quote.ceiling, known, unknown, reservation=budget_reservation,
+            execution_revoked=outcome.execution_revoked)
+    else:
+        predicted = predict_budget_settlement(
+            lease, quote.operation_id, intent.budget_reservation_digest,
+            quote.ceiling, outcome.actual, reservation=budget_reservation,
+            execution_revoked=outcome.execution_revoked)
     return OriginalModelCostPlanV1(
         namespace,
         "model-cost-" + canonical_digest({
@@ -242,7 +260,7 @@ def prepare_original_model_cost_plan(
         })[:48],
         quote.operation_id, intent.call_id, quote, outcome,
         intent.budget_reservation_digest,
-        canonical_digest(asdict(fact.receipt)), predicted,
+        canonical_digest(asdict(fact.receipt)), predicted, known, unknown,
     )
 
 
@@ -264,11 +282,17 @@ def apply_original_model_budget_in_transaction(
     )
     if current != plan:
         raise ModelCostUnavailable("original cost plan became stale")
-    receipt = settle_budget(
-        db, plan.quote.parent_budget_lease_ref, plan.original_operation_id,
-        plan.original_reservation_digest, plan.outcome.actual,
-        execution_revoked=plan.outcome.execution_revoked,
-    )
+    if plan.known_actual and plan.unknown_dimensions:
+        receipt = settle_budget_partial(
+            db, plan.quote.parent_budget_lease_ref, plan.original_operation_id,
+            plan.original_reservation_digest, plan.known_actual,
+            plan.unknown_dimensions,
+            execution_revoked=plan.outcome.execution_revoked)
+    else:
+        receipt = settle_budget(
+            db, plan.quote.parent_budget_lease_ref, plan.original_operation_id,
+            plan.original_reservation_digest, plan.outcome.actual,
+            execution_revoked=plan.outcome.execution_revoked)
     if receipt != plan.predicted_budget.receipt:
         raise ModelCostUnavailable("settlement differs from original cost prediction")
     value = cost_settlement_from_runtime(
@@ -293,5 +317,6 @@ __all__ = (
     "OriginalModelCostPlanV1", "prepare_original_model_cost_plan",
     "OriginalModelCostApplicationV1", "apply_original_model_budget_in_transaction",
     "original_model_budget_actual", "outcome_from_original_model_cost",
+    "original_model_budget_measurement",
     "read_original_model_cost",
 )
