@@ -13,7 +13,7 @@ import json
 import math
 import secrets
 import time
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Mapping, Protocol
 from types import SimpleNamespace
 
 from .contracts import Event, EventConflict, Scope, StaleRead, canonical_json
@@ -61,9 +61,20 @@ from .authority_service.v2_owner_contract import (
 if TYPE_CHECKING:
     from .authority_service.v2_model_egress_contract import ModelEgressDraftV1
     from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
+    from .authority_service.v2_worker_result_read_fact_contract import (
+        WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+    )
     from .runtime.encoding_call_binding import EncodingCallBinding
     from .runtime.restore_anchor import RestoreAnchor
     from .workbench_api.d01_onboarding import VerifiedBudgetLease
+
+
+class WorkerResultReadFactPort(Protocol):
+    """Installed Authority committer for a finished original worker read."""
+
+    def current_worker_result_read_fact(
+        self, request: WorkerResultReadFactRequestV1,
+    ) -> WorkerResultReadFactV1: ...
 
 
 @dataclass(frozen=True)
@@ -653,7 +664,8 @@ class GraphCoordinator:
                  dispatch_admission_issuer=None, dispatch_clock_policy=None,
                  scene_identity_port=None, scene_clock_policy=None,
                  encoding_request_issuer=None, model_terminal_cost_port=None,
-                 accounting_maintenance_port=None, self_identity_port=None):
+                 accounting_maintenance_port=None, self_identity_port=None,
+                 worker_result_fact_port: WorkerResultReadFactPort | None = None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -698,6 +710,11 @@ class GraphCoordinator:
                 and not callable(getattr(self_identity_port, "current_self_identity", None))):
             raise TypeError("self identity port requires current_self_identity")
         self.__self_identity_port = self_identity_port
+        if (worker_result_fact_port is not None and not callable(
+                getattr(worker_result_fact_port,
+                        "current_worker_result_read_fact", None))):
+            raise TypeError("worker result fact port requires current_worker_result_read_fact")
+        self.__worker_result_fact_port = worker_result_fact_port
         if accounting_maintenance_port is not None:
             # Persist the fence attempt before asking Authority to begin it.
             # A process restart must never invent a second active attempt.
