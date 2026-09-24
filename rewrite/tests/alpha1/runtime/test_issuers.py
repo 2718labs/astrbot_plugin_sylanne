@@ -40,8 +40,11 @@ from sylanne3.runtime.issuers import (
 from sylanne3.runtime.d03_self_identity_projection_identity import (
     d03_self_identity_projection_activity_id_v1,
     d03_self_identity_projection_operation_id_v1,
+    d03_self_identity_projection_retry_operation_id_v2,
 )
 from sylanne3.memory_types import access_key
+from sylanne3.authority_service.v2_contract import FencePermitV2, to_wire
+from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime.jobs import create_job
 from sylanne3.runtime_contracts import (
     RUNTIME_SCHEMA,
@@ -532,7 +535,7 @@ class ProductionIssuerTests(unittest.TestCase):
                 resource_lease_versions=()),
             source_qualification=replace(
                 self.envelope.source_qualification, source_refs=(source.token,)),
-            input_refs=(source.token,),
+            input_refs=(source.token,), causation=("op-1",),
         )
         policy = AdminD03SelfIdentityProjectionPolicy(
             60.0, {"cpu_ms": 7}, "projection-snapshot", "projection-resource")
@@ -556,7 +559,7 @@ class ProductionIssuerTests(unittest.TestCase):
             resource_lease_versions=(VersionedRef(quote.quote_id, 1),)))
         self.assertEqual(self.d11._admission_state(
             guarded, self.db, now_utc=now)[0], quote)
-        with self.assertRaisesRegex(IssuerAuthorityDenied, "mapping or operation"):
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "lineage is absent"):
             self.d11.issue_d03_self_identity_projection_quote(
                 self.db, replace(envelope, identity=replace(
                     identity, operation_id="client-chosen")), policy,
@@ -566,6 +569,108 @@ class ProductionIssuerTests(unittest.TestCase):
                         (event.token,))
         with self.assertRaisesRegex(IssuerAuthorityDenied, "stale"):
             self.d11._admission_state(guarded, self.db, now_utc=now)
+        self.db.execute("UPDATE graph_atoms SET revision=1 WHERE token=?",
+                        (event.token,))
+        retry_id = d03_self_identity_projection_retry_operation_id_v2(
+            self.namespace, source.token, mapping.certification_ref, operation, 1)
+        retry = replace(envelope, identity=replace(identity, operation_id=retry_id))
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "lineage is absent"):
+            self.d11.issue_d03_self_identity_projection_quote(
+                self.db, retry, policy, installation_id="installation-1",
+                qualified_mapping=mapping, now_utc=now)
+        self.db.execute("CREATE TABLE graph_stage_retry_lineage_v1("
+                        "bot TEXT, persona TEXT, stage TEXT, source_ref TEXT,"
+                        "original_operation_id TEXT, operation_id TEXT,"
+                        "previous_operation_id TEXT, retry_index INTEGER,"
+                        "previous_bundle_digest TEXT, previous_attempt_id TEXT,"
+                        "previous_rejection_digest TEXT)")
+        self.db.execute("CREATE TABLE graph_bundle_intents_v2("
+                        "bot TEXT, persona TEXT, operation_id TEXT, digest TEXT,"
+                        "fence_attempt_id TEXT, graph_revision INTEGER, graph_epoch INTEGER)")
+        self.db.execute("CREATE TABLE graph_bundle_rejections_v2("
+                        "bot TEXT, persona TEXT, operation_id TEXT, digest TEXT,"
+                        "status TEXT, permit_json TEXT, graph_revision INTEGER,"
+                        "graph_epoch INTEGER, finish_request_id TEXT,"
+                        "finish_request_digest TEXT)")
+        self.db.execute("CREATE TABLE graph_bundle_operations("
+                        "bot TEXT, persona TEXT, operation_id TEXT)")
+        self.db.execute("CREATE TABLE graph_bundle_fences_v2("
+                        "bot TEXT, persona TEXT, operation_id TEXT)")
+        self.db.execute("CREATE TABLE graph_d03_self_projection_intents_v1("
+                        "bot TEXT, persona TEXT, source_ref TEXT,"
+                        "original_operation_id TEXT, operation_id TEXT,"
+                        "bundle_digest TEXT)")
+        digest = "f" * 64
+        attempt = "graph-write-old"
+        anchor = RestoreAnchor(
+            authority_id="authority", namespace="opaque",
+            activation_generation=1, deletion_journal_id="delete",
+            deletion_seq=0, deletion_digest="genesis",
+            execution_journal_id="execute", execution_seq=0,
+            execution_digest="genesis", revocation_epoch=1, proof="proof")
+        permit = FencePermitV2(
+            "authority", "opaque", "subject", "host", 1, "write",
+            attempt, "A" * 43, 1, 1, anchor)
+        rejection = (
+            digest, "rejected_no_commit",
+            json.dumps(to_wire(permit), sort_keys=True, separators=(",", ":")),
+            1, 1, "abort:" + attempt,
+            "sha256:" + canonical_digest({
+                "operation_id": attempt, "permit_token": permit.token,
+                "action": "rejected_no_commit", "business_operation_id": operation,
+                "bundle_digest": digest,
+            }),
+        )
+        self.db.execute("INSERT INTO graph_bundle_intents_v2 VALUES(?,?,?,?,?,?,?)",
+                        ("bot", "persona", operation, digest, attempt, 1, 1))
+        self.db.execute("INSERT INTO graph_bundle_rejections_v2 VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        ("bot", "persona", operation, *rejection))
+        self.db.execute("INSERT INTO graph_stage_retry_lineage_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        ("bot", "persona", "d03",
+                         source.token, "op-1", retry_id, operation, 1,
+                         digest, attempt, canonical_digest(list(rejection))))
+        self.db.execute("INSERT INTO graph_bundle_intents_v2 VALUES(?,?,?,?,?,?,?)",
+                        ("bot", "persona", retry_id, "e" * 64,
+                         "graph-write-current", 1, 1))
+        self.db.execute("INSERT INTO graph_d03_self_projection_intents_v1 "
+                        "VALUES(?,?,?,?,?,?)",
+                        ("bot", "persona", source.token, "op-1", retry_id,
+                         "e" * 64))
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "quote survived rollback"):
+            self.d11.issue_d03_self_identity_projection_quote(
+                self.db, retry, policy, installation_id="installation-1",
+                qualified_mapping=mapping, now_utc=now)
+        self.db.execute("DELETE FROM runtime_resource_quotes WHERE quote_id=?",
+                        (quote.quote_id,))  # Emulate the failed business transaction rollback.
+        retry_quote = self.d11.issue_d03_self_identity_projection_quote(
+            self.db, retry, policy, installation_id="installation-1",
+            qualified_mapping=mapping, now_utc=now)
+        self.assertNotEqual(retry_quote.quote_id, quote.quote_id)
+        self.assertEqual(retry_quote.operation_id, retry_id)
+        guarded_retry = replace(retry, version_guard=replace(
+            retry.version_guard,
+            resource_lease_versions=(VersionedRef(retry_quote.quote_id, 1),)))
+        self.assertEqual(self.d11._admission_state(
+            guarded_retry, self.db, now_utc=now)[0], retry_quote)
+        self.db.execute("UPDATE graph_d03_self_projection_intents_v1 "
+                        "SET bundle_digest=?", ("0" * 64,))
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "current intent"):
+            self.d11._admission_state(guarded_retry, self.db, now_utc=now)
+        self.db.execute("UPDATE graph_d03_self_projection_intents_v1 "
+                        "SET bundle_digest=?", ("e" * 64,))
+        self.db.execute("UPDATE graph_stage_retry_lineage_v1 "
+                        "SET previous_rejection_digest=?", ("0" * 64,))
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "durably rejected"):
+            self.d11._admission_state(guarded_retry, self.db, now_utc=now)
+        self.db.execute("UPDATE graph_stage_retry_lineage_v1 "
+                        "SET previous_rejection_digest=?",
+                        (canonical_digest(list(rejection)),))
+        self.db.execute("INSERT INTO runtime_budget_reservations "
+                        "(lease_id,operation_id,digest,ceiling_json,state) "
+                        "VALUES(?,?,?,?,?)",
+                        ("parent", operation, "a" * 64, '{"cpu_ms":7}', "reserved"))
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "budget is unresolved"):
+            self.d11._admission_state(guarded_retry, self.db, now_utc=now)
 
 
 if __name__ == "__main__":

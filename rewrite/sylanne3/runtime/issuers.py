@@ -15,6 +15,7 @@ import hmac
 import json
 import math
 import re
+import sqlite3
 import time
 from typing import Mapping
 
@@ -458,6 +459,134 @@ def _d03_projection_inputs(envelope: CommandEnvelope):
     if len(arrival) != 1 or guarded[arrival[0]] < 1:
         raise IssuerAuthorityDenied("D03 projection needs one committed arrival")
     return source, mapping, arrival[0], guarded
+
+
+def _d03_projection_retry_operation(
+        db, namespace, source_ref: str, certification_ref: str,
+        original_ingress_operation_id: str,
+        operation_id: str, lease_id: str) -> bool:
+    """Accept only a contiguous, locally rejected, unreserved retry chain.
+
+    W01 separately verifies that each old Authority fence has finished before
+    appending a lineage row. A graph row alone is not that Authority proof.
+    """
+    from ..authority_service.v2_contract import FencePermitV2, from_wire
+    from .d03_self_identity_projection_identity import (
+        d03_self_identity_projection_operation_id_v1,
+        d03_self_identity_projection_retry_operation_id_v2,
+    )
+
+    base = d03_self_identity_projection_operation_id_v1(
+        namespace, source_ref, certification_ref)
+    if operation_id == base:
+        return True
+    try:
+        rows = db.execute(
+            "SELECT operation_id,previous_operation_id,retry_index,"
+            "previous_bundle_digest,previous_attempt_id,previous_rejection_digest "
+            "FROM graph_stage_retry_lineage_v1 WHERE bot=? AND persona=? "
+            "AND stage=? AND source_ref=? AND original_operation_id=? "
+            "ORDER BY retry_index",
+            namespace.as_tuple + ("d03",
+                                  source_ref, original_ingress_operation_id),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise IssuerAuthorityDenied("D03 projection retry lineage is absent") from exc
+    if not rows or len(rows) > 64:
+        raise IssuerAuthorityDenied("D03 projection retry lineage is incomplete")
+    previous = base
+    for index, row in enumerate(rows, 1):
+        next_id, prior_id, ordinal, prior_digest, attempt_id, rejection_digest = row
+        expected = d03_self_identity_projection_retry_operation_id_v2(
+            namespace, source_ref, certification_ref, previous, index)
+        if (ordinal != index or prior_id != previous or next_id != expected
+                or type(prior_digest) is not str
+                or type(attempt_id) is not str
+                or type(rejection_digest) is not str):
+            raise IssuerAuthorityDenied("D03 projection retry chain differs")
+        intent = db.execute(
+            "SELECT digest,fence_attempt_id,graph_revision,graph_epoch "
+            "FROM graph_bundle_intents_v2 WHERE bot=? AND persona=? "
+            "AND operation_id=?", namespace.as_tuple + (previous,),
+        ).fetchone()
+        rejection = db.execute(
+            "SELECT digest,status,permit_json,graph_revision,graph_epoch,"
+            "finish_request_id,finish_request_digest "
+            "FROM graph_bundle_rejections_v2 WHERE bot=? AND persona=? "
+            "AND operation_id=?", namespace.as_tuple + (previous,),
+        ).fetchone()
+        if (intent is None or rejection is None
+                or intent[:2] != (prior_digest, attempt_id)
+                or rejection[:2] != (prior_digest, "rejected_no_commit")
+                or rejection[3:5] != intent[2:4]
+                or rejection_digest != canonical_digest(list(rejection))
+                or rejection[5] != "abort:" + attempt_id):
+            raise IssuerAuthorityDenied("D03 projection prior retry is not durably rejected")
+        try:
+            permit = from_wire(json.loads(rejection[2]))
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("D03 projection retry permit is invalid") from exc
+        if (type(permit) is not FencePermitV2
+                or permit.operation != "write" or permit.operation_id != attempt_id
+                or rejection[6] != "sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "rejected_no_commit",
+                    "business_operation_id": previous,
+                    "bundle_digest": prior_digest,
+                })):
+            raise IssuerAuthorityDenied("D03 projection retry finish identity differs")
+        for table in ("graph_bundle_operations", "graph_bundle_fences_v2"):
+            if db.execute(
+                    f"SELECT 1 FROM {table} WHERE bot=? AND persona=? "
+                    "AND operation_id=?", namespace.as_tuple + (previous,),
+            ).fetchone() is not None:
+                raise IssuerAuthorityDenied("D03 projection prior attempt committed")
+        if (db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_d03_self_projection_issuance_v1'",
+        ).fetchone() is not None and db.execute(
+                "SELECT 1 FROM graph_d03_self_projection_issuance_v1 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (previous,),
+        ).fetchone() is not None):
+            raise IssuerAuthorityDenied("D03 projection prior issuance survived rollback")
+        if db.execute(
+                "SELECT 1 FROM runtime_resource_quotes WHERE quote_id=?",
+                (d03_self_identity_projection_quote_id(namespace, previous),),
+        ).fetchone() is not None:
+            raise IssuerAuthorityDenied("D03 projection prior quote survived rollback")
+        if (db.execute(
+                "SELECT 1 FROM runtime_budget_reservations WHERE lease_id=? "
+                "AND operation_id=?", (lease_id, previous),
+            ).fetchone() is not None
+                or db.execute(
+                    "SELECT 1 FROM runtime_budget_operations WHERE bot_id=? "
+                    "AND persona_id=? AND operation_id=? AND phase='reserve'",
+                    namespace.as_tuple + (previous,),
+                ).fetchone() is not None):
+            raise IssuerAuthorityDenied("D03 projection prior budget is unresolved")
+        previous = next_id
+    if operation_id != previous:
+        raise IssuerAuthorityDenied("D03 projection retry is not the lineage head")
+    current = db.execute(
+        "SELECT digest FROM graph_bundle_intents_v2 WHERE bot=? AND persona=? "
+        "AND operation_id=?", namespace.as_tuple + (operation_id,),
+    ).fetchone()
+    stage_head = db.execute(
+        "SELECT operation_id,bundle_digest FROM graph_d03_self_projection_intents_v1 "
+        "WHERE bot=? AND persona=? AND source_ref=? AND original_operation_id=?",
+        namespace.as_tuple + (source_ref, original_ingress_operation_id),
+    ).fetchone()
+    if current is None or stage_head != (operation_id, current[0]):
+        raise IssuerAuthorityDenied("D03 projection retry head lacks current intent")
+    for table in ("graph_bundle_operations", "graph_bundle_fences_v2",
+                  "graph_bundle_rejections_v2"):
+        if db.execute(
+                f"SELECT 1 FROM {table} WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+        ).fetchone() is not None:
+            raise IssuerAuthorityDenied("D03 projection retry operation is terminal")
+    return True
 
 
 def _d04_policy_id(installation_id: str, grant: BudgetLeaseGrant) -> str:
@@ -1635,10 +1764,17 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         namespace = envelope.authority.namespace
         expected_operation = d03_self_identity_projection_operation_id_v1(
             namespace, source.token, qualified_mapping.certification_ref)
-        if (envelope.identity.operation_id != expected_operation
-                or qualified_mapping.persona_ref != f"persona:{namespace.persona_id}"
+        if (qualified_mapping.persona_ref != f"persona:{namespace.persona_id}"
                 or qualified_mapping.status != "active"):
             raise IssuerAuthorityDenied("D03 projection mapping or operation differs")
+        if envelope.identity.operation_id != expected_operation:
+            if len(envelope.causation) != 1:
+                raise IssuerAuthorityDenied("D03 projection retry lacks original ingress")
+            _d03_projection_retry_operation(
+                db, namespace, source.token, qualified_mapping.certification_ref,
+                envelope.causation[0], envelope.identity.operation_id,
+                envelope.parent_budget_lease_ref)
+            expected_operation = envelope.identity.operation_id
         now = _now_utc(now_utc)
         grant = self._load_grant(db, envelope.parent_budget_lease_ref)
         lease = get_budget_lease(db, grant.lease_id)
@@ -1874,6 +2010,12 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
             source, mapping, arrival, guarded = _d03_projection_inputs(envelope)
             policy = self._d02._qualified_d03_projection_policy(
                 db, envelope, quote, grant)
+            if len(envelope.causation) != 1:
+                raise IssuerAuthorityDenied("D03 projection lacks original ingress")
+            _d03_projection_retry_operation(
+                db, envelope.authority.namespace, source.token,
+                policy.certification_ref, envelope.causation[0],
+                envelope.identity.operation_id, quote.parent_budget_lease_ref)
             if ((policy.source_ref, policy.mapping_ref, policy.arrival_ref,
                  policy.mapping_revision, policy.activity_id, policy.operation_id)
                 != (source.token, mapping.token, arrival.token, guarded[mapping],
