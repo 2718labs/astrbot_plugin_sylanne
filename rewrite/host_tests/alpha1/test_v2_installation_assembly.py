@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from sylanne3.host.authority_client import AuthorityClientStatus
 from sylanne3.host.installed_package import InstalledPackageVerification
-from sylanne3.host.authority_profile import AdminIngressModelPolicy
+from sylanne3.host.authority_profile import (
+    AdminIngressModelPolicy, installed_model_config_ref,
+)
 from sylanne3.host.v2_installation import assemble_v2_installation
 from sylanne3.runtime_contracts import InstallationGrantV2
 
@@ -27,7 +29,9 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
             d11_signing_key=b"k" * 32, d02_signing_key=b"d" * 32,
             ingress_clock=None, ingress_encoding=None,
             ingress_model=AdminIngressModelPolicy(
-                "provider-1", "model-1", "admin:config-1", "c" * 64,
+                "provider-1", "model-1",
+                installed_model_config_ref("provider-1", "model-1", "c" * 64),
+                "c" * 64,
                 20.0, 128, ("structured",), "private",
             ),
             workbench_origin="https://workbench.example.org:8443",

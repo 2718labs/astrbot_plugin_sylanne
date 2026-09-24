@@ -144,8 +144,8 @@ class RuntimeContext:
         self._owner_principal_resolver = owner_principal_resolver
         self._scene_identity_port = scene_identity_port
         if model_selection_port is not None and not callable(
-                getattr(model_selection_port, "verify_admin_selection", None)):
-            raise TypeError("model_selection_port must verify administrator selections")
+                getattr(model_selection_port, "verify_admin_config", None)):
+            raise TypeError("model_selection_port must verify installed model config")
         self._model_selection_port = model_selection_port
         self._store: ProductionGraphStore | None = None
         self._coordinator: GraphCoordinator | None = None
@@ -164,6 +164,7 @@ class RuntimeContext:
         self._v2_namespace: NamespaceId | None = None
         self._v2_missing_ingress_policies: tuple[str, ...] = ()
         self._v2_installed_model_selected = False
+        self._v2_installed_model_config_matched = False
         self._v2_namespace_provisioned = False
         self._ingress_handler: Callable[
             [HostIngressEnvelope, GraphCoordinator], Awaitable[IngressReceipt]
@@ -234,10 +235,10 @@ class RuntimeContext:
             provision = None
             ingress = None
             owner_runtime = None
-            model_selected = False
+            model_config_matched = False
 
             def make_coordinator(store, port):
-                nonlocal provision, ingress, owner_runtime, model_selected
+                nonlocal provision, ingress, owner_runtime, model_config_matched
                 if port.installation_grant != installation_grant:
                     raise RuntimeError("v2 port installation grant changed")
                 bootstrap = object()
@@ -278,11 +279,11 @@ class RuntimeContext:
                 if (type(installation.ingress_model) is AdminIngressModelPolicy
                         and self._model_selection_port is not None):
                     try:
-                        model_selected = (
-                            self._model_selection_port.verify_admin_selection(
+                        model_config_matched = (
+                            self._model_selection_port.verify_admin_config(
                                 policy.namespace, installation.ingress_model) is True)
                     except Exception:
-                        model_selected = False
+                        model_config_matched = False
                 coordinator = GraphCoordinator(
                     store, bootstrap, holder=installation_grant.administrator_holder,
                     content_fence_v2=port,
@@ -330,7 +331,7 @@ class RuntimeContext:
                 return self.health
             self._v2_provision = provision
             self._v2_ingress = ingress
-            self._v2_installed_model_selected = model_selected
+            self._v2_installed_model_config_matched = model_config_matched
             self._v2_namespace = policy.namespace
             if owner_runtime is not None:
                 (self._v2_coordinator, self._v2_bootstrap, port,
@@ -452,8 +453,13 @@ class RuntimeContext:
 
     @property
     def v2_installed_model_selected(self) -> bool:
-        """Startup host check only; model request issuance is not yet enabled."""
+        """HOLD until capability, privacy and limit policy has trusted proof."""
         return self._v2_installed_model_selected
+
+    @property
+    def v2_installed_model_config_matched(self) -> bool:
+        """Startup match of exact installed adapter, model and config identity."""
+        return self._v2_installed_model_config_matched
 
     @property
     def v2_ingress_qualified(self) -> bool:

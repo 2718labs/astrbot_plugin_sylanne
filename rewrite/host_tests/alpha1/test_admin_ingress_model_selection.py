@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from sylanne3.host.authority_profile import (
-    AdminIngressModelPolicy, _ingress_model_from_payload,
+    AdminIngressModelPolicy, installed_model_config_ref, _ingress_model_from_payload,
     _policy_from_payload, _read_profile_json,
 )
 from sylanne3.runtime_contracts import NamespaceId, canonical_digest
@@ -17,10 +17,12 @@ from test_authority_profile import _schema2_payload
 
 
 def _selection(config=None):
+    digest = canonical_digest(config if config is not None else {"model": "model-1"})
     return {
         "provider_id": "provider-1", "model_id": "model-1",
-        "provider_config_ref": "admin:provider-config-1",
-        "provider_config_digest": canonical_digest(config or {"model": "model-1"}),
+        "provider_config_ref": installed_model_config_ref(
+            "provider-1", "model-1", digest),
+        "provider_config_digest": digest,
         "timeout_seconds": 20.0, "max_output_tokens": 128,
         "required_capabilities": ["structured"], "privacy_tier": "private",
     }
@@ -41,6 +43,7 @@ def test_admin_profile_keeps_model_selector_outside_installation_policy(tmp_path
 @pytest.mark.parametrize("change", [
     {"provider_id": ""}, {"model_id": " "},
     {"provider_config_digest": "bad"}, {"timeout_seconds": 0},
+    {"provider_config_ref": "admin:unverified-ref"},
     {"timeout_seconds": 10 ** 1000}, {"max_output_tokens": 0},
     {"max_output_tokens": True}, {"required_capabilities": []},
     {"required_capabilities": ["structured", "structured"]},
@@ -101,17 +104,19 @@ async def test_admin_selection_checks_exact_current_provider_and_config():
                 InstalledProvider),
           patch("sylanne3.host.installed_model_capability.AsyncOpenAI",
                 SimpleNamespace)):
-        assert await asyncio.to_thread(port.verify_admin_selection,
+        assert await asyncio.to_thread(port.verify_admin_config,
                                        namespace, selection)
-        provider.provider_config["temperature"] = 0.5
         assert not await asyncio.to_thread(port.verify_admin_selection,
+                                           namespace, selection)
+        provider.provider_config["temperature"] = 0.5
+        assert not await asyncio.to_thread(port.verify_admin_config,
                                            namespace, selection)
         provider.provider_config.pop("temperature")
         provider.model = "model-2"
-        assert not await asyncio.to_thread(port.verify_admin_selection,
+        assert not await asyncio.to_thread(port.verify_admin_config,
                                            namespace, selection)
         provider.model = "model-1"
         manager.inst_map.clear()
-        assert not await asyncio.to_thread(port.verify_admin_selection,
+        assert not await asyncio.to_thread(port.verify_admin_config,
                                            namespace, selection)
-    assert not port.verify_admin_selection(namespace, selection)
+    assert not port.verify_admin_config(namespace, selection)

@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.budget import BudgetLease
-from ..runtime_contracts import NamespaceId
+from ..runtime_contracts import NamespaceId, canonical_digest
 from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 
 
@@ -76,6 +76,16 @@ _WIN_BACKUP_SEMANTICS = 0x02000000
 _WIN_OPEN_REPARSE_POINT = 0x00200000
 _WIN_REPARSE_POINT = 0x00000400
 _WIN_DIRECTORY = 0x00000010
+
+
+def installed_model_config_ref(provider_id: str, model_id: str,
+                               config_digest: str) -> str:
+    """Content address for an exact installed AstrBot model configuration."""
+    return "astrbot-config:" + canonical_digest({
+        "schema": "sylanne.astrbot.model-config.v1",
+        "provider_id": provider_id, "model_id": model_id,
+        "config_digest": config_digest,
+    })
 
 
 class _Filetime(ctypes.Structure):
@@ -165,7 +175,7 @@ class AdminIngressModelPolicy:
     privacy_tier: str
 
     def __post_init__(self) -> None:
-        for name in ("provider_id", "model_id", "provider_config_ref", "privacy_tier"):
+        for name in ("provider_id", "model_id", "privacy_tier"):
             value = getattr(self, name)
             if type(value) is not str or not value.strip() or len(value) > 256:
                 raise ValueError(f"ingress model {name} must be a bounded string")
@@ -173,6 +183,9 @@ class AdminIngressModelPolicy:
         if (type(digest) is not str or len(digest) != 64
                 or any(char not in "0123456789abcdef" for char in digest)):
             raise ValueError("ingress model config digest must be lowercase SHA-256")
+        if self.provider_config_ref != installed_model_config_ref(
+                self.provider_id, self.model_id, digest):
+            raise ValueError("ingress model config ref differs from content identity")
         timeout = self.timeout_seconds
         try:
             valid_timeout = (type(timeout) in {int, float}
@@ -894,5 +907,6 @@ __all__ = (
     "AdminInstallationPolicy",
     "AuthorityProfileUnavailable",
     "build_admin_authority_transport", "load_admin_installation_policy",
+    "installed_model_config_ref",
     "load_admin_d11_signing_key", "load_admin_installation_bundle",
 )
