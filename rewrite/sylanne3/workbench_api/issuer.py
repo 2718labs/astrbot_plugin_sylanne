@@ -232,7 +232,6 @@ class GraphWorkbenchIssuer:
             entry = {"view_type": name, "status": "available"}
             if context_version is None:
                 entry["snapshot_epoch"] = epoch.revision
-                entry["cursor"] = page.next_after.token if page.next_after else None
             entries.append(entry)
         return {"status": "ready", "projection": {
             "namespace": {"bot": grant.authority.namespace.bot_id,

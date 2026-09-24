@@ -243,6 +243,25 @@ def test_open_workspace_is_a_real_read_catalogue_without_a_durable_receipt():
     assert {call[2]["owner_kind"] for call in coordinator.calls} == {"persona", "event"}
 
 
+def test_workspace_catalogue_does_not_offer_a_cursor_that_skips_unread_content():
+    provider, coordinator, _ = issuer()
+    first = coordinator.page.snapshot.atoms[0]
+    coordinator.page = GraphPage(coordinator.page.snapshot, first.key)
+    opened = WorkbenchService(provider).handle(
+        request("open_workspace"), session=SESSION, context=CONTEXT)
+    overview = next(entry for entry in opened.projection["views"]
+                    if entry["view_type"] == "overview")
+    assert overview == {"view_type": "overview", "status": "available",
+                        "snapshot_epoch": 9}
+    # Catalogue sampling has not delivered the atom. A subsequent view read
+    # starts at the first atom, rather than consuming a catalogue cursor.
+    read = WorkbenchService(provider).handle(request(view_type="overview"),
+                                             session=SESSION, context=CONTEXT)
+    assert read.status == "ready"
+    assert coordinator.calls[-1][2]["after"] is None
+    assert read.projection["data"] == {"summary": "overview:1"}
+
+
 def test_workspace_marks_each_unqueryable_registry_view_unavailable_without_content():
     provider, coordinator, resolver = issuer()
     provider._view_registry = Registry({"overview": ("d01.persona_plan.v1",), "broken": ("d99.unknown",)})
