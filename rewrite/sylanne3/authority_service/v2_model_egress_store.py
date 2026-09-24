@@ -437,6 +437,51 @@ class AuthorityV2ModelEgressStore:
             raise AuthorityUnavailable("original dispatch identity changed")
         return target
 
+    def _finish_terminal_observation_fenced_locked(
+            self, db: sqlite3.Connection, intent: ModelEgressIntentV1,
+            observation: ModelEgressObservationV1, permit: FencePermitV2,
+            fences, current_anchor) -> ModelEgressRecoveryV1:
+        """Executor-only storage step; caller must authenticate the response first.
+
+        The caller holds the journal freezes and Authority transaction. This
+        does not accept a host task or authorize a provider call.
+        """
+        if (db is not self._db or not db.in_transaction
+                or type(intent) is not ModelEgressIntentV1
+                or type(observation) is not ModelEgressObservationV1
+                or type(permit) is not FencePermitV2):
+            raise AuthorityUnavailable("typed executor observation and Authority transaction required")
+        if (observation.authority_id, observation.namespace,
+                observation.subject, observation.operation_id,
+                observation.call_id, observation.request_digest) != (
+                intent.authority_id, intent.namespace, intent.subject,
+                intent.operation_id, intent.call_id, intent.request_digest):
+            raise AuthorityUnavailable("executor observation differs from original call")
+        record = self.read_locked(db, intent)
+        if record.state == "dispatch_started":
+            record = self._record_observation_locked(db, observation)
+        elif record.state in {"observed", "unknown"}:
+            if self._read_observation_locked(db, intent) != observation:
+                raise AuthorityUnavailable("terminal observation identity conflict")
+        else:
+            raise AuthorityUnavailable("original dispatch marker is absent")
+        fences.finish_terminal_model_egress_locked(
+            db, permit, intent=intent, current_anchor=current_anchor,
+            status=observation.status)
+        return record
+
+    def _finish_not_dispatched_fenced_locked(
+            self, db: sqlite3.Connection, intent: ModelEgressIntentV1,
+            permit: FencePermitV2, fences, current_anchor) -> ModelEgressRecoveryV1:
+        """Close an unsent prepared call; dispatch_started can never return here."""
+        record = self.read_locked(db, intent)
+        if record.state != "prepared":
+            raise AuthorityUnavailable("model call was dispatched or already resolved")
+        fences.finish_terminal_model_egress_locked(
+            db, permit, intent=intent, current_anchor=current_anchor,
+            status="not_dispatched")
+        return record
+
     def _erase_observation_content_locked(self, db: sqlite3.Connection,
                                           intent: ModelEgressIntentV1) -> ModelEgressRecoveryV1:
         """Internal D12 cleanup primitive; caller must first prove barrier and closure.

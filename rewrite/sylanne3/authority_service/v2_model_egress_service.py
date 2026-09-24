@@ -91,7 +91,10 @@ class AuthorityV2ModelEgressService:
 
     def recover_fenced(self, *, credential, subject: str,
                        intent: ModelEgressIntentV1):
-        """Read only the exact typed identity and its persisted model fence."""
+        """Read the typed identity and fence; prepared plus finished means unsent.
+
+        The recovery DTO alone is passive. Production dispatch remains HOLD.
+        """
         if self._fences is None or type(intent) is not ModelEgressIntentV1:
             raise AuthorityUnavailable("protected typed model egress unavailable")
         identifier(subject, "subject")
@@ -114,11 +117,15 @@ class AuthorityV2ModelEgressService:
                        (permit.token, permit.fence_epoch, permit.revision,
                         canonical_digest(asdict(permit.pinned_anchor)))):
                 raise AuthorityUnavailable("typed model fence identity changed")
-            if row[6] == "finished" and (
-                    record.state != "observed"
-                    or (row[8], row[9]) !=
-                    (intent.call_id, "sha256:" + record.observation_digest)):
-                raise AuthorityUnavailable("finished model fence lacks original observation")
+            if row[6] == "finished":
+                status = {"prepared": "not_dispatched", "observed": "completed",
+                          "unknown": "unknown"}.get(record.state)
+                if (status is None or row[10] is not None or
+                        (row[8], row[9]) != (
+                            intent.call_id,
+                            self._fences.fences.model_terminal_finish_digest(
+                                intent, permit, status, record.observation_digest))):
+                    raise AuthorityUnavailable("finished model fence lacks original terminal state")
             return record, permit
 
     def read_observation_fenced(self, *, credential, subject: str,
@@ -165,6 +172,31 @@ class AuthorityV2ModelEgressService:
             self._fences.fences.finish_observed_model_egress_locked(
                 db, permit, intent=intent, current_anchor=anchor)
             return self._store.read_locked(db, intent), permit
+
+    def _finish_prepared_not_dispatched_fenced(
+            self, *, credential, subject: str, holder: str,
+            intent: ModelEgressIntentV1, expected_anchor: RestoreAnchor):
+        """Close a prepared unsent call and release its exclusive model fence."""
+        if self._fences is None or type(intent) is not ModelEgressIntentV1:
+            raise AuthorityUnavailable("protected typed model egress unavailable")
+        identifier(subject, "subject")
+        identifier(holder, "holder")
+        if (subject, intent.namespace) != (intent.subject, self._fences.namespace):
+            raise AuthorityUnavailable("model egress subject or namespace mismatch")
+        self._fences.core._require(credential, "model_egress", self._fences.namespace, holder)
+        with self._fences._frozen() as (db, deletion_head, execution_head, deletion_history):
+            anchor = self._fences._current_locked(
+                db, deletion_head, execution_head, holder=holder,
+                generation=expected_anchor.activation_generation)
+            if anchor != expected_anchor or deletion_history:
+                raise AuthorityUnavailable("model finish anchor changed or deletion history exists")
+            row = self._fences.fences._row(db, intent.operation_id)
+            if row is None:
+                raise AuthorityUnavailable("typed model fence absent")
+            permit = self._fences.fences._permit(row)
+            record = self._store._finish_not_dispatched_fenced_locked(
+                db, intent, permit, self._fences.fences, anchor)
+            return record, permit
 
     async def begin_handoff(self, request, request_digest):
         raise AuthorityUnavailable(

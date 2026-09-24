@@ -743,6 +743,27 @@ class AuthorityV2FenceStore:
                                             permit: FencePermitV2, *, intent,
                                             current_anchor: RestoreAnchor) -> None:
         """Close only the original typed model fence with its complete durable observation."""
+        self.finish_terminal_model_egress_locked(
+            db, permit, intent=intent, current_anchor=current_anchor,
+            status="completed")
+
+    @staticmethod
+    def model_terminal_finish_digest(intent, permit: FencePermitV2,
+                                     status: str,
+                                     observation_digest: str | None = None) -> str:
+        if status == "not_dispatched" and observation_digest is None:
+            return "sha256:" + canonical_digest({
+                "status": status, "call_id": intent.call_id,
+                "operation_id": intent.operation_id, "token": permit.token})
+        if status in {"completed", "unknown"} and observation_digest is not None:
+            return "sha256:" + observation_digest
+        raise AuthorityUnavailable("invalid model egress terminal digest")
+
+    def finish_terminal_model_egress_locked(self, db: sqlite3.Connection,
+                                            permit: FencePermitV2, *, intent,
+                                            current_anchor: RestoreAnchor,
+                                            status: str) -> None:
+        """Atomically close a typed model fence after its terminal ledger state exists."""
         from .v2_model_egress_contract import ModelEgressIntentV1
         from .v2_model_egress_store import AuthorityV2ModelEgressStore
         if (db is not self._db or not db.in_transaction
@@ -771,13 +792,22 @@ class AuthorityV2FenceStore:
         ).fetchone()
         if binding != (intent.operation_id, intent.fence_token):
             raise AuthorityUnavailable("typed model fence lacks atomic call binding")
+        if status not in {"completed", "unknown", "not_dispatched"}:
+            raise AuthorityUnavailable("invalid model egress terminal status")
         # The strict read rechecks canonical body, digest, and original identity.
         recovery = AuthorityV2ModelEgressStore._read(db, intent.call_id)
-        if (recovery is None or recovery.intent != intent or recovery.state != "observed"
-                or recovery.content_erased):
-            raise AuthorityUnavailable("complete original provider observation is absent")
-        AuthorityV2ModelEgressStore._read_observation_locked(db, intent)
-        finish_digest = "sha256:" + recovery.observation_digest
+        expected_state = {"completed": "observed", "unknown": "unknown",
+                          "not_dispatched": "prepared"}[status]
+        if recovery is None or recovery.intent != intent or recovery.state != expected_state:
+            raise AuthorityUnavailable("complete original provider observation or unsent state is absent")
+        if status == "not_dispatched":
+            finish_digest = self.model_terminal_finish_digest(intent, permit, status)
+        else:
+            if recovery.content_erased:
+                raise AuthorityUnavailable("complete original provider observation is absent")
+            AuthorityV2ModelEgressStore._read_observation_locked(db, intent)
+            finish_digest = self.model_terminal_finish_digest(
+                intent, permit, status, recovery.observation_digest)
         if row[6] == "finished":
             if (row[8], row[9]) == (intent.call_id, finish_digest):
                 return

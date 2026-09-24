@@ -467,3 +467,133 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
             next(fixture)
         except StopIteration:
             pass
+
+
+@pytest.mark.parametrize("status", ["completed", "unknown"])
+def test_terminal_observation_and_finish_share_authority_commit(tmp_path, monkeypatch, status):
+    from rewrite.tests.alpha1.runtime.test_authority_v2_rpc_content_fences import _PEER_A, rpc
+    from sylanne3.authority_service.v2_model_egress_contract import ModelEgressObservationV1
+    from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
+
+    fixture = rpc.__wrapped__(tmp_path)
+    server = next(fixture)
+    try:
+        fences = server._v2_fences["ns-a"]
+        store = AuthorityV2ModelEgressStore(fences.core._db, create=True,
+                                            lock=fences.core._lock)
+        service = AuthorityV2ModelEgressService(store, fences)
+        anchor = fences.current_anchor(credential=_PEER_A, subject="worker")
+        draft = ModelEgressDraftV1.from_intent(intent(
+            namespace="ns-a", authority_id=anchor.authority_id,
+            authority_activation_generation=anchor.activation_generation,
+            authority_revocation_epoch=anchor.revocation_epoch,
+            authority_deletion_seq=anchor.deletion_seq,
+            authority_execution_seq=anchor.execution_seq))
+        prepared, permit = service.prepare_fenced(
+            credential=_PEER_A, subject="worker", holder="holder-a",
+            draft=draft, expected_anchor=anchor)
+        original = prepared.intent
+        with fences._frozen() as (db, deletion_head, execution_head, _):
+            current = fences._current_locked(db, deletion_head, execution_head,
+                                              holder="holder-a")
+            store._record_dispatch_started_fenced_locked(
+                db, original, permit, fences.fences, current)
+        response = ProviderResponse(
+            status, {"answer": "ok"} if status == "completed" else None,
+            {"input_tokens": 1}, {"micro_usd": 2}, "provider-ref")
+        observation = ModelEgressObservationV1.from_response(original, response)
+        original_finish = fences.fences.finish_terminal_model_egress_locked
+
+        def fail_after_finish(*args, **kwargs):
+            original_finish(*args, **kwargs)
+            raise RuntimeError("lost terminal commit")
+
+        monkeypatch.setattr(fences.fences, "finish_terminal_model_egress_locked",
+                            fail_after_finish)
+        with pytest.raises(RuntimeError, match="lost terminal commit"):
+            with fences._frozen() as (db, deletion_head, execution_head, _):
+                current = fences._current_locked(db, deletion_head, execution_head,
+                                                  holder="holder-a")
+                store._finish_terminal_observation_fenced_locked(
+                    db, original, observation, permit, fences.fences, current)
+        assert store.read(original.call_id, subject="worker", namespace="ns-a").state == "dispatch_started"
+        assert fences.fences._row(fences.core._db, original.operation_id)[6] == "active"
+        monkeypatch.setattr(fences.fences, "finish_terminal_model_egress_locked",
+                            original_finish)
+        with fences._frozen() as (db, deletion_head, execution_head, _):
+            current = fences._current_locked(db, deletion_head, execution_head,
+                                              holder="holder-a")
+            record = store._finish_terminal_observation_fenced_locked(
+                db, original, observation, permit, fences.fences, current)
+        assert record.state == ("observed" if status == "completed" else "unknown")
+        assert fences.fences._row(fences.core._db, original.operation_id)[6] == "finished"
+        assert service.recover_fenced(
+            credential=_PEER_A, subject="worker", intent=original) == (record, permit)
+        with fences._frozen() as (db, deletion_head, execution_head, _):
+            current = fences._current_locked(db, deletion_head, execution_head,
+                                              holder="holder-a")
+            assert store._finish_terminal_observation_fenced_locked(
+                db, original, observation, permit, fences.fences, current) == record
+            changed = ModelEgressObservationV1.from_response(
+                original, ProviderResponse("unknown", None, {}, {}, "different-ref"))
+            with pytest.raises(AuthorityUnavailable, match="conflict"):
+                store._finish_terminal_observation_fenced_locked(
+                    db, original, changed, permit, fences.fences, current)
+    finally:
+        try:
+            next(fixture)
+        except StopIteration:
+            pass
+
+
+def test_prepared_not_dispatched_closes_only_unsent_fence(tmp_path):
+    from rewrite.tests.alpha1.runtime.test_authority_v2_rpc_content_fences import _PEER_A, rpc
+    from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
+
+    fixture = rpc.__wrapped__(tmp_path)
+    server = next(fixture)
+    try:
+        fences = server._v2_fences["ns-a"]
+        store = AuthorityV2ModelEgressStore(fences.core._db, create=True,
+                                            lock=fences.core._lock)
+        service = AuthorityV2ModelEgressService(store, fences)
+        anchor = fences.current_anchor(credential=_PEER_A, subject="worker")
+        draft = ModelEgressDraftV1.from_intent(intent(
+            namespace="ns-a", authority_id=anchor.authority_id,
+            authority_activation_generation=anchor.activation_generation,
+            authority_revocation_epoch=anchor.revocation_epoch,
+            authority_deletion_seq=anchor.deletion_seq,
+            authority_execution_seq=anchor.execution_seq))
+        prepared, permit = service.prepare_fenced(
+            credential=_PEER_A, subject="worker", holder="holder-a",
+            draft=draft, expected_anchor=anchor)
+        assert service._finish_prepared_not_dispatched_fenced(
+            credential=_PEER_A, subject="worker", holder="holder-a",
+            intent=prepared.intent, expected_anchor=anchor) == (prepared, permit)
+        assert service._finish_prepared_not_dispatched_fenced(
+            credential=_PEER_A, subject="worker", holder="holder-a",
+            intent=prepared.intent, expected_anchor=anchor) == (prepared, permit)
+        assert fences.fences._row(fences.core._db, prepared.intent.operation_id)[6] == "finished"
+        assert service.recover_fenced(
+            credential=_PEER_A, subject="worker", intent=prepared.intent) == (prepared, permit)
+        second = replace(draft, operation_id="job-operation-2",
+                         call_id="call-2", job_id="job-2")
+        next_record, _ = service.prepare_fenced(
+            credential=_PEER_A, subject="worker", holder="holder-a",
+            draft=second, expected_anchor=anchor)
+        with fences._frozen() as (db, deletion_head, execution_head, _):
+            current = fences._current_locked(db, deletion_head, execution_head,
+                                              holder="holder-a")
+            store._record_dispatch_started_fenced_locked(
+                db, next_record.intent,
+                fences.fences._permit(fences.fences._row(db, second.operation_id)),
+                fences.fences, current)
+        with pytest.raises(AuthorityUnavailable, match="dispatched"):
+            service._finish_prepared_not_dispatched_fenced(
+                credential=_PEER_A, subject="worker", holder="holder-a",
+                intent=next_record.intent, expected_anchor=anchor)
+    finally:
+        try:
+            next(fixture)
+        except StopIteration:
+            pass
