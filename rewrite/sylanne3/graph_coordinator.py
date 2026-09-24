@@ -10635,11 +10635,23 @@ class GraphCoordinator:
             permit = from_wire(json.loads(fence[1]))
         except (TypeError, ValueError) as exc:
             raise UnavailableGuard("C02 replay write permit is invalid") from exc
+        attempt_id = "graph-write-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            "bundle_digest": row[0],
+        })[:48]
         if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.operation_id != attempt_id
                 or permit.pinned_anchor != anchor or permit.holder != self.__holder
                 or permit.generation != metadata.requirements.activation_generation
                 or fence[4] != fence[2] + 1
                 or fence[5] < fence[3]
+                or fence[6] != "finish:" + attempt_id
+                or fence[7] != "sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_domain_bundle",
+                    "business_operation_id": operation_id,
+                    "bundle_digest": row[0],
+                })
                 or metadata.graph_revision < fence[4]
                 or epoch.revision < fence[5]):
             raise UnavailableGuard("C02 replay graph write fence differs")
