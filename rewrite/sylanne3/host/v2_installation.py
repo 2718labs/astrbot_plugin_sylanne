@@ -14,7 +14,8 @@ from .authority_client import (
     AuthoritySelection, PublisherPackageIdentity,
 )
 from .authority_profile import (
-    AdminIngressClockPolicy, AdminIngressEncodingPolicy, load_admin_installation_bundle,
+    AdminIngressClockPolicy, AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    load_admin_installation_bundle,
 )
 from .installed_package import verify_installed_package
 from .mtls_transport import MtlsAuthorityTransport
@@ -36,6 +37,7 @@ class V2InstallationAssembly:
     ingress_clock: AdminIngressClockPolicy | None = None
     ingress_encoding: AdminIngressEncodingPolicy | None = None
     workbench_origin: str | None = None
+    ingress_model: AdminIngressModelPolicy | None = None
 
 
 async def assemble_v2_installation(
@@ -113,6 +115,7 @@ async def assemble_v2_installation(
         policy, grant, bundle.d11_signing_key, bundle.d02_signing_key, make_fence_port,
         root, data, available_cpu_features, bundle.ingress_clock,
         bundle.ingress_encoding, bundle.workbench_origin,
+        getattr(bundle, "ingress_model", None),
     )
 
 

@@ -11,7 +11,10 @@ import asyncio
 from astrbot.api.star import Context
 from astrbot.core.provider.entities import ProviderMeta, ProviderType
 from astrbot.core.provider.provider import Provider
+from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 
+from .authority_profile import AdminIngressModelPolicy
 from ..runtime_contracts import NamespaceId, canonical_digest
 from ..workbench_api.d01_onboarding import VerifiedModelCapability
 
@@ -122,6 +125,63 @@ class InstalledModelCapabilityPort:
         self, *, namespace: NamespaceId, capability_ref: str,
     ) -> VerifiedModelCapability | None:
         return self.verify(namespace, capability_ref)
+
+    async def _verify_admin_selection_on_host_loop(
+        self, selection: AdminIngressModelPolicy,
+    ) -> bool:
+        """Check the exact installed adapter and config without returning secrets."""
+        try:
+            providers = self._context.get_all_providers()
+            if type(providers) is not list:
+                return False
+            matches = [provider for provider in providers
+                       if type(provider) is ProviderOpenAIOfficial
+                       and isinstance(provider.meta(), ProviderMeta)
+                       and provider.meta().id == selection.provider_id]
+            if len(matches) != 1:
+                return False
+            provider = matches[0]
+            meta = provider.meta()
+            return (
+                meta.provider_type is ProviderType.CHAT_COMPLETION
+                and meta.model == selection.model_id
+                and provider.get_model() == selection.model_id
+                and self._context.get_provider_by_id(selection.provider_id) is provider
+                and type(provider.provider_config) is dict
+                and "api_version" not in provider.provider_config
+                and canonical_digest(provider.provider_config)
+                == selection.provider_config_digest
+                and isinstance(provider.client, AsyncOpenAI)
+                and not isinstance(provider.client, AsyncAzureOpenAI)
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+
+    def verify_admin_selection(
+        self, namespace: NamespaceId, selection: AdminIngressModelPolicy,
+    ) -> bool:
+        if (type(namespace) is not NamespaceId
+                or namespace != self._installed_namespace
+                or type(selection) is not AdminIngressModelPolicy
+                or not self._host_loop.is_running()):
+            return False
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._host_loop:
+            return False
+        coro = self._verify_admin_selection_on_host_loop(selection)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, self._host_loop)
+        except RuntimeError:
+            coro.close()
+            return False
+        try:
+            return future.result(timeout=self._timeout_seconds)
+        except Exception:
+            future.cancel()
+            return False
 
 
 __all__ = ("InstalledModelCapabilityPort", "model_capability_ref")

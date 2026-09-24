@@ -184,12 +184,17 @@ class Sylanne3Plugin(Star):
             context=self.context, host_loop=asyncio.get_running_loop(),
             candidates=self._scene_candidates,
         )
+        model_port = InstalledModelCapabilityPort(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            installed_namespace=installation.installation_policy.namespace,
+        )
         try:
             self._runtime = RuntimeContext(
                 data_dir, package_root=PACKAGE_ROOT, dependencies=None,
                 domains=verified.registry,
                 owner_principal_resolver=self._owner_principal_resolver,
                 scene_identity_port=scene_port,
+                model_selection_port=model_port,
             )
             health = await self._runtime.start_v2(installation)
             self._installed_namespace = installation.installation_policy.namespace
@@ -219,10 +224,6 @@ class Sylanne3Plugin(Star):
         if onboarding is None and pairing is None and grants is None and origin is not None:
             try:
                 owner_ports = self._runtime.installed_owner_onboarding_ports()
-                model_port = InstalledModelCapabilityPort(
-                    context=self.context, host_loop=asyncio.get_running_loop(),
-                    installed_namespace=installation.installation_policy.namespace,
-                )
                 onboarding = CurrentOnboardingResolver(
                     d01=CurrentD01OnboardingResolver(
                         namespaces=owner_ports, owners=owner_ports,

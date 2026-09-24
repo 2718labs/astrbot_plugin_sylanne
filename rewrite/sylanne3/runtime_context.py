@@ -20,7 +20,9 @@ from .graph_coordinator import (
 from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
-from .host.authority_profile import AdminIngressClockPolicy, AdminIngressEncodingPolicy
+from .host.authority_profile import (
+    AdminIngressClockPolicy, AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+)
 from .host.v2_ingress_adapter import ingress_host_facts
 from .host.installed_package import verify_installed_package
 from .host.v2_installation import V2InstallationAssembly
@@ -124,6 +126,7 @@ class RuntimeContext:
         authority_state: str = "unavailable",
         owner_principal_resolver: Callable[[str, NamespaceId], OwnerPrincipalV1 | None] | None = None,
         scene_identity_port: SceneIdentityPort | None = None,
+        model_selection_port: object | None = None,
     ) -> None:
         if owner_principal_resolver is not None and not callable(owner_principal_resolver):
             raise TypeError("owner_principal_resolver must be callable")
@@ -140,6 +143,10 @@ class RuntimeContext:
         self._domains = domains or discover_domain_registry()
         self._owner_principal_resolver = owner_principal_resolver
         self._scene_identity_port = scene_identity_port
+        if model_selection_port is not None and not callable(
+                getattr(model_selection_port, "verify_admin_selection", None)):
+            raise TypeError("model_selection_port must verify administrator selections")
+        self._model_selection_port = model_selection_port
         self._store: ProductionGraphStore | None = None
         self._coordinator: GraphCoordinator | None = None
         self._worker: GraphWorker | None = None
@@ -156,6 +163,7 @@ class RuntimeContext:
         self._v2_scene_probe: Callable | None = None
         self._v2_namespace: NamespaceId | None = None
         self._v2_missing_ingress_policies: tuple[str, ...] = ()
+        self._v2_installed_model_selected = False
         self._v2_namespace_provisioned = False
         self._ingress_handler: Callable[
             [HostIngressEnvelope, GraphCoordinator], Awaitable[IngressReceipt]
@@ -226,9 +234,10 @@ class RuntimeContext:
             provision = None
             ingress = None
             owner_runtime = None
+            model_selected = False
 
             def make_coordinator(store, port):
-                nonlocal provision, ingress, owner_runtime
+                nonlocal provision, ingress, owner_runtime, model_selected
                 if port.installation_grant != installation_grant:
                     raise RuntimeError("v2 port installation grant changed")
                 bootstrap = object()
@@ -266,6 +275,14 @@ class RuntimeContext:
                             and binding.principal == principal else None)
 
                 d02_issuer = D02ResourceIssuer(installation.d02_signing_key)
+                if (type(installation.ingress_model) is AdminIngressModelPolicy
+                        and self._model_selection_port is not None):
+                    try:
+                        model_selected = (
+                            self._model_selection_port.verify_admin_selection(
+                                policy.namespace, installation.ingress_model) is True)
+                    except Exception:
+                        model_selected = False
                 coordinator = GraphCoordinator(
                     store, bootstrap, holder=installation_grant.administrator_holder,
                     content_fence_v2=port,
@@ -313,6 +330,7 @@ class RuntimeContext:
                 return self.health
             self._v2_provision = provision
             self._v2_ingress = ingress
+            self._v2_installed_model_selected = model_selected
             self._v2_namespace = policy.namespace
             if owner_runtime is not None:
                 (self._v2_coordinator, self._v2_bootstrap, port,
@@ -431,6 +449,11 @@ class RuntimeContext:
                 "limited", tuple(missing), detail,
             )
             return self.health
+
+    @property
+    def v2_installed_model_selected(self) -> bool:
+        """Startup host check only; model request issuance is not yet enabled."""
+        return self._v2_installed_model_selected
 
     @property
     def v2_ingress_qualified(self) -> bool:

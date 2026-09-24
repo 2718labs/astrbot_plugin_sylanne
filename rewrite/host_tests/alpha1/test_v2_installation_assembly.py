@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from sylanne3.host.authority_client import AuthorityClientStatus
 from sylanne3.host.installed_package import InstalledPackageVerification
+from sylanne3.host.authority_profile import AdminIngressModelPolicy
 from sylanne3.host.v2_installation import assemble_v2_installation
 from sylanne3.runtime_contracts import InstallationGrantV2
 
@@ -25,6 +26,10 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
             tls_profile=profile, installation_policy=policy,
             d11_signing_key=b"k" * 32, d02_signing_key=b"d" * 32,
             ingress_clock=None, ingress_encoding=None,
+            ingress_model=AdminIngressModelPolicy(
+                "provider-1", "model-1", "admin:config-1", "c" * 64,
+                20.0, 128, ("structured",), "private",
+            ),
             workbench_origin="https://workbench.example.org:8443",
         )
         grant = InstallationGrantV2(
@@ -57,6 +62,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(assembled.available_cpu_features, frozenset({"avx2"}))
             self.assertEqual(assembled.workbench_origin,
                              "https://workbench.example.org:8443")
+            self.assertIs(assembled.ingress_model, bundle.ingress_model)
             port_type.assert_not_called()
             await asyncio.to_thread(assembled.fence_port_factory)
             request, profiles, selected_grant = port_type.call_args.args

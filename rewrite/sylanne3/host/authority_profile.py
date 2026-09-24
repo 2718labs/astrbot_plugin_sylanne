@@ -44,6 +44,10 @@ _INGRESS_ENCODING_FIELDS = frozenset({
     "deadline_after_seconds", "quote_ceiling", "snapshot_ref", "resource_ref",
     "character_interval_ref",
 })
+_INGRESS_MODEL_FIELDS = frozenset({
+    "provider_id", "model_id", "provider_config_ref", "provider_config_digest",
+    "timeout_seconds", "max_output_tokens", "required_capabilities", "privacy_tier",
+})
 _RESOURCE_DIMENSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 _INSTALLATION_FIELDS = frozenset({
     "namespace", "authority_namespace", "installation_id", "manifest_digest",
@@ -148,6 +152,47 @@ class AdminIngressEncodingPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class AdminIngressModelPolicy:
+    """Exact administrator selection; it does not grant model egress."""
+
+    provider_id: str
+    model_id: str
+    provider_config_ref: str
+    provider_config_digest: str
+    timeout_seconds: float
+    max_output_tokens: int
+    required_capabilities: tuple[str, ...]
+    privacy_tier: str
+
+    def __post_init__(self) -> None:
+        for name in ("provider_id", "model_id", "provider_config_ref", "privacy_tier"):
+            value = getattr(self, name)
+            if type(value) is not str or not value.strip() or len(value) > 256:
+                raise ValueError(f"ingress model {name} must be a bounded string")
+        digest = self.provider_config_digest
+        if (type(digest) is not str or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)):
+            raise ValueError("ingress model config digest must be lowercase SHA-256")
+        timeout = self.timeout_seconds
+        try:
+            valid_timeout = (type(timeout) in {int, float}
+                             and math.isfinite(timeout) and 0 < timeout <= 300)
+        except OverflowError:
+            valid_timeout = False
+        if not valid_timeout:
+            raise ValueError("ingress model timeout must be in (0, 300]")
+        if type(self.max_output_tokens) is not int or self.max_output_tokens < 1:
+            raise ValueError("ingress model output token ceiling must be positive")
+        capabilities = self.required_capabilities
+        if (type(capabilities) is not tuple or not capabilities
+                or len(capabilities) > 16
+                or any(type(item) is not str or not item.strip() or len(item) > 128
+                       for item in capabilities)
+                or len(set(capabilities)) != len(capabilities)):
+            raise ValueError("ingress model capabilities must be unique bounded strings")
+
+
+@dataclass(frozen=True, slots=True)
 class AdminInstallationBundle:
     """One verified installation snapshot for Authority client assembly."""
 
@@ -158,6 +203,7 @@ class AdminInstallationBundle:
     ingress_clock: AdminIngressClockPolicy | None = None
     ingress_encoding: AdminIngressEncodingPolicy | None = None
     workbench_origin: str | None = None
+    ingress_model: AdminIngressModelPolicy | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -463,7 +509,7 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "workbench_origin"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin"}
     )
 
 
@@ -560,6 +606,20 @@ def _ingress_encoding_from_payload(payload: dict[str, object]) -> AdminIngressEn
     return AdminIngressEncodingPolicy(**values)
 
 
+def _ingress_model_from_payload(payload: dict[str, object]) -> AdminIngressModelPolicy | None:
+    if "ingress_model" not in payload:
+        return None
+    if type(payload.get("schema")) is not int or payload["schema"] != 2:
+        raise ValueError("ingress model requires profile schema 2")
+    values = _exact_object(payload["ingress_model"], _INGRESS_MODEL_FIELDS,
+                           "ingress model")
+    if type(values["required_capabilities"]) is not list:
+        raise ValueError("ingress model capabilities must be an array")
+    return AdminIngressModelPolicy(**{
+        **values, "required_capabilities": tuple(values["required_capabilities"]),
+    })
+
+
 def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     """Parse schema 2 after the enclosing profile passed its trusted read gate."""
     from ..runtime.issuers import BudgetLeaseGrant
@@ -569,6 +629,7 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
         raise ValueError("administrator installation policy requires profile schema 2")
     _ingress_clock_from_payload(payload)
     _ingress_encoding_from_payload(payload)
+    _ingress_model_from_payload(payload)
     _workbench_origin_from_payload(payload)
     values = _exact_object(payload["installation_policy"], _INSTALLATION_FIELDS,
                            "installation policy")
@@ -750,7 +811,8 @@ def _load_installation_bundle_from_root(
     return AdminInstallationBundle(profile, policy, d11_key, d02_key,
                                    _ingress_clock_from_payload(payload),
                                    _ingress_encoding_from_payload(payload),
-                                   _workbench_origin_from_payload(payload))
+                                   _workbench_origin_from_payload(payload),
+                                   _ingress_model_from_payload(payload))
 
 
 def _load_windows_installation_bundle(
@@ -774,7 +836,8 @@ def _load_windows_installation_bundle(
     return AdminInstallationBundle(profile, policy, d11_key, d02_key,
                                    _ingress_clock_from_payload(payload),
                                    _ingress_encoding_from_payload(payload),
-                                   _workbench_origin_from_payload(payload))
+                                   _workbench_origin_from_payload(payload),
+                                   _ingress_model_from_payload(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -826,7 +889,8 @@ def load_admin_d11_signing_key(profile_id: str) -> bytes:
 
 
 __all__ = (
-    "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminInstallationBundle",
+    "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
+    "AdminInstallationBundle",
     "AdminInstallationPolicy",
     "AuthorityProfileUnavailable",
     "build_admin_authority_transport", "load_admin_installation_policy",
