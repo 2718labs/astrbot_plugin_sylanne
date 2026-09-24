@@ -44,6 +44,9 @@ _INGRESS_ENCODING_FIELDS = frozenset({
     "deadline_after_seconds", "quote_ceiling", "snapshot_ref", "resource_ref",
     "character_interval_ref",
 })
+_D03_ARRIVAL_FIELDS = frozenset({
+    "deadline_after_seconds", "quote_ceiling", "snapshot_ref", "resource_ref",
+})
 _INGRESS_MODEL_FIELDS = frozenset({
     "provider_id", "model_id", "provider_config_ref", "provider_config_digest",
     "timeout_seconds", "max_output_tokens", "required_capabilities", "privacy_tier",
@@ -165,6 +168,38 @@ class AdminIngressEncodingPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class AdminD03ArrivalPolicy:
+    """Installed per-arrival price; the root grant remains only an upper bound."""
+
+    deadline_after_seconds: float
+    quote_ceiling: Mapping[str, int]
+    snapshot_ref: str
+    resource_ref: str
+
+    def __post_init__(self) -> None:
+        from ..runtime.issuers import MAX_DIMENSIONS, MAX_QUANTITY
+
+        deadline = self.deadline_after_seconds
+        if (type(deadline) not in {int, float} or not math.isfinite(deadline)
+                or deadline <= 0):
+            raise ValueError("D03 arrival deadline must be finite and positive")
+        ceiling = self.quote_ceiling
+        if not isinstance(ceiling, Mapping) or not 0 < len(ceiling) <= MAX_DIMENSIONS:
+            raise ValueError("D03 arrival quote ceiling must be nonempty and bounded")
+        normalized: dict[str, int] = {}
+        for name, amount in ceiling.items():
+            if (type(name) is not str or _RESOURCE_DIMENSION.fullmatch(name) is None
+                    or type(amount) is not int or not 0 < amount <= MAX_QUANTITY):
+                raise ValueError("D03 arrival quote ceiling contains an invalid amount")
+            normalized[name] = amount
+        object.__setattr__(self, "quote_ceiling", MappingProxyType(normalized))
+        for name in ("snapshot_ref", "resource_ref"):
+            value = getattr(self, name)
+            if (type(value) is not str or _RESOURCE_DIMENSION.fullmatch(value) is None):
+                raise ValueError(f"D03 arrival {name} must be a canonical resource ID")
+
+
+@dataclass(frozen=True, slots=True)
 class AdminIngressModelPolicy:
     """Exact administrator selection; it does not grant model egress."""
 
@@ -233,6 +268,7 @@ class AdminInstallationBundle:
     ingress_encoding: AdminIngressEncodingPolicy | None = None
     workbench_origin: str | None = None
     ingress_model: AdminIngressModelPolicy | None = None
+    d03_arrival: AdminD03ArrivalPolicy | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -538,7 +574,7 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival"}
     )
 
 
@@ -635,6 +671,18 @@ def _ingress_encoding_from_payload(payload: dict[str, object]) -> AdminIngressEn
     return AdminIngressEncodingPolicy(**values)
 
 
+def _d03_arrival_from_payload(payload: dict[str, object]) -> AdminD03ArrivalPolicy | None:
+    if "d03_arrival" not in payload:
+        return None
+    if type(payload.get("schema")) is not int or payload["schema"] != 2:
+        raise ValueError("D03 arrival requires profile schema 2")
+    values = _exact_object(payload["d03_arrival"], _D03_ARRIVAL_FIELDS,
+                           "D03 arrival")
+    if type(values["quote_ceiling"]) is not dict:
+        raise ValueError("D03 arrival quote ceiling must be an object")
+    return AdminD03ArrivalPolicy(**values)
+
+
 def _ingress_model_from_payload(payload: dict[str, object]) -> AdminIngressModelPolicy | None:
     if "ingress_model" not in payload:
         return None
@@ -666,6 +714,7 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
         raise ValueError("administrator installation policy requires profile schema 2")
     _ingress_clock_from_payload(payload)
     encoding = _ingress_encoding_from_payload(payload)
+    arrival = _d03_arrival_from_payload(payload)
     model = _ingress_model_from_payload(payload)
     _workbench_origin_from_payload(payload)
     values = _exact_object(payload["installation_policy"], _INSTALLATION_FIELDS,
@@ -700,6 +749,12 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
             **grant, "allowed_work_kinds": tuple(grant["allowed_work_kinds"]),
         }),
     )
+    if arrival is not None:
+        if "d03.message_received" not in policy.root_grant.allowed_work_kinds:
+            raise ValueError("D03 arrival requires an explicit root grant work kind")
+        if any(amount > policy.root_grant.max_ceiling.get(name, 0)
+               for name, amount in arrival.quote_ceiling.items()):
+            raise ValueError("D03 arrival quote exceeds the signed root grant")
     if model is not None and encoding is not None:
         output = model.max_output_tokens
         if (encoding.quote_ceiling.get("output_tokens", 0) < output
@@ -856,7 +911,8 @@ def _load_installation_bundle_from_root(
                                    _ingress_clock_from_payload(payload),
                                    _ingress_encoding_from_payload(payload),
                                    _workbench_origin_from_payload(payload),
-                                   _ingress_model_from_payload(payload))
+                                   _ingress_model_from_payload(payload),
+                                   _d03_arrival_from_payload(payload))
 
 
 def _load_windows_installation_bundle(
@@ -881,7 +937,8 @@ def _load_windows_installation_bundle(
                                    _ingress_clock_from_payload(payload),
                                    _ingress_encoding_from_payload(payload),
                                    _workbench_origin_from_payload(payload),
-                                   _ingress_model_from_payload(payload))
+                                   _ingress_model_from_payload(payload),
+                                   _d03_arrival_from_payload(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -933,7 +990,7 @@ def load_admin_d11_signing_key(profile_id: str) -> bytes:
 
 
 __all__ = (
-    "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
+    "AdminD03ArrivalPolicy", "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
     "AdminInstallationBundle",
     "AdminInstallationPolicy",
     "AuthorityProfileUnavailable",
