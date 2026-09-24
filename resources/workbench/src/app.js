@@ -82,6 +82,25 @@ function creationProjectionMarkup(projection) {
     : `<p class="creation-empty">当前范围内没有已保存的角色方案。</p>`}</section>`;
 }
 
+function overviewCatalogueMarkup(projection) {
+  const views = projection?.views;
+  const unavailable = projection?.unavailable_domains;
+  if (!Array.isArray(views) || !Array.isArray(unavailable)
+      || !views.every((item) => item && typeof item.view_type === "string"
+        && ["available", "unavailable"].includes(item.status))
+      || !unavailable.every((item) => item && typeof item.domain === "string"
+        && typeof item.reason === "string")) {
+    return `<section class="empty-state" role="alert"><h2>能力目录不可用</h2><p>服务未返回可确认的视图与领域状态；请重新请求当前目录。</p></section>`;
+  }
+  return `<section class="overview-view" aria-label="服务返回的能力目录"><h2>当前角色能力目录</h2><p>以下仅表示服务在当前 Owner 权限下公布的读取能力，不代表领域内容或真实对话已经就绪。</p>
+    <h3>视图状态</h3>${views.length
+      ? `<ul class="catalogue-list">${views.map((item) => `<li><strong>${escapeHtml(item.view_type)}</strong><span>${item.status === "available" ? "可读取" : "暂不可用"}</span></li>`).join("")}</ul>`
+      : `<p class="catalogue-empty">服务当前未公布可读取视图。</p>`}
+    <h3>不可用领域</h3>${unavailable.length
+      ? `<ul class="catalogue-list">${unavailable.map((item) => `<li><strong>${escapeHtml(item.domain)}</strong><span>暂不可用 · ${escapeHtml(item.reason)}</span></li>`).join("")}</ul>`
+      : `<p class="catalogue-empty">服务当前未列出不可用领域。</p>`}</section>`;
+}
+
 function ownerLoginMarkup() {
   const problem = ownerProblem ? `<p class="owner-problem" role="alert">${escapeHtml(ownerProblem.message)}</p>` : "";
   if (state.sessionReady) {
@@ -156,7 +175,8 @@ function render() {
     : statusCopy(state.status, state.problem);
   const sessionVerified = state.sessionReady;
   const body = state.view === "setup" ? setupMarkup() : sessionVerified && state.projection
-    ? state.view === "creation" ? creationProjectionMarkup(state.projection)
+    ? state.view === "overview" ? overviewCatalogueMarkup(state.projection)
+      : state.view === "creation" ? creationProjectionMarkup(state.projection)
       : `<pre class="projection" aria-label="服务返回的权限过滤投影">${escapeHtml(JSON.stringify(state.projection, null, 2))}</pre>`
     : `<section class="empty-state" aria-live="polite"><div class="empty-mark" aria-hidden="true">◇</div><h2>${sessionVerified ? statusTitle : "Owner 尚未解锁"}</h2><p>${sessionVerified ? statusDetail : "Sylanne Owner 会话尚未核验。请先完成服务端登录，再刷新解锁状态。"}</p><button class="primary" data-command="refresh" ${state.role && sessionVerified ? "" : "disabled"}>重新请求投影</button></section>`;
   app.innerHTML = `
@@ -190,7 +210,7 @@ async function loadView() {
   if (!state.role) { Object.assign(state, applyProblem(state, { code: "role_required", message: "请填写已由服务端授权的角色范围；浏览器输入不会创建角色。" })); render(); return; }
   state.status = "loading"; state.problem = null; render();
   try {
-    const result = state.view === "setup"
+    const result = ["setup", "overview"].includes(state.view)
       ? await api.command(ACTIONS.openWorkspace, { scope: state.role, purpose: "workbench_view", input: { client_protocol: "d12.contract.v1" } })
       : await api.readView({ scope: state.role, viewType: VIEW_TYPES[state.view] });
     if (epoch !== requestEpoch) return;

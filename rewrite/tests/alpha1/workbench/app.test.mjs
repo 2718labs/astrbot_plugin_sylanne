@@ -309,7 +309,9 @@ test("revoked Owner session clears private projection and relocks the page", asy
     await initial;
     const view = ui.clickView("overview");
     await ui.nextRequest(1);
-    ui.requests[1].resolve({ status: "ready", projection: { private: "must-clear" } });
+    ui.requests[1].resolve({ status: "ready", projection: {
+      views: [{ view_type: "must-clear", status: "available" }], unavailable_domains: []
+    } });
     await view;
     assert.match(ui.app.innerHTML, /must-clear/);
 
@@ -334,15 +336,71 @@ test("refresh retains the current projection while requesting its replacement", 
 
     const overview = ui.clickView("overview");
     await ui.nextRequest(1);
-    ui.requests[1].resolve({ status: "ready", projection: { label: "current" } });
+    ui.requests[1].resolve({ status: "ready", projection: {
+      views: [{ view_type: "current", status: "available" }], unavailable_domains: []
+    } });
     await overview;
 
     const refreshing = ui.clickCommand("refresh");
     assert.match(ui.app.innerHTML, /current/);
     await ui.nextRequest(2);
-    ui.requests[2].resolve({ status: "ready", projection: { label: "refreshed" } });
+    ui.requests[2].resolve({ status: "ready", projection: {
+      views: [{ view_type: "refreshed", status: "available" }], unavailable_domains: []
+    } });
     await refreshing;
     assert.match(ui.app.innerHTML, /refreshed/);
+  } finally { ui.restore(); }
+});
+
+test("overview reads the Owner-authorized service catalogue without inventing domain content", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    const selected = ui.clickView("overview");
+    const request = await ui.nextRequest(1);
+    assert.equal(request.payload.action, "open_workspace");
+    assert.equal(request.payload.scope, "bot/persona");
+    assert.equal(request.payload.purpose, "workbench_view");
+    request.resolve({ status: "ready", projection: {
+      namespace: { bot: "bot", persona: "persona" }, access_generation: 3,
+      views: [{ view_type: "creation", status: "available" },
+        { view_type: "memory", status: "unavailable" }],
+      unavailable_domains: [{ domain: "d06<script>", reason: "no_public_projection_contract" }]
+    } });
+    await selected;
+    assert.match(ui.app.innerHTML, /服务返回的能力目录/);
+    assert.match(ui.app.innerHTML, /creation<\/strong><span>可读取/);
+    assert.match(ui.app.innerHTML, /memory<\/strong><span>暂不可用/);
+    assert.match(ui.app.innerHTML, /d06&lt;script&gt;/);
+    assert.match(ui.app.innerHTML, /no_public_projection_contract/);
+    assert.doesNotMatch(ui.app.innerHTML, /<script>/);
+    assert.match(ui.app.innerHTML, /不代表领域内容或真实对话已经就绪/);
+  } finally { ui.restore(); }
+});
+
+test("overview keeps absent and malformed service catalogues distinct", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    const selected = ui.clickView("overview");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await selected;
+    assert.match(ui.app.innerHTML, /服务当前未公布可读取视图/);
+    const refreshed = ui.clickCommand("refresh");
+    await ui.nextRequest(2);
+    ui.requests[2].resolve({ status: "ready", projection: { views: [{ view_type: "creation" }] } });
+    await refreshed;
+    assert.match(ui.app.innerHTML, /能力目录不可用/);
+    assert.doesNotMatch(ui.app.innerHTML, /creation<\/strong>/);
   } finally { ui.restore(); }
 });
 
