@@ -66,6 +66,32 @@ def test_max_output_tokens_requires_positive_exact_integer(limit):
         intent(max_output_tokens=limit)
 
 
+@pytest.mark.parametrize("token", ["_" + "a" * 31, "-" + "a" * 31,
+                                     "_" * 256, "-" * 256])
+def test_fence_token_accepts_v2_urlsafe_syntax_and_length(token):
+    assert intent(fence_token=token).fence_token == token
+
+
+@pytest.mark.parametrize("token", ["_" + "a" * 30, "a" * 257,
+                                     "a" * 31 + ".", "a" * 31 + " ",
+                                     "a" * 31 + "é", None])
+def test_fence_token_rejects_values_outside_v2_syntax(token):
+    with pytest.raises(ValueError, match="fence_token"):
+        intent(fence_token=token)
+
+
+@pytest.mark.parametrize("prefix", ["_", "-"])
+def test_v2_fence_token_round_trips_through_recovery(tmp_path, prefix):
+    path = tmp_path / "authority.db"
+    original = intent(fence_token=prefix + "a" * 31)
+    with connection(path) as db:
+        AuthorityV2ModelEgressStore(db, create=True).prepare(original)
+    with connection(path) as db:
+        recovered = AuthorityV2ModelEgressStore(db).read(
+            "call-1", subject="worker", namespace="bot:persona")
+        assert recovered.intent == original
+
+
 def test_dispatch_marker_survives_restart_and_cannot_repeat(tmp_path):
     path = tmp_path / "authority.db"
     with connection(path) as db:

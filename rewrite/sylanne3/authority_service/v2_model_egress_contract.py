@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import re
 
 from .contract import identifier
+from .v2_contract import _TOKEN
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -60,10 +61,12 @@ class ModelEgressIntentV1:
     def __post_init__(self) -> None:
         for name in (
             "authority_id", "namespace", "subject", "operation_id", "call_id",
-            "job_id", "fence_token", "budget_lease_id",
+            "job_id", "budget_lease_id",
             "budget_reservation_operation_id", "provider_id", "model_id",
         ):
             identifier(getattr(self, name), name)
+        if type(self.fence_token) is not str or not _TOKEN.fullmatch(self.fence_token):
+            raise ValueError("invalid fence_token")
         if self.operation_id == self.call_id:
             raise ValueError("call ID must differ from operation ID")
         for name in ("request_digest", "anchor_digest", "budget_reservation_digest",
