@@ -646,16 +646,19 @@ pub(crate) fn verify_joint_error_bounds(
     };
     let reconstruction_defect = Interval::new(0.0, defect_upper)?;
 
-    // Existing analytic Interval::exp is valid only through argument 2.
-    // Integral_0^h exp(Ls) ds <= h exp(Lh), including L=0. This is wider than
-    // expm1(Lh)/L but avoids an unbounded platform transcendental or cancellation.
+    // Both analytic interval functions are valid through argument 2. The
+    // integral factor is phi_1(Lh) = expm1(Lh)/(Lh), continuously one at L=0.
+    // Its positive series and explicit tail avoid cancellation near zero.
     let lh = finite_interval(step.mul(vector_field_lipschitz)?)?;
     if lh.upper() > 2.0 {
         return Err(VerifierError::TemporalBoundUnavailable);
     }
     let amplification = finite_interval(Interval::new(0.0, lh.upper())?.exp()?)?;
+    let integral_factor = finite_interval(Interval::new(0.0, lh.upper())?.exp_integral_factor()?)?;
     let time_upper = finite_interval(
-        amplification.mul(inherited_error.add(step.mul(reconstruction_defect)?)?)?,
+        amplification
+            .mul(inherited_error)?
+            .add(step.mul(integral_factor)?.mul(reconstruction_defect)?)?,
     )?
     .upper();
     Ok(JointErrorBounds {

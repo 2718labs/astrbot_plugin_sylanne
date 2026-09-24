@@ -203,6 +203,41 @@ impl Interval {
         Self::from_validated_bounds(lower.lower.max(0.0), upper.upper)
     }
 
+    /// Enclose `phi_1(x) = (exp(x)-1)/x = integral_0^1 exp(tx) dt` on `[0, 2]`.
+    /// The value at zero is one. A positive Taylor series avoids subtracting
+    /// nearly equal numbers when `x` is small. After degree 24, the omitted
+    /// terms have ratio at most `2/27`, so the geometric tail bounds them.
+    pub(crate) fn exp_integral_factor(self) -> Result<Self, IntervalError> {
+        require_environment()?;
+        if !self.lower.is_finite()
+            || !self.upper.is_finite()
+            || self.lower < 0.0
+            || self.upper > 2.0
+        {
+            return Err(IntervalError::UnsupportedTranscendental);
+        }
+        let lower = Self::exp_integral_factor_scalar(self.lower)?;
+        let upper = Self::exp_integral_factor_scalar(self.upper)?;
+        Self::from_validated_bounds(lower.lower.max(1.0), upper.upper)
+    }
+
+    fn exp_integral_factor_scalar(value: f64) -> Result<Self, IntervalError> {
+        if value == 0.0 {
+            return Self::point(1.0);
+        }
+        let x = Self::point(value)?;
+        let mut term = Self::point(1.0)?;
+        let mut sum = term;
+        for degree in 1..=24 {
+            term = term.mul(x)?.div(Self::point((degree + 1) as f64)?)?;
+            sum = sum.add(term)?;
+        }
+        let first_omitted = term.mul(x)?.div(Self::point(26.0)?)?;
+        let ratio_limit = Self::point(2.0)?.div(Self::point(27.0)?)?;
+        let tail = first_omitted.div(Self::point(1.0)?.sub(ratio_limit)?)?;
+        sum.add(Self::new(0.0, tail.upper.max(0.0))?)
+    }
+
     /// Analytic enclosure of `tanh(self)` for finite `self` within `[-17/4, 17/4]`.
     ///
     /// For a nonnegative endpoint this evaluates
@@ -618,6 +653,35 @@ mod tests {
         let enclosure = Interval::new(-1.0, 1.0).unwrap().exp().unwrap();
         assert_contains(enclosure, (-1.0_f64).exp());
         assert_contains(enclosure, 1.0_f64.exp());
+    }
+
+    #[test]
+    fn exponential_integral_factor_encloses_zero_small_and_large_arguments() {
+        let zero = Interval::point(0.0).unwrap().exp_integral_factor().unwrap();
+        assert_eq!(zero, Interval::point(1.0).unwrap());
+        for value in [f64::from_bits(1), 1e-12, 0.1, 1.0, 2.0] {
+            let factor = Interval::point(value)
+                .unwrap()
+                .exp_integral_factor()
+                .unwrap();
+            let oracle = value.exp_m1() / value;
+            assert_contains(factor, oracle);
+            if value >= 0.1 {
+                assert!(factor.upper() < Interval::point(value).unwrap().exp().unwrap().upper());
+            }
+        }
+        let span = Interval::new(0.0, 2.0)
+            .unwrap()
+            .exp_integral_factor()
+            .unwrap();
+        assert_contains(span, 1.0);
+        assert_contains(span, 2.0_f64.exp_m1() / 2.0);
+        assert_eq!(
+            Interval::new(-f64::from_bits(1), 0.1)
+                .unwrap()
+                .exp_integral_factor(),
+            Err(IntervalError::UnsupportedTranscendental)
+        );
     }
 
     #[test]

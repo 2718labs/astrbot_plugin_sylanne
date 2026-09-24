@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from decimal import Decimal, localcontext
 import math
 from pathlib import Path
 import platform
@@ -218,6 +219,34 @@ class NativeV2FFITests(unittest.TestCase):
         trajectory_distance = math.hypot(output[0] - continuous[0], output[1] - continuous[1])
         self.assertLessEqual(trajectory_distance, report.trajectory_error)
         self.assertGreaterEqual(report.trajectory_error, step.previous_error)
+        self.assertTrue(keepalive)
+
+    def test_time_bound_encloses_high_precision_flow_with_inherited_error(self) -> None:
+        step, keepalive = self._linear_input()
+        step.previous_error = 0.01
+        output = (ctypes.c_double * 1)(0.0)
+        result = ABI2StepResult()
+        status = self.library.sylanne3_v2_step(
+            ctypes.byref(step), output, 1, ctypes.byref(result)
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(result.certificate_flags, ABI2_FIXED_BLOCK_INTERVAL_V1)
+        with localcontext() as context:
+            context.prec = 80
+            d = Decimal.from_float
+            # z'=-2z+0.1. The true initial state lies 0.01 above the
+            # reported nominal x=0.4; this checks inherited error as well.
+            exact = d(0.05) + (d(0.4) + d(step.previous_error) - d(0.05)) * (
+                -d(2.0) * d(step.h)
+            ).exp()
+            actual_error = abs(d(output[0]) - exact)
+            self.assertLessEqual(actual_error, d(result.trajectory_error))
+        # The certified integral factor is strictly tighter here than the old
+        # h*exp(Lh) defect term at the same reported defect bound.
+        old_envelope = math.exp(0.2) * (
+            step.previous_error + step.h * result.time_defect
+        )
+        self.assertLess(result.trajectory_error, old_envelope)
         self.assertTrue(keepalive)
 
     def test_nonzero_boundary_remains_diagnostic(self) -> None:
