@@ -67,6 +67,17 @@ function hasVerifiedCatalogue() {
   return state.status === "ready" && Array.isArray(state.projection?.views);
 }
 
+function creationCoverage(projection) {
+  const coverage = projection?.coverage;
+  if (!coverage || typeof coverage.truncated !== "boolean"
+      || !Number.isSafeInteger(projection.snapshot_epoch)
+      || !Number.isSafeInteger(projection.access_generation)
+      || typeof projection.namespace?.bot !== "string"
+      || typeof projection.namespace?.persona !== "string") return "unknown";
+  if (coverage.truncated) return typeof projection.next_cursor === "string" && projection.next_cursor ? "more" : "unknown";
+  return projection.next_cursor === null ? "complete" : "unknown";
+}
+
 function creationProjectionMarkup(projection) {
   const candidates = projection?.data?.candidates;
   if (projection?.view_type !== "creation" || !Array.isArray(candidates)
@@ -77,9 +88,15 @@ function creationProjectionMarkup(projection) {
         && Number.isInteger(item.value_rule_count) && item.value_rule_count >= 0)) {
     return `<section class="empty-state" role="alert"><h2>方案投影不可用</h2><p>服务未返回可确认的 D01 方案列表；请重新请求当前视图。</p></section>`;
   }
+  const coverage = creationCoverage(projection);
+  const summary = coverage === "complete" ? `当前快照已读完，共 ${candidates.length} 个方案。`
+    : coverage === "more" ? `已读取 ${candidates.length} 个方案，服务标记还有后续页面。`
+      : `已读取 ${candidates.length} 个方案；覆盖范围未核验，不能判断列表是否完整。`;
   return `<section class="creation-view" aria-label="已授权角色方案"><h2>角色方案</h2><p>以下是当前 Owner 权限下服务返回的已保存方案摘要；方案在此不会被采用。</p>${candidates.length
     ? `<ul class="creation-list">${candidates.map((item) => `<li><strong>${escapeHtml(item.plan_id)}</strong><span>版本 ${item.version} · 创作标记：${item.authored ? "是" : "否"}</span><small>${item.block_count} 个设定块 · ${item.value_rule_count} 条价值规则</small></li>`).join("")}</ul>`
-    : `<p class="creation-empty">当前范围内没有已保存的角色方案。</p>`}</section>`;
+    : `<p class="creation-empty">${coverage === "complete" ? "当前范围内没有已保存的角色方案。" : "本页没有返回方案；尚不能确认整个范围为空。"}</p>`}
+    <p class="creation-coverage" role="status" tabindex="-1">${summary}</p>${coverage === "more"
+      ? `<button type="button" class="quiet" data-command="creation-next" ${state.status === "loading" ? "disabled" : ""}>${state.status === "loading" ? "正在读取后续方案" : "继续读取后续方案"}</button>` : ""}</section>`;
 }
 
 function overviewCatalogueMarkup(projection) {
@@ -235,6 +252,45 @@ async function loadView() {
   render();
 }
 
+async function loadMoreCreation() {
+  const previous = state.projection;
+  if (state.view !== "creation" || state.status !== "ready"
+      || creationCoverage(previous) !== "more" || !state.role || !state.sessionReady) return;
+  const epoch = ++requestEpoch;
+  state.status = "loading"; state.problem = null; render();
+  try {
+    const result = await api.readView({ scope: state.role, viewType: "creation", cursor: previous.next_cursor });
+    if (epoch !== requestEpoch) return;
+    state.sessionReady = api.hasSession;
+    if (result.status !== "ready") {
+      Object.assign(state, applyResponse(state, result));
+    } else {
+      const next = result.projection;
+      const sameSnapshot = next?.view_type === "creation"
+        && next.snapshot_epoch === previous.snapshot_epoch
+        && next.access_generation === previous.access_generation
+        && next.namespace?.bot === previous.namespace?.bot
+        && next.namespace?.persona === previous.namespace?.persona;
+      const validPage = sameSnapshot && Array.isArray(next.data?.candidates)
+        && creationCoverage(next) !== "unknown"
+        && next.next_cursor !== previous.next_cursor;
+      if (!validPage) {
+        Object.assign(state, applyProblem(state, { code: "invalid_creation_page", message: "后续方案页无法与当前快照核对；请重新读取创作视图。" }));
+      } else {
+        const merged = { ...next, data: { ...next.data, candidates: [...previous.data.candidates, ...next.data.candidates] } };
+        Object.assign(state, applyResponse(state, { ...result, projection: merged }));
+      }
+    }
+  } catch (error) {
+    if (epoch !== requestEpoch) return;
+    state.sessionReady = api.hasSession;
+    if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
+    Object.assign(state, applyProblem(state, normalizeError(error)));
+  }
+  render();
+  if (state.view === "creation" && state.status === "ready") document.querySelector(".creation-coverage")?.focus();
+}
+
 function normalizeError(error) {
   if (error instanceof WorkbenchApiError) return { code: error.code, message: error.message, retryable: error.retryable };
   return { code: "client_error", message: "工作台客户端遇到未识别错误；没有显示任何旧内容。", retryable: false };
@@ -362,6 +418,7 @@ async function command(action) {
   if (action === "retry-session") return verifySession(true);
   if (action === "retry-status") return verifyInstallationStatus();
   if (action === "refresh") return loadView();
+  if (action === "creation-next") return loadMoreCreation();
   if (action === "open-workspace") return commandAction(ACTIONS.openWorkspace, { client_protocol: "d12.contract.v1" }, "workbench_view");
   if (action === "page-action") {
     const page = pages.find(([id]) => id === state.view) ?? pages[0];
