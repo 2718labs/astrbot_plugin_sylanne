@@ -304,6 +304,11 @@ class CoordinatorTests(unittest.TestCase):
                             (job_key.token,) if outbox else (),
                             (outbox_key.token,) if outbox else ())
 
+    def test_arrival_issuance_requires_qualified_quote(self):
+        with self.assertRaisesRegex(AuthorityDenied, "qualified resource quote"):
+            self.coordinator._admit_runtime_bundle(
+                self.store._db, self.bundle(), require_arrival_quote=True)
+
     def d04_bundle(self, operation, cursor, revision, *, phase="affect", coordinates=None,
                    driver_refs=None, evidence=None):
         if not hasattr(self, "d04_lease"):

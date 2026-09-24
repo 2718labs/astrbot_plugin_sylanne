@@ -6716,7 +6716,8 @@ class GraphCoordinator:
                     raise
 
     def _admit_runtime_bundle(self, db, bundle: DomainBundle, *,
-                              now_utc: float | None = None) -> RuntimeAdmission:
+                              now_utc: float | None = None,
+                              require_arrival_quote: bool = False) -> RuntimeAdmission:
         """Apply D02/D11 decisions in the graph's existing SQLite transaction."""
         from .runtime.issuers import D03_ARRIVAL_WORK_KIND
 
@@ -6726,9 +6727,15 @@ class GraphCoordinator:
         if self.__d02_issuer.authorize_resources(
                 bundle, db, **time_kwargs) is not True:
             raise AuthorityDenied("D02 resource admission did not approve the bundle")
-        quote = self.__d02_issuer.qualified_quote(
-            bundle.envelope, db, **time_kwargs)
-        if quote.work_kind == D03_ARRIVAL_WORK_KIND:
+        qualified_quote = getattr(self.__d02_issuer, "qualified_quote", None)
+        if require_arrival_quote and not callable(qualified_quote):
+            raise AuthorityDenied("D03 arrival requires a qualified resource quote")
+        quote = (qualified_quote(bundle.envelope, db, **time_kwargs)
+                 if callable(qualified_quote) else None)
+        if require_arrival_quote and (quote is None or
+                                      quote.work_kind != D03_ARRIVAL_WORK_KIND):
+            raise AuthorityDenied("D03 arrival requires its signed resource quote")
+        if quote is not None and quote.work_kind == D03_ARRIVAL_WORK_KIND:
             if db.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='graph_d03_arrival_issuance_v2'",
@@ -8742,7 +8749,8 @@ class GraphCoordinator:
             runtime_admissions.append(self._admit_runtime_bundle(
                 db, bundle, now_utc=(
                     self._dispatch_clock_upper(dispatch_clock_reading)
-                    if dispatch_clock_reading is not None else now_utc)))
+                    if dispatch_clock_reading is not None else now_utc),
+                require_arrival_quote=arrival_issuance is not None))
             for proposal in bundle.proposals:
                 for write in proposal.typed_writes:
                     if write.key.type_name.startswith("runtime."):
