@@ -17,6 +17,7 @@ from rewrite.tests.alpha1.authority.test_v2_model_egress_store import intent
 from sylanne3.authority_service.current_model_egress_graph_verifier import (
     PinnedCurrentModelEgressGraphVerifier,
 )
+from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.mtls_server import AuthorityRpcServer
 from sylanne3.authority_service.mtls_server import AuthorityServerTlsConfig, MtlsPeerCredential
 from sylanne3.authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
@@ -250,6 +251,16 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         assert completed["record"]["state"] == "observed"
         assert receipt.report_digest == report.digest
         assert fences.fences._row(fences.core._db, intent2.operation_id)[6] == "finished"
+        # The terminal receipt is not a current Owner read grant, even for the
+        # observer that submitted the complete response.
+        with pytest.raises(AuthorityUnavailable, match="Owner-qualified"):
+            model.read_observation_fenced(
+                credential=_PEER_A, subject=subject, intent=intent2)
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            call("model_read_observation_v2", {
+                "namespace": "ns-a", "holder": "holder-a",
+                "intent": to_wire(intent2), "receipt": to_wire(receipt),
+                "graph_current": True, "owner_current": True})
         assert call("model_complete_observed_v2", complete) == completed
         with pytest.raises(RuntimeError, match="authority unavailable"):
             call("model_complete_observed_v2", {

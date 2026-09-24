@@ -50,6 +50,9 @@ class PinnedCurrentModelEgressGraphVerifier:
     original budget. ``complete_graph_current`` additionally checks the one
     durable model request in the same read snapshot. Neither method validates
     the new Authority fence or the administrator's live provider configuration.
+    These are admission checks, not a result-read proof: they receive no
+    consumer Owner principal/session and cannot authorize release of the
+    completed provider body after a terminal receipt.
     """
 
     def __init__(self, graph_db_path: str | Path, *,
