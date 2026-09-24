@@ -6011,6 +6011,137 @@ class GraphCoordinator:
                 "original D06 source qualification invalid; HOLD") from exc
         return qualification
 
+    def read_first_ingress_baseline_inputs_v1(
+        self, authority: AuthorityContext, lease: object, job_id: str,
+        original_operation_id: str,
+    ):
+        """Read queued C01 evidence for D04 without acquiring an encoding worker.
+
+        This returns no D03 self perspective and grants no D04 write authority.
+        """
+        from datetime import datetime
+
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .memory_types import SourceRecord
+        from .runtime.first_ingress_baseline_inputs import FirstIngressBaselineInputsV1
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D11BudgetJobIssuer
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("installed first-ingress baseline read authorities required")
+        self._authorize(lease, authority, frozenset({"d11"}), owner_read=True)
+        namespace = authority.namespace
+        if (authority.issuer_domain != "d11" or authority.actor != self.__holder
+                or "activity" not in authority.owner_scope
+                or authority.purpose != "context"
+                or authority.worker_fence is not None
+                or type(original_operation_id) is not str
+                or authority.capability_ref != _operation_capability_ref(
+                    namespace, authority.actor, "d11", frozenset({"d11"}),
+                    authority.activation_generation, original_operation_id)):
+            raise AuthorityDenied("baseline read requires the original job-bound D11 lease")
+        try:
+            now = trusted_upper(self.__content_fence_v2.read_ingress_clock(
+                self.__scene_clock_policy))
+        except Exception as exc:
+            raise UnavailableGuard("baseline trusted clock unavailable; HOLD") from exc
+
+        def reader():
+            db = self.__store._db
+            job, job_key, _, outbox, _, _, source_version, access_version = (
+                self._first_ingress_encoding_job_locked(namespace, job_id))
+            if (job.operation_id != original_operation_id
+                    or job.phase != "queued" or job.fence != 0
+                    or job.lease_holder is not None
+                    or job.lease_expires_utc is not None
+                    or job.cancel_epoch != 0 or job.result_ref is not None):
+                raise UnavailableGuard("baseline job is no longer queued; HOLD")
+            deadline = datetime.fromisoformat(
+                job.deadline_utc.replace("Z", "+00:00")).timestamp()
+            if now >= deadline:
+                raise UnavailableGuard("baseline job deadline expired; HOLD")
+            self.__d11_issuer.authorize_existing_encoding_job(db, job, now_utc=now)
+            if (self.__d11_issuer.current_budget_grant(db, job.budget_ref).policy_ref
+                    != authority.provider_policy_ref):
+                raise UnavailableGuard("baseline D11 policy identity differs; HOLD")
+            identity = db.execute(
+                "SELECT source_ref,platform_ref,conversation_ref,sender_ref,"
+                "message_id,visibility,identity_json,bundle_digest FROM "
+                "graph_first_ingress_identity_v1 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (original_operation_id,),
+            ).fetchone()
+            intent = db.execute(
+                "SELECT identity_json,requirements_json FROM "
+                "graph_first_ingress_intents_v2 WHERE bot=? AND persona=? "
+                "AND operation_id=?",
+                namespace.as_tuple + (original_operation_id,),
+            ).fetchone()
+            bundle = db.execute(
+                "SELECT digest,receipt_json FROM graph_bundle_operations WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (original_operation_id,),
+            ).fetchone()
+            if identity is None or intent is None or bundle is None:
+                raise UnavailableGuard("baseline original ingress identity absent; HOLD")
+            original = json.loads(identity[6])
+            original_intent = json.loads(intent[0])
+            receipt = json.loads(bundle[1])
+            if (identity[0] != outbox.payload_ref
+                    or (original_intent["source_ref"],
+                        original_intent["conversation_ref"]) != (identity[0], identity[2])
+                    or (original["source_ref"], original["platform_ref"],
+                        original["conversation_ref"], original["sender_ref"],
+                        original["message_id"], original["visibility"],
+                        original["operation_id"]) != (*identity[:6], original_operation_id)
+                    or identity[7] != bundle[0]
+                    or job_key.token not in receipt.get("ledger_refs", ())
+                    or authority.audience != (identity[2],)):
+                raise UnavailableGuard("baseline original ingress identity differs; HOLD")
+            source_row = db.execute(
+                "SELECT value FROM graph_atoms WHERE token=? AND revision=? AND valid=1",
+                (source_version.key.token, source_version.revision),
+            ).fetchone()
+            access_row = db.execute(
+                "SELECT value FROM graph_atoms WHERE token=? AND revision=? AND valid=1",
+                (access_version.key.token, access_version.revision),
+            ).fetchone()
+            if source_row is None or access_row is None:
+                raise UnavailableGuard("baseline current source/access disappeared; HOLD")
+            source = SourceRecord.from_dict(json.loads(source_row[0]))
+            access = json.loads(access_row[0])
+            if (source.speaker_id != identity[3]
+                    or "context" not in source.purposes
+                    or "context" not in access["purposes"]
+                    or identity[2] not in source.audiences
+                    or identity[2] not in access["audiences"]):
+                raise UnavailableGuard("baseline current source/access differs; HOLD")
+            qualification = self._original_first_ingress_qualification_locked(
+                namespace, original_operation_id, source_version.key.token)
+            epochs = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone()
+            if epochs is None:
+                raise UnavailableGuard("baseline current authority epochs absent; HOLD")
+            return (job, source_version, access_version, qualification, epochs,
+                    json.loads(intent[1])["graph_incarnation"])
+
+        prepared, anchor, metadata, graph_epoch = self._read_v2(
+            authority, reader, return_recovery_context=True)
+        job, source_version, access_version, qualification, epochs, original_incarnation = prepared
+        if metadata.requirements.graph_incarnation != original_incarnation:
+            raise UnavailableGuard("baseline graph incarnation differs from original ingress; HOLD")
+        return FirstIngressBaselineInputsV1(
+            namespace, original_incarnation, metadata.graph_revision,
+            graph_epoch.revision, *epochs, job_id, job.activity_id,
+            original_operation_id, source_version.key.token,
+            source_version.revision, access_version.revision, qualification,
+            anchor)
+
     def read_first_ingress_encoding_job_v2(
         self, authority: AuthorityContext, lease: object, job_id: str,
         acquire_operation_id: str,
