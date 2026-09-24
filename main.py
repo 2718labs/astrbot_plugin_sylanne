@@ -102,7 +102,7 @@ class Sylanne3Plugin(Star):
         self._runtime: RuntimeContext | None = None
         self._v2_installation: V2InstallationAssembly | None = None
         self._encoding_tasks: set[asyncio.Task] = set()
-        self._encoding_attempted: set[tuple[str, str, str, str]] = set()
+        self._encoding_inflight: set[tuple[str, str, str, str]] = set()
         self._encoding_stopping = False
         self._installed_namespace: NamespaceId | None = None
         self._scene_candidates = SceneCandidateCatalog()
@@ -359,16 +359,19 @@ class Sylanne3Plugin(Star):
             logger.warning("Sylanne 3 first encoding handoff identity unavailable; HOLD")
             return
         key = (*envelope.namespace.as_tuple, stages.job_id, receipt.operation_id)
-        if key in self._encoding_attempted:
+        if key in self._encoding_inflight:
             return
-        if len(self._encoding_tasks) >= 1 or len(self._encoding_attempted) >= 1024:
+        if len(self._encoding_tasks) >= 1:
             logger.warning("Sylanne 3 first encoding handoff capacity reached; HOLD")
             return
         task = asyncio.create_task(self._run_first_ingress_c02(
             runtime, installation, trusted_umo, envelope, receipt))
-        self._encoding_attempted.add(key)
+        self._encoding_inflight.add(key)
         self._encoding_tasks.add(task)
-        task.add_done_callback(self._encoding_tasks.discard)
+        def release(completed: asyncio.Task) -> None:
+            self._encoding_tasks.discard(completed)
+            self._encoding_inflight.discard(key)
+        task.add_done_callback(release)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def ingress(self, event: AstrMessageEvent) -> None:

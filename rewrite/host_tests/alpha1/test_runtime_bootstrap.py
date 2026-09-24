@@ -792,7 +792,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             await plugin.ingress(event)
         driver.assert_not_awaited()
         self.assertEqual(plugin._encoding_tasks, set())
-        self.assertEqual(plugin._encoding_attempted, set())
+        self.assertEqual(plugin._encoding_inflight, set())
         self.assertEqual(event.sent, [])
 
     async def test_auto_c02_handoff_is_bounded_once_and_drains_on_terminate(self) -> None:
@@ -855,11 +855,70 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             await plugin.ingress(event)
             self.assertEqual(len(calls), 1)
             self.assertEqual(len(plugin._encoding_tasks), 1)
-            self.assertEqual(len(plugin._encoding_attempted), 1)
+            self.assertEqual(len(plugin._encoding_inflight), 1)
             self.assertEqual(calls[0][1]["trusted_umo"], event.unified_msg_origin)
             await plugin.terminate()
         self.assertTrue(cancelled.is_set())
         self.assertEqual(plugin._encoding_tasks, set())
+        self.assertEqual(plugin._encoding_inflight, set())
+        self.assertEqual(event.sent, [])
+
+    async def test_auto_c02_handoff_retries_same_original_after_hold(self) -> None:
+        module = load_plugin_module()
+        calls = []
+        completed = asyncio.Event()
+
+        class ControlledRuntime:
+            async def handle_ingress(self, _envelope):
+                return IngressReceipt("accepted", "ingress-1")
+
+            async def first_ingress_c02_accounting_installed_v1(self):
+                return True
+
+            async def commit_first_ingress_pre_encoding_stages_v1(
+                self, envelope, receipt,
+            ):
+                stage_receipt = CommitReceipt(
+                    "committed", "stage-op", "a" * 64, "activity", None, 1,
+                    (), (), (), (), (),
+                )
+                return module.FirstIngressPreEncodingStagesV1(
+                    envelope.namespace, receipt.operation_id, "job-1",
+                    stage_receipt, stage_receipt,
+                )
+
+        async def held_driver(*args, **kwargs):
+            calls.append((args, kwargs))
+            completed.set()
+            return None
+
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None,
+                    None, None, None, None, None),
+            {"enabled": True},
+        )
+        plugin.context = _IngressContext()
+        plugin._runtime = ControlledRuntime()
+        plugin._v2_installation = object()
+        plugin.runtime_health = RuntimeHealth("ready")
+        event = Event()
+        plugin._installed_namespace = (
+            await module.build_astrbot_ingress(event, plugin.context)).namespace
+        with patch.object(module, "run_installed_first_ingress_c02_v1",
+                          new=held_driver):
+            await plugin.ingress(event)
+            await asyncio.wait_for(completed.wait(), 1)
+            await asyncio.sleep(0)
+            self.assertEqual(plugin._encoding_tasks, set())
+            self.assertEqual(plugin._encoding_inflight, set())
+            completed.clear()
+            await plugin.ingress(event)
+            await asyncio.wait_for(completed.wait(), 1)
+            await asyncio.sleep(0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1]["receipt"].operation_id, "ingress-1")
+        self.assertEqual(calls[1][1]["receipt"].operation_id, "ingress-1")
+        self.assertEqual(plugin._encoding_inflight, set())
         self.assertEqual(event.sent, [])
 
     async def test_limited_installed_v2_ingress_never_claims_receipt_as_reply(self) -> None:
