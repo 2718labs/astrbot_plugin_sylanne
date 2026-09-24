@@ -3,7 +3,8 @@
 //! entire synchronous call and must not mutate them or overlap the output.
 use crate::interval::Interval;
 use crate::interval_verifier::{
-    linear_readout, verify_affine_switched_trajectory, verify_fixed_trajectory,
+    linear_readout, verify_affine_switched_trajectory,
+    verify_affine_switched_trajectory_with_energy_jump, verify_fixed_trajectory,
     verify_fixed_trajectory_from_error, verify_joint_error_bounds, verify_joint_step,
     JointVerificationInput, SparseMatrix,
 };
@@ -11,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{mem, ptr, slice};
 
 const VERSION: u32 = 1;
+const SWITCH_REPORT_VERSION_2: u32 = 2;
 const MAX_N: usize = 64;
 const MAX_NNZ: usize = 4_096;
 const MAX_TRAJECTORY_STEPS: usize = 64;
@@ -134,6 +136,27 @@ pub struct AffineSwitchedTrajectoryMathReport {
     nominal_mapping_error: ReportInterval,
     mapped_error: ReportInterval,
     final_time_error: ReportInterval,
+}
+
+/// Version 2 retains the V1 prefix and adds the parameter-event energy ledger.
+/// This is a mathematical enclosure, conditional on the supplied initial error
+/// and affine map; it does not establish external event authority.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AffineSwitchedTrajectoryMathReportV2 {
+    struct_size: u32,
+    version: u32,
+    status: i32,
+    product_certificate_flags: u32,
+    before_steps_verified: u32,
+    after_steps_verified: u32,
+    input_sha256: [u8; 32],
+    before_final_time_error: ReportInterval,
+    mapping_lipschitz_upper: f64,
+    nominal_mapping_error: ReportInterval,
+    mapped_error: ReportInterval,
+    final_time_error: ReportInterval,
+    switch_energy_jump: ReportInterval,
 }
 
 #[no_mangle]
@@ -559,9 +582,196 @@ pub unsafe extern "C" fn sylanne3_v2_affine_switched_trajectory_math_report_v1(
     0
 }
 
+/// Version 2 also encloses E_new(z_new) - E_old(z_old) at the explicit switch.
+/// The enclosure uses the old trajectory error and the full mapped-state error
+/// independently of either segment's fixed-parameter dissipation.
+///
+/// # Safety
+/// Follows [`sylanne3_v2_affine_switched_trajectory_math_report_v1`] pointer
+/// requirements. Output must have the exact V2 layout and exclusive storage.
+#[no_mangle]
+pub unsafe extern "C" fn sylanne3_v2_affine_switched_trajectory_math_report_v2(
+    before_steps: *const TrajectoryMathStep,
+    before_count: u32,
+    after_steps: *const TrajectoryMathStep,
+    after_count: u32,
+    initial_error_upper: f64,
+    mapping: ReportCsr,
+    offset: *const f64,
+    output: *mut AffineSwitchedTrajectoryMathReportV2,
+    output_size: u32,
+) -> i32 {
+    if !aligned(output)
+        || output_size as usize != mem::size_of::<AffineSwitchedTrajectoryMathReportV2>()
+    {
+        return -1;
+    }
+    let mut report = AffineSwitchedTrajectoryMathReportV2 {
+        struct_size: mem::size_of::<AffineSwitchedTrajectoryMathReportV2>() as u32,
+        version: SWITCH_REPORT_VERSION_2,
+        status: -1,
+        ..AffineSwitchedTrajectoryMathReportV2::default()
+    };
+    ptr::write(output, report);
+    let (Some(before), Some(after)) = (
+        parse_trajectory_steps(before_steps, before_count),
+        parse_trajectory_steps(after_steps, after_count),
+    ) else {
+        return -1;
+    };
+    let old_n = before.last().unwrap().y.len();
+    let new_n = after.first().unwrap().x.len();
+    let (Some(map), Some(offset_values)) = (matrix(mapping, new_n, old_n), vector(offset, new_n))
+    else {
+        return -1;
+    };
+    let verified = Interval::new(0.0, initial_error_upper)
+        .ok()
+        .and_then(|initial| {
+            verify_affine_switched_trajectory_with_energy_jump(
+                &before,
+                &after,
+                initial,
+                map,
+                offset_values,
+            )
+            .ok()
+        });
+    let Some((verified, energy_jump)) = verified else {
+        report.status = -2;
+        ptr::write(output, report);
+        return -2;
+    };
+    report.before_steps_verified = verified.before.steps.len() as u32;
+    report.after_steps_verified = verified.after.steps.len() as u32;
+    let mut hash = Sha256::new();
+    hash.update(b"sylanne3-affine-switched-trajectory-math-report-v2\0");
+    hash.update(verified.input_sha256);
+    report.input_sha256.copy_from_slice(&hash.finalize());
+    report.before_final_time_error = verified.before.final_time_error.into();
+    report.mapping_lipschitz_upper = verified.switch.mapping_lipschitz_upper;
+    report.nominal_mapping_error = verified.switch.nominal_mapping_error.into();
+    report.mapped_error = verified.switch.mapped_error.into();
+    report.final_time_error = verified.after.final_time_error.into();
+    report.switch_energy_jump = energy_jump.into();
+    report.status = 0;
+    ptr::write(output, report);
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffi_v2_switch_reports_separate_energy_jump_and_preserves_v1_layout() {
+        let offsets = [0, 1];
+        let indices = [0];
+        let one = [1.0];
+        let two = [2.0];
+        let half = [0.5];
+        let empty_offsets = [0, 0];
+        let a_offsets = [0];
+        let csr = |values: &[f64; 1]| ReportCsr {
+            rows: 1,
+            cols: 1,
+            nnz: 1,
+            offsets: offsets.as_ptr(),
+            indices: indices.as_ptr(),
+            values: values.as_ptr(),
+        };
+        let empty = ReportCsr {
+            rows: 1,
+            cols: 1,
+            nnz: 0,
+            offsets: empty_offsets.as_ptr(),
+            indices: ptr::null(),
+            values: ptr::null(),
+        };
+        let no_nonlinear = ReportCsr {
+            rows: 0,
+            cols: 1,
+            nnz: 0,
+            offsets: a_offsets.as_ptr(),
+            indices: ptr::null(),
+            values: ptr::null(),
+        };
+        let old_state = [1.0];
+        let new_state = [2.251];
+        let old_drive = [1.0];
+        let new_drive = [2.251];
+        let step =
+            |k: ReportCsr, r: ReportCsr, state: &[f64; 1], drive: &[f64; 1]| TrajectoryMathStep {
+                struct_size: mem::size_of::<TrajectoryMathStep>() as u32,
+                version: VERSION,
+                n: 1,
+                k,
+                r,
+                j: empty,
+                a: no_nonlinear,
+                alpha: ptr::null(),
+                x: state.as_ptr(),
+                y: state.as_ptr(),
+                drive: drive.as_ptr(),
+                h: 0.001,
+            };
+        let before = [step(csr(&one), csr(&one), &old_state, &old_drive)];
+        let after = [step(csr(&two), csr(&half), &new_state, &new_drive)];
+        let map = csr(&two);
+        let offset = [0.25];
+        let mut report = AffineSwitchedTrajectoryMathReportV2::default();
+        let size = mem::size_of::<AffineSwitchedTrajectoryMathReportV2>() as u32;
+        assert!(size > mem::size_of::<AffineSwitchedTrajectoryMathReport>() as u32);
+        let mut legacy = AffineSwitchedTrajectoryMathReport::default();
+        assert_eq!(
+            unsafe {
+                sylanne3_v2_affine_switched_trajectory_math_report_v1(
+                    before.as_ptr(),
+                    1,
+                    after.as_ptr(),
+                    1,
+                    0.01,
+                    map,
+                    offset.as_ptr(),
+                    &mut legacy,
+                    mem::size_of::<AffineSwitchedTrajectoryMathReport>() as u32,
+                )
+            },
+            0
+        );
+        assert_eq!(legacy.version, 1);
+        assert_eq!(legacy.product_certificate_flags, 0);
+        let call = |error, output: &mut AffineSwitchedTrajectoryMathReportV2| unsafe {
+            sylanne3_v2_affine_switched_trajectory_math_report_v2(
+                before.as_ptr(),
+                1,
+                after.as_ptr(),
+                1,
+                error,
+                map,
+                offset.as_ptr(),
+                output,
+                size,
+            )
+        };
+        assert_eq!(call(0.01, &mut report), 0);
+        assert_eq!(report.version, 2);
+        assert_eq!(report.product_certificate_flags, 0);
+        let true_old = 1.0 + 0.01 * (-0.001_f64).exp();
+        let true_new = 2.0 * true_old + 0.25;
+        let actual_jump = true_new * true_new - 0.5 * true_old * true_old;
+        assert!(report.switch_energy_jump.lower <= actual_jump);
+        assert!(actual_jump <= report.switch_energy_jump.upper);
+        assert!(report.switch_energy_jump.lower > 0.0);
+        assert!(report.mapped_error.upper > 2.0 * report.before_final_time_error.upper);
+        let hash = report.input_sha256;
+        assert_eq!(call(0.0, &mut report), 0);
+        assert_ne!(report.input_sha256, hash);
+        assert!(report.switch_energy_jump.upper < actual_jump);
+        assert_eq!(call(-1.0, &mut report), -2);
+        assert_eq!(report.switch_energy_jump.upper, 0.0);
+        assert_eq!(report.product_certificate_flags, 0);
+    }
 
     #[test]
     fn ffi_trajectory_derives_history_and_rejects_forged_link() {

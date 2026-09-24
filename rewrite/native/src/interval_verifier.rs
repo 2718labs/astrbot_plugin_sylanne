@@ -204,6 +204,63 @@ pub(crate) fn verify_affine_switched_trajectory(
     })
 }
 
+/// Bound the parameter-event energy ledger separately from fixed-parameter
+/// dissipation. The old state is enclosed by the verified old trajectory error;
+/// the new state uses the full mapped error, including the nominal map mismatch.
+/// Both energies are evaluated with their own checked model parameters.
+pub(crate) fn verify_affine_switched_trajectory_with_energy_jump(
+    before_steps: &[JointVerificationInput<'_>],
+    after_steps: &[JointVerificationInput<'_>],
+    initial_error: Interval,
+    mapping: SparseMatrix<'_>,
+    offset: &[f64],
+) -> Result<(AffineSwitchedTrajectoryBounds, Interval), VerifierError> {
+    let verified = verify_affine_switched_trajectory(
+        before_steps,
+        after_steps,
+        initial_error,
+        mapping,
+        offset,
+    )?;
+    let old = before_steps.last().ok_or(VerifierError::InvalidDimension)?;
+    let new = after_steps.first().ok_or(VerifierError::InvalidDimension)?;
+    let old_state = state_error_ball(old.y, verified.before.final_time_error)?;
+    let new_state = state_error_ball(new.x, verified.switch.mapped_error)?;
+    let old_energy = energy(
+        old.k,
+        old.a,
+        old.alpha,
+        &old_state,
+        &matvec(old.a, &old_state)?,
+    )?;
+    let new_energy = energy(
+        new.k,
+        new.a,
+        new.alpha,
+        &new_state,
+        &matvec(new.a, &new_state)?,
+    )?;
+    let energy_jump = finite_interval(new_energy.sub(old_energy)?)?;
+    Ok((verified, energy_jump))
+}
+
+fn state_error_ball(nominal: &[f64], error: Interval) -> Result<Vec<Interval>, VerifierError> {
+    if !error.upper().is_finite() || error.lower() < 0.0 {
+        return Err(VerifierError::InvalidInheritedError);
+    }
+    let radius = Interval::new(-error.upper(), error.upper())?;
+    nominal
+        .iter()
+        .map(|value| {
+            let coordinate = finite_interval(Interval::point(*value)?.add(radius)?)?;
+            if coordinate.lower() < -MAX_ABS_INPUT || coordinate.upper() > MAX_ABS_INPUT {
+                return Err(VerifierError::InvalidState);
+            }
+            Ok(coordinate)
+        })
+        .collect()
+}
+
 /// Propagate a verified old-state error through `new = M old + offset`.
 /// The complete mapping is checked here; no caller-supplied Lipschitz claim is
 /// accepted. The nominal new state may differ from the exact affine image by
@@ -1426,6 +1483,69 @@ mod tests {
             verify_affine_parameter_switch(map, &[0.0], first.y, &[2.05], before.time_error)
                 .unwrap();
         assert!(unexplained.mapped_error.upper() > offset.mapped_error.upper() + 0.24);
+    }
+
+    #[test]
+    fn switch_energy_jump_encloses_amplified_old_error_and_nominal_map_gap() {
+        let old_k = [1.0];
+        let new_k = [2.0];
+        let old_r = [1.0];
+        let new_r = [0.5];
+        let empty = SparseMatrix::new(1, 1, &[0, 0], &[], &[]);
+        let no_nonlinear = SparseMatrix::new(0, 1, &[0], &[], &[]);
+        // Old nominal state is stationary under its drive; the independent
+        // initial condition can still be 0.01 away from that nominal state.
+        let before = JointVerificationInput {
+            k: scalar_matrix(&old_k),
+            r: scalar_matrix(&old_r),
+            j: empty,
+            a: no_nonlinear,
+            alpha: &[],
+            x: &[1.0],
+            y: &[1.0],
+            h: 0.001,
+            drive: &[1.0],
+        };
+        let after = JointVerificationInput {
+            k: scalar_matrix(&new_k),
+            r: scalar_matrix(&new_r),
+            x: &[2.251],
+            y: &[2.251],
+            drive: &[2.251],
+            ..before
+        };
+        let map_values = [2.0];
+        let (verified, jump) = verify_affine_switched_trajectory_with_energy_jump(
+            &[before],
+            &[after],
+            Interval::new(0.0, 0.01).unwrap(),
+            scalar_matrix(&map_values),
+            &[0.25],
+        )
+        .unwrap();
+        let true_old = 1.0 + 0.01 * (-0.001_f64).exp();
+        let true_new = 2.0 * true_old + 0.25;
+        let actual_jump = true_new * true_new - 0.5 * true_old * true_old;
+        assert!(jump.lower() <= actual_jump && actual_jump <= jump.upper());
+        assert!(jump.lower() > 0.0);
+        assert!(
+            verified.switch.mapped_error.upper() > 2.0 * verified.before.final_time_error.upper()
+        );
+        // A calculation at nominal points misses this positive-energy case.
+        let nominal_jump = 2.251_f64.powi(2) - 0.5;
+        assert!(nominal_jump < actual_jump);
+        let (without_error, _) = verify_affine_switched_trajectory_with_energy_jump(
+            &[before],
+            &[after],
+            Interval::point(0.0).unwrap(),
+            scalar_matrix(&map_values),
+            &[0.25],
+        )
+        .unwrap();
+        assert!(
+            without_error.before.final_time_error.upper()
+                < verified.before.final_time_error.upper()
+        );
     }
 
     #[test]
