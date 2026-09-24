@@ -6,6 +6,7 @@ from .clock import (
     install_schema as _install_clock_schema,
 )
 from .jobs import PersistentJob, install_schema as _install_job_schema
+from .encoding_call_binding import install_schema as _install_encoding_call_schema
 
 
 def install_schema(db) -> None:
@@ -16,6 +17,7 @@ def install_schema(db) -> None:
     """
     _install_budget_schema(db)
     _install_job_schema(db)
+    _install_encoding_call_schema(db)
     _install_clock_schema(db)
 
 __all__ = [

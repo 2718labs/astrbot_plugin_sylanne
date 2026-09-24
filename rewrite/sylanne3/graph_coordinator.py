@@ -190,6 +190,18 @@ class JobAcquireOutcomeUnknown(UnavailableGuard):
         self.operation_id = operation_id
 
 
+@dataclass(frozen=True, slots=True)
+class FirstIngressEncodingInputsV1:
+    """Fenced, current inputs for a trusted fixed-template request issuer."""
+
+    job: PersistentJob
+    source: object
+    source_revision: int
+    access_revision: int
+    budget_lease_id: str
+    budget_reservation_operation_id: str
+
+
 @dataclass(frozen=True)
 class NamespaceProvisionReceiptV2:
     """Durable business genesis and the exact Authority finish to reconcile."""
@@ -5534,6 +5546,72 @@ class GraphCoordinator:
                     authority.activation_generation):
                 raise AuthorityDenied("D11 job read lease names another job")
             return job
+
+        return self._read_v2(authority, reader)
+
+    def read_first_ingress_encoding_inputs_v2(
+        self, authority: AuthorityContext, lease: object, job_id: str,
+        acquire_operation_id: str,
+    ) -> FirstIngressEncodingInputsV1:
+        """Read the acquired job and its original source under one v2 fence.
+
+        This is preparation only. A caller cannot turn this read into a model
+        handoff or durable binding without the separate write admission.
+        """
+        from .memory_types import SourceRecord
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D11BudgetJobIssuer
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("v2 encoding input read requires the installed graph")
+        self._authorize(lease, authority, frozenset({"d11"}), owner_read=True)
+        if (authority.issuer_domain != "d11" or "activity" not in authority.owner_scope
+                or type(acquire_operation_id) is not str
+                or authority.capability_ref != _operation_capability_ref(
+                    authority.namespace, authority.actor, "d11", frozenset({"d11"}),
+                    authority.activation_generation, acquire_operation_id)):
+            raise AuthorityDenied("encoding input read requires the job-bound D11 lease")
+        try:
+            now = trusted_upper(self.__content_fence_v2.read_ingress_clock(
+                self.__scene_clock_policy))
+        except Exception as exc:
+            raise UnavailableGuard("encoding input trusted clock unavailable; HOLD") from exc
+
+        def reader():
+            (job, _, _, outbox, _, _, source_version, access_version) = (
+                self._first_ingress_encoding_job_locked(authority.namespace, job_id))
+            if not _job_acquire_id_matches(
+                    acquire_operation_id, authority.namespace, job_id,
+                    job.operation_id, authority.actor,
+                    authority.activation_generation):
+                raise AuthorityDenied("encoding input read lease names another job")
+            if (job.phase != "running" or job.lease_holder != authority.actor
+                    or job.cancel_epoch or job.fence < 1
+                    or authority.worker_fence != job.fence):
+                raise UnavailableGuard("encoding input job lease is not current; HOLD")
+            from datetime import datetime
+            expiry = datetime.fromisoformat(
+                job.lease_expires_utc.replace("Z", "+00:00")).timestamp()
+            if now >= expiry:
+                raise UnavailableGuard("encoding input job lease expired; HOLD")
+            self.__d11_issuer.authorize_existing_encoding_job(
+                self.__store._db, job, now_utc=now)
+            row = self.__store._db.execute(
+                "SELECT value FROM graph_atoms WHERE token=? AND valid=1",
+                (source_version.key.token,),
+            ).fetchone()
+            if row is None:
+                raise UnavailableGuard("encoding source disappeared; HOLD")
+            source = SourceRecord.from_dict(json.loads(row[0]))
+            if source.source_id != outbox.payload_ref:
+                raise UnavailableGuard("encoding source differs from original outbox")
+            return FirstIngressEncodingInputsV1(
+                job, source, source_version.revision, access_version.revision,
+                job.budget_ref, job.operation_id)
 
         return self._read_v2(authority, reader)
 

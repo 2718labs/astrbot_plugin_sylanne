@@ -82,6 +82,30 @@ def test_first_ingress_job_acquire_is_durable_and_exactly_replayed(ingress_syste
             authority, lease, job_id, "acquire-encoding-2", lease_seconds=30)
 
 
+def test_acquired_encoding_inputs_are_read_from_current_source(ingress_system):
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    acquired = coordinator.acquire_first_ingress_encoding_job_v2(
+        authority, lease, job_id, operation_id, lease_seconds=30)
+    current_authority = replace(authority, worker_fence=acquired.fence)
+    inputs = coordinator.read_first_ingress_encoding_inputs_v2(
+        current_authority, lease, job_id, operation_id)
+    assert inputs.job == acquired
+    assert inputs.source.text == host.text
+    assert inputs.source.source_id == host.lineage.source_ref
+    assert inputs.source_revision == 1 and inputs.access_revision == 1
+    assert inputs.budget_lease_id == acquired.budget_ref
+    assert inputs.budget_reservation_operation_id == acquired.operation_id
+    with pytest.raises(UnavailableGuard, match="not current"):
+        coordinator.read_first_ingress_encoding_inputs_v2(
+            authority, lease, job_id, operation_id)
+
+
 def test_d11_lease_cannot_acquire_a_different_operation(ingress_system):
     store, coordinator, bootstrap, _port, policy, clock, encoding, host = ingress_system
     coordinator._GraphCoordinator__scene_clock_policy = clock
