@@ -101,7 +101,11 @@ def original_model_budget_actual(
     usage, money = dict(fact.recovery.usage), dict(fact.recovery.cost)
     actual: dict[str, int] = {}
     for dimension in quote.ceiling:
-        if dimension == "model_tokens":
+        if dimension in {"input_tokens", "output_tokens"}:
+            if dimension not in usage:
+                return None
+            actual[dimension] = usage[dimension]
+        elif dimension == "model_tokens":
             if not {"input_tokens", "output_tokens"} <= usage.keys():
                 return None
             actual[dimension] = usage["input_tokens"] + usage["output_tokens"]

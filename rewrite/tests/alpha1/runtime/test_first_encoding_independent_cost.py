@@ -16,13 +16,17 @@ from sylanne3.runtime.model_cost_settlement import (
     ModelCostUnavailable, OriginalModelCostFactV1,
     original_model_budget_actual, outcome_from_original_model_cost,
 )
-from sylanne3.runtime.issuers import ResourceQuote
+from sylanne3.runtime.issuers import (
+    D02ResourceIssuer, IssuerAuthorityDenied, ResourceQuote,
+    install_schema as install_issuer_schema,
+)
 
 
 class IndependentCostTests(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:")
         install_schema(self.db)
+        install_issuer_schema(self.db)
         create_budget_lease(
             self.db,
             BudgetLease("lease", None, "bot", "persona", "USD",
@@ -123,6 +127,33 @@ class IndependentCostTests(unittest.TestCase):
         self.assertEqual(original_model_budget_actual(fact, self.quote()),
                          {"model_tokens": 120, "model_microusd": 90})
 
+    def test_v2_output_token_quote_uses_original_output_counter(self):
+        quote = ResourceQuote(
+            "v2-quote", 1, "bot", "persona", "activity", "original", None,
+            "lease", "d06.encode_source", "snapshot", 100.0, "resource",
+            None, (), (), {"output_tokens": 80}, None, 100.0,
+        )
+        fact = self.original_fact(
+            usage={"input_tokens": 40, "output_tokens": 72},
+        )
+        from dataclasses import replace
+        intent = replace(fact.intent, budget_ceiling=(("output_tokens", 80),))
+        fact = OriginalModelCostFactV1(
+            intent, replace(fact.recovery, intent=intent),
+            fact.admission, fact.receipt,
+        )
+        self.assertEqual(original_model_budget_actual(fact, quote),
+                         {"output_tokens": 72})
+        quote = replace(quote, ceiling={"input_tokens": 50, "output_tokens": 80})
+        intent = replace(intent, budget_ceiling=(
+            ("input_tokens", 50), ("output_tokens", 80)))
+        fact = OriginalModelCostFactV1(
+            intent, replace(fact.recovery, intent=intent),
+            fact.admission, fact.receipt,
+        )
+        self.assertEqual(original_model_budget_actual(fact, quote),
+                         {"input_tokens": 40, "output_tokens": 72})
+
     def test_wrong_terminal_receipt_cannot_form_cost_fact(self):
         fact = self.original_fact()
         wrong = ModelTerminalReceiptV2(
@@ -134,6 +165,21 @@ class IndependentCostTests(unittest.TestCase):
         with self.assertRaises(ModelCostUnavailable):
             OriginalModelCostFactV1(fact.intent, fact.recovery,
                                     fact.admission, wrong)
+
+    def test_original_signed_quote_survives_loss_of_work_authority(self):
+        issuer = D02ResourceIssuer(b"k" * 32)
+        quote = self.quote()
+        issuer.issue_quote(self.db, quote)
+        self.db.execute(
+            "UPDATE runtime_resource_quotes SET status='revoked' "
+            "WHERE quote_id=? AND version=?", (quote.quote_id, quote.version),
+        )
+        self.assertEqual(
+            issuer.original_signed_quote(self.db, quote.quote_id, quote.version),
+            quote,
+        )
+        with self.assertRaises(IssuerAuthorityDenied):
+            issuer._load_quote(self.db, quote.quote_id, quote.version)
 
 
 if __name__ == "__main__":

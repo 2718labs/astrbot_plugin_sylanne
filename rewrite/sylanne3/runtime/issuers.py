@@ -516,6 +516,28 @@ class D02ResourceIssuer:
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
             raise IssuerAuthorityDenied("resource quote payload is invalid") from exc
 
+    def original_signed_quote(self, db, quote_id: str, version: int) -> ResourceQuote:
+        """Read original signed accounting bounds after expiry or revocation.
+
+        This historical read authorizes no new work or budget reservation.
+        The caller must independently join the original job, Authority call,
+        and durable budget reservation before recording a cost.
+        """
+        row = db.execute(
+            "SELECT quote_json,signature FROM runtime_resource_quotes "
+            "WHERE quote_id=? AND version=?", (quote_id, version),
+        ).fetchone()
+        if row is None:
+            raise IssuerAuthorityDenied("original signed D02 quote is absent")
+        self._signer.verify("resource-quote.v1", row[0], row[1])
+        try:
+            quote = _decode_quote(row[0])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("original signed D02 quote is invalid") from exc
+        if (quote.quote_id, quote.version) != (quote_id, version):
+            raise IssuerAuthorityDenied("original signed D02 quote identity differs")
+        return quote
+
     def qualified_quote(self, envelope: CommandEnvelope, db, *,
                         now_utc: float | None = None) -> ResourceQuote:
         if not isinstance(envelope, CommandEnvelope):
