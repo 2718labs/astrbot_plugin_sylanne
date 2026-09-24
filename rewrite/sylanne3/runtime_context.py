@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import inspect
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
 
@@ -15,7 +16,8 @@ from .domains.d01 import ActiveRoleQualification
 from .domains.d03.context import RoleBinding
 from .graph_coordinator import (
     FirstIngressOutcomeUnknown, GraphCoordinator, IngressClockSample,
-    IngressIssuancePolicy, UnavailableGuard, namespace_ref,
+    IngressIssuancePolicy, UnavailableGuard,
+    first_ingress_encoding_acquire_operation_id, namespace_ref,
 )
 from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
@@ -37,9 +39,8 @@ from .model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION, issue_first_ingress_encoding_request_v2,
 )
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+from .runtime.first_ingress_v2 import ingress_ids
 from .runtime.restore_anchor import ExecutionJournalPort
-from .runtime.restore_anchor import RestoreAnchor
-from .authority_service.v2_model_egress_contract import ModelEgressDraftV1
 from .runtime_contracts import AuthorityContext, InstallationGrantV2, NamespaceId
 from .workbench_api.async_service import AsyncGraphWorkbenchService
 from .workbench_api.domain_registry import CurrentDomainViewRegistry
@@ -383,11 +384,13 @@ class RuntimeContext:
                         )
                         if (first.status in {"committed", "duplicate"}
                                 and type(installation.d03_arrival) is AdminD03ArrivalPolicy):
-                            return graph.commit_d03_message_arrival_v2(
+                            arrival = graph.commit_d03_message_arrival_v2(
                                 bootstrap, host.namespace, host.lineage.source_ref,
                                 policy, installation.d03_arrival,
                                 installation.ingress_clock,
                             )
+                            if arrival.status not in {"committed", "duplicate"}:
+                                return arrival
                         return first
                 owner_runtime = (
                     coordinator, bootstrap, port, policy, current_actor
@@ -750,10 +753,9 @@ class RuntimeContext:
     async def execute_first_ingress_encoding_v2(
         self, authority: AuthorityContext, lease: object,
         job_id: str, acquire_operation_id: str, *,
-        executor: HostModelEgressExecutor, draft: ModelEgressDraftV1,
-        expected_anchor: RestoreAnchor,
+        executor: HostModelEgressExecutor,
     ) -> FrozenEncodingEgressResult | None:
-        """Read the original graph binding, then attempt its Authority-fenced call.
+        """Read original graph and Authority facts, then attempt the fenced call.
 
         The worker's read is the only request source. The separate Authority
         admission rechecks its current graph, budget and model configuration.
@@ -761,8 +763,6 @@ class RuntimeContext:
         """
         if (type(executor) is not HostModelEgressExecutor
                 or type(authority) is not AuthorityContext
-                or type(draft) is not ModelEgressDraftV1
-                or type(expected_anchor) is not RestoreAnchor
                 or self._worker is None
                 or not self._v2_namespace_provisioned
                 or authority.namespace != self._v2_namespace
@@ -771,9 +771,9 @@ class RuntimeContext:
                 or executor._bundle.installation_policy != self._v2_policy):
             return None
         try:
-            binding = await self._worker.call(
+            binding, draft, expected_anchor = await self._worker.call(
                 lambda graph, auth, bound_lease, job, acquire: (
-                    graph.read_first_ingress_encoding_binding_v2(
+                    graph.read_first_ingress_model_egress_preparation_v2(
                         auth, bound_lease, job, acquire)),
                 authority, lease, job_id, acquire_operation_id,
             )
@@ -781,6 +781,90 @@ class RuntimeContext:
             return None
         return await executor.execute_frozen_encoding_once(
             binding=binding, draft=draft, expected_anchor=expected_anchor)
+
+    async def run_committed_first_ingress_encoding_v2(
+        self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
+        executor: HostModelEgressExecutor,
+    ) -> FrozenEncodingEgressResult | None:
+        """Consume one committed ingress job through its installed D11 identity.
+
+        Only a newly committed ingress is scheduled here. The deterministic
+        first-attempt ID preserves the original acquire identity after an
+        uncertain response; a later recovery must inspect that operation and
+        model terminal before considering any new attempt.
+        """
+        if (type(envelope) is not HostIngressEnvelope
+                or type(receipt) is not IngressReceipt
+                or receipt.status != "accepted"
+                or self._worker is None
+                or self._v2_policy is None
+                or self._v2_port is None
+                or self._v2_bootstrap is None
+                or self._v2_installation_grant is None
+                or self._v2_model_bundle is None
+                or self._v2_model_bundle.model_workflows is None
+                or envelope.namespace != self._v2_namespace):
+            return None
+        _, _, ingress_operation_id, job_id, _, _ = ingress_ids(
+            envelope.lineage.source_ref)
+        if receipt.operation_id != ingress_operation_id:
+            return None
+        workflow = self._v2_model_bundle.model_workflows.encode
+        if (type(workflow) is not AdminModelWorkflowV2
+                or envelope.conversation_ref not in workflow.audiences):
+            return None
+        policy = self._v2_policy
+        port = self._v2_port
+        bootstrap = self._v2_bootstrap
+        actor = self._v2_installation_grant.subject
+        lease_seconds = min(3600, math.ceil(workflow.timeout_seconds) + 120)
+
+        def acquire(graph: GraphCoordinator):
+            anchor = port.current_anchor(
+                namespace=policy.namespace,
+                authority_namespace=policy.authority_namespace)
+            generation = anchor.activation_generation
+            attempt_nonce = hashlib.sha256(
+                ("sylanne.first-ingress-encoding-first-attempt.v1:"
+                 + self._v2_installation_grant.installation_id + ":"
+                 + job_id).encode("utf-8")
+            ).hexdigest()[:32]
+            acquire_id = first_ingress_encoding_acquire_operation_id(
+                policy.namespace, job_id, ingress_operation_id,
+                actor, generation, attempt_nonce)
+            lease, capability_ref = graph.grant(
+                bootstrap, actor=actor, issuer_domain="d11",
+                namespace=policy.namespace, domains=("d11",),
+                activation_generation=generation,
+                operation_id=acquire_id)
+            try:
+                authority = AuthorityContext(
+                    actor, "d11", capability_ref, policy.namespace,
+                    ("activity",), workflow.purpose,
+                    (envelope.conversation_ref,), workflow.provider_config_ref,
+                    generation)
+                job = graph.acquire_first_ingress_encoding_job_v2(
+                    authority, lease, job_id, acquire_id,
+                    lease_seconds=lease_seconds)
+            except BaseException:
+                graph.release_authority_lease(bootstrap, lease)
+                raise
+            return (AuthorityContext(
+                actor, "d11", capability_ref, policy.namespace,
+                ("activity",), workflow.purpose,
+                (envelope.conversation_ref,), workflow.provider_config_ref,
+                generation, job.fence), lease, acquire_id)
+
+        try:
+            authority, lease, acquire_id = await self._worker.call(acquire)
+        except Exception:
+            return None
+        try:
+            return await self.execute_first_ingress_encoding_v2(
+                authority, lease, job_id, acquire_id, executor=executor)
+        finally:
+            await self._worker.call(
+                lambda graph: graph.release_authority_lease(bootstrap, lease))
 
     async def handle_ingress(self, envelope: HostIngressEnvelope) -> IngressReceipt:
         if not isinstance(envelope, HostIngressEnvelope):

@@ -117,6 +117,8 @@ class AstrBotModelProvider:
         self._descriptor = descriptor
         self._admin_model = admin_model
         self._installation_bundle = installation_bundle
+        self._aborted = False
+        self._started_calls: set[str] = set()
         self._binding = (context, host_loop, trusted_umo,
                          descriptor.provider_id, descriptor.model_id,
                          admin_model.provider_config_ref,
@@ -345,6 +347,11 @@ class AstrBotModelProvider:
 
     def _launch_on_host(self, entry: _CallEntry,
                         request: ModelCallRequest) -> None:
+        if self._aborted:
+            if not entry.terminal.done():
+                entry.terminal.set_result(
+                    ProviderResponse("unknown", None, {}, {}, None))
+            return
         coroutine = self._invoke_on_host(request)
         try:
             task = asyncio.create_task(coroutine)
@@ -364,7 +371,8 @@ class AstrBotModelProvider:
             except Exception:
                 response = ProviderResponse("unknown", None, {}, {}, None)
             entry.task = None
-            entry.terminal.set_result(response)
+            if not entry.terminal.done():
+                entry.terminal.set_result(response)
 
         task.add_done_callback(finish)
 
@@ -409,6 +417,7 @@ class AstrBotModelProvider:
                 _calls[request.call_id] = entry
                 _admissions[admission.admission_id] = request.call_id
                 first = True
+        self._started_calls.add(request.call_id)
         if first:
             if (request.provider_id != self._descriptor.provider_id
                     or request.model_id != self._descriptor.model_id
@@ -428,6 +437,23 @@ class AstrBotModelProvider:
                         ProviderResponse("not_dispatched", None, {}, {}, None))
         # A cancelled waiter must never cancel the one accepted provider task.
         return await asyncio.shield(asyncio.wrap_future(entry.terminal))
+
+    async def abort_local_dispatches(self) -> None:
+        """Stop this host binding during shutdown; remote outcome stays unknown."""
+        if asyncio.get_running_loop() is not self._host_loop:
+            raise RuntimeError("model host loop required")
+        self._aborted = True
+        with _call_lock:
+            entries = tuple(
+                _calls[call_id] for call_id in self._started_calls
+                if call_id in _calls and self._same_binding(_calls[call_id])
+            )
+        for entry in entries:
+            if entry.task is not None and not entry.task.done():
+                entry.task.cancel()
+            if not entry.terminal.done():
+                entry.terminal.set_result(
+                    ProviderResponse("unknown", None, {}, {}, None))
 
     async def cancel(self, request: ModelCallRequest) -> bool:
         """No host cancellation proof: preserve Broker's unknown outcome."""

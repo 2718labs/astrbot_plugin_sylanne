@@ -19,12 +19,15 @@ from .rewrite.sylanne3.host import (
 from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
 from .rewrite.sylanne3.host.context_scheme_asset import load_verified_context_scheme
 from .rewrite.sylanne3.host.authority_profile import (
-    AdminIngressModelPolicy, AdminInstallationBundle,
+    AdminIngressModelPolicy, AdminInstallationBundle, AdminModelWorkflowsV2,
     AuthorityProfileUnavailable,
 )
 from .rewrite.sylanne3.host.v2_installation import V2InstallationAssembly
 from .rewrite.sylanne3.host.installed_scene_identity import InstalledSceneIdentityPort
 from .rewrite.sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
+from .rewrite.sylanne3.host.first_ingress_encoding_driver import (
+    run_installed_first_ingress_encoding_v2,
+)
 from .rewrite.sylanne3.installation_policy import AdminInstallationPolicy
 from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, SceneCandidateCatalog
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
@@ -60,12 +63,18 @@ def _installed_model_port(
     if type(installation) is not V2InstallationAssembly:
         return None
     bundle = installation.admin_bundle
+    has_v2_workflows = (
+        type(bundle) is AdminInstallationBundle
+        and type(bundle.model_workflows) is AdminModelWorkflowsV2
+        and bundle.ingress_model is None
+    )
     if (type(bundle) is not AdminInstallationBundle
             or installation.installation_policy is not bundle.installation_policy
             or installation.ingress_encoding is not bundle.ingress_encoding
             or installation.ingress_model is not bundle.ingress_model
             or type(bundle.installation_policy) is not AdminInstallationPolicy
-            or type(bundle.ingress_model) is not AdminIngressModelPolicy):
+            or (not has_v2_workflows
+                and type(bundle.ingress_model) is not AdminIngressModelPolicy)):
         return None
     return InstalledModelCapabilityPort(
         context=context, host_loop=host_loop,
@@ -91,6 +100,8 @@ class Sylanne3Plugin(Star):
             self._enabled = False
             self._config_valid = False
         self._runtime: RuntimeContext | None = None
+        self._v2_installation: V2InstallationAssembly | None = None
+        self._encoding_tasks: set[asyncio.Task] = set()
         self._installed_namespace: NamespaceId | None = None
         self._scene_candidates = SceneCandidateCatalog()
         self.runtime_health = RuntimeHealth("limited", ("not_started",))
@@ -228,6 +239,7 @@ class Sylanne3Plugin(Star):
                 **({"model_selection_port": model_port} if model_port is not None else {}),
             )
             health = await self._runtime.start_v2(installation)
+            self._v2_installation = installation
             self._installed_namespace = installation.installation_policy.namespace
         except Exception:
             self.runtime_health = RuntimeHealth("blocked", ("runtime_bootstrap",))
@@ -298,6 +310,12 @@ class Sylanne3Plugin(Star):
         self._workbench.close()
         self._scene_candidates.clear()
         self._installed_namespace = None
+        if self._encoding_tasks:
+            for task in self._encoding_tasks:
+                task.cancel()
+            await asyncio.gather(*self._encoding_tasks, return_exceptions=True)
+            self._encoding_tasks.clear()
+        self._v2_installation = None
         if self._runtime is not None:
             self.runtime_health = await self._runtime.stop()
             self._runtime = None
@@ -338,6 +356,29 @@ class Sylanne3Plugin(Star):
         # processing every event, including duplicate and deferred ingress.
         if receipt.status == "deferred":
             logger.warning("Sylanne 3 ingress outcome pending confirmation")
+        elif receipt.status == "accepted" and self._v2_installation is not None:
+            task = asyncio.create_task(self._run_first_ingress_encoding(
+                runtime, self._v2_installation, event.unified_msg_origin,
+                envelope, receipt))
+            self._encoding_tasks.add(task)
+            task.add_done_callback(self._encoding_tasks.discard)
+
+    async def _run_first_ingress_encoding(
+        self, runtime: RuntimeContext, installation: V2InstallationAssembly,
+        trusted_umo: str, envelope, receipt,
+    ) -> None:
+        try:
+            result = await run_installed_first_ingress_encoding_v2(
+                runtime, installation, context=self.context,
+                trusted_umo=trusted_umo, envelope=envelope, receipt=receipt)
+        except asyncio.CancelledError:
+            logger.warning("Sylanne 3 first encoding interrupted; terminal HOLD")
+            raise
+        except Exception:
+            logger.exception("Sylanne 3 first encoding unresolved; HOLD")
+            return
+        if result is None or result.terminal is None:
+            logger.warning("Sylanne 3 first encoding unresolved; HOLD")
 
 
 __all__ = ("Sylanne3Plugin",)

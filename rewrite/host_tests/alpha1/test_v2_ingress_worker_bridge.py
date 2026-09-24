@@ -197,8 +197,8 @@ async def test_v2_ingress_uses_installed_path_while_global_health_stays_limited(
     admitted = True
     first = await context.handle_ingress(envelope(installed.installation_policy.namespace))
     second = await context.handle_ingress(envelope(installed.installation_policy.namespace))
-    assert first == IngressReceipt("accepted", "arrival-op")
-    assert second == IngressReceipt("duplicate", "arrival-op")
+    assert first == IngressReceipt("accepted", "ingress-op")
+    assert second == IngressReceipt("duplicate", "ingress-op")
     assert trace.count(("arrival", "a" * 64)) == 2
     ingress_calls = [item for item in trace if isinstance(item, tuple)
                      and type(item[0]) is IngressHostFacts]

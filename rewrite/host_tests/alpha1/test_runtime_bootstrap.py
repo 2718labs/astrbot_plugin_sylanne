@@ -212,6 +212,29 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(module._installed_model_port(
             context, asyncio.get_running_loop(),
             replace(installation, ingress_model=replace(model, privacy_tier="public"))))
+        shared = dict(
+            provider_id=model.provider_id, model_id=model.model_id,
+            provider_config_ref=model.provider_config_ref,
+            provider_config_digest=model.provider_config_digest,
+            audiences=("owner",), privacy_tier="private",
+            required_capabilities=("text",), timeout_seconds=2.0,
+            max_output_tokens=64, quote_ceiling={"output_tokens": 64},
+        )
+        workflows = profile.AdminModelWorkflowsV2(
+            2,
+            profile.AdminModelWorkflowV2(
+                work_kind="d06.encode_source", purpose="consolidation",
+                template_version="d06.first-ingress-encoding.v2", **shared),
+            profile.AdminModelWorkflowV2(
+                work_kind="reply", purpose="proposal",
+                template_version="d09.reply.v1", **shared),
+        )
+        v2_bundle = replace(bundle, ingress_model=None, model_workflows=workflows)
+        v2_installation = replace(
+            installation, ingress_model=None, admin_bundle=v2_bundle)
+        self.assertIsInstance(module._installed_model_port(
+            context, asyncio.get_running_loop(), v2_installation),
+            module.InstalledModelCapabilityPort)
 
     async def test_runtime_context_accepts_host_scene_verify_port_without_sdk_type(self) -> None:
         class ScenePort:
@@ -687,6 +710,41 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(controlled.envelopes), 1)
         self.assertEqual(controlled.envelopes[0].lineage.source_ref.__len__(), 64)
         self.assertEqual(len(plugin.observed_scene_candidates(expected.namespace)), 1)
+
+    async def test_committed_v2_ingress_schedules_once_without_claiming_reply(self) -> None:
+        module = load_plugin_module()
+
+        class ControlledRuntime:
+            def __init__(self):
+                self.calls = 0
+
+            async def handle_ingress(self, _envelope):
+                self.calls += 1
+                return IngressReceipt(
+                    "accepted" if self.calls == 1 else "duplicate", "ingress-op")
+
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),
+            {"enabled": True},
+        )
+        plugin.context = _IngressContext()
+        plugin._runtime = ControlledRuntime()
+        plugin._v2_installation = object()
+        plugin.runtime_health = RuntimeHealth("ready")
+        event = Event()
+        expected = await module.build_astrbot_ingress(event, plugin.context)
+        plugin._installed_namespace = expected.namespace
+        with patch.object(module, "run_installed_first_ingress_encoding_v2",
+                          new=AsyncMock(return_value=types.SimpleNamespace(
+                              terminal=object()))) as run:
+            await plugin.ingress(event)
+            await asyncio.gather(*plugin._encoding_tasks)
+            await plugin.ingress(event)
+            self.assertEqual(run.await_count, 1)
+            self.assertEqual(run.await_args.kwargs["trusted_umo"], event.unified_msg_origin)
+            self.assertEqual(run.await_args.kwargs["receipt"].status, "accepted")
+        self.assertFalse(event.is_stopped())
+        self.assertEqual(event.sent, [])
 
     async def test_limited_installed_v2_ingress_never_claims_receipt_as_reply(self) -> None:
         module = load_plugin_module()

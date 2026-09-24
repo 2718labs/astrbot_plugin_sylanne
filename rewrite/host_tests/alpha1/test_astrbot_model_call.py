@@ -313,6 +313,25 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.terminal_response(
             request.call_id, request.digest, admission.admission_id), response)
 
+    async def test_host_shutdown_aborts_local_task_but_keeps_unknown(self):
+        from sylanne3.host.astrbot_model_call import _calls, _call_lock
+        request = call_request()
+        admission = self.admission_for(request)
+        self.response_gate = asyncio.Event()
+        waiter = asyncio.create_task(self.adapter.invoke_admitted(
+            request, admission, asyncio.Event()))
+        await asyncio.wait_for(self.request_started.wait(), 1)
+        await self.adapter.abort_local_dispatches()
+        response = await asyncio.wait_for(waiter, 1)
+        await asyncio.sleep(0)
+        with _call_lock:
+            task = _calls[request.call_id].task
+        self.assertTrue(task is None or task.done())
+        self.assertEqual(response.status, "unknown")
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.adapter.terminal_response(
+            request.call_id, request.digest, admission.admission_id), response)
+
     async def test_one_http_request_on_host_loop_with_usage(self):
         response = await self.invoke_on_worker()
         self.assertEqual(response.status, "completed")
