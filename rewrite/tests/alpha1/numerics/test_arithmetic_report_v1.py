@@ -37,6 +37,21 @@ class TrajectoryMathReport(ctypes.Structure):
     ]
 
 
+class AffineSwitchedTrajectoryMathReport(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("version", ctypes.c_uint32),
+        ("status", ctypes.c_int32), ("product_certificate_flags", ctypes.c_uint32),
+        ("before_steps_verified", ctypes.c_uint32),
+        ("after_steps_verified", ctypes.c_uint32),
+        ("input_sha256", ctypes.c_ubyte * 32),
+        ("before_final_time_error", ReportInterval),
+        ("mapping_lipschitz_upper", ctypes.c_double),
+        ("nominal_mapping_error", ReportInterval),
+        ("mapped_error", ReportInterval),
+        ("final_time_error", ReportInterval),
+    ]
+
+
 class ArithmeticReportTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -175,6 +190,75 @@ class ArithmeticReportTests(unittest.TestCase):
         self.assertNotEqual(bytes(report.input_sha256), first_hash)
         self.assertEqual(call(steps, 2, -1.0, ctypes.byref(report), size), -2)
         self.assertEqual(report.steps_verified, 0)
+        self.assertEqual(bytes(report.input_sha256), bytes(32))
+
+    def test_affine_switch_propagates_error_and_binds_mapping(self):
+        offsets = (ctypes.c_uint32 * 2)(0, 1)
+        indices = (ctypes.c_uint32 * 1)(0)
+        ones = (ctypes.c_double * 1)(1.0)
+        halves = (ctypes.c_double * 1)(0.5)
+        twos = (ctypes.c_double * 1)(2.0)
+        changed_twos = (ctypes.c_double * 1)(2.1)
+        empty_offsets = (ctypes.c_uint32 * 2)(0, 0)
+        empty_a_offsets = (ctypes.c_uint32 * 1)(0)
+        positive = ReportCSR(1, 1, 1, offsets, indices, ones)
+        new_r = ReportCSR(1, 1, 1, offsets, indices, halves)
+        zero = ReportCSR(1, 1, 0, empty_offsets, None, None)
+        no_nonlinear = ReportCSR(0, 1, 0, empty_a_offsets, None, None)
+        h = 0.001
+        old_factor = (1 - h / 2) / (1 + h / 2)
+        new_factor = (1 - h / 4) / (1 + h / 4)
+        old_x = (ctypes.c_double * 1)(1.0)
+        old_y = (ctypes.c_double * 1)(old_factor)
+        # Include a nominal jump: its 0.001 discrepancy must enter the envelope.
+        new_x = (ctypes.c_double * 1)(2 * old_y[0] + 0.251)
+        new_y = (ctypes.c_double * 1)(new_x[0] * new_factor)
+        drive = (ctypes.c_double * 1)(0.0)
+        offset = (ctypes.c_double * 1)(0.25)
+        before = (TrajectoryMathStep * 1)(TrajectoryMathStep(
+            ctypes.sizeof(TrajectoryMathStep), 1, 1,
+            positive, positive, zero, no_nonlinear,
+            None, old_x, old_y, drive, h))
+        after = (TrajectoryMathStep * 1)(TrajectoryMathStep(
+            ctypes.sizeof(TrajectoryMathStep), 1, 1,
+            positive, new_r, zero, no_nonlinear,
+            None, new_x, new_y, drive, h))
+        mapping = ReportCSR(1, 1, 1, offsets, indices, twos)
+        call = self.library.sylanne3_v2_affine_switched_trajectory_math_report_v1
+        call.argtypes = [ctypes.POINTER(TrajectoryMathStep), ctypes.c_uint32,
+                         ctypes.POINTER(TrajectoryMathStep), ctypes.c_uint32,
+                         ctypes.c_double, ReportCSR, ctypes.POINTER(ctypes.c_double),
+                         ctypes.POINTER(AffineSwitchedTrajectoryMathReport), ctypes.c_uint32]
+        call.restype = ctypes.c_int32
+        report = AffineSwitchedTrajectoryMathReport()
+        size = ctypes.sizeof(report)
+        self.assertEqual(call(before, 1, after, 1, 0.01, mapping,
+                              offset, ctypes.byref(report), size), 0)
+        self.assertEqual(report.product_certificate_flags, 0)
+        self.assertEqual((report.before_steps_verified, report.after_steps_verified), (1, 1))
+        self.assertGreaterEqual(report.mapping_lipschitz_upper, 2.0)
+        self.assertGreaterEqual(report.nominal_mapping_error.upper, 0.001)
+        self.assertGreater(report.mapped_error.upper, 2 * report.before_final_time_error.upper)
+        digest = bytes(report.input_sha256)
+        with localcontext() as context:
+            context.prec = 80
+            d = Decimal.from_float
+            true_old_end = (d(old_x[0]) + d(0.01)) * (-d(h)).exp()
+            true_new_end = (2 * true_old_end + d(0.25)) * (-d(0.5) * d(h)).exp()
+            actual_error = abs(d(new_y[0]) - true_new_end)
+            self.assertLessEqual(actual_error, d(report.final_time_error.upper))
+            self.assertEqual(call(before, 1, after, 1, 0.0, mapping,
+                                  offset, ctypes.byref(report), size), 0)
+            # A falsely exact old state cannot enclose the independently
+            # constructed switched trajectory.
+            self.assertLess(d(report.final_time_error.upper), actual_error)
+        changed_map = ReportCSR(1, 1, 1, offsets, indices, changed_twos)
+        self.assertEqual(call(before, 1, after, 1, 0.01, changed_map,
+                              offset, ctypes.byref(report), size), 0)
+        self.assertNotEqual(bytes(report.input_sha256), digest)
+        self.assertEqual(call(before, 1, after, 1, -1.0, mapping,
+                              offset, ctypes.byref(report), size), -2)
+        self.assertEqual(report.after_steps_verified, 0)
         self.assertEqual(bytes(report.input_sha256), bytes(32))
 
 

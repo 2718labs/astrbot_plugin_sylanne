@@ -3,8 +3,9 @@
 //! entire synchronous call and must not mutate them or overlap the output.
 use crate::interval::Interval;
 use crate::interval_verifier::{
-    linear_readout, verify_fixed_trajectory, verify_fixed_trajectory_from_error,
-    verify_joint_error_bounds, verify_joint_step, JointVerificationInput, SparseMatrix,
+    linear_readout, verify_affine_switched_trajectory, verify_fixed_trajectory,
+    verify_fixed_trajectory_from_error, verify_joint_error_bounds, verify_joint_step,
+    JointVerificationInput, SparseMatrix,
 };
 use sha2::{Digest, Sha256};
 use std::{mem, ptr, slice};
@@ -116,6 +117,23 @@ pub struct TrajectoryMathReport {
     final_time_error: ReportInterval,
     max_endpoint_error: ReportInterval,
     max_reconstruction_defect: ReportInterval,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AffineSwitchedTrajectoryMathReport {
+    struct_size: u32,
+    version: u32,
+    status: i32,
+    product_certificate_flags: u32, // always zero: no source/event authority or graph closure
+    before_steps_verified: u32,
+    after_steps_verified: u32,
+    input_sha256: [u8; 32],
+    before_final_time_error: ReportInterval,
+    mapping_lipschitz_upper: f64,
+    nominal_mapping_error: ReportInterval,
+    mapped_error: ReportInterval,
+    final_time_error: ReportInterval,
 }
 
 #[no_mangle]
@@ -384,48 +402,9 @@ unsafe fn trajectory_math_report_impl(
         ..TrajectoryMathReport::default()
     };
     ptr::write(output, report);
-    if !aligned(steps) || !(1..=MAX_TRAJECTORY_STEPS).contains(&(step_count as usize)) {
+    let Some(numerical_steps) = parse_trajectory_steps(steps, step_count) else {
         return -1;
-    }
-    let raw_steps = slice::from_raw_parts(steps, step_count as usize);
-    let mut numerical_steps = Vec::with_capacity(raw_steps.len());
-    for raw in raw_steps {
-        let n = raw.n as usize;
-        if raw.struct_size as usize != mem::size_of::<TrajectoryMathStep>()
-            || raw.version != VERSION
-            || !(1..=MAX_N).contains(&n)
-            || raw.a.rows as usize > MAX_N
-        {
-            return -1;
-        }
-        let (Some(k), Some(r), Some(j), Some(a)) = (
-            matrix(raw.k, n, n),
-            matrix(raw.r, n, n),
-            matrix(raw.j, n, n),
-            matrix(raw.a, raw.a.rows as usize, n),
-        ) else {
-            return -1;
-        };
-        let (Some(alpha), Some(x), Some(y), Some(drive)) = (
-            vector(raw.alpha, raw.a.rows as usize),
-            vector(raw.x, n),
-            vector(raw.y, n),
-            vector(raw.drive, n),
-        ) else {
-            return -1;
-        };
-        numerical_steps.push(JointVerificationInput {
-            k,
-            r,
-            j,
-            a,
-            alpha,
-            x,
-            y,
-            h: raw.h,
-            drive,
-        });
-    }
+    };
     let verified = match initial_error_upper {
         Some(error) => Interval::new(0.0, error)
             .ok()
@@ -458,6 +437,123 @@ unsafe fn trajectory_math_report_impl(
         lower: 0.0,
         upper: max_defect,
     };
+    report.status = 0;
+    ptr::write(output, report);
+    0
+}
+
+// SAFETY: the caller owns immutable, live step and referenced buffers.
+unsafe fn parse_trajectory_steps<'a>(
+    steps: *const TrajectoryMathStep,
+    step_count: u32,
+) -> Option<Vec<JointVerificationInput<'a>>> {
+    if !aligned(steps) || !(1..=MAX_TRAJECTORY_STEPS).contains(&(step_count as usize)) {
+        return None;
+    }
+    let raw_steps = slice::from_raw_parts(steps, step_count as usize);
+    let mut numerical_steps = Vec::with_capacity(raw_steps.len());
+    for raw in raw_steps {
+        let n = raw.n as usize;
+        if raw.struct_size as usize != mem::size_of::<TrajectoryMathStep>()
+            || raw.version != VERSION
+            || !(1..=MAX_N).contains(&n)
+            || raw.a.rows as usize > MAX_N
+        {
+            return None;
+        }
+        let (Some(k), Some(r), Some(j), Some(a)) = (
+            matrix(raw.k, n, n),
+            matrix(raw.r, n, n),
+            matrix(raw.j, n, n),
+            matrix(raw.a, raw.a.rows as usize, n),
+        ) else {
+            return None;
+        };
+        let (Some(alpha), Some(x), Some(y), Some(drive)) = (
+            vector(raw.alpha, raw.a.rows as usize),
+            vector(raw.x, n),
+            vector(raw.y, n),
+            vector(raw.drive, n),
+        ) else {
+            return None;
+        };
+        numerical_steps.push(JointVerificationInput {
+            k,
+            r,
+            j,
+            a,
+            alpha,
+            x,
+            y,
+            h: raw.h,
+            drive,
+        });
+    }
+    Some(numerical_steps)
+}
+
+/// Mathematical continuation across one explicit affine parameter switch.
+/// The map and both fixed-model segments are checked and byte-bound, but the
+/// caller must prove the external event time, map authority, and initial e0.
+/// Product certificate flags remain zero.
+///
+/// # Safety
+/// Both step arrays, CSR map, offset and their buffers must remain live,
+/// aligned, immutable, and non-overlapping with exclusive output storage.
+#[no_mangle]
+pub unsafe extern "C" fn sylanne3_v2_affine_switched_trajectory_math_report_v1(
+    before_steps: *const TrajectoryMathStep,
+    before_count: u32,
+    after_steps: *const TrajectoryMathStep,
+    after_count: u32,
+    initial_error_upper: f64,
+    mapping: ReportCsr,
+    offset: *const f64,
+    output: *mut AffineSwitchedTrajectoryMathReport,
+    output_size: u32,
+) -> i32 {
+    if !aligned(output)
+        || output_size as usize != mem::size_of::<AffineSwitchedTrajectoryMathReport>()
+    {
+        return -1;
+    }
+    let mut report = AffineSwitchedTrajectoryMathReport {
+        struct_size: mem::size_of::<AffineSwitchedTrajectoryMathReport>() as u32,
+        version: VERSION,
+        status: -1,
+        ..AffineSwitchedTrajectoryMathReport::default()
+    };
+    ptr::write(output, report);
+    let (Some(before), Some(after)) = (
+        parse_trajectory_steps(before_steps, before_count),
+        parse_trajectory_steps(after_steps, after_count),
+    ) else {
+        return -1;
+    };
+    let old_n = before.last().unwrap().y.len();
+    let new_n = after.first().unwrap().x.len();
+    let (Some(map), Some(offset_values)) = (matrix(mapping, new_n, old_n), vector(offset, new_n))
+    else {
+        return -1;
+    };
+    let verified = Interval::new(0.0, initial_error_upper)
+        .ok()
+        .and_then(|initial| {
+            verify_affine_switched_trajectory(&before, &after, initial, map, offset_values).ok()
+        });
+    let Some(verified) = verified else {
+        report.status = -2;
+        ptr::write(output, report);
+        return -2;
+    };
+    report.before_steps_verified = verified.before.steps.len() as u32;
+    report.after_steps_verified = verified.after.steps.len() as u32;
+    report.input_sha256 = verified.input_sha256;
+    report.before_final_time_error = verified.before.final_time_error.into();
+    report.mapping_lipschitz_upper = verified.switch.mapping_lipschitz_upper;
+    report.nominal_mapping_error = verified.switch.nominal_mapping_error.into();
+    report.mapped_error = verified.switch.mapped_error.into();
+    report.final_time_error = verified.after.final_time_error.into();
     report.status = 0;
     ptr::write(output, report);
     0

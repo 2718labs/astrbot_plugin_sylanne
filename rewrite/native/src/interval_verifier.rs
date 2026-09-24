@@ -157,6 +157,53 @@ pub(crate) struct AffineSwitchBounds {
     pub(crate) mapped_error: Interval,
 }
 
+/// Two internally fixed-model segments joined by one explicit affine map.
+/// This is a mathematical certificate conditional on the supplied initial
+/// error and map; it does not authenticate either input or an external event.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AffineSwitchedTrajectoryBounds {
+    pub(crate) before: FixedTrajectoryBounds,
+    pub(crate) switch: AffineSwitchBounds,
+    pub(crate) after: FixedTrajectoryBounds,
+    pub(crate) input_sha256: [u8; 32],
+}
+
+pub(crate) fn verify_affine_switched_trajectory(
+    before_steps: &[JointVerificationInput<'_>],
+    after_steps: &[JointVerificationInput<'_>],
+    initial_error: Interval,
+    mapping: SparseMatrix<'_>,
+    offset: &[f64],
+) -> Result<AffineSwitchedTrajectoryBounds, VerifierError> {
+    let before = verify_fixed_trajectory_from_error(before_steps, initial_error)?;
+    let Some(old_end) = before_steps.last() else {
+        return Err(VerifierError::InvalidDimension);
+    };
+    let Some(new_start) = after_steps.first() else {
+        return Err(VerifierError::InvalidDimension);
+    };
+    let switch = verify_affine_parameter_switch(
+        mapping,
+        offset,
+        old_end.y,
+        new_start.x,
+        before.final_time_error,
+    )?;
+    let after = verify_fixed_trajectory_from_error(after_steps, switch.mapped_error)?;
+    let mut digest = Sha256::new();
+    digest.update(b"sylanne3-affine-switched-trajectory-math-v1\0");
+    digest.update(before.input_sha256);
+    hash_matrix(&mut digest, mapping);
+    hash_f64_values(&mut digest, offset);
+    digest.update(after.input_sha256);
+    Ok(AffineSwitchedTrajectoryBounds {
+        before,
+        switch,
+        after,
+        input_sha256: digest.finalize().into(),
+    })
+}
+
 /// Propagate a verified old-state error through `new = M old + offset`.
 /// The complete mapping is checked here; no caller-supplied Lipschitz claim is
 /// accepted. The nominal new state may differ from the exact affine image by
