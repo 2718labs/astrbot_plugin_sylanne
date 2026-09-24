@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 import threading
 import unittest
+from types import SimpleNamespace
 from uuid import uuid4
 
 from astrbot.api.star import Context
@@ -17,9 +18,13 @@ from openai import AsyncOpenAI
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.host.astrbot_model_call import AstrBotModelProvider
 from sylanne3.host.authority_profile import (
-    AdminIngressModelPolicy, installed_model_config_ref,
+    AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    AdminInstallationBundle, installed_model_config_ref,
 )
+from sylanne3.installation_policy import AdminInstallationPolicy
 from sylanne3.model_broker.broker import ModelCallRequest, ModelProviderDescriptor
+from sylanne3.runtime.budget import BudgetLease
+from sylanne3.runtime.issuers import BudgetLeaseGrant
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
     QueryEpoch, SourceQualification, VersionGuard, canonical_digest,
@@ -128,11 +133,30 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             "provider-1", "model-1",
             installed_model_config_ref("provider-1", "model-1", config_digest),
             config_digest, 0.2, 64, ("text",), "private",
+            ("proposal",), ("owner",), ("private",),
         )
+        namespace = NamespaceId("bot", "persona")
+        lease = BudgetLease(
+            "root-lease", None, "bot", "persona", "USD",
+            {"output_tokens": 128}, {}, {}, {}, 1, "active")
+        grant = BudgetLeaseGrant(
+            "root-grant", 1, "bot", "persona", "root-lease", "USD",
+            {"output_tokens": 128}, ("reply",), 4102444800,
+            "budget-policy")
+        policy = AdminInstallationPolicy(
+            namespace, "bot/persona", "install", "a" * 64, "holder",
+            "authority", "b" * 64, "scheme", "operator", "policy",
+            lease, grant)
+        encoding = AdminIngressEncodingPolicy(
+            2, {"output_tokens": 128}, "snapshot", "resource", "interval")
+        self.bundle = AdminInstallationBundle(
+            SimpleNamespace(), policy, b"k" * 32, b"d" * 32,
+            ingress_encoding=encoding, ingress_model=self.admin_model)
         self.adapter = AstrBotModelProvider(
             context=self.context, host_loop=asyncio.get_running_loop(),
             trusted_umo=UMO, descriptor=self.descriptor,
             admin_model=self.admin_model,
+            installation_bundle=self.bundle,
         )
 
     async def asyncTearDown(self):
@@ -243,6 +267,51 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.seen_umo, [])
         self.assertEqual(self.requests, [])
 
+    async def test_request_purpose_audience_and_privacy_are_checked_before_http(self):
+        adapter = AstrBotModelProvider(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            trusted_umo=UMO, descriptor=self.descriptor,
+            admin_model=self.admin_model, installation_bundle=self.bundle,
+        )
+        baseline = call_request()
+        wrong_purpose = replace(
+            baseline, call_id=uuid4().hex,
+            envelope=replace(baseline.envelope, authority=replace(
+                baseline.envelope.authority, purpose="unrelated")))
+        wrong_audience = replace(
+            baseline, call_id=uuid4().hex,
+            envelope=replace(baseline.envelope, authority=replace(
+                baseline.envelope.authority, audience=("public",))))
+        wrong_privacy = replace(baseline, call_id=uuid4().hex,
+                                privacy_tier="public")
+        for request in (wrong_purpose, wrong_audience, wrong_privacy):
+            with self.subTest(call_id=request.call_id):
+                response = await adapter.invoke(request, asyncio.Event())
+                self.assertEqual(response.status, "not_dispatched")
+        self.assertEqual(self.requests, [])
+
+    async def test_unscoped_or_underfunded_installed_selection_never_dispatches(self):
+        request = call_request()
+        for model, encoding in (
+            (replace(self.admin_model, allowed_purposes=(),
+                     allowed_audiences=(), allowed_privacy_tiers=()),
+             self.bundle.ingress_encoding),
+            (self.admin_model, replace(
+                self.bundle.ingress_encoding,
+                quote_ceiling={"output_tokens": 63})),
+        ):
+            with self.subTest(model=model, encoding=encoding):
+                bundle = replace(self.bundle, ingress_model=model,
+                                 ingress_encoding=encoding)
+                adapter = AstrBotModelProvider(
+                    context=self.context, host_loop=asyncio.get_running_loop(),
+                    trusted_umo=UMO, descriptor=self.descriptor,
+                    admin_model=model, installation_bundle=bundle)
+                result = await adapter.invoke(
+                    replace(request, call_id=uuid4().hex), asyncio.Event())
+                self.assertEqual(result.status, "not_dispatched")
+        self.assertEqual(self.requests, [])
+
     async def test_ambiguous_completion_is_unknown(self):
         self.completion["choices"] = [{
             "index": 0, "finish_reason": "tool_calls",
@@ -310,6 +379,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             adapter = AstrBotModelProvider(
                 context=self.context, host_loop=host_loop, trusted_umo=UMO,
                 descriptor=self.descriptor, admin_model=self.admin_model,
+                installation_bundle=self.bundle,
             )
             request = call_request()
             waiter = asyncio.create_task(adapter.invoke(request, asyncio.Event()))
@@ -328,6 +398,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
                 restarted = AstrBotModelProvider(
                     context=self.context, host_loop=restarted_loop, trusted_umo=UMO,
                     descriptor=self.descriptor, admin_model=self.admin_model,
+                    installation_bundle=self.bundle,
                 )
                 with self.assertRaises(ValueError):
                     await restarted.invoke(request, asyncio.Event())

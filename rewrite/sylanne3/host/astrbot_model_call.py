@@ -22,7 +22,11 @@ from ..runtime_contracts import canonical_digest
 from ..model_broker.broker import (
     ModelCallRequest, ModelProviderDescriptor, ProviderResponse,
 )
-from .authority_profile import AdminIngressModelPolicy, installed_model_config_ref
+from .authority_profile import (
+    AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    AdminInstallationBundle, installed_model_config_ref,
+)
+from ..installation_policy import AdminInstallationPolicy
 
 
 @dataclass
@@ -46,6 +50,7 @@ class AstrBotModelProvider:
         self, *, context: Context, host_loop: asyncio.AbstractEventLoop,
         trusted_umo: str, descriptor: ModelProviderDescriptor,
         admin_model: AdminIngressModelPolicy,
+        installation_bundle: AdminInstallationBundle,
     ) -> None:
         if (not isinstance(context, Context)
                 or not isinstance(host_loop, asyncio.AbstractEventLoop)
@@ -60,13 +65,16 @@ class AstrBotModelProvider:
                 or admin_model.model_id != descriptor.model_id
                 or admin_model.provider_config_ref != installed_model_config_ref(
                     descriptor.provider_id, descriptor.model_id,
-                    admin_model.provider_config_digest)):
+                    admin_model.provider_config_digest)
+                or type(installation_bundle) is not AdminInstallationBundle
+                or admin_model is not installation_bundle.ingress_model):
             raise ValueError("exact administrator model configuration is required")
         self._context = context
         self._host_loop = host_loop
         self._trusted_umo = trusted_umo
         self._descriptor = descriptor
         self._admin_model = admin_model
+        self._installation_bundle = installation_bundle
         self._binding = (context, host_loop, trusted_umo,
                          descriptor.provider_id, descriptor.model_id,
                          admin_model.provider_config_ref)
@@ -79,6 +87,40 @@ class AstrBotModelProvider:
     @property
     def descriptor(self) -> ModelProviderDescriptor:
         return self._descriptor
+
+    def _request_allowed(self, request: ModelCallRequest) -> bool:
+        """Recheck the installed scope and exact request before host dispatch."""
+        model = self._admin_model
+        bundle = self._installation_bundle
+        policy = bundle.installation_policy
+        encoding = bundle.ingress_encoding
+        authority = request.envelope.authority
+        descriptor = self._descriptor
+        if (model is not bundle.ingress_model
+                or type(policy) is not AdminInstallationPolicy
+                or type(encoding) is not AdminIngressEncodingPolicy
+                or policy.namespace != authority.namespace
+                or descriptor.capabilities != frozenset({"text"})
+                or not set(model.required_capabilities) <= {"text"}
+                or not request.required_capabilities
+                or not request.required_capabilities <= descriptor.capabilities
+                or not request.required_capabilities <= set(model.required_capabilities)
+                or not descriptor.purposes <= set(model.allowed_purposes)
+                or authority.purpose not in descriptor.purposes
+                or authority.purpose not in model.allowed_purposes
+                or not authority.audience
+                or not set(authority.audience) <= set(model.allowed_audiences)
+                or not descriptor.privacy_tiers <= set(model.allowed_privacy_tiers)
+                or request.privacy_tier != model.privacy_tier
+                or request.privacy_tier not in descriptor.privacy_tiers
+                or request.privacy_tier not in model.allowed_privacy_tiers
+                or "reply" not in policy.root_grant.allowed_work_kinds):
+            return False
+        output = model.max_output_tokens
+        return (encoding.quote_ceiling.get("output_tokens", 0) >= output
+                and policy.root_lease.limits.get("output_tokens", 0) >= output
+                and policy.root_grant.max_ceiling.get("output_tokens", 0) >= output
+                and request.max_output_tokens <= output)
 
     def _matches_live_provider(self, provider: object) -> bool:
         if type(provider) is not ProviderOpenAIOfficial:
@@ -133,7 +175,8 @@ class AstrBotModelProvider:
                 selected = await self._context.get_using_provider_async(self._trusted_umo)
                 if (selected is not provider
                         or not self._matches_live_provider(provider)
-                        or provider.client is not selected_client):
+                        or provider.client is not selected_client
+                        or not self._request_allowed(request)):
                     return ProviderResponse("not_dispatched", None, {}, {}, None)
             except asyncio.CancelledError:
                 return ProviderResponse("not_dispatched", None, {}, {}, None)
@@ -246,6 +289,7 @@ class AstrBotModelProvider:
                     or request.model_id != self._descriptor.model_id
                     or request.timeout_seconds > self._admin_model.timeout_seconds
                     or request.max_output_tokens > self._admin_model.max_output_tokens
+                    or not self._request_allowed(request)
                     or cancellation.is_set() or not self._host_loop.is_running()):
                 entry.terminal.set_result(
                     ProviderResponse("not_dispatched", None, {}, {}, None))
