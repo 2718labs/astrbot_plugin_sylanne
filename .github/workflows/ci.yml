@@ -75,9 +75,18 @@ jobs:
           cargo test --manifest-path rewrite/native/Cargo.toml
 
       - name: Build and cold-load this platform's dev-probe ZIP without Rust or source path
-        run: |
-          cargo build --release --manifest-path rewrite/native/Cargo.toml
-          python scripts/alpha1/probe_current_platform_package.py
+        run: >-
+          python scripts/alpha1/cross_platform_build.py
+          --output-dir
+          artifacts/alpha1-dev-probes/${{ matrix.target_os }}-${{ matrix.target_arch }}
+
+      - name: Retain this platform's dev-probe ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpha1-dev-probe-${{ matrix.target_os }}-${{ matrix.target_arch }}
+          path: artifacts/alpha1-dev-probes/${{ matrix.target_os }}-${{ matrix.target_arch }}/*.zip
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Test alpha1 contracts and package builder
         run: python -m pytest -q rewrite/tests/alpha1 rewrite/tests/test_plugin_package.py
