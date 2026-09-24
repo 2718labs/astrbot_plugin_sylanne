@@ -16,8 +16,16 @@ from . import ErasureRequest
 
 
 _MISSING_AUTHORITY_FACETS = (
-    "request_authorization", "access_deletion_epoch", "current_dependency_index",
-    "graph_cache_index", "other_domain_history", "independent_deletion_intent",
+    "request_authorization", "access_deletion_epoch",
+    "current_reverse_dependency_snapshot", "historical_graph_values",
+    "historical_reverse_dependency_snapshot", "graph_cache_index",
+    "other_domain_history", "independent_deletion_intent",
+)
+
+_COVERED_D06_FACETS = (
+    "current_source_parent_refs", "current_episode_refs", "current_trace_refs",
+    "current_association_refs", "current_interpretation_refs",
+    "current_recollection_refs",
 )
 
 
@@ -35,6 +43,7 @@ class DeletionReadCandidate:
     epoch: NamespaceEpoch | None
     scan_complete: bool
     next_after: AtomKey | None
+    covered_facets: tuple[str, ...]
     missing_facets: tuple[str, ...]
     status: str
 
@@ -45,9 +54,9 @@ def read_deletion_closure_candidate(
 ) -> DeletionReadCandidate:
     """Scan known D06 references with one epoch across every observed page.
 
-    Full pagination means only the listed D06 value fields were covered. The
-    current dependency DAG, caches, other domains, and deletion policy cannot
-    be proven from GraphPage and therefore always keep this result on HOLD.
+    GraphPage contains current values and an epoch, but no dependency edges or
+    historical graph versions. This reads current D06 value references only;
+    absent reverse-edge/history ports and Authority evidence keep it on HOLD.
     """
     if not isinstance(repository, MemoryRepository) or not isinstance(request, ErasureRequest):
         raise TypeError("MemoryRepository and ErasureRequest are required")
@@ -89,7 +98,7 @@ def read_deletion_closure_candidate(
         return DeletionReadCandidate(
             request.request_id, tuple(key.token for key in roots),
             (), (), (), (), (), (), (), epoch, False, after,
-            (*missing, "namespace_changed"), "partial_hold",
+            (), (*missing, "namespace_changed"), "partial_hold",
         )
     complete = after is None
     if not complete:
@@ -109,6 +118,13 @@ def read_deletion_closure_candidate(
             source_parents[atom.key] = tuple(record.parent_source_ids)
         except (TypeError, ValueError, KeyError):
             missing.append("unreadable_source_payload")
+    present_source_ids = {
+        atom.key.owner.subject for atom in atoms
+        if atom.key.type_name == "memory.source" and atom.key.owner.kind == "event"
+    }
+    for parent_ids in source_parents.values():
+        if any(parent not in present_source_ids for parent in parent_ids):
+            missing.append("missing_source_parent")
     affected = set(roots)
     changed = True
     while changed:
@@ -146,7 +162,9 @@ def read_deletion_closure_candidate(
             if kind in {"memory.episode.v1", "memory.association.v1", "memory.interpretation"}:
                 missing.append("unreadable_memory_payload")
     episode_tokens = {key.token for key in episodes}
-    related_tokens = affected_tokens | episode_tokens | {key.token for key in associations}
+    related_tokens = (affected_tokens | episode_tokens
+                      | {key.token for key in associations}
+                      | {key.token for key in interpretations})
     for atom in atoms:
         value = atom.value
         kind = atom.key.type_name
@@ -156,6 +174,9 @@ def read_deletion_closure_candidate(
                     traces.add(atom.key)
             elif kind == "d06.recollection.v1" and (
                 set(value["content_refs"]) | set(value["activity_basis_refs"])
+                | set(value["now_interpretation_refs"])
+                | set(value["feeling_experience_refs"])
+                | set(value["self_understanding_refs"])
             ) & related_tokens:
                 recollections.add(atom.key)
         except (TypeError, KeyError, ValueError):
@@ -171,6 +192,7 @@ def read_deletion_closure_candidate(
         tuple(sorted(key.token for key in interpretations)),
         tuple(sorted(key.token for key in recollections)),
         tuple(GraphVersion(atom.key, atom.revision) for atom in atoms),
-        epoch, complete, after, tuple(dict.fromkeys(missing)),
+        epoch, complete, after, _COVERED_D06_FACETS,
+        tuple(dict.fromkeys(missing)),
         "hold" if complete else "partial_hold",
     )

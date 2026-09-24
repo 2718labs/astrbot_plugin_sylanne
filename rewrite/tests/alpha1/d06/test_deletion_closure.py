@@ -2,7 +2,7 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from sylanne3.domains.d06 import D06DomainAdapter, ErasureRequest
+from sylanne3.domains.d06 import D06DomainAdapter, D06DomainProvider, ErasureRequest
 from sylanne3.domains.d06.deletion_read import read_deletion_closure_candidate
 from sylanne3.contracts import Event, Scope
 from sylanne3.graph_store import GraphStore
@@ -79,6 +79,11 @@ class DeletionClosureTests(unittest.TestCase):
         if True:
             registry = TypeRegistry()
             register_memory_types(registry)
+            recollection_spec = next(
+                spec for spec in D06DomainProvider.type_specs()
+                if spec.name == "d06.recollection.v1"
+            )
+            registry.register(recollection_spec)
             registry.register(TypeSpec("d03.world_event", ("event",), "state", lambda _: None))
             store = GraphStore(Path(tmp.name) / "memory.db", registry)
             self.addCleanup(store.close)
@@ -89,16 +94,26 @@ class DeletionClosureTests(unittest.TestCase):
                                     None, 1.0, "family", ("owner",), ("context",), parents)
             repository.ingest(Event(scope, "root", 1, "ingest", {}), source("source-1"))
             repository.ingest(Event(scope, "child", 2, "ingest", {}), source("child-1", ("source-1",)))
-            repository.ingest(Event(scope, "other", 3, "ingest", {}), source("other-1"))
+            repository.ingest(Event(scope, "grandchild", 3, "ingest", {}), source("grandchild-1", ("child-1",)))
+            repository.ingest(Event(scope, "other", 4, "ingest", {}), source("other-1"))
             child = source_key("bot", "persona", "child-1")
+            grandchild = source_key("bot", "persona", "grandchild-1")
             other = source_key("bot", "persona", "other-1")
             episode = episode_key("bot", "persona", "episode-1")
             trace = subjective_trace_key("bot", "persona", "trace-1")
             association = association_key("bot", "persona", "other-1", "association-1")
+            interpretation = AtomKey(
+                Owner("event", "bot", "persona", "interpretation-1"),
+                "memory.interpretation", "current",
+            )
+            recollection = AtomKey(
+                Owner("activity", "bot", "persona", "activity-1"),
+                "d06.recollection.v1", "current",
+            )
             event_ref = AtomKey(Owner("event", "bot", "persona", "event-1"), "d03.world_event", "current")
             perspective = AtomKey(Owner("scene", "bot", "persona", "scene-1"), "d03.role_binding", "current")
             writes = (
-                GraphWrite(episode, {"episode_id": "episode-1", "source_refs": [child.token],
+                GraphWrite(episode, {"episode_id": "episode-1", "source_refs": [grandchild.token],
                                      "event_ref": event_ref.token}),
                 GraphWrite(trace, {"trace_id": "trace-1", "episode_ref": episode.token,
                                    "perspective_ref": perspective.token, "then_feeling_refs": [],
@@ -108,25 +123,76 @@ class DeletionClosureTests(unittest.TestCase):
                                          "kind": "similarity", "weight": 0.5,
                                          "context_tags": [], "basis_source_refs": [other.token],
                                          "content_reality": "reported"}),
+                GraphWrite(interpretation, {
+                    "interpretation_id": "interpretation-1", "source_ids": ["grandchild-1"],
+                    "subject_id": "self", "claim": "claim", "status": "confirmed",
+                    "valid_from": 1.0, "recorded_at": 1.0, "valid_to": None,
+                }),
+                GraphWrite(recollection, {
+                    "recollection_id": "recollection-1", "activity_id": "activity-1",
+                    "selection_ref": "selection-1", "candidate_set_id": "candidate-1",
+                    "content_refs": [grandchild.token], "activity_basis_refs": [grandchild.token],
+                    "now_interpretation_refs": [interpretation.token],
+                    "feeling_experience_refs": [grandchild.token], "self_understanding_refs": [],
+                    "provenance_eligibility": [], "focus_epoch": 1,
+                    "access_epoch": 1, "delete_epoch": 1,
+                }),
             )
             store.graph_commit(GraphCandidate(
-                Event(scope, "derived", 4, "derived", {}),
+                Event(scope, "derived", 5, "derived", {}),
                 tuple(GraphVersion(write.key, 0) for write in writes), writes,
             ))
             request = ErasureRequest("erase-1", (self.root.token,), "all_derived", 1, 1)
             result = read_deletion_closure_candidate(repository, request, page_limit=1)
             self.assertTrue(result.scan_complete)
             self.assertEqual(result.status, "hold")
-            self.assertEqual(result.source_descendant_refs, (child.token,))
+            self.assertEqual(result.source_descendant_refs, tuple(sorted((child.token, grandchild.token))))
             self.assertEqual(result.episode_refs, (episode.token,))
             self.assertEqual(result.trace_refs, (trace.token,))
             self.assertEqual(result.association_refs, (association.token,))
-            self.assertIn("current_dependency_index", result.missing_facets)
+            self.assertEqual(result.interpretation_refs, (interpretation.token,))
+            self.assertEqual(result.recollection_refs, (recollection.token,))
+            self.assertIn("current_reverse_dependency_snapshot", result.missing_facets)
+            self.assertIn("historical_graph_values", result.missing_facets)
+            self.assertIn("current_episode_refs", result.covered_facets)
+            self.assertFalse(any("dependency" in item for item in result.covered_facets))
             self.assertFalse(hasattr(result, "request_authorized"))
+            missing_target_request = ErasureRequest(
+                "erase-missing", (source_key("bot", "persona", "absent").token,),
+                "all_derived", 1, 1,
+            )
+            missing_target = read_deletion_closure_candidate(
+                repository, missing_target_request, page_limit=1,
+            )
+            self.assertIn("target_unavailable", missing_target.missing_facets)
+            self.assertEqual(missing_target.status, "hold")
             partial = read_deletion_closure_candidate(repository, request, page_limit=1, max_pages=2)
             self.assertFalse(partial.scan_complete)
             self.assertEqual(partial.status, "partial_hold")
             self.assertIsNotNone(partial.next_after)
+
+            original_query = store.graph_query
+            query_count = 0
+            def query_with_interpage_write(*args, **kwargs):
+                nonlocal query_count
+                page = original_query(*args, **kwargs)
+                query_count += 1
+                if query_count == 1:
+                    changed_key = AtomKey(
+                        Owner("event", "bot", "persona", "drift"),
+                        "d03.world_event", "current",
+                    )
+                    store.graph_commit(GraphCandidate(
+                        Event(scope, "drift", 6, "test", {}),
+                        (GraphVersion(changed_key, 0),),
+                        (GraphWrite(changed_key, {}),),
+                    ))
+                return page
+            store.graph_query = query_with_interpage_write
+            drifted = read_deletion_closure_candidate(repository, request, page_limit=1)
+            self.assertFalse(drifted.scan_complete)
+            self.assertEqual(drifted.status, "partial_hold")
+            self.assertIn("namespace_changed", drifted.missing_facets)
 
 
 if __name__ == "__main__":
