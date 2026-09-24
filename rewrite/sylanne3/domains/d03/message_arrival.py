@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from ...graph_types import AtomKey, GraphVersion, Owner
 from ...host.ingress import HostIngressEnvelope
-from ...memory_types import SourceRecord, access_key, source_key
+from ...memory_types import SourceRecord, access_key, source_key, validate_access
 from ...runtime.first_ingress_v2 import scene_ref_for_conversation
 from ...runtime_contracts import SourceQualification, canonical_digest
 from .context import EntityAnchor, WorldEvent
@@ -32,6 +32,7 @@ def build_message_arrival_candidate(
     ingress: HostIngressEnvelope,
     current_scene: CurrentHostScene,
     source: SourceRecord,
+    access: dict,
     qualification: SourceQualification,
     *,
     source_version: GraphVersion,
@@ -40,13 +41,14 @@ def build_message_arrival_candidate(
     """Describe the host-observed receipt, without endorsing the message text.
 
     The caller obtains ``current_scene`` through the host verifier and both
-    graph versions through a current D06 read. A committing graph transaction
-    must check those guards and the source's current access state again.
+    graph versions and access through a current D06 read. A committing graph
+    transaction must check those guards and the source's current access again.
     """
     if not isinstance(ingress, HostIngressEnvelope):
         raise TypeError("host ingress is required")
     if not isinstance(source, SourceRecord) or not isinstance(qualification, SourceQualification):
         raise TypeError("qualified D06 source is required")
+    validate_access(access)
     namespace = ingress.namespace
     expected_scene = scene_ref_for_conversation(
         namespace, ingress.platform_ref, ingress.conversation_ref,
@@ -64,19 +66,24 @@ def build_message_arrival_candidate(
     if (
         source_version.key != source_atom or source_version.revision < 1
         or access_version.key != access_atom or access_version.revision < 1
+        or access["source_id"] != source.source_id
+        or access["status"] != "active"
+        or ingress.conversation_ref not in access["audiences"]
+        or "context" not in access["purposes"]
         or qualification.source_refs != (source_atom.token,)
         or qualification.source_family != "reported"
         or qualification.content_reality != "external_report"
         or qualification.evidence_eligibility != "qualified"
         or qualification.occurred_at != ingress.occurred_at
-        or qualification.learned_at != ingress.learned_at
+        # v2 freezes learned_at from the paired Authority clock. The host
+        # envelope's receive time is only an untrusted input candidate.
+        or qualification.learned_at != source.recorded_at
         or source.source_id != ingress.lineage.source_ref
         or source.text != ingress.text
         or source.speaker_id != ingress.sender_ref
         or source.source_kind != "reported"
         or source.assertion_status != "reported"
         or source.occurred_at != ingress.occurred_at
-        or source.recorded_at != ingress.learned_at
         or source.provenance_root != ingress.lineage.provenance_family
         or source.audiences != (ingress.conversation_ref,)
         or "context" not in source.purposes
