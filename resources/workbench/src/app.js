@@ -8,7 +8,7 @@ const pages = [
   ["overview", "总览", "当前角色的权限过滤投影与能力状态", "read"],
   ["creation", "创作", "创建草稿、编译与采用方案", "compile"],
   ["relations", "关系与经历", "关系、情境与纠错投影", "correct"],
-  ["memory", "记忆", "来源资格约束的记忆查询与修正", "correct"],
+  ["memory", "记忆", "已授权记忆来源的元数据摘要", "read"],
   ["cognition", "感受与认知", "连续感受、关切和解释视图", "read"],
   ["action", "计划与行动", "目标、承诺、活动与控制", "control"],
   ["expression", "表达与投递", "表达合同与投递状态，不直接发送", "control"],
@@ -56,7 +56,7 @@ function statusCopy(status, problem) {
 function formMarkup(page) {
   if (page[0] === "setup") return `<p class="setup-hint">近期场景候选仅来自宿主已观察到的会话，供 Owner 点选。点选不会绑定场景；服务端仍会核验场景和权限，可能暂缓绑定。</p><button type="button" class="quiet" data-command="refresh-scene-candidates" ${state.sessionReady ? "" : "disabled"}>刷新场景候选</button><div class="scene-candidates" aria-label="近期场景候选">${sceneCandidatesProblem ? `<p>${escapeHtml(sceneCandidatesProblem)}</p>` : sceneCandidates.length ? sceneCandidates.map((item, index) => `<button type="button" class="quiet" data-scene-candidate="${index}">${escapeHtml(item.platform_ref)} · ${escapeHtml(item.conversation_ref)} · ${item.visibility === "group" ? "群聊" : "私聊"}</button>`).join("") : "<p>暂无近期场景候选；需在目标会话中产生真实消息后刷新。</p>"}</div><label>场景引用<input name="scene_ref" required autocomplete="off" placeholder="scene:conversation-v1:（64 位小写十六进制值）" /></label><label>可见范围<select name="visibility" required><option value="">请选择</option><option value="private">私聊</option><option value="group">群聊</option></select></label><label class="acknowledgement"><input type="checkbox" name="acknowledgement" required /><span>我确认所选场景和可见范围适用于当前角色，并明确申请绑定。</span></label>`;
   if (page[0] === "creation") return `<label>方案草稿（JSON 对象，可编辑）<textarea name="draft_json" placeholder='{"fields":{},"field_sources":{}}'></textarea></label><label>已有方案草稿引用（与 JSON 二选一）<input name="draft_ref" placeholder="由已授权草稿提供" /></label><label>已编译候选引用<input name="compiled_scheme_ref" placeholder="采用前由服务签发" /></label><label>操作<select name="mode"><option value="compile">编译候选</option><option value="activate">采用方案</option></select></label>`;
-  if (["relations", "memory"].includes(page[0])) return `<label>纠错类型<select name="correction_kind"><option value="source_correction">来源更正</option><option value="interpretation_challenge">解释质疑</option><option value="administrative_edit">创作调整</option></select></label><label>新说明<textarea name="statement" required></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" /></label>`;
+  if (page[0] === "relations") return `<label>纠错类型<select name="correction_kind"><option value="source_correction">来源更正</option><option value="interpretation_challenge">解释质疑</option><option value="administrative_edit">创作调整</option></select></label><label>新说明<textarea name="statement" required></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" /></label>`;
   if (["cognition", "action", "expression"].includes(page[0])) return `<label>对象引用<input name="object_ref" required /></label><label>控制请求<input name="control" placeholder="只提交领域可解释的控制请求" /></label>`;
   if (page[0] === "diagnostics") return `<label>操作<select name="mode"><option value="experiment">隔离实验</option><option value="support">生成脱敏支持诊断</option></select></label><label>假设或问题<textarea name="hypothesis"></textarea><input name="question" placeholder="支持问题" /></label>`;
   if (page[0] === "lifecycle") return `<label>操作<select name="mode"><option value="prepare">准备备份或迁移</option><option value="execute">执行已采用计划</option><option value="erase">删除或停用</option><option value="upgrade">校验升级</option></select></label><label>计划/范围引用<input name="plan_ref" /><input name="scope_selection" /><input name="data_choice" placeholder="保留或删除的明确选择" /><input name="release_manifest_ref" placeholder="受信发布清单引用" /></label>`;
@@ -99,6 +99,24 @@ function creationProjectionMarkup(projection) {
       ? `<button type="button" class="quiet" data-command="creation-next" ${state.status === "loading" ? "disabled" : ""}>${state.status === "loading" ? "正在读取后续方案" : "继续读取后续方案"}</button>` : ""}</section>`;
 }
 
+function validMemoryProjection(projection) {
+  const data = projection?.data;
+  return projection?.view_type === VIEW_TYPES.memory
+    && data?.coverage === "complete" && Array.isArray(data.sources)
+    && data.sources.every((item) => item && typeof item === "object"
+      && ["source_id", "source_kind", "assertion_status"].every((key) => typeof item[key] === "string" && item[key].trim())
+      && typeof item.recorded_at === "number" && Number.isFinite(item.recorded_at) && item.recorded_at >= 0
+      && item.qualification === "not_recorded");
+}
+
+function memoryProjectionMarkup(projection) {
+  if (!validMemoryProjection(projection)) return `<section class="empty-state" role="alert"><h2>记忆来源不可用</h2><p>服务未返回完整且可确认的 D06 来源摘要；请重新请求当前视图。</p></section>`;
+  const sources = projection.data.sources;
+  return `<section class="creation-view" aria-label="已授权记忆来源摘要"><h2>记忆来源</h2><p>仅显示服务按当前权限返回的来源元数据，不包含记忆原文。来源资格未记录时，不能据此认定其为事实证据。</p>${sources.length
+    ? `<ul class="creation-list">${sources.map((item) => `<li><strong>${escapeHtml(item.source_id)}</strong><span>来源类型：${escapeHtml(item.source_kind)} · 断言状态：${escapeHtml(item.assertion_status)}</span><small>记录时间戳：${item.recorded_at} · 来源资格：未记录</small></li>`).join("")}</ul>`
+    : `<p class="creation-empty">当前授权范围内没有可显示的记忆来源。</p>`}<p class="creation-coverage" role="status">服务已确认完整覆盖，共 ${sources.length} 条来源。</p></section>`;
+}
+
 function overviewCatalogueMarkup(projection) {
   const views = projection?.views;
   const unavailable = projection?.unavailable_domains;
@@ -112,7 +130,7 @@ function overviewCatalogueMarkup(projection) {
   return `<section class="overview-view" aria-label="服务返回的能力目录"><h2>当前角色能力目录</h2><p>以下仅表示服务在当前 Owner 权限下公布的读取能力，不代表领域内容或真实对话已经就绪。可读取的已知页面可以直接打开；进入后仍会重新请求当前投影。</p>
     <h3>视图状态</h3>${views.length
       ? `<ul class="catalogue-list">${views.map((item) => {
-        const page = pages.find(([id]) => id === item.view_type && id !== "overview");
+        const page = pages.find(([id]) => VIEW_TYPES[id] === item.view_type && id !== "overview");
         const label = page ? `${page[1]} (${item.view_type})` : item.view_type;
         const link = item.status === "available" && page
           ? `<button type="button" class="catalogue-link" data-view="${page[0]}" aria-label="打开${escapeHtml(page[1])}视图">${escapeHtml(label)}</button>`
@@ -204,6 +222,7 @@ function render() {
   const body = state.view === "setup" ? setupMarkup() : sessionVerified && state.projection
     ? state.view === "overview" ? overviewCatalogueMarkup(state.projection)
       : state.view === "creation" ? creationProjectionMarkup(state.projection)
+      : state.view === "memory" ? memoryProjectionMarkup(state.projection)
       : `<pre class="projection" aria-label="服务返回的权限过滤投影">${escapeHtml(JSON.stringify(state.projection, null, 2))}</pre>`
     : `<section class="empty-state" aria-live="polite"><div class="empty-mark" aria-hidden="true">◇</div><h2>${sessionVerified ? statusTitle : "Owner 尚未解锁"}</h2><p>${sessionVerified ? statusDetail : "Sylanne Owner 会话尚未核验。请先完成服务端登录，再刷新解锁状态。"}</p><button class="primary" data-command="refresh" ${state.role && sessionVerified ? "" : "disabled"}>重新请求投影</button></section>`;
   app.innerHTML = `
@@ -242,7 +261,9 @@ async function loadView() {
       : await api.readView({ scope: state.role, viewType: VIEW_TYPES[state.view] });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
-    Object.assign(state, applyResponse(state, result));
+    Object.assign(state, state.view === "memory" && result.status === "ready" && !validMemoryProjection(result.projection)
+      ? applyProblem(state, { code: "invalid_memory_projection", message: "D06 未返回完整且可确认的来源摘要；请重新请求记忆视图。" })
+      : applyResponse(state, result));
   } catch (error) {
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;

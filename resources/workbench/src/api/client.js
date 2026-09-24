@@ -123,7 +123,7 @@ export class WorkbenchApi {
     return this.command("read_character_view", {
       scope,
       purpose,
-      input: { view_type: viewType, cursor, page_size: 50 }
+      input: { view_type: viewType, cursor, page_size: viewType === "d06.memory_sources.v1" ? 100 : 50 }
     });
   }
 

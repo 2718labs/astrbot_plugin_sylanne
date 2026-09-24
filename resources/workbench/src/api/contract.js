@@ -21,7 +21,7 @@ export const VIEW_TYPES = Object.freeze({
   overview: "overview",
   creation: "creation",
   relations: "relations",
-  memory: "memory",
+  memory: "d06.memory_sources.v1",
   cognition: "cognition",
   action: "action",
   expression: "expression",

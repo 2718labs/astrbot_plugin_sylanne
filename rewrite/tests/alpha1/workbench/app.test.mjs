@@ -112,7 +112,11 @@ test("an older same-role view response cannot replace the selected page", async 
     const older = ui.clickView("creation");
     const newer = ui.clickView("memory");
     await ui.nextRequest(2);
-    ui.requests[2].resolve({ status: "ready", projection: { label: "memory-current" } });
+    assert.equal(ui.requests[2].payload.input.view_type, "d06.memory_sources.v1");
+    assert.equal(ui.requests[2].payload.input.page_size, 100);
+    ui.requests[2].resolve({ status: "ready", projection: { view_type: "d06.memory_sources.v1", data: {
+      sources: [{ source_id: "memory-current", source_kind: "reported", assertion_status: "asserted", recorded_at: 42, qualification: "not_recorded" }], coverage: "complete"
+    } } });
     await newer;
     ui.requests[1].resolve({ status: "ready", projection: { label: "creation-obsolete" } });
     await older;
@@ -371,13 +375,13 @@ test("overview reads the Owner-authorized service catalogue without inventing do
     request.resolve({ status: "ready", projection: {
       namespace: { bot: "bot", persona: "persona" }, access_generation: 3,
       views: [{ view_type: "creation", status: "available" },
-        { view_type: "memory", status: "unavailable" }],
+        { view_type: "d06.memory_sources.v1", status: "unavailable" }],
       unavailable_domains: [{ domain: "d06<script>", reason: "no_public_projection_contract" }]
     } });
     await selected;
     assert.match(ui.app.innerHTML, /服务返回的能力目录/);
     assert.match(ui.app.innerHTML, /data-view="creation" aria-label="打开创作视图"/);
-    assert.match(ui.app.innerHTML, /memory\)<\/strong><span>暂不可用；没有可读取内容/);
+    assert.match(ui.app.innerHTML, /d06\.memory_sources\.v1\)<\/strong><span>暂不可用；没有可读取内容/);
     assert.match(ui.app.innerHTML, /d06&lt;script&gt;/);
     assert.match(ui.app.innerHTML, /no_public_projection_contract/);
     assert.doesNotMatch(ui.app.innerHTML, /<script>/);
@@ -394,7 +398,7 @@ test("catalogue opens only a service-available known page and requests its fresh
     ui.requests[0].resolve({ status: "ready", projection: {
       views: [
         { view_type: "creation", status: "available" },
-        { view_type: "memory", status: "unavailable" },
+        { view_type: "d06.memory_sources.v1", status: "unavailable" },
         { view_type: "future-view", status: "available" }
       ], unavailable_domains: []
     } });
@@ -404,7 +408,7 @@ test("catalogue opens only a service-available known page and requests its fresh
     ui.requests[1].resolve({ status: "ready", projection: {
       views: [
         { view_type: "creation", status: "available" },
-        { view_type: "memory", status: "unavailable" },
+        { view_type: "d06.memory_sources.v1", status: "unavailable" },
         { view_type: "future-view", status: "available" }
       ], unavailable_domains: []
     } });
@@ -421,6 +425,75 @@ test("catalogue opens only a service-available known page and requests its fresh
     request.resolve({ status: "ready", projection: { view_type: "creation", data: { candidates: [] } } });
     await selected;
     assert.match(ui.app.innerHTML, /尚不能确认整个范围为空/);
+  } finally { ui.restore(); }
+});
+
+test("D06 catalogue opens a read-only memory summary without source text", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: {
+      views: [{ view_type: "d06.memory_sources.v1", status: "available" }], unavailable_domains: []
+    } });
+    await opened;
+    const overview = ui.clickView("overview");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: {
+      views: [{ view_type: "d06.memory_sources.v1", status: "available" }], unavailable_domains: []
+    } });
+    await overview;
+    assert.match(ui.app.innerHTML, /data-view="memory" aria-label="打开记忆视图"/);
+    const memory = ui.clickView("memory");
+    const request = await ui.nextRequest(2);
+    assert.equal(request.payload.action, "read_character_view");
+    assert.equal(request.payload.input.view_type, "d06.memory_sources.v1");
+    assert.equal(request.payload.input.page_size, 100);
+    request.resolve({ status: "ready", projection: { view_type: "d06.memory_sources.v1", data: {
+      sources: [{ source_id: "source-<unsafe>", source_kind: "reported", assertion_status: "asserted", recorded_at: 12.5, qualification: "not_recorded", text: "secret-original" }],
+      coverage: "complete"
+    } } });
+    await memory;
+    assert.match(ui.app.innerHTML, /source-&lt;unsafe&gt;/);
+    assert.match(ui.app.innerHTML, /服务已确认完整覆盖，共 1 条来源/);
+    assert.doesNotMatch(ui.app.innerHTML, /secret-original|<unsafe>|纠错类型|提交给服务端|<pre class="projection"/);
+    const refresh = ui.clickCommand("page-action");
+    await ui.nextRequest(3);
+    assert.equal(ui.requests[3].payload.action, "read_character_view");
+    ui.requests[3].resolve({ status: "ready", projection: { view_type: "d06.memory_sources.v1", data: { sources: [], coverage: "complete" } } });
+    await refresh;
+    assert.match(ui.app.innerHTML, /当前授权范围内没有可显示的记忆来源/);
+  } finally { ui.restore(); }
+});
+
+test("D06 memory rejects partial or malformed source coverage and clears prior summary", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await opened;
+    const memory = ui.clickView("memory");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: { view_type: "d06.memory_sources.v1", data: {
+      sources: [{ source_id: "prior-source", source_kind: "observed", assertion_status: "asserted", recorded_at: 1, qualification: "not_recorded" }], coverage: "complete"
+    } } });
+    await memory;
+    assert.match(ui.app.innerHTML, /prior-source/);
+    for (const data of [
+      { sources: [{ source_id: "partial-source", source_kind: "reported", assertion_status: "asserted", recorded_at: 2, qualification: "not_recorded" }], coverage: "partial" },
+      { sources: [{ source_id: "malformed-source", source_kind: "reported", assertion_status: "asserted", recorded_at: "2", qualification: "not_recorded" }], coverage: "complete" }
+    ]) {
+      const nextIndex = ui.requests.length;
+      const refresh = ui.clickCommand("page-action");
+      const request = await ui.nextRequest(nextIndex);
+      request.resolve({ status: "ready", projection: { view_type: "d06.memory_sources.v1", data } });
+      await refresh;
+      assert.match(ui.app.innerHTML, /state-unavailable/);
+      assert.doesNotMatch(ui.app.innerHTML, /prior-source|partial-source|malformed-source|<pre class="projection"/);
+    }
   } finally { ui.restore(); }
 });
 

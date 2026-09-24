@@ -43,7 +43,6 @@ export function workflowForPage(page, values) {
         : [ACTIONS.compileScheme, { ...(draft ? { draft } : { draft_ref: text(values.draft_ref) }), intent: "user_requested_candidate" }];
     }
     case "relations":
-    case "memory":
       return [ACTIONS.correctOrEdit, { correction_kind: text(values.correction_kind), statement: text(values.statement), source_refs: commaList(values.source_refs) }];
     case "cognition":
       return [ACTIONS.configureOrControl, { object_ref: text(values.object_ref), config_diff: { requested_view: page } }];

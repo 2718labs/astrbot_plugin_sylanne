@@ -236,7 +236,7 @@ test("nine-page workflows map user inputs only to W10 action schemas", () => {
   assert.throws(() => workflowForPage("setup", { scene_ref: "scene:fake", visibility: "private" }), /conversation-v1/);
   assert.throws(() => workflowForPage("setup", { scene_ref: "scene:other:42", visibility: "private", acknowledgement: "on" }), /conversation-v1/);
   const [compile, compileInput] = workflowForPage("creation", { mode: "compile", draft_ref: "draft:1" });
-  const [correct, correction] = workflowForPage("memory", { correction_kind: "source_correction", statement: "修正", source_refs: "source:1,source:2" });
+  const [correct, correction] = workflowForPage("relations", { correction_kind: "source_correction", statement: "修正", source_refs: "source:1,source:2" });
   const [erase, eraseInput] = workflowForPage("lifecycle", { mode: "erase", scope_selection: "all", data_choice: "delete" });
   assert.equal(compile, ACTIONS.compileScheme); assert.deepEqual(compileInput, { draft_ref: "draft:1", intent: "user_requested_candidate" });
   assert.equal(correct, ACTIONS.correctOrEdit); assert.deepEqual(correction.source_refs, ["source:1", "source:2"]);
