@@ -1,11 +1,16 @@
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 import tempfile
 
 from sylanne3.contracts import Event, Scope
 from sylanne3.domains.d04 import AffectAxis, AffectProvider, AffectScheme, CommittedRef, EncodingBaseline
 from sylanne3.domains.d04.encoding_baseline import decode_encoding_baseline
+from sylanne3.domains.d03.context import WorldEvent
+from sylanne3.domains.d03.self_perspective import (
+    SelfIdentityMapping, SelfPerspective, self_mapping_key,
+    self_perspective_id, self_perspective_key,
+)
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import (AtomKey, GraphAtom, GraphCandidate, GraphSnapshot,
                                   GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec)
@@ -82,6 +87,57 @@ def _baseline(**changes):
 
 
 class EncodingBaselineTests(unittest.TestCase):
+    def test_self_perspective_requires_current_mapping_and_matching_arrival(self):
+        provider, prior, _ = _proposal_and_snapshot()
+        namespace = prior.envelope.authority.namespace
+        event_key = AtomKey(Owner("event", "bot", "persona", "world:arrival"),
+                            "d03.world_event", "current")
+        event = WorldEvent("world:arrival", "message_received",
+                           (("entity:account:sender", "sender_account"),),
+                           1.0, 1.0, 1.0, "scene:one", (SOURCE,), "host_observed")
+        mapping_key = self_mapping_key(namespace)
+        mapping = SelfIdentityMapping(
+            "self-map:one", "persona:persona", "entity:self",
+            "d11:self-identity:one", "role:head", "incarnation:one", "active",
+        )
+        perspective = SelfPerspective(
+            self_perspective_id(namespace, event.scene_ref, event_key.token),
+            mapping.persona_ref, mapping.self_entity_ref, event.scene_ref,
+            mapping_key.token, event_key.token, mapping.role_head_id,
+        )
+        perspective_key = self_perspective_key(namespace, perspective.perspective_id)
+        atoms = (
+            GraphAtom(AtomKey.from_token(SOURCE), 1, {}),
+            GraphAtom(perspective_key, 1, asdict(perspective)),
+            GraphAtom(mapping_key, 2, asdict(mapping)),
+            GraphAtom(event_key, 3, {
+                **asdict(event),
+                "participant_roles": [list(item) for item in event.participant_roles],
+                "source_refs": list(event.source_refs),
+            }),
+        )
+        snapshot = GraphSnapshot(atoms, ())
+        guards = tuple(GraphVersion(atom.key, atom.revision) for atom in atoms)
+        envelope = replace(prior.envelope, version_guard=replace(
+            prior.envelope.version_guard, read_versions=guards,
+        ))
+        args = dict(source_refs=(SOURCE,), perspective_ref=perspective_key.token,
+                    projection_policy_ref="policy:unresolved")
+        proposal = provider.propose_encoding_baseline(envelope, snapshot, **args)
+        self.assertEqual(proposal.dependencies.historical_provenance, guards)
+        self.assertEqual(decode_encoding_baseline(
+            proposal.typed_writes[0].value).perspective_ref, perspective_key.token)
+        stale = replace(envelope, version_guard=replace(
+            envelope.version_guard, read_versions=guards[:-2] + (guards[-1],),
+        ))
+        with self.assertRaisesRegex(ValueError, "matching committed guarded revisions"):
+            provider.propose_encoding_baseline(stale, snapshot, **args)
+        unrelated = GraphSnapshot((*atoms[:-1], replace(
+            atoms[-1], value={**atoms[-1].value, "source_refs": ["other"]},
+        )), ())
+        with self.assertRaisesRegex(ValueError, "unrelated to baseline source"):
+            provider.propose_encoding_baseline(envelope, unrelated, **args)
+
     def test_unknown_baseline_proposal_is_committable_as_immutable_graph_source(self):
         provider, prior, _ = _proposal_and_snapshot()
         registry = TypeRegistry()

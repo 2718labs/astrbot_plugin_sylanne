@@ -899,7 +899,24 @@ class AffectProvider:
         sources = tuple(sorted(source_refs))
         feeling_refs = tuple(sorted(then_feeling_refs))
         interpretations = tuple(sorted(interpretation_refs))
-        ref_tokens = (*sources, perspective_ref, *feeling_refs, *interpretations)
+        perspective_dependencies = EncodingBaseline(
+            baseline_id="baseline:pending",
+            source_refs=sources,
+            perspective_ref=perspective_ref,
+            then_feeling_versions=(), interpretation_versions=(),
+            as_known_at=envelope.source_qualification.learned_at,
+            projection_policy_ref=projection_policy_ref,
+            projection_policy_version=envelope.version_guard.policy_version,
+            basis_version=scheme.scheme_version,
+            parameter_version=scheme.parameter_version,
+            salience_interval=None, tone_interval=None,
+            unknown_reasons=(
+                "salience_interval:numeric_projection_uncertified",
+                "tone_interval:numeric_projection_uncertified",
+            ),
+        ).perspective_dependency_refs(snapshot)
+        ref_tokens = (*sources, perspective_ref, *perspective_dependencies,
+                      *feeling_refs, *interpretations)
         keys = tuple(AtomKey.from_token(ref) for ref in ref_tokens)
         if len(set(keys)) != len(keys) or len({atom.key for atom in snapshot.atoms}) != len(snapshot.atoms):
             raise ValueError("baseline read set contains duplicate graph keys")
@@ -1442,6 +1459,7 @@ class AffectProvider:
                     raise ValueError("encoding baseline requires a revision-0 write guard")
                 refs = tuple(AtomKey.from_token(token) for token in (
                     *decoded.source_refs, decoded.perspective_ref,
+                    *decoded.perspective_dependency_refs(snapshot),
                     *(item.ref for item in decoded.then_feeling_versions),
                     *(item.ref for item in decoded.interpretation_versions),
                 ))

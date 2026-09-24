@@ -44,6 +44,7 @@ def _typed_key(value: object, name: str, allowed: dict[str, frozenset[str]]) -> 
 _PERSPECTIVE_TYPES = {
     "d03.entity_anchor": frozenset({"persona"}),
     "d03.role_binding": frozenset({"persona", "scene"}),
+    "d03.self_perspective.v1": frozenset({"persona"}),
 }
 _INTERPRETATION_TYPES = {
     "d07.current_interpretation.v1": frozenset({"activity"}),
@@ -170,7 +171,8 @@ class EncodingBaseline:
         """Require valid graph atoms at the referenced committed revisions."""
         if not isinstance(snapshot, GraphSnapshot):
             raise TypeError("baseline reference verification requires a graph snapshot")
-        for token in (*self.source_refs, self.perspective_ref):
+        for token in (*self.source_refs, self.perspective_ref,
+                      *self.perspective_dependency_refs(snapshot)):
             atom = snapshot.get(AtomKey.from_token(token))
             if atom is None or not atom.valid or atom.revision < 1:
                 raise ValueError("baseline source or perspective lacks a committed graph atom")
@@ -178,6 +180,70 @@ class EncodingBaseline:
             atom = snapshot.get(AtomKey.from_token(item.ref))
             if atom is None or not atom.valid or atom.revision != item.revision:
                 raise ValueError("baseline version ref lacks its committed graph revision")
+
+    def perspective_dependency_refs(self, snapshot: GraphSnapshot) -> tuple[str, ...]:
+        """Bind a D03 self perspective to its current mapping and arrival fact."""
+        key = AtomKey.from_token(self.perspective_ref)
+        if key.type_name != "d03.self_perspective.v1":
+            return ()
+        if not isinstance(snapshot, GraphSnapshot):
+            raise TypeError("self perspective needs a committed graph snapshot")
+        from ..d03.self_perspective import (
+            SelfIdentityMapping, SelfPerspective, self_mapping_key,
+            self_perspective_id, self_perspective_key,
+        )
+        from ..d03.context import WorldEvent
+        from ...runtime_contracts import NamespaceId
+
+        namespace = NamespaceId(key.owner.bot, key.owner.persona)
+        perspective_atom = snapshot.get(key)
+        if (perspective_atom is None or not perspective_atom.valid
+                or perspective_atom.revision < 1):
+            raise ValueError("D03 self perspective is not committed")
+        try:
+            perspective = SelfPerspective(**perspective_atom.value)
+            mapping_key = AtomKey.from_token(perspective.identity_mapping_ref)
+            event_key = AtomKey.from_token(perspective.arrival_event_ref)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("D03 self perspective value is invalid") from exc
+        mapping_atom = snapshot.get(mapping_key)
+        event_atom = snapshot.get(event_key)
+        if (mapping_atom is None or event_atom is None
+                or not mapping_atom.valid or not event_atom.valid
+                or mapping_atom.revision < 1 or event_atom.revision < 1):
+            raise ValueError("D03 self perspective mapping or arrival is unavailable")
+        try:
+            mapping = SelfIdentityMapping(**mapping_atom.value)
+            event = WorldEvent(**{
+                **event_atom.value,
+                "participant_roles": tuple(tuple(item) for item in event_atom.value["participant_roles"]),
+                "source_refs": tuple(event_atom.value["source_refs"]),
+            })
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("D03 self perspective mapping or arrival is invalid") from exc
+        if (key != self_perspective_key(namespace, perspective.perspective_id)
+                or mapping_key != self_mapping_key(namespace)
+                or event_key.owner.kind != "event"
+                or (event_key.owner.bot, event_key.owner.persona) != namespace.as_tuple
+                or event_key.owner.subject != event.event_id
+                or event_key.name != "current"
+                or perspective.perspective_id != self_perspective_id(
+                    namespace, perspective.scene_ref, event_key.token)
+                or perspective.persona_ref != mapping.persona_ref
+                or perspective.persona_ref != f"persona:{namespace.persona_id}"
+                or perspective.self_entity_ref != mapping.self_entity_ref
+                or perspective.role_head_id != mapping.role_head_id
+                or mapping.status != "active"
+                or perspective.scene_ref != event.scene_ref
+                or event.kind != "message_received"
+                or event.reality != "host_observed"
+                or event.source_refs != self.source_refs
+                or event.learned_at != self.as_known_at
+                or len(event.participant_roles) != 1
+                or event.participant_roles[0][1] != "sender_account"
+                or event.participant_roles[0][0] == perspective.self_entity_ref):
+            raise ValueError("D03 self perspective is unrelated to baseline source or self")
+        return mapping_key.token, event_key.token
 
 
 def decode_encoding_baseline(payload: object) -> EncodingBaseline:
