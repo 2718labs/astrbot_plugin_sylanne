@@ -402,6 +402,38 @@ class PluginPackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dangerous"):
             self.builder.verify_package(dangerous)
 
+    def test_verifier_rejects_extra_file_even_when_manifest_lists_it(self) -> None:
+        package = self.builder.build_package(
+            project_root=self.project,
+            target_os="windows",
+            target_arch="x86_64",
+            native_library=self._native(),
+            output_dir=self.base / "single-platform",
+            allow_dirty_dev_probe=True,
+        )
+        with zipfile.ZipFile(package) as source:
+            original = {name: source.read(name) for name in source.namelist()}
+        for extra in (
+            "rewrite/sylanne3/_native/linux-x86_64/libsylanne3_kernel.so",
+            "credentials.json",
+        ):
+            with self.subTest(extra=extra):
+                members = original.copy()
+                members[extra] = b"unwanted extra file"
+                manifest = json.loads(members["release-manifest.json"])
+                manifest["files"].append({
+                    "path": extra,
+                    "bytes": len(members[extra]),
+                    "sha256": hashlib.sha256(members[extra]).hexdigest(),
+                })
+                members["release-manifest.json"] = json.dumps(manifest).encode()
+                forged = self.base / f"extra-{extra.replace('/', '-')}.zip"
+                with zipfile.ZipFile(forged, "w") as archive:
+                    for name, content in members.items():
+                        archive.writestr(name, content)
+                with self.assertRaisesRegex(ValueError, "not allowed"):
+                    self.builder.verify_package(forged)
+
     def test_verifier_rejects_missing_entrypoint_or_runtime_source(self) -> None:
         package = self.builder.build_package(
             project_root=self.project,

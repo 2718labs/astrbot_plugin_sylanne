@@ -323,6 +323,21 @@ def _resource_is_forbidden(relative: str) -> bool:
     )
 
 
+def _allowed_package_member(path: str, native_path: str) -> bool:
+    if path == native_path or path in ROOT_FILE_ALLOWLIST:
+        return True
+    if path in NOTICE_FILE_ALLOWLIST or path in SBOM_FILE_ALLOWLIST:
+        return True
+    if path.startswith("rewrite/sylanne3/_native/"):
+        return False
+    if path.startswith("rewrite/sylanne3/"):
+        return path.endswith(".py") and "__pycache__" not in PurePosixPath(path).parts
+    return any(
+        path.startswith(root + "/") and not _resource_is_forbidden(path)
+        for root in RESOURCE_ROOT_ALLOWLIST
+    )
+
+
 def _read_allowlisted_payload(
     project_root: Path, *, formal: bool
 ) -> dict[str, bytes]:
@@ -808,6 +823,9 @@ def verify_package(package: Path | str) -> None:
             )
             if native_path not in listed:
                 raise ValueError("ReleaseManifest canonical native library is missing")
+            unexpected = sorted(path for path in listed if not _allowed_package_member(path, native_path))
+            if unexpected:
+                raise ValueError(f"package member is not allowed: {unexpected[0]}")
             native = manifest.get("native")
             if not isinstance(native, dict) or native != {
                 "path": native_path,
