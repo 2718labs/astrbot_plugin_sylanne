@@ -25,6 +25,7 @@ from .domain_registry import PROJECTION_CONTEXT_V1, PROJECTION_CONTEXT_V2
 from .onboarding import OnboardingPolicyResolver, TrustedBindScene, TrustedCreateCharacter
 from .d01_onboarding import VerifiedCreationResources
 from .service import AuthenticatedSession, request_digest
+from .source_correction import SourceCorrectionCommitReceiptV1, SourceCorrectionRequestV1
 
 
 @dataclass(frozen=True)
@@ -283,6 +284,66 @@ class GraphWorkbenchIssuer:
                                     audience=audience, operation_id=operation_id,
                                     input_data=input_data)
         return _unavailable("action_issuer_unavailable")
+
+    def correct_source_claim(self, *, session: AuthenticatedSession, scope: str,
+                             purpose: str, audience: str,
+                             request: SourceCorrectionRequestV1) -> Mapping[str, Any]:
+        """Cross only a dedicated W01 correction commit port, never generic execute.
+
+        The W01 method must recheck the signed Owner session, durable graph
+        grant, source access and deletion epochs in its commit transaction.
+        Until that method exists, this route remains explicitly unavailable.
+        """
+        if (type(request) is not SourceCorrectionRequestV1
+                or scope != f"{request.namespace.bot_id}/{request.namespace.persona_id}"
+                or not session.allows(scope, "workbench.correct", purpose, audience)):
+            return _unavailable("source_correction_policy_unavailable")
+        login = session.owner_session_request
+        if (type(session.owner_session_token) is not str
+                or not session.owner_session_token
+                or type(login) is not OwnerSessionLoginRequestV1
+                or login.audience != audience):
+            return _unavailable("signed_owner_session_unavailable")
+        commit = getattr(self._coordinator, "commit_source_correction_v1", None)
+        if not callable(commit):
+            return _unavailable("source_correction_commit_unavailable")
+        try:
+            result = commit(
+                request=request, actor_id=session.actor_id,
+                principal=login.principal,
+                owner_session_token=session.owner_session_token,
+                owner_session_request=login,
+            )
+        except PermissionError:
+            raise
+        except Exception:
+            # A failed response is not proof that the transaction did not commit.
+            # A retry must keep the same operation ID so W01 can replay its receipt.
+            return {"status": "unavailable", "problem": {
+                "code": "source_correction_outcome_unknown", "retryable": False,
+            }}
+        if (type(result) is not SourceCorrectionCommitReceiptV1
+                or result.namespace != request.namespace
+                or result.operation_id != request.operation_id
+                or result.request_digest != request.request_digest
+                or result.source_refs != request.source_refs
+                or result.invalidated_target_refs != request.target_refs
+                or result.access_epoch != request.access_epoch
+                or result.deletion_epoch != request.deletion_epoch):
+            return _unavailable("source_correction_receipt_invalid")
+        return {"status": "ready", "receipt": {
+            "schema": result.schema, "phase": result.phase,
+            "operation_id": result.operation_id,
+            "request_digest": result.request_digest,
+            "correction_source_ref": result.correction_source_ref,
+            "source_refs": list(result.source_refs),
+            "invalidated_target_refs": list(result.invalidated_target_refs),
+            "reevaluation_outbox_ref": result.reevaluation_outbox_ref,
+            "audit_event_ref": result.audit_event_ref,
+            "graph_revision": result.graph_revision,
+            "access_epoch": result.access_epoch,
+            "deletion_epoch": result.deletion_epoch,
+        }}
 
     def _bind_scene(self, *, session: AuthenticatedSession, scope: str,
                     purpose: str, audience: str, operation_id: str,

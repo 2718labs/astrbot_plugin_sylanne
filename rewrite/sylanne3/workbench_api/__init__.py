@@ -6,9 +6,11 @@ from .domain_registry import CurrentDomainViewRegistry, ViewCatalogue
 from .async_service import AsyncGraphWorkbenchService
 from .owner_grant import CurrentOwnerGrant, CurrentOwnerGrantPort, DurableOwnerGrantResolver
 from .onboarding import OnboardingPolicyResolver, TrustedBindScene, TrustedCreateCharacter
+from .source_correction import SourceCorrectionCommitReceiptV1, SourceCorrectionRequestV1
 
 __all__ = ("ApiResponse", "AuthenticatedSession", "RequestContext", "WorkbenchService",
            "CoordinatorGrant", "DomainViewRegistry", "GraphWorkbenchIssuer", "GrantResolver",
            "CurrentDomainViewRegistry", "ViewCatalogue", "AsyncGraphWorkbenchService",
            "CurrentOwnerGrant", "CurrentOwnerGrantPort", "DurableOwnerGrantResolver",
-           "OnboardingPolicyResolver", "TrustedCreateCharacter", "TrustedBindScene")
+           "OnboardingPolicyResolver", "TrustedCreateCharacter", "TrustedBindScene",
+           "SourceCorrectionRequestV1", "SourceCorrectionCommitReceiptV1")

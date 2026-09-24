@@ -15,6 +15,8 @@ from typing import Any, Mapping, Protocol
 from uuid import UUID
 
 from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
+from ..runtime_contracts import NamespaceId
+from .source_correction import SourceCorrectionRequestV1
 
 
 D12_SCHEMA = "d12.contract.v1"
@@ -116,6 +118,10 @@ class WorkbenchIssuer(Protocol):
     def execute(self, *, session: AuthenticatedSession, action: str, scope: str, purpose: str,
                 audience: str, operation_id: str, input_data: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
+    def correct_source_claim(self, *, session: AuthenticatedSession, scope: str,
+                             purpose: str, audience: str,
+                             request: SourceCorrectionRequestV1) -> Mapping[str, Any]: ...
+
 
 class WorkbenchService:
     """Validate D12 requests then delegate to an authenticated coordinator facade."""
@@ -138,19 +144,43 @@ class WorkbenchService:
         # selects a permitted audience; it can never expand one.
         if not session.allows(command["scope"], capability, command["purpose"], command["audience"]):
             return self._problem("unauthorized", "capability_denied", "当前会话没有此范围、用途或受众的能力。", False)
-        if command["action"] == "correct_or_edit":
-            # D06 can plan a correction, but W01/W03 do not yet expose an
-            # Owner-authorized atomic source/reinterpretation commit. A preview
-            # reference supplied by the browser is not evidence of a commit.
-            return ApiResponse(status="unavailable", problem={
-                "schema": SOURCE_CORRECTION_RESPONSE_SCHEMA,
-                "code": "source_correction_commit_unavailable",
-                "message": "来源纠错提交尚未接入权威协调器；未修改来源或解释。",
-                "retryable": False,
-            })
         if self._issuer is None:
+            if command["action"] == "correct_or_edit":
+                return self._correction_hold()
             return self._problem("unavailable", "provider_unavailable", "工作台协调器尚未接入；未执行任何领域写入。", True)
         try:
+            if command["action"] == "correct_or_edit":
+                submit = getattr(self._issuer, "correct_source_claim", None)
+                if not callable(submit):
+                    return self._correction_hold()
+                scope_parts = command["scope"].split("/")
+                if len(scope_parts) != 2:
+                    return self._problem("unavailable", "invalid_request", "纠错需要精确的角色范围。", False)
+                input_data = command["input"]
+                digest = "sha256:" + request_digest({
+                    "action": "correct_or_edit", "scope": command["scope"],
+                    "purpose": command["purpose"], "audience": command["audience"],
+                    "operation_id": command["operation_id"], "input": input_data,
+                })
+                correction = SourceCorrectionRequestV1(
+                    namespace=NamespaceId(*scope_parts),
+                    operation_id=command["operation_id"], request_digest=digest,
+                    statement=input_data["statement"],
+                    source_refs=tuple(input_data["source_refs"]),
+                    target_refs=tuple(input_data["target_refs"]),
+                    access_epoch=input_data["access_epoch"],
+                    deletion_epoch=input_data["deletion_epoch"],
+                    impact_preview_ref=input_data.get("impact_preview_ref"),
+                )
+                returned = submit(session=session, scope=command["scope"],
+                                  purpose=command["purpose"], audience=command["audience"],
+                                  request=correction)
+                if (returned.get("status") == "unavailable"
+                        and isinstance(returned.get("problem"), Mapping)
+                        and returned["problem"].get("code") == "source_correction_commit_unavailable"):
+                    return self._correction_hold()
+                return self._command_response("correct_or_edit", command["operation_id"],
+                                              input_data, returned, expected_digest=digest)
             if command["action"] == "open_workspace":
                 returned = self._issuer.open_workspace(session=session, scope=command["scope"],
                                                        purpose=command["purpose"],
@@ -240,6 +270,8 @@ class WorkbenchService:
             if input_data["visibility"] not in {"private", "group"} or input_data["acknowledgement"] is not True:
                 raise ValueError("bind_scene requires an acknowledged visibility")
         if action == "correct_or_edit":
+            if len(scope.split("/")) != 2:
+                raise ValueError("source correction requires an exact role scope")
             required = _INPUT_FIELDS[action] - {"impact_preview_ref"}
             if set(input_data) not in (required, _INPUT_FIELDS[action]):
                 raise ValueError("source correction requires its versioned claim, sources, targets and epochs")
@@ -252,7 +284,8 @@ class WorkbenchService:
             for name in ("source_refs", "target_refs"):
                 refs = input_data[name]
                 if (type(refs) is not list or not 1 <= len(refs) <= 100
-                        or any(type(ref) is not str or not 1 <= len(ref) <= 4096 for ref in refs)
+                        or any(type(ref) is not str or not 1 <= len(ref) <= 4096
+                               or not ref.strip() for ref in refs)
                         or len(set(refs)) != len(refs)):
                     raise ValueError(f"{name} must contain unique bounded references")
             for name in ("access_epoch", "deletion_epoch"):
@@ -285,7 +318,8 @@ class WorkbenchService:
 
     @classmethod
     def _command_response(cls, action: str, operation_id: str, input_data: Mapping[str, Any],
-                          returned: Mapping[str, Any]) -> ApiResponse:
+                          returned: Mapping[str, Any], *,
+                          expected_digest: str | None = None) -> ApiResponse:
         status = returned.get("status")
         if status not in {"ready", "partial", "stale", "unavailable", "unauthorized"}:
             return cls._problem("unavailable", "invalid_provider_response", "提供方返回了未知操作状态。", False)
@@ -311,8 +345,34 @@ class WorkbenchService:
                 or type(receipt.get("binding_revision")) is not int
                 or receipt["binding_revision"] < 1):
             return cls._problem("unavailable", "invalid_provider_response", "场景绑定缺少权威收据。", False)
+        if action == "correct_or_edit" and (
+                receipt.get("phase") != "source_correction_committed"
+                or receipt.get("schema") != "d12.source_correction_receipt.v1"
+                or receipt.get("request_digest") != expected_digest
+                or receipt.get("source_refs") != input_data["source_refs"]
+                or receipt.get("invalidated_target_refs") != input_data["target_refs"]
+                or type(receipt.get("graph_revision")) is not int
+                or receipt["graph_revision"] < 1
+                or receipt.get("access_epoch") != input_data["access_epoch"]
+                or receipt.get("deletion_epoch") != input_data["deletion_epoch"]
+                or not isinstance(receipt.get("correction_source_ref"), str)
+                or not receipt["correction_source_ref"]
+                or not isinstance(receipt.get("reevaluation_outbox_ref"), str)
+                or not receipt["reevaluation_outbox_ref"]
+                or not isinstance(receipt.get("audit_event_ref"), str)
+                or not receipt["audit_event_ref"]):
+            return cls._problem("unavailable", "invalid_provider_response", "来源纠错缺少权威提交收据。", False)
         return ApiResponse(status="ready", projection=returned.get("projection") if isinstance(returned.get("projection"), Mapping) else None,
                            receipt=receipt)
+
+    @staticmethod
+    def _correction_hold() -> ApiResponse:
+        return ApiResponse(status="unavailable", problem={
+            "schema": SOURCE_CORRECTION_RESPONSE_SCHEMA,
+            "code": "source_correction_commit_unavailable",
+            "message": "来源纠错提交尚未接入权威协调器；未修改来源或解释。",
+            "retryable": False,
+        })
 
     @staticmethod
     def _problem(status: str, code: str, message: str, retryable: bool) -> ApiResponse:
