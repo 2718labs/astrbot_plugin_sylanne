@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING, Mapping
 from types import SimpleNamespace
 
 from .contracts import Event, EventConflict, Scope, StaleRead, canonical_json
-from .graph_store import GraphStore, ProductionGraphStore
+from .graph_store import (
+    DeletionDependencyEdge, DeletionHistoryRow, GraphStore, ProductionGraphStore,
+)
 from .graph_types import (
     AtomKey, CurrentSceneProof, GraphCandidate, GraphSnapshot, GraphAtom,
     GraphVersion, GraphWrite,
@@ -73,6 +75,25 @@ class BudgetAdmission:
     actual: dict[str, int] | None = None
     execution_revoked: bool = False
     reservation_operation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeletionSnapshotCandidate:
+    """Bounded D06 read evidence, never a deletion or access permit."""
+
+    snapshot: GraphSnapshot
+    read_set: tuple[GraphVersion, ...]
+    current_reverse_edges: tuple[DeletionDependencyEdge, ...]
+    history_rows: tuple[DeletionHistoryRow, ...]
+    history_edges: tuple[DeletionDependencyEdge, ...]
+    access_epoch: int
+    delete_epoch: int
+    complete: bool
+    pages_scanned: int
+
+    @property
+    def epoch(self) -> NamespaceEpoch:
+        return self.snapshot.epochs[0]
 
 
 @dataclass(frozen=True)
@@ -622,6 +643,7 @@ class GraphCoordinator:
                                                   frozenset[str], int]] = {}
         self.__owner_leases: dict[_AuthorityLease, OwnerLeaseBindingV1] = {}
         self.__owner_session_proofs: dict[_AuthorityLease, tuple[str, object]] = {}
+        self.__deletion_read_leases: set[_AuthorityLease] = set()
         self.__providers: dict[str, tuple[object, str, str]] = {}
 
     def _content_fence(self, namespace: NamespaceId, generation: int,
@@ -663,7 +685,8 @@ class GraphCoordinator:
                  owner_principal=None,
                  owner_binding: OwnerLeaseBindingV1 | None = None,
                  owner_view: bool = False,
-                 owner_session_proof: tuple[str, object] | None = None):
+                 owner_session_proof: tuple[str, object] | None = None,
+                 final_check=None):
         """Keep every Authority RPC outside the business graph lock."""
         if owner_view and owner_principal is None:
             raise ValueError("Owner view requires an expected principal")
@@ -712,6 +735,11 @@ class GraphCoordinator:
                         raise UnavailableGuard("v2 graph recovery stamp changed")
                 if port.validate_fence(scope) != permit:
                     raise UnavailableGuard("v2 read permit changed")
+                if final_check is not None:
+                    with store._lock:
+                        if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                            raise UnavailableGuard("v2 graph recovery stamp changed")
+                        final_check(result)
                 if owner_view:
                     return CurrentOwnerViewV1(observed_guard, observed_owner)
                 return result
@@ -3884,6 +3912,38 @@ class GraphCoordinator:
             domains=domains, activation_generation=activation_generation,
             operation_id=operation_id)
 
+    def grant_deletion_read(self, bootstrap: object, *, actor: str,
+                            namespace: NamespaceId,
+                            activation_generation: int) -> tuple[AuthorityContext, object]:
+        """Host-mint a D06-only wide read lease for candidate closure evidence."""
+        self._admin(bootstrap)
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or "d06" not in self.__providers
+                or type(activation_generation) is not int
+                or activation_generation < 1):
+            raise UnavailableGuard("D06 deletion read authority is unavailable")
+        specs = self.__store._registry.specs
+        if not specs or any(spec.writer_domain is None for spec in specs):
+            raise UnavailableGuard("deletion read requires complete type ownership")
+        domains = tuple(sorted({spec.writer_domain for spec in specs}))
+        lease, ref = self._grant_registered(
+            actor=actor, issuer_domain="d06", namespace=namespace,
+            domains=domains, activation_generation=activation_generation)
+        owner_scope = tuple(sorted(self.__leases[lease][5]))
+        authority = AuthorityContext(
+            actor, "d06", ref, namespace, owner_scope, "deletion_cleanup",
+            ("internal",), "d06-deletion-closure-v1", activation_generation)
+        self.__deletion_read_leases.add(lease)
+        return authority, lease
+
+    def release_deletion_read_lease(self, bootstrap: object, lease: object) -> None:
+        self._admin(bootstrap)
+        if lease not in self.__deletion_read_leases:
+            raise AuthorityDenied("deletion read lease required")
+        self.__deletion_read_leases.remove(lease)
+        del self.__leases[lease]
+
     def _grant_registered(self, *, actor: str, issuer_domain: str,
                           namespace: NamespaceId, domains: tuple[str, ...],
                           activation_generation: int,
@@ -6734,6 +6794,98 @@ class GraphCoordinator:
         }
         if any(value.get(key) != item for key, item in expected.items()):
             raise AuthorityDenied("D11 cost graph atom differs from budget settlement")
+
+    @staticmethod
+    def _deletion_epochs_locked(db, namespace: NamespaceId) -> tuple[int, int]:
+        row = db.execute(
+            "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+            "WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
+        if row is None or row[0] < 1 or row[1] < 0:
+            raise UnavailableGuard("deletion access/delete epochs are unavailable")
+        return row[0], row[1]
+
+    def read_deletion_snapshot_candidate(
+            self, authority: AuthorityContext, lease: object,
+            keys: tuple[AtomKey, ...], *, page_limit: int = 128,
+            max_pages: int = 16) -> DeletionSnapshotCandidate:
+        """Collect bounded namespace history under one v2 Authority read fence.
+
+        The caller supplies no cursor or completion flag. A partial result is
+        evidence for more work only; deletion still needs independent admission.
+        """
+        if not isinstance(authority, AuthorityContext):
+            raise TypeError("authority required")
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None):
+            raise UnavailableGuard("v2 deletion read fence is unavailable")
+        if (lease not in self.__deletion_read_leases
+                or authority.issuer_domain != "d06"
+                or authority.purpose != "deletion_cleanup"
+                or authority.audience != ("internal",)
+                or authority.provider_policy_ref != "d06-deletion-closure-v1"
+                or authority.activation_generation != self.__leases[lease][6]):
+            raise AuthorityDenied("host-minted deletion read lease required")
+        keys = tuple(keys)
+        if not keys or len(keys) > 512 or len(set(keys)) != len(keys):
+            raise ValueError("deletion read requires 1 to 512 unique keys")
+        if (type(page_limit) is not int or not 1 <= page_limit <= 512
+                or type(max_pages) is not int or not 1 <= max_pages <= 32):
+            raise ValueError("deletion history page bounds are invalid")
+        if any(not isinstance(key, AtomKey)
+               or NamespaceId.from_key(key) != authority.namespace
+               for key in keys):
+            raise AuthorityDenied("deletion key crosses namespace")
+        specs = self.__store._registry.specs
+        if not specs or any(spec.writer_domain is None for spec in specs):
+            raise UnavailableGuard("deletion read requires complete type ownership")
+        domains = frozenset(spec.writer_domain for spec in specs)
+        owner_kinds = frozenset(kind for spec in specs for kind in spec.owner_kinds)
+        if not owner_kinds.issubset(authority.owner_scope):
+            raise AuthorityDenied("deletion read owner scope is incomplete")
+        self._authorize(lease, authority, domains, owner_read=True)
+
+        store = self.__store
+        namespace = authority.namespace
+
+        def reader():
+            access_epoch, delete_epoch = self._deletion_epochs_locked(
+                store._db, namespace)
+            cursor = None
+            epoch = None
+            first = None
+            rows = {}
+            edges = []
+            pages_scanned = 0
+            complete = False
+            for _ in range(max_pages):
+                page = GraphStore._deletion_snapshot_page(
+                    store, namespace, keys, after=cursor, expected_epoch=epoch,
+                    limit=page_limit, _capability=self.__graph_capability)
+                pages_scanned += 1
+                if first is None:
+                    first = page
+                    epoch = page.epoch
+                for row in page.history_rows:
+                    rows.setdefault((row.atom.key, row.atom.revision), row)
+                edges.extend(page.history_edges)
+                complete = page.complete
+                if complete:
+                    break
+                cursor = page.next_after
+            if (access_epoch, delete_epoch) != self._deletion_epochs_locked(
+                    store._db, namespace):
+                raise UnavailableGuard("deletion access/delete epochs changed during read")
+            return DeletionSnapshotCandidate(
+                first.snapshot, first.read_set, first.current_reverse_edges,
+                tuple(rows.values()), tuple(edges), access_epoch, delete_epoch,
+                complete, pages_scanned)
+
+        def final_check(candidate):
+            if (candidate.access_epoch, candidate.delete_epoch) != (
+                    self._deletion_epochs_locked(store._db, namespace)):
+                raise UnavailableGuard("deletion access/delete epochs changed during read")
+
+        return self._read_v2(authority, reader, final_check=final_check)
 
     def read_snapshot(self, authority: AuthorityContext, lease: object,
                       keys) -> GraphSnapshot:
