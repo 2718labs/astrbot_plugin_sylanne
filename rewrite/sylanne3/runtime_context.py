@@ -40,7 +40,7 @@ from .host.authority_client import AuthorityClient, AuthoritySelection
 from .host.model_terminal_cost_port import InstalledModelTerminalCostPort
 from .host.self_identity_current_port import InstalledCurrentSelfIdentityPort
 from .host.worker_result_read_fact_port import InstalledWorkerResultReadFactPort
-from .host.mtls_transport import MtlsAuthorityTransport
+from .host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 from .host.first_ingress_result import OriginalFirstIngressRead
 from .host.worker_result_identity import first_ingress_worker_result_request_v1
 from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
@@ -296,10 +296,11 @@ class RuntimeContext:
             self_identity_port = None
             worker_result_fact_port = None
             bundle = installation.admin_bundle
-            if type(bundle) is AdminInstallationBundle:
-                cost_transport = MtlsAuthorityTransport({
-                    bundle.tls_profile.profile_id: bundle.tls_profile})
+            if (type(bundle) is AdminInstallationBundle
+                    and type(bundle.tls_profile) is AuthorityTlsProfile):
                 try:
+                    cost_transport = MtlsAuthorityTransport({
+                        bundle.tls_profile.profile_id: bundle.tls_profile})
                     client = AuthorityClient(
                         AuthoritySelection(bundle.tls_profile.profile_id),
                         package_root=installation.package_root,
@@ -323,10 +324,14 @@ class RuntimeContext:
                         client=client, bundle=bundle,
                         grant=installation_grant, owner_loop=loop)
                 except Exception:
-                    await cost_transport.close()
+                    if cost_transport is not None:
+                        await cost_transport.close()
                     cost_transport = None
                     terminal_cost_port = accounting_port = None
                     self_identity_port = worker_result_fact_port = None
+            model_authority_hold = (
+                type(bundle) is AdminInstallationBundle
+                and cost_transport is None)
 
             def make_store():
                 return ProductionGraphStore(
@@ -527,9 +532,11 @@ class RuntimeContext:
                     ("ingress_encoding", installation.ingress_encoding, AdminIngressEncodingPolicy),
                 ) if type(configured) is not expected
             )
+            detail = "v2 graph worker started; namespace admission is pending"
+            if model_authority_hold:
+                detail += "; model egress and C02 HOLD: paired Authority TLS unavailable"
             self.health = RuntimeHealth(
-                "limited", ("namespace_activation",),
-                "v2 graph worker started; namespace admission is pending",
+                "limited", ("namespace_activation",), detail,
             )
             return self.health
 
@@ -568,6 +575,9 @@ class RuntimeContext:
             )
             if self._v2_missing_ingress_policies:
                 detail += "; ingress requires " + ", ".join(self._v2_missing_ingress_policies)
+            if (type(self._v2_model_bundle) is AdminInstallationBundle
+                    and self._v2_cost_transport is None):
+                detail += "; model egress and C02 HOLD: paired Authority TLS unavailable"
             self.health = RuntimeHealth(
                 "limited", tuple(missing), detail,
             )
@@ -623,6 +633,9 @@ class RuntimeContext:
                 )
             else:
                 detail = "current Owner and role checked; scene-specific proof and dispatch remain pending"
+            if (type(self._v2_model_bundle) is AdminInstallationBundle
+                    and self._v2_cost_transport is None):
+                detail += "; model egress and C02 HOLD: paired Authority TLS unavailable"
             self.health = RuntimeHealth(
                 "limited", tuple(missing), detail,
             )
@@ -859,6 +872,7 @@ class RuntimeContext:
         if (type(executor) is not HostModelEgressExecutor
                 or type(authority) is not AuthorityContext
                 or self._worker is None
+                or self._v2_cost_transport is None
                 or not self._v2_namespace_provisioned
                 or authority.namespace != self._v2_namespace
                 or executor._bundle is not self._v2_model_bundle
@@ -1028,6 +1042,7 @@ class RuntimeContext:
                 or type(receipt) is not IngressReceipt
                 or receipt.status != "accepted"
                 or self._worker is None
+                or self._v2_cost_transport is None
                 or self._v2_policy is None
                 or self._v2_port is None
                 or self._v2_bootstrap is None

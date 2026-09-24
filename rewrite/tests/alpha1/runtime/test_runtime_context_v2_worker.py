@@ -143,6 +143,12 @@ def test_v2_worker_installs_only_current_scoped_encoding_issuer(
         class Coordinator:
             def __init__(self, _store, _bootstrap, **kwargs):
                 captured["issuer"] = kwargs["encoding_request_issuer"]
+                captured["model_ports"] = (
+                    kwargs["model_terminal_cost_port"],
+                    kwargs["accounting_maintenance_port"],
+                    kwargs["self_identity_port"],
+                    kwargs["worker_result_fact_port"],
+                )
             def register_provider(self, *_args):
                 pass
 
@@ -156,7 +162,11 @@ def test_v2_worker_installs_only_current_scoped_encoding_issuer(
             domains=SimpleNamespace(complete=True, registrations={}, type_registry=object()),
             model_selection_port=SelectionPort(),
         )
-        assert (await context.start_v2(assembled)).status == "limited"
+        health = await context.start_v2(assembled)
+        assert health.status == "limited"
+        assert "model egress and C02 HOLD: paired Authority TLS unavailable" in health.detail
+        assert captured["model_ports"] == (None, None, None, None)
+        assert context._v2_cost_transport is None
         issuer = captured["issuer"]
         if profile_case == "current":
             assert callable(issuer)
