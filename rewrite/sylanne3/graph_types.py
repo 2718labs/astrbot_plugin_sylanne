@@ -271,10 +271,32 @@ class IngressIdentityReceipt:
 
 
 @dataclass(frozen=True)
+class CurrentSceneProof:
+    """Coordinator-read Owner/D01/D03 heads for one committed host ingress."""
+
+    source_ref: str
+    scene_ref: str
+    visibility: str
+    learned_at: float
+    graph_epoch: int
+    graph_incarnation: str
+    owner_grant_id: str
+    owner_authorization_revision: int
+    owner_authorization_head: str
+    owner_revocation_epoch: int
+    role_head_id: str
+    binding_id: str
+    binding_version: int
+    binding_receipt_operation_id: str
+    binding_receipt_graph_epoch: int
+
+
+@dataclass(frozen=True)
 class GraphSnapshot:
     atoms: tuple[GraphAtom, ...]
     epochs: tuple[NamespaceEpoch, ...]
     ingress_receipts: tuple[IngressIdentityReceipt, ...] = ()
+    scene_proofs: tuple[CurrentSceneProof, ...] = ()
 
     def __post_init__(self):
         atoms = tuple(self.atoms)
@@ -286,9 +308,13 @@ class GraphSnapshot:
         receipts = tuple(self.ingress_receipts)
         if any(type(receipt) is not IngressIdentityReceipt for receipt in receipts):
             raise TypeError("ingress receipts must be coordinator-read values")
+        proofs = tuple(self.scene_proofs)
+        if any(type(proof) is not CurrentSceneProof for proof in proofs):
+            raise TypeError("scene proofs must be coordinator-read values")
         object.__setattr__(self, "atoms", atoms)
         object.__setattr__(self, "epochs", epochs)
         object.__setattr__(self, "ingress_receipts", receipts)
+        object.__setattr__(self, "scene_proofs", proofs)
 
     def get(self, key: AtomKey) -> GraphAtom | None:
         return next((atom for atom in self.atoms if atom.key == key), None)

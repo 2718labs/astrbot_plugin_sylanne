@@ -19,7 +19,8 @@ from types import SimpleNamespace
 from .contracts import Event, EventConflict, Scope, StaleRead, canonical_json
 from .graph_store import GraphStore, ProductionGraphStore
 from .graph_types import (
-    AtomKey, GraphCandidate, GraphSnapshot, GraphAtom, GraphVersion, GraphWrite,
+    AtomKey, CurrentSceneProof, GraphCandidate, GraphSnapshot, GraphAtom,
+    GraphVersion, GraphWrite,
     NamespaceEpoch, Owner, owner_grant_key, owner_grant_policy_digest_v1,
     validate_owner_grant_v1,
 )
@@ -4357,8 +4358,178 @@ class GraphCoordinator:
             deadline_check(policy.deadline_utc)
         return True
 
+    def _current_scene_proof_locked(self, db, namespace, receipt, source_atom,
+                                    owner_guard, graph_epoch):
+        """Join current graph heads to a committed ingress in this SQLite read."""
+        from .authority_service.v2_owner_contract import (
+            OwnerGraphCommitProofV1, canonical_digest as owner_contract_digest,
+        )
+        from .domains.d03 import RoleBinding, RoleBindingRequest
+        from .runtime.first_ingress_v2 import scene_ref_for_conversation
+
+        if (type(owner_guard) is not OwnerAuthorizationGuardV1
+                or source_atom is None or not source_atom.valid
+                or source_atom.key.type_name != "memory.source"):
+            raise UnavailableGuard("current scene Owner or source is unavailable")
+        source = SourceRecord.from_dict(source_atom.value)
+        identity = json.loads(receipt.identity_json)
+        if (type(identity) is not dict
+                or identity.get("namespace") != list(namespace.as_tuple)
+                or identity.get("source_ref") != source.source_id
+                or source_atom.key.owner.subject != source.source_id
+                or source.recorded_at != receipt.learned_at):
+            raise UnavailableGuard("current scene ingress source differs")
+        scene_ref = scene_ref_for_conversation(
+            namespace, identity["platform_ref"], identity["conversation_ref"])
+        visibility = identity["visibility"]
+        metadata, current_epoch = self._v2_graph_stamp(namespace)
+        if current_epoch != graph_epoch:
+            raise StaleRead("current scene graph epoch changed")
+        target = metadata.requirements
+        grant_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (owner_grant_key(*namespace.as_tuple).token,),
+        ).fetchone()
+        proof_row = db.execute(
+            "SELECT operation_id,request_digest,grant_id,grant_digest,"
+            "graph_incarnation,graph_access_epoch,graph_epoch,"
+            "graph_receipt_digest,proof_json "
+            "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()
+        epochs = db.execute(
+            "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        if grant_row is None or proof_row is None or epochs is None:
+            raise UnavailableGuard("current scene Owner graph proof is absent")
+        try:
+            grant = json.loads(grant_row[1])
+            validate_owner_grant_v1(grant)
+            proof = OwnerGraphCommitProofV1(
+                namespace, proof_row[0], proof_row[1], proof_row[2],
+                proof_row[3], proof_row[4], grant["grant_revision"],
+                proof_row[5], proof_row[6], proof_row[7])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("current scene Owner graph proof is invalid") from exc
+        if (grant_row[0] != grant["grant_revision"] or grant_row[2] != 1
+                or grant_row[1] != canonical_json(grant)
+                or proof_row[8] != canonical_json(asdict(proof))
+                or "sha256:" + canonical_digest(grant) != proof.grant_digest
+                or grant["grant_id"] != proof.grant_id
+                or grant["issue_operation_id"] != proof.operation_id
+                or grant["activation_generation"] != target.activation_generation
+                or grant["scope"] != "bot/persona"
+                or target.namespace != namespace
+                or grant["graph_incarnation"] != target.graph_incarnation
+                or proof.graph_incarnation != target.graph_incarnation
+                or proof.graph_access_epoch > epochs[0]
+                or proof.graph_epoch > graph_epoch.revision
+                or owner_guard.namespace != namespace
+                or owner_guard.authority_id != target.authority_id
+                or owner_guard.authority_id != grant["authority_id"]
+                or owner_guard.installation_id != grant["installation_id"]
+                or owner_guard.installation_id
+                != self.__content_fence_v2.installation_grant.installation_id
+                or owner_guard.authorization_revision != grant["grant_revision"]
+                or owner_guard.authorization_head != owner_contract_digest(proof)
+                or target.revocation_epoch
+                != owner_guard.minimum_revocation_epoch
+                or owner_guard.minimum_revocation_revision != 0
+                or owner_guard.minimum_revocation_epoch != 0
+                or owner_guard.pending_revoke_operation_id is not None):
+            # The only durable graph authorization here is the initial issue.
+            # A later Owner head requires a separately authorized refresh.
+            raise UnavailableGuard("current scene Owner head lacks matching graph authorization")
+        role, _, role_epoch, _ = self._scene_binding_state_locked(
+            namespace, owner_guard)
+        if role_epoch != graph_epoch:
+            raise StaleRead("current scene D01 epoch changed")
+        rows = db.execute(
+            "SELECT token,revision,value FROM graph_atoms WHERE bot=? AND persona=? "
+            "AND owner_kind='scene' AND subject=? "
+            "AND type_name='d03.role_binding' AND valid=1",
+            namespace.as_tuple + (scene_ref,),
+        ).fetchall()
+        applicable = []
+        for token, revision, encoded in rows:
+            key = AtomKey.from_token(token)
+            try:
+                value = json.loads(encoded)
+                binding = RoleBinding(**{
+                    **value, "norm_refs": tuple(value["norm_refs"]),
+                    "source_refs": tuple(value["source_refs"]),
+                })
+                at_occurrence = RoleBindingRequest(
+                    f"persona:{namespace.persona_id}", None, None, scene_ref,
+                    "message", "context", source.occurred_at, True)
+                at_learning = replace(at_occurrence, at_time=source.recorded_at)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("current scene binding is invalid") from exc
+            if (key.name != binding.role_binding_id
+                    or key.owner.subject != scene_ref
+                    or revision != binding.binding_version
+                    or binding.scene_ref != scene_ref):
+                raise UnavailableGuard("current scene binding identity differs")
+            if (binding.scope_selector == "scene"
+                    and binding.visibility_scope == visibility
+                    and binding.target_entity_ref is None
+                    and binding.group_ref is None
+                    and binding.applies_to(at_occurrence)
+                    and binding.applies_to(at_learning)):
+                applicable.append((key, revision, binding))
+        if len(applicable) != 1:
+            raise UnavailableGuard("current scene has no unique applicable binding")
+        key, revision, binding = applicable[0]
+        receipt_row = db.execute(
+            "SELECT r.operation_id,r.receipt_json,r.pre_graph_revision,"
+            "r.pre_graph_epoch,r.post_graph_revision,r.post_graph_epoch,"
+            "h.value,h.valid FROM graph_history AS h "
+            "JOIN graph_scene_binding_receipts_v1 AS r "
+            "ON r.bot=h.event_bot AND r.persona=h.event_persona "
+            "AND r.operation_id=h.event_id "
+            "WHERE h.token=? AND h.revision=? "
+            "AND h.event_session='d03-scene-binding'",
+            (key.token, revision),
+        ).fetchone()
+        if receipt_row is None:
+            raise UnavailableGuard("current scene binding lacks fenced history receipt")
+        try:
+            payload = json.loads(receipt_row[1])
+            payload["namespace"] = NamespaceId(**payload["namespace"])
+            binding_receipt = SceneBindingReceiptV1(**payload)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("current scene binding receipt is invalid") from exc
+        if (receipt_row[1] != canonical_json(asdict(binding_receipt))
+                or receipt_row[6] != encoded or receipt_row[7] != 1
+                or receipt_row[4] != receipt_row[2] + 1
+                or receipt_row[5] != receipt_row[3] + 1
+                or binding_receipt.operation_id != receipt_row[0]
+                or binding_receipt.namespace != namespace
+                or binding_receipt.scene_ref != scene_ref
+                or binding_receipt.binding_id != binding.role_binding_id
+                or binding_receipt.role_head_id != role.head_id
+                or binding_receipt.owner_grant_id != grant["grant_id"]
+                or binding_receipt.owner_authorization_head
+                != owner_guard.authorization_head
+                or binding_receipt.graph_incarnation != target.graph_incarnation
+                or binding_receipt.graph_revision != receipt_row[4]
+                or binding_receipt.graph_epoch != receipt_row[5]
+                or binding_receipt.graph_revision > metadata.graph_revision
+                or binding_receipt.graph_epoch > graph_epoch.revision):
+            raise UnavailableGuard("current scene binding receipt differs from current heads")
+        return CurrentSceneProof(
+            source.source_id, scene_ref, visibility, source.recorded_at,
+            graph_epoch.revision, target.graph_incarnation, grant["grant_id"],
+            owner_guard.authorization_revision, owner_guard.authorization_head,
+            owner_guard.minimum_revocation_epoch, role.head_id,
+            binding.role_binding_id, revision, binding_receipt.operation_id,
+            binding_receipt.graph_epoch,
+        )
+
     def _check_guard(self, db, bundle: DomainBundle, *,
-                     ingress_deadline_check=None) -> GraphSnapshot:
+                     ingress_deadline_check=None,
+                     scene_owner_guard=None) -> GraphSnapshot:
         store = self.__store
         envelope = bundle.envelope
         namespace = envelope.authority.namespace
@@ -4415,13 +4586,14 @@ class GraphCoordinator:
             atoms.append(GraphAtom(read.key, revision, json.loads(row[1]), bool(row[2]))
                          if row else GraphAtom(read.key, 0, {}, False))
         ingress_receipts = []
-        if any(
+        host_observed = any(
                 proposal.domain == "d03" and any(
                     write.key.type_name == "d03.world_event"
                     and (write.value.get("kind") == "message_received"
                          or write.value.get("reality") == "host_observed")
                     for write in proposal.typed_writes)
-                for proposal in bundle.proposals):
+                for proposal in bundle.proposals)
+        if host_observed:
             from .runtime.ingress_observation import read_committed_ingress_identity
 
             for source_ref in envelope.source_qualification.source_refs:
@@ -4432,8 +4604,19 @@ class GraphCoordinator:
                     db, namespace, key.owner.subject)
                 if receipt is not None:
                     ingress_receipts.append(receipt)
+        scene_proofs = ()
+        if host_observed and scene_owner_guard is not None:
+            if len(ingress_receipts) != 1 or len(envelope.source_qualification.source_refs) != 1:
+                raise UnavailableGuard("current scene needs one committed host ingress")
+            source_key_current = self._parse_ref(
+                envelope.source_qualification.source_refs[0], namespace)
+            source_atom = next((atom for atom in atoms
+                                if atom.key == source_key_current), None)
+            scene_proofs = (self._current_scene_proof_locked(
+                db, namespace, ingress_receipts[0], source_atom,
+                scene_owner_guard, graph_epoch),)
         return GraphSnapshot(tuple(atoms), (graph_epoch,),
-                             tuple(ingress_receipts))
+                             tuple(ingress_receipts), scene_proofs)
 
     @staticmethod
     def _parse_ref(ref: str, namespace: NamespaceId) -> AtomKey:
@@ -7494,11 +7677,33 @@ class GraphCoordinator:
             raise UnavailableGuard("v2 bundle write permit changed")
         transaction_state = {"phase": "before_transaction"}
         try:
+            scene_owner_guard = None
+            if any(
+                    proposal.domain == "d03" and any(
+                        write.key.type_name == "d03.world_event"
+                        and (write.value.get("kind") == "message_received"
+                             or write.value.get("reality") == "host_observed")
+                        for write in proposal.typed_writes)
+                    for proposal in bundle.proposals):
+                reader = getattr(port, "get_current_owner_guard_for_fence", None)
+                if not callable(reader):
+                    raise UnavailableGuard("current scene Owner guard port is unavailable")
+                guarded = reader(
+                    namespace=namespace,
+                    authority_namespace=target.authority_namespace,
+                    permit=permit)
+                if (type(guarded) is not tuple or len(guarded) != 2
+                        or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                        or guarded[1] != permit
+                        or port.validate_fence(scope) != permit):
+                    raise UnavailableGuard("current scene Owner guard is unavailable")
+                scene_owner_guard = guarded[0]
             receipt = self._commit_domain_bundle_fenced(
                 bundle, lease, v2_write=(metadata, epoch, finish_id,
                                          finish_digest, canonical_json(to_wire(permit))),
                 v2_transaction_state=transaction_state,
-                dispatch_clock_reading=dispatch_clock_reading)
+                dispatch_clock_reading=dispatch_clock_reading,
+                scene_owner_guard=scene_owner_guard)
         except Exception:
             if transaction_state["phase"] in {"before_transaction", "rolled_back"}:
                 rejection = self._record_rejected_bundle_v2(
@@ -7622,10 +7827,11 @@ class GraphCoordinator:
     def _commit_domain_bundle_fenced(self, bundle: DomainBundle,
                                      lease: object, *, v2_read: bool = False,
                                      v2_write=None, v2_transaction_state=None,
-                                     in_transaction: bool = False,
-                                     now_utc: float | None = None,
+                                      in_transaction: bool = False,
+                                      now_utc: float | None = None,
                                      dispatch_clock_reading=None,
-                                     ingress_deadline_check=None) -> CommitReceipt:
+                                     ingress_deadline_check=None,
+                                     scene_owner_guard=None) -> CommitReceipt:
         """Join a caller-owned graph transaction when ``in_transaction`` is set.
 
         The caller holds the store lock and owns COMMIT or ROLLBACK.
@@ -7796,7 +8002,8 @@ class GraphCoordinator:
                     raise EventConflict("operation ID reused with different bundle")
                 return
             snapshot = self._check_guard(
-                db, bundle, ingress_deadline_check=ingress_deadline_check)
+                db, bundle, ingress_deadline_check=ingress_deadline_check,
+                scene_owner_guard=scene_owner_guard)
             if dispatch_candidate is not None and self.__dispatch_admission_issuer is not None:
                 from .runtime.dispatch_current_projection import (
                     read_current_dispatch_projection,
