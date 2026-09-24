@@ -802,3 +802,62 @@ test("creation cursor refuses a page from another snapshot and clears prior plan
     assert.doesNotMatch(ui.app.innerHTML, /prior-private-plan/);
   } finally { ui.restore(); }
 });
+
+test("setup keeps independent server receipts for role initialization and scene binding", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    (await ui.nextRequest(0)).resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await opened;
+    ui.setCreateFields({ display_name: "Mira", blueprint: "d01.persona.warm-listener.v1",
+      model_capability_ref: "capability:verified", budget_ref: "budget:verified" });
+    const created = ui.clickCommand("create-character");
+    const createRequest = await ui.nextRequest(1);
+    createRequest.resolve({ status: "ready", receipt: { operation_id: createRequest.payload.operation_id,
+      phase: "role_initialized", role_ref: "persona:persona", owner_grant_revision: 1 } });
+    (await ui.nextRequest(2)).resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await created;
+    assert.match(ui.app.innerHTML, /角色初始化<\/strong><span>已初始化/);
+    assert.match(ui.app.innerHTML, /场景绑定<\/strong><span>未核验/);
+
+    ui.setPageFields({ scene_ref: `scene:conversation-v1:${"a".repeat(64)}`,
+      visibility: "private", acknowledgement: "on" });
+    const bound = ui.clickCommand("page-action");
+    const bindRequest = await ui.nextRequest(3);
+    bindRequest.resolve({ status: "ready", receipt: { operation_id: bindRequest.payload.operation_id,
+      phase: "scene_bound", scene_ref: `scene:conversation-v1:${"a".repeat(64)}`, binding_revision: 1 } });
+    (await ui.nextRequest(4)).resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await bound;
+    assert.match(ui.app.innerHTML, /角色初始化<\/strong><span>已初始化/);
+    assert.match(ui.app.innerHTML, /场景绑定<\/strong><span>已绑定/);
+    assert.match(ui.app.innerHTML, /验证对话<\/strong><span>未核验/);
+  } finally { ui.restore(); }
+});
+
+test("setup receipts are cleared on role switch and Owner logout", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    (await ui.nextRequest(0)).resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await opened;
+    ui.setCreateFields({ display_name: "Mira", blueprint: "d01.persona.warm-listener.v1",
+      model_capability_ref: "capability:verified", budget_ref: "budget:verified" });
+    const created = ui.clickCommand("create-character");
+    const createRequest = await ui.nextRequest(1);
+    createRequest.resolve({ status: "ready", receipt: { operation_id: createRequest.payload.operation_id,
+      phase: "role_initialized", role_ref: "persona:persona", owner_grant_revision: 1 } });
+    (await ui.nextRequest(2)).resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await created;
+    ui.setRole("bot/other");
+    const switched = ui.clickCommand("switch-role");
+    (await ui.nextRequest(3)).resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await switched;
+    assert.match(ui.app.innerHTML, /角色初始化<\/strong><span>未核验/);
+    const logout = ui.clickCommand("owner-logout");
+    (await ui.nextRequest(4)).resolve({ status: "ok", owner_session: "locked" });
+    await logout;
+    assert.doesNotMatch(ui.app.innerHTML, /角色初始化<\/strong><span>已初始化/);
+  } finally { ui.restore(); }
+});

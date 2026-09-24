@@ -33,6 +33,22 @@ let sceneCandidates = [];
 let sceneCandidatesProblem = null;
 let sceneCandidatesEpoch = 0;
 const ownerDraft = {};
+const setupReceipts = { roleInitialized: null, sceneBound: null };
+
+function clearSetupReceipts() {
+  setupReceipts.roleInitialized = null;
+  setupReceipts.sceneBound = null;
+}
+
+function rememberSetupReceipt(action, result) {
+  if (result.status !== "ready" || !result.receipt) return;
+  if (action === ACTIONS.createCharacter && result.receipt.phase === "role_initialized") {
+    setupReceipts.roleInitialized = result.receipt;
+  }
+  if (action === ACTIONS.bindScene && result.receipt.phase === "scene_bound") {
+    setupReceipts.sceneBound = result.receipt;
+  }
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
@@ -200,8 +216,8 @@ function setupMarkup() {
   const stage = installation ? stageNames[installation.stage] : "未取得";
   const reason = installation ? (reasonNames[installation.reason] ?? "运行能力尚未齐备")
     : (installationProblem?.message ?? "正在读取宿主安装状态");
-  const creationReceipt = state.receipt?.phase === "role_initialized" ? state.receipt : null;
-  const sceneReceipt = state.receipt?.phase === "scene_bound" ? state.receipt : null;
+  const creationReceipt = state.sessionReady ? setupReceipts.roleInitialized : null;
+  const sceneReceipt = state.sessionReady ? setupReceipts.sceneBound : null;
   const creationHold = ["role_initialization_unavailable", "role_initialization_policy_unavailable", "role_initialization_receipt_invalid", "authority_unavailable", "invalid_provider_response"].includes(state.problem?.code);
   const steps = [
     ["插件安装与运行", stage, reason],
@@ -263,12 +279,14 @@ async function loadView() {
       : await api.readView({ scope: state.role, viewType: VIEW_TYPES[state.view] });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (result.status === "unauthorized") clearSetupReceipts();
     Object.assign(state, state.view === "memory" && result.status === "ready" && !validMemoryProjection(result.projection)
       ? applyProblem(state, { code: "invalid_memory_projection", message: "D06 未返回完整且可确认的来源摘要；请重新请求记忆视图。" })
       : applyResponse(state, result));
   } catch (error) {
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (!state.sessionReady) clearSetupReceipts();
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
@@ -354,6 +372,7 @@ async function ownerAction(action) {
     ownerProblem = null;
     api.clearSession();
     state.sessionReady = false;
+    clearSetupReceipts();
     Object.assign(state, applyProblem(state, { code: "owner_session_locked", message: "页面已锁定，正在等待服务端确认 Owner 退出。" }));
     render();
     try {
@@ -436,6 +455,7 @@ async function command(action) {
     ++sceneCandidatesEpoch;
     sceneCandidates = [];
     sceneCandidatesProblem = null;
+    clearSetupReceipts();
     Object.assign(state, switchRole(state, value)); render(); await loadView(); return;
   }
   if (action === "retry-session") return verifySession(true);
@@ -493,7 +513,7 @@ async function loadSceneCandidates() {
   } catch (error) {
     if (epoch !== sceneCandidatesEpoch) return;
     sceneCandidatesProblem = normalizeError(error).message;
-    if (!api.hasSession) state.sessionReady = false;
+    if (!api.hasSession) { state.sessionReady = false; clearSetupReceipts(); }
   }
   render();
 }
@@ -506,11 +526,14 @@ async function commandAction(action, input, purpose = "workbench_user_action") {
     const result = await api.command(action, { scope: state.role, purpose, input });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (result.status === "unauthorized") clearSetupReceipts();
     Object.assign(state, applyResponse(state, result));
+    rememberSetupReceipt(action, result);
     if (result.status === "ready" && needsFreshProjection(action)) return loadView();
   } catch (error) {
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (!state.sessionReady) clearSetupReceipts();
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
@@ -526,6 +549,7 @@ async function verifySession(refreshRole = false) {
     ++requestEpoch;
     api.clearSession();
     state.sessionReady = false;
+    clearSetupReceipts();
     state.projection = null;
     state.receipt = null;
     state.status = "loading";
@@ -545,6 +569,7 @@ async function verifySession(refreshRole = false) {
   } catch (error) {
     if (checkEpoch !== sessionCheckEpoch) return;
     state.sessionReady = false;
+    clearSetupReceipts();
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
