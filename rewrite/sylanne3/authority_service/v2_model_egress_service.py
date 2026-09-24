@@ -7,6 +7,7 @@ import secrets
 
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest
+from ..runtime_contracts import NamespaceId
 from ..host.authority_profile import AdminIngressModelPolicy, AdminModelWorkflowsV2
 from ..model_broker.broker import ModelCallRequest
 from ..model_broker.first_ingress_encoding import (
@@ -20,6 +21,7 @@ from .v2_model_egress_contract import (
     ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
 )
 from .v2_model_egress_store import AuthorityV2ModelEgressStore
+from .v2_terminal_c02_recovery_contract import OriginalC02ResultKeyV1
 from .v2_fence_service import AuthorityV2FenceService
 
 
@@ -265,6 +267,51 @@ class AuthorityV2ModelEgressService:
                           (call_id,)).fetchone():
                 admission, _, terminal = self._store.read_admission_locked(db, intent)
             return record, permit, admission, terminal
+
+    def terminal_recovery_identity_v1(
+        self, *, credential, subject: str, holder: str,
+        authority_id: str, namespace: str, namespace_id: NamespaceId,
+        installation_id: str, job_id: str, original_operation_id: str,
+        acquire_operation_id: str, original_model_operation_id: str,
+        call_id: str, request_digest: str, binding_digest: str,
+    ) -> OriginalC02ResultKeyV1:
+        """Authority-only terminal preflight; this does not release content.
+
+        The graph and read-attempt qualifications are deliberately separate.
+        No caller may use this key alone as a completed content handoff.
+        """
+        if type(namespace_id) is not NamespaceId:
+            raise AuthorityUnavailable("typed C02 namespace required")
+        identifier(original_operation_id, "original_operation_id")
+        found = self.lookup_original_intent_v1(
+            credential=credential, subject=subject, holder=holder,
+            authority_id=authority_id, namespace=namespace,
+            installation_id=installation_id, job_id=job_id,
+            acquire_operation_id=acquire_operation_id,
+            original_model_operation_id=original_model_operation_id,
+            call_id=call_id, request_digest=request_digest,
+            binding_digest=binding_digest)
+        if found is None:
+            raise AuthorityUnavailable("original terminal C02 result absent")
+        record, _permit, admission, terminal = found
+        intent = record.intent
+        if (record.state != "observed" or record.content_erased
+                or record.observation_digest is None
+                or admission is None or terminal is None
+                or intent.budget_reservation_operation_id != original_operation_id
+                or (terminal.call_id, terminal.request_digest,
+                    terminal.observation_digest, terminal.installation_id,
+                    terminal.admission_id) !=
+                   (intent.call_id, intent.request_digest,
+                    record.observation_digest, installation_id,
+                    admission.admission_id)):
+            raise AuthorityUnavailable("original C02 terminal evidence unavailable")
+        return OriginalC02ResultKeyV1(
+            authority_id, namespace, namespace_id, installation_id,
+            job_id, original_operation_id, acquire_operation_id,
+            original_model_operation_id, call_id, binding_digest,
+            request_digest, canonical_digest(asdict(intent)),
+            record.observation_digest, canonical_digest(asdict(terminal)))
 
     def recover_fenced(self, *, credential, subject: str,
                        intent: ModelEgressIntentV1):

@@ -35,6 +35,11 @@ from sylanne3.authority_service.v2_model_egress_contract import (
 from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
 from sylanne3.authority_service.v2_model_egress_store import AuthorityV2ModelEgressStore
 from sylanne3.authority_service.v2_model_egress_wire import from_wire, to_wire
+from sylanne3.authority_service.v2_terminal_c02_recovery_contract import (
+    OriginalC02ResultKeyV1, TerminalRecoveryReadRequestV1,
+    TerminalRecoveryReadAttemptV1,
+    from_wire as terminal_c02_from_wire, to_wire as terminal_c02_to_wire,
+)
 from sylanne3.host.authority_profile import AdminIngressModelPolicy, installed_model_config_ref
 from sylanne3.host.authority_client import (
     AUTHORITY_PROTOCOL, AuthorityProvisioningRequest, PublisherPackageIdentity,
@@ -236,7 +241,13 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
             "request_digest": draft2.request_digest,
             "binding_digest": draft2.binding_digest,
         }
+        recovery_identity = {
+            **lookup, "business_namespace": {"bot_id": "bot-a", "persona_id": "persona-a"},
+            "original_operation_id": draft2.budget_reservation_operation_id,
+        }
         assert call("model_original_intent_lookup_v1", lookup)["status"] == "prepared"
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            call("model_terminal_recovery_identity_v1", recovery_identity)
         assert call("model_original_intent_lookup_v1", {
             **lookup, "call_id": "absent-call"})["status"] == "absent"
         for changed in ({"binding_digest": "f" * 64},
@@ -310,6 +321,33 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         assert recovered_lookup["status"] == "terminal"
         assert recovered_lookup["terminal"] == to_wire(receipt)
         assert "result_json" not in json.dumps(recovered_lookup)
+        terminal_identity = call("model_terminal_recovery_identity_v1", recovery_identity)
+        original_key = terminal_c02_from_wire(
+            terminal_identity["original_key"], OriginalC02ResultKeyV1)
+        assert original_key.original_model_operation_id == intent2.operation_id
+        assert len(original_key.terminal_receipt_digest) == 64
+        assert terminal_identity["stable_result_digest"] == original_key.stable_result_digest
+        assert "result_json" not in json.dumps(terminal_identity)
+        attempt_a = TerminalRecoveryReadRequestV1(original_key, "c02-operation", "read-attempt-a")
+        attempt_b = TerminalRecoveryReadRequestV1(original_key, "c02-operation", "read-attempt-b")
+        assert attempt_a.digest != attempt_b.digest
+        assert attempt_a.original_key.stable_result_digest == attempt_b.original_key.stable_result_digest
+        assert terminal_c02_from_wire(
+            terminal_c02_to_wire(attempt_a), TerminalRecoveryReadRequestV1) == attempt_a
+        finished_attempt = TerminalRecoveryReadAttemptV1(
+            attempt_a, "a" * 64, "finished", original_key.stable_result_digest)
+        assert terminal_c02_from_wire(
+            terminal_c02_to_wire(finished_attempt),
+            TerminalRecoveryReadAttemptV1) == finished_attempt
+        with pytest.raises(ValueError, match="differs"):
+            TerminalRecoveryReadAttemptV1(attempt_a, "a" * 64, "finished", "b" * 64)
+        for changed in ({"binding_digest": "f" * 64},
+                        {"original_operation_id": "other-operation"},
+                        {"installation_id": "other-installation"},
+                        {"business_namespace": {"bot_id": "bot-b", "persona_id": "persona-a"}}):
+            with pytest.raises(RuntimeError, match="authority unavailable"):
+                call("model_terminal_recovery_identity_v1", {
+                    **recovery_identity, **changed})
         terminal = call("model_terminal_fact_v2", terminal_query)
         assert terminal["record"]["state"] == "observed"
         assert terminal["record"]["usage"] == [["input_tokens", 1]]

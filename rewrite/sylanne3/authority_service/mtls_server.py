@@ -47,6 +47,7 @@ from .v2_model_egress_contract import (
 from .v2_model_egress_service import AuthorityV2ModelEgressService
 from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
 from .v2_model_egress_wire import from_wire as model_from_wire, to_wire as model_to_wire
+from .v2_terminal_c02_recovery_contract import to_wire as terminal_c02_to_wire
 from .v2_model_result_read_contract import ModelResultReadRequestV1
 from .v2_model_result_read_service import AuthorityV2ModelResultReadService
 from .current_model_result_read_graph_verifier import PinnedCurrentModelResultReadGraphVerifier
@@ -991,6 +992,48 @@ class AuthorityRpcServer:
                     observer_profile_id=profile_id, manifest_digest=manifest_digest)
                 return {"record": model_to_wire(record), "permit": to_wire(permit),
                         "receipt": model_to_wire(receipt)}
+            if method == "model_terminal_recovery_identity_v1":
+                expected = {"namespace", "business_namespace", "installation_id",
+                            "job_id", "original_operation_id",
+                            "acquire_operation_id", "call_id",
+                            "original_model_operation_id", "request_digest",
+                            "binding_digest"}
+                if set(command) != expected:
+                    raise AuthorityUnavailable("terminal C02 identity fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                raw_business = command["business_namespace"]
+                if (type(raw_business) is not dict
+                        or set(raw_business) != {"bot_id", "persona_id"}):
+                    raise AuthorityUnavailable("terminal C02 business namespace differs")
+                namespace_id = NamespaceId(**raw_business)
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                model = self._v2_model_egress.get(namespace)
+                if (model is None or self._model_observers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)
+                        or command["installation_id"] != installed.installation_id
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            namespace_id)) != namespace):
+                    raise AuthorityUnavailable("designated terminal C02 observer differs")
+                key = model.terminal_recovery_identity_v1(
+                    credential=credential, subject=subject,
+                    holder=installed.administrator_holder,
+                    authority_id=self._authority_id(), namespace=namespace,
+                    namespace_id=namespace_id,
+                    installation_id=installed.installation_id,
+                    job_id=command["job_id"],
+                    original_operation_id=command["original_operation_id"],
+                    acquire_operation_id=command["acquire_operation_id"],
+                    original_model_operation_id=
+                        command["original_model_operation_id"],
+                    call_id=command["call_id"],
+                    request_digest=command["request_digest"],
+                    binding_digest=command["binding_digest"])
+                return {"original_key": terminal_c02_to_wire(key),
+                        "stable_result_digest": key.stable_result_digest}
             if method == "model_original_intent_lookup_v1":
                 expected = {"namespace", "installation_id", "job_id",
                             "acquire_operation_id", "call_id",
