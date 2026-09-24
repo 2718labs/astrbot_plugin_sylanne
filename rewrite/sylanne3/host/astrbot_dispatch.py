@@ -101,7 +101,7 @@ class AstrBotTextPlatformCapability:
         self._timeout_seconds = float(timeout_seconds)
         self._lock = Lock()
         self._attempted: set[str] = set()
-        self._pending: dict[str, Future[bool]] = {}
+        self._pending: dict[str, Future[int | None]] = {}
 
     def handoff(
         self, request: DispatchRequest, start: HandoffStartReceipt,
@@ -193,17 +193,24 @@ class AstrBotTextPlatformCapability:
             # Timeout/cancellation does not stop the host coroutine. The effect
             # may still complete, so the original operation stays unknown.
             raise HandoffUncertain(observation_ref) from exc
-        if type(matched) is not bool:
+        if matched is None:
+            return PlatformObservation("failed", observation_ref, None)
+        if type(matched) is not int or matched <= 0:
             raise HandoffUncertain(observation_ref)
         return PlatformObservation(
-            "handed_off" if matched else "failed", observation_ref, None,
+            "handed_off", observation_ref, self._provider_request_ref(matched),
         )
+
+    def _provider_request_ref(self, message_id: int) -> str:
+        scope = f"{self._platform_id}\0{self._self_id}"
+        scope_digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+        return f"astrbot:onebot:{scope_digest}:{message_id}"
 
     async def _send(
         self, session: MessageSession, text: str, candidate: ObservedSceneCandidate,
-    ) -> bool:
+    ) -> int | None:
         if await verify_current_host_scene(self._context, candidate) is None:
-            return False
+            return None
         # Context.send_message selects only the platform instance. OneBot may
         # have multiple accounts on that instance, so every action specifies
         # and revalidates the original account before the external handoff.
@@ -212,12 +219,12 @@ class AstrBotTextPlatformCapability:
             if platform.meta().id == self._platform_id
         ]
         if len(matching) != 1:
-            return False
+            return None
         adapter = self._context.get_platform_inst(self._platform_id)
         if (adapter is not matching[0] or not isinstance(adapter, AiocqhttpAdapter)
                 or adapter.meta().id != self._platform_id
                 or adapter.meta().name != "aiocqhttp"):
-            return False
+            return None
         action = (
             "send_group_msg" if session.message_type == MessageType.GROUP_MESSAGE
             else "send_private_msg"
@@ -236,9 +243,9 @@ class AstrBotTextPlatformCapability:
             # The API call may have reached OneBot. An absent or malformed
             # receipt cannot prove failure and must keep this operation unknown.
             raise ValueError("OneBot send receipt lacks a valid message_id")
-        return True
+        return receipt["message_id"]
 
-    def _forget_done(self, operation_id: str, future: Future[bool]) -> None:
+    def _forget_done(self, operation_id: str, future: Future[int | None]) -> None:
         with self._lock:
             if self._pending.get(operation_id) is future:
                 self._pending.pop(operation_id)

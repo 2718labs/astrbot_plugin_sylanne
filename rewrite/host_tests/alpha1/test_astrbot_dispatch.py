@@ -118,7 +118,9 @@ class AstrBotTextDispatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_private_handoff_revalidates_and_routes_to_bound_account(self) -> None:
         result = await asyncio.to_thread(self.capability.handoff, _request(), _start())
         self.assertEqual(result.status, "handed_off")
-        self.assertIsNone(result.provider_request_ref)
+        expected_scope = hashlib.sha256(b"platform-1\0bot-1").hexdigest()
+        expected_ref = f"astrbot:onebot:{expected_scope}:1"
+        self.assertEqual(result.provider_request_ref, expected_ref)
         self.platform.bot.call_action.assert_has_awaits([
             call("get_login_info", self_id="bot-1"),
             call("send_private_msg", self_id="bot-1", user_id=123456,
@@ -185,6 +187,7 @@ class AstrBotTextDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.platform.bot.call_action.side_effect = lambda action, **kwargs: {"user_id": "other-bot"}
         result = await asyncio.to_thread(self.capability.handoff, _request(), _start())
         self.assertEqual(result.status, "failed")
+        self.assertIsNone(result.provider_request_ref)
         self.platform.bot.call_action.assert_awaited_once_with("get_login_info", self_id="bot-1")
 
     async def test_changed_conversation_or_persona_blocks_before_send(self) -> None:
@@ -231,6 +234,9 @@ class AstrBotTextDispatchTests(unittest.IsolatedAsyncioTestCase):
         second_start = replace(_start(), operation_id="operation-2")
         result = await asyncio.to_thread(self.capability.handoff, second, second_start)
         self.assertEqual(result.status, "handed_off")
+        expected_scope = hashlib.sha256(b"platform-1\0bot-1").hexdigest()
+        expected_ref = f"astrbot:onebot:{expected_scope}:2"
+        self.assertEqual(result.provider_request_ref, expected_ref)
         first.bot.call_action.assert_any_await("get_login_info", self_id="bot-1")
         replacement.bot.call_action.assert_any_await("get_login_info", self_id="bot-1")
         self.assertEqual(first.bot.call_action.await_count, 2)
