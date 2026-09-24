@@ -51,7 +51,7 @@ def _case(ingress_system):
     reservation = db.execute(
         "SELECT digest,ceiling_json FROM runtime_budget_reservations "
         "WHERE lease_id=? AND operation_id=?", (job.budget_ref, original_id)).fetchone()
-    permit = from_wire(json.loads(db.execute(
+    acquire_permit = from_wire(json.loads(db.execute(
         "SELECT permit_json FROM graph_job_acquire_receipts_v2 "
         "WHERE acquire_operation_id=?", (acquire_id,)).fetchone()[0]))
     requirements = json.loads(db.execute(
@@ -69,8 +69,8 @@ def _case(ingress_system):
     intent = ModelEgressIntentV1(
         "authority", requirements["authority_namespace"], "encoding-worker",
         "model-operation", "model-call", "0" * 64, job_id, job.fence,
-        permit.token, permit.fence_epoch, permit.revision,
-        canonical_digest(asdict(permit.pinned_anchor)), (source_ref,),
+        "m" * 32, acquire_permit.fence_epoch + 1, 0,
+        canonical_digest(asdict(acquire_permit.pinned_anchor)), (source_ref,),
         ((source_ref, revisions[source.token]),),
         ((source_ref, revisions[access.token]),), access_epoch, delete_epoch,
         graph_epoch, graph_revision, requirements["activation_generation"],
@@ -84,6 +84,7 @@ def _case(ingress_system):
     verifier = PinnedCurrentModelEgressGraphVerifier(
         path, d11_issuer=issuer, trusted_now_utc=time.time)
     assert quote["ceiling"] == dict(intent.budget_ceiling)
+    assert intent.fence_token != acquire_permit.token
     return db, verifier, intent
 
 
