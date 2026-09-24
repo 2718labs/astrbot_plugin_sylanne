@@ -45,6 +45,7 @@ from .v2_model_egress_contract import (
     HostObservedModelCompletionV2,
 )
 from .v2_model_egress_service import AuthorityV2ModelEgressService
+from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
 from .v2_model_egress_wire import from_wire as model_from_wire, to_wire as model_to_wire
 from .v2_model_result_read_contract import ModelResultReadRequestV1
 from .v2_model_result_read_service import AuthorityV2ModelResultReadService
@@ -58,6 +59,9 @@ from .v2_worker_model_result_contract import (
 )
 from .v2_worker_model_result_read_service import (
     AuthorityV2WorkerModelResultReadService, WorkerResultDeliveryV1,
+)
+from .current_worker_model_result_graph_verifier import (
+    PinnedCurrentWorkerModelResultGraphVerifier,
 )
 from .v2_execution_bridge import AuthorityV2ExecutionBridge
 from .v2_owner_contract import (
@@ -362,6 +366,11 @@ class AuthorityRpcServer:
                        or type(service) is not AuthorityV2WorkerModelResultReadService
                        or service._store is not model_services[namespace]._store
                        or service._fences is not services[namespace]
+                       or type(service._graph) is not PinnedCurrentWorkerModelResultGraphVerifier
+                       or type(model_services[namespace]._graph_verifier)
+                          is not PinnedCurrentModelEgressGraphVerifier
+                       or service._graph._path != model_services[namespace]._graph_verifier._path
+                       or service._graph._issuer is not model_services[namespace]._graph_verifier._issuer
                        or type(worker_readers[namespace]) is not tuple
                        or len(worker_readers[namespace]) != 2
                        or worker_readers[namespace] not in installed
