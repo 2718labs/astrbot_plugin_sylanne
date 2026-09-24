@@ -7,7 +7,9 @@ from dataclasses import asdict
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest
 from .contract import AuthorityUnavailable, identifier
-from .v2_model_egress_contract import ModelEgressDraftV1, ModelEgressIntentV1
+from .v2_model_egress_contract import (
+    ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressObservationV1,
+)
 from .v2_model_egress_store import AuthorityV2ModelEgressStore
 from .v2_fence_service import AuthorityV2FenceService
 
@@ -106,13 +108,51 @@ class AuthorityV2ModelEgressService:
                 raise AuthorityUnavailable("typed model fence absent")
             permit = self._fences.fences._permit(row)
             if (permit.operation != "model_egress" or permit.subject != subject
-                    or permit.namespace != intent.namespace or row[6] != "active"
+                    or permit.namespace != intent.namespace or row[6] not in {"active", "finished"}
                     or (intent.fence_token, intent.fence_epoch,
                         intent.fence_revision, intent.anchor_digest) !=
                        (permit.token, permit.fence_epoch, permit.revision,
                         canonical_digest(asdict(permit.pinned_anchor)))):
                 raise AuthorityUnavailable("typed model fence identity changed")
+            if row[6] == "finished" and (
+                    record.state != "observed" or record.observation is None
+                    or (row[8], row[9]) !=
+                    (intent.call_id, "sha256:" + record.observation_digest)):
+                raise AuthorityUnavailable("finished model fence lacks original observation")
             return record, permit
+
+    def _record_provider_observation(self, *, intent: ModelEgressIntentV1,
+                                     response):
+        """Future Authority executor hook after parsing the actual provider response."""
+        observation = ModelEgressObservationV1.from_response(intent, response)
+        with self._store._tx() as db:
+            record = self._store._record_observation_locked(db, observation)
+        return record
+
+    def _finish_observed_fenced(self, *, credential, subject: str, holder: str,
+                                intent: ModelEgressIntentV1,
+                                expected_anchor: RestoreAnchor):
+        """Future executor hook; finish and observation checks share one Authority commit."""
+        if self._fences is None or type(intent) is not ModelEgressIntentV1:
+            raise AuthorityUnavailable("protected typed model egress unavailable")
+        identifier(subject, "subject")
+        identifier(holder, "holder")
+        if (subject, intent.namespace) != (intent.subject, self._fences.namespace):
+            raise AuthorityUnavailable("model egress subject or namespace mismatch")
+        self._fences.core._require(credential, "model_egress", self._fences.namespace, holder)
+        with self._fences._frozen() as (db, deletion_head, execution_head, deletion_history):
+            anchor = self._fences._current_locked(
+                db, deletion_head, execution_head, holder=holder,
+                generation=expected_anchor.activation_generation)
+            if anchor != expected_anchor or deletion_history:
+                raise AuthorityUnavailable("model finish anchor changed or deletion history exists")
+            row = self._fences.fences._row(db, intent.operation_id)
+            if row is None:
+                raise AuthorityUnavailable("typed model fence absent")
+            permit = self._fences.fences._permit(row)
+            self._fences.fences.finish_observed_model_egress_locked(
+                db, permit, intent=intent, current_anchor=anchor)
+            return self._store.read_locked(db, intent), permit
 
     async def begin_handoff(self, request, request_digest):
         raise AuthorityUnavailable(

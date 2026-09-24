@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
+import json
 import re
 
 from .contract import identifier
 from .v2_contract import _TOKEN
+from ..runtime_contracts import canonical_digest, canonical_serialize
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -157,10 +159,83 @@ class ModelEgressDraftV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelEgressObservationV1:
+    """Authority-owned, fully parsed provider observation bound to the original call."""
+
+    authority_id: str
+    namespace: str
+    subject: str
+    operation_id: str
+    call_id: str
+    request_digest: str
+    status: str  # completed | unknown
+    result_json: str | None
+    usage: tuple[tuple[str, int], ...]
+    cost: tuple[tuple[str, int], ...]
+    provider_call_ref: str | None
+
+    def __post_init__(self) -> None:
+        for name in ("authority_id", "namespace", "subject", "operation_id", "call_id"):
+            identifier(getattr(self, name), name)
+        _digest(self.request_digest, "request_digest")
+        if self.status not in {"completed", "unknown"}:
+            raise ValueError("invalid provider observation status")
+        if self.status == "completed":
+            if type(self.result_json) is not str:
+                raise ValueError("completed observation requires result JSON")
+            try:
+                result = json.loads(self.result_json)
+                if type(result) is not dict or canonical_serialize(result) != self.result_json:
+                    raise ValueError("noncanonical result JSON")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid result JSON") from exc
+        elif self.result_json is not None:
+            raise ValueError("unknown observation has no eligible result")
+        for name in ("usage", "cost"):
+            amounts = getattr(self, name)
+            if (type(amounts) is not tuple
+                    or len({key for key, _ in amounts}) != len(amounts)
+                    or tuple(sorted(amounts)) != amounts):
+                raise ValueError(f"invalid {name}")
+            for key, amount in amounts:
+                if type(key) is not str or not key or len(key) > 256:
+                    raise ValueError(f"invalid {name} key")
+                _integer(amount, f"{name} amount")
+        if self.provider_call_ref is not None:
+            if (type(self.provider_call_ref) is not str or not self.provider_call_ref
+                    or len(self.provider_call_ref) > 256):
+                raise ValueError("invalid provider_call_ref")
+
+    @classmethod
+    def from_response(cls, intent: ModelEgressIntentV1, response) -> ModelEgressObservationV1:
+        """Internal executor adapter. Never accept a caller-supplied digest."""
+        from ..model_broker.broker import ProviderResponse
+        if type(intent) is not ModelEgressIntentV1 or type(response) is not ProviderResponse:
+            raise ValueError("typed intent and parsed provider response required")
+        if response.status == "not_dispatched":
+            raise ValueError("dispatch_started cannot be reclassified as unsent")
+        return cls(intent.authority_id, intent.namespace, intent.subject,
+                   intent.operation_id, intent.call_id, intent.request_digest,
+                   response.status,
+                   canonical_serialize(dict(response.result)) if response.result is not None else None,
+                   tuple(sorted(response.usage.items())), tuple(sorted(response.cost.items())),
+                   response.provider_call_ref)
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(asdict(self))
+
+    @property
+    def result(self) -> dict | None:
+        return json.loads(self.result_json) if self.result_json is not None else None
+
+
+@dataclass(frozen=True, slots=True)
 class ModelEgressRecoveryV1:
     intent: ModelEgressIntentV1
     state: str  # prepared | dispatch_started | observed | unknown
     observation_digest: str | None = None
+    observation: ModelEgressObservationV1 | None = None
 
     def __post_init__(self) -> None:
         if type(self.intent) is not ModelEgressIntentV1:
@@ -171,6 +246,19 @@ class ModelEgressRecoveryV1:
             _digest(self.observation_digest, "observation_digest")
         elif self.observation_digest is not None:
             raise ValueError("unobserved egress cannot have an observation digest")
+        if self.observation is not None:
+            if (type(self.observation) is not ModelEgressObservationV1
+                    or self.observation.digest != self.observation_digest
+                    or self.observation.status != ("completed" if self.state == "observed" else "unknown")
+                    or (self.observation.authority_id, self.observation.namespace,
+                        self.observation.subject, self.observation.operation_id,
+                        self.observation.call_id, self.observation.request_digest) !=
+                       (self.intent.authority_id, self.intent.namespace,
+                        self.intent.subject, self.intent.operation_id,
+                        self.intent.call_id, self.intent.request_digest)):
+                raise ValueError("observation differs from original call")
+        elif self.state == "observed":
+            raise ValueError("observed egress requires complete durable observation")
 
 
-__all__ = ["ModelEgressDraftV1", "ModelEgressIntentV1", "ModelEgressRecoveryV1"]
+__all__ = ["ModelEgressDraftV1", "ModelEgressIntentV1", "ModelEgressObservationV1", "ModelEgressRecoveryV1"]

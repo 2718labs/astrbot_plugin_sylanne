@@ -17,7 +17,7 @@ them; this B1 module does not append to or inspect the execution journal.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 import secrets
@@ -26,6 +26,7 @@ import threading
 import uuid
 
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime_contracts import canonical_digest
 from ..runtime_journal import RecoveryConstraintFootprint
 from .contract import AuthorityUnavailable, identifier
 from .local_bridge import constraint_keys_from_footprint
@@ -737,6 +738,58 @@ class AuthorityV2FenceStore:
         if row[10] is not None:
             raise AuthorityUnavailable("pending mutation blocks fence finish")
         db.execute("UPDATE authority_v2_fences SET state='finished',finish_request_id=?,finish_request_digest=? WHERE operation_id=?", (request_id, request_digest, permit.operation_id))
+
+    def finish_observed_model_egress_locked(self, db: sqlite3.Connection,
+                                            permit: FencePermitV2, *, intent,
+                                            current_anchor: RestoreAnchor) -> None:
+        """Close only the original typed model fence with its complete durable observation."""
+        from .v2_model_egress_contract import ModelEgressIntentV1
+        from .v2_model_egress_store import AuthorityV2ModelEgressStore
+        if (db is not self._db or not db.in_transaction
+                or type(permit) is not FencePermitV2
+                or type(intent) is not ModelEgressIntentV1
+                or permit.operation != "model_egress"):
+            raise AuthorityUnavailable("typed active model fence transaction required")
+        self._require_anchor(current_anchor, permit.namespace)
+        self._check_schema(db)
+        self._require_no_migration(db)
+        row = self._row(db, permit.operation_id)
+        if row is None:
+            raise AuthorityUnavailable("typed model fence is absent")
+        saved = self._permit(row)
+        if (saved != permit or permit.pinned_anchor != current_anchor
+                or (intent.authority_id, intent.namespace, intent.subject,
+                    intent.operation_id, intent.fence_token, intent.fence_epoch,
+                    intent.fence_revision, intent.anchor_digest) !=
+                   (permit.authority_id, permit.namespace, permit.subject,
+                    permit.operation_id, permit.token, permit.fence_epoch,
+                    permit.revision, canonical_digest(asdict(permit.pinned_anchor)))):
+            raise AuthorityUnavailable("typed model fence identity or anchor mismatch")
+        binding = db.execute(
+            "SELECT operation_id,token FROM authority_model_egress_bindings_v1 WHERE call_id=?",
+            (intent.call_id,),
+        ).fetchone()
+        if binding != (intent.operation_id, intent.fence_token):
+            raise AuthorityUnavailable("typed model fence lacks atomic call binding")
+        # The strict read rechecks canonical body, digest, and original identity.
+        recovery = AuthorityV2ModelEgressStore._read(db, intent.call_id)
+        if (recovery is None or recovery.intent != intent or recovery.state != "observed"
+                or recovery.observation is None):
+            raise AuthorityUnavailable("complete original provider observation is absent")
+        finish_digest = "sha256:" + recovery.observation_digest
+        if row[6] == "finished":
+            if (row[8], row[9]) == (intent.call_id, finish_digest):
+                return
+            raise AuthorityUnavailable("typed model finish identity conflict")
+        if row[6] != "active" or row[10] is not None:
+            raise AuthorityUnavailable("typed model fence is not finishable")
+        updated = db.execute(
+            "UPDATE authority_v2_fences SET state='finished',finish_request_id=?,finish_request_digest=? "
+            "WHERE operation_id=? AND state='active' AND token=? AND revision=? AND pending IS NULL",
+            (intent.call_id, finish_digest, permit.operation_id, permit.token, permit.revision),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityUnavailable("typed model fence finish lost CAS")
 
 
 __all__ = ["AuthorityV2FenceStore"]

@@ -1,7 +1,7 @@
 """Read-only first-ingress graph facts for a future model-egress authority.
 
-The original ingress does not persist a ModelCallRequest binding. A successful
-graph-facts check therefore remains HOLD for the complete egress decision.
+Even a complete graph binding is not an Authority model fence or an executable
+provider admission. The callable remains HOLD until those independent gates.
 """
 
 from __future__ import annotations
@@ -19,12 +19,17 @@ from .v2_contract import FencePermitV2, from_wire
 from .v2_model_egress_contract import ModelEgressIntentV1
 from ..contracts import canonical_json
 from ..memory_types import SourceRecord, access_key, source_key, validate_access
+from ..model_broker.first_ingress_encoding import (
+    FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+    build_first_ingress_encoding_payload,
+)
 from ..runtime.budget import get_budget_lease
 from ..runtime.d11_types import RuntimeOutboxValue, job_graph_write, runtime_job_key, runtime_outbox_key
+from ..runtime.encoding_call_binding import load_binding
 from ..runtime.first_ingress_v2 import ingress_ids
 from ..runtime.issuers import D11BudgetJobIssuer
 from ..runtime.jobs import get_job
-from ..runtime_contracts import NamespaceId, SnapshotRequirementsV2, canonical_digest
+from ..runtime_contracts import NamespaceId, SnapshotRequirementsV2, canonical_serialize
 
 
 def _canonical(value: str):
@@ -37,11 +42,10 @@ def _canonical(value: str):
 class PinnedCurrentModelEgressGraphVerifier:
     """Check original business facts in one pinned, read-only SQLite snapshot.
 
-    ``graph_facts_current`` verifies only ingress, acquire, source/access, and
-    original budget facts. It does not authenticate the intent's new operation,
-    call ID, request digest, provider, model, configuration, output cap, or
-    proposed egress fence. The callable stays fail-closed until an independent
-    durable ModelCallRequest binding and live Authority fence can be checked.
+    ``graph_facts_current`` verifies ingress, acquire, source/access, and the
+    original budget. ``complete_graph_current`` additionally checks the one
+    durable model request in the same read snapshot. Neither method validates
+    the new Authority fence or the administrator's live provider configuration.
     """
 
     def __init__(self, graph_db_path: str | Path, *,
@@ -59,13 +63,17 @@ class PinnedCurrentModelEgressGraphVerifier:
         self._clock = trusted_now_utc
 
     def __call__(self, intent: ModelEgressIntentV1) -> bool:
-        # No first-ingress row authenticates the complete model request, call
-        # identity, provider selection or provider configuration. A claimant's
-        # own digest must never fill this gap.
-        self.graph_facts_current(intent)
+        # A graph row alone cannot authenticate the live Authority model fence
+        # or the administrator-bound provider and executable token ceiling.
         return False
 
     def graph_facts_current(self, intent: ModelEgressIntentV1) -> bool:
+        return self._current(intent, include_binding=False)
+
+    def complete_graph_current(self, intent: ModelEgressIntentV1) -> bool:
+        return self._current(intent, include_binding=True)
+
+    def _current(self, intent: ModelEgressIntentV1, *, include_binding: bool) -> bool:
         if type(intent) is not ModelEgressIntentV1:
             return False
         try:
@@ -76,11 +84,54 @@ class PinnedCurrentModelEgressGraphVerifier:
                 db.execute("PRAGMA query_only=ON")
                 db.execute("BEGIN")
                 try:
-                    return self._check(db, intent, float(now))
+                    return (self._check(db, intent, float(now))
+                            and (not include_binding or self._check_binding(db, intent)))
                 finally:
                     db.execute("ROLLBACK")
         except Exception:
             return False
+
+    @staticmethod
+    def _check_binding(db: sqlite3.Connection, intent: ModelEgressIntentV1) -> bool:
+        job = get_job(db, intent.job_id)
+        namespace = NamespaceId(job.bot_id, job.persona_id)
+        binding = load_binding(db, namespace, intent.job_id)
+        if binding is None:
+            return False
+        source_id = intent.source_refs[0]
+        source_token = source_key(*namespace.as_tuple, source_id).token
+        source_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (source_token,),
+        ).fetchone()
+        if source_row is None or source_row[2] != 1:
+            return False
+        source = SourceRecord.from_dict(_canonical(source_row[1]))
+        payload, template_digest = build_first_ingress_encoding_payload(source)
+        frozen = binding.request
+        envelope = frozen["envelope"]
+        return (
+            binding.call_id == intent.call_id
+            and binding.model_request_digest == intent.request_digest
+            and binding.source_id == source_id
+            and binding.source_revision == intent.source_revisions[0][1] == source_row[0]
+            and binding.access_revision == intent.access_revisions[0][1]
+            and binding.budget_lease_id == intent.budget_lease_id
+            and binding.budget_reservation_operation_id == intent.budget_reservation_operation_id
+            and frozen["provider_id"] == intent.provider_id
+            and frozen["model_id"] == intent.model_id
+            and frozen["provider_config_digest"] == intent.provider_config_digest
+            and frozen["max_output_tokens"] == intent.max_output_tokens
+            and frozen["prompt_template_version"] == FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
+            and frozen["prompt_template_digest"] == template_digest
+            and frozen["payload"] == payload
+            and envelope["identity"]["operation_id"] == intent.operation_id
+            and envelope["authority"]["actor"] == intent.subject
+            and envelope["authority"]["worker_fence"] == intent.worker_fence
+            and envelope["authority"]["namespace"] == json.loads(canonical_serialize(namespace))
+            and envelope["source_qualification"]["source_refs"] == [source_token]
+            and envelope["input_refs"] == [source_token]
+        )
 
     def _check(self, db: sqlite3.Connection, intent: ModelEgressIntentV1,
                now: float) -> bool:
