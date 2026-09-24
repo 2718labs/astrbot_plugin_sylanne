@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import replace
+from fractions import Fraction
 
 from sylanne3.domains.d04.encoding_baseline import EncodingBaseline
 from sylanne3.domains.d06.encoding_projection import (
@@ -86,6 +87,27 @@ class EncodingProjectionTests(unittest.TestCase):
             EncodingAffectIntervals((0.7, 0.2), (0.0, 0.2))
         with self.assertRaisesRegex(ValueError, "finite"):
             EncodingProjectionPolicyV1("policy:p", "v1", float("nan"), 0.2)
+
+    def test_outward_rounding_encloses_exact_float_input_expression(self):
+        model = replace(self.model, quoted_details=(("I waited", 0.1),))
+        affect = EncodingAffectIntervals((0.5, 0.5), (1.0, 1.0))
+        for gain, naive_is_above in ((0.2, True), (0.4, False)):
+            with self.subTest(gain=gain):
+                policy = EncodingProjectionPolicyV1("policy:rounding", "v1", 0.0, gain)
+                detail = project_encoding_candidate(
+                    self.source, model, affect, policy,
+                ).details[0]
+                exact_weight = Fraction.from_float(0.1) + Fraction.from_float(gain)
+                naive = Fraction.from_float(0.1 + gain)
+                self.assertEqual(naive > exact_weight, naive_is_above)
+                low, high = detail.subjective_weight_interval
+                self.assertLessEqual(Fraction.from_float(low), exact_weight)
+                self.assertGreaterEqual(Fraction.from_float(high), exact_weight)
+                self.assertLess(low, high)
+                exact_strength = Fraction.from_float(0.1) * Fraction.from_float(gain)
+                strength_low, strength_high = detail.affective_strength_interval
+                self.assertLessEqual(Fraction.from_float(strength_low), exact_strength)
+                self.assertGreaterEqual(Fraction.from_float(strength_high), exact_strength)
 
 
 if __name__ == "__main__":

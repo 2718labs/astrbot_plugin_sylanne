@@ -8,6 +8,7 @@ without changing source bytes, fact eligibility, or C02 admission status.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 import math
 
 from ...graph_types import AtomKey
@@ -32,8 +33,25 @@ def _interval(value: object, lower: float, upper: float, label: str) -> tuple[fl
     return low, high
 
 
-def _clip(value: float) -> float:
-    return min(1.0, max(0.0, value))
+def _exact(value: float) -> Fraction:
+    return Fraction.from_float(value)
+
+
+def _clip_exact(value: Fraction) -> Fraction:
+    return min(Fraction(1), max(Fraction(0), value))
+
+
+def _outward_interval(low: Fraction, high: Fraction) -> tuple[float, float]:
+    """Enclose exact binary-float input arithmetic in binary-float output."""
+    low, high = _clip_exact(low), _clip_exact(high)
+    if low > high:
+        raise ValueError("projected interval is inverted")
+    rounded_low, rounded_high = float(low), float(high)
+    if _exact(rounded_low) > low:
+        rounded_low = math.nextafter(rounded_low, -math.inf)
+    if _exact(rounded_high) < high:
+        rounded_high = math.nextafter(rounded_high, math.inf)
+    return rounded_low, rounded_high
 
 
 @dataclass(frozen=True)
@@ -113,26 +131,29 @@ def project_encoding_candidate(
         raise TypeError("source, model candidate, affect intervals, and policy are required")
     if model_candidate.source_id != source.source_id or model_candidate.status != "candidate":
         raise ValueError("model candidate differs from the source")
-    salience_low, salience_high = affect.salience
+    salience_low, salience_high = map(_exact, affect.salience)
     tone_low, tone_high = affect.tone
     magnitude_low = 0.0 if tone_low <= 0 <= tone_high else min(abs(tone_low), abs(tone_high))
     magnitude_high = max(abs(tone_low), abs(tone_high))
+    magnitude_low, magnitude_high = _exact(magnitude_low), _exact(magnitude_high)
+    salience_gain = _exact(policy.salience_gain)
+    tone_gain = _exact(policy.tone_magnitude_gain)
+    neutral = _exact(policy.neutral_salience)
     details = []
     for quote, raw_weight in model_candidate.quoted_details:
         if type(quote) is not str or not quote or quote not in source.text:
             raise ValueError("model quote must remain an exact source span")
         weight = _bounded(raw_weight, 0.0, 1.0, "model salience")
-        projected = (
-            _clip(weight + policy.salience_gain * (salience_low - policy.neutral_salience)
-                  + policy.tone_magnitude_gain * magnitude_low),
-            _clip(weight + policy.salience_gain * (salience_high - policy.neutral_salience)
-                  + policy.tone_magnitude_gain * magnitude_high),
+        exact_weight = _exact(weight)
+        projected = _outward_interval(
+            exact_weight + salience_gain * (salience_low - neutral)
+            + tone_gain * magnitude_low,
+            exact_weight + salience_gain * (salience_high - neutral)
+            + tone_gain * magnitude_high,
         )
-        strength = (
-            _clip(weight * (policy.salience_gain * salience_low
-                            + policy.tone_magnitude_gain * magnitude_low)),
-            _clip(weight * (policy.salience_gain * salience_high
-                            + policy.tone_magnitude_gain * magnitude_high)),
+        strength = _outward_interval(
+            exact_weight * (salience_gain * salience_low + tone_gain * magnitude_low),
+            exact_weight * (salience_gain * salience_high + tone_gain * magnitude_high),
         )
         details.append(ProjectedEncodingDetail(quote, weight, projected, strength))
     return EncodingProjectionCandidateV1(
