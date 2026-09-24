@@ -65,6 +65,7 @@ if TYPE_CHECKING:
         WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
     )
     from .runtime.encoding_call_binding import EncodingCallBinding
+    from .runtime.encoding_call_binding import CommittedEncodingBaselineV1
     from .runtime.restore_anchor import RestoreAnchor
     from .workbench_api.d01_onboarding import VerifiedBudgetLease
 
@@ -325,6 +326,7 @@ class FirstIngressEncodingIssueContextV2:
     clock_epoch: str
     monotonic_deadline: float
     current_monotonic_deadline: float
+    baseline: CommittedEncodingBaselineV1 | None = None
 
 @dataclass(frozen=True)
 class NamespaceProvisionReceiptV2:
@@ -6361,8 +6363,9 @@ class GraphCoordinator:
         binding = load_binding(db, authority.namespace, job_id)
         if (intent is None or intent[0] is None or receipt is None
                 or binding is None or binding != binding_from_json(intent[0])
-                or binding.request.get("schema")
-                != "sylanne.first-ingress-encoding-call.v2"):
+                or binding.request.get("schema") not in {
+                    "sylanne.first-ingress-encoding-call.v2",
+                    "sylanne.first-ingress-encoding-call.v3"}):
             raise UnavailableGuard("committed original encoding binding is absent; HOLD")
         self._validate_first_ingress_encoding_binding_context(
             authority.namespace, job, outbox, source_version, access_version,
@@ -6593,7 +6596,8 @@ class GraphCoordinator:
 
             acquire = db.execute(
                 "SELECT i.job_id,i.original_operation_id,i.actor,"
-                "i.encoding_binding_json,r.job_json,i.requirements_json "
+                "i.encoding_binding_json,r.job_json,i.requirements_json,"
+                "i.graph_revision,i.graph_epoch "
                 "FROM graph_job_acquire_intents_v2 AS i "
                 "JOIN graph_job_acquire_receipts_v2 AS r "
                 "ON r.bot=i.bot AND r.persona=i.persona "
@@ -6626,7 +6630,9 @@ class GraphCoordinator:
                 raise UnavailableGuard("original encoding binding was redacted; HOLD")
             frozen = binding.request
             envelope_authority = frozen["envelope"]["authority"]
-            if (frozen["schema"] != "sylanne.first-ingress-encoding-call.v2"
+            if (frozen["schema"] not in {
+                    "sylanne.first-ingress-encoding-call.v2",
+                    "sylanne.first-ingress-encoding-call.v3"}
                     or frozen["acquire_operation_id"] != acquire_operation_id
                     or frozen["original_operation_id"] != job.operation_id
                     or frozen["worker_fence"] != job.fence
@@ -6639,6 +6645,13 @@ class GraphCoordinator:
                     or envelope_authority["worker_fence"] != job.fence
                     or envelope_authority["purpose"] != "consolidation"):
                 raise UnavailableGuard("original model binding identity differs; HOLD")
+            if frozen["schema"] == "sylanne.first-ingress-encoding-call.v3":
+                current_metadata, current_epoch = self._v2_graph_stamp(namespace)
+                baseline = self._committed_first_ingress_baseline_locked(
+                    namespace, binding.source_id, current_metadata, current_epoch,
+                    acquire_stamp=acquire[0][6:8])
+                if frozen.get("baseline") != asdict(baseline):
+                    raise UnavailableGuard("original V3 D04 baseline identity differs; HOLD")
 
             # Historical signatures remain checkable after D11 settlement or
             # grant/quote revocation. Neither is used as a new-work permit.
@@ -7175,10 +7188,74 @@ class GraphCoordinator:
             raise UnavailableGuard("job acquire result lost runnable eligibility; HOLD") from exc
         return current
 
+    def _committed_first_ingress_baseline_locked(
+        self, namespace, source_id, metadata, epoch, *, acquire_stamp=None,
+    ):
+        """Read the one previously committed D04 baseline in this graph snapshot."""
+        from .authority_service.current_d04_baseline_graph_proof import (
+            committed_baseline_current,
+        )
+        from .runtime.encoding_call_binding import CommittedEncodingBaselineV1
+
+        db = self.__store._db
+        opened = not db.in_transaction
+        if opened:
+            db.execute("BEGIN")
+        try:
+            source_ref = source_key(*namespace.as_tuple, source_id).token
+            if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='graph_d04_baseline_issuance_v1'",
+            ).fetchone() is None:
+                raise UnavailableGuard("committed D04 baseline absent; HOLD")
+            issued = db.execute(
+                "SELECT operation_id,bundle_digest FROM "
+                "graph_d04_baseline_issuance_v1 WHERE bot=? AND persona=? "
+                "AND source_ref=?",
+                namespace.as_tuple + (source_ref,),
+            ).fetchall()
+            if len(issued) != 1:
+                raise UnavailableGuard("one committed D04 baseline required; HOLD")
+            operation_id, bundle_digest = issued[0]
+            writes = db.execute(
+                "SELECT h.token,h.revision FROM graph_history AS h "
+                "JOIN graph_atoms AS a ON a.token=h.token "
+                "WHERE h.event_bot=? AND h.event_persona=? AND h.event_id=? "
+                "AND a.type_name='d04.encoding_baseline.v1' AND h.valid=1",
+                namespace.as_tuple + (operation_id,),
+            ).fetchall()
+            fence = db.execute(
+                "SELECT post_graph_epoch FROM graph_bundle_fences_v2 "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if len(writes) != 1 or fence is None:
+                raise UnavailableGuard("committed D04 baseline history absent; HOLD")
+            baseline = CommittedEncodingBaselineV1(
+                writes[0][0], writes[0][1], operation_id, bundle_digest,
+                metadata.requirements.graph_incarnation, fence[0],
+            )
+            acquire_revision, acquire_epoch = (
+                acquire_stamp if acquire_stamp is not None else
+                (metadata.graph_revision, epoch.revision))
+            if not committed_baseline_current(
+                    db, namespace=namespace, baseline=baseline,
+                    source_id=source_id, requirements=metadata.requirements,
+                    current_graph_revision=metadata.graph_revision,
+                    current_graph_epoch=epoch.revision,
+                    acquire_graph_revision=acquire_revision,
+                    acquire_graph_epoch=acquire_epoch,
+                    issuer=self.__d11_issuer):
+                raise UnavailableGuard("committed D04 baseline proof differs; HOLD")
+            return baseline
+        finally:
+            if opened:
+                db.execute("ROLLBACK")
+
     def _first_ingress_encoding_issue_context(
         self, namespace, planned, outbox, source_version, access_version,
         authority, now_utc, acquire_operation_id, clock_reading,
-        frozen_binding=None,
+        frozen_binding=None, *, require_baseline_v3=False,
     ) -> FirstIngressEncodingIssueContextV2:
         """Gather current graph truth and the original D06 qualification."""
         from datetime import datetime
@@ -7220,8 +7297,33 @@ class GraphCoordinator:
             ).fetchone()
             if epochs is None:
                 raise UnavailableGuard("encoding authority epochs absent; HOLD")
+            needs_baseline = (require_baseline_v3 or frozen_binding is not None
+                              and frozen_binding.request.get("schema") ==
+                              "sylanne.first-ingress-encoding-call.v3")
+            if needs_baseline:
+                metadata, epoch = self._v2_graph_stamp(namespace)
+                acquire_stamp = None
+                if frozen_binding is not None:
+                    acquire_stamp = self.__store._db.execute(
+                        "SELECT graph_revision,graph_epoch FROM "
+                        "graph_job_acquire_intents_v2 WHERE bot=? AND persona=? "
+                        "AND acquire_operation_id=?",
+                        namespace.as_tuple + (acquire_operation_id,),
+                    ).fetchone()
+                    if acquire_stamp is None:
+                        raise UnavailableGuard("original V3 acquire stamp absent; HOLD")
+                baseline = self._committed_first_ingress_baseline_locked(
+                    namespace, outbox.payload_ref, metadata, epoch,
+                    acquire_stamp=acquire_stamp)
+                baseline_versions = (GraphVersion(
+                    AtomKey.from_token(baseline.baseline_ref),
+                    baseline.baseline_revision),)
+            else:
+                baseline = None
+                baseline_versions = ()
             guard = VersionGuard(
-                (source_version, access_version), (), epochs[0], epochs[1],
+                (source_version, access_version) + baseline_versions,
+                (), epochs[0], epochs[1],
                 self.__store._registry.catalogue_hash,
                 self._version(self.__store._db, namespace, "scheme", "current"),
                 self._version(self.__store._db, namespace, "operator", "current"),
@@ -7270,7 +7372,9 @@ class GraphCoordinator:
             monotonic_deadline = current_monotonic_deadline
             if frozen_binding is not None:
                 frozen = frozen_binding.request
-                if (frozen.get("schema") != "sylanne.first-ingress-encoding-call.v2"
+                if (frozen.get("schema") not in {
+                        "sylanne.first-ingress-encoding-call.v2",
+                        "sylanne.first-ingress-encoding-call.v3"}
                         or frozen.get("clock_epoch") != clock_epoch
                         or frozen.get("acquire_operation_id") != acquire_operation_id):
                     raise ValueError("frozen clock epoch or acquire differs")
@@ -7286,12 +7390,12 @@ class GraphCoordinator:
             tuple(access_value["audiences"]), tuple(access_value["purposes"]),
             guard, qualification, now_utc, deadline, worker_deadline,
             acquire_operation_id, character_interval_ref, clock_epoch,
-            monotonic_deadline, current_monotonic_deadline)
+            monotonic_deadline, current_monotonic_deadline, baseline)
 
     def _issue_first_ingress_encoding_binding(
         self, namespace, planned, outbox, source_version, access_version,
         authority, now_utc, acquire_operation_id, clock_reading,
-        frozen_binding=None,
+        frozen_binding=None, *, require_baseline_v3=False,
     ):
         """Freeze the installed pure issuer output for one planned worker fence."""
         from .runtime.encoding_call_binding import (
@@ -7304,7 +7408,7 @@ class GraphCoordinator:
         context = self._first_ingress_encoding_issue_context(
             namespace, planned, outbox, source_version, access_version,
             authority, now_utc, acquire_operation_id, clock_reading,
-            frozen_binding)
+            frozen_binding, require_baseline_v3=require_baseline_v3)
         issue = self.__encoding_request_issuer(context)
         if type(issue) is not EncodingRequestIssueV2:
             raise UnavailableGuard("production encoding requires a V2 request issuer; HOLD")
@@ -7328,6 +7432,7 @@ class GraphCoordinator:
             provider_config_ref=issue.provider_config_ref,
             provider_config_digest=issue.provider_config_digest,
             production_context=context,
+            baseline=context.baseline,
         )
 
     def _validate_first_ingress_encoding_binding_context(
@@ -7337,9 +7442,15 @@ class GraphCoordinator:
         """Recheck frozen issuer claims against current worker and graph truth."""
         context = self._first_ingress_encoding_issue_context(
             namespace, job, outbox, source_version, access_version,
-            authority, now_utc, acquire_operation_id, clock_reading, binding)
+            authority, now_utc, acquire_operation_id, clock_reading, binding,
+            require_baseline_v3=(binding.request.get("schema") ==
+                                 "sylanne.first-ingress-encoding-call.v3"))
         envelope = binding.request["envelope"]
-        if (binding.request.get("schema") != "sylanne.first-ingress-encoding-call.v2"
+        if (binding.request.get("schema") not in {
+                "sylanne.first-ingress-encoding-call.v2",
+                "sylanne.first-ingress-encoding-call.v3"}
+                or (context.baseline is not None and
+                    binding.request.get("baseline") != asdict(context.baseline))
                 or binding.request.get("original_operation_id")
                 != context.job.operation_id
                 or binding.request.get("worker_fence") != context.job.fence
@@ -7361,9 +7472,19 @@ class GraphCoordinator:
                 <= context.deadline_utc):
             raise UnavailableGuard("encoding binding lost trusted issuance context; HOLD")
 
+    def acquire_first_ingress_encoding_job_v3(
+        self, authority: AuthorityContext, lease: object, job_id: str,
+        acquire_operation_id: str, *, lease_seconds: int,
+    ) -> PersistentJob:
+        """Acquire new first-ingress work only with a committed D04 baseline."""
+        return self.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, acquire_operation_id,
+            lease_seconds=lease_seconds, _require_baseline_v3=True)
+
     def acquire_first_ingress_encoding_job_v2(
         self, authority: AuthorityContext, lease: object, job_id: str,
         acquire_operation_id: str, *, lease_seconds: int,
+        _require_baseline_v3: bool = False,
     ) -> PersistentJob:
         """Acquire exactly one original encoding job under a recoverable v2 write fence."""
         from datetime import datetime, timezone
@@ -7440,6 +7561,12 @@ class GraphCoordinator:
                 job = None
         if erased is not None:
             raise UnavailableGuard("encoding request was erased; HOLD")
+        if _require_baseline_v3 and (
+                self.__encoding_request_issuer is None or
+                intent is not None and (intent[14] is None or
+                binding_from_json(intent[14]).request.get("schema") !=
+                "sylanne.first-ingress-encoding-call.v3")):
+            raise UnavailableGuard("V3 acquire requires original committed baseline; HOLD")
         original_operation_id = job.operation_id if intent is None else intent[2]
         if not _job_acquire_id_matches(
                 acquire_operation_id, namespace, job_id,
@@ -7476,7 +7603,8 @@ class GraphCoordinator:
                 raise UnavailableGuard("encoding job has an active or cancelled lease; HOLD")
             binding = (self._issue_first_ingress_encoding_binding(
                 namespace, planned, outbox, source_version, access_version,
-                authority, now, acquire_operation_id, clock)
+                authority, now, acquire_operation_id, clock,
+                require_baseline_v3=_require_baseline_v3)
                 if self.__encoding_request_issuer is not None else None)
             binding_json = binding_to_json(binding) if binding is not None else None
             request_digest = canonical_digest({
@@ -7679,7 +7807,7 @@ class GraphCoordinator:
             current_binding = self._issue_first_ingress_encoding_binding(
                 namespace, planned, outbox, source_version, access_version,
                 authority, now, acquire_operation_id, clock,
-                frozen_binding)
+                frozen_binding, require_baseline_v3=_require_baseline_v3)
             if current_binding != frozen_binding:
                 raise UnavailableGuard("encoding request configuration changed; HOLD")
         elif self.__encoding_request_issuer is not None:
@@ -7753,7 +7881,8 @@ class GraphCoordinator:
                         or self._issue_first_ingress_encoding_binding(
                             namespace, planned, outbox, source_version,
                             access_version, authority, commit_now,
-                            acquire_operation_id, clock, frozen_binding)
+                            acquire_operation_id, clock, frozen_binding,
+                            require_baseline_v3=_require_baseline_v3)
                         != frozen_binding):
                     raise UnavailableGuard(
                         "encoding request configuration changed; HOLD")
