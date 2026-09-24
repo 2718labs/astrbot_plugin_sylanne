@@ -70,6 +70,13 @@ def test_real_mtls_generic_model_begin_cannot_leave_orphan_fence(tmp_path, monke
                 request, protocol=AUTHORITY_V2_PROTOCOL)
             anchor = await transport.v2_current_anchor(request, handshake, "ns-a")
             with pytest.raises(RuntimeError, match="unavailable"):
+                await transport._content_rpc(
+                    request, handshake, "model_read_observation_v2", {
+                        "namespace": "ns-a", "call_id": "forged-call",
+                        "graph_current": True, "owner_current": True,
+                        "receipt": {"admission_id": "a" * 64},
+                    }, protocol=AUTHORITY_V2_PROTOCOL)
+            with pytest.raises(RuntimeError, match="unavailable"):
                 # Send the old generic command through the actual TLS channel,
                 # bypassing any current host-side operation allowlist.
                 await transport._content_rpc(

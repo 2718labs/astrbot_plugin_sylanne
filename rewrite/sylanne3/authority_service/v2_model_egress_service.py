@@ -181,15 +181,21 @@ class AuthorityV2ModelEgressService:
                                 intent: ModelEgressIntentV1) -> ModelEgressObservationV1:
         """HOLD: a terminal receipt is recovery evidence, never read authority.
 
-        A future read needs an authenticated consumer Owner principal and live
-        Owner session bound to this call, plus an Authority-issued read fence.
-        While that fence is active, a pinned graph verifier must independently
-        recheck current source/access/delete/activation and Owner qualification
-        outside Authority locks. Only then may the service re-enter `_frozen`,
-        validate the same read permit and v2 admission/terminal receipt, and
-        copy the completed body before closing the read fence. This signature
-        supplies neither consumer Owner identity nor such a proof; accepting
-        a caller boolean or the finished model fence would bypass revocation.
+        The missing versioned read request must bind this call and admission to
+        an authenticated consumer Owner principal, actor, live signed session,
+        fixed read purpose/audience, and a fresh Authority-issued read permit.
+        Existing OwnerSessionStore.require_current_in_tx and
+        OwnerTicketStore.get_current_guard can recheck the Authority half, but
+        the GraphCoordinator Owner lease is a private process capability, not
+        a transferable proof. A pinned result-read verifier must check current
+        source/access/delete/activation and Owner graph grant in one read-only
+        graph snapshot while the read fence is active. The admission verifier
+        cannot serve this role: it requires a still-running job, pending outbox,
+        and reserved budget. After graph verification outside Authority locks,
+        `_frozen` must recheck the same permit, Owner session/guard, original
+        v2 admission and terminal receipt before copying completed content;
+        close the read fence before return. This signature has none of those
+        consumer inputs. A caller boolean or finished model fence is not proof.
         """
         raise AuthorityUnavailable(
             "HOLD: current Owner-qualified model result read proof is unavailable"
