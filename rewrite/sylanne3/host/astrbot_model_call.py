@@ -15,9 +15,11 @@ from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 from openai.types.chat.chat_completion import ChatCompletion
 
+from ..runtime_contracts import canonical_digest
 from ..model_broker.broker import (
     ModelCallRequest, ModelProviderDescriptor, ProviderResponse,
 )
+from .authority_profile import AdminIngressModelPolicy, installed_model_config_ref
 
 
 class AstrBotModelProvider:
@@ -26,6 +28,7 @@ class AstrBotModelProvider:
     def __init__(
         self, *, context: Context, host_loop: asyncio.AbstractEventLoop,
         trusted_umo: str, descriptor: ModelProviderDescriptor,
+        admin_model: AdminIngressModelPolicy,
     ) -> None:
         if (not isinstance(context, Context)
                 or not isinstance(host_loop, asyncio.AbstractEventLoop)
@@ -35,34 +38,50 @@ class AstrBotModelProvider:
                 or descriptor.supports_idempotency
                 or descriptor.cost_reporting != "unknown"):
             raise ValueError("trusted non-retrying AstrBot model binding is required")
+        if (type(admin_model) is not AdminIngressModelPolicy
+                or admin_model.provider_id != descriptor.provider_id
+                or admin_model.model_id != descriptor.model_id
+                or admin_model.provider_config_ref != installed_model_config_ref(
+                    descriptor.provider_id, descriptor.model_id,
+                    admin_model.provider_config_digest)):
+            raise ValueError("exact administrator model configuration is required")
         self._context = context
         self._host_loop = host_loop
         self._trusted_umo = trusted_umo
         self._descriptor = descriptor
+        self._admin_model = admin_model
 
     @property
     def descriptor(self) -> ModelProviderDescriptor:
         return self._descriptor
 
+    def _matches_live_provider(self, provider: object) -> bool:
+        if type(provider) is not ProviderOpenAIOfficial:
+            return False
+        installed = self._context.get_all_providers()
+        meta = provider.meta()
+        if (type(installed) is not list
+                or sum(item is provider for item in installed) != 1
+                or not isinstance(meta, ProviderMeta)
+                or meta.provider_type is not ProviderType.CHAT_COMPLETION
+                or meta.id != self._descriptor.provider_id
+                or meta.model != self._descriptor.model_id
+                or provider.get_model() != meta.model
+                or self._context.get_provider_by_id(meta.id) is not provider
+                or type(provider.provider_config) is not dict
+                or "api_version" in provider.provider_config
+                or not isinstance(provider.client, AsyncOpenAI)
+                or isinstance(provider.client, AsyncAzureOpenAI)):
+            return False
+        digest = canonical_digest(provider.provider_config)
+        return (digest == self._admin_model.provider_config_digest
+                and installed_model_config_ref(meta.id, meta.model, digest)
+                == self._admin_model.provider_config_ref)
+
     async def _invoke_on_host(self, request: ModelCallRequest) -> ProviderResponse:
         try:
             provider = await self._context.get_using_provider_async(self._trusted_umo)
-            if type(provider) is not ProviderOpenAIOfficial:
-                return ProviderResponse("not_dispatched", None, {}, {}, None)
-            installed = self._context.get_all_providers()
-            meta = provider.meta()
-            if (type(installed) is not list
-                    or sum(item is provider for item in installed) != 1
-                    or not isinstance(meta, ProviderMeta)
-                    or meta.provider_type is not ProviderType.CHAT_COMPLETION
-                    or meta.id != self._descriptor.provider_id
-                    or meta.model != self._descriptor.model_id
-                    or provider.get_model() != meta.model
-                    or self._context.get_provider_by_id(meta.id) is not provider
-                    or type(provider.provider_config) is not dict
-                    or "api_version" in provider.provider_config
-                    or not isinstance(provider.client, AsyncOpenAI)
-                    or isinstance(provider.client, AsyncAzureOpenAI)):
+            if not self._matches_live_provider(provider):
                 return ProviderResponse("not_dispatched", None, {}, {}, None)
         except Exception:
             return ProviderResponse("not_dispatched", None, {}, {}, None)
@@ -73,13 +92,26 @@ class AstrBotModelProvider:
                     and type(payload["system_prompt"]) is not str)):
             return ProviderResponse("not_dispatched", None, {}, {}, None)
         try:
-            client = provider.client.with_options(
+            selected_client = provider.client
+            client = selected_client.with_options(
                 max_retries=0, timeout=request.timeout_seconds,
             )
             messages = []
             if payload.get("system_prompt"):
                 messages.append({"role": "system", "content": payload["system_prompt"]})
             messages.append({"role": "user", "content": payload["prompt"]})
+            # No network operation has begun. Re-read the selected provider and
+            # its live configuration immediately before creating the call.
+            try:
+                selected = await self._context.get_using_provider_async(self._trusted_umo)
+                if (selected is not provider
+                        or not self._matches_live_provider(provider)
+                        or provider.client is not selected_client):
+                    return ProviderResponse("not_dispatched", None, {}, {}, None)
+            except asyncio.CancelledError:
+                return ProviderResponse("unknown", None, {}, {}, None)
+            except Exception:
+                return ProviderResponse("not_dispatched", None, {}, {}, None)
             response = await client.chat.completions.create(
                 model=self._descriptor.model_id,
                 messages=messages, stream=False,
@@ -122,7 +154,9 @@ class AstrBotModelProvider:
                      cancellation: asyncio.Event) -> ProviderResponse:
         if (type(request) is not ModelCallRequest
                 or request.provider_id != self._descriptor.provider_id
-                or request.model_id != self._descriptor.model_id):
+                or request.model_id != self._descriptor.model_id
+                or request.timeout_seconds > self._admin_model.timeout_seconds
+                or request.max_output_tokens > self._admin_model.max_output_tokens):
             return ProviderResponse("not_dispatched", None, {}, {}, None)
         if cancellation.is_set() or not self._host_loop.is_running():
             return ProviderResponse("not_dispatched", None, {}, {}, None)

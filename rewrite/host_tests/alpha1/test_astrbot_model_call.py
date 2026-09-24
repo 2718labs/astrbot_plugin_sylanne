@@ -15,6 +15,9 @@ from openai import AsyncOpenAI
 
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.host.astrbot_model_call import AstrBotModelProvider
+from sylanne3.host.authority_profile import (
+    AdminIngressModelPolicy, installed_model_config_ref,
+)
 from sylanne3.model_broker.broker import ModelCallRequest, ModelProviderDescriptor
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
@@ -31,10 +34,13 @@ class Manager:
         self.inst_map = {"provider-1": provider}
         self.selected = provider
         self.seen_umo = []
+        self.on_selection = None
 
     async def get_using_provider_async(self, *, provider_type, umo):
         assert provider_type is ProviderType.CHAT_COMPLETION
         self.seen_umo.append(umo)
+        if self.on_selection is not None:
+            self.on_selection(len(self.seen_umo))
         return self.selected
 
 
@@ -111,9 +117,16 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             frozenset({"private"}), "credential:astrbot-installed",
             "unknown", False, False,
         )
+        config_digest = canonical_digest(self.provider.provider_config)
+        self.admin_model = AdminIngressModelPolicy(
+            "provider-1", "model-1",
+            installed_model_config_ref("provider-1", "model-1", config_digest),
+            config_digest, 0.2, 64, ("text",), "private",
+        )
         self.adapter = AstrBotModelProvider(
             context=self.context, host_loop=asyncio.get_running_loop(),
             trusted_umo=UMO, descriptor=self.descriptor,
+            admin_model=self.admin_model,
         )
 
     async def asyncTearDown(self):
@@ -132,7 +145,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             "input_tokens": 3, "cached_input_tokens": 1, "output_tokens": 3,
         })
         self.assertEqual(response.provider_call_ref, "remote-1")
-        self.assertEqual(self.manager.seen_umo, [UMO])
+        self.assertEqual(self.manager.seen_umo, [UMO, UMO])
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.requests[0][0], self.host_thread)
         self.assertIn(b'"max_completion_tokens":64', self.requests[0][1].content)
@@ -167,6 +180,47 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.invoke_on_worker(
             replace(call_request(), payload={"prompt": "hello", "unexpected": True})
         )).status, "not_dispatched")
+        self.assertEqual(self.requests, [])
+
+    async def test_installed_config_drift_has_no_network_dispatch(self):
+        self.provider.provider_config["temperature"] = 0.25
+        response = await self.invoke_on_worker()
+        self.assertEqual(response.status, "not_dispatched")
+        self.assertEqual(self.requests, [])
+        self.provider.provider_config.pop("temperature")
+        self.assertEqual((await self.invoke_on_worker()).status, "completed")
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_config_drift_after_first_selection_still_has_no_dispatch(self):
+        def change_on_second_selection(number):
+            if number == 2:
+                self.provider.provider_config["temperature"] = 0.25
+
+        self.manager.on_selection = change_on_second_selection
+        response = await self.invoke_on_worker()
+        self.assertEqual(response.status, "not_dispatched")
+        self.assertEqual(self.manager.seen_umo, [UMO, UMO])
+        self.assertEqual(self.requests, [])
+
+    async def test_client_replacement_after_first_selection_has_no_dispatch(self):
+        def replace_on_second_selection(number):
+            if number == 2:
+                self.provider.client = object.__new__(AsyncOpenAI)
+
+        self.manager.on_selection = replace_on_second_selection
+        response = await self.invoke_on_worker()
+        self.assertEqual(response.status, "not_dispatched")
+        self.assertEqual(self.requests, [])
+
+    async def test_admin_timeout_and_token_ceilings_hold_before_dispatch(self):
+        for request in (
+            replace(call_request(), timeout_seconds=0.3),
+            replace(call_request(), max_output_tokens=65),
+        ):
+            with self.subTest(request=request):
+                self.assertEqual((await self.invoke_on_worker(request)).status,
+                                 "not_dispatched")
+        self.assertEqual(self.manager.seen_umo, [])
         self.assertEqual(self.requests, [])
 
     async def test_ambiguous_completion_is_unknown(self):
