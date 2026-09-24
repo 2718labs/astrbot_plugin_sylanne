@@ -57,6 +57,10 @@ from ..authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
     from_wire as worker_result_from_wire, to_wire as worker_result_to_wire,
 )
+from ..authority_service.v2_self_identity_contract import (
+    AuthorityCurrentSelfIdentityV1, SelfIdentityCurrentRequestV1,
+    from_wire as self_identity_from_wire, to_wire as self_identity_to_wire,
+)
 from ..authority_service.v2_accounting_contract import (
     AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
 )
@@ -777,6 +781,49 @@ class MtlsAuthorityTransport:
                 or response["finished"] is not True):
             raise RuntimeError("authority worker read finish is unresolved")
         return True
+
+    async def self_identity_current_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        current_request: SelfIdentityCurrentRequestV1,
+    ) -> AuthorityCurrentSelfIdentityV1 | None:
+        if (type(current_request) is not SelfIdentityCurrentRequestV1
+                or (current_request.authority_id,
+                    current_request.authority_namespace,
+                    current_request.installation_id,
+                    current_request.manifest_digest,
+                    current_request.permit.subject,
+                    current_request.permit.holder) !=
+                   (grant.authority_id, namespace, grant.installation_id,
+                    grant.manifest_digest, grant.subject,
+                    grant.administrator_holder)):
+            raise RuntimeError("installed self identity read is invalid")
+        response = await self._content_rpc(
+            request, handshake, "self_identity_current_v1",
+            {"namespace": namespace,
+             "current_request": self_identity_to_wire(current_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"current", "channel_binding_sha256"}:
+            raise RuntimeError("authority self identity response is invalid")
+        if response["current"] is None:
+            return None
+        try:
+            current = self_identity_from_wire(response["current"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority self identity response is invalid") from exc
+        if (type(current) is not AuthorityCurrentSelfIdentityV1
+                or (current.authority_id, current.authority_namespace,
+                    current.namespace, current.installation_id,
+                    current.manifest_digest, current.request_operation_id,
+                    current.permit) !=
+                   (current_request.authority_id,
+                    current_request.authority_namespace,
+                    current_request.namespace, current_request.installation_id,
+                    current_request.manifest_digest,
+                    current_request.request_operation_id,
+                    current_request.permit)):
+            raise RuntimeError("authority self identity receipt differs")
+        return current
 
     async def _accounting_rpc(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

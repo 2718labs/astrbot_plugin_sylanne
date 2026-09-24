@@ -19,6 +19,9 @@ from ..authority_service.v2_model_result_read_contract import (
 from ..authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
 )
+from ..authority_service.v2_self_identity_contract import (
+    AuthorityCurrentSelfIdentityV1, SelfIdentityCurrentRequestV1,
+)
 from ..authority_service.v2_accounting_contract import (
     AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
 )
@@ -224,7 +227,10 @@ class AuthorityTransport(Protocol):
                                            *, namespace, read_request): ...
 
     async def worker_model_result_recover_finish_v1(self, request, handshake, grant,
-                                                     *, namespace, read_request): ...
+                                                    *, namespace, read_request): ...
+
+    async def self_identity_current_v1(self, request, handshake, grant,
+                                       *, namespace, current_request): ...
 
 
 class AuthorityClient:
@@ -487,6 +493,26 @@ class AuthorityClient:
         return await self._transport.worker_model_result_recover_finish_v1(
             request, handshake, grant, namespace=policy.authority_namespace,
             read_request=read_request)
+
+    async def self_identity_current_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        current_request: SelfIdentityCurrentRequestV1,
+    ) -> AuthorityCurrentSelfIdentityV1 | None:
+        """Read only the Authority-current mapping under the caller's live fence."""
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(current_request) is not SelfIdentityCurrentRequestV1
+                or (current_request.authority_id,
+                    current_request.authority_namespace, current_request.namespace,
+                    current_request.installation_id, current_request.manifest_digest,
+                    current_request.permit.subject, current_request.permit.holder) !=
+                   (grant.authority_id, policy.authority_namespace,
+                    policy.namespace, grant.installation_id,
+                    grant.manifest_digest, grant.subject,
+                    grant.administrator_holder)):
+            raise RuntimeError("self identity read differs from installed namespace")
+        return await self._transport.self_identity_current_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            current_request=current_request)
 
     async def accounting_begin_v1(
         self, bundle, grant: InstallationGrantV2, *,
