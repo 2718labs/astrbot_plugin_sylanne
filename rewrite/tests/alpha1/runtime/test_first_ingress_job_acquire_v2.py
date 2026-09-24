@@ -1,6 +1,7 @@
 """The first-ingress encoding job is acquired once under the v2 graph fence."""
 
 import json
+import math
 import sqlite3
 import time
 from types import SimpleNamespace
@@ -14,8 +15,9 @@ from sylanne3.graph_coordinator import (
 )
 from sylanne3.graph_store import ProductionGraphStore
 from sylanne3.memory_types import access_key, source_key, validate_access
-from sylanne3.model_broker.broker import ModelCallRequest
-from sylanne3.model_broker.first_ingress_encoding import build_first_ingress_encoding_payload
+from sylanne3.model_broker.first_ingress_encoding import (
+    issue_first_ingress_encoding_request_v2,
+)
 from sylanne3.runtime.encoding_call_binding import (
     EncodingCallConflict, EncodingRequestIssueV1,
     _redact_source_binding_content_in_transaction, insert_binding, load_binding,
@@ -25,13 +27,29 @@ from sylanne3.runtime.d11_types import (
 )
 from sylanne3.runtime.issuers import build_runtime_issuers
 from sylanne3.runtime_contracts import (
-    AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
-    canonical_digest,
+    AuthorityContext, NamespaceId,
 )
 from sylanne3.runtime import first_ingress_v2
 
-from test_first_ingress_v2 import ingress_system  # noqa: F401
+from test_first_ingress_v2 import ingress_system as base_ingress_system
 from test_graph_v2_provisioning import AuthorityPort
+
+
+@pytest.fixture
+def ingress_system(base_ingress_system):
+    system = base_ingress_system
+    port, clock_policy = system[3], system[5]
+    original = port.read_ingress_clock
+
+    def paired_clock(policy):
+        reading = original(policy)
+        if not hasattr(reading, "sample"):
+            reading.sample = SimpleNamespace(
+                epoch="fixture-clock-epoch", source_id=clock_policy.source_id)
+        return reading
+
+    port.read_ingress_clock = paired_clock
+    return system
 
 
 def _op(coordinator, job_id, actor="encoding-worker", nonce="a" * 32):
@@ -101,27 +119,13 @@ class FixedEncodingRequestIssuer:
         assert context.source_qualification.source_family == "reported"
         assert context.version_guard.access_epoch >= 0
         assert context.now_utc < context.deadline_utc
-        namespace = NamespaceId(job.bot_id, job.persona_id)
-        source_ref = source_key(*namespace.as_tuple, source.source_id).token
-        payload, template_digest = build_first_ingress_encoding_payload(source)
-        envelope = CommandEnvelope(
-            "sylanne.runtime.v1",
-            OperationIdentity(
-                job.activity_id, None, "encoding-attempt", "encode",
-                "encoding-model-operation", canonical_digest({"input_refs": [source_ref]})),
-            context.authority,
-            context.version_guard,
-            context.source_qualification,
-            (source_ref,), job.budget_ref,
-            context.deadline_utc,
-            1.0, "interval", (),
-        )
-        return EncodingRequestIssueV1(
-            ModelCallRequest(
-                envelope, "encoding-call-1", "provider-1", "model-1",
-                frozenset({"structured"}), "private", template_digest,
-                payload, 20.0, 128),
-            "admin-provider-config", self.config_digest,
+        return issue_first_ingress_encoding_request_v2(
+            context, provider_id="provider-1", model_id="model-1",
+            provider_config_ref="admin-provider-config",
+            provider_config_digest=self.config_digest,
+            required_capabilities=frozenset({"structured"}),
+            privacy_tier="private", timeout_seconds=20.0,
+            max_output_tokens=128,
         )
 
 
@@ -192,6 +196,15 @@ def test_encoding_request_binds_in_the_job_acquire_transaction(ingress_system):
         authority, lease, job_id, operation_id, lease_seconds=30)
     binding = load_binding(store._db, policy.namespace, job_id)
     assert binding is not None
+    assert binding.request["schema"] == "sylanne.first-ingress-encoding-call.v2"
+    assert binding.request["acquire_operation_id"] == operation_id
+    assert binding.request["original_operation_id"] == acquired.operation_id
+    assert binding.request["worker_fence"] == acquired.fence
+    assert binding.request["clock_epoch"] == "fixture-clock-epoch"
+    assert binding.request["envelope"]["identity"]["operation_id"] == operation_id
+    assert binding.request["envelope"]["authority"]["purpose"] == "consolidation"
+    assert binding.request["envelope"]["character_interval_ref"] == encoding.character_interval_ref
+    assert binding.request["envelope"]["monotonic_deadline"] > time.monotonic()
     assert binding.request["envelope"]["authority"]["worker_fence"] == acquired.fence
     assert binding.request["provider_config_digest"] == "c" * 64
     assert binding.request["payload"]["prompt"]
@@ -203,6 +216,88 @@ def test_encoding_request_binds_in_the_job_acquire_transaction(ingress_system):
     assert coordinator.acquire_first_ingress_encoding_job_v2(
         authority, lease, job_id, operation_id, lease_seconds=30) == acquired
     assert load_binding(store._db, policy.namespace, job_id) == binding
+
+
+def test_legacy_v1_issue_is_explicitly_rejected_for_production_acquire(ingress_system):
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+
+    class LegacyIssuer(FixedEncodingRequestIssuer):
+        def __call__(self, context):
+            issued = super().__call__(context)
+            return EncodingRequestIssueV1(
+                issued.request, issued.provider_config_ref,
+                issued.provider_config_digest)
+
+    coordinator._GraphCoordinator__encoding_request_issuer = LegacyIssuer()
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    with pytest.raises(UnavailableGuard, match="V2 request issuer"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+    assert load_binding(store._db, policy.namespace, job_id) is None
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_job_acquire_intents_v2").fetchone()[0] == 0
+
+
+def test_bound_request_replay_holds_when_paired_clock_epoch_changes(ingress_system):
+    store, coordinator, bootstrap, port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+    coordinator._GraphCoordinator__encoding_request_issuer = FixedEncodingRequestIssuer()
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    coordinator.acquire_first_ingress_encoding_job_v2(
+        authority, lease, job_id, operation_id, lease_seconds=30)
+    original_clock = port.read_ingress_clock
+
+    def changed_epoch(clock_policy):
+        reading = original_clock(clock_policy)
+        reading.sample.epoch = "new-process-epoch"
+        return reading
+
+    port.read_ingress_clock = changed_epoch
+    with pytest.raises(UnavailableGuard, match="clock context"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+
+
+def test_v2_issue_holds_without_original_interval_or_paired_epoch(ingress_system):
+    store, coordinator, bootstrap, port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+    coordinator._GraphCoordinator__encoding_request_issuer = FixedEncodingRequestIssuer()
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    paired = port.read_ingress_clock
+    port.read_ingress_clock = lambda selected: SimpleNamespace(
+        utc_upper_bound_seconds=paired(selected).utc_upper_bound_seconds,
+        monotonic_after_seconds=time.monotonic(),
+    )
+    with pytest.raises(UnavailableGuard, match="clock context"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+    port.read_ingress_clock = paired
+    store._db.execute("DROP TRIGGER runtime_ingress_issuance_no_update_v2")
+    (policy_json,) = store._db.execute(
+        "SELECT policy_json FROM runtime_ingress_issuance").fetchone()
+    original_policy = json.loads(policy_json)
+    del original_policy["character_interval_ref"]
+    store._db.execute(
+        "UPDATE runtime_ingress_issuance SET policy_json=?",
+        (json.dumps(original_policy),),
+    )
+    with pytest.raises(UnavailableGuard, match="original encoding interval"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+    assert load_binding(store._db, policy.namespace, job_id) is None
 
 
 def test_original_d06_qualification_is_durable_and_legacy_gap_holds(ingress_system):
@@ -779,11 +874,14 @@ def test_revoked_budget_lease_blocks_historical_replay(ingress_system):
             authority, lease, job_id, _op(coordinator, job_id), lease_seconds=30)
 
 
+@pytest.mark.parametrize("bound", [False, True])
 def test_committed_acquire_replays_after_graph_and_authority_reopen(
-    ingress_system, tmp_path,
+    ingress_system, tmp_path, bound,
 ):
     store, coordinator, bootstrap, port, policy, clock, encoding, host = ingress_system
     coordinator._GraphCoordinator__scene_clock_policy = clock
+    if bound:
+        coordinator._GraphCoordinator__encoding_request_issuer = FixedEncodingRequestIssuer()
     coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
     (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
     authority, lease = _worker(coordinator, bootstrap, policy.namespace)
@@ -802,6 +900,7 @@ def test_committed_acquire_replays_after_graph_and_authority_reopen(
     reopened_port.read_ingress_clock = lambda _: SimpleNamespace(
         utc_upper_bound_seconds=time.time() + 0.01,
         monotonic_after_seconds=time.monotonic(),
+        sample=SimpleNamespace(epoch="fixture-clock-epoch", source_id=clock.source_id),
     )
     d02, d11 = build_runtime_issuers(b"issuer-key-" * 4)
     next_bootstrap = object()
@@ -809,6 +908,7 @@ def test_committed_acquire_replays_after_graph_and_authority_reopen(
         reopened, next_bootstrap, holder="administrator",
         content_fence_v2=reopened_port, d02_issuer=d02, d11_issuer=d11,
         scene_clock_policy=clock,
+        encoding_request_issuer=(FixedEncodingRequestIssuer() if bound else None),
     )
     next_coordinator.register_provider(
         next_bootstrap, "d11", D11RuntimeProvider(), D11_PROPOSAL_SCHEMA,
@@ -817,6 +917,23 @@ def test_committed_acquire_replays_after_graph_and_authority_reopen(
     try:
         next_authority, next_lease = _worker(
             next_coordinator, next_bootstrap, policy.namespace)
+        if bound:
+            frozen = load_binding(reopened._db, policy.namespace, job_id)
+            reading = reopened_port.read_ingress_clock(clock)
+            (current, _, _, current_outbox, _, _, source_version,
+             access_version) = next_coordinator._first_ingress_encoding_job_locked(
+                 policy.namespace, job_id)
+            context = next_coordinator._first_ingress_encoding_issue_context(
+                policy.namespace, current, current_outbox, source_version,
+                access_version, next_authority,
+                first_ingress_v2.trusted_upper(reading), _op(next_coordinator, job_id),
+                reading, frozen)
+            assert context.monotonic_deadline == frozen.request[
+                "envelope"]["monotonic_deadline"]
+            assert math.isclose(context.current_monotonic_deadline,
+                reading.monotonic_after_seconds + (
+                    context.deadline_utc - reading.utc_upper_bound_seconds),
+                abs_tol=1e-6)
         assert next_coordinator.acquire_first_ingress_encoding_job_v2(
             next_authority, next_lease, job_id, _op(next_coordinator, job_id),
             lease_seconds=30,

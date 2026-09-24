@@ -278,7 +278,7 @@ class FirstIngressEncodingInputsV1:
 
 
 @dataclass(frozen=True, slots=True)
-class FirstIngressEncodingIssueContextV1:
+class FirstIngressEncodingIssueContextV2:
     """Current, fenced inputs for a pure encoding request issuer.
 
     The AuthorityContext is the acquired D11 worker assertion.  This is not a
@@ -297,6 +297,11 @@ class FirstIngressEncodingIssueContextV1:
     now_utc: float
     deadline_utc: float
     worker_lease_deadline_utc: float
+    acquire_operation_id: str
+    character_interval_ref: str
+    clock_epoch: str
+    monotonic_deadline: float
+    current_monotonic_deadline: float
 
 @dataclass(frozen=True)
 class NamespaceProvisionReceiptV2:
@@ -6088,8 +6093,9 @@ class GraphCoordinator:
 
     def _first_ingress_encoding_issue_context(
         self, namespace, planned, outbox, source_version, access_version,
-        authority, now_utc,
-    ) -> FirstIngressEncodingIssueContextV1:
+        authority, now_utc, acquire_operation_id, clock_reading,
+        frozen_binding=None,
+    ) -> FirstIngressEncodingIssueContextV2:
         """Gather current graph truth and the original D06 qualification."""
         from datetime import datetime
         with self.__store._lock:
@@ -6140,6 +6146,18 @@ class GraphCoordinator:
             )
             qualification = self._original_first_ingress_qualification_locked(
                 namespace, planned.operation_id, source_version.key.token)
+            issuance = self.__store._db.execute(
+                "SELECT policy_json FROM runtime_ingress_issuance "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (planned.operation_id,),
+            ).fetchone()
+            if issuance is None:
+                raise UnavailableGuard("original encoding interval absent; HOLD")
+            try:
+                character_interval_ref = IngressIssuancePolicy(
+                    **json.loads(issuance[0])).character_interval_ref
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("original encoding interval invalid; HOLD") from exc
         if row is None or row[0] != source_version.revision or row[2] != 1:
             raise UnavailableGuard("encoding source changed before request issue; HOLD")
         source = SourceRecord.from_dict(json.loads(row[1]))
@@ -6152,19 +6170,48 @@ class GraphCoordinator:
         deadline = min(job_deadline, worker_deadline)
         if now_utc >= deadline:
             raise UnavailableGuard("encoding request deadline expired; HOLD")
-        return FirstIngressEncodingIssueContextV1(
+        try:
+            clock_epoch = clock_reading.sample.epoch
+            clock_source = clock_reading.sample.source_id
+            if (type(clock_epoch) is not str or not clock_epoch
+                    or clock_source != self.__scene_clock_policy.source_id):
+                raise ValueError("paired clock identity is invalid")
+            current_monotonic_deadline = clock_reading.monotonic_after_seconds + (
+                deadline - clock_reading.utc_upper_bound_seconds)
+            if (not math.isfinite(current_monotonic_deadline)
+                    or time.monotonic() >= current_monotonic_deadline):
+                raise ValueError("paired monotonic deadline expired")
+            # The frozen envelope value is request identity. Every check uses
+            # this process's freshly rebuilt deadline from the paired sample.
+            monotonic_deadline = current_monotonic_deadline
+            if frozen_binding is not None:
+                frozen = frozen_binding.request
+                if (frozen.get("schema") != "sylanne.first-ingress-encoding-call.v2"
+                        or frozen.get("clock_epoch") != clock_epoch
+                        or frozen.get("acquire_operation_id") != acquire_operation_id):
+                    raise ValueError("frozen clock epoch or acquire differs")
+                monotonic_deadline = frozen["envelope"]["monotonic_deadline"]
+                if (type(monotonic_deadline) not in (int, float)
+                        or not math.isfinite(monotonic_deadline)):
+                    raise ValueError("frozen monotonic deadline invalid")
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise UnavailableGuard("paired encoding clock context unavailable; HOLD") from exc
+        return FirstIngressEncodingIssueContextV2(
             planned, source, replace(authority, worker_fence=planned.fence),
             source_version.revision, access_version.revision,
             tuple(access_value["audiences"]), tuple(access_value["purposes"]),
-            guard, qualification, now_utc, deadline, worker_deadline)
+            guard, qualification, now_utc, deadline, worker_deadline,
+            acquire_operation_id, character_interval_ref, clock_epoch,
+            monotonic_deadline, current_monotonic_deadline)
 
     def _issue_first_ingress_encoding_binding(
         self, namespace, planned, outbox, source_version, access_version,
-        authority, now_utc,
+        authority, now_utc, acquire_operation_id, clock_reading,
+        frozen_binding=None,
     ):
         """Freeze the installed pure issuer output for one planned worker fence."""
         from .runtime.encoding_call_binding import (
-            EncodingRequestIssueV1, prepare_binding,
+            EncodingRequestIssueV2, prepare_binding,
         )
         from .model_broker.first_ingress_encoding import (
             FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
@@ -6172,16 +6219,22 @@ class GraphCoordinator:
 
         context = self._first_ingress_encoding_issue_context(
             namespace, planned, outbox, source_version, access_version,
-            authority, now_utc)
+            authority, now_utc, acquire_operation_id, clock_reading,
+            frozen_binding)
         issue = self.__encoding_request_issuer(context)
-        if type(issue) is not EncodingRequestIssueV1:
-            raise UnavailableGuard("encoding request issuer returned no typed request")
+        if type(issue) is not EncodingRequestIssueV2:
+            raise UnavailableGuard("production encoding requires a V2 request issuer; HOLD")
         request = issue.request
         if (request.envelope.identity.activity_id != planned.activity_id
                 or request.envelope.authority != context.authority
                 or request.envelope.version_guard != context.version_guard
                 or request.envelope.source_qualification != context.source_qualification
-                or request.envelope.deadline_utc > context.deadline_utc
+                or request.envelope.identity.operation_id != acquire_operation_id
+                or request.envelope.identity.phase != "encode"
+                or request.envelope.monotonic_deadline != context.monotonic_deadline
+                or request.envelope.character_interval_ref
+                != context.character_interval_ref
+                or request.envelope.deadline_utc != context.deadline_utc
                 or request.envelope.deadline_utc <= context.now_utc):
             raise UnavailableGuard("encoding request differs from trusted issuance context")
         return prepare_binding(
@@ -6190,18 +6243,29 @@ class GraphCoordinator:
             request, prompt_template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
             provider_config_ref=issue.provider_config_ref,
             provider_config_digest=issue.provider_config_digest,
+            production_context=context,
         )
 
     def _validate_first_ingress_encoding_binding_context(
         self, namespace, job, outbox, source_version, access_version,
-        authority, now_utc, binding,
+        authority, now_utc, acquire_operation_id, clock_reading, binding,
     ) -> None:
         """Recheck frozen issuer claims against current worker and graph truth."""
         context = self._first_ingress_encoding_issue_context(
             namespace, job, outbox, source_version, access_version,
-            authority, now_utc)
+            authority, now_utc, acquire_operation_id, clock_reading, binding)
         envelope = binding.request["envelope"]
-        if (binding.source_revision != context.source_revision
+        if (binding.request.get("schema") != "sylanne.first-ingress-encoding-call.v2"
+                or binding.request.get("original_operation_id")
+                != context.job.operation_id
+                or binding.request.get("worker_fence") != context.job.fence
+                or binding.request.get("worker_lease_expires_utc")
+                != context.job.lease_expires_utc
+                or envelope.get("character_interval_ref")
+                != context.character_interval_ref
+                or envelope.get("monotonic_deadline")
+                != context.monotonic_deadline
+                or binding.source_revision != context.source_revision
                 or binding.access_revision != context.access_revision
                 or canonical_serialize(envelope["authority"])
                 != canonical_serialize(context.authority)
@@ -6328,7 +6392,8 @@ class GraphCoordinator:
                 raise UnavailableGuard("encoding job has an active or cancelled lease; HOLD")
             binding = (self._issue_first_ingress_encoding_binding(
                 namespace, planned, outbox, source_version, access_version,
-                authority, now) if self.__encoding_request_issuer is not None else None)
+                authority, now, acquire_operation_id, clock)
+                if self.__encoding_request_issuer is not None else None)
             binding_json = binding_to_json(binding) if binding is not None else None
             request_digest = canonical_digest({
                 "schema": "sylanne.job-acquire.v2",
@@ -6462,7 +6527,8 @@ class GraphCoordinator:
                         self._validate_first_ingress_encoding_binding_context(
                             namespace, current, current_outbox,
                             current_source, current_access, authority,
-                            replay_now, frozen_binding)
+                            replay_now, acquire_operation_id, clock,
+                            frozen_binding)
                 try:
                     current_is_live = plan_job_acquire(
                         current, authority.actor, now_utc=replay_now_text,
@@ -6528,7 +6594,8 @@ class GraphCoordinator:
                 raise UnavailableGuard("original encoding request issuer is unavailable; HOLD")
             current_binding = self._issue_first_ingress_encoding_binding(
                 namespace, planned, outbox, source_version, access_version,
-                authority, now)
+                authority, now, acquire_operation_id, clock,
+                frozen_binding)
             if current_binding != frozen_binding:
                 raise UnavailableGuard("encoding request configuration changed; HOLD")
         elif self.__encoding_request_issuer is not None:
@@ -6596,11 +6663,13 @@ class GraphCoordinator:
             if frozen_binding is not None:
                 self._validate_first_ingress_encoding_binding_context(
                     namespace, planned, outbox, source_version,
-                    access_version, authority, commit_now, frozen_binding)
+                    access_version, authority, commit_now,
+                    acquire_operation_id, clock, frozen_binding)
                 if (self.__encoding_request_issuer is None
                         or self._issue_first_ingress_encoding_binding(
                             namespace, planned, outbox, source_version,
-                            access_version, authority, commit_now)
+                            access_version, authority, commit_now,
+                            acquire_operation_id, clock, frozen_binding)
                         != frozen_binding):
                     raise UnavailableGuard(
                         "encoding request configuration changed; HOLD")

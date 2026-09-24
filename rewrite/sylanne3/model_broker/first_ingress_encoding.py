@@ -8,8 +8,10 @@ import math
 from typing import Mapping
 
 from ..contracts import canonical_json
-from ..memory_types import SourceRecord
-from ..runtime_contracts import canonical_digest
+from ..memory_types import SourceRecord, source_key
+from ..runtime_contracts import (
+    CommandEnvelope, OperationIdentity, canonical_digest,
+)
 
 
 FIRST_INGRESS_ENCODING_TEMPLATE_VERSION = "sylanne.d06.first_ingress_encoding.v1"
@@ -48,6 +50,63 @@ def build_first_ingress_encoding_payload(source: SourceRecord) -> tuple[dict[str
         "source": {name: getattr(source, name) for name in _SOURCE_FIELDS},
     })
     return {"system_prompt": _SYSTEM_PROMPT, "prompt": prompt}, FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST
+
+
+def issue_first_ingress_encoding_request_v2(
+    context, *, provider_id: str, model_id: str, provider_config_ref: str,
+    provider_config_digest: str, required_capabilities: frozenset[str],
+    privacy_tier: str, timeout_seconds: float, max_output_tokens: int,
+):
+    """Build a fixed D06 request from already qualified D11 context.
+
+    The caller owns graph qualification, budget reservation and egress admission.
+    This pure function neither grants nor spends any of them.
+    """
+    from .broker import ModelCallRequest
+    from ..runtime.encoding_call_binding import EncodingRequestIssueV2
+
+    if (context.authority.issuer_domain != "d11"
+            or context.authority.purpose != "consolidation"
+            or context.job.work_kind != "d06.encode_source"
+            or context.authority.worker_fence != context.job.fence
+            or context.job.fence < 1
+            or not context.acquire_operation_id
+            or not context.character_interval_ref
+            or not context.clock_epoch
+            or context.now_utc >= context.deadline_utc
+            or context.monotonic_deadline <= 0):
+        raise ValueError("qualified D06 encoding context is required")
+    source_ref = source_key(
+        *context.authority.namespace.as_tuple, context.source.source_id).token
+    if (context.source_qualification.source_refs != (source_ref,)
+            or "consolidation" not in context.access_purposes
+            or not set(context.authority.audience).issubset(
+                context.access_audiences)):
+        raise ValueError("D06 source or access context differs")
+    payload, template_digest = build_first_ingress_encoding_payload(context.source)
+    envelope = CommandEnvelope(
+        "sylanne.runtime.v1",
+        OperationIdentity(
+            context.job.activity_id, None, context.acquire_operation_id,
+            "encode", context.acquire_operation_id,
+            canonical_digest({"input_refs": [source_ref]}),
+        ),
+        context.authority, context.version_guard,
+        context.source_qualification, (source_ref,), context.job.budget_ref,
+        context.deadline_utc, context.monotonic_deadline,
+        context.character_interval_ref, (context.job.operation_id,),
+    )
+    call_id = "encode-call-" + canonical_digest({
+        "job_id": context.job.job_id,
+        "acquire_operation_id": context.acquire_operation_id,
+    })[:48]
+    return EncodingRequestIssueV2(
+        ModelCallRequest(
+            envelope, call_id, provider_id, model_id, required_capabilities,
+            privacy_tier, template_digest, payload, timeout_seconds,
+            max_output_tokens,
+        ), provider_config_ref, provider_config_digest,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +163,7 @@ __all__ = (
     "FIRST_INGRESS_ENCODING_TEMPLATE_VERSION",
     "FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST",
     "build_first_ingress_encoding_payload",
+    "issue_first_ingress_encoding_request_v2",
     "FirstIngressEncodingCandidate",
     "parse_first_ingress_encoding_result",
 )

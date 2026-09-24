@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import math
 from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
@@ -42,7 +43,16 @@ class EncodingCallBinding:
 
 @dataclass(frozen=True)
 class EncodingRequestIssueV1:
-    """Trusted pure issuer output; configuration identity contains no secret."""
+    """Legacy fixture output. It is never a production egress authorization."""
+
+    request: ModelCallRequest
+    provider_config_ref: str
+    provider_config_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class EncodingRequestIssueV2:
+    """Pure request construction; graph, budget and egress admission stay external."""
 
     request: ModelCallRequest
     provider_config_ref: str
@@ -156,6 +166,7 @@ def prepare_binding(
     budget_reservation_operation_id: str, request: ModelCallRequest,
     *, prompt_template_version: str, provider_config_ref: str,
     provider_config_digest: str,
+    production_context=None,
 ) -> EncodingCallBinding:
     """Freeze all request inputs. Caller must independently qualify their origin."""
     from ..memory_types import SourceRecord, access_key, source_key
@@ -205,7 +216,9 @@ def prepare_binding(
             or prompt_template_version != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION):
         raise ValueError("model request differs from fixed first-ingress template")
     frozen = {
-        "schema": "sylanne.first-ingress-encoding-call.v1",
+        "schema": ("sylanne.first-ingress-encoding-call.v2"
+                   if production_context is not None else
+                   "sylanne.first-ingress-encoding-call.v1"),
         "namespace": list(namespace.as_tuple),
         "job_id": job_id,
         "source_id": source_id,
@@ -228,6 +241,29 @@ def prepare_binding(
         "timeout_seconds": float(request.timeout_seconds),
         "max_output_tokens": request.max_output_tokens,
     }
+    if production_context is not None:
+        if (request.envelope.identity.operation_id
+                != production_context.acquire_operation_id
+                or request.envelope.identity.phase != "encode"
+                or request.envelope.authority.purpose != "consolidation"
+                or production_context.job.work_kind != "d06.encode_source"
+                or production_context.job.operation_id
+                != budget_reservation_operation_id
+                or production_context.job.budget_ref != budget_lease_id
+                or request.envelope.monotonic_deadline
+                != production_context.monotonic_deadline
+                or request.envelope.character_interval_ref
+                != production_context.character_interval_ref
+                or request.envelope.deadline_utc != production_context.deadline_utc):
+            raise ValueError("production encoding request lost original job or clock context")
+        frozen.update({
+            "acquire_operation_id": production_context.acquire_operation_id,
+            "original_operation_id": production_context.job.operation_id,
+            "work_kind": production_context.job.work_kind,
+            "worker_fence": production_context.job.fence,
+            "worker_lease_expires_utc": production_context.job.lease_expires_utc,
+            "clock_epoch": production_context.clock_epoch,
+        })
     request_json = canonical_serialize(frozen)
     if len(request_json.encode("utf-8")) > 131_072:
         raise ValueError("encoding request exceeds durable binding limit")
@@ -259,6 +295,40 @@ def _validate_binding_content(binding: EncodingCallBinding) -> None:
     from ..runtime_contracts import canonical_digest
 
     request = binding.request
+    schema = request.get("schema")
+    if schema not in {"sylanne.first-ingress-encoding-call.v1",
+                      "sylanne.first-ingress-encoding-call.v2"}:
+        raise EncodingCallConflict("unknown encoding request binding schema")
+    if schema == "sylanne.first-ingress-encoding-call.v2":
+        try:
+            envelope = request["envelope"]
+            identity = envelope["identity"]
+            authority = envelope["authority"]
+            if (type(request["acquire_operation_id"]) is not str
+                    or not request["acquire_operation_id"]
+                    or request["acquire_operation_id"] != identity["operation_id"]
+                    or type(request["original_operation_id"]) is not str
+                    or not request["original_operation_id"]
+                    or request["original_operation_id"]
+                    != request["budget_reservation_operation_id"]
+                    or request["work_kind"] != "d06.encode_source"
+                    or type(request["clock_epoch"]) is not str
+                    or not request["clock_epoch"]
+                    or type(request["worker_lease_expires_utc"]) is not str
+                    or not request["worker_lease_expires_utc"]
+                    or type(request["worker_fence"]) is not int
+                    or request["worker_fence"] < 1
+                    or request["worker_fence"] != authority["worker_fence"]
+                    or authority["purpose"] != "consolidation"
+                    or "activity" not in authority["owner_scope"]
+                    or identity["phase"] != "encode"
+                    or type(envelope["character_interval_ref"]) is not str
+                    or not envelope["character_interval_ref"]
+                    or type(envelope["monotonic_deadline"]) not in (int, float)
+                    or not math.isfinite(envelope["monotonic_deadline"])):
+                raise ValueError("production context differs")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EncodingCallConflict("production encoding context is incomplete") from exc
     try:
         model_digest = canonical_digest({
             "envelope": request["envelope"],
