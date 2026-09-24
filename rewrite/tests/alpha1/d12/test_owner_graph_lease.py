@@ -21,6 +21,7 @@ from sylanne3.graph_worker import GraphWorker
 from sylanne3.graph_types import (
     AtomKey, GraphCandidate, GraphWrite, Owner, TypeRegistry, owner_grant_key, owner_grant_spec,
 )
+from sylanne3.domains.d05 import RelationshipProvider
 from sylanne3.domains.d06 import D06DomainProvider
 from sylanne3.domain_registry import discover_domain_registry
 from sylanne3.memory_types import SourceRecord, access_key, source_key
@@ -31,7 +32,7 @@ from sylanne3.runtime_contracts import (
 from sylanne3.workbench_api.owner_grant import (
     DurableOwnerGrantResolver, GraphCurrentOwnerGrantPort,
 )
-from sylanne3.workbench_api.service import AuthenticatedSession
+from sylanne3.workbench_api.service import AuthenticatedSession, WorkbenchService
 from sylanne3.workbench_api import (
     AsyncGraphWorkbenchService, CoordinatorGrant, CurrentDomainViewRegistry,
     GraphWorkbenchIssuer, RequestContext,
@@ -117,6 +118,8 @@ class Provider:
 def owner_graph(tmp_path):
     registry = TypeRegistry()
     registry.register(owner_grant_spec())
+    for spec in RelationshipProvider().type_specs():
+        registry.register(spec)
     for spec in D06DomainProvider.type_specs():
         registry.register(spec)
     graph = ProductionGraphStore(tmp_path / "business.db", registry)
@@ -138,6 +141,10 @@ def owner_graph(tmp_path):
             and namespace == NAMESPACE else None)
     spec = registry.spec(owner_grant_key(*NAMESPACE.as_tuple).type_name)
     coordinator.register_provider(bootstrap, "d11", Provider(), "owner", spec.schema_hash)
+    d05 = RelationshipProvider()
+    coordinator.register_provider(
+        bootstrap, "d05", d05, "d05.proposal.v1", d05.descriptor.request_schema_hash,
+    )
     d06 = D06DomainProvider()
     coordinator.register_provider(
         bootstrap, "d06", d06, "d06.contract.v1", d06.descriptor.request_schema_hash,
@@ -199,6 +206,104 @@ def owner_graph(tmp_path):
         yield graph, coordinator, bootstrap, port, key, pairing
     finally:
         graph.close()
+
+
+def test_d05_relations_read_uses_committed_graph_and_current_owner_fence(owner_graph):
+    graph, coordinator, bootstrap, port, _, _ = owner_graph
+    authority, lease, _ = coordinator.grant_current_owner(
+        bootstrap, actor="owner-session", namespace=NAMESPACE,
+        domains=("d05", "d11"), purpose="workbench_view", audience="owner",
+        activation_generation=1, owner_session_token=OWNER_TOKEN,
+        owner_session_request=OWNER_REQUEST,
+    )
+
+    class Resolver:
+        def resolve(self, **_kwargs):
+            return CoordinatorGrant("bot/persona", authority, lease)
+
+    issuer = GraphWorkbenchIssuer(
+        coordinator, Resolver(), CurrentDomainViewRegistry(discover_domain_registry),
+    )
+    session = AuthenticatedSession(
+        "owner-session", "signed-session",
+        {"bot/persona": frozenset({"workbench.read"})},
+        {"bot/persona": frozenset({"owner"})},
+        {"bot/persona": frozenset({"workbench_view"})},
+        owner_session_token=OWNER_TOKEN, owner_session_request=OWNER_REQUEST,
+    )
+    payload = {
+        "schema_version": "d12.contract.v1", "action": "read_character_view",
+        "scope": "bot/persona", "purpose": "workbench_view", "audience": "owner",
+        "operation_id": str(uuid4()), "input": {"view_type": "relations"},
+    }
+
+    def read():
+        return WorkbenchService(issuer).handle(
+            payload, session=session, context=RequestContext(True, True, True),
+        ).as_dict()
+
+    assert read()["projection"]["data"] == {"relations": [], "coverage": "complete"}
+    key = AtomKey(Owner("relation", "bot", "persona", "entity:alice"),
+                  "d05.relationship_projection", "trust:work")
+    snapshot = GraphStore.graph_snapshot(
+        graph, (key,), _capability=graph._coordinator_capability,
+    )
+    GraphStore.graph_commit(
+        graph, GraphCandidate(
+            Event(Scope("bot", "persona", "seed"), "relation-projection", 2.0,
+                  "test", {}),
+            snapshot.versions,
+            (GraphWrite(key, {"subject_entity_ref": "entity:alice",
+                              "dimension": "trust:work", "status": "available"}),),
+            snapshot.epochs,
+        ), _capability=graph._coordinator_capability,
+    )
+    with graph._lock:
+        graph._db.execute("BEGIN IMMEDIATE")
+        try:
+            recovery = graph.graph_recovery_metadata(
+                NAMESPACE, _capability=graph._coordinator_capability,
+            )
+            graph.cas_graph_recovery_metadata(
+                recovery, recovery.requirements,
+                _capability=graph._coordinator_capability,
+            )
+            graph._db.execute("COMMIT")
+        except BaseException:
+            graph._db.execute("ROLLBACK")
+            raise
+
+    assert read()["projection"]["data"] == {
+        "relations": [{"subject_entity_ref": "entity:alice", "dimensions": [
+            {"dimension": "trust:work", "status": "available"},
+        ]}], "coverage": "complete",
+    }
+    denied = replace(session, scope_capabilities={"bot/persona": frozenset()})
+    assert WorkbenchService(issuer).handle(
+        payload, session=denied, context=RequestContext(True, True, True),
+    ).status == "unauthorized"
+    limited_authority, limited_lease, _ = coordinator.grant_current_owner(
+        bootstrap, actor="owner-session", namespace=NAMESPACE,
+        domains=("d11",), purpose="workbench_view", audience="owner",
+        activation_generation=1, owner_session_token=OWNER_TOKEN,
+        owner_session_request=OWNER_REQUEST,
+    )
+
+    class LimitedResolver:
+        def resolve(self, **_kwargs):
+            return CoordinatorGrant("bot/persona", limited_authority, limited_lease)
+
+    limited_issuer = GraphWorkbenchIssuer(
+        coordinator, LimitedResolver(), CurrentDomainViewRegistry(discover_domain_registry),
+    )
+    assert WorkbenchService(limited_issuer).handle(
+        payload, session=session, context=RequestContext(True, True, True),
+    ).problem["code"] == "view_unsupported"
+    coordinator.release_current_owner_lease(bootstrap, limited_lease)
+    port.session_current = False
+    revoked = read()
+    assert revoked["status"] == "unavailable" and "projection" not in revoked
+    coordinator.release_current_owner_lease(bootstrap, lease)
 
 
 def test_d06_workbench_uses_full_fenced_private_scan_without_count_side_channel(
