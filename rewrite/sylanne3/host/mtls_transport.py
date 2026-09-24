@@ -40,11 +40,19 @@ from ..authority_service.v2_owner_session import (
     from_wire as session_from_wire, to_wire as session_to_wire,
 )
 from ..authority_service.v2_execution_bridge import HandoffStartV2
+from ..authority_service.v2_model_egress_contract import (
+    ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
+)
+from ..authority_service.v2_model_egress_wire import (
+    from_wire as model_from_wire, to_wire as model_to_wire,
+)
+from ..model_broker.broker import ModelCallRequest
 from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import (
     InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
+    canonical_digest as runtime_canonical_digest,
 )
 from .authority_client import (
     AUTHORITY_PROTOCOL,
@@ -406,6 +414,113 @@ class MtlsAuthorityTransport:
                 or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
             raise RuntimeError("authority v2 installation grant binding is invalid")
         return grant
+
+    @staticmethod
+    def _model_identity(
+        request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, namespace: str, holder: str,
+        candidate: ModelEgressDraftV1 | ModelEgressIntentV1,
+    ) -> None:
+        if (type(grant) is not InstallationGrantV2 or not handshake.valid_pairing()
+                or grant.authority_id != handshake.installation_authority_id
+                or grant.subject != handshake.installation_identity_ref
+                or grant.manifest_digest != request.publisher_package.manifest_sha256
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256
+                or grant.administrator_holder != holder
+                or type(candidate) not in {ModelEgressDraftV1, ModelEgressIntentV1}
+                or (candidate.authority_id, candidate.namespace, candidate.subject)
+                != (grant.authority_id, namespace, grant.subject)):
+            raise RuntimeError("authority model installation binding is invalid")
+
+    @staticmethod
+    def _model_response(
+        response: dict[str, object], grant: InstallationGrantV2,
+        candidate: ModelEgressDraftV1 | ModelEgressIntentV1,
+        expected_state: str | None,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2]:
+        if set(response) != {"record", "permit", "channel_binding_sha256"}:
+            raise RuntimeError("authority model response is invalid")
+        try:
+            record = model_from_wire(response["record"], ModelEgressRecoveryV1)
+            permit = from_wire(response["permit"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority model response is invalid") from exc
+        intent = record.intent
+        if (type(permit) is not FencePermitV2
+                or permit.operation != "model_egress"
+                or permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject
+                or permit.namespace != intent.namespace
+                or permit.holder != grant.administrator_holder
+                or permit.operation_id != intent.operation_id
+                or (intent.fence_token, intent.fence_epoch, intent.fence_revision,
+                    intent.anchor_digest) !=
+                   (permit.token, permit.fence_epoch, permit.revision,
+                    runtime_canonical_digest(asdict(permit.pinned_anchor)))
+                or (ModelEgressDraftV1.from_intent(intent) != candidate
+                    if type(candidate) is ModelEgressDraftV1 else intent != candidate)
+                or (expected_state is not None and record.state != expected_state)):
+            raise RuntimeError("authority model response binding is invalid")
+        return record, permit
+
+    async def model_prepare_fenced_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str, holder: str,
+        draft: ModelEgressDraftV1, expected_anchor: RestoreAnchor,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2]:
+        self._model_identity(request, handshake, grant, namespace, holder, draft)
+        if (type(expected_anchor) is not RestoreAnchor
+                or (expected_anchor.authority_id, expected_anchor.namespace)
+                != (grant.authority_id, namespace)):
+            raise RuntimeError("authority model anchor binding is invalid")
+        response = await self._content_rpc(
+            request, handshake, "model_prepare_fenced_v1",
+            {"namespace": namespace, "holder": holder, "draft": model_to_wire(draft),
+             "expected_anchor": asdict(expected_anchor)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        record, permit = self._model_response(response, grant, draft, "prepared")
+        if permit.pinned_anchor != expected_anchor:
+            raise RuntimeError("authority model anchor binding is invalid")
+        return record, permit
+
+    async def model_admit_dispatch_once_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str, holder: str,
+        intent: ModelEgressIntentV1, expected_anchor: RestoreAnchor,
+        model_request: ModelCallRequest,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2]:
+        self._model_identity(request, handshake, grant, namespace, holder, intent)
+        if (type(model_request) is not ModelCallRequest
+                or model_request.digest != intent.request_digest
+                or model_request.call_id != intent.call_id
+                or model_request.identity.operation_id != intent.operation_id
+                or (model_request.provider_id, model_request.model_id,
+                    model_request.max_output_tokens) !=
+                   (intent.provider_id, intent.model_id, intent.max_output_tokens)
+                or type(expected_anchor) is not RestoreAnchor
+                or (expected_anchor.authority_id, expected_anchor.namespace)
+                != (grant.authority_id, namespace)
+                or runtime_canonical_digest(asdict(expected_anchor)) != intent.anchor_digest):
+            raise RuntimeError("authority model request binding is invalid")
+        response = await self._content_rpc(
+            request, handshake, "model_admit_dispatch_once_v1",
+            {"namespace": namespace, "holder": holder, "intent": model_to_wire(intent),
+             "expected_anchor": asdict(expected_anchor),
+             "request": model_to_wire(model_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        return self._model_response(response, grant, intent, "dispatch_started")
+
+    async def model_recover_fenced_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str, holder: str,
+        intent: ModelEgressIntentV1,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2]:
+        self._model_identity(request, handshake, grant, namespace, holder, intent)
+        response = await self._content_rpc(
+            request, handshake, "model_recover_fenced_v1",
+            {"namespace": namespace, "holder": holder, "intent": model_to_wire(intent)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        return self._model_response(response, grant, intent, None)
 
     async def ingress_clock_sample_v2(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

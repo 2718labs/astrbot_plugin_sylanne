@@ -8,6 +8,12 @@ import re
 from typing import Protocol
 
 from ..authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
+from ..authority_service.v2_contract import FencePermitV2
+from ..authority_service.v2_model_egress_contract import (
+    ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
+)
+from ..model_broker.broker import ModelCallRequest
+from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import InstallationGrantV2
 
 
@@ -176,6 +182,16 @@ class AuthorityTransport(Protocol):
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
     ) -> InstallationGrantV2: ...
 
+    async def model_prepare_fenced_v1(self, request, handshake, grant, *, namespace,
+                                      holder, draft, expected_anchor): ...
+
+    async def model_admit_dispatch_once_v1(self, request, handshake, grant, *, namespace,
+                                           holder, intent, expected_anchor,
+                                           model_request): ...
+
+    async def model_recover_fenced_v1(self, request, handshake, grant, *, namespace,
+                                     holder, intent): ...
+
 
 class AuthorityClient:
     """Fail-closed enrollment client for the separately installed authority."""
@@ -286,6 +302,65 @@ class AuthorityClient:
             and grant.manifest_digest == self._v2_request.publisher_package.manifest_sha256
             and grant.channel_binding_sha256 == self._v2_handshake.channel_binding_sha256
         ) else None
+
+    async def _model_installation_context(self, bundle, grant: InstallationGrantV2):
+        """Recheck installed facts and package bytes before each passive model RPC."""
+        from .authority_profile import AdminInstallationBundle
+        if (type(bundle) is not AdminInstallationBundle
+                or type(grant) is not InstallationGrantV2
+                or self._transport is None
+                or self._v2_request is None or self._v2_handshake is None):
+            raise RuntimeError("authority model installation is unavailable")
+        policy = bundle.installation_policy
+        request = self._v2_request
+        handshake = self._v2_handshake
+        current = await asyncio.to_thread(self._build_request)
+        installed_profile = getattr(self._transport, "profile_for", None)
+        if (current != request or not handshake.valid_pairing()
+                or installed_profile is None
+                or installed_profile(request.profile_id) != bundle.tls_profile
+                or bundle.tls_profile.profile_id != request.profile_id
+                or bundle.tls_profile.expected_authority_id != grant.authority_id
+                or (policy.expected_authority_id, policy.installation_id,
+                    policy.manifest_digest, policy.administrator_holder) !=
+                   (grant.authority_id, grant.installation_id,
+                    grant.manifest_digest, grant.administrator_holder)
+                or grant.authority_id != handshake.installation_authority_id
+                or grant.subject != handshake.installation_identity_ref
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256
+                or grant.manifest_digest != request.publisher_package.manifest_sha256):
+            raise RuntimeError("authority model installation binding is invalid")
+        return request, handshake, policy
+
+    async def model_prepare_fenced_v1(
+        self, bundle, grant: InstallationGrantV2, *, draft: ModelEgressDraftV1,
+        expected_anchor: RestoreAnchor,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2]:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.model_prepare_fenced_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            holder=policy.administrator_holder, draft=draft,
+            expected_anchor=expected_anchor)
+
+    async def model_admit_dispatch_once_v1(
+        self, bundle, grant: InstallationGrantV2, *, intent: ModelEgressIntentV1,
+        expected_anchor: RestoreAnchor, model_request: ModelCallRequest,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2]:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if model_request.envelope.authority.namespace != policy.namespace:
+            raise RuntimeError("authority model namespace binding is invalid")
+        return await self._transport.model_admit_dispatch_once_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            holder=policy.administrator_holder, intent=intent,
+            expected_anchor=expected_anchor, model_request=model_request)
+
+    async def model_recover_fenced_v1(
+        self, bundle, grant: InstallationGrantV2, *, intent: ModelEgressIntentV1,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2]:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.model_recover_fenced_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            holder=policy.administrator_holder, intent=intent)
 
     async def capability_grant(self) -> AuthorityCapabilityGrant | None:
         """Return a complete runtime grant; enrollment-only facts remain blocked."""
