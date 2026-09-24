@@ -9410,9 +9410,14 @@ class GraphCoordinator:
                   or epoch.revision < saved[5]):
                 raise UnavailableGuard("D03 self projection graph receipt regressed")
             return replace(prior, status="duplicate")
-        observed, state = port.get_fence_operation(
-            namespace=namespace, authority_namespace=target.authority_namespace,
-            operation_id=intent[1])
+        try:
+            observed, state = port.get_fence_operation(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                operation_id=intent[1])
+        except Exception as exc:
+            raise UnavailableGuard(
+                "D03 self projection original fence cannot prove absence; HOLD") from exc
         if observed is None:
             return None
         if (state != "active" or (metadata.graph_revision, epoch.revision)
@@ -9851,9 +9856,14 @@ class GraphCoordinator:
             namespace=namespace, authority_namespace=target.authority_namespace)
         if not self._anchor_matches(target, anchor):
             raise UnavailableGuard("D04 baseline recovery anchor differs")
-        observed, state = port.get_fence_operation(
-            namespace=namespace, authority_namespace=target.authority_namespace,
-            operation_id=intent[1])
+        try:
+            observed, state = port.get_fence_operation(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                operation_id=intent[1])
+        except Exception as exc:
+            raise UnavailableGuard(
+                "D04 baseline original fence cannot prove absence; HOLD") from exc
         if issued:
             original_permit = from_wire(json.loads(saved[1]))
             if (observed != original_permit or state not in {"active", "finished"}

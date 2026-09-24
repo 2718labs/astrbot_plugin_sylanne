@@ -352,3 +352,65 @@ def test_d04_crashed_queued_read_recovers_before_retry(projection_case, monkeypa
     assert coordinator.commit_d04_encoding_baseline_v1(
         bootstrap, namespace, job_id, original_operation_id,
         policy, baseline_policy, clock).status == "committed"
+
+
+def test_d03_no_start_intent_keeps_unknown_fence_on_hold(
+        projection_case, monkeypatch):
+    case = projection_case
+    store, coordinator, *_ = case
+    port = coordinator._GraphCoordinator__content_fence_v2
+    begin = port.begin_fence
+    stopped = {"once": True}
+
+    def stop_before_write_begin(**kwargs):
+        if kwargs["operation"] == "write" and stopped["once"]:
+            stopped["once"] = False
+            raise RuntimeError("stopped before Authority begin")
+        return begin(**kwargs)
+
+    monkeypatch.setattr(port, "begin_fence", stop_before_write_begin)
+    with pytest.raises(RuntimeError, match="before Authority begin"):
+        _commit(case)
+    with pytest.raises(UnavailableGuard, match="cannot prove absence; HOLD"):
+        _commit(case)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_d03_self_projection_intents_v1"
+    ).fetchone() == (1,)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_bundle_operations "
+        "WHERE operation_id LIKE 'd03-self-projection-%'"
+    ).fetchone() == (0,)
+
+
+def test_d04_no_start_intent_keeps_unknown_fence_on_hold(
+        projection_case, monkeypatch):
+    case = projection_case
+    store, coordinator, bootstrap, namespace, job_id, original_operation_id, policy, _, clock, _ = case
+    _commit(case)
+    baseline_policy = AdminD04EncodingBaselinePolicy(
+        30.0, {"cpu_ms": 2}, "baseline-snapshot", "baseline-resource")
+    port = coordinator._GraphCoordinator__content_fence_v2
+    begin = port.begin_fence
+    stopped = {"once": True}
+
+    def stop_before_write_begin(**kwargs):
+        if kwargs["operation"] == "write" and stopped["once"]:
+            stopped["once"] = False
+            raise RuntimeError("stopped before Authority begin")
+        return begin(**kwargs)
+
+    monkeypatch.setattr(port, "begin_fence", stop_before_write_begin)
+    with pytest.raises(RuntimeError, match="before Authority begin"):
+        coordinator.commit_d04_encoding_baseline_v1(
+            bootstrap, namespace, job_id, original_operation_id,
+            policy, baseline_policy, clock)
+    with pytest.raises(UnavailableGuard, match="cannot prove absence; HOLD"):
+        coordinator.commit_d04_encoding_baseline_v1(
+            bootstrap, namespace, job_id, original_operation_id,
+            policy, baseline_policy, clock)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_d04_baseline_intents_v1"
+    ).fetchone() == (1,)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_atoms WHERE type_name='d04.encoding_baseline.v1'"
+    ).fetchone() == (0,)
