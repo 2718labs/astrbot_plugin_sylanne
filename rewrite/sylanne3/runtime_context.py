@@ -21,7 +21,8 @@ from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
 from .host.authority_profile import (
-    AdminIngressClockPolicy, AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    AdminD03ArrivalPolicy, AdminIngressClockPolicy, AdminIngressEncodingPolicy,
+    AdminIngressModelPolicy,
 )
 from .host.v2_ingress_adapter import ingress_host_facts
 from .host.installed_package import verify_installed_package
@@ -315,10 +316,18 @@ class RuntimeContext:
                 if (type(installation.ingress_clock) is AdminIngressClockPolicy
                         and type(installation.ingress_encoding) is AdminIngressEncodingPolicy):
                     def ingress(graph, host):
-                        return graph.commit_first_ingress_v2(
+                        first = graph.commit_first_ingress_v2(
                             bootstrap, host, policy,
                             installation.ingress_clock, installation.ingress_encoding,
                         )
+                        if (first.status in {"committed", "duplicate"}
+                                and type(installation.d03_arrival) is AdminD03ArrivalPolicy):
+                            return graph.commit_d03_message_arrival_v2(
+                                bootstrap, host.namespace, host.lineage.source_ref,
+                                policy, installation.d03_arrival,
+                                installation.ingress_clock,
+                            )
+                        return first
                 owner_runtime = (
                     coordinator, bootstrap, port, policy, current_actor
                     if current_binding_available else None

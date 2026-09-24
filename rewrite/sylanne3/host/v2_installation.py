@@ -14,7 +14,8 @@ from .authority_client import (
     AuthoritySelection, PublisherPackageIdentity,
 )
 from .authority_profile import (
-    AdminIngressClockPolicy, AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    AdminD03ArrivalPolicy, AdminIngressClockPolicy, AdminIngressEncodingPolicy,
+    AdminIngressModelPolicy,
     AdminInstallationBundle,
     load_admin_installation_bundle,
 )
@@ -40,6 +41,7 @@ class V2InstallationAssembly:
     workbench_origin: str | None = None
     ingress_model: AdminIngressModelPolicy | None = None
     admin_bundle: AdminInstallationBundle | None = None
+    d03_arrival: AdminD03ArrivalPolicy | None = None
 
 
 async def assemble_v2_installation(
@@ -119,6 +121,7 @@ async def assemble_v2_installation(
         bundle.ingress_encoding, bundle.workbench_origin,
         getattr(bundle, "ingress_model", None),
         bundle,
+        bundle.d03_arrival,
     )
 
 

@@ -23,7 +23,9 @@ from sylanne3.domains.d03.context import RoleBinding
 from sylanne3.graph_coordinator import (
     FirstIngressOutcomeUnknown, IngressHostFacts, ingress_host_fingerprint,
 )
-from sylanne3.host.authority_profile import AdminIngressClockPolicy, AdminIngressEncodingPolicy
+from sylanne3.host.authority_profile import (
+    AdminD03ArrivalPolicy, AdminIngressClockPolicy, AdminIngressEncodingPolicy,
+)
 from sylanne3.host.ingress import HostIngressEnvelope, IngressReceipt, SourceLineage
 from sylanne3.host.installed_package import InstalledPackageVerification
 from sylanne3.host.v2_installation import V2InstallationAssembly
@@ -36,7 +38,7 @@ if installed_stub:
     del sys.modules["sylanne3.host"]
 
 
-def assembly(root, grant, port_factory, *, clock, encoding):
+def assembly(root, grant, port_factory, *, clock, encoding, arrival=None):
     namespace = NamespaceId("bot", "persona")
     lease = BudgetLease(
         "root-lease", None, *namespace.as_tuple, "USD",
@@ -44,7 +46,9 @@ def assembly(root, grant, port_factory, *, clock, encoding):
     )
     root_grant = BudgetLeaseGrant(
         "root-grant", 1, *namespace.as_tuple, lease.lease_id,
-        "USD", {"cpu_ms": 100}, ("encode",), time.time() + 3600, "d11-policy",
+        "USD", {"cpu_ms": 100},
+        ("encode", "d03.message_received") if arrival is not None else ("encode",),
+        time.time() + 3600, "d11-policy",
     )
     policy = AdminInstallationPolicy(
         namespace, "opaque:persona", grant.installation_id, grant.manifest_digest,
@@ -54,6 +58,7 @@ def assembly(root, grant, port_factory, *, clock, encoding):
     return V2InstallationAssembly(
         policy, grant, b"k" * 32, b"d" * 32, port_factory,
         root, root / "data", frozenset({"avx2"}), clock, encoding,
+        d03_arrival=arrival,
     )
 
 
@@ -77,9 +82,13 @@ async def test_v2_ingress_uses_installed_path_while_global_health_stays_limited(
     encoding = AdminIngressEncodingPolicy(
         30, {"cpu_ms": 100}, "snapshot", "resource", "interval",
     )
+    arrival = AdminD03ArrivalPolicy(
+        30, {"cpu_ms": 10}, "snapshot", "resource",
+    )
     trace = []
     admitted = False
     committed = False
+    arrived = False
 
     class Store:
         def __init__(self, *_):
@@ -119,6 +128,21 @@ async def test_v2_ingress_uses_installed_path_while_global_health_stays_limited(
             committed = True
             return SimpleNamespace(status=status, operation_id="ingress-op")
 
+        def commit_d03_message_arrival_v2(self, bootstrap, namespace, source_ref,
+                                          policy, arrival_policy, clock_policy):
+            nonlocal arrived
+            assert bootstrap is self.bootstrap
+            assert namespace == installed.installation_policy.namespace
+            assert source_ref == "a" * 64
+            assert policy is installed.installation_policy
+            assert arrival_policy is arrival
+            assert clock_policy is clock
+            assert get_ident() == self.worker_thread
+            trace.append(("arrival", source_ref))
+            status = "duplicate" if arrived else "committed"
+            arrived = True
+            return SimpleNamespace(status=status, operation_id="arrival-op")
+
         def read_active_role_v2(self, *, namespace):
             assert namespace == installed.installation_policy.namespace
             assert get_ident() == self.worker_thread
@@ -147,7 +171,9 @@ async def test_v2_ingress_uses_installed_path_while_global_health_stays_limited(
             True, "verified", digest, "3.0.0-alpha1", "formal-alpha1",
         ),
     )
-    installed = assembly(tmp_path, grant, Port, clock=clock, encoding=encoding)
+    installed = assembly(
+        tmp_path, grant, Port, clock=clock, encoding=encoding, arrival=arrival,
+    )
     context = runtime_context.RuntimeContext(
         installed.data_dir, package_root=tmp_path, dependencies=None,
         domains=SimpleNamespace(complete=True, registrations={}, type_registry=object()),
@@ -171,9 +197,11 @@ async def test_v2_ingress_uses_installed_path_while_global_health_stays_limited(
     admitted = True
     first = await context.handle_ingress(envelope(installed.installation_policy.namespace))
     second = await context.handle_ingress(envelope(installed.installation_policy.namespace))
-    assert first == IngressReceipt("accepted", "ingress-op")
-    assert second == IngressReceipt("duplicate", "ingress-op")
-    ingress_calls = [item for item in trace if isinstance(item, tuple)]
+    assert first == IngressReceipt("accepted", "arrival-op")
+    assert second == IngressReceipt("duplicate", "arrival-op")
+    assert trace.count(("arrival", "a" * 64)) == 2
+    ingress_calls = [item for item in trace if isinstance(item, tuple)
+                     and type(item[0]) is IngressHostFacts]
     assert len(ingress_calls) == 3
     assert ingress_calls[1] == ingress_calls[2]
     assert context.health.status == "limited"
