@@ -16,6 +16,8 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+from typing import Iterable
+import unicodedata
 import zipfile
 
 
@@ -287,13 +289,30 @@ def _verify_native_target(content: bytes, target_os: str, target_arch: str) -> N
 
 
 def _validate_member_path(path: str) -> None:
-    if not path or "\x00" in path or "\\" in path or path.startswith("/"):
+    if (not path or any(ord(character) < 32 or ord(character) == 127 for character in path)
+            or "\\" in path or path.startswith("/")):
         raise ValueError(f"dangerous ZIP member path: {path!r}")
     parts = path.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError(f"dangerous ZIP member path: {path!r}")
-    if ":" in parts[0] or str(PurePosixPath(path)) != path:
+    reserved = {"con", "prn", "aux", "nul", *(f"com{number}" for number in range(1, 10)),
+                *(f"lpt{number}" for number in range(1, 10))}
+    if (any(any(character in ':<>"|?*' for character in part)
+            or part.endswith((".", " "))
+            or part.split(".", 1)[0].casefold() in reserved for part in parts)
+            or str(PurePosixPath(path)) != path):
         raise ValueError(f"dangerous ZIP member path: {path!r}")
+
+
+def _validate_portable_member_set(paths: Iterable[str]) -> None:
+    """Reject paths that collide on case or Unicode-normalizing filesystems."""
+    seen: dict[str, str] = {}
+    for path in paths:
+        _validate_member_path(path)
+        key = unicodedata.normalize("NFD", path.casefold())
+        previous = seen.setdefault(key, path)
+        if previous != path:
+            raise ValueError(f"ZIP member paths collide across platforms: {previous!r}, {path!r}")
 
 
 def _run_git(project_root: Path, *args: str) -> str:
@@ -651,6 +670,7 @@ def build_package(
         + "\n"
     ).encode("utf-8")
     payload[MANIFEST_PATH] = manifest_bytes
+    _validate_portable_member_set(payload)
 
     destination.mkdir(parents=True, exist_ok=True)
     platform_suffix = f"{target_os}-{target_arch}"
@@ -687,8 +707,7 @@ def verify_package(package: Path | str) -> None:
             names = [info.filename for info in infos]
             if len(names) != len(set(names)):
                 raise ValueError("ZIP contains duplicate member paths")
-            for name in names:
-                _validate_member_path(name)
+            _validate_portable_member_set(names)
             bad_crc = archive.testzip()
             if bad_crc is not None:
                 raise ValueError(f"ZIP CRC check failed for {bad_crc}")
