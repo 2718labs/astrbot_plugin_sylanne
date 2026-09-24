@@ -21,10 +21,11 @@ from sylanne3.host.authority_profile import (
     AdminIngressClockPolicy, AdminIngressEncodingPolicy,
 )
 from sylanne3.runtime.budget import BudgetLease, create_budget_lease, get_budget_lease
+from sylanne3.runtime.issuers import ResourceQuote
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, DependencySet, DomainBundle, DomainProposal,
     NamespaceId, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA,
-    SourceQualification, VersionGuard, canonical_digest,
+    SourceQualification, VersionGuard, VersionedRef, canonical_digest,
 )
 
 from test_dispatch_admission_preflight import _candidates
@@ -82,7 +83,7 @@ def _coordinator(store, providers):
 
 
 def _bundle(coordinator, authority, lease, providers, *, tamper=False,
-            source_id="source-1", budget_ref="parent"):
+            source_id="source-1", budget_ref="parent", quote_id=None):
     namespace = authority.namespace
     source = source_key("bot", "persona", source_id)
     access = access_key("bot", "persona", source_id)
@@ -117,7 +118,8 @@ def _bundle(coordinator, authority, lease, providers, *, tamper=False,
         snapshot.versions, (QueryEpoch(namespace, "all", snapshot.epochs[0].revision),),
         access_epoch, delete_epoch,
         coordinator._GraphCoordinator__store._registry.catalogue_hash,
-        "scheme-1", "operator-1", "policy-1", (), (), (),
+        "scheme-1", "operator-1", "policy-1", (), (),
+        (VersionedRef(quote_id, 1),) if quote_id is not None else (),
     )
     envelope = CommandEnvelope(
         RUNTIME_SCHEMA, identity, authority, guard,
@@ -259,7 +261,6 @@ def test_v2_fenced_candidate_commit_and_cold_recovery(tmp_path):
     d11.admit_runtime = lambda _bundle, db, **_kwargs: RuntimeAdmission(
         BudgetAdmission("lease-persona", get_budget_lease(db, "lease-persona").version,
                         {"cpu_ms": 1}))
-    d02.authorize_resources = lambda _bundle, _db, **_kwargs: True
     lease, capability = coordinator.grant(
         bootstrap, actor="host", issuer_domain="d06", namespace=policy.namespace,
         domains=("d06", "d08", "d09"), activation_generation=1,
@@ -269,8 +270,26 @@ def test_v2_fenced_candidate_commit_and_cold_recovery(tmp_path):
         "host", "d06", capability, policy.namespace, ("event", "activity"),
         "context", ("conversation",), "policy-1", 1,
     )
+    quote_id = "quote-dispatch-candidate"
     bundle = _bundle(coordinator, authority, lease, providers,
-                     source_id=source_row[0], budget_ref="lease-persona")
+                     source_id=source_row[0], budget_ref="lease-persona",
+                     quote_id=quote_id)
+    envelope = bundle.envelope
+    with store._lock:
+        store._db.execute(
+            "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+            "VALUES(?,?,?,?,?)",
+            namespace.as_tuple + ("resource_lease", quote_id, "1"),
+        )
+        d02.issue_quote(store._db, ResourceQuote(
+            quote_id, 1, namespace.bot_id, namespace.persona_id,
+            envelope.identity.activity_id, envelope.identity.operation_id,
+            envelope.identity.effect_id, envelope.parent_budget_lease_ref,
+            "dispatch.candidate", "snapshot-dispatch-candidate",
+            envelope.deadline_utc, "resource-dispatch-candidate", None, (), (),
+            {"cpu_ms": 1}, envelope.authority.worker_fence,
+            envelope.deadline_utc + 100.0,
+        ))
     try:
         assert coordinator.commit_domain_bundle(bundle, lease).status == "committed"
         assert coordinator.commit_domain_bundle(bundle, lease).status == "duplicate"
