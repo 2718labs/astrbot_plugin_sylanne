@@ -15,6 +15,7 @@ from .scene_applicability import (
     SceneIngressScopeV1,
     check_current_scene_applicability,
 )
+from .message_arrival import MessageArrivalCandidate, build_message_arrival_candidate
 
 __all__ = (
     "AccountBinding",
@@ -27,5 +28,7 @@ __all__ = (
     "SceneBindingApplicabilityV1",
     "SceneIngressScopeV1",
     "WorldEvent",
+    "MessageArrivalCandidate",
+    "build_message_arrival_candidate",
     "check_current_scene_applicability",
 )
