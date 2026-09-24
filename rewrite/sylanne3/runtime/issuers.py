@@ -1388,6 +1388,61 @@ class D02ResourceIssuer:
         )
         return signature
 
+    def issue_c02_unknown_outcome(
+            self, db, plan, original_intent, read, verified_completion) -> str:
+        """Sign a local C02 completion with unknown use after Authority reconciliation.
+
+        The installed coordinator supplies its verified finished-fence receipt;
+        the local C02 verifier joins that receipt to the signed quote, committed
+        graph, completed job, and original D11 reservation. This is never a
+        provider usage measurement.
+        """
+        from .c02_cost_settlement import (
+            C02UnknownCostPlanV1, prepare_c02_unknown_cost_plan,
+        )
+
+        if type(plan) is not C02UnknownCostPlanV1 or not db.in_transaction:
+            raise IssuerAuthorityDenied("caller-owned C02 accounting transaction required")
+        current = prepare_c02_unknown_cost_plan(
+            db, self, plan.namespace, original_intent, read, verified_completion)
+        if current != plan or plan.outcome.actual is not None:
+            raise IssuerAuthorityDenied("C02 completion proof differs")
+        outcome = plan.outcome
+        payload = canonical_serialize(_payload(outcome))
+        signature = self._signer.sign("resource-outcome.v1", payload)
+        _insert_signed(
+            db, "runtime_resource_outcomes",
+            ("quote_id", "operation_id", "version"),
+            (outcome.quote_id, outcome.operation_id, outcome.version),
+            "outcome_json", payload, signature,
+        )
+        return signature
+
+    def original_c02_unknown_outcome(
+            self, db, quote: ResourceQuote) -> ResourceOutcome:
+        """Read the signed historical local completion, without granting work."""
+        if type(quote) is not ResourceQuote or quote.work_kind != D06_FIRST_INGRESS_C02_WORK_KIND:
+            raise IssuerAuthorityDenied("original C02 quote required")
+        row = db.execute(
+            "SELECT outcome_json,signature FROM runtime_resource_outcomes "
+            "WHERE quote_id=? AND operation_id=? AND version=1",
+            (quote.quote_id, quote.operation_id),
+        ).fetchone()
+        if row is None:
+            raise IssuerAuthorityDenied("C02 completion outcome is absent")
+        self._signer.verify("resource-outcome.v1", row[0], row[1])
+        outcome = _decode_outcome(row[0])
+        if ((outcome.bot_id, outcome.persona_id, outcome.activity_id,
+             outcome.operation_id, outcome.quote_id) != (
+             quote.bot_id, quote.persona_id, quote.activity_id,
+             quote.operation_id, quote.quote_id)
+                or outcome.actual is not None
+                or outcome.execution_revoked is not True
+                or outcome.provider_receipt_ref != (
+                    "local-c02-finished-fence:" + quote.operation_id)):
+            raise IssuerAuthorityDenied("C02 unknown completion outcome differs")
+        return outcome
+
     def _load_quote(self, db, quote_id: str,
                     version: int | None) -> ResourceQuote:
         if version is None:

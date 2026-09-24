@@ -729,6 +729,17 @@ class GraphCoordinator:
                         state TEXT NOT NULL CHECK(state IN ('open','closed','committed')),
                         PRIMARY KEY(bot, persona, call_id), UNIQUE(attempt_id))
                 """)
+        with store._lock:
+            store._db.execute("""
+                CREATE TABLE IF NOT EXISTS graph_c02_cost_attempts_v1 (
+                    bot TEXT NOT NULL, persona TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    intent_digest TEXT NOT NULL,
+                    completion_digest TEXT NOT NULL,
+                    attempt_id TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('open','closed','committed')),
+                    PRIMARY KEY(bot,persona,operation_id), UNIQUE(attempt_id))
+            """)
         # Installed by trusted host composition only.  A missing issuer leaves
         # D08/D09 candidates in HOLD; caller receipt strings are never enough.
         self.__dispatch_admission_issuer = dispatch_admission_issuer
@@ -10715,6 +10726,256 @@ class GraphCoordinator:
         finally:
             self.release_authority_lease(bootstrap, lease)
 
+    def first_ingress_c02_accounting_installed_v1(self) -> bool:
+        """Whether the mandatory C02 unknown-cost continuation has its ports."""
+        return (isinstance(self.__store, ProductionGraphStore)
+                and self.__content_fence_v2 is not None
+                and self.__worker_result_fact_port is not None
+                and self.__model_terminal_cost_port is not None
+                and self.__accounting_maintenance_port is not None
+                and callable(getattr(self.__d02_issuer,
+                                     "issue_c02_unknown_outcome", None))
+                and callable(getattr(self.__d02_issuer,
+                                     "original_c02_unknown_outcome", None))
+                and self.__d11_issuer is not None)
+
+    def _commit_first_ingress_c02_unknown_cost_v1(
+        self, namespace: NamespaceId, original_intent, read, verified_completion,
+    ) -> None:
+        """Move completed local C02's entire upper bound to unconfirmed once."""
+        from .authority_service.v2_accounting_contract import (
+            AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
+        )
+        from .runtime.c02_cost_settlement import (
+            apply_c02_unknown_budget_in_transaction,
+            prepare_c02_unknown_cost_plan,
+        )
+        from .runtime.d11_types import validate_d11_writes
+        from .runtime.model_cost_settlement import read_original_model_cost
+
+        if not self.first_ingress_c02_accounting_installed_v1():
+            raise UnavailableGuard("C02 local accounting authority unavailable; HOLD")
+        store = self.__store
+        port = self.__accounting_maintenance_port
+        operation_id = read.request.consumer_operation_id
+        intent_digest = canonical_digest(asdict(original_intent))
+        completion_digest = canonical_digest(asdict(verified_completion))
+
+        def prior_locked(db):
+            row = db.execute(
+                "SELECT digest,activity_id,receipt_json FROM graph_bundle_operations "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (cost_operation_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            data = json.loads(row[2])
+            cost_ref = data.get("cost_ref")
+            self.__d02_issuer.original_c02_unknown_outcome(db, quote)
+            if (data.get("original_operation_id") != operation_id
+                    or data.get("original_intent_digest") != intent_digest
+                    or data.get("completion_digest") != completion_digest
+                    or db.execute(
+                        "SELECT 1 FROM graph_events WHERE bot=? AND persona=? "
+                        "AND session=? AND event_id=?",
+                        namespace.as_tuple + (row[1], cost_operation_id),
+                    ).fetchone() is None
+                    or db.execute(
+                        "SELECT 1 FROM graph_atoms WHERE token=? AND valid=1",
+                        (cost_ref,),
+                    ).fetchone() is None
+                    or db.execute(
+                        "SELECT 1 FROM runtime_budget_operations WHERE bot_id=? "
+                        "AND persona_id=? AND operation_id=? AND phase='settle'",
+                        namespace.as_tuple + (operation_id,),
+                    ).fetchone() is None):
+                raise UnavailableGuard("C02 cost receipt is incomplete or differs")
+            return True
+
+        with store._lock:
+            db = store._db
+            # The operation ID is stable even if accounting needs a new fence attempt.
+            from .runtime.issuers import d06_first_ingress_c02_quote_id
+            quote = self.__d02_issuer.original_signed_quote(
+                db, d06_first_ingress_c02_quote_id(namespace, operation_id), 1)
+            cost_operation_id = "c02-cost-" + canonical_digest({
+                "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+            })[:48]
+            committed = prior_locked(db)
+            metadata, _ = self._v2_graph_stamp(namespace)
+            attempt = db.execute(
+                "SELECT intent_digest,completion_digest,attempt_id,anchor_json,state "
+                "FROM graph_c02_cost_attempts_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+        if committed:
+            if (attempt is None or attempt[:2] != (
+                    intent_digest, completion_digest) or attempt[4] != "committed"):
+                raise UnavailableGuard("C02 cost lacks its original fence attempt")
+            from .runtime.restore_anchor import RestoreAnchor
+            port.recover_finish(AccountingMaintenanceRequestV1(
+                attempt[2], original_intent, RestoreAnchor(**json.loads(attempt[3]))))
+            return
+        if attempt is not None and attempt[4] == "open":
+            if attempt[:2] != (intent_digest, completion_digest):
+                raise EventConflict("C02 accounting identity reused with different proof")
+            from .runtime.restore_anchor import RestoreAnchor
+            old = AccountingMaintenanceRequestV1(
+                attempt[2], original_intent, RestoreAnchor(**json.loads(attempt[3])))
+            try:
+                port.recover_finish(old)
+            except Exception:
+                grant = port.begin(old)
+                port.finish(old, grant)
+            with store._lock:
+                if prior_locked(store._db):
+                    raise UnavailableGuard("C02 cost committed during recovery; retry")
+                store._db.execute(
+                    "UPDATE graph_c02_cost_attempts_v1 SET state='closed' "
+                    "WHERE bot=? AND persona=? AND operation_id=? AND attempt_id=? "
+                    "AND state='open'", namespace.as_tuple + (operation_id, attempt[2]))
+        target = metadata.requirements
+        if (original_intent.authority_id != target.authority_id
+                or original_intent.namespace != target.authority_namespace):
+            raise UnavailableGuard("C02 accounting Authority differs")
+        # Network reads and Authority begin/finish stay outside GraphStore's lock.
+        original_model_fact = read_original_model_cost(
+            self.__model_terminal_cost_port, original_intent)
+        if original_model_fact.recovery.state != "observed":
+            raise UnavailableGuard("C02 original model terminal is unavailable")
+        anchor = self.__content_fence_v2.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._accounting_anchor_covers(target, anchor):
+            raise UnavailableGuard("C02 accounting anchor differs")
+        attempt_id = "c02-cost-fence-" + secrets.token_hex(24)
+        request = AccountingMaintenanceRequestV1(attempt_id, original_intent, anchor)
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if prior_locked(db) or self._v2_graph_stamp(namespace)[0] != metadata:
+                    raise StaleRead("C02 cost graph changed before fence")
+                db.execute(
+                    "INSERT INTO graph_c02_cost_attempts_v1"
+                    "(bot,persona,operation_id,intent_digest,completion_digest,"
+                    "attempt_id,anchor_json,state) VALUES(?,?,?,?,?,?,?,'open') "
+                    "ON CONFLICT(bot,persona,operation_id) DO UPDATE SET "
+                    "intent_digest=excluded.intent_digest,"
+                    "completion_digest=excluded.completion_digest,"
+                    "attempt_id=excluded.attempt_id,anchor_json=excluded.anchor_json,"
+                    "state='open'",
+                    namespace.as_tuple + (operation_id, intent_digest,
+                    completion_digest, attempt_id, canonical_json(asdict(anchor))),
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        grant = port.begin(request)
+        terminal_digest = canonical_digest(asdict(original_model_fact.receipt))
+        if (type(grant) is not AccountingMaintenanceGrantV1
+                or grant.call_id != original_intent.call_id
+                or grant.admission_id != original_model_fact.admission.admission_id
+                or grant.observation_digest != original_model_fact.recovery.observation_digest
+                or grant.terminal_receipt_digest != terminal_digest
+                or grant.permit.operation_id != attempt_id
+                or grant.permit.pinned_anchor != anchor):
+            raise UnavailableGuard("C02 accounting grant differs")
+        port.validate(request, grant)
+        try:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    current, epoch = self._v2_graph_stamp(namespace)
+                    if (current != metadata or prior_locked(db)
+                            or not self._accounting_anchor_covers(
+                                current.requirements, anchor)):
+                        raise StaleRead("C02 cost graph changed")
+                    plan = prepare_c02_unknown_cost_plan(
+                        db, self.__d02_issuer, namespace, original_intent,
+                        read, verified_completion)
+                    if plan.bundle_operation_id != cost_operation_id or plan.quote != quote:
+                        raise EventConflict("C02 accounting plan differs")
+                    application = apply_c02_unknown_budget_in_transaction(
+                        db, self.__d02_issuer, plan, original_intent,
+                        read, verified_completion)
+                    write = application.cost_write
+                    if not validate_d11_writes(
+                            (write,), namespace, operation_id=cost_operation_id,
+                            activity_id=quote.activity_id, effect_id=quote.effect_id):
+                        raise UnavailableGuard("C02 cost graph write is invalid")
+                    reconcile_runtime_write(db, write)
+                    bundle_digest = canonical_digest({
+                        "operation_id": cost_operation_id,
+                        "write": asdict(write),
+                        "completion_digest": completion_digest,
+                    })
+                    event = Event(Scope(*namespace.as_tuple, quote.activity_id),
+                                  cost_operation_id, time.time(), "domain_bundle",
+                                  {"bundle_digest": bundle_digest})
+                    candidate = GraphCandidate(
+                        event, (GraphVersion(write.key, 0),), (write,), (epoch,))
+                    graph_receipt = GraphStore._graph_commit_in_transaction(
+                        store, candidate, _capability=self.__graph_capability)
+                    if graph_receipt.status != "committed":
+                        raise EventConflict("C02 cost graph event already exists")
+                    replacement = replace(
+                        current.requirements,
+                        deletion_seq=anchor.deletion_seq,
+                        deletion_digest=anchor.deletion_digest,
+                        execution_seq=anchor.execution_seq,
+                        execution_digest=anchor.execution_digest,
+                        revocation_epoch=anchor.revocation_epoch)
+                    store.cas_graph_recovery_metadata(
+                        current, replacement, _capability=self.__graph_capability)
+                    seq_row = db.execute(
+                        "SELECT last_seq FROM graph_bundle_sequence WHERE bot=? "
+                        "AND persona=?", namespace.as_tuple).fetchone()
+                    seq = (seq_row[0] if seq_row else 0) + 1
+                    db.execute(
+                        "INSERT INTO graph_bundle_sequence(bot,persona,last_seq) "
+                        "VALUES(?,?,?) ON CONFLICT(bot,persona) DO UPDATE SET "
+                        "last_seq=excluded.last_seq", namespace.as_tuple + (seq,))
+                    db.execute(
+                        "INSERT INTO graph_bundle_operations"
+                        "(bot,persona,operation_id,digest,activity_id,effect_id,"
+                        "commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (cost_operation_id, bundle_digest,
+                        quote.activity_id, quote.effect_id, seq, canonical_json({
+                            "original_operation_id": operation_id,
+                            "original_intent_digest": intent_digest,
+                            "completion_digest": completion_digest,
+                            "cost_ref": write.key.token,
+                            "budget_receipt_digest": canonical_digest(
+                                asdict(application.receipt)),
+                        })),
+                    )
+                    db.execute(
+                        "UPDATE graph_c02_cost_attempts_v1 SET state='committed' "
+                        "WHERE bot=? AND persona=? AND operation_id=? "
+                        "AND attempt_id=?", namespace.as_tuple +
+                        (operation_id, attempt_id))
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+        except BaseException:
+            with store._lock:
+                committed = prior_locked(store._db)
+            if committed:
+                port.recover_finish(request)
+                return
+            port.finish(request, grant)
+            with store._lock:
+                store._db.execute(
+                    "UPDATE graph_c02_cost_attempts_v1 SET state='closed' "
+                    "WHERE bot=? AND persona=? AND operation_id=? "
+                    "AND attempt_id=? AND state='open'",
+                    namespace.as_tuple + (operation_id, attempt_id))
+            raise
+        port.finish(request, grant)
+
     def commit_first_ingress_c02_v1(
         self, bootstrap: object, original_intent, read, installation_policy,
         admin_policy, clock_policy,
@@ -10755,7 +11016,8 @@ class GraphCoordinator:
                 or not isinstance(self.__store, ProductionGraphStore)
                 or self.__content_fence_v2 is None
                 or self.__worker_result_fact_port is None
-                or self.__d11_issuer is None):
+                or self.__d11_issuer is None
+                or not self.first_ingress_c02_accounting_installed_v1()):
             raise UnavailableGuard("installed first-ingress C02 authorities required; HOLD")
         read.require_original_intent(original_intent)
         request = read.request
@@ -10765,6 +11027,8 @@ class GraphCoordinator:
         duplicate = self._first_ingress_c02_duplicate_v1(
             namespace, request.consumer_operation_id, original_intent, read)
         if duplicate is not None:
+            self._commit_first_ingress_c02_unknown_cost_v1(
+                namespace, original_intent, read, duplicate)
             return duplicate
         try:
             reading = self.__content_fence_v2.read_ingress_clock(clock_policy)
@@ -10940,10 +11204,17 @@ class GraphCoordinator:
                 DependencySet(), (), ())
             bundle = DomainBundle(envelope, (held.proposal, job_proposal), (), (), (),
                                   (), (), (), ())
-            return self._commit_domain_bundle_v2(
+            receipt = self._commit_domain_bundle_v2(
                 bundle, lease, c02_adoption=(
                     original_intent, read, binding, held, installation_policy,
                     admin_policy, now))
+            verified = self._first_ingress_c02_duplicate_v1(
+                namespace, operation_id, original_intent, read)
+            if verified is None:
+                raise UnavailableGuard("C02 content receipt missing before cost accounting")
+            self._commit_first_ingress_c02_unknown_cost_v1(
+                namespace, original_intent, read, verified)
+            return receipt
         finally:
             self.release_authority_lease(bootstrap, lease)
 
