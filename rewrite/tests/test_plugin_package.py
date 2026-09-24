@@ -101,9 +101,25 @@ class PluginPackageTests(unittest.TestCase):
         _run_git(self.project, "commit", "--quiet", "-m", "fixture")
         self.builder = _load_builder()
 
-    def _native(self, name: str = "sylanne3_kernel.dll") -> Path:
+    def _native(self, name: str = "sylanne3_kernel.dll", *, arch: str = "aarch64") -> Path:
         path = self.base / name
-        path.write_bytes(b"native-binary")
+        # Header-only fixtures exercise target binding; they are not loadable libraries.
+        if name == "sylanne3_kernel.dll":
+            content = bytearray(134)
+            content[:2] = b"MZ"
+            content[0x3c:0x40] = (128).to_bytes(4, "little")
+            content[128:134] = b"PE\0\0\x64\x86"
+        elif name == "libsylanne3_kernel.so":
+            content = bytearray(20)
+            content[:6] = b"\x7fELF\x02\x01"
+            content[18:20] = (183 if arch == "aarch64" else 62).to_bytes(2, "little")
+        elif name == "libsylanne3_kernel.dylib":
+            content = bytearray(8)
+            content[:4] = b"\xcf\xfa\xed\xfe"
+            content[4:8] = (0x0100000c if arch == "aarch64" else 0x01000007).to_bytes(4, "little")
+        else:
+            content = b"native-binary"
+        path.write_bytes(content)
         return path
 
     def _add_formal_assets(self) -> None:
@@ -386,6 +402,61 @@ class PluginPackageTests(unittest.TestCase):
             paths,
         )
 
+    def test_formal_native_header_matches_each_target(self) -> None:
+        targets = (
+            ("windows", "x86_64", "sylanne3_kernel.dll"),
+            ("linux", "x86_64", "libsylanne3_kernel.so"),
+            ("linux", "aarch64", "libsylanne3_kernel.so"),
+            ("macos", "x86_64", "libsylanne3_kernel.dylib"),
+            ("macos", "aarch64", "libsylanne3_kernel.dylib"),
+        )
+        for target_os, arch, filename in targets:
+            with self.subTest(target=f"{target_os}-{arch}"):
+                content = self._native(filename, arch=arch).read_bytes()
+                self.builder._verify_native_target(content, target_os, arch)
+                with self.assertRaisesRegex(ValueError, "native binary header"):
+                    self.builder._verify_native_target(b"native-binary", target_os, arch)
+                wrong_arch = "aarch64" if arch == "x86_64" else "x86_64"
+                if wrong_arch in self.builder.TARGET_MATRIX[target_os]:
+                    with self.assertRaisesRegex(ValueError, "native binary header"):
+                        self.builder._verify_native_target(content, target_os, wrong_arch)
+
+    def test_formal_build_rejects_native_header_with_wrong_architecture(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        with self.assertRaisesRegex(ValueError, "native binary header"):
+            self.builder.build_package(
+                project_root=self.project, target_os="linux", target_arch="x86_64",
+                target_libc="glibc", native_library=self._native("libsylanne3_kernel.so"),
+                output_dir=self.base / "wrong-native-arch",
+            )
+
+    def test_formal_verifier_rejects_rehashed_wrong_native_architecture(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        package = self.builder.build_package(
+            project_root=self.project, target_os="linux", target_arch="aarch64",
+            target_libc="glibc", native_library=self._native("libsylanne3_kernel.so"),
+            output_dir=self.base / "correct-native",
+        )
+        with zipfile.ZipFile(package) as source:
+            members = {name: source.read(name) for name in source.namelist()}
+        native_path = "rewrite/sylanne3/_native/linux-aarch64/libsylanne3_kernel.so"
+        wrong = self._native("libsylanne3_kernel.so", arch="x86_64").read_bytes()
+        members[native_path] = wrong
+        manifest = json.loads(members["release-manifest.json"])
+        entry = next(item for item in manifest["files"] if item["path"] == native_path)
+        entry["sha256"] = hashlib.sha256(wrong).hexdigest()
+        entry["bytes"] = len(wrong)
+        manifest["native"] = dict(entry)
+        members["release-manifest.json"] = json.dumps(manifest).encode()
+        forged = self.base / "rehashed-wrong-native.zip"
+        with zipfile.ZipFile(forged, "w") as archive:
+            for name, content in members.items():
+                archive.writestr(name, content)
+        with self.assertRaisesRegex(ValueError, "native binary header"):
+            self.builder.verify_package(forged)
+
     def test_verifier_rejects_duplicate_and_dangerous_members(self) -> None:
         duplicate = self.base / "duplicate.zip"
         with warnings.catch_warnings():
@@ -574,7 +645,7 @@ class PluginPackageTests(unittest.TestCase):
         ]
         package = self.builder.build_package(
             project_root=self.project, target_os=os_name, target_arch=arch,
-            native_library=self._native(self.builder.TARGETS[os_name]),
+            native_library=self._native(self.builder.TARGETS[os_name], arch=arch),
             output_dir=self.base / "local-formal",
             target_libc=platform.libc_ver()[0] if os_name == "linux" else None,
         )
@@ -592,7 +663,7 @@ class PluginPackageTests(unittest.TestCase):
 
         probe = self.builder.build_package(
             project_root=self.project, target_os=os_name, target_arch=arch,
-            native_library=self._native(self.builder.TARGETS[os_name]),
+            native_library=self._native(self.builder.TARGETS[os_name], arch=arch),
             output_dir=self.base / "local-probe", allow_dirty_dev_probe=True,
             target_libc=platform.libc_ver()[0] if os_name == "linux" else None,
         )

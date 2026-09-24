@@ -261,6 +261,31 @@ def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _verify_native_target(content: bytes, target_os: str, target_arch: str) -> None:
+    """Check the object format and machine before admitting a formal native asset.
+
+    A matching header does not prove loadability, dependencies, or Linux libc.
+    Those remain cold-install gates for the exact package on the target host.
+    """
+    valid = False
+    if target_os == "windows" and len(content) >= 64 and content[:2] == b"MZ":
+        offset = int.from_bytes(content[0x3c:0x40], "little")
+        valid = (offset >= 64 and offset + 6 <= len(content)
+                 and content[offset:offset + 4] == b"PE\0\0"
+                 and int.from_bytes(content[offset + 4:offset + 6], "little") == 0x8664
+                 and target_arch == "x86_64")
+    elif target_os == "linux" and len(content) >= 20 and content[:4] == b"\x7fELF":
+        machines = {"x86_64": 62, "aarch64": 183}
+        valid = (content[4] == 2 and content[5] == 1
+                 and int.from_bytes(content[18:20], "little") == machines[target_arch])
+    elif target_os == "macos" and len(content) >= 8:
+        machines = {"x86_64": 0x01000007, "aarch64": 0x0100000c}
+        valid = (content[:4] == b"\xcf\xfa\xed\xfe"
+                 and int.from_bytes(content[4:8], "little") == machines[target_arch])
+    if not valid:
+        raise ValueError(f"native binary header does not match {target_os}-{target_arch}")
+
+
 def _validate_member_path(path: str) -> None:
     if not path or "\x00" in path or "\\" in path or path.startswith("/"):
         raise ValueError(f"dangerous ZIP member path: {path!r}")
@@ -603,6 +628,8 @@ def build_package(
     )
     _validate_member_path(native_path)
     payload[native_path] = native.read_bytes()
+    if formal:
+        _verify_native_target(payload[native_path], target_os, target_arch)
     manifest = _manifest(
         version=version,
         git_sha=git_sha,
@@ -833,6 +860,8 @@ def verify_package(package: Path | str) -> None:
                 "bytes": listed[native_path].get("bytes"),
             }:
                 raise ValueError("ReleaseManifest native binding is inconsistent")
+            if mode == "formal-alpha1":
+                _verify_native_target(archive.read(native_path), target_os, target_arch)
     except zipfile.BadZipFile as exc:
         raise ValueError(f"invalid ZIP archive: {path}") from exc
 
