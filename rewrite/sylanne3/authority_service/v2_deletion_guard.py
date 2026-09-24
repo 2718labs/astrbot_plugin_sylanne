@@ -364,6 +364,9 @@ class AuthorityV2DeletionGuard:
                 or self._db is None or not self._db.in_transaction
                 or self.schema_version() != 2):
             raise AuthorityUnavailable("schema-2 guarded deletion pending is required")
+        if (pending.source_phase, pending.target_phase,
+                pending.evidence.kind) != ("absent", "pending", "request_authorized"):
+            raise AuthorityUnavailable("deletion barrier and cleanup phases remain HOLD")
         _, journal_id, metadata = self._check_schema()
         permit = pending.permit
         before = pending.before_anchor

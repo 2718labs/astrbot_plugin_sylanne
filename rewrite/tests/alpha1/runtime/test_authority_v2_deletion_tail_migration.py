@@ -195,6 +195,15 @@ def test_schema2_append_requires_persisted_exact_pending_and_retries(tmp_path):
     guard = parts[3]
     with pytest.raises(AuthorityUnavailable, match="durably owned"):
         guard.append_pending(pending, core=parts[0], fences=parts[1])
+    barrier_evidence = replace(
+        pending.evidence, kind="barrier_installed", graph_version="graph-a",
+        incarnation="incarnation-a", access_epoch=1, deletion_epoch=1,
+        barrier_scope_digest="sha256:" + "c" * 64)
+    barrier_pending = replace(
+        pending, source_phase="pending", target_phase="accepted",
+        evidence=barrier_evidence)
+    with pytest.raises(AuthorityUnavailable, match="remain HOLD"):
+        guard.append_pending(barrier_pending, core=parts[0], fences=parts[1])
     with guard.freeze_writes():
         assert guard.verified_head().seq == 0
     _persist_fixture_pending(parts, pending)
