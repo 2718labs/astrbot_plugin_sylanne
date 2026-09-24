@@ -226,6 +226,21 @@ def install_schema(db) -> None:
             PRIMARY KEY(bot_id, persona_id, operation_id, phase)
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_budget_debt_blocks(
+            lease_id TEXT NOT NULL,
+            cause_lease_id TEXT NOT NULL,
+            cause_operation_id TEXT NOT NULL,
+            PRIMARY KEY(lease_id,cause_lease_id,cause_operation_id),
+            FOREIGN KEY(lease_id) REFERENCES runtime_budget_leases(lease_id)
+        )
+    """)
+    # Preserve admission safety when opening an older store that already
+    # contains an overrun. The original reservation remains the debt evidence.
+    for lease_id, operation_id in db.execute(
+            "SELECT lease_id,operation_id FROM runtime_budget_reservations "
+            "WHERE state IN ('overrun','partial_overrun')"):
+        _record_debt_block(db, lease_id, operation_id)
 
 
 def _lease_from_row(row) -> BudgetLease:
@@ -244,6 +259,37 @@ def get_budget_lease(db, lease_id: str) -> BudgetLease:
         "reserved_json,unconfirmed_json,version,state FROM runtime_budget_leases "
         "WHERE lease_id=?", (lease_id,),
     ).fetchone())
+
+
+def _lease_ancestry(db, lease_id: str):
+    """Include self and every parent; a cycle is invalid budget authority."""
+    seen = set()
+    current = lease_id
+    while current is not None:
+        if current in seen:
+            raise BudgetConflict("budget lease ancestry has a cycle")
+        seen.add(current)
+        lease = get_budget_lease(db, current)
+        yield lease
+        current = lease.parent_id
+
+
+def _record_debt_block(db, lease_id: str, operation_id: str) -> None:
+    for ancestor in _lease_ancestry(db, lease_id):
+        db.execute(
+            "INSERT OR IGNORE INTO runtime_budget_debt_blocks"
+            "(lease_id,cause_lease_id,cause_operation_id) VALUES(?,?,?)",
+            (ancestor.lease_id, lease_id, operation_id),
+        )
+
+
+def _assert_no_ancestor_debt(db, lease_id: str) -> None:
+    for ancestor in _lease_ancestry(db, lease_id):
+        if db.execute(
+                "SELECT 1 FROM runtime_budget_debt_blocks "
+                "WHERE lease_id=? LIMIT 1", (ancestor.lease_id,),
+        ).fetchone() is not None:
+            raise BudgetUnavailable("budget ancestry has unresolved overrun debt")
 
 
 def _save_lease(db, lease: BudgetLease) -> None:
@@ -453,6 +499,7 @@ def create_budget_lease(db, lease: BudgetLease, operation_id: str,
     if lease.used or lease.reserved or lease.unconfirmed or lease.version != 1 or lease.state != "active":
         raise ValueError("new budget lease must start active and unused at version 1")
     if lease.parent_id is not None:
+        _assert_no_ancestor_debt(db, lease.parent_id)
         parent = get_budget_lease(db, lease.parent_id)
         if (parent.bot_id, parent.persona_id, parent.currency) != (
                 lease.bot_id, lease.persona_id, lease.currency):
@@ -491,6 +538,7 @@ def reserve_budget(db, lease_id: str, operation_id: str, digest: str,
     prior = _prior(db, lease, operation_id, "reserve", digest)
     if prior is not None:
         return prior
+    _assert_no_ancestor_debt(db, lease_id)
     updated = _reserve_transition(lease, requested)
     _save_lease(db, updated)
     db.execute(
@@ -534,6 +582,8 @@ def settle_budget(db, lease_id: str, operation_id: str, digest: str,
     )
     receipt = _receipt(updated, status, operation_id, digest)
     _record(db, updated, operation_id, "settle", digest, receipt)
+    if status == "overrun":
+        _record_debt_block(db, lease_id, operation_id)
     return receipt
 
 
@@ -578,6 +628,8 @@ def settle_budget_partial(
     )
     receipt = _receipt(updated, status, operation_id, digest)
     _record(db, updated, operation_id, "settle", digest, receipt)
+    if status == "pending_overrun":
+        _record_debt_block(db, lease_id, operation_id)
     return receipt
 
 
@@ -629,6 +681,8 @@ def resolve_partial_budget(
     )
     receipt = _receipt(updated, status, resolution_operation_id, digest)
     _record(db, updated, resolution_operation_id, "resolve", digest, receipt)
+    if status == "overrun":
+        _record_debt_block(db, lease_id, original_operation_id)
     return receipt
 
 
@@ -672,6 +726,8 @@ def resolve_unconfirmed(db, lease_id: str, original_operation_id: str,
     )
     receipt = _receipt(updated, status, resolution_operation_id, digest)
     _record(db, updated, resolution_operation_id, "resolve", digest, receipt)
+    if status == "overrun":
+        _record_debt_block(db, lease_id, original_operation_id)
     return receipt
 
 
