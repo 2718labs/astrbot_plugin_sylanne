@@ -4,6 +4,7 @@ import ctypes
 import _ctypes
 from dataclasses import FrozenInstanceError, fields, replace
 from decimal import Decimal, localcontext
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -26,11 +27,13 @@ from sylanne3.native_runtime import (
     require_d04_production_readout,
     run_d04_fixed_block_candidate,
     run_fixed_block_math,
+    run_fixed_block_linear_readout_math,
     run_fixed_block_trajectory_math,
 )
 from sylanne3.domains.d04 import AffectAxis, AffectScheme
 from sylanne3.native_runtime.d04_engineering_scheme import build_d04_engineering_candidate
 from sylanne3.native_runtime.loader import _runtime_target
+from sylanne3.native_runtime.linear_readout import _outward_binary64
 
 
 def _block() -> FixedBlockStep:
@@ -243,6 +246,80 @@ class FixedBlockTranscriptTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "1 to 1024"):
             run_fixed_block_trajectory_math(self.handle, first, ())
+
+    def test_linear_readout_contains_exact_flow_and_refuses_threshold_shortcut(self) -> None:
+        first = replace(_block(), previous_error=0.01)
+        trajectory = run_fixed_block_trajectory_math(
+            self.handle, first,
+            (FixedBlockContinuation.from_step(first, h=0.05),
+             FixedBlockContinuation.from_step(first, h=0.08)),
+        )
+        readout = run_fixed_block_linear_readout_math(self.handle, trajectory, (1.0, -1.0))
+        t = sum(step.input.h for step in trajectory.steps)
+        exact_initial = (first.previous[0] - 0.005, first.previous[1])
+        decay, cosine, sine = math.exp(-2 * t), math.cos(0.4 * t), math.sin(0.4 * t)
+        exact = decay * (
+            (cosine + sine) * exact_initial[0] + (sine - cosine) * exact_initial[1]
+        )
+        nominal = trajectory.steps[-1].output[0] - trajectory.steps[-1].output[1]
+        self.assertLess(exact, nominal)
+        threshold = (exact + nominal) / 2
+        self.assertLess(exact, threshold)
+        self.assertLess(threshold, nominal)
+        self.assertLessEqual(readout.lower, exact)
+        self.assertLessEqual(exact, readout.upper)
+        self.assertLessEqual(readout.lower, threshold)
+        self.assertLessEqual(threshold, readout.upper)
+
+        # Decimal reconstructs exact products of the recorded binary64 values.
+        with localcontext() as context:
+            context.prec = 1100
+            d = Decimal.from_float
+            state = trajectory.steps[-1].output
+            point = d(state[0]) - d(state[1])
+            radius = d(trajectory.final_error) * 2
+            self.assertLessEqual(d(readout.lower), point - radius)
+            self.assertGreaterEqual(d(readout.upper), point + radius)
+        self.assertEqual(readout.production_binding, self.handle.production_binding)
+        self.assertEqual(readout.source_trajectory_sha256, trajectory.transcript_sha256)
+        opposite = run_fixed_block_linear_readout_math(self.handle, trajectory, (-1.0, 1.0))
+        self.assertNotEqual(readout.transcript_sha256, opposite.transcript_sha256)
+
+        tampered_last = replace(trajectory.steps[-1], output=(0.0, 0.0))
+        with self.assertRaisesRegex(ABI2ResultError, "digest is inconsistent"):
+            run_fixed_block_linear_readout_math(
+                self.handle, replace(trajectory, steps=trajectory.steps[:-1] + (tampered_last,)),
+                (1.0, -1.0),
+            )
+
+    def test_24d_linear_readout_encloses_binary64_point_and_rejects_nonfinite(self) -> None:
+        operator = build_d04_engineering_candidate()
+        state = (0.5, 0.25, 0.125) + (0.0,) * 21
+        drive = (0.0, 0.0625, 0.0) + (0.0,) * 21
+        first = FixedBlockStep(
+            operator.k, operator.r, operator.j, operator.a, operator.alpha,
+            state, drive, state, 1.0 / 256.0, 0.0, 64, 1e-5,
+        )
+        trajectory = run_fixed_block_trajectory_math(
+            self.handle, first, (FixedBlockContinuation.from_step(first),),
+        )
+        weights = (1.0, -0.5, 0.25) + (0.0,) * 21
+        readout = run_fixed_block_linear_readout_math(self.handle, trajectory, weights)
+        with localcontext() as context:
+            context.prec = 1100
+            d = Decimal.from_float
+            point = sum((d(weight) * d(value)
+                         for weight, value in zip(weights, trajectory.steps[-1].output)), Decimal(0))
+            radius = d(trajectory.final_error) * sum((abs(d(weight)) for weight in weights), Decimal(0))
+            self.assertLessEqual(d(readout.lower), point - radius)
+            self.assertGreaterEqual(d(readout.upper), point + radius)
+        with self.assertRaisesRegex(ValueError, "finite binary64"):
+            run_fixed_block_linear_readout_math(
+                self.handle, trajectory, (math.nan,) + (0.0,) * 23,
+            )
+        beyond_finite = Fraction.from_float(float.fromhex("0x1.fffffffffffffp+1023")) + 1
+        with self.assertRaisesRegex(ABI2ResultError, "exceeds finite binary64"):
+            _outward_binary64(beyond_finite, lower=False)
 
     def test_real_package_bound_step_retains_actual_values_and_hashes(self) -> None:
         block = _block()
