@@ -187,6 +187,22 @@ class OriginalModelCostApplicationV1:
     schema: str = "sylanne.d11.original-model-cost-application.v1"
 
 
+@dataclass(frozen=True, slots=True)
+class OriginalModelCostCommitV1:
+    status: str
+    operation_id: str
+    call_id: str
+    quote_id: str
+    quote_version: int
+    terminal_receipt_digest: str
+    cost_ref: str
+    budget_receipt_digest: str
+    commit_seq: int
+    graph_revision: int
+    graph_epoch: int
+    schema: str = "sylanne.d11.original-model-cost-commit.v1"
+
+
 def prepare_original_model_cost_plan(
     db, issuer, namespace: NamespaceId, fact: OriginalModelCostFactV1,
     *, quote_id: str, quote_version: int,
@@ -316,6 +332,7 @@ __all__ = (
     "ModelCostUnavailable", "OriginalModelCostFactV1",
     "OriginalModelCostPlanV1", "prepare_original_model_cost_plan",
     "OriginalModelCostApplicationV1", "apply_original_model_budget_in_transaction",
+    "OriginalModelCostCommitV1",
     "original_model_budget_actual", "outcome_from_original_model_cost",
     "original_model_budget_measurement",
     "read_original_model_cost",

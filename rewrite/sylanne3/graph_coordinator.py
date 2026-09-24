@@ -643,7 +643,8 @@ class GraphCoordinator:
                  owner_principal_resolver=None,
                  dispatch_admission_issuer=None, dispatch_clock_policy=None,
                  scene_identity_port=None, scene_clock_policy=None,
-                 encoding_request_issuer=None, model_terminal_cost_port=None):
+                 encoding_request_issuer=None, model_terminal_cost_port=None,
+                 accounting_maintenance_port=None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -679,6 +680,23 @@ class GraphCoordinator:
         if model_terminal_cost_port is not None and not callable(model_terminal_cost_port):
             raise TypeError("model_terminal_cost_port must be callable")
         self.__model_terminal_cost_port = model_terminal_cost_port
+        if (accounting_maintenance_port is not None
+                and any(not callable(getattr(accounting_maintenance_port, name, None))
+                        for name in ("begin", "validate", "finish", "recover_finish"))):
+            raise TypeError("accounting maintenance port requires four operations")
+        self.__accounting_maintenance_port = accounting_maintenance_port
+        if accounting_maintenance_port is not None:
+            # Persist the fence attempt before asking Authority to begin it.
+            # A process restart must never invent a second active attempt.
+            with store._lock:
+                store._db.execute("""
+                    CREATE TABLE IF NOT EXISTS graph_original_model_cost_attempts_v1 (
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        call_id TEXT NOT NULL, intent_digest TEXT NOT NULL,
+                        attempt_id TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN ('open','closed','committed')),
+                        PRIMARY KEY(bot, persona, call_id), UNIQUE(attempt_id))
+                """)
         # Installed by trusted host composition only.  A missing issuer leaves
         # D08/D09 candidates in HOLD; caller receipt strings are never enough.
         self.__dispatch_admission_issuer = dispatch_admission_issuer
@@ -6341,6 +6359,338 @@ class GraphCoordinator:
                 quote_id=quote_id, quote_version=quote_version))
         except ModelCostUnavailable as exc:
             raise UnavailableGuard(str(exc)) from exc
+
+    @staticmethod
+    def _accounting_anchor_covers(target, anchor) -> bool:
+        """Accounting may follow a closed deletion; never rewind graph history."""
+        return (target.authority_id == anchor.authority_id
+                and target.authority_namespace == anchor.namespace
+                and target.activation_generation == anchor.activation_generation
+                and target.deletion_journal_id == anchor.deletion_journal_id
+                and target.execution_journal_id == anchor.execution_journal_id
+                and target.deletion_seq <= anchor.deletion_seq
+                and target.execution_seq <= anchor.execution_seq
+                and target.revocation_epoch <= anchor.revocation_epoch
+                and (target.deletion_seq != anchor.deletion_seq
+                     or target.deletion_digest == anchor.deletion_digest)
+                and (target.execution_seq != anchor.execution_seq
+                     or target.execution_digest == anchor.execution_digest))
+
+    def commit_first_ingress_model_cost_v1(
+        self, bootstrap: object, namespace: NamespaceId, original_intent,
+        *, quote_id: str, quote_version: int,
+    ):
+        """Commit one original model cost bundle, independent of D06 content.
+
+        The installed ports own mTLS credentials. Their calls happen only
+        outside GraphStore's lock; the signed quote and D11 reservation are
+        re-read in the single graph transaction. A fence attempt is durable
+        before begin, while the business operation stays fixed to call_id.
+        """
+        from .authority_service.v2_accounting_contract import (
+            AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
+        )
+        from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
+        from .runtime.restore_anchor import RestoreAnchor
+        from .runtime.model_cost_settlement import (
+            OriginalModelCostCommitV1, apply_original_model_budget_in_transaction,
+            prepare_original_model_cost_plan, read_original_model_cost,
+        )
+        from .runtime.d11_types import (
+            D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH, validate_d11_writes,
+        )
+        from .runtime_contracts import (
+            CommandEnvelope, DependencySet, DomainProposal, OperationIdentity,
+            RUNTIME_SCHEMA,
+        )
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId
+                or type(original_intent) is not ModelEgressIntentV1
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__model_terminal_cost_port is None
+                or self.__accounting_maintenance_port is None
+                or self.__d02_issuer is None or self.__d11_issuer is None):
+            raise UnavailableGuard("installed original model accounting authorities required")
+        store, port = self.__store, self.__accounting_maintenance_port
+        # The receipt is an Authority fact, never a caller-supplied cost.
+        fact = read_original_model_cost(self.__model_terminal_cost_port, original_intent)
+        if fact.recovery.state != "observed":
+            raise UnavailableGuard("unobserved model cost retains original upper bound; HOLD")
+        intent_digest = canonical_digest(asdict(original_intent))
+        terminal_digest = canonical_digest(asdict(fact.receipt))
+        operation_id = "model-cost-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "call_id": original_intent.call_id,
+        })[:48]
+
+        def business_receipt_locked():
+            row = store._db.execute(
+                "SELECT activity_id,commit_seq,receipt_json "
+                "FROM graph_bundle_operations WHERE bot=? "
+                "AND persona=? AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            data = json.loads(row[2])
+            if (data.get("original_intent_digest") != intent_digest
+                    or data.get("terminal_receipt_digest") != terminal_digest
+                    or data.get("quote_id") != quote_id
+                    or data.get("quote_version") != quote_version):
+                raise EventConflict("original model cost operation identity differs")
+            committed = OriginalModelCostCommitV1(**data["original_model_cost"])
+            graph_event = store._db.execute(
+                "SELECT 1 FROM graph_events WHERE bot=? AND persona=? "
+                "AND session=? AND event_id=?", namespace.as_tuple +
+                (row[0], operation_id),
+            ).fetchone()
+            atom = store._db.execute(
+                "SELECT 1 FROM graph_atoms WHERE token=? AND valid=1",
+                (committed.cost_ref,),
+            ).fetchone()
+            budget = store._db.execute(
+                "SELECT 1 FROM runtime_budget_operations WHERE bot_id=? "
+                "AND persona_id=? AND operation_id=? AND phase='settle'",
+                namespace.as_tuple + (original_intent.budget_reservation_operation_id,),
+            ).fetchone()
+            if (committed.status != "committed"
+                    or committed.operation_id != operation_id
+                    or committed.call_id != original_intent.call_id
+                    or committed.quote_id != quote_id
+                    or committed.quote_version != quote_version
+                    or committed.terminal_receipt_digest != terminal_digest
+                    or committed.commit_seq != row[1]
+                    or graph_event is None or atom is None or budget is None):
+                raise UnavailableGuard("original cost business receipt is incomplete")
+            return committed
+
+        with store._lock:
+            committed = business_receipt_locked()
+            metadata, _ = self._v2_graph_stamp(namespace)
+            attempt = store._db.execute(
+                "SELECT intent_digest,attempt_id,anchor_json,state FROM "
+                "graph_original_model_cost_attempts_v1 WHERE bot=? AND persona=? "
+                "AND call_id=?", namespace.as_tuple + (original_intent.call_id,),
+            ).fetchone()
+        if committed is not None:
+            if attempt is None or attempt[0] != intent_digest or attempt[3] != "committed":
+                raise UnavailableGuard("committed cost lacks original fence attempt")
+            request = AccountingMaintenanceRequestV1(
+                attempt[1], original_intent, RestoreAnchor(**json.loads(attempt[2])))
+            port.recover_finish(request)
+            return replace(committed, status="duplicate")
+        target = metadata.requirements
+        if (original_intent.authority_id != target.authority_id
+                or original_intent.namespace != target.authority_namespace):
+            raise UnavailableGuard("original model call belongs to another authority")
+
+        if attempt is not None and attempt[3] == "open":
+            if attempt[0] != intent_digest:
+                raise EventConflict("original call ID reused with different intent")
+            # A prior invocation may have rolled back after begin or lost its
+            # finish reply. First prove no business receipt, then close it.
+            old_request = AccountingMaintenanceRequestV1(
+                attempt[1], original_intent, RestoreAnchor(**json.loads(attempt[2])))
+            try:
+                port.recover_finish(old_request)
+            except Exception:
+                # The durable local intent may precede Authority begin. The
+                # exact same attempt ID is safe to begin or replay; any other
+                # Authority failure remains HOLD rather than minting a new ID.
+                old_grant = port.begin(old_request)
+                port.finish(old_request, old_grant)
+            with store._lock:
+                if business_receipt_locked() is not None:
+                    raise UnavailableGuard("cost committed during fence recovery; retry")
+                store._db.execute(
+                    "UPDATE graph_original_model_cost_attempts_v1 SET state='closed' "
+                    "WHERE bot=? AND persona=? AND call_id=? AND attempt_id=? "
+                    "AND state='open'", namespace.as_tuple +
+                    (original_intent.call_id, attempt[1]),
+                )
+
+        # current_anchor is an Authority network read. It is outside the
+        # graph lock and can advance past a completed source deletion.
+        anchor = self.__content_fence_v2.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._accounting_anchor_covers(target, anchor):
+            raise UnavailableGuard("accounting Authority anchor differs from graph history")
+        attempt_id = "model-cost-fence-" + secrets.token_hex(24)
+        request = AccountingMaintenanceRequestV1(attempt_id, original_intent, anchor)
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if business_receipt_locked() is not None or self._v2_graph_stamp(namespace)[0] != metadata:
+                    raise StaleRead("original cost graph changed before accounting fence")
+                row = db.execute(
+                    "SELECT state FROM graph_original_model_cost_attempts_v1 "
+                    "WHERE bot=? AND persona=? AND call_id=?",
+                    namespace.as_tuple + (original_intent.call_id,),
+                ).fetchone()
+                if row is not None and row[0] != "closed":
+                    raise UnavailableGuard("original cost fence attempt remains open")
+                if attempt is not None and attempt[0] != intent_digest:
+                    raise EventConflict("original call ID reused with different intent")
+                db.execute(
+                    "INSERT INTO graph_original_model_cost_attempts_v1"
+                    "(bot,persona,call_id,intent_digest,attempt_id,anchor_json,state) "
+                    "VALUES(?,?,?,?,?,?,'open') ON CONFLICT(bot,persona,call_id) "
+                    "DO UPDATE SET intent_digest=excluded.intent_digest,"
+                    "attempt_id=excluded.attempt_id,anchor_json=excluded.anchor_json,"
+                    "state='open'", namespace.as_tuple +
+                    (original_intent.call_id, intent_digest, attempt_id,
+                     canonical_json(asdict(anchor))),
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+        grant = port.begin(request)
+        if type(grant) is not AccountingMaintenanceGrantV1 or (
+                grant.call_id != original_intent.call_id
+                or grant.admission_id != fact.admission.admission_id
+                or grant.reservation_digest != original_intent.budget_reservation_digest
+                or grant.observation_digest != fact.recovery.observation_digest
+                or grant.terminal_receipt_digest != terminal_digest
+                or grant.permit.operation_id != attempt_id
+                or grant.permit.pinned_anchor != anchor):
+            raise UnavailableGuard("accounting grant differs from original Authority fact")
+        port.validate(request, grant)
+
+        result = None
+        try:
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    current, epoch = self._v2_graph_stamp(namespace)
+                    if current != metadata or not self._accounting_anchor_covers(
+                            current.requirements, anchor):
+                        raise StaleRead("accounting graph stamp changed")
+                    row = db.execute(
+                        "SELECT attempt_id,state FROM graph_original_model_cost_attempts_v1 "
+                        "WHERE bot=? AND persona=? AND call_id=?",
+                        namespace.as_tuple + (original_intent.call_id,),
+                    ).fetchone()
+                    if row != (attempt_id, "open") or business_receipt_locked() is not None:
+                        raise StaleRead("original cost business operation changed")
+                    plan = prepare_original_model_cost_plan(
+                        db, self.__d02_issuer, namespace, fact,
+                        quote_id=quote_id, quote_version=quote_version)
+                    if plan.bundle_operation_id != operation_id:
+                        raise EventConflict("original cost operation differs")
+                    application = apply_original_model_budget_in_transaction(
+                        db, self.__d02_issuer, plan, fact)
+                    write = application.cost_write
+                    if not validate_d11_writes(
+                            (write,), namespace, operation_id=operation_id,
+                            activity_id=plan.quote.activity_id,
+                            effect_id=plan.quote.effect_id):
+                        raise UnavailableGuard("D11 cost write is invalid")
+                    reconcile_runtime_write(db, write)
+                    identity = OperationIdentity(
+                        plan.quote.activity_id, plan.quote.effect_id,
+                        original_intent.call_id, "accounting", operation_id,
+                        canonical_digest({"input_refs": []}))
+                    authority = AuthorityContext(
+                        "host", "d11", "accounting:" + attempt_id,
+                        namespace, ("activity",), "cost_accounting", ("internal",),
+                        "original-model-cost-v1", target.activation_generation)
+                    epochs = db.execute(
+                        "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                        "WHERE bot=? AND persona=?", namespace.as_tuple,
+                    ).fetchone() or (0, 0)
+                    envelope = CommandEnvelope(
+                        RUNTIME_SCHEMA, identity, authority,
+                        VersionGuard((GraphVersion(write.key, 0),), (), *epochs,
+                                     "accounting-v1", "accounting-v1",
+                                     "accounting-v1", "accounting-v1", (), (), ()),
+                        SourceQualification((), "derived", None, time.time(),
+                                            "unknown", "ineligible", None,
+                                            "not_applicable"),
+                        (), plan.quote.parent_budget_lease_ref,
+                        plan.quote.deadline_utc, 0.0, "accounting-v1",
+                        (plan.original_operation_id,))
+                    proposal = DomainProposal(
+                        "d11", D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
+                        envelope, (write,), DependencySet(), (), ("cost_settlement",))
+                    bundle = DomainBundle(
+                        envelope, (proposal,), (), (), (), (write.key.token,),
+                        (), (), ())
+                    event = Event(
+                        Scope(*namespace.as_tuple, plan.quote.activity_id),
+                        operation_id, time.time(), "domain_bundle",
+                        {"bundle_digest": bundle.digest})
+                    candidate = GraphCandidate(
+                        event, (GraphVersion(write.key, 0),), (write,), (epoch,))
+                    graph_receipt = GraphStore._graph_commit_in_transaction(
+                        store, candidate, _capability=self.__graph_capability)
+                    if graph_receipt.status != "committed":
+                        raise EventConflict("original cost graph event already exists")
+                    replacement = replace(
+                        current.requirements,
+                        deletion_seq=anchor.deletion_seq,
+                        deletion_digest=anchor.deletion_digest,
+                        execution_seq=anchor.execution_seq,
+                        execution_digest=anchor.execution_digest,
+                        revocation_epoch=anchor.revocation_epoch)
+                    store.cas_graph_recovery_metadata(
+                        current, replacement, _capability=self.__graph_capability)
+                    seq_row = db.execute(
+                        "SELECT last_seq FROM graph_bundle_sequence WHERE bot=? AND persona=?",
+                        namespace.as_tuple).fetchone()
+                    seq = (seq_row[0] if seq_row else 0) + 1
+                    db.execute(
+                        "INSERT INTO graph_bundle_sequence(bot,persona,last_seq) "
+                        "VALUES(?,?,?) ON CONFLICT(bot,persona) DO UPDATE SET "
+                        "last_seq=excluded.last_seq", namespace.as_tuple + (seq,))
+                    result = OriginalModelCostCommitV1(
+                        "committed", operation_id, original_intent.call_id,
+                        quote_id, quote_version, terminal_digest, write.key.token,
+                        canonical_digest(asdict(application.receipt)), seq,
+                        current.graph_revision + 1, graph_receipt.epoch.revision)
+                    receipt_data = {
+                        "original_model_cost": asdict(result),
+                        "original_intent_digest": intent_digest,
+                        "terminal_receipt_digest": terminal_digest,
+                        "quote_id": quote_id, "quote_version": quote_version,
+                        "accounting_attempt_id": attempt_id,
+                    }
+                    db.execute(
+                        "INSERT INTO graph_bundle_operations"
+                        "(bot,persona,operation_id,digest,activity_id,effect_id,"
+                        "commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (
+                            operation_id, bundle.digest, plan.quote.activity_id,
+                            plan.quote.effect_id, seq, canonical_json(receipt_data)))
+                    db.execute(
+                        "UPDATE graph_original_model_cost_attempts_v1 "
+                        "SET state='committed' WHERE bot=? AND persona=? "
+                        "AND call_id=? AND attempt_id=?", namespace.as_tuple +
+                        (original_intent.call_id, attempt_id))
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+        except BaseException:
+            # The business transaction rolled back. Closing this *attempt*
+            # leaves the fixed business operation and reservation untouched.
+            with store._lock:
+                committed = business_receipt_locked()
+            if committed is not None:
+                port.recover_finish(request)
+                return replace(committed, status="duplicate")
+            port.finish(request, grant)
+            with store._lock:
+                store._db.execute(
+                    "UPDATE graph_original_model_cost_attempts_v1 SET state='closed' "
+                    "WHERE bot=? AND persona=? AND call_id=? AND attempt_id=? "
+                    "AND state='open'", namespace.as_tuple +
+                    (original_intent.call_id, attempt_id))
+            raise
+        port.finish(request, grant)
+        return result
 
     def _qualified_first_ingress_acquire_return(
         self, namespace: NamespaceId, job_id: str, expected: PersistentJob,
