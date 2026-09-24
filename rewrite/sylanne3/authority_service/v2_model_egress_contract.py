@@ -232,10 +232,14 @@ class ModelEgressObservationV1:
 
 @dataclass(frozen=True, slots=True)
 class ModelEgressRecoveryV1:
+    """Content-free recovery. Provider result requires future qualified access."""
+
     intent: ModelEgressIntentV1
     state: str  # prepared | dispatch_started | observed | unknown
     observation_digest: str | None = None
-    observation: ModelEgressObservationV1 | None = None
+    usage: tuple[tuple[str, int], ...] = ()
+    cost: tuple[tuple[str, int], ...] = ()
+    content_erased: bool = False
 
     def __post_init__(self) -> None:
         if type(self.intent) is not ModelEgressIntentV1:
@@ -244,21 +248,20 @@ class ModelEgressRecoveryV1:
             raise ValueError("invalid model egress recovery state")
         if self.state in {"observed", "unknown"}:
             _digest(self.observation_digest, "observation_digest")
-        elif self.observation_digest is not None:
-            raise ValueError("unobserved egress cannot have an observation digest")
-        if self.observation is not None:
-            if (type(self.observation) is not ModelEgressObservationV1
-                    or self.observation.digest != self.observation_digest
-                    or self.observation.status != ("completed" if self.state == "observed" else "unknown")
-                    or (self.observation.authority_id, self.observation.namespace,
-                        self.observation.subject, self.observation.operation_id,
-                        self.observation.call_id, self.observation.request_digest) !=
-                       (self.intent.authority_id, self.intent.namespace,
-                        self.intent.subject, self.intent.operation_id,
-                        self.intent.call_id, self.intent.request_digest)):
-                raise ValueError("observation differs from original call")
-        elif self.state == "observed":
-            raise ValueError("observed egress requires complete durable observation")
+        elif (self.observation_digest is not None or self.usage or self.cost
+              or self.content_erased):
+            raise ValueError("unobserved egress cannot have observation metadata")
+        if type(self.content_erased) is not bool:
+            raise ValueError("invalid content erasure marker")
+        for name in ("usage", "cost"):
+            amounts = getattr(self, name)
+            if (type(amounts) is not tuple or tuple(sorted(amounts)) != amounts
+                    or len({key for key, _ in amounts}) != len(amounts)):
+                raise ValueError(f"invalid {name}")
+            for key, amount in amounts:
+                if type(key) is not str or not key or len(key) > 256:
+                    raise ValueError(f"invalid {name} key")
+                _integer(amount, f"{name} amount")
 
 
 __all__ = ["ModelEgressDraftV1", "ModelEgressIntentV1", "ModelEgressObservationV1", "ModelEgressRecoveryV1"]

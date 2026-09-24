@@ -332,9 +332,26 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
         parsed = ProviderResponse("completed", {"answer": {"parts": ["ok", 2]}},
                                   {"input_tokens": 4, "output_tokens": 2},
                                   {"micro_usd": 30}, "provider/ref 1")
+        original_history = fences.deletion.has_deletion_history
+        monkeypatch.setattr(fences.deletion, "has_deletion_history", lambda _: True)
+        with pytest.raises(AuthorityUnavailable, match="deletion history"):
+            service._record_provider_observation(intent=original, response=parsed)
+        assert store.read(original.call_id, subject="worker", namespace="ns-a").state == "dispatch_started"
+        monkeypatch.setattr(fences.deletion, "has_deletion_history", original_history)
         observed = service._record_provider_observation(intent=original, response=parsed)
-        assert observed.observation.result == parsed.result
-        assert observed.observation.digest == observed.observation_digest
+        assert not hasattr(observed, "observation")
+        assert observed.usage == tuple(sorted(parsed.usage.items()))
+        with store._tx() as db:
+            complete = store._read_observation_locked(db, original)
+        assert complete.result == parsed.result
+        assert complete.digest == observed.observation_digest
+        with pytest.raises(AuthorityUnavailable, match="HOLD: trusted current graph"):
+            service.read_observation_fenced(
+                credential=_PEER_A, subject="worker", intent=original)
+        monkeypatch.setattr(fences.deletion, "has_deletion_history", lambda _: True)
+        assert service.recover_fenced(
+            credential=_PEER_A, subject="worker", intent=original) == (observed, permit)
+        monkeypatch.setattr(fences.deletion, "has_deletion_history", original_history)
         with pytest.raises(AuthorityUnavailable, match="already resolved"):
             service._record_provider_observation(intent=original, response=parsed)
         path = fences.core._db.execute("PRAGMA database_list").fetchone()[2]
@@ -342,7 +359,7 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
             recovered = AuthorityV2ModelEgressStore(reopened).read(
                 original.call_id, subject="worker", namespace="ns-a")
             assert recovered == observed
-            assert recovered.observation.result == parsed.result
+            assert not hasattr(recovered, "observation")
             with pytest.raises(AuthorityUnavailable):
                 AuthorityV2ModelEgressStore(reopened).read(
                     original.call_id, subject="other", namespace="ns-a")
@@ -383,6 +400,34 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
         with connection(path) as reopened:
             assert AuthorityV2ModelEgressStore(reopened).read(
                 original.call_id, subject="worker", namespace="ns-a") == observed
+        fences.core._db.execute(
+            "CREATE TEMP TRIGGER refuse_egress_erasure BEFORE UPDATE ON "
+            "authority_model_egress_observation_status_v1 "
+            "BEGIN SELECT RAISE(ABORT,'simulated erasure failure'); END")
+        with pytest.raises(AuthorityUnavailable, match="SQLite transaction failed"):
+            with store._tx() as db:
+                store._erase_observation_content_locked(db, original)
+        fences.core._db.execute("DROP TRIGGER refuse_egress_erasure")
+        with store._tx() as db:
+            assert store._read_observation_locked(db, original) == complete
+        with store._tx() as db:
+            erased = store._erase_observation_content_locked(db, original)
+        assert erased.content_erased
+        assert (erased.state, erased.observation_digest, erased.usage, erased.cost) == (
+            observed.state, observed.observation_digest, observed.usage, observed.cost)
+        with store._tx() as db:
+            assert store._erase_observation_content_locked(db, original) == erased
+        assert service.recover_fenced(
+            credential=_PEER_A, subject="worker", intent=original) == (erased, permit)
+        with store._tx() as db:
+            with pytest.raises(AuthorityUnavailable, match="unavailable"):
+                store._read_observation_locked(db, original)
+        with connection(path) as reopened:
+            assert AuthorityV2ModelEgressStore(reopened).read(
+                original.call_id, subject="worker", namespace="ns-a") == erased
+            assert reopened.execute(
+                "SELECT COUNT(*) FROM authority_model_egress_observations_v1 WHERE call_id=?",
+                (original.call_id,)).fetchone() == (0,)
         second_draft = replace(draft, operation_id="job-operation-2",
                                call_id="call-2", job_id="job-2")
         second, second_permit = service.prepare_fenced(
@@ -403,9 +448,20 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
                 credential=_PEER_A, subject="worker", holder="holder-a",
                 intent=second.intent, expected_anchor=anchor)
         assert fences.fences._row(fences.core._db, second.intent.operation_id)[6] == "active"
+        with store._tx() as db:
+            unknown_erased = store._erase_observation_content_locked(db, second.intent)
+        assert unknown_erased.content_erased and unknown_erased.usage == unknown.usage
+        with store._tx() as db:
+            with pytest.raises(AuthorityUnavailable, match="unavailable"):
+                store._read_observation_locked(db, second.intent)
+        with store._tx() as db:
+            assert store._erase_observation_content_locked(db, second.intent) == unknown_erased
+        with pytest.raises(AuthorityUnavailable):
+            store.prepare(replace(second.intent, call_id="call-3", job_id="job-2",
+                                  operation_id="job-operation-3"))
         with connection(path) as reopened:
             assert AuthorityV2ModelEgressStore(reopened).read(
-                second.intent.call_id, subject="worker", namespace="ns-a") == unknown
+                second.intent.call_id, subject="worker", namespace="ns-a") == unknown_erased
     finally:
         try:
             next(fixture)

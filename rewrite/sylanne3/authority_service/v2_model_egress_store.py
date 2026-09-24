@@ -36,6 +36,13 @@ _OBSERVATION_DDL = """CREATE TABLE authority_model_egress_observations_v1(
     observation_digest TEXT NOT NULL,
     FOREIGN KEY(call_id) REFERENCES authority_model_egress_v1(call_id)
 )"""
+_OBSERVATION_STATUS_DDL = """CREATE TABLE authority_model_egress_observation_status_v1(
+    call_id TEXT PRIMARY KEY, observation_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('completed','unknown')),
+    usage_json TEXT NOT NULL, cost_json TEXT NOT NULL,
+    content_erased INTEGER NOT NULL CHECK(content_erased IN (0,1)),
+    FOREIGN KEY(call_id) REFERENCES authority_model_egress_v1(call_id)
+)"""
 
 
 def _encoded(intent: ModelEgressIntentV1) -> str:
@@ -54,6 +61,17 @@ def _decoded(value: str) -> ModelEgressIntentV1:
     if _encoded(result) != value:
         raise ValueError("noncanonical egress identity")
     return result
+
+
+def _decoded_observation(value: str) -> ModelEgressObservationV1:
+    data = json.loads(value)
+    if (type(data) is not dict
+            or set(data) != set(ModelEgressObservationV1.__dataclass_fields__)
+            or canonical_serialize(data) != value):
+        raise ValueError("noncanonical observation")
+    data["usage"] = tuple(tuple(item) for item in data["usage"])
+    data["cost"] = tuple(tuple(item) for item in data["cost"])
+    return ModelEgressObservationV1(**data)
 
 
 class AuthorityV2ModelEgressStore:
@@ -113,6 +131,39 @@ class AuthorityV2ModelEgressStore:
                 db.execute(_OBSERVATION_DDL)
             elif observation != (_OBSERVATION_DDL,):
                 raise AuthorityUnavailable("unknown model egress observation schema")
+            status = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='authority_model_egress_observation_status_v1'"
+            ).fetchone()
+            if status is None:
+                # This unshipped schema can be upgraded without changing the
+                # complete response bytes or any call identity.
+                db.execute(_OBSERVATION_STATUS_DDL)
+                for call_id, raw, digest in db.execute(
+                        "SELECT call_id,observation_json,observation_digest "
+                        "FROM authority_model_egress_observations_v1"):
+                    try:
+                        item = _decoded_observation(raw)
+                        ledger = self._read_ledger(db, call_id)
+                        if (item.call_id != call_id or item.digest != digest
+                                or ledger is None or ledger[5:7] !=
+                                (("observed" if item.status == "completed" else "unknown"), digest)):
+                            raise ValueError("observation and ledger differ")
+                    except (TypeError, ValueError, UnicodeError) as exc:
+                        raise AuthorityUnavailable("legacy observation cannot be upgraded") from exc
+                    db.execute(
+                        "INSERT INTO authority_model_egress_observation_status_v1 "
+                        "(call_id,observation_digest,status,usage_json,cost_json,content_erased) "
+                        "VALUES(?,?,?,?,?,0)",
+                        (call_id, digest, item.status,
+                         canonical_serialize(item.usage), canonical_serialize(item.cost)))
+                if db.execute(
+                        "SELECT 1 FROM authority_model_egress_v1 l LEFT JOIN "
+                        "authority_model_egress_observation_status_v1 s USING(call_id) "
+                        "WHERE l.state IN ('observed','unknown') AND s.call_id IS NULL LIMIT 1"
+                ).fetchone():
+                    raise AuthorityUnavailable("digest-only model observation cannot be upgraded")
+            elif status != (_OBSERVATION_STATUS_DDL,):
+                raise AuthorityUnavailable("unknown model egress observation status schema")
 
     @contextmanager
     def _tx(self):
@@ -131,40 +182,85 @@ class AuthorityV2ModelEgressStore:
                 raise AuthorityUnavailable("model egress SQLite transaction failed") from exc
 
     @staticmethod
-    def _read(db, call_id: str) -> ModelEgressRecoveryV1 | None:
-        row = db.execute(
+    def _read_ledger(db, call_id: str):
+        return db.execute(
             "SELECT call_id,operation_id,namespace,subject,identity_json,state,observation_digest "
             "FROM authority_model_egress_v1 WHERE call_id=?", (call_id,),
         ).fetchone()
+
+    @staticmethod
+    def _read(db, call_id: str) -> ModelEgressRecoveryV1 | None:
+        row = AuthorityV2ModelEgressStore._read_ledger(db, call_id)
         if row is None:
             return None
         try:
             intent = _decoded(row[4])
             if row[:4] != (intent.call_id, intent.operation_id, intent.namespace, intent.subject):
                 raise ValueError("persisted egress identity mismatch")
-            observation_row = db.execute(
-                "SELECT observation_json,observation_digest FROM authority_model_egress_observations_v1 WHERE call_id=?",
+            status_row = db.execute(
+                "SELECT observation_digest,status,usage_json,cost_json,content_erased "
+                "FROM authority_model_egress_observation_status_v1 WHERE call_id=?",
                 (call_id,),
             ).fetchone()
-            observation = None
-            if observation_row is not None:
-                data = json.loads(observation_row[0])
-                if (type(data) is not dict
-                        or set(data) != set(ModelEgressObservationV1.__dataclass_fields__)
-                        or canonical_serialize(data) != observation_row[0]):
-                    raise ValueError("noncanonical observation")
-                data["usage"] = tuple(tuple(item) for item in data["usage"])
-                data["cost"] = tuple(tuple(item) for item in data["cost"])
-                observation = ModelEgressObservationV1(**data)
-                if observation.digest != observation_row[1]:
-                    raise ValueError("observation digest mismatch")
-            if row[5] == "observed" and observation is None:
-                raise ValueError("observed result body missing")
-            if observation is not None and row[5] not in {"observed", "unknown"}:
-                raise ValueError("unobserved egress has result body")
-            return ModelEgressRecoveryV1(intent, row[5], row[6], observation)
+            if row[5] in {"observed", "unknown"}:
+                if (status_row is None or status_row[:2] !=
+                        (row[6], "completed" if row[5] == "observed" else "unknown")
+                        or type(status_row[4]) is not int or status_row[4] not in (0, 1)):
+                    raise ValueError("observation status differs from ledger")
+                usage = json.loads(status_row[2])
+                cost = json.loads(status_row[3])
+                if (type(usage) is not list or type(cost) is not list
+                        or canonical_serialize(usage) != status_row[2]
+                        or canonical_serialize(cost) != status_row[3]):
+                    raise ValueError("noncanonical observation amounts")
+                result = ModelEgressRecoveryV1(
+                    intent, row[5], row[6], tuple(tuple(item) for item in usage),
+                    tuple(tuple(item) for item in cost), bool(status_row[4]))
+                content_exists = db.execute(
+                    "SELECT 1 FROM authority_model_egress_observations_v1 WHERE call_id=?",
+                    (call_id,),
+                ).fetchone() is not None
+                if content_exists == result.content_erased:
+                    raise ValueError("observation content and erasure marker differ")
+                return result
+            if status_row is not None:
+                raise ValueError("unobserved egress has observation metadata")
+            return ModelEgressRecoveryV1(intent, row[5], row[6])
         except (TypeError, ValueError, UnicodeError) as exc:
             raise AuthorityUnavailable("persisted model egress record is invalid") from exc
+
+    @staticmethod
+    def _read_observation_locked(db: sqlite3.Connection,
+                                 intent: ModelEgressIntentV1) -> ModelEgressObservationV1:
+        """Internal only; production reads require future graph and deletion proofs."""
+        if type(intent) is not ModelEgressIntentV1 or not db.in_transaction:
+            raise AuthorityUnavailable("typed original call and Authority transaction required")
+        recovery = AuthorityV2ModelEgressStore._read(db, intent.call_id)
+        if (recovery is None or recovery.intent != intent
+                or recovery.state not in {"observed", "unknown"}
+                or recovery.content_erased):
+            raise AuthorityUnavailable("original provider content is unavailable")
+        row = db.execute(
+            "SELECT observation_json,observation_digest FROM authority_model_egress_observations_v1 WHERE call_id=?",
+            (intent.call_id,),
+        ).fetchone()
+        try:
+            if row is None:
+                raise ValueError("observation body absent")
+            observation = _decoded_observation(row[0])
+            if (observation.digest != row[1] or row[1] != recovery.observation_digest
+                    or observation.status != ("completed" if recovery.state == "observed" else "unknown")
+                    or observation.usage != recovery.usage or observation.cost != recovery.cost
+                    or (observation.authority_id, observation.namespace,
+                        observation.subject, observation.operation_id,
+                        observation.call_id, observation.request_digest) !=
+                       (intent.authority_id, intent.namespace,
+                        intent.subject, intent.operation_id,
+                        intent.call_id, intent.request_digest)):
+                raise ValueError("observation differs from original call")
+            return observation
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise AuthorityUnavailable("persisted provider content is invalid") from exc
 
     def prepare(self, intent: ModelEgressIntentV1) -> ModelEgressRecoveryV1:
         if type(intent) is not ModelEgressIntentV1:
@@ -301,6 +397,13 @@ class AuthorityV2ModelEgressStore:
         old = self._read(db, observation.call_id)
         if old is None or old.state != "dispatch_started":
             raise AuthorityUnavailable("original dispatch marker is absent or already resolved")
+        if (observation.authority_id, observation.namespace,
+            observation.subject, observation.operation_id,
+            observation.call_id, observation.request_digest) != (
+            old.intent.authority_id, old.intent.namespace,
+            old.intent.subject, old.intent.operation_id,
+            old.intent.call_id, old.intent.request_digest):
+            raise ValueError("observation differs from original call")
         if not self.is_fence_bound_locked(db, old.intent):
             raise AuthorityUnavailable("original dispatch lacks atomic fence binding")
         fence = db.execute(
@@ -311,11 +414,19 @@ class AuthorityV2ModelEgressStore:
             raise AuthorityUnavailable("original model fence is not active")
         target_state = "observed" if observation.status == "completed" else "unknown"
         target = ModelEgressRecoveryV1(old.intent, target_state,
-                                       observation.digest, observation)
+                                       observation.digest, observation.usage,
+                                       observation.cost)
         raw = canonical_serialize(asdict(observation))
         db.execute(
             "INSERT INTO authority_model_egress_observations_v1(call_id,observation_json,observation_digest) VALUES(?,?,?)",
             (observation.call_id, raw, observation.digest),
+        )
+        db.execute(
+            "INSERT INTO authority_model_egress_observation_status_v1 "
+            "(call_id,observation_digest,status,usage_json,cost_json,content_erased) "
+            "VALUES(?,?,?,?,?,0)",
+            (observation.call_id, observation.digest, observation.status,
+             canonical_serialize(observation.usage), canonical_serialize(observation.cost)),
         )
         updated = db.execute(
             "UPDATE authority_model_egress_v1 SET state=?,observation_digest=? "
@@ -325,6 +436,37 @@ class AuthorityV2ModelEgressStore:
         if updated.rowcount != 1:
             raise AuthorityUnavailable("original dispatch identity changed")
         return target
+
+    def _erase_observation_content_locked(self, db: sqlite3.Connection,
+                                          intent: ModelEgressIntentV1) -> ModelEgressRecoveryV1:
+        """Internal D12 cleanup primitive; caller must first prove barrier and closure.
+
+        This method supplies no deletion admission or cleanup receipt. It only
+        removes content inside an Authority transaction, preserving the original
+        call, state, digest and accounting summary so a send cannot be retried.
+        """
+        if db is not self._db or not db.in_transaction or type(intent) is not ModelEgressIntentV1:
+            raise AuthorityUnavailable("typed original call and Authority transaction required")
+        recovery = self.read_locked(db, intent)
+        if recovery.state not in {"observed", "unknown"}:
+            raise AuthorityUnavailable("unobserved call has no content to erase")
+        if recovery.content_erased:
+            return recovery
+        self._read_observation_locked(db, intent)
+        removed = db.execute(
+            "DELETE FROM authority_model_egress_observations_v1 WHERE call_id=?",
+            (intent.call_id,),
+        )
+        marked = db.execute(
+            "UPDATE authority_model_egress_observation_status_v1 SET content_erased=1 "
+            "WHERE call_id=? AND content_erased=0 AND observation_digest=?",
+            (intent.call_id, recovery.observation_digest),
+        )
+        if removed.rowcount != 1 or marked.rowcount != 1:
+            raise AuthorityUnavailable("observation erasure lost exact identity")
+        return ModelEgressRecoveryV1(
+            intent, recovery.state, recovery.observation_digest,
+            recovery.usage, recovery.cost, True)
 
     def record_unknown(self, intent: ModelEgressIntentV1, *,
                        observation_digest: str) -> ModelEgressRecoveryV1:
