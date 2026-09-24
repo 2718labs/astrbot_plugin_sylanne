@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import hashlib
 import threading
 import unittest
 from types import SimpleNamespace
@@ -170,7 +171,8 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
 
     def admission_for(self, request):
         return LocalModelAdmission(
-            "admit:" + request.call_id, self.adapter.host_incarnation,
+            hashlib.sha256(("admit:" + request.call_id).encode()).hexdigest(),
+            self.adapter.host_incarnation,
             request.call_id, request.digest, self.admin_model.provider_config_digest)
 
     async def test_unadmitted_broker_invoke_never_sends(self):
@@ -182,7 +184,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         request = call_request()
         admission = self.admission_for(request)
         for changed in (
-            replace(admission, host_incarnation="other-process"),
+            replace(admission, host_incarnation="e" * 64),
             replace(admission, request_digest="e" * 64),
             replace(admission, provider_config_digest="e" * 64),
         ):
@@ -198,7 +200,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             request, admission, asyncio.Event())).status, "completed")
         with self.assertRaises(ValueError):
             await self.adapter.invoke_admitted(
-                request, replace(admission, admission_id="different"), asyncio.Event())
+                request, replace(admission, admission_id="f" * 64), asyncio.Event())
         other = replace(request, call_id=uuid4().hex)
         with self.assertRaises(ValueError):
             await self.adapter.invoke_admitted(

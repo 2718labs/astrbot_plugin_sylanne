@@ -42,6 +42,7 @@ from ..authority_service.v2_owner_session import (
 from ..authority_service.v2_execution_bridge import HandoffStartV2
 from ..authority_service.v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
+    ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
 )
 from ..authority_service.v2_model_egress_wire import (
     from_wire as model_from_wire, to_wire as model_to_wire,
@@ -521,6 +522,116 @@ class MtlsAuthorityTransport:
             {"namespace": namespace, "holder": holder, "intent": model_to_wire(intent)},
             protocol=AUTHORITY_V2_PROTOCOL)
         return self._model_response(response, grant, intent, None)
+
+    @staticmethod
+    def _model_admission_binding(
+        admission: ModelAdmissionV2, grant: InstallationGrantV2,
+        request: AuthorityProvisioningRequest, intent: ModelEgressIntentV1,
+        host_incarnation: str,
+    ) -> None:
+        if (type(admission) is not ModelAdmissionV2
+                or not grant.subject.startswith("mtls:sha256:")
+                or _SHA256.fullmatch(grant.subject.removeprefix("mtls:sha256:")) is None
+                or (admission.authority_id, admission.namespace, admission.subject,
+                    admission.operation_id, admission.call_id,
+                    admission.request_digest, admission.provider_config_digest,
+                    admission.installation_id, admission.observer_peer_sha256,
+                    admission.observer_profile_id, admission.manifest_digest,
+                    admission.host_incarnation) !=
+                   (intent.authority_id, intent.namespace, intent.subject,
+                    intent.operation_id, intent.call_id,
+                    intent.request_digest, intent.provider_config_digest,
+                    grant.installation_id, grant.subject.removeprefix("mtls:sha256:"),
+                    request.profile_id, grant.manifest_digest, host_incarnation)):
+            raise RuntimeError("authority model admission binding is invalid")
+
+    async def model_admit_dispatch_once_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str, holder: str,
+        intent: ModelEgressIntentV1, expected_anchor: RestoreAnchor,
+        model_request: ModelCallRequest, host_incarnation: str,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2, ModelAdmissionV2]:
+        self._model_identity(request, handshake, grant, namespace, holder, intent)
+        if (type(model_request) is not ModelCallRequest
+                or model_request.digest != intent.request_digest
+                or model_request.call_id != intent.call_id
+                or model_request.identity.operation_id != intent.operation_id
+                or (model_request.provider_id, model_request.model_id,
+                    model_request.max_output_tokens) !=
+                   (intent.provider_id, intent.model_id, intent.max_output_tokens)
+                or type(expected_anchor) is not RestoreAnchor
+                or (expected_anchor.authority_id, expected_anchor.namespace)
+                != (grant.authority_id, namespace)
+                or runtime_canonical_digest(asdict(expected_anchor)) != intent.anchor_digest
+                or type(host_incarnation) is not str
+                or not _SHA256.fullmatch(host_incarnation)):
+            raise RuntimeError("authority model request binding is invalid")
+        response = await self._content_rpc(
+            request, handshake, "model_admit_dispatch_once_v2",
+            {"namespace": namespace, "holder": holder, "intent": model_to_wire(intent),
+             "expected_anchor": asdict(expected_anchor),
+             "request": model_to_wire(model_request),
+             "host_incarnation": host_incarnation},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"record", "permit", "admission", "channel_binding_sha256"}:
+            raise RuntimeError("authority model admission response is invalid")
+        record, permit = self._model_response(
+            {key: response[key] for key in ("record", "permit", "channel_binding_sha256")},
+            grant, intent, "dispatch_started")
+        if permit.pinned_anchor != expected_anchor:
+            raise RuntimeError("authority model admission anchor is invalid")
+        try:
+            admission = model_from_wire(response["admission"], ModelAdmissionV2)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority model admission response is invalid") from exc
+        self._model_admission_binding(admission, grant, request, intent, host_incarnation)
+        return record, permit, admission
+
+    async def model_complete_observed_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str, holder: str,
+        intent: ModelEgressIntentV1, expected_anchor: RestoreAnchor,
+        admission: ModelAdmissionV2, report: HostObservedModelCompletionV2,
+    ) -> tuple[ModelEgressRecoveryV1, FencePermitV2, ModelTerminalReceiptV2]:
+        self._model_identity(request, handshake, grant, namespace, holder, intent)
+        if (type(expected_anchor) is not RestoreAnchor
+                or (expected_anchor.authority_id, expected_anchor.namespace)
+                != (grant.authority_id, namespace)
+                or runtime_canonical_digest(asdict(expected_anchor)) != intent.anchor_digest
+                or type(report) is not HostObservedModelCompletionV2):
+            raise RuntimeError("authority model completion binding is invalid")
+        self._model_admission_binding(
+            admission, grant, request, intent, report.host_incarnation)
+        if ((report.admission_id, report.call_id, report.request_digest,
+             report.provider_id, report.model_id, report.provider_config_digest) !=
+            (admission.admission_id, intent.call_id, intent.request_digest,
+             intent.provider_id, intent.model_id, intent.provider_config_digest)):
+            raise RuntimeError("authority model completion binding is invalid")
+        response = await self._content_rpc(
+            request, handshake, "model_complete_observed_v2",
+            {"namespace": namespace, "holder": holder, "intent": model_to_wire(intent),
+             "expected_anchor": asdict(expected_anchor),
+             "admission": model_to_wire(admission), "report": model_to_wire(report)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"record", "permit", "receipt", "channel_binding_sha256"}:
+            raise RuntimeError("authority model completion response is invalid")
+        record, permit = self._model_response(
+            {key: response[key] for key in ("record", "permit", "channel_binding_sha256")},
+            grant, intent, "observed")
+        try:
+            receipt = model_from_wire(response["receipt"], ModelTerminalReceiptV2)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority model completion response is invalid") from exc
+        if (permit.pinned_anchor != expected_anchor
+                or (receipt.admission_id, receipt.call_id, receipt.request_digest,
+                    receipt.report_digest, receipt.observation_digest,
+                    receipt.installation_id, receipt.host_incarnation) !=
+                   (admission.admission_id, intent.call_id, intent.request_digest,
+                    report.digest, report.observation_for(intent).digest,
+                    grant.installation_id, admission.host_incarnation)
+                or receipt.observation_digest != record.observation_digest):
+            raise RuntimeError("authority model terminal receipt binding is invalid")
+        return record, permit, receipt
 
     async def ingress_clock_sample_v2(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

@@ -12,8 +12,8 @@ import asyncio
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 import re
+import secrets
 from threading import Lock
-from uuid import uuid4
 
 from astrbot.api.star import Context
 from astrbot.core.provider.entities import ProviderMeta, ProviderType
@@ -48,7 +48,7 @@ class _CallEntry:
 _call_lock = Lock()
 _calls: dict[str, _CallEntry] = {}
 _admissions: dict[str, str] = {}
-_HOST_INCARNATION = uuid4().hex
+_HOST_INCARNATION = secrets.token_hex(32)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -66,8 +66,8 @@ class LocalModelAdmission:
         if (not all(type(value) is str and value for value in (
                 self.admission_id, self.host_incarnation, self.call_id,
                 self.request_digest, self.provider_config_digest))
-                or len(self.admission_id) > 256
-                or len(self.host_incarnation) > 128
+                or _SHA256.fullmatch(self.admission_id) is None
+                or _SHA256.fullmatch(self.host_incarnation) is None
                 or _SHA256.fullmatch(self.request_digest) is None
                 or _SHA256.fullmatch(self.provider_config_digest) is None):
             raise ValueError("invalid local model admission identity")

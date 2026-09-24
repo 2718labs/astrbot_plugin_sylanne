@@ -1,13 +1,14 @@
 """Real TLS model identity RPCs remain passive, bound to one installation."""
 
+import asyncio
 from dataclasses import replace
 import hashlib
 import ssl
-from types import SimpleNamespace
 
 import pytest
 
 from rewrite.host_tests.alpha1 import test_authority_mtls_loopback as loopback
+from rewrite.host_tests.alpha1 import test_astrbot_model_call as model_fixture
 from rewrite.tests.alpha1.authority.test_v2_model_egress_store import intent
 from rewrite.tests.alpha1.model_broker.test_broker import request as broker_request
 from sylanne3.authority_service import AuthorityServiceCore, JournalHead
@@ -31,8 +32,10 @@ from sylanne3.host.authority_client import (
     AuthoritySelection, PublisherPackageIdentity,
 )
 from sylanne3.host.authority_profile import (
-    AdminIngressModelPolicy, AdminInstallationBundle, installed_model_config_ref,
+    AdminIngressModelPolicy, installed_model_config_ref,
 )
+from sylanne3.host.astrbot_model_call import AstrBotModelProvider
+from sylanne3.host.model_egress_executor import HostModelEgressExecutor
 from sylanne3.host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime_contracts import NamespaceId
@@ -72,6 +75,7 @@ async def test_model_identity_rpc_real_mtls_binding_digest_and_replay(tmp_path, 
     listener = None
     transports = []
     server = None
+    host_fixture = None
     try:
         core.register_namespace(peers["client"], "ns:role", "host:one", deletion_head,
                                 JournalHead("execution", 0, "genesis"))
@@ -93,6 +97,7 @@ async def test_model_identity_rpc_real_mtls_binding_digest_and_replay(tmp_path, 
             fences, graph_verifier=verifier, admin_model_policy=policy)
         server = AuthorityRpcServer(
             core, v2_fences=fences, v2_model_egress={"ns:role": model},
+            model_observers_v2={"ns:role": (peers["client"].certificate_sha256, "first")},
             administrator_authorizer=lambda peer, action, namespace, holder:
                 peer in peers.values() and action == "pair"
                 and namespace == "authority:enrollment",
@@ -146,6 +151,79 @@ async def test_model_identity_rpc_real_mtls_binding_digest_and_replay(tmp_path, 
             authority_deletion_seq=anchor.deletion_seq,
             authority_execution_seq=anchor.execution_seq,
             request_digest=call.digest, budget_ceiling=(("output_tokens", 256),)))
+        client = AuthorityClient(
+            AuthoritySelection("first"), package_root=tmp_path, data_dir=tmp_path,
+            transport=transport)
+        assert (await client.status_v2()).state == "paired"
+        current_grant = await client.installation_grant_v2()
+        handshake = client._v2_handshake
+        grant = current_grant
+        installed_profile = transport.profile_for("first")
+        host_fixture = model_fixture.AstrBotModelCallTests(
+            methodName="test_one_http_request_on_host_loop_with_usage")
+        await host_fixture.asyncSetUp()
+        host_base = model_fixture.call_request()
+        call2 = replace(
+            host_base, call_id="call-2",
+            envelope=replace(
+                host_base.envelope,
+                identity=replace(host_base.identity, operation_id="job-operation-2"),
+                authority=replace(
+                    host_base.envelope.authority, actor=subject,
+                    issuer_domain="d11", namespace=NamespaceId("bot-a", "persona-a"),
+                    worker_fence=7),
+                version_guard=replace(host_base.envelope.version_guard,
+                                      read_versions=(), query_epochs=())))
+        draft2 = replace(
+            draft, call_id="call-2", job_id="job-2",
+            operation_id="job-operation-2", request_digest=call2.digest,
+            provider_config_digest=host_fixture.admin_model.provider_config_digest,
+            max_output_tokens=64, budget_ceiling=(("output_tokens", 128),))
+        base_policy = host_fixture.bundle.installation_policy
+        executor_policy = replace(
+            base_policy, namespace=NamespaceId("bot-a", "persona-a"),
+            authority_namespace="ns:role", installation_id="installation-a",
+            manifest_digest=manifest_digest, administrator_holder="host:one",
+            expected_authority_id=server._authority_id(),
+            root_lease=replace(base_policy.root_lease,
+                               bot_id="bot-a", persona_id="persona-a"),
+            root_grant=replace(base_policy.root_grant,
+                               bot_id="bot-a", persona_id="persona-a"))
+        executor_bundle = replace(
+            host_fixture.bundle, tls_profile=installed_profile,
+            installation_policy=executor_policy)
+        bundle = executor_bundle
+        adapter = AstrBotModelProvider(
+            context=host_fixture.context, host_loop=asyncio.get_running_loop(),
+            trusted_umo=model_fixture.UMO, descriptor=host_fixture.descriptor,
+            admin_model=host_fixture.admin_model,
+            installation_bundle=executor_bundle)
+        model._admin_model_policy = host_fixture.admin_model
+        prepared2, _ = await client.model_prepare_fenced_v1(
+            executor_bundle, grant, draft=draft2, expected_anchor=anchor)
+        with pytest.raises(RuntimeError, match="request binding"):
+            await client.model_admit_dispatch_once_v2(
+                executor_bundle, grant,
+                intent=prepared2.intent, expected_anchor=anchor,
+                model_request=replace(call2, payload={"prompt": "changed"}),
+                host_incarnation="b" * 64)
+        assert host_fixture.requests == []
+        executor = HostModelEgressExecutor(
+            authority=client, bundle=executor_bundle, grant=grant, adapter=adapter)
+        receipt2 = await executor.execute_once(
+            intent=prepared2.intent, expected_anchor=anchor, request=call2)
+        assert receipt2 is not None
+        assert len(host_fixture.requests) == 1
+        assert host_fixture.requests[0][1].url.host == "mock.invalid"
+        assert (await client.model_recover_fenced_v1(
+            executor_bundle, grant, intent=prepared2.intent))[0].state == "observed"
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await client.model_admit_dispatch_once_v2(
+                executor_bundle, grant,
+                intent=prepared2.intent, expected_anchor=anchor,
+                model_request=call2, host_incarnation=adapter.host_incarnation)
+        assert len(host_fixture.requests) == 1
+        model._admin_model_policy = policy
         prepared, permit = await transport.model_prepare_fenced_v1(
             provisioning, handshake, grant, namespace="ns:role", holder="host:one",
             draft=draft, expected_anchor=anchor)
@@ -175,39 +253,27 @@ async def test_model_identity_rpc_real_mtls_binding_digest_and_replay(tmp_path, 
         admitted, _ = await transport.model_admit_dispatch_once_v1(
             provisioning, handshake, grant, namespace="ns:role", holder="host:one",
             intent=prepared.intent, expected_anchor=anchor, model_request=call)
-        assert admitted.state == "dispatch_started" and len(checked) == 1
+        assert admitted.state == "dispatch_started" and len(checked) == 2
         with pytest.raises(RuntimeError, match="unavailable"):
             await transport.model_admit_dispatch_once_v1(
                 provisioning, handshake, grant, namespace="ns:role", holder="host:one",
                 intent=prepared.intent, expected_anchor=anchor, model_request=call)
-        assert len(checked) == 1
+        assert len(checked) == 2
         recovered, _ = await transport.model_recover_fenced_v1(
             provisioning, handshake, grant, namespace="ns:role", holder="host:one",
             intent=prepared.intent)
         assert recovered.state == "dispatch_started"
-        client = AuthorityClient(
-            AuthoritySelection("first"), package_root=tmp_path, data_dir=tmp_path,
-            transport=transport)
-        assert (await client.status_v2()).state == "paired"
-        current_grant = await client.installation_grant_v2()
-        installed_profile = transport.profile_for("first")
-        installed_policy = SimpleNamespace(
-            expected_authority_id=server._authority_id(),
-            installation_id="installation-a", manifest_digest=manifest_digest,
-            administrator_holder="host:one", authority_namespace="ns:role",
-            namespace=NamespaceId("bot-a", "persona-a"))
-        bundle = AdminInstallationBundle(
-            installed_profile, installed_policy, b"k" * 32, b"d" * 32)
         assert (await client.model_recover_fenced_v1(
             bundle, current_grant, intent=prepared.intent))[0].state == "dispatch_started"
-        drifted = AdminInstallationBundle(
-            installed_profile, SimpleNamespace(**{
-                **vars(installed_policy), "manifest_digest": "e" * 64}),
-            b"k" * 32, b"d" * 32)
+        drifted = replace(
+            bundle, installation_policy=replace(
+                executor_policy, manifest_digest="e" * 64))
         with pytest.raises(RuntimeError, match="installation binding"):
             await client.model_recover_fenced_v1(
                 drifted, current_grant, intent=prepared.intent)
     finally:
+        if host_fixture is not None:
+            await host_fixture.asyncTearDown()
         for transport in transports:
             await transport.close()
         if server is not None:
