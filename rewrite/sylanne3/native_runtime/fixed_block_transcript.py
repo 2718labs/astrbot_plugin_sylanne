@@ -11,6 +11,8 @@ from dataclasses import dataclass, fields
 import hashlib
 import json
 import math
+import struct
+from typing import Sequence
 
 from .abi2 import (
     ABI2CSR,
@@ -127,6 +129,137 @@ class FixedBlockMathTranscript:
     input_sha256: str
     output_sha256: str
     transcript_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class FixedBlockContinuation:
+    """Next step settings and complete model, without caller-supplied chain state.
+
+    The trajectory runner supplies ``previous``, ``iterate`` and
+    ``previous_error`` from the preceding native result. A changed model is
+    rejected before the next native call; parameter switches need their own
+    mathematical mapping certificate.
+    """
+
+    k: FixedBlockCSR
+    r: FixedBlockCSR
+    j: FixedBlockCSR
+    a: FixedBlockCSR
+    alpha: tuple[float, ...]
+    drive: tuple[float, ...]
+    h: float
+    max_iterations: int
+    tolerance: float
+
+    def __post_init__(self) -> None:
+        n = self.k.rows
+        zero = (0.0,) * n
+        # Reuse the ABI2 input gate, including finite values and dimensions.
+        checked = FixedBlockStep(
+            self.k, self.r, self.j, self.a, self.alpha, zero, self.drive,
+            zero, self.h, 0.0, self.max_iterations, self.tolerance,
+        )
+        object.__setattr__(self, "alpha", checked.alpha)
+        object.__setattr__(self, "drive", checked.drive)
+        object.__setattr__(self, "h", checked.h)
+        object.__setattr__(self, "tolerance", checked.tolerance)
+
+    @classmethod
+    def from_step(cls, step: FixedBlockStep, *, h: float | None = None,
+                  max_iterations: int | None = None,
+                  tolerance: float | None = None) -> FixedBlockContinuation:
+        return cls(
+            step.k, step.r, step.j, step.a, step.alpha, step.drive,
+            step.h if h is None else h,
+            step.max_iterations if max_iterations is None else max_iterations,
+            step.tolerance if tolerance is None else tolerance,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FixedBlockTrajectoryMathTranscript:
+    """Conditional fixed-model numerical chain from a supplied initial error.
+
+    The initial error is a caller assertion; neither this transcript nor ABI2
+    establish its external provenance or D04 product eligibility.
+    """
+
+    steps: tuple[FixedBlockMathTranscript, ...]
+    initial_error: float
+    final_error: float
+    production_binding: NativeLoadBinding
+    transcript_sha256: str
+
+
+def _same_float_bits(lhs: tuple[float, ...], rhs: tuple[float, ...]) -> bool:
+    return len(lhs) == len(rhs) and all(
+        struct.pack("!d", left) == struct.pack("!d", right)
+        for left, right in zip(lhs, rhs)
+    )
+
+
+def _same_csr_bits(lhs: FixedBlockCSR, rhs: FixedBlockCSR) -> bool:
+    return (
+        lhs.rows == rhs.rows and lhs.cols == rhs.cols
+        and lhs.offsets == rhs.offsets and lhs.indices == rhs.indices
+        and _same_float_bits(lhs.values, rhs.values)
+    )
+
+
+def _same_fixed_model(first: FixedBlockStep, next_step: FixedBlockContinuation) -> bool:
+    return (
+        all(_same_csr_bits(getattr(first, name), getattr(next_step, name))
+            for name in ("k", "r", "j", "a"))
+        and _same_float_bits(first.alpha, next_step.alpha)
+        and _same_float_bits(first.drive, next_step.drive)
+    )
+
+
+def run_fixed_block_trajectory_math(
+    handle: ABI2NativeLibrary,
+    first: FixedBlockStep,
+    continuations: Sequence[FixedBlockContinuation],
+) -> FixedBlockTrajectoryMathTranscript:
+    """Run at most 1025 package-bound steps with an unchanged complete model.
+
+    Each native call receives the exact preceding output as its state and the
+    preceding outward interval upper bound as its inherited error. The first
+    step's ``previous_error`` remains a conditional caller-supplied premise.
+    """
+    if not isinstance(first, FixedBlockStep):
+        raise TypeError("first must be an immutable FixedBlockStep")
+    if not isinstance(continuations, Sequence) or not 1 <= len(continuations) <= 1024:
+        raise ValueError("fixed trajectory requires 1 to 1024 continuations")
+    planned = tuple(continuations)
+    if any(not isinstance(step, FixedBlockContinuation) for step in planned):
+        raise TypeError("continuations must be immutable FixedBlockContinuation values")
+    if any(not _same_fixed_model(first, step) for step in planned):
+        raise ABI2ResultError("fixed trajectory parameter or drive switch requires a separate certificate")
+
+    recorded = [run_fixed_block_math(handle, first)]
+    for continuation in planned:
+        previous = recorded[-1]
+        step = FixedBlockStep(
+            continuation.k, continuation.r, continuation.j, continuation.a,
+            continuation.alpha, previous.output, continuation.drive,
+            previous.output, continuation.h, previous.bounds.trajectory_error,
+            continuation.max_iterations, continuation.tolerance,
+        )
+        recorded.append(run_fixed_block_math(handle, step))
+
+    steps = tuple(recorded)
+    binding = steps[0].production_binding
+    digest = _digest({
+        "schema": "abi2.fixed-block-trajectory-math-transcript.v1",
+        "initial_error": first.previous_error,
+        "final_error": steps[-1].bounds.trajectory_error,
+        "production_binding": {field.name: getattr(binding, field.name) for field in fields(binding)},
+        "steps": [step.transcript_sha256 for step in steps],
+    })
+    return FixedBlockTrajectoryMathTranscript(
+        steps, first.previous_error, steps[-1].bounds.trajectory_error,
+        binding, digest,
+    )
 
 
 def run_fixed_block_math(handle: ABI2NativeLibrary, block: FixedBlockStep) -> FixedBlockMathTranscript:

@@ -20,11 +20,13 @@ from sylanne3.native_runtime import (
     D04CandidateError,
     D04ProductionReadoutUnavailable,
     FixedBlockCSR,
+    FixedBlockContinuation,
     FixedBlockStep,
     load_production_native,
     require_d04_production_readout,
     run_d04_fixed_block_candidate,
     run_fixed_block_math,
+    run_fixed_block_trajectory_math,
 )
 from sylanne3.domains.d04 import AffectAxis, AffectScheme
 from sylanne3.native_runtime.d04_engineering_scheme import build_d04_engineering_candidate
@@ -168,6 +170,79 @@ class FixedBlockTranscriptTests(unittest.TestCase):
         else:
             _ctypes.dlclose(library._handle)
         library._handle = 0
+
+    def test_fixed_model_trajectory_inherits_native_enclosure_and_matches_exact_flow(self) -> None:
+        first = _block()
+        continuations = (
+            FixedBlockContinuation.from_step(first, h=0.05),
+            FixedBlockContinuation.from_step(first, h=0.08),
+        )
+        trajectory = run_fixed_block_trajectory_math(self.handle, first, continuations)
+        self.assertEqual(len(trajectory.steps), 3)
+        self.assertEqual(trajectory.initial_error, first.previous_error)
+        self.assertEqual(trajectory.final_error, trajectory.steps[-1].bounds.trajectory_error)
+        self.assertEqual(trajectory.production_binding, self.handle.production_binding)
+        self.assertTrue(self.handle.capabilities.diagnostic_only)
+        self.assertFalse(self.handle.capabilities.numerically_certified)
+
+        # The ODE is x'=[[-2, .4],[-.4,-2]]x. Its matrix exponential is
+        # independent of the kernel's AVF discretization and interval code.
+        exact_initial = (first.previous[0] + 0.00005, first.previous[1])
+        elapsed = 0.0
+        for index, transcript in enumerate(trajectory.steps):
+            elapsed += transcript.input.h
+            decay = math.exp(-2.0 * elapsed)
+            cosine = math.cos(0.4 * elapsed)
+            sine = math.sin(0.4 * elapsed)
+            exact = (
+                decay * (cosine * exact_initial[0] + sine * exact_initial[1]),
+                decay * (-sine * exact_initial[0] + cosine * exact_initial[1]),
+            )
+            self.assertLessEqual(math.dist(transcript.output, exact), transcript.bounds.trajectory_error)
+            self.assertEqual(transcript.bounds.certificate_flags, 1)
+            if index:
+                prior = trajectory.steps[index - 1]
+                self.assertEqual(transcript.input.previous, prior.output)
+                self.assertEqual(transcript.input.iterate, prior.output)
+                self.assertEqual(transcript.input.previous_error, prior.bounds.trajectory_error)
+
+        # Resetting the inherited error changes the actual native enclosure.
+        second = trajectory.steps[1]
+        reset = run_fixed_block_math(self.handle, replace(second.input, previous_error=0.0))
+        self.assertLess(reset.bounds.trajectory_error, second.bounds.trajectory_error)
+        self.assertNotEqual(reset.input_sha256, second.input_sha256)
+
+        binding = trajectory.production_binding
+        digest_payload = {
+            "schema": "abi2.fixed-block-trajectory-math-transcript.v1",
+            "initial_error": trajectory.initial_error,
+            "final_error": trajectory.final_error,
+            "production_binding": {field.name: getattr(binding, field.name) for field in fields(binding)},
+            "steps": [step.transcript_sha256 for step in trajectory.steps],
+        }
+        expected = hashlib.sha256(json.dumps(
+            digest_payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()).hexdigest()
+        self.assertEqual(trajectory.transcript_sha256, expected)
+        changed = run_fixed_block_trajectory_math(
+            self.handle, first, (FixedBlockContinuation.from_step(first, h=0.06), continuations[1]),
+        )
+        self.assertNotEqual(changed.transcript_sha256, trajectory.transcript_sha256)
+
+    def test_fixed_model_trajectory_rejects_parameter_switch_and_unbounded_chain(self) -> None:
+        first = _block()
+        valid = FixedBlockContinuation.from_step(first)
+        with self.assertRaisesRegex(ABI2ResultError, "parameter or drive switch"):
+            run_fixed_block_trajectory_math(
+                self.handle, first, (valid, replace(valid, drive=(0.01, 0.0))),
+            )
+        with self.assertRaisesRegex(ABI2ResultError, "parameter or drive switch"):
+            run_fixed_block_trajectory_math(
+                self.handle, first,
+                (replace(valid, j=FixedBlockCSR(2, 2, (0, 1, 2), (1, 0), (0.3, -0.3))),),
+            )
+        with self.assertRaisesRegex(ValueError, "1 to 1024"):
+            run_fixed_block_trajectory_math(self.handle, first, ())
 
     def test_real_package_bound_step_retains_actual_values_and_hashes(self) -> None:
         block = _block()

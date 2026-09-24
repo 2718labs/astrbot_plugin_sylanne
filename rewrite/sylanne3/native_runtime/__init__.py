@@ -26,9 +26,12 @@ from .arithmetic_report import (
 )
 from .fixed_block_transcript import (
     FixedBlockCSR,
+    FixedBlockContinuation,
     FixedBlockMathTranscript,
     FixedBlockStep,
+    FixedBlockTrajectoryMathTranscript,
     run_fixed_block_math,
+    run_fixed_block_trajectory_math,
 )
 from .d04_candidate import (
     D04CandidateError,
@@ -60,9 +63,12 @@ __all__ = [
     "parse_fixed_block_interval_result",
     "load_production_native",
     "FixedBlockCSR",
+    "FixedBlockContinuation",
     "FixedBlockMathTranscript",
     "FixedBlockStep",
+    "FixedBlockTrajectoryMathTranscript",
     "run_fixed_block_math",
+    "run_fixed_block_trajectory_math",
     "D04CandidateError",
     "D04FixedBlockCandidate",
     "D04ProductionReadoutUnavailable",
