@@ -18,7 +18,7 @@ from .authority_profile import (
 )
 from .ingress import HostIngressEnvelope, IngressReceipt
 from .model_egress_executor import HostModelEgressExecutor
-from .mtls_transport import MtlsAuthorityTransport
+from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 from .v2_installation import V2InstallationAssembly
 
 
@@ -47,6 +47,7 @@ async def run_installed_first_ingress_c02_v1(
     grant = installation.installation_grant
     if (type(bundle) is not AdminInstallationBundle
             or type(grant) is not InstallationGrantV2
+            or type(bundle.tls_profile) is not AuthorityTlsProfile
             or bundle.installation_policy is not installation.installation_policy
             or type(bundle.d06_first_ingress_c02)
                is not AdminD06FirstIngressC02Policy

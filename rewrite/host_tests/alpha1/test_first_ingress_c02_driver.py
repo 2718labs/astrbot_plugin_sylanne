@@ -93,6 +93,9 @@ async def test_explicit_c02_driver_uses_paired_bundle_and_holds_without_it(
         assert await run(replace(
             installation, admin_bundle=replace(
                 bundle, d06_first_ingress_c02=None))) is None
+        assert await run(replace(
+            installation, admin_bundle=replace(
+                bundle, tls_profile=None))) is None
         assert calls == [(envelope, receipt)]
         pairing["state"] = "unpaired"
         assert await run(installation) is None
