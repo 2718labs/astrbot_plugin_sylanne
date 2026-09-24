@@ -302,6 +302,9 @@ class AuthorityV2FenceService:
                      request_digest: str) -> None:
         """Finish under both writer guards; exact completed retries return no permit."""
         self._require_permit(credential=credential, subject=subject, permit=permit)
+        if permit.operation == "model_egress":
+            raise AuthorityUnavailable(
+                "model_egress requires typed durable observation before finish; HOLD")
         with self._frozen() as (db, deletion_head, execution_head, deletion_history):
             anchor = self._current_locked(
                 db, deletion_head, execution_head, holder=permit.holder,

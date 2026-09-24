@@ -706,6 +706,9 @@ class AuthorityV2FenceStore:
         """Finish within the caller's already-held Authority transaction."""
         if type(permit) is not FencePermitV2:
             raise AuthorityUnavailable("invalid v2 fence permit")
+        if permit.operation == "model_egress":
+            raise AuthorityUnavailable(
+                "model_egress requires typed durable observation before finish; HOLD")
         identifier(subject, "subject")
         identifier(request_id, "request_id")
         # Reuse strict DTO digest validation without accepting a caller token.

@@ -91,6 +91,7 @@ def test_exclusive_retry_finish_epoch_and_restart(tmp_path):
         begin(store, operation_id="op-b")
     db.close()
 
+
     db, store = open_store(path)
     assert store.get_operation("op-a", subject="subject-a", namespace="ns-a") == (first, "active", None)
     with pytest.raises(AuthorityUnavailable):
@@ -109,6 +110,28 @@ def test_exclusive_retry_finish_epoch_and_restart(tmp_path):
     with pytest.raises(AuthorityUnavailable):
         begin(store)
     db.close()
+
+
+def test_generic_store_finish_holds_model_egress(tmp_path):
+    db, store = open_store(tmp_path / "model-egress.db", create=True)
+    try:
+        permit = begin(store, operation="model_egress")
+        assert store.validate_fence(
+            permit, subject="subject-a", current_anchor=anchor()) == permit
+        with pytest.raises(AuthorityUnavailable, match="model_egress.*HOLD"):
+            finish(store, permit)
+        with pytest.raises(AuthorityUnavailable, match="model_egress.*HOLD"):
+            with store._tx() as transaction:
+                store.finish_fence_locked(
+                    transaction, permit, subject="subject-a",
+                    current_anchor=anchor(), request_id="finish-locked",
+                    request_digest=digest("e"),
+                )
+        assert store.get_operation(
+            permit.operation_id, subject="subject-a", namespace="ns-a"
+        ) == (permit, "active", None)
+    finally:
+        db.close()
 
 
 def test_identity_anchor_and_finish_conflicts_fail_closed(tmp_path):
