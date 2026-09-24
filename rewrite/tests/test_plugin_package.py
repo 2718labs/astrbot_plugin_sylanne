@@ -402,6 +402,33 @@ class PluginPackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dangerous"):
             self.builder.verify_package(dangerous)
 
+    def test_verifier_rejects_missing_entrypoint_or_runtime_source(self) -> None:
+        package = self.builder.build_package(
+            project_root=self.project,
+            target_os="windows",
+            target_arch="x86_64",
+            native_library=self._native(),
+            output_dir=self.base / "complete",
+            allow_dirty_dev_probe=True,
+        )
+        with zipfile.ZipFile(package) as archive:
+            original = {name: archive.read(name) for name in archive.namelist()}
+        for missing in ("main.py", "rewrite/sylanne3/__init__.py",
+                        "rewrite/sylanne3/runtime.py"):
+            with self.subTest(missing=missing):
+                members = original.copy()
+                members.pop(missing)
+                manifest = json.loads(members["release-manifest.json"])
+                manifest["files"] = [entry for entry in manifest["files"]
+                                     if entry["path"] != missing]
+                members["release-manifest.json"] = json.dumps(manifest).encode()
+                tampered = self.base / f"without-{missing.replace('/', '-')}.zip"
+                with zipfile.ZipFile(tampered, "w") as archive:
+                    for name, content in members.items():
+                        archive.writestr(name, content)
+                with self.assertRaisesRegex(ValueError, "missing .*source"):
+                    self.builder.verify_package(tampered)
+
     def test_verifier_rejects_dev_version_claiming_formal_alpha1(self) -> None:
         package = self.builder.build_package(
             project_root=self.project,

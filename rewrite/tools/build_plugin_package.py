@@ -342,9 +342,11 @@ def _read_allowlisted_payload(
         raise FileNotFoundError("runtime allowlist matched no Python source files")
     for source in runtime_files:
         relative_parts = source.relative_to(project_root).parts
-        if source.is_symlink() or "__pycache__" in relative_parts:
+        if "__pycache__" in relative_parts:
             continue
         relative = PurePosixPath(*relative_parts).as_posix()
+        if source.is_symlink():
+            raise ValueError(f"runtime Python source is a symlink: {relative}")
         _validate_member_path(relative)
         payload[relative] = source.read_bytes()
 
@@ -678,6 +680,17 @@ def verify_package(package: Path | str) -> None:
             expected = set(names) - {MANIFEST_PATH}
             if set(listed) != expected:
                 raise ValueError("ReleaseManifest file set does not match ZIP members")
+            required_source = REQUIRED_ROOT_FILES | {
+                "rewrite/sylanne3/__init__.py",
+            }
+            if not required_source.issubset(listed):
+                raise ValueError("ReleaseManifest is missing required plugin or runtime source")
+            if not any(
+                member.startswith("rewrite/sylanne3/") and member.endswith(".py")
+                and member != "rewrite/sylanne3/__init__.py"
+                for member in listed
+            ):
+                raise ValueError("ReleaseManifest is missing runtime implementation source")
             for member, entry in listed.items():
                 content = archive.read(member)
                 if entry.get("bytes") != len(content):
