@@ -103,7 +103,8 @@ class WorkbenchIssuer(Protocol):
     """W01/W09-backed coordinator facade. It is the only route to real writes."""
 
     def read_projection(self, *, session: AuthenticatedSession, scope: str, view_type: str,
-                        purpose: str, audience: str) -> Mapping[str, Any]: ...
+                        purpose: str, audience: str, cursor: str | None = None,
+                        page_size: int = 100) -> Mapping[str, Any]: ...
 
     def open_workspace(self, *, session: AuthenticatedSession, scope: str, purpose: str,
                        audience: str) -> Mapping[str, Any]: ...
@@ -144,7 +145,9 @@ class WorkbenchService:
             if command["action"] == "read_character_view":
                 returned = self._issuer.read_projection(session=session, scope=command["scope"],
                                                          view_type=command["input"]["view_type"],
-                                                         purpose=command["purpose"], audience=command["audience"])
+                                                         purpose=command["purpose"], audience=command["audience"],
+                                                         cursor=command["input"].get("cursor"),
+                                                         page_size=command["input"].get("page_size", 100))
                 return self._projection_response(returned)
             returned = self._issuer.execute(session=session, action=command["action"], scope=command["scope"],
                                             purpose=command["purpose"], audience=command["audience"],
@@ -223,6 +226,9 @@ class WorkbenchService:
                 raise ValueError("bind_scene requires an acknowledged visibility")
         if "page_size" in input_data and (type(input_data["page_size"]) is not int or not 1 <= input_data["page_size"] <= 100):
             raise ValueError("page_size must be an integer from 1 through 100")
+        if "cursor" in input_data and (type(input_data["cursor"]) is not str
+                                        or not 1 <= len(input_data["cursor"]) <= 4096):
+            raise ValueError("cursor must be a bounded string")
         return {"action": action, "scope": scope, "purpose": purpose, "audience": audience,
                 "operation_id": operation_id, "input": input_data}
 

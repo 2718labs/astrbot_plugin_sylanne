@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from uuid import uuid4
 from types import MappingProxyType
+import json
 import pytest
 
 from sylanne3.domain_registry import DomainRegistration, DomainRegistry
+from sylanne3.contracts import StaleRead
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphPage, GraphSnapshot, NamespaceEpoch, Owner
 from sylanne3.graph_types import TypeRegistry, TypeSpec
 from sylanne3.runtime_contracts import AuthorityContext, NamespaceId
@@ -94,6 +96,70 @@ def test_character_view_uses_single_coordinator_snapshot_and_server_grant():
     assert answer.projection["coverage"]["truncated"] is False
     assert coordinator.calls[0][2]["owner_kind"] == "persona"
     assert resolver.calls[0]["scope"] == SCOPE
+
+
+def test_graph_view_paginates_owner_plans_at_one_epoch_and_rejects_stale_page():
+    provider, coordinator, _ = issuer()
+    first = GraphAtom(AtomKey(Owner("persona", "bot", "persona"),
+                              "d01.persona_plan.v1", "plan-a"), 1, {"label": "first"})
+    second = GraphAtom(AtomKey(Owner("persona", "bot", "persona"),
+                               "d01.persona_plan.v1", "plan-b"), 1, {"label": "second"})
+    epoch = NamespaceEpoch("bot", "persona", 9)
+
+    def query(_authority, _lease, **kwargs):
+        coordinator.calls.append(kwargs)
+        if kwargs["expected_epoch"] is not None and kwargs["expected_epoch"] != epoch:
+            raise StaleRead("graph changed")
+        atoms = (first, second)
+        start = 0 if kwargs["after"] is None else atoms.index(next(
+            atom for atom in atoms if atom.key == kwargs["after"])) + 1
+        selected = atoms[start:start + kwargs["limit"]]
+        next_after = selected[-1].key if start + kwargs["limit"] < len(atoms) else None
+        return GraphPage(GraphSnapshot(selected, (epoch,)), next_after)
+
+    coordinator.query = query
+    first_request = request(view_type="overview", page_size=1)
+    first_page = WorkbenchService(provider).handle(first_request, session=SESSION, context=CONTEXT)
+    assert first_page.status == "ready"
+    assert first_page.projection["data"] == {"summary": "overview:1"}
+    assert first_page.projection["coverage"]["truncated"] is True
+    cursor = first_page.projection["next_cursor"]
+    assert json.loads(cursor)["epoch"] == 9
+
+    second_page = WorkbenchService(provider).handle(
+        request(view_type="overview", page_size=1, cursor=cursor),
+        session=SESSION, context=CONTEXT)
+    assert second_page.status == "ready"
+    assert second_page.projection["next_cursor"] is None
+    assert coordinator.calls[-1]["after"] == first.key
+    assert coordinator.calls[-1]["limit"] == 1
+
+    epoch = NamespaceEpoch("bot", "persona", 10)
+    stale = WorkbenchService(provider).handle(
+        request(view_type="overview", page_size=1, cursor=cursor),
+        session=SESSION, context=CONTEXT)
+    assert stale.status == "stale" and stale.projection is None
+    assert stale.problem["code"] == "view_cursor_stale"
+
+
+def test_view_cursor_cannot_cross_view_scope_or_access_generation():
+    provider, coordinator, _ = issuer()
+    cursor = json.dumps({
+        "schema": "d12.graph_page.v1", "scope": SCOPE, "view_type": "overview",
+        "audience": "owner", "purpose": "workbench_view", "generation": 4,
+        "epoch": 9, "after": AtomKey(Owner("persona", "bot", "persona"),
+                                     "d01.persona_plan.v1", "plan-a").token,
+    }, sort_keys=True, separators=(",", ":"))
+    crossed = json.loads(cursor)
+    crossed["after"] = AtomKey(Owner("persona", "other", "persona"),
+                                 "d01.persona_plan.v1", "plan-a").token
+    for bad_cursor in (json.dumps(crossed), cursor.replace('"generation":4', '"generation":3')):
+        answer = WorkbenchService(provider).handle(
+            request(view_type="overview", cursor=bad_cursor),
+            session=SESSION, context=CONTEXT)
+        assert answer.status == "unavailable"
+        assert answer.problem["code"] == "invalid_view_cursor"
+    assert not coordinator.calls
 
 
 def test_memory_view_reads_event_owned_graph_atoms_with_event_grant():

@@ -8,10 +8,12 @@ graph state and does not manufacture operation receipts.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any, Mapping, Protocol
 
+from ..contracts import StaleRead
 from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
-from ..graph_types import GraphPage
+from ..graph_types import AtomKey, GraphPage, NamespaceEpoch
 from ..graph_coordinator import RoleInitializationReceiptV1, SceneBindingReceiptV1
 from ..domains.d01 import ActiveRoleQualification
 from ..domains.d03.context import RoleBindingResolution
@@ -75,7 +77,8 @@ class GraphWorkbenchIssuer:
         self._onboarding = onboarding
 
     def read_projection(self, *, session: AuthenticatedSession, scope: str, view_type: str,
-                        purpose: str, audience: str) -> Mapping[str, Any]:
+                        purpose: str, audience: str, cursor: str | None = None,
+                        page_size: int = 100) -> Mapping[str, Any]:
         if not session.allows(scope, "workbench.read", purpose, audience):
             return _unavailable("authority_unavailable")
         grant = self._resolve(session, scope, purpose, audience)
@@ -94,11 +97,43 @@ class GraphWorkbenchIssuer:
             context_version = self._context_version(grant, view_type)
         except (TypeError, ValueError, LookupError):
             return _unavailable("field_projection_unavailable")
+        if type(page_size) is not int or not 1 <= page_size <= 100:
+            return _unavailable("invalid_page_size")
+        # Context-filtered views cannot safely expose graph cursors or raw
+        # coverage: hidden atoms could reveal their existence through either.
+        if context_version == PROJECTION_CONTEXT_V1 and (cursor is not None or page_size != 100):
+            return _unavailable("view_pagination_unavailable")
+        after = expected_epoch = None
+        if cursor is not None:
+            try:
+                token = json.loads(cursor)
+                if (type(token) is not dict or set(token) != {
+                        "schema", "scope", "view_type", "audience", "purpose",
+                        "generation", "epoch", "after"}
+                        or token["schema"] != "d12.graph_page.v1"
+                        or token["scope"] != scope or token["view_type"] != view_type
+                        or token["audience"] != audience or token["purpose"] != purpose
+                        or token["generation"] != grant.authority.activation_generation
+                        or type(token["epoch"]) is not int or token["epoch"] < 0):
+                    raise ValueError("cursor context mismatch")
+                after = AtomKey.from_token(token["after"])
+                if ((after.owner.bot, after.owner.persona) != grant.authority.namespace.as_tuple
+                        or after.owner.kind != owner_kind or after.type_name not in types):
+                    raise ValueError("cursor crosses view")
+                expected_epoch = NamespaceEpoch(
+                    grant.authority.namespace.bot_id,
+                    grant.authority.namespace.persona_id, token["epoch"])
+            except (TypeError, ValueError, KeyError):
+                return _unavailable("invalid_view_cursor")
         try:
             page = self._coordinator.query(grant.authority, grant.lease,
-                                           type_names=types, owner_kind=owner_kind, limit=100)
+                                           type_names=types, owner_kind=owner_kind,
+                                           after=after, expected_epoch=expected_epoch,
+                                           limit=page_size)
         except PermissionError:
             raise
+        except StaleRead:
+            return {"status": "stale", "problem": {"code": "view_cursor_stale"}}
         except Exception:
             return _unavailable("graph_query_unavailable")
         if not isinstance(page, GraphPage):
@@ -107,11 +142,16 @@ class GraphWorkbenchIssuer:
         epoch = snapshot.epochs[0] if len(snapshot.epochs) == 1 else None
         if epoch is None:
             return _unavailable("incomplete_graph_snapshot")
+        if expected_epoch is not None and epoch != expected_epoch:
+            return {"status": "stale", "problem": {"code": "view_cursor_stale"}}
         if ((epoch.bot, epoch.persona) != grant.authority.namespace.as_tuple
                 or any(atom.key.owner.kind != owner_kind
                        or (atom.key.owner.bot, atom.key.owner.persona)
                        != grant.authority.namespace.as_tuple
                        or atom.key.type_name not in types for atom in snapshot.atoms)):
+            return _unavailable("invalid_graph_snapshot")
+        if page.next_after is not None and (
+                not snapshot.atoms or page.next_after != snapshot.atoms[-1].key):
             return _unavailable("invalid_graph_snapshot")
         atoms = tuple({
             "type": atom.key.type_name,
@@ -142,8 +182,12 @@ class GraphWorkbenchIssuer:
             projection["snapshot_epoch"] = epoch.revision
             projection["coverage"] = {"requested_types": types, "returned_atoms": len(atoms),
                                       "truncated": page.next_after is not None}
-            projection["next_cursor"] = (page.next_after.token
-                                         if page.next_after is not None else None)
+            projection["next_cursor"] = (json.dumps({
+                "schema": "d12.graph_page.v1", "scope": scope,
+                "view_type": view_type, "audience": audience, "purpose": purpose,
+                "generation": grant.authority.activation_generation,
+                "epoch": epoch.revision, "after": page.next_after.token,
+            }, sort_keys=True, separators=(",", ":")) if page.next_after is not None else None)
         return {"status": "ready", "projection": projection}
 
     def open_workspace(self, *, session: AuthenticatedSession, scope: str, purpose: str,
