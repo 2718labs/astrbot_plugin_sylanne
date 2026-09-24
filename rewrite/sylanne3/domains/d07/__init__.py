@@ -16,6 +16,7 @@ import json
 import math
 
 from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeSpec
+from ...memory_types import SourceRecord, access_key, source_key, validate_access
 from ...runtime_contracts import (
     CommandEnvelope,
     DependencySet,
@@ -747,6 +748,175 @@ class D07DomainProvider:
         )
         return self.validate(proposal)
 
+    def first_source_interpretation_proposal(
+        self,
+        envelope: CommandEnvelope,
+        snapshot: GraphSnapshot,
+        interpretation: CurrentInterpretationCandidate,
+        *,
+        perspective_ref: str,
+    ) -> DomainProposal:
+        """Bind an explicit interpretation to committed D06 and D03 reads.
+
+        A source alone cannot produce a proposition, feeling, or Concern. W01
+        must provide this snapshot from a fenced graph read and commit it.
+        """
+        if not isinstance(interpretation, CurrentInterpretationCandidate):
+            raise TypeError("interpretation must be CurrentInterpretationCandidate")
+        if len(interpretation.source_refs) != 1:
+            raise ValueError("first-source interpretation needs one source")
+        source = AtomKey.from_token(interpretation.source_refs[0])
+        perspective = AtomKey.from_token(perspective_ref)
+        if not isinstance(envelope, CommandEnvelope):
+            raise TypeError("envelope must be CommandEnvelope")
+        read_map = {item.key: item for item in envelope.version_guard.read_versions}
+        if len(read_map) != len(envelope.version_guard.read_versions):
+            raise ValueError("interpretation guard repeats graph keys")
+        access = access_key(source.owner.bot, source.owner.persona, source.owner.subject)
+        source_version = read_map.get(source)
+        perspective_version = read_map.get(perspective)
+        if source_version is None or perspective_version is None:
+            raise ValueError("interpretation needs guarded source and perspective")
+        identity = {
+            "source": (source.token, source_version.revision),
+            "perspective": (perspective.token, perspective_version.revision),
+            "candidate": {
+                "activity_id": interpretation.activity_id,
+                "question_key": interpretation.question_key,
+                "proposition": interpretation.proposition,
+                "stance": interpretation.stance.value,
+                "subjective_conviction": interpretation.subjective_conviction,
+                "evidence_status": interpretation.evidence_status.value,
+                "source_families": interpretation.source_families,
+                "meaningful_unknowns": interpretation.meaningful_unknowns,
+            },
+        }
+        candidate = replace(interpretation, interpretation_id=_stable_id("interpretation", identity))
+        key = AtomKey(
+            Owner("activity", source.owner.bot, source.owner.persona, candidate.activity_id),
+            "d07.current_interpretation.v1", candidate.interpretation_id,
+        )
+        absent = GraphVersion(key, 0)
+        if key in read_map and read_map[key] != absent:
+            raise ValueError("interpretation needs revision-0 write guard")
+        if key not in read_map:
+            envelope = replace(envelope, version_guard=replace(
+                envelope.version_guard,
+                read_versions=(*envelope.version_guard.read_versions, absent),
+            ))
+        proposal = DomainProposal(
+            domain="d07", proposal_schema="d07.proposal.v1",
+            proposal_schema_hash=self.descriptor.request_schema_hash,
+            envelope=envelope,
+            typed_writes=(self.current_interpretation_write(
+                envelope, candidate, source_dependencies=(source,),
+            ),),
+            dependencies=DependencySet(historical_provenance=(source_version, perspective_version)),
+            contribution_keys=(), required_bundle_parts=(),
+        )
+        return self.validate(proposal, snapshot)
+
+    @staticmethod
+    def _validate_first_source_interpretation(
+        proposal: DomainProposal, snapshot: object, write: GraphWrite,
+    ) -> None:
+        if not isinstance(snapshot, GraphSnapshot):
+            raise ValueError("first-source interpretation needs a committed graph snapshot")
+        if len({atom.key for atom in snapshot.atoms}) != len(snapshot.atoms):
+            raise ValueError("interpretation snapshot repeats graph keys")
+        envelope = proposal.envelope
+        namespace = envelope.authority.namespace
+        if "activity" not in envelope.authority.owner_scope:
+            raise ValueError("interpretation needs activity owner scope")
+        if len(proposal.typed_writes) != 1 or write.dependencies:
+            raise ValueError("first-source interpretation must be one immutable write")
+        historical = proposal.dependencies.historical_provenance
+        if (len(historical) != 2 or proposal.dependencies.current_invalidation
+                or proposal.dependencies.associations or proposal.dependencies.numeric_coupling):
+            raise ValueError("interpretation needs exact source and perspective provenance")
+        source_version, perspective_version = historical
+        source, perspective = source_version.key, perspective_version.key
+        if source != source_key(namespace.bot_id, namespace.persona_id, source.owner.subject):
+            raise ValueError("interpretation source must be a D06 event source")
+        if (perspective.type_name not in {"d03.entity_anchor", "d03.role_binding"}
+                or perspective.owner.bot != namespace.bot_id
+                or perspective.owner.persona != namespace.persona_id
+                or perspective.owner.kind not in {"persona", "scene"}):
+            raise ValueError("interpretation perspective must be a D03 perspective")
+        access = access_key(namespace.bot_id, namespace.persona_id, source.owner.subject)
+        if any(key.owner.kind not in envelope.authority.owner_scope
+               for key in (source, access, perspective, write.key)):
+            raise ValueError("interpretation read and write owners exceed authority scope")
+        guarded = {item.key: item for item in envelope.version_guard.read_versions}
+        if len(guarded) != len(envelope.version_guard.read_versions):
+            raise ValueError("interpretation guard repeats graph keys")
+        for key in (source, perspective, access):
+            atom = snapshot.get(key)
+            if (atom is None or not atom.valid or atom.revision < 1
+                    or guarded.get(key) != GraphVersion(key, atom.revision)):
+                raise ValueError("interpretation needs matching committed guarded reads")
+        if guarded.get(write.key) != GraphVersion(write.key, 0):
+            raise ValueError("interpretation needs revision-0 write guard")
+        existing = snapshot.get(write.key)
+        if existing is not None and (existing.valid or existing.revision != 0):
+            raise ValueError("interpretation identity already exists")
+        if (historical != (guarded[source], guarded[perspective])
+                or tuple(write.value["source_refs"]) != (source.token,)
+                or envelope.source_qualification.source_refs != (source.token,)
+                or source.token not in envelope.input_refs
+                or perspective.token not in envelope.input_refs):
+            raise ValueError("interpretation source and perspective proofs differ")
+        record = SourceRecord.from_dict(snapshot.get(source).value)
+        access_value = snapshot.get(access).value
+        validate_access(access_value)
+        if (record.source_id != source.owner.subject
+                or access_value["source_id"] != record.source_id
+                or access_value["status"] != "active"
+                or "context" not in record.purposes
+                or "context" not in access_value["purposes"]
+                or not set(envelope.authority.audience).issubset(record.audiences)
+                or not set(envelope.authority.audience).issubset(access_value["audiences"])):
+            raise ValueError("interpretation source access is not active for context")
+        expected_family = "derived" if record.source_kind == "internal" else record.source_kind
+        expected_eligibility = {
+            "confirmed": "eligible", "reported": "qualified",
+            "disputed": "ineligible", "unknown": "ineligible",
+        }[record.assertion_status]
+        if (envelope.source_qualification.learned_at != record.recorded_at
+                or envelope.source_qualification.occurred_at != record.occurred_at
+                or envelope.source_qualification.source_family != expected_family
+                or envelope.source_qualification.evidence_eligibility != expected_eligibility
+                or tuple(write.value["source_families"]) != (record.provenance_root,)):
+            raise ValueError("interpretation source qualification differs from committed source")
+        from ..d03.context import ContextProvider
+        perspective_value = snapshot.get(perspective).value
+        next(spec for spec in ContextProvider().type_specs()
+             if spec.name == perspective.type_name).validator(perspective_value)
+        if (perspective.type_name == "d03.entity_anchor"
+                and (perspective.owner.kind != "persona"
+                     or perspective.name != perspective_value["entity_id"]
+                     or perspective_value["status"] != "active")):
+            raise ValueError("interpretation entity perspective is not active")
+        if (perspective.type_name == "d03.role_binding"
+                and (perspective.name != perspective_value["role_binding_id"]
+                     or perspective_value["status"] != "active"
+                     or (perspective.owner.kind == "scene"
+                         and perspective.owner.subject != perspective_value["scene_ref"]))):
+            raise ValueError("interpretation role perspective is not active")
+        value = write.value
+        identity = {
+            "source": (source.token, source_version.revision),
+            "perspective": (perspective.token, perspective_version.revision),
+            "candidate": {name: value[name] for name in (
+                "activity_id", "question_key", "proposition", "stance",
+                "subjective_conviction", "evidence_status", "source_families",
+                "meaningful_unknowns",
+            )},
+        }
+        if (write.key.name != value["interpretation_id"]
+                or write.key.name != _stable_id("interpretation", identity)):
+            raise ValueError("interpretation key differs from committed evidence identity")
+
     def proposal_for(
         self,
         envelope: CommandEnvelope,
@@ -829,6 +999,10 @@ class D07DomainProvider:
                     raise ValueError("current interpretation key does not match its interpretation ID")
                 if tuple(interpretation["source_refs"]) != historical_sources:
                     raise ValueError("current interpretation source refs differ from historical provenance")
+        elif interpretations:
+            if len(interpretations) != 1:
+                raise ValueError("first-source interpretation needs exactly one candidate")
+            self._validate_first_source_interpretation(proposal, snapshot, interpretations[0])
         return proposal
 
     @staticmethod
