@@ -6,10 +6,11 @@ They are not a read grant or evidence that the model result was released.
 
 from __future__ import annotations
 
-from dataclasses import asdict
-
 from ..authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1,
+)
+from ..runtime.first_ingress_c02_identity import (
+    first_ingress_c02_consumer_operation_id_v1,
 )
 from ..runtime.original_model_result_context import OriginalModelResultContextV1
 from ..runtime_contracts import canonical_digest
@@ -21,21 +22,18 @@ def first_ingress_worker_result_request_v1(
     """Name one consumer and its first read attempt across host restarts."""
     if type(context) is not OriginalModelResultContextV1:
         raise TypeError("fenced original model result context required")
-    original = {
-        "namespace": asdict(context.namespace),
-        "authority_id": context.authority_id,
-        "authority_namespace": context.authority_namespace,
-        "installation_id": context.installation_id,
-        "job_id": context.job_id,
-        "acquire_operation_id": context.acquire_operation_id,
-        "original_operation_id": context.original_operation_id,
-        "call_id": context.call_id,
-        "binding_digest": context.binding_digest,
-        "model_request_digest": context.model_request_digest,
-    }
-    consumer_id = "first-ingress-c02-" + canonical_digest({
-        "schema": "sylanne3.first-ingress-c02-consumer.v1", "original": original,
-    })[:48]
+    consumer_id = first_ingress_c02_consumer_operation_id_v1(
+        namespace=context.namespace,
+        authority_id=context.authority_id,
+        authority_namespace=context.authority_namespace,
+        installation_id=context.installation_id,
+        job_id=context.job_id,
+        acquire_operation_id=context.acquire_operation_id,
+        original_operation_id=context.original_operation_id,
+        call_id=context.call_id,
+        binding_digest=context.binding_digest,
+        model_request_digest=context.model_request_digest,
+    )
     read_id = "first-ingress-worker-read-" + canonical_digest({
         "schema": "sylanne3.first-ingress-worker-read-attempt.v1",
         "consumer_operation_id": consumer_id,

@@ -14,24 +14,34 @@ from sylanne3.authority_service.v2_model_egress_contract import (
 from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.host.model_egress_executor import HostModelEgressExecutor
 from sylanne3.host.model_terminal_cost_port import InstalledModelTerminalCostPort
+from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.memory_types import SourceRecord, access_key, source_key
 from sylanne3.model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
     build_first_ingress_encoding_payload,
 )
-from sylanne3.runtime.encoding_call_binding import prepare_binding
+from sylanne3.runtime.encoding_call_binding import (
+    CommittedEncodingBaselineV1, prepare_binding,
+)
 from sylanne3.runtime.restore_anchor import RestoreAnchor
-from sylanne3.runtime_contracts import canonical_digest
+from sylanne3.runtime_contracts import canonical_digest, canonical_serialize
 
 
-def frozen_case(host, bundle):
+def frozen_case(host, bundle, *, with_baseline=False):
     namespace = bundle.installation_policy.namespace
     source = SourceRecord(
         "source-1", "a remembered sentence", "speaker-1", "reported",
         "reported", None, 1.0, "source-1", ("owner",), ("consolidation",),
     )
     source_token = source_key(*namespace.as_tuple, source.source_id).token
+    baseline_key = AtomKey(
+        Owner("event", *namespace.as_tuple, "arrival-event"),
+        "d04.encoding_baseline.v1", "record",
+    )
+    baseline = CommittedEncodingBaselineV1(
+        baseline_key.token, 2, "d04-op", "a" * 64, "graph-incarnation", 12,
+    ) if with_baseline else None
     payload, _ = build_first_ingress_encoding_payload(source)
     base = model_fixture.call_request()
     identity = replace(
@@ -50,7 +60,8 @@ def frozen_case(host, bundle):
                     key=source_key(*namespace.as_tuple, source.source_id), revision=1),
             replace(base.envelope.version_guard.read_versions[0],
                     key=access_key(*namespace.as_tuple, source.source_id), revision=1),
-        ), query_epochs=(),
+        ) + ((GraphVersion(baseline_key, 2),) if with_baseline else ()),
+        query_epochs=(),
     )
     envelope = replace(
         base.envelope, identity=identity, authority=authority_context,
@@ -81,6 +92,7 @@ def frozen_case(host, bundle):
         provider_config_ref=model.provider_config_ref,
         provider_config_digest=model.provider_config_digest,
         production_context=context,
+        baseline=baseline,
     )
     draft = ModelEgressDraftV1(
         authority_id="authority", namespace=bundle.installation_policy.authority_namespace,
@@ -102,6 +114,37 @@ def frozen_case(host, bundle):
         "authority", draft.namespace, 1, "deletion", 0, "genesis",
         "execution", 0, "genesis", 0, "proof")
     return binding, draft, anchor, request
+
+
+@pytest.mark.asyncio
+async def test_frozen_v3_binding_preserves_committed_baseline_guard():
+    host = model_fixture.AstrBotModelCallTests(
+        methodName="test_one_http_request_on_host_loop_with_usage")
+    await host.asyncSetUp()
+    try:
+        bundle, adapter, _ = host.v2_adapters()
+        binding, draft, anchor, request = frozen_case(
+            host, bundle, with_baseline=True)
+        _old, _old_anchor, _old_permit, _old_admission, grant, authority = (
+            fixture_values(host, request))
+        executor = HostModelEgressExecutor(
+            authority=authority, bundle=bundle, grant=grant, adapter=adapter)
+        rebuilt = executor._frozen_encoding_request(binding, draft, anchor)
+        assert rebuilt.digest == request.digest
+        assert rebuilt.envelope.version_guard.read_versions == (
+            request.envelope.version_guard.read_versions)
+        assert binding.request["schema"] == "sylanne.first-ingress-encoding-call.v3"
+        forged = dict(binding.request)
+        forged["baseline"] = {**forged["baseline"], "baseline_revision": 3}
+        changed = replace(
+            binding, request_json=canonical_serialize(forged),
+            binding_digest=canonical_digest(forged),
+        )
+        assert await executor.execute_frozen_encoding_once(
+            binding=changed, draft=draft, expected_anchor=anchor) is None
+        assert host.requests == []
+    finally:
+        await host.asyncTearDown()
 
 
 @pytest.mark.asyncio

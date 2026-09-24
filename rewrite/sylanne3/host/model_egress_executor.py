@@ -20,14 +20,17 @@ from ..authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
 )
 from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
-from ..graph_types import AtomKey
+from ..graph_types import AtomKey, GraphVersion
 from ..model_broker.broker import ModelCallRequest, ProviderResponse
 from ..model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
 )
 from ..memory_types import source_key
-from ..runtime.encoding_call_binding import EncodingCallBinding, binding_to_json
+from ..runtime.encoding_call_binding import (
+    CommittedEncodingBaselineV1, EncodingCallBinding, EncodingCallConflict,
+    binding_to_json,
+)
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import InstallationGrantV2, canonical_serialize
 from .astrbot_model_call import AstrBotModelProvider, LocalModelAdmission
@@ -92,17 +95,19 @@ class HostModelEgressExecutor:
         self, binding: EncodingCallBinding, draft: ModelEgressDraftV1,
         expected_anchor: RestoreAnchor,
     ) -> ModelCallRequest:
-        """Rebuild the immutable V2 request; Authority still checks graph truth."""
+        """Rebuild the frozen V2/V3 request; Authority still checks graph truth."""
         if (type(binding) is not EncodingCallBinding
                 or type(draft) is not ModelEgressDraftV1
                 or type(expected_anchor) is not RestoreAnchor
                 or type(self._adapter._admin_model) is not AdminModelWorkflowV2):
-            raise ValueError("V2 encoding binding, draft and anchor are required")
+            raise ValueError("frozen encoding binding, draft and anchor are required")
         binding_to_json(binding)
         frozen = binding.request
         model = self._adapter._admin_model
         policy = self._bundle.installation_policy
-        if (frozen.get("schema") != "sylanne.first-ingress-encoding-call.v2"
+        schema = frozen.get("schema")
+        if (schema not in {"sylanne.first-ingress-encoding-call.v2",
+                           "sylanne.first-ingress-encoding-call.v3"}
                 or model is not self._bundle.model_workflows.encode
                 or model.work_kind != "d06.encode_source"
                 or model.template_version != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
@@ -111,7 +116,7 @@ class HostModelEgressExecutor:
                 or draft.authority_id != self._grant.authority_id
                 or expected_anchor.authority_id != draft.authority_id
                 or expected_anchor.namespace != draft.namespace):
-            raise ValueError("installed V2 encoding authority differs")
+            raise ValueError("installed encoding authority differs")
         fields = (
             "envelope", "call_id", "provider_id", "model_id",
             "required_capabilities", "privacy_tier", "prompt_template_digest",
@@ -119,6 +124,14 @@ class HostModelEgressExecutor:
         )
         request = model_from_wire(
             {name: _plain_frozen(frozen[name]) for name in fields}, ModelCallRequest)
+        if schema == "sylanne.first-ingress-encoding-call.v3":
+            baseline = CommittedEncodingBaselineV1(**frozen["baseline"])
+            baseline_version = GraphVersion(
+                AtomKey.from_token(baseline.baseline_ref),
+                baseline.baseline_revision,
+            )
+            if request.envelope.version_guard.read_versions.count(baseline_version) != 1:
+                raise ValueError("frozen D04 baseline guard differs")
         authority = request.envelope.authority
         guard = request.envelope.version_guard
         source_token = source_key(*binding.namespace.as_tuple, binding.source_id).token
@@ -161,7 +174,7 @@ class HostModelEgressExecutor:
         self, *, binding: EncodingCallBinding, draft: ModelEgressDraftV1,
         expected_anchor: RestoreAnchor,
     ) -> FrozenEncodingEgressResult | None:
-        """Prepare and spend one exact V2 call; uncertainty remains HOLD.
+        """Prepare and spend one exact frozen call; uncertainty remains HOLD.
 
         Re-entry in this executor never reissues prepare or admission. Across
         host restarts the Authority's original operation/terminal must be read
@@ -169,7 +182,7 @@ class HostModelEgressExecutor:
         """
         try:
             request = self._frozen_encoding_request(binding, draft, expected_anchor)
-        except (KeyError, TypeError, ValueError):
+        except (EncodingCallConflict, KeyError, TypeError, ValueError):
             return None
         if binding.call_id in self._frozen_attempts:
             return None
@@ -232,7 +245,7 @@ class HostModelEgressExecutor:
             return None
         try:
             request = self._frozen_encoding_request(binding, draft, expected_anchor)
-        except (KeyError, TypeError, ValueError):
+        except (EncodingCallConflict, KeyError, TypeError, ValueError):
             return None
         authority = request.envelope.authority
         if (ModelEgressDraftV1.from_intent(intent) != draft
