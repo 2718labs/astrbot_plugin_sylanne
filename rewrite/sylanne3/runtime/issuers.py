@@ -181,6 +181,7 @@ class BudgetLeaseGrant:
 
 
 D03_ARRIVAL_WORK_KIND = "d03.message_received"
+D03_SELF_IDENTITY_PROJECTION_WORK_KIND = "d03.self_identity_projection"
 D04_BASELINE_WORK_KIND = "d04.encoding_baseline"
 D06_FIRST_INGRESS_C02_WORK_KIND = "d06.first_ingress_c02"
 _MODEL_COST_DIMENSIONS = frozenset({
@@ -246,6 +247,54 @@ class D04BaselineQuotePolicy:
         deadline = _finite(self.deadline_after_seconds, "deadline_after_seconds")
         if deadline <= 0:
             raise ValueError("D04 baseline deadline bound must be positive")
+        object.__setattr__(self, "deadline_after_seconds", deadline)
+        object.__setattr__(self, "quote_ceiling", _amounts(self.quote_ceiling))
+
+
+@dataclass(frozen=True)
+class D03SelfIdentityProjectionQuotePolicy:
+    """Signed stage price and exact Authority-qualified mapping candidate."""
+
+    policy_id: str
+    bot_id: str
+    persona_id: str
+    installation_id: str
+    grant_id: str
+    grant_version: int
+    lease_id: str
+    provider_policy_ref: str
+    quote_ceiling: Mapping[str, int]
+    deadline_after_seconds: float
+    snapshot_ref: str
+    resource_ref: str
+    source_ref: str
+    arrival_ref: str
+    mapping_ref: str
+    mapping_revision: int
+    perspective_ref: str
+    certification_ref: str
+    qualified_mapping_digest: str
+    activity_id: str
+    operation_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("policy_id", "bot_id", "persona_id", "installation_id",
+                     "grant_id", "lease_id", "provider_policy_ref",
+                     "snapshot_ref", "resource_ref", "activity_id", "operation_id"):
+            _id(getattr(self, name), name)
+        for name in ("source_ref", "arrival_ref", "mapping_ref",
+                     "perspective_ref", "certification_ref"):
+            _ref(getattr(self, name), name)
+        if type(self.grant_version) is not int or self.grant_version < 1:
+            raise ValueError("D03 projection grant version is invalid")
+        if type(self.mapping_revision) is not int or self.mapping_revision < 0:
+            raise ValueError("D03 projection mapping revision is invalid")
+        if (type(self.qualified_mapping_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", self.qualified_mapping_digest) is None):
+            raise ValueError("D03 projection mapping digest is invalid")
+        deadline = _finite(self.deadline_after_seconds, "deadline_after_seconds")
+        if deadline <= 0:
+            raise ValueError("D03 projection deadline bound must be positive")
         object.__setattr__(self, "deadline_after_seconds", deadline)
         object.__setattr__(self, "quote_ceiling", _amounts(self.quote_ceiling))
 
@@ -336,6 +385,79 @@ def _d03_quote_refs(policy: D03ArrivalQuotePolicy,
         "input_refs": envelope.input_refs,
     })[:56]
     return snapshot, resource
+
+
+def _d03_projection_policy_id(installation_id: str, grant: BudgetLeaseGrant,
+                              operation_id: str) -> str:
+    return "d03-self-policy-" + canonical_digest({
+        "installation_id": installation_id,
+        "namespace": [grant.bot_id, grant.persona_id],
+        "grant_id": grant.grant_id, "grant_version": grant.version,
+        "operation_id": operation_id,
+    })[:40]
+
+
+def d03_self_identity_projection_quote_id(namespace, operation_id: str) -> str:
+    return "d03-self-q-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+    })[:40]
+
+
+def _d03_projection_quote_refs(policy: D03SelfIdentityProjectionQuotePolicy,
+                               envelope: CommandEnvelope) -> tuple[str, str]:
+    snapshot = "d03selfsnap:" + policy.policy_id + ":" + canonical_digest({
+        "policy": _payload(policy),
+        "guard": replace(envelope.version_guard, resource_lease_versions=()),
+        "identity": envelope.identity,
+        "source_qualification": envelope.source_qualification,
+        "input_refs": envelope.input_refs,
+    })[:32]
+    resource = "d03selfsrc:" + canonical_digest({
+        "policy_id": policy.policy_id, "resource_ref": policy.resource_ref,
+        "qualified_mapping_digest": policy.qualified_mapping_digest,
+        "source_ref": policy.source_ref,
+    })[:56]
+    return snapshot, resource
+
+
+def _d03_projection_inputs(envelope: CommandEnvelope):
+    from ..domains.d03.self_perspective import self_mapping_key
+    from .d03_self_identity_projection_identity import d03_self_identity_projection_activity_id_v1
+
+    identity, authority = envelope.identity, envelope.authority
+    if (authority.actor != "host" or authority.issuer_domain != "d11"
+            or authority.worker_fence is not None
+            or authority.purpose != "context"
+            or not {"persona", "event"} <= set(authority.owner_scope)
+            or identity.phase != D03_SELF_IDENTITY_PROJECTION_WORK_KIND
+            or identity.effect_id is not None
+            or len(envelope.input_refs) != 1
+            or envelope.source_qualification.source_refs != envelope.input_refs
+            or identity.canonical_input_digest != canonical_digest({
+                "input_refs": list(envelope.input_refs),
+            })):
+        raise IssuerAuthorityDenied("D03 projection requires exact host stage identity")
+    try:
+        source = AtomKey.from_token(envelope.input_refs[0])
+        expected_activity = d03_self_identity_projection_activity_id_v1(
+            authority.namespace, source.token)
+    except (TypeError, ValueError) as exc:
+        raise IssuerAuthorityDenied("D03 projection source identity is invalid") from exc
+    if (source.owner.kind != "event" or source.name != "record"
+            or identity.activity_id != expected_activity):
+        raise IssuerAuthorityDenied("D03 projection activity differs from source")
+    guarded = {item.key: item.revision for item in envelope.version_guard.read_versions}
+    if (len(guarded) != len(envelope.version_guard.read_versions)
+            or guarded.get(source, 0) < 1):
+        raise IssuerAuthorityDenied("D03 projection source needs a committed guard")
+    mapping = self_mapping_key(authority.namespace)
+    if mapping not in guarded or guarded[mapping] < 0:
+        raise IssuerAuthorityDenied("D03 projection mapping needs a version guard")
+    arrival = [item.key for item in envelope.version_guard.read_versions
+               if item.key.type_name == "d03.world_event"]
+    if len(arrival) != 1 or guarded[arrival[0]] < 1:
+        raise IssuerAuthorityDenied("D03 projection needs one committed arrival")
+    return source, mapping, arrival[0], guarded
 
 
 def _d04_policy_id(installation_id: str, grant: BudgetLeaseGrant) -> str:
@@ -716,6 +838,10 @@ def _decode_d04_policy(payload: str) -> D04BaselineQuotePolicy:
     return D04BaselineQuotePolicy(**json.loads(payload))
 
 
+def _decode_d03_projection_policy(payload: str) -> D03SelfIdentityProjectionQuotePolicy:
+    return D03SelfIdentityProjectionQuotePolicy(**json.loads(payload))
+
+
 def _decode_d06_c02_policy(payload: str) -> D06FirstIngressC02QuotePolicy:
     return D06FirstIngressC02QuotePolicy(**json.loads(payload))
 
@@ -780,6 +906,14 @@ def install_schema(db) -> None:
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS runtime_d04_baseline_quote_policies(
+            policy_id TEXT PRIMARY KEY,
+            policy_json TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            status TEXT NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_d03_self_projection_quote_policies(
             policy_id TEXT PRIMARY KEY,
             policy_json TEXT NOT NULL,
             signature TEXT NOT NULL,
@@ -915,6 +1049,70 @@ class D02ResourceIssuer:
                 or quote.resource_ref != resource_ref
                 or dict(quote.ceiling) != dict(policy.quote_ceiling)):
             raise IssuerAuthorityDenied("D03 arrival quote differs from signed policy")
+        return policy
+
+    def _install_d03_projection_policy(
+            self, db, policy: D03SelfIdentityProjectionQuotePolicy) -> str:
+        payload = canonical_serialize(_payload(policy))
+        signature = self._signer.sign("d03-self-projection-policy.v1", payload)
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM runtime_d03_self_projection_quote_policies "
+            "WHERE policy_id=?", (policy.policy_id,),
+        ).fetchone()
+        if row is not None:
+            self._signer.verify("d03-self-projection-policy.v1", row[0], row[1])
+            if row != (payload, signature, "active"):
+                raise IssuerAuthorityDenied("D03 projection policy replay differs")
+            return signature
+        db.execute(
+            "INSERT INTO runtime_d03_self_projection_quote_policies"
+            "(policy_id,policy_json,signature,status) VALUES(?,?,?,'active')",
+            (policy.policy_id, payload, signature),
+        )
+        return signature
+
+    def _load_d03_projection_policy(
+            self, db, policy_id: str) -> D03SelfIdentityProjectionQuotePolicy:
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM runtime_d03_self_projection_quote_policies "
+            "WHERE policy_id=?", (policy_id,),
+        ).fetchone()
+        if row is None or row[2] != "active":
+            raise IssuerAuthorityDenied("active signed D03 projection policy is absent")
+        self._signer.verify("d03-self-projection-policy.v1", row[0], row[1])
+        try:
+            policy = _decode_d03_projection_policy(row[0])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("signed D03 projection policy is invalid") from exc
+        if policy.policy_id != policy_id:
+            raise IssuerAuthorityDenied("signed D03 projection policy identity differs")
+        return policy
+
+    def _qualified_d03_projection_policy(
+            self, db, envelope: CommandEnvelope, quote: ResourceQuote,
+            grant: BudgetLeaseGrant) -> D03SelfIdentityProjectionQuotePolicy:
+        parts = quote.snapshot_ref.split(":")
+        if len(parts) != 3 or parts[0] != "d03selfsnap":
+            raise IssuerAuthorityDenied("D03 projection quote lacks policy binding")
+        policy = self._load_d03_projection_policy(db, parts[1])
+        snapshot_ref, resource_ref = _d03_projection_quote_refs(policy, envelope)
+        if (policy.policy_id != _d03_projection_policy_id(
+                    policy.installation_id, grant, envelope.identity.operation_id)
+                or (policy.bot_id, policy.persona_id)
+                != envelope.authority.namespace.as_tuple
+                or (policy.grant_id, policy.grant_version, policy.lease_id,
+                    policy.provider_policy_ref) != (
+                    grant.grant_id, grant.version, grant.lease_id, grant.policy_ref)
+                or quote.snapshot_ref != snapshot_ref
+                or quote.resource_ref != resource_ref
+                or quote.quote_id != d03_self_identity_projection_quote_id(
+                    envelope.authority.namespace, envelope.identity.operation_id)
+                or (quote.activity_id, quote.operation_id, quote.effect_id)
+                != (policy.activity_id, policy.operation_id, None)
+                or quote.graph_job_ref is not None or quote.outbox_refs
+                or quote.d02_settlement_refs
+                or dict(quote.ceiling) != dict(policy.quote_ceiling)):
+            raise IssuerAuthorityDenied("D03 projection quote differs from signed policy")
         return policy
 
     def _install_d04_baseline_policy(self, db, policy: D04BaselineQuotePolicy) -> str:
@@ -1410,6 +1608,133 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         self._d02._issue_bound_stage_quote(db, quote)
         return quote
 
+    def issue_d03_self_identity_projection_quote(
+            self, db, envelope: CommandEnvelope, admin_policy, *,
+            installation_id: str, qualified_mapping,
+            now_utc: float | None = None) -> ResourceQuote:
+        """Price one mapping plus perspective stage, without certifying identity."""
+        from ..domains.d03.self_perspective import (
+            SelfIdentityMapping, self_perspective_id, self_perspective_key,
+        )
+        from ..host.authority_profile import AdminD03SelfIdentityProjectionPolicy
+        from ..memory_types import access_key
+        from .d03_self_identity_projection_identity import (
+            d03_self_identity_projection_operation_id_v1,
+        )
+
+        if type(admin_policy) is not AdminD03SelfIdentityProjectionPolicy:
+            raise IssuerAuthorityDenied("installed D03 projection policy is required")
+        if type(qualified_mapping) is not SelfIdentityMapping:
+            raise IssuerAuthorityDenied("Authority-qualified D03 mapping is required")
+        if not isinstance(envelope, CommandEnvelope):
+            raise TypeError("envelope must be CommandEnvelope")
+        _id(installation_id, "installation_id")
+        if envelope.version_guard.resource_lease_versions:
+            raise IssuerAuthorityDenied("D03 projection quote request has prior resource refs")
+        source, mapping, arrival, guarded = _d03_projection_inputs(envelope)
+        namespace = envelope.authority.namespace
+        expected_operation = d03_self_identity_projection_operation_id_v1(
+            namespace, source.token, qualified_mapping.certification_ref)
+        if (envelope.identity.operation_id != expected_operation
+                or qualified_mapping.persona_ref != f"persona:{namespace.persona_id}"
+                or qualified_mapping.status != "active"):
+            raise IssuerAuthorityDenied("D03 projection mapping or operation differs")
+        now = _now_utc(now_utc)
+        grant = self._load_grant(db, envelope.parent_budget_lease_ref)
+        lease = get_budget_lease(db, grant.lease_id)
+        authority = envelope.authority
+        if (D03_SELF_IDENTITY_PROJECTION_WORK_KIND not in grant.allowed_work_kinds
+                or (grant.bot_id, grant.persona_id) != namespace.as_tuple
+                or (lease.bot_id, lease.persona_id, lease.currency)
+                != (grant.bot_id, grant.persona_id, grant.currency)
+                or lease.state != "active"
+                or grant.policy_ref != authority.provider_policy_ref
+                or grant.valid_until_utc <= now
+                or not now < envelope.deadline_utc <= min(
+                    now + admin_policy.deadline_after_seconds,
+                    grant.valid_until_utc)):
+            raise IssuerAuthorityDenied("D03 projection lacks current signed grant or deadline")
+        if any(amount > grant.max_ceiling.get(name, 0)
+               for name, amount in admin_policy.quote_ceiling.items()):
+            raise IssuerAuthorityDenied("D03 projection quote exceeds signed grant")
+        access = access_key(*namespace.as_tuple, source.owner.subject)
+        if guarded.get(access, 0) < 1:
+            raise IssuerAuthorityDenied("D03 projection source access needs current guard")
+        for key in (source, access, arrival, mapping):
+            row = db.execute(
+                "SELECT revision,valid,value FROM graph_atoms WHERE token=?", (key.token,),
+            ).fetchone()
+            if key == mapping and guarded[mapping] == 0 and row is None:
+                continue
+            if row is None or row[:2] != (guarded[key], 1):
+                raise IssuerAuthorityDenied("D03 projection prerequisite is not current")
+            if key == arrival:
+                try:
+                    event = json.loads(row[2])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise IssuerAuthorityDenied("D03 projection arrival is invalid") from exc
+        if (type(event) is not dict
+                or event.get("event_id") != arrival.owner.subject
+                or event.get("kind") != "message_received"
+                or event.get("reality") != "host_observed"
+                or event.get("source_refs") != [source.token]
+                or type(event.get("scene_ref")) is not str
+                or not event["scene_ref"].startswith("scene:")):
+            raise IssuerAuthorityDenied("D03 projection arrival differs from source")
+        requirements_row = db.execute(
+            "SELECT requirements_json FROM graph_recovery_metadata_v2 "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        if requirements_row is None:
+            raise IssuerAuthorityDenied("D03 projection graph incarnation is unavailable")
+        try:
+            requirements = json.loads(requirements_row[0])
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("D03 projection graph incarnation is invalid") from exc
+        if (type(requirements) is not dict
+                or qualified_mapping.graph_incarnation
+                != requirements.get("graph_incarnation")):
+            raise IssuerAuthorityDenied("D03 projection mapping graph incarnation differs")
+        perspective = self_perspective_key(namespace, self_perspective_id(
+            namespace, event["scene_ref"], arrival.token))
+        if guarded.get(perspective) != 0 or db.execute(
+                "SELECT 1 FROM graph_atoms WHERE token=?", (perspective.token,),
+        ).fetchone() is not None:
+            raise IssuerAuthorityDenied("D03 projection perspective is already committed")
+        policy = D03SelfIdentityProjectionQuotePolicy(
+            _d03_projection_policy_id(installation_id, grant, expected_operation),
+            *namespace.as_tuple, installation_id,
+            grant.grant_id, grant.version, grant.lease_id, grant.policy_ref,
+            dict(admin_policy.quote_ceiling), admin_policy.deadline_after_seconds,
+            admin_policy.snapshot_ref, admin_policy.resource_ref,
+            source.token, arrival.token, mapping.token, guarded[mapping],
+            perspective.token, qualified_mapping.certification_ref,
+            canonical_digest(_payload(qualified_mapping)),
+            envelope.identity.activity_id, expected_operation,
+        )
+        snapshot_ref, resource_ref = _d03_projection_quote_refs(policy, envelope)
+        quote = ResourceQuote(
+            d03_self_identity_projection_quote_id(namespace, expected_operation),
+            1, *namespace.as_tuple, envelope.identity.activity_id,
+            expected_operation, None, grant.lease_id,
+            D03_SELF_IDENTITY_PROJECTION_WORK_KIND, snapshot_ref,
+            envelope.deadline_utc, resource_ref, None, (), (),
+            dict(policy.quote_ceiling), None, envelope.deadline_utc,
+        )
+        install_schema(db)
+        existing = db.execute(
+            "SELECT 1 FROM runtime_resource_quotes WHERE quote_id=? AND version=1",
+            (quote.quote_id,),
+        ).fetchone()
+        if existing is None and any(
+                amount > lease.limits.get(name, 0) - lease.used.get(name, 0)
+                - lease.reserved.get(name, 0) - lease.unconfirmed.get(name, 0)
+                for name, amount in policy.quote_ceiling.items()):
+            raise IssuerAuthorityDenied("D03 projection budget has insufficient capacity")
+        self._d02._install_d03_projection_policy(db, policy)
+        self._d02._issue_bound_stage_quote(db, quote)
+        return quote
+
     def issue_d06_first_ingress_c02_quote(
             self, db, envelope: CommandEnvelope, admin_policy, *,
             installation_id: str, job_id: str,
@@ -1545,6 +1870,26 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
             raise IssuerAuthorityDenied("quote ceiling exceeds the signed budget grant")
         if quote.work_kind == D03_ARRIVAL_WORK_KIND:
             self._d02._qualified_d03_arrival_policy(db, envelope, quote, grant)
+        if quote.work_kind == D03_SELF_IDENTITY_PROJECTION_WORK_KIND:
+            source, mapping, arrival, guarded = _d03_projection_inputs(envelope)
+            policy = self._d02._qualified_d03_projection_policy(
+                db, envelope, quote, grant)
+            if ((policy.source_ref, policy.mapping_ref, policy.arrival_ref,
+                 policy.mapping_revision, policy.activity_id, policy.operation_id)
+                != (source.token, mapping.token, arrival.token, guarded[mapping],
+                    envelope.identity.activity_id, envelope.identity.operation_id)):
+                raise IssuerAuthorityDenied("D03 projection signed inputs changed")
+            for key in (source, mapping, arrival):
+                row = db.execute(
+                    "SELECT revision,valid FROM graph_atoms WHERE token=?", (key.token,),
+                ).fetchone()
+                if key == mapping and guarded[mapping] == 0 and row is None:
+                    continue
+                if row != (guarded[key], 1):
+                    raise IssuerAuthorityDenied("D03 projection prerequisite is stale")
+            if db.execute("SELECT 1 FROM graph_atoms WHERE token=?",
+                          (policy.perspective_ref,)).fetchone() is not None:
+                raise IssuerAuthorityDenied("D03 projection perspective already exists")
         if quote.work_kind == D04_BASELINE_WORK_KIND:
             _d04_baseline_input_keys(envelope)
             if (quote.graph_job_ref is not None or quote.outbox_refs
@@ -1688,7 +2033,7 @@ def build_runtime_issuers(signing_key: bytes, *,
 
 
 __all__ = [
-    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D04BaselineQuotePolicy", "D04_BASELINE_WORK_KIND", "D06FirstIngressC02QuotePolicy", "D06_FIRST_INGRESS_C02_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id", "d04_baseline_quote_id", "d06_first_ingress_c02_quote_id",
+    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D03SelfIdentityProjectionQuotePolicy", "D03_SELF_IDENTITY_PROJECTION_WORK_KIND", "D04BaselineQuotePolicy", "D04_BASELINE_WORK_KIND", "D06FirstIngressC02QuotePolicy", "D06_FIRST_INGRESS_C02_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id", "d03_self_identity_projection_quote_id", "d04_baseline_quote_id", "d06_first_ingress_c02_quote_id",
     "IssuerAuthorityDenied", "ResourceOutcome", "ResourceQuote",
     "build_runtime_issuers", "install_schema",
 ]

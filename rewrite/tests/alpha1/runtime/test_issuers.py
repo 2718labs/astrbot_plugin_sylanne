@@ -8,9 +8,14 @@ from unittest.mock import patch
 
 from sylanne3.graph_coordinator import budget_operation_digest
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
+from sylanne3.domains.d03.self_perspective import (
+    SelfIdentityMapping, self_mapping_key, self_perspective_id,
+    self_perspective_key,
+)
 from sylanne3.host.authority_profile import (
-    AdminD04EncodingBaselinePolicy, AdminD06FirstIngressC02Policy,
-    _d04_baseline_from_payload,
+    AdminD03SelfIdentityProjectionPolicy, AdminD04EncodingBaselinePolicy,
+    AdminD06FirstIngressC02Policy,
+    _d03_projection_from_payload, _d04_baseline_from_payload,
     _policy_from_payload,
 )
 from sylanne3.runtime import install_schema as install_runtime_schema
@@ -25,11 +30,18 @@ from sylanne3.runtime.issuers import (
     ResourceOutcome,
     ResourceQuote,
     D04_BASELINE_WORK_KIND,
+    D03_SELF_IDENTITY_PROJECTION_WORK_KIND,
     D06_FIRST_INGRESS_C02_WORK_KIND,
     d04_baseline_quote_id,
+    d03_self_identity_projection_quote_id,
     build_runtime_issuers,
     install_schema as install_issuer_schema,
 )
+from sylanne3.runtime.d03_self_identity_projection_identity import (
+    d03_self_identity_projection_activity_id_v1,
+    d03_self_identity_projection_operation_id_v1,
+)
+from sylanne3.memory_types import access_key
 from sylanne3.runtime.jobs import create_job
 from sylanne3.runtime_contracts import (
     RUNTIME_SCHEMA,
@@ -376,6 +388,22 @@ class ProductionIssuerTests(unittest.TestCase):
         self.assertEqual(_d04_baseline_from_payload(profile).quote_ceiling,
                          {"cpu_ms": 30})
         self.assertEqual(_policy_from_payload(profile).root_grant, grant)
+        profile["d03_self_identity_projection"] = {
+            "deadline_after_seconds": 30.0, "quote_ceiling": {"cpu_ms": 7},
+            "snapshot_ref": "projection-snapshot",
+            "resource_ref": "projection-resource",
+        }
+        self.assertEqual(_d03_projection_from_payload(profile).quote_ceiling,
+                         {"cpu_ms": 7})
+        with self.assertRaisesRegex(ValueError, "D03 projection requires an explicit"):
+            _policy_from_payload(profile)
+        profile["installation_policy"]["root_grant"]["allowed_work_kinds"] = [
+            D04_BASELINE_WORK_KIND, D03_SELF_IDENTITY_PROJECTION_WORK_KIND,
+        ]
+        self.assertEqual(_policy_from_payload(profile).root_grant.allowed_work_kinds,
+                         (D04_BASELINE_WORK_KIND,
+                          D03_SELF_IDENTITY_PROJECTION_WORK_KIND))
+        profile.pop("d03_self_identity_projection")
         profile["installation_policy"]["root_grant"]["allowed_work_kinds"] = [
             "d06.encode_source",
         ]
@@ -455,6 +483,89 @@ class ProductionIssuerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already-settled model"):
             AdminD06FirstIngressC02Policy(
                 60.0, {"output_tokens": 5}, "c02-snapshot", "c02-resource")
+
+    def test_d03_self_projection_uses_distinct_signed_quote_and_mapping(self):
+        source = AtomKey(Owner("event", "bot", "persona", "source-event"),
+                         "memory.source", "record")
+        access = access_key("bot", "persona", "source-event")
+        event = AtomKey(Owner("event", "bot", "persona", "arrival-event"),
+                        "d03.world_event", "current")
+        mapping_key = self_mapping_key(self.namespace)
+        perspective = self_perspective_key(self.namespace, self_perspective_id(
+            self.namespace, "scene:test", event.token))
+        mapping = SelfIdentityMapping(
+            "self-map:1", "persona:persona", "entity:self",
+            "authority:self-identity:stable", "head-1", "incarnation-1", "active")
+        self.db.execute("CREATE TABLE graph_atoms(token TEXT PRIMARY KEY, "
+                        "revision INTEGER, valid INTEGER, value TEXT)")
+        self.db.executemany("INSERT INTO graph_atoms VALUES(?,?,1,?)", (
+            (source.token, 1, "{}"), (access.token, 1, "{}"),
+            (event.token, 1, json.dumps({
+                "event_id": "arrival-event", "kind": "message_received",
+                "reality": "host_observed", "scene_ref": "scene:test",
+                "source_refs": [source.token],
+            })),
+        ))
+        self.db.execute("CREATE TABLE graph_recovery_metadata_v2("
+                        "bot TEXT, persona TEXT, requirements_json TEXT)")
+        self.db.execute("INSERT INTO graph_recovery_metadata_v2 VALUES(?,?,?)",
+                        ("bot", "persona", json.dumps({
+                            "graph_incarnation": "incarnation-1"})))
+        operation = d03_self_identity_projection_operation_id_v1(
+            self.namespace, source.token, mapping.certification_ref)
+        identity = replace(
+            self.envelope.identity,
+            activity_id=d03_self_identity_projection_activity_id_v1(
+                self.namespace, source.token),
+            phase=D03_SELF_IDENTITY_PROJECTION_WORK_KIND,
+            operation_id=operation,
+            canonical_input_digest=canonical_digest({"input_refs": [source.token]}),
+        )
+        envelope = replace(
+            self.envelope, identity=identity,
+            authority=replace(self.envelope.authority, actor="host",
+                              owner_scope=("persona", "event"), purpose="context"),
+            version_guard=replace(self.envelope.version_guard,
+                read_versions=(GraphVersion(source, 1), GraphVersion(access, 1),
+                               GraphVersion(event, 1), GraphVersion(mapping_key, 0),
+                               GraphVersion(perspective, 0)),
+                resource_lease_versions=()),
+            source_qualification=replace(
+                self.envelope.source_qualification, source_refs=(source.token,)),
+            input_refs=(source.token,),
+        )
+        policy = AdminD03SelfIdentityProjectionPolicy(
+            60.0, {"cpu_ms": 7}, "projection-snapshot", "projection-resource")
+        now = envelope.deadline_utc - 30.0
+        grant = replace(self.grant(), allowed_work_kinds=(
+            D03_SELF_IDENTITY_PROJECTION_WORK_KIND,))
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "grant is absent"):
+            self.d11.issue_d03_self_identity_projection_quote(
+                self.db, envelope, policy, installation_id="installation-1",
+                qualified_mapping=mapping, now_utc=now)
+        self.d11.issue_budget_grant(self.db, grant)
+        quote = self.d11.issue_d03_self_identity_projection_quote(
+            self.db, envelope, policy, installation_id="installation-1",
+            qualified_mapping=mapping, now_utc=now)
+        self.assertEqual(quote.work_kind, D03_SELF_IDENTITY_PROJECTION_WORK_KIND)
+        self.assertEqual(quote.quote_id, d03_self_identity_projection_quote_id(
+            self.namespace, operation))
+        self.assertEqual(quote.ceiling, {"cpu_ms": 7})
+        guarded = replace(envelope, version_guard=replace(
+            envelope.version_guard,
+            resource_lease_versions=(VersionedRef(quote.quote_id, 1),)))
+        self.assertEqual(self.d11._admission_state(
+            guarded, self.db, now_utc=now)[0], quote)
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "mapping or operation"):
+            self.d11.issue_d03_self_identity_projection_quote(
+                self.db, replace(envelope, identity=replace(
+                    identity, operation_id="client-chosen")), policy,
+                installation_id="installation-1", qualified_mapping=mapping,
+                now_utc=now)
+        self.db.execute("UPDATE graph_atoms SET revision=2 WHERE token=?",
+                        (event.token,))
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "stale"):
+            self.d11._admission_state(guarded, self.db, now_utc=now)
 
 
 if __name__ == "__main__":
