@@ -12,7 +12,9 @@ import re
 
 from ..runtime_contracts import NamespaceId, canonical_digest, canonical_serialize
 from .contract import identifier
-from .v2_model_egress_contract import ModelEgressObservationV1, ModelTerminalReceiptV2
+from .v2_model_egress_contract import (
+    ModelEgressIntentV1, ModelEgressObservationV1, ModelTerminalReceiptV2,
+)
 
 
 SCHEMA = "sylanne3.authority.worker_model_result_read.v1"
@@ -57,6 +59,15 @@ class WorkerModelResultReadRequestV1:
 
 @dataclass(frozen=True, slots=True)
 class WorkerModelResultReadV1:
+    """Response shape only; Authority must check the original intent and current graph.
+
+    The request does not contain the model fence operation or server-derived
+    worker subject. The service must obtain those from its durable original
+    egress ledger, call ``require_original_intent``, and verify that ledger's
+    terminal fence, binding, and current worker qualification before release.
+    This structural check never grants access by itself.
+    """
+
     request: WorkerModelResultReadRequestV1
     observation: ModelEgressObservationV1
     terminal_receipt: ModelTerminalReceiptV2
@@ -76,7 +87,22 @@ class WorkerModelResultReadV1:
                     self.terminal_receipt.installation_id) !=
                    (self.request.call_id, self.request.model_request_digest,
                     self.observation.digest, self.request.installation_id)):
-            raise ValueError("original completed worker result required")
+            raise ValueError("consistent completed worker result fields required")
+
+    def require_original_intent(self, intent: ModelEgressIntentV1) -> None:
+        """Compare to an Authority-loaded original intent, without authorizing read."""
+        if (type(intent) is not ModelEgressIntentV1
+                or (intent.authority_id, intent.namespace, intent.job_id,
+                    intent.call_id, intent.request_digest) !=
+                   (self.request.authority_id, self.request.authority_namespace,
+                    self.request.job_id, self.request.call_id,
+                    self.request.model_request_digest)
+                or (self.observation.authority_id, self.observation.namespace,
+                    self.observation.subject, self.observation.operation_id,
+                    self.observation.call_id, self.observation.request_digest) !=
+                   (intent.authority_id, intent.namespace, intent.subject,
+                    intent.operation_id, intent.call_id, intent.request_digest)):
+            raise ValueError("worker result differs from original Authority model intent")
 
 
 def _shape(raw: object, kind: type) -> dict:

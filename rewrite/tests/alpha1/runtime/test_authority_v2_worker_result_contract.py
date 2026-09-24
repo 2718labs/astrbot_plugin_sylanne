@@ -11,7 +11,7 @@ from sylanne3.authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1, from_wire, to_wire,
 )
 from sylanne3.authority_service.v2_model_egress_contract import (
-    ModelEgressObservationV1, ModelTerminalReceiptV2,
+    ModelEgressIntentV1, ModelEgressObservationV1, ModelTerminalReceiptV2,
 )
 from sylanne3.authority_service.v2_worker_model_result_attempts import (
     AuthorityV2WorkerModelResultAttempts,
@@ -77,6 +77,49 @@ def test_result_wire_binds_original_completed_call():
     assert from_wire(to_wire(result), WorkerModelResultReadV1) == result
     with pytest.raises(ValueError):
         WorkerModelResultReadV1(item, observation, dataclasses.replace(receipt, call_id="other"))
+
+
+@pytest.mark.parametrize("subject,operation", [
+    ("other-worker", "model-op-1"),
+    ("worker-1", "other-model-op"),
+    ("worker-1", "model-op-1"),
+])
+def test_dto_requires_original_authority_ledger_for_operation_and_subject(
+        subject, operation):
+    item = request()
+    original = ModelEgressIntentV1(
+        authority_id=item.authority_id, namespace=item.authority_namespace,
+        subject="worker-1", operation_id="model-op-1", call_id=item.call_id,
+        request_digest=item.model_request_digest, job_id=item.job_id,
+        worker_fence=1, fence_token="f" * 32, fence_epoch=1,
+        fence_revision=0, anchor_digest="0" * 64,
+        source_refs=("source-1",), source_revisions=(("source-1", 1),),
+        access_revisions=(("source-1", 1),), access_epoch=0, delete_epoch=0,
+        graph_epoch=0, graph_revision=0, authority_activation_generation=1,
+        authority_revocation_epoch=0, authority_deletion_seq=0,
+        authority_execution_seq=0, budget_lease_id="lease-1",
+        budget_reservation_operation_id="budget-op-1",
+        budget_reservation_digest="1" * 64,
+        budget_ceiling=(("tokens", 1),), provider_id="provider-1",
+        model_id="model-1", provider_config_digest="2" * 64,
+        max_output_tokens=1,
+    )
+    wrong = ModelEgressObservationV1(
+        item.authority_id, item.authority_namespace, subject, operation,
+        item.call_id, item.model_request_digest, "completed", "{}", (), (), None,
+    )
+    receipt = ModelTerminalReceiptV2(
+        "a" * 64, item.call_id, item.model_request_digest, "b" * 64,
+        wrong.digest, "sha256:" + "c" * 64, item.installation_id,
+        "d" * 64,
+    )
+    # The wire DTO cannot infer the true model operation or subject.
+    result = WorkerModelResultReadV1(item, wrong, receipt)
+    if (subject, operation) == (original.subject, original.operation_id):
+        result.require_original_intent(original)
+    else:
+        with pytest.raises(ValueError):
+            result.require_original_intent(original)
 
 
 def test_attempt_retries_conflicts_finish_and_restart(tmp_path):
