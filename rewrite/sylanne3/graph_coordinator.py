@@ -3977,6 +3977,23 @@ class GraphCoordinator:
             domains=domains, activation_generation=activation_generation,
             operation_id=operation_id)
 
+    def release_authority_lease(self, bootstrap: object, lease: object) -> None:
+        """Discard a plain process capability after its host operation ends.
+
+        This touches no graph, job, reservation, or Authority receipt. A later
+        recovery may mint a new lease scoped to the original operation ID.
+        Owner and deletion read leases keep their dedicated release paths.
+        """
+        self._admin(bootstrap)
+        if type(lease) is not _AuthorityLease:
+            raise AuthorityDenied("process authority lease required")
+        if lease in self.__owner_leases or lease in self.__deletion_read_leases:
+            raise AuthorityDenied("specialized lease requires its own release")
+        try:
+            del self.__leases[lease]
+        except (KeyError, TypeError):
+            raise AuthorityDenied("unknown process authority") from None
+
     def grant_deletion_read(self, bootstrap: object, *, actor: str,
                             namespace: NamespaceId,
                             activation_generation: int) -> tuple[AuthorityContext, object]:
