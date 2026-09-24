@@ -18,6 +18,8 @@ from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 
 
 D12_SCHEMA = "d12.contract.v1"
+SOURCE_CORRECTION_SCHEMA = "d12.source_correction.v1"
+SOURCE_CORRECTION_RESPONSE_SCHEMA = "d12.source_correction_response.v1"
 _SCOPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 _BLUEPRINT_REF = re.compile(r"[A-Za-z0-9]+(?:[._:-][A-Za-z0-9]+)*\Z")
 _ACTIONS = frozenset({
@@ -43,7 +45,9 @@ _INPUT_FIELDS = {
     "compile_scheme": frozenset({"draft", "draft_ref", "field_diff", "view_type", "intent", "budget_ref"}),
     "activate_scheme": frozenset({"compiled_scheme_ref", "read_set", "adopt_intent"}),
     "read_character_view": frozenset({"view_type", "cursor", "page_size"}),
-    "correct_or_edit": frozenset({"correction_kind", "statement", "source_refs", "impact_preview_ref", "draft_ref"}),
+    "correct_or_edit": frozenset({"schema", "correction_kind", "statement", "source_refs",
+                                   "target_refs", "access_epoch", "deletion_epoch",
+                                   "impact_preview_ref"}),
     "run_experiment": frozenset({"experiment", "input_refs", "budget_ref", "retention_policy_ref"}),
     "prepare_transfer": frozenset({"mode", "target", "manifest_ref", "scope_selection"}),
     "execute_transfer": frozenset({"plan_ref", "current_epochs", "target_lease_ref"}),
@@ -134,6 +138,16 @@ class WorkbenchService:
         # selects a permitted audience; it can never expand one.
         if not session.allows(command["scope"], capability, command["purpose"], command["audience"]):
             return self._problem("unauthorized", "capability_denied", "当前会话没有此范围、用途或受众的能力。", False)
+        if command["action"] == "correct_or_edit":
+            # D06 can plan a correction, but W01/W03 do not yet expose an
+            # Owner-authorized atomic source/reinterpretation commit. A preview
+            # reference supplied by the browser is not evidence of a commit.
+            return ApiResponse(status="unavailable", problem={
+                "schema": SOURCE_CORRECTION_RESPONSE_SCHEMA,
+                "code": "source_correction_commit_unavailable",
+                "message": "来源纠错提交尚未接入权威协调器；未修改来源或解释。",
+                "retryable": False,
+            })
         if self._issuer is None:
             return self._problem("unavailable", "provider_unavailable", "工作台协调器尚未接入；未执行任何领域写入。", True)
         try:
@@ -224,6 +238,29 @@ class WorkbenchService:
                 raise ValueError("bind_scene requires a server-resolvable scene reference")
             if input_data["visibility"] not in {"private", "group"} or input_data["acknowledgement"] is not True:
                 raise ValueError("bind_scene requires an acknowledged visibility")
+        if action == "correct_or_edit":
+            required = _INPUT_FIELDS[action] - {"impact_preview_ref"}
+            if set(input_data) not in (required, _INPUT_FIELDS[action]):
+                raise ValueError("source correction requires its versioned claim, sources, targets and epochs")
+            if (input_data["schema"] != SOURCE_CORRECTION_SCHEMA
+                    or input_data["correction_kind"] != "source_claim"):
+                raise ValueError("unsupported source correction contract")
+            if (type(input_data["statement"]) is not str
+                    or not 1 <= len(input_data["statement"].strip()) <= 4096):
+                raise ValueError("source correction requires a bounded statement")
+            for name in ("source_refs", "target_refs"):
+                refs = input_data[name]
+                if (type(refs) is not list or not 1 <= len(refs) <= 100
+                        or any(type(ref) is not str or not 1 <= len(ref) <= 4096 for ref in refs)
+                        or len(set(refs)) != len(refs)):
+                    raise ValueError(f"{name} must contain unique bounded references")
+            for name in ("access_epoch", "deletion_epoch"):
+                if type(input_data[name]) is not int or input_data[name] < 0:
+                    raise ValueError(f"{name} must be a nonnegative exact integer")
+            if "impact_preview_ref" in input_data and (
+                    type(input_data["impact_preview_ref"]) is not str
+                    or not 1 <= len(input_data["impact_preview_ref"]) <= 4096):
+                raise ValueError("impact_preview_ref must be a bounded reference")
         if "page_size" in input_data and (type(input_data["page_size"]) is not int or not 1 <= input_data["page_size"] <= 100):
             raise ValueError("page_size must be an integer from 1 through 100")
         if "cursor" in input_data and (type(input_data["cursor"]) is not str

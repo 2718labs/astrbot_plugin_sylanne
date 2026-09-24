@@ -182,6 +182,42 @@ def test_command_rejects_provider_receipt_for_another_operation():
     assert answer.problem["code"] == "invalid_provider_response"
 
 
+def test_source_correction_is_versioned_and_cannot_claim_a_commit_without_authority():
+    class SpuriousWriter:
+        def execute(self, **_):
+            raise AssertionError("correction must not reach a generic writer")
+
+    payload = request(
+        "correct_or_edit", schema="d12.source_correction.v1",
+        correction_kind="source_claim", statement="周一那件事是我说错了",
+        source_refs=["source:owner-statement"], target_refs=["memory:prior-claim"],
+        access_epoch=2, deletion_epoch=1,
+    )
+    answer = WorkbenchService(SpuriousWriter()).handle(
+        payload, session=session("workbench.correct"), context=CONTEXT)
+    assert answer.status == "unavailable" and answer.receipt is None
+    assert answer.problem["code"] == "source_correction_commit_unavailable"
+    assert answer.problem["schema"] == "d12.source_correction_response.v1"
+
+    for invalid in (
+        {"schema": "d12.source_correction.v2"},
+        {"correction_kind": "creative_edit"},
+        {"source_refs": []},
+        {"target_refs": ["memory:prior-claim", "memory:prior-claim"]},
+        {"access_epoch": True},
+        {"statement": " "},
+    ):
+        malformed = {**payload, "input": {**payload["input"], **invalid}}
+        rejected = WorkbenchService(SpuriousWriter()).handle(
+            malformed, session=session("workbench.correct"), context=CONTEXT)
+        assert rejected.problem["code"] == "invalid_request"
+        assert rejected.receipt is None
+
+    denied = WorkbenchService(SpuriousWriter()).handle(
+        payload, session=session("workbench.read"), context=CONTEXT)
+    assert denied.problem["code"] == "capability_denied"
+
+
 def test_d12_draft_types_preserve_candidate_boundary_and_schema_digest():
     draft = CharacterDraft(SCOPE, 0, {"identity": "candidate"}, {"identity": "authored"})
     assert draft.revision == 0
