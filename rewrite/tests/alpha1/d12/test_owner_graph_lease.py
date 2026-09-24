@@ -306,6 +306,102 @@ def test_d05_relations_read_uses_committed_graph_and_current_owner_fence(owner_g
     coordinator.release_current_owner_lease(bootstrap, lease)
 
 
+def test_d06_workbench_reads_authorized_source_then_hides_withdrawn_access(owner_graph):
+    graph, coordinator, bootstrap, port, _, _ = owner_graph
+    authority, lease, _ = coordinator.grant_current_owner(
+        bootstrap, actor="owner-session", namespace=NAMESPACE,
+        domains=("d06", "d11"), purpose="context", audience="owner",
+        activation_generation=1, owner_session_token=OWNER_TOKEN,
+        owner_session_request=OWNER_REQUEST,
+    )
+
+    class Resolver:
+        def resolve(self, **_kwargs):
+            return CoordinatorGrant("bot/persona", authority, lease)
+
+    issuer = GraphWorkbenchIssuer(
+        coordinator, Resolver(), CurrentDomainViewRegistry(discover_domain_registry),
+    )
+    session = AuthenticatedSession(
+        "owner-session", "signed-session",
+        {"bot/persona": frozenset({"workbench.read"})},
+        {"bot/persona": frozenset({"owner"})},
+        {"bot/persona": frozenset({"context"})},
+        owner_session_token=OWNER_TOKEN, owner_session_request=OWNER_REQUEST,
+    )
+    source = SourceRecord(
+        "visible-source", "private source text", "private speaker", "reported",
+        "reported", None, 7.0, "private provenance", ("owner",), ("context",),
+    )
+    source_ref = source_key("bot", "persona", source.source_id)
+    access_ref = access_key("bot", "persona", source.source_id)
+
+    def commit(event_id, writes):
+        keys = tuple(dict.fromkeys(
+            key for write in writes for key in (write.key, *write.dependencies)
+        ))
+        snapshot = GraphStore.graph_snapshot(
+            graph, keys, _capability=graph._coordinator_capability,
+        )
+        GraphStore.graph_commit(
+            graph, GraphCandidate(
+                Event(Scope("bot", "persona", "seed"), event_id, 2.0, "test", {}),
+                snapshot.versions, tuple(writes), snapshot.epochs,
+            ), _capability=graph._coordinator_capability,
+        )
+        with graph._lock:
+            graph._db.execute("BEGIN IMMEDIATE")
+            try:
+                recovery = graph.graph_recovery_metadata(
+                    NAMESPACE, _capability=graph._coordinator_capability,
+                )
+                graph.cas_graph_recovery_metadata(
+                    recovery, recovery.requirements,
+                    _capability=graph._coordinator_capability,
+                )
+                graph._db.execute("COMMIT")
+            except BaseException:
+                graph._db.execute("ROLLBACK")
+                raise
+
+    def read():
+        return issuer.read_projection(
+            session=session, scope="bot/persona", view_type="d06.memory_sources.v1",
+            purpose="context", audience="owner",
+        )
+
+    def access(status):
+        return {"source_id": source.source_id, "audiences": ["owner"],
+                "purposes": ["context"], "status": status, "recorded_at": 7.0}
+
+    commit("source-visible", (
+        GraphWrite(source_ref, source.to_dict()),
+        GraphWrite(access_ref, access("active"), (source_ref,)),
+    ))
+    visible = read()
+    assert visible["status"] == "ready"
+    assert visible["projection"]["data"] == {"sources": [{
+        "source_id": "visible-source", "source_kind": "reported",
+        "assertion_status": "reported", "recorded_at": 7.0,
+        "qualification": "not_recorded",
+    }], "coverage": "complete"}
+    assert "private source text" not in repr(visible)
+    assert "private speaker" not in repr(visible)
+
+    commit("source-withdrawn", (GraphWrite(
+        access_ref, access("withdrawn"), (source_ref,),
+    ),))
+    withdrawn = read()
+    assert withdrawn["status"] == "ready"
+    assert withdrawn["projection"]["data"] == {"sources": [], "coverage": "complete"}
+    assert source.source_id not in repr(withdrawn)
+
+    port.session_current = False
+    stale_owner = read()
+    assert stale_owner["status"] == "unavailable" and "projection" not in stale_owner
+    coordinator.release_current_owner_lease(bootstrap, lease)
+
+
 def test_d06_workbench_uses_full_fenced_private_scan_without_count_side_channel(
         owner_graph, monkeypatch):
     graph, coordinator, bootstrap, _, _, _ = owner_graph
