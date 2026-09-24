@@ -6474,6 +6474,8 @@ class GraphCoordinator:
             job.budget_ref, job.operation_id, reservation_digest, ceiling,
             frozen["provider_id"], frozen["model_id"],
             frozen["provider_config_digest"], frozen["max_output_tokens"],
+            acquire_operation_id=acquire_operation_id,
+            binding_digest=binding.binding_digest,
         )
         return binding, draft, anchor
 
@@ -6772,6 +6774,375 @@ class GraphCoordinator:
             binding.model_request_digest, binding.source_id,
             binding.source_revision, binding.access_revision,
             authority.actor, job.fence, job.lease_expires_utc, anchor)
+
+    def discover_first_ingress_recovery_v1(
+        self, bootstrap: object, namespace: NamespaceId,
+        cursor: str | None = None, limit: int = 20,
+    ):
+        """List original V3 call identities; this grants no new dispatch."""
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .runtime.first_ingress_recovery import FirstIngressRecoveryPageV1
+        from .runtime.first_ingress_v2 import trusted_upper
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId or type(limit) is not int
+                or not 1 <= limit <= 50
+                or cursor is not None and (type(cursor) is not str
+                                           or len(cursor) > 1024)
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__d02_issuer is None
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("installed, bounded V3 recovery discovery required")
+        parsed_cursor = self._parse_first_ingress_recovery_cursor_v1(cursor)
+        try:
+            now = trusted_upper(self.__content_fence_v2.read_ingress_clock(
+                self.__scene_clock_policy))
+        except Exception as exc:
+            raise UnavailableGuard("recovery discovery clock unavailable") from exc
+        with self.__store._lock:
+            metadata, _ = self._v2_graph_stamp(namespace)
+        authority = AuthorityContext(
+            self.__holder, "d11", "recovery-discovery", namespace,
+            ("activity",), "recovery", ("internal",),
+            "recovery-discovery-v1",
+            metadata.requirements.activation_generation)
+
+        def reader():
+            db = self.__store._db
+            current, epoch = self._v2_graph_stamp(namespace)
+            target = current.requirements
+            provision_row = self._provision_row(db, namespace)
+            if provision_row is None:
+                raise UnavailableGuard("V3 recovery provisioning absent; HOLD")
+            provision = self._decode_provision_receipt(provision_row)
+            installed = self.__content_fence_v2.installation_grant
+            if (provision.installation_id != installed.installation_id
+                    or provision.authority_id != installed.authority_id
+                    or provision.authority_namespace != target.authority_namespace
+                    or provision.generation != target.activation_generation
+                    or target.namespace != namespace):
+                raise UnavailableGuard("V3 recovery installation differs; HOLD")
+            stamp = {
+                "schema": "sylanne3.runtime.first-ingress-recovery-cursor.v1",
+                "namespace": asdict(namespace),
+                "installation_id": provision.installation_id,
+                "graph_incarnation": target.graph_incarnation,
+                "graph_revision": current.graph_revision,
+                "graph_epoch": epoch.revision,
+            }
+            last = ""
+            if parsed_cursor is not None:
+                if any(parsed_cursor.get(key) != value for key, value in stamp.items()):
+                    raise UnavailableGuard("V3 recovery cursor lost graph stamp")
+                last = parsed_cursor["last_acquire_operation_id"]
+                if db.execute(
+                    "SELECT 1 FROM graph_job_acquire_intents_v2 WHERE bot=? "
+                    "AND persona=? AND acquire_operation_id=? AND "
+                    "json_extract(json_extract(encoding_binding_json,"
+                    "'$.request_json'),'$.schema')=?",
+                    namespace.as_tuple + (last,
+                        "sylanne.first-ingress-encoding-call.v3"),
+                ).fetchone() is None:
+                    raise UnavailableGuard("V3 recovery cursor row is absent")
+            rows = db.execute(
+                "SELECT i.acquire_operation_id,i.job_id,i.original_operation_id,"
+                "i.actor,i.encoding_binding_json,i.requirements_json,"
+                "i.graph_revision,i.graph_epoch,i.request_digest,"
+                "r.request_digest,r.job_json "
+                "FROM graph_job_acquire_intents_v2 AS i "
+                "JOIN graph_job_acquire_receipts_v2 AS r "
+                "ON r.bot=i.bot AND r.persona=i.persona "
+                "AND r.acquire_operation_id=i.acquire_operation_id "
+                "WHERE i.bot=? AND i.persona=? AND i.acquire_operation_id>? "
+                "AND json_extract(json_extract(i.encoding_binding_json,"
+                "'$.request_json'),'$.schema')=? "
+                "ORDER BY i.acquire_operation_id LIMIT ?",
+                namespace.as_tuple + (last,
+                    "sylanne.first-ingress-encoding-call.v3", limit + 1),
+            ).fetchall()
+            items = tuple(self._first_ingress_recovery_item_locked_v1(
+                namespace, provision.installation_id, current, epoch, now, row)
+                          for row in rows[:limit])
+            next_cursor = None
+            if len(rows) > limit:
+                payload = {**stamp, "last_acquire_operation_id": rows[limit - 1][0]}
+                next_cursor = canonical_json({
+                    **payload, "digest": canonical_digest(payload)})
+            return FirstIngressRecoveryPageV1(
+                namespace, provision.installation_id,
+                target.graph_incarnation, current.graph_revision,
+                epoch.revision, items, next_cursor)
+
+        return self._read_v2(authority, reader)
+
+    @staticmethod
+    def _parse_first_ingress_recovery_cursor_v1(cursor):
+        if cursor is None:
+            return None
+        try:
+            parsed = json.loads(cursor)
+            if (type(parsed) is not dict
+                    or set(parsed) != {
+                        "schema", "namespace", "installation_id",
+                        "graph_incarnation", "graph_revision", "graph_epoch",
+                        "last_acquire_operation_id", "digest"}
+                    or parsed["schema"] !=
+                    "sylanne3.runtime.first-ingress-recovery-cursor.v1"
+                    or type(parsed["last_acquire_operation_id"]) is not str
+                    or not 1 <= len(parsed["last_acquire_operation_id"]) <= 128
+                    or cursor != canonical_json(parsed)
+                    or parsed["digest"] != canonical_digest({
+                        key: value for key, value in parsed.items()
+                        if key != "digest"})):
+                raise ValueError("recovery cursor differs")
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            raise UnavailableGuard("invalid V3 recovery cursor") from exc
+        return parsed
+
+    def _first_ingress_recovery_item_locked_v1(
+        self, namespace, installation_id, metadata, epoch, now, row,
+    ):
+        """Join one V3 receipt to its current graph without exposing content."""
+        from datetime import datetime
+
+        from .memory_types import access_key, episode_key, source_key, validate_access
+        from .runtime.d11_types import RuntimeOutboxValue, job_graph_write, runtime_job_key
+        from .runtime.encoding_call_binding import binding_from_json, load_binding
+        from .runtime.first_ingress_c02_identity import (
+            first_ingress_c02_consumer_operation_id_v1,
+        )
+        from .runtime.first_ingress_recovery import FirstIngressRecoveryItemV1
+        from .runtime.first_ingress_v2 import ingress_ids
+
+        (acquire_id, job_id, original_id, actor, binding_json,
+         requirements_json, acquired_revision, acquired_epoch,
+         intent_digest, receipt_digest, job_json) = row
+        db = self.__store._db
+        binding = binding_from_json(binding_json)
+        frozen = binding.request
+        original = PersistentJob(**json.loads(job_json))
+        job = get_job(db, job_id)
+        historical = json.loads(requirements_json)
+        if (binding != load_binding(db, namespace, job_id)
+                or binding.namespace != namespace
+                or intent_digest != receipt_digest
+                or historical.get("namespace") != asdict(namespace)
+                or historical.get("graph_incarnation") !=
+                metadata.requirements.graph_incarnation
+                or historical.get("authority_id") !=
+                metadata.requirements.authority_id
+                or historical.get("authority_namespace") !=
+                metadata.requirements.authority_namespace
+                or frozen.get("schema") !=
+                "sylanne.first-ingress-encoding-call.v3"
+                or frozen.get("acquire_operation_id") != acquire_id
+                or frozen.get("original_operation_id") != original_id
+                or frozen.get("worker_fence") != original.fence
+                or frozen.get("worker_lease_expires_utc") !=
+                original.lease_expires_utc
+                or frozen.get("baseline") is None
+                or frozen.get("call_id") != binding.call_id
+                or frozen.get("model_request_digest") !=
+                binding.model_request_digest
+                or (original.job_id, original.operation_id,
+                    original.phase, original.lease_holder,
+                    original.cancel_epoch) != (
+                    job_id, original_id, "running", actor, 0)
+                or (job.bot_id, job.persona_id, job.job_id,
+                    job.operation_id, job.activity_id, job.budget_ref,
+                    job.work_kind, job.fence, job.cancel_epoch) != (
+                    *namespace.as_tuple, job_id, original_id,
+                    original.activity_id, original.budget_ref,
+                    "d06.encode_source", original.fence, 0)
+                or job.phase not in {"running", "completed"}
+                or not _job_acquire_id_matches(
+                    acquire_id, namespace, job_id, original_id, actor,
+                    metadata.requirements.activation_generation)):
+            raise UnavailableGuard("V3 recovery original acquire differs; HOLD")
+        if db.execute(
+                "SELECT 1 FROM runtime_encoding_call_redactions_v1 "
+                "WHERE bot=? AND persona=? AND "
+                "(acquire_operation_id=? OR call_id=? OR source_id=?) LIMIT 1",
+                namespace.as_tuple + (
+                    acquire_id, binding.call_id, binding.source_id),
+        ).fetchone() is not None:
+            raise UnavailableGuard("V3 recovery original call was redacted; HOLD")
+        job_key = runtime_job_key(*namespace.as_tuple, job.activity_id, job_id)
+        current_job_atom = db.execute(
+            "SELECT value,valid FROM graph_atoms WHERE token=?",
+            (job_key.token,),
+        ).fetchone()
+        original_job_atom = db.execute(
+            "SELECT value FROM graph_history WHERE token=? AND valid=1 "
+            "AND event_bot=? AND event_persona=? AND event_session=? "
+            "AND event_id=?",
+            (job_key.token, *namespace.as_tuple, job.activity_id, acquire_id),
+        ).fetchone()
+        if (current_job_atom != (canonical_json(job_graph_write(job).value), 1)
+                or original_job_atom != (
+                    canonical_json(job_graph_write(original).value),)):
+            raise UnavailableGuard("V3 recovery job graph history differs; HOLD")
+        source_key_value = source_key(*namespace.as_tuple, binding.source_id)
+        access_key_value = access_key(*namespace.as_tuple, binding.source_id)
+        source_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (source_key_value.token,),
+        ).fetchone()
+        access_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (access_key_value.token,),
+        ).fetchone()
+        if (source_row is None or access_row is None
+                or (source_row[0], source_row[2]) != (
+                    binding.source_revision, 1)
+                or (access_row[0], access_row[2]) != (
+                    binding.access_revision, 1)
+                or db.execute(
+                    "SELECT dependency_revision FROM graph_dependencies "
+                    "WHERE dependent_token=? AND dependency_token=?",
+                    (access_key_value.token, source_key_value.token),
+                ).fetchone() != (binding.source_revision,)):
+            raise UnavailableGuard("V3 recovery source/access revoked; HOLD")
+        source = SourceRecord.from_dict(json.loads(source_row[1]))
+        access = json.loads(access_row[1])
+        validate_access(access)
+        frozen_authority = frozen["envelope"]["authority"]
+        audience = frozen_authority["audience"]
+        if (source.source_id != binding.source_id
+                or access["source_id"] != binding.source_id
+                or access["status"] != "active"
+                or "consolidation" not in source.purposes
+                or "consolidation" not in access["purposes"]
+                or type(audience) is not list or not audience
+                or not set(audience).issubset(source.audiences)
+                or not set(audience).issubset(access["audiences"])
+                or frozen_authority["actor"] != actor
+                or frozen_authority["worker_fence"] != original.fence):
+            raise UnavailableGuard("V3 recovery source scope differs; HOLD")
+        baseline = self._committed_first_ingress_baseline_locked(
+            namespace, binding.source_id, metadata, epoch,
+            acquire_stamp=(acquired_revision, acquired_epoch))
+        if frozen["baseline"] != asdict(baseline):
+            raise UnavailableGuard("V3 recovery baseline differs; HOLD")
+        receipt = db.execute(
+            "SELECT activity_id,receipt_json FROM graph_bundle_operations "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (original_id,),
+        ).fetchone()
+        expected = ingress_ids(binding.source_id)
+        if (receipt is None or receipt[0] != job.activity_id
+                or (expected[1], expected[2], expected[3]) != (
+                    job.activity_id, original_id, job_id)
+                or job_key.token not in json.loads(receipt[1]).get(
+                    "ledger_refs", ())):
+            raise UnavailableGuard("V3 recovery ingress receipt differs; HOLD")
+        self._original_first_ingress_qualification_locked(
+            namespace, original_id, source_key_value.token)
+        outbox_refs = json.loads(receipt[1]).get("outbox_refs")
+        if type(outbox_refs) is not list or len(outbox_refs) != 1:
+            raise UnavailableGuard("V3 recovery original outbox differs; HOLD")
+        outbox_token = outbox_refs[0]
+        outbox_key = AtomKey.from_token(outbox_token)
+        historical_outbox = db.execute(
+            "SELECT value FROM graph_history WHERE token=? AND valid=1 "
+            "AND event_bot=? AND event_persona=? AND event_session=? "
+            "AND event_id=?",
+            (outbox_token, *namespace.as_tuple, job.activity_id, original_id),
+        ).fetchall()
+        if len(historical_outbox) != 1:
+            raise UnavailableGuard("V3 recovery original outbox absent; HOLD")
+        outbox = RuntimeOutboxValue(**json.loads(historical_outbox[0][0]))
+        if (outbox_key.type_name != "runtime.outbox"
+                or outbox_key.owner != Owner(
+                    "activity", *namespace.as_tuple, job.activity_id)
+                or outbox.payload_ref != binding.source_id
+                or outbox.job_ref != job_key.token
+                or outbox.operation_id != original_id
+                or outbox.job_id != job_id
+                or outbox.phase != "pending"
+                or outbox.outbox_id != expected[4]
+                or outbox.idempotency_key != expected[5]):
+            raise UnavailableGuard("V3 recovery original outbox changed; HOLD")
+        quote_ref = job.operator_versions.get("resource_quote")
+        if type(quote_ref) is not str or ":" not in quote_ref:
+            raise UnavailableGuard("V3 recovery signed quote absent; HOLD")
+        quote_id, version_text = quote_ref.rsplit(":", 1)
+        quote = self.__d02_issuer.original_signed_quote(
+            db, quote_id, int(version_text))
+        reservation = db.execute(
+            "SELECT digest,ceiling_json FROM runtime_budget_reservations "
+            "WHERE lease_id=? AND operation_id=?",
+            (job.budget_ref, original_id),
+        ).fetchone()
+        reserve_receipt = db.execute(
+            "SELECT digest FROM runtime_budget_operations WHERE bot_id=? "
+            "AND persona_id=? AND operation_id=? AND phase='reserve'",
+            namespace.as_tuple + (original_id,),
+        ).fetchone()
+        if (quote.graph_job_ref != job_key.token
+                or quote.operation_id != original_id
+                or quote.activity_id != job.activity_id
+                or quote.parent_budget_lease_ref != job.budget_ref
+                or reservation is None or reserve_receipt is None
+                or reservation != (reserve_receipt[0],
+                                   canonical_json(quote.ceiling))):
+            raise UnavailableGuard("V3 recovery original budget differs; HOLD")
+        consumer_id = first_ingress_c02_consumer_operation_id_v1(
+            namespace=namespace,
+            authority_id=metadata.requirements.authority_id,
+            authority_namespace=metadata.requirements.authority_namespace,
+            installation_id=installation_id, job_id=job_id,
+            acquire_operation_id=acquire_id,
+            original_operation_id=original_id, call_id=binding.call_id,
+            binding_digest=binding.binding_digest,
+            model_request_digest=binding.model_request_digest)
+        c02 = db.execute(
+            "SELECT digest,commit_seq,receipt_json FROM "
+            "graph_bundle_operations WHERE bot=? AND persona=? "
+            "AND operation_id=?",
+            namespace.as_tuple + (consumer_id,),
+        ).fetchone()
+        if job.phase == "running":
+            if (c02 is not None or job.lease_holder != actor
+                    or job.lease_expires_utc != original.lease_expires_utc
+                    or job.result_ref is not None):
+                raise UnavailableGuard("V3 recovery original lease changed; HOLD")
+            expires = datetime.fromisoformat(
+                original.lease_expires_utc.replace("Z", "+00:00")).timestamp()
+            state = ("expired_lease_hold" if now >= expires
+                     else "original_fence")
+            c02_digest = c02_seq = None
+        else:
+            if (c02 is None or job.lease_holder is not None
+                    or job.lease_expires_utc is not None or not job.result_ref):
+                raise UnavailableGuard("V3 recovery completion receipt absent; HOLD")
+            detail = json.loads(c02[2]).get("first_ingress_c02")
+            event = db.execute(
+                "SELECT 1 FROM graph_events WHERE bot=? AND persona=? "
+                "AND session=? AND event_id=?",
+                namespace.as_tuple + (job.activity_id, consumer_id),
+            ).fetchone()
+            fence = db.execute(
+                "SELECT digest FROM graph_bundle_fences_v2 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (consumer_id,),
+            ).fetchone()
+            episode = episode_key(*namespace.as_tuple, job.result_ref)
+            episode_row = db.execute(
+                "SELECT valid FROM graph_atoms WHERE token=?", (episode.token,),
+            ).fetchone()
+            if (type(detail) is not dict or event is None
+                    or fence != (c02[0],) or episode_row != (1,)
+                    or type(c02[1]) is not int or c02[1] < 1):
+                raise UnavailableGuard("V3 recovery C02 receipt differs; HOLD")
+            state, c02_digest, c02_seq = "c02_committed", c02[0], c02[1]
+        return FirstIngressRecoveryItemV1(
+            namespace, installation_id, job_id, acquire_id, original_id,
+            binding.call_id, binding.binding_digest,
+            binding.model_request_digest, consumer_id, job.phase, actor,
+            original.fence, original.lease_expires_utc, state,
+            c02_digest, c02_seq)
 
     def prepare_first_ingress_model_cost_v1(
         self, bootstrap: object, namespace: NamespaceId, original_intent,
@@ -8652,8 +9023,8 @@ class GraphCoordinator:
             if current is None:
                 raise StaleRead("D04 write key is absent from the complete read set")
             if current.revision == 0:
-                # Initial state creation has no preceding numerical interval.
-                continue
+                raise UnavailableGuard(
+                    "initial D04 state needs an authenticated authored root; HOLD")
             if not current.valid:
                 raise StaleRead("D04 state is invalid")
             old, new = current.value, write.value
