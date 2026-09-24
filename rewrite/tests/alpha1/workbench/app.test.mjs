@@ -417,7 +417,7 @@ test("catalogue opens only a service-available known page and requests its fresh
     assert.equal(request.payload.scope, "bot/persona");
     request.resolve({ status: "ready", projection: { view_type: "creation", data: { candidates: [] } } });
     await selected;
-    assert.match(ui.app.innerHTML, /当前范围内没有已保存的角色方案/);
+    assert.match(ui.app.innerHTML, /尚不能确认整个范围为空/);
   } finally { ui.restore(); }
 });
 
@@ -580,7 +580,7 @@ test("creation page keeps empty and malformed projections distinct and clears on
       view_type: "creation", data: { candidates: [] }
     } });
     await selected;
-    assert.match(ui.app.innerHTML, /没有已保存的角色方案/);
+    assert.match(ui.app.innerHTML, /尚不能确认整个范围为空/);
     const refreshed = ui.clickCommand("refresh");
     await ui.nextRequest(2);
     ui.requests[2].resolve({ status: "ready", projection: {
@@ -594,5 +594,69 @@ test("creation page keeps empty and malformed projections distinct and clears on
     assert.doesNotMatch(ui.app.innerHTML, /已授权角色方案/);
     ui.requests[3].resolve({ status: "ok", owner_session: "locked" });
     await logout;
+  } finally { ui.restore(); }
+});
+
+test("creation list marks truncated coverage and appends only matching cursor pages", async () => {
+  const ui = await mountWorkbench();
+  const candidate = (id) => ({ plan_id: id, version: 1, authored: true, block_count: 0, value_rule_count: 0 });
+  const projection = (candidates, truncated, cursor) => ({
+    view_type: "creation", namespace: { bot: "bot", persona: "persona" },
+    access_generation: 4, snapshot_epoch: 9, data: { candidates },
+    coverage: { returned_atoms: candidates.length, truncated }, next_cursor: cursor
+  });
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    const selected = ui.clickView("creation");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: projection([candidate("first")], true, "opaque-cursor") });
+    await selected;
+    assert.match(ui.app.innerHTML, /已读取 1 个方案，服务标记还有后续页面/);
+    assert.match(ui.app.innerHTML, /data-command="creation-next"[^>]*>继续读取后续方案/);
+    const next = ui.clickCommand("creation-next");
+    const request = await ui.nextRequest(2);
+    assert.equal(request.payload.input.cursor, "opaque-cursor");
+    assert.equal(request.payload.input.view_type, "creation");
+    assert.match(ui.app.innerHTML, /正在读取后续方案/);
+    request.resolve({ status: "ready", projection: projection([candidate("second")], false, null) });
+    await next;
+    assert.match(ui.app.innerHTML, /first<\/strong>/);
+    assert.match(ui.app.innerHTML, /second<\/strong>/);
+    assert.match(ui.app.innerHTML, /当前快照已读完，共 2 个方案/);
+    assert.doesNotMatch(ui.app.innerHTML, /data-command="creation-next"/);
+  } finally { ui.restore(); }
+});
+
+test("creation cursor refuses a page from another snapshot and clears prior plans", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    const selected = ui.clickView("creation");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: {
+      view_type: "creation", namespace: { bot: "bot", persona: "persona" },
+      access_generation: 4, snapshot_epoch: 9,
+      data: { candidates: [{ plan_id: "prior-private-plan", version: 1, authored: true, block_count: 0, value_rule_count: 0 }] },
+      coverage: { truncated: true }, next_cursor: "opaque-cursor"
+    } });
+    await selected;
+    const next = ui.clickCommand("creation-next");
+    await ui.nextRequest(2);
+    ui.requests[2].resolve({ status: "ready", projection: {
+      view_type: "creation", namespace: { bot: "bot", persona: "persona" },
+      access_generation: 4, snapshot_epoch: 10,
+      data: { candidates: [] }, coverage: { truncated: false }, next_cursor: null
+    } });
+    await next;
+    assert.match(ui.app.innerHTML, /后续方案页无法与当前快照核对/);
+    assert.doesNotMatch(ui.app.innerHTML, /prior-private-plan/);
   } finally { ui.restore(); }
 });
