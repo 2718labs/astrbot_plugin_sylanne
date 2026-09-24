@@ -101,6 +101,7 @@ def qualify_authority_current_self_identity(
             or current.activation_generation != activation["activation_generation"]
             or current.graph_incarnation != activation["graph_incarnation"]
             or current.role_head_id != role.head_id
+            or current.graph_epoch != role.graph_epoch
             or current.owner_authorization_revision != owner_guard.authorization_revision
             or current.owner_authorization_head != owner_guard.authorization_head
             or current.owner_minimum_revocation_revision != owner_guard.minimum_revocation_revision

@@ -155,6 +155,161 @@ def build_self_perspective_bundle(
     return DomainBundle(envelope, (proposal,), (), (), (), (), (), (), ())
 
 
+def build_self_identity_projection_proposal(
+    envelope: CommandEnvelope, role: ActiveRoleQualification,
+    qualified_mapping: SelfIdentityMapping, mapping_atom: GraphAtom | None,
+    arrival_atom: GraphAtom, *, perspective_revision: int = 0,
+) -> DomainProposal:
+    """Compile the Authority-qualified mapping and perspective in one D03 stage.
+
+    The caller must qualify ``qualified_mapping`` against Authority current under
+    the actual write fence. Construction alone is not an issuer. An unchanged
+    mapping is read-guarded but not rewritten, preserving prior perspectives.
+    """
+    if (type(envelope) is not CommandEnvelope or type(role) is not ActiveRoleQualification
+            or type(qualified_mapping) is not SelfIdentityMapping):
+        raise TypeError("current command, role, and Authority mapping are required")
+    namespace = envelope.authority.namespace
+    mapping_key = self_mapping_key(namespace)
+    if mapping_atom is not None and (type(mapping_atom) is not GraphAtom
+                                     or mapping_atom.key != mapping_key):
+        raise ValueError("self mapping read differs from namespace")
+    prior_revision = 0 if mapping_atom is None else mapping_atom.revision
+    if mapping_atom is not None and prior_revision > 0 and not mapping_atom.valid:
+        raise ValueError("revoked graph mapping needs current Authority replacement")
+    if mapping_atom is not None and prior_revision > 0:
+        prior = SelfIdentityMapping(**mapping_atom.value)
+        if prior == qualified_mapping:
+            return build_self_perspective_proposal(
+                envelope, role, mapping_atom, arrival_atom,
+                perspective_revision=perspective_revision,
+            )
+    if (role.namespace != namespace or role.plan.namespace != namespace
+            or role.head_id != role.plan.head_id or role.graph_epoch < 1
+            or envelope.authority.issuer_domain != "d11"
+            or envelope.authority.purpose != "context"
+            or "persona" not in envelope.authority.owner_scope
+            or qualified_mapping.status != "active"
+            or qualified_mapping.persona_ref != f"persona:{namespace.persona_id}"
+            or qualified_mapping.role_head_id != role.head_id
+            or not arrival_atom.valid or arrival_atom.revision < 1):
+        raise ValueError("self projection lacks current role, identity, or arrival")
+    event = WorldEvent(**{
+        **arrival_atom.value,
+        "participant_roles": tuple(tuple(item) for item in arrival_atom.value["participant_roles"]),
+        "source_refs": tuple(arrival_atom.value["source_refs"]),
+    })
+    if (arrival_atom.key != AtomKey(Owner("event", *namespace.as_tuple, event.event_id),
+                                   "d03.world_event", "current")
+            or event.kind != "message_received" or event.reality != "host_observed"
+            or len(event.participant_roles) != 1
+            or event.participant_roles[0][1] != "sender_account"
+            or qualified_mapping.self_entity_ref == event.participant_roles[0][0]):
+        raise ValueError("account arrival cannot establish the role's self identity")
+    perspective = SelfPerspective(
+        self_perspective_id(namespace, event.scene_ref, arrival_atom.key.token),
+        qualified_mapping.persona_ref, qualified_mapping.self_entity_ref,
+        event.scene_ref, mapping_key.token, arrival_atom.key.token, role.head_id,
+    )
+    target = self_perspective_key(namespace, perspective.perspective_id)
+    dependencies = role.read_versions + (
+        GraphVersion(mapping_key, prior_revision),
+        GraphVersion(arrival_atom.key, arrival_atom.revision),
+    )
+    expected = dependencies + (GraphVersion(target, perspective_revision),)
+    reads = {item.key: item.revision for item in envelope.version_guard.read_versions}
+    if (perspective_revision != 0
+            or any(reads.get(item.key) != item.revision for item in expected)
+            or not any(query == QueryEpoch(namespace, "all", role.graph_epoch)
+                       for query in envelope.version_guard.query_epochs)
+            or envelope.input_refs != event.source_refs
+            or envelope.source_qualification.source_refs != event.source_refs):
+        raise ValueError("self projection lacks complete current graph guards")
+    role_keys = tuple(item.key for item in role.read_versions)
+    writes = (
+        GraphWrite(mapping_key, asdict(qualified_mapping), role_keys),
+        GraphWrite(target, asdict(perspective), tuple(item.key for item in dependencies)),
+    )
+    return DomainProposal(
+        "d03", "d03.proposal.v1", ContextProvider().descriptor.request_schema_hash,
+        envelope, writes, DependencySet(current_invalidation=dependencies), (), (),
+    )
+
+
+def build_self_identity_projection_bundle(
+    envelope: CommandEnvelope, role: ActiveRoleQualification,
+    qualified_mapping: SelfIdentityMapping, mapping_atom: GraphAtom | None,
+    arrival_atom: GraphAtom, *, perspective_revision: int = 0,
+) -> DomainBundle:
+    proposal = build_self_identity_projection_proposal(
+        envelope, role, qualified_mapping, mapping_atom, arrival_atom,
+        perspective_revision=perspective_revision,
+    )
+    return DomainBundle(envelope, (proposal,), (), (), (), (), (), (), ())
+
+
+def validate_self_identity_projection_snapshot(
+    proposal: DomainProposal, snapshot: GraphSnapshot,
+    role: ActiveRoleQualification, qualified_mapping: SelfIdentityMapping,
+) -> None:
+    """Check the dedicated D03 stage against a locked graph snapshot.
+
+    W01 must additionally obtain the Authority current value and D11 quote
+    under its actual fence. This graph check never authenticates the DTO.
+    """
+    if (type(proposal) is not DomainProposal or type(snapshot) is not GraphSnapshot
+            or type(role) is not ActiveRoleQualification
+            or type(qualified_mapping) is not SelfIdentityMapping):
+        raise TypeError("self projection needs typed candidate and current proofs")
+    namespace = proposal.envelope.authority.namespace
+    mapping_key = self_mapping_key(namespace)
+    mapping_atom = snapshot.get(mapping_key)
+    if mapping_atom is None:
+        raise ValueError("self projection needs a revision-0 mapping read")
+    writes = proposal.typed_writes
+    if len(writes) not in (1, 2):
+        raise ValueError("self projection has an invalid write shape")
+    perspective_value = SelfPerspective(**writes[-1].value)
+    arrival_atom = snapshot.get(AtomKey.from_token(perspective_value.arrival_event_ref))
+    target_atom = snapshot.get(writes[-1].key)
+    if (arrival_atom is None or target_atom is None or target_atom.revision != 0
+            or not arrival_atom.valid or arrival_atom.revision < 1
+            or role.namespace != namespace):
+        raise ValueError("self projection snapshot lacks current arrival or target")
+    expected = build_self_identity_projection_proposal(
+        proposal.envelope, role, qualified_mapping, mapping_atom, arrival_atom,
+        perspective_revision=target_atom.revision,
+    )
+    if proposal != expected:
+        raise ValueError("self projection differs from current Authority mapping or graph")
+    activation_key = AtomKey(Owner("persona", *namespace.as_tuple),
+                             "d01.persona_activation.v1", "current")
+    activation = snapshot.get(activation_key)
+    if activation is None or not activation.valid:
+        raise ValueError("self projection lacks current D01 activation")
+    plan_key = AtomKey(Owner("persona", *namespace.as_tuple),
+                       "d01.persona_plan.v1", activation.value.get("plan_id", ""))
+    grant_key = owner_grant_key(*namespace.as_tuple)
+    plan, grant = snapshot.get(plan_key), snapshot.get(grant_key)
+    if (plan is None or grant is None or not plan.valid or not grant.valid
+            or activation.value.get("head_id") != role.head_id
+            or activation.value.get("graph_incarnation") != qualified_mapping.graph_incarnation
+            or activation.value.get("owner_grant_id") != grant.value.get("grant_id")
+            or activation.value.get("owner_grant_revision") != grant.revision
+            or plan.value.get("version") != activation.value.get("plan_version")
+            or plan.value.get("plan_id") != activation.value.get("plan_id")
+            or len(snapshot.epochs) != 1
+            or (snapshot.epochs[0].bot, snapshot.epochs[0].persona) != namespace.as_tuple
+            or snapshot.epochs[0].revision != role.graph_epoch):
+        raise ValueError("self projection lacks current role and graph incarnation")
+    for version in role.read_versions:
+        atom = snapshot.get(version.key)
+        if atom is None or not atom.valid or atom.revision != version.revision:
+            raise ValueError("self projection role read changed")
+    if len(writes) == 1:
+        validate_self_perspective_snapshot(proposal, snapshot)
+
+
 def validate_self_perspective_snapshot(proposal: DomainProposal, snapshot: GraphSnapshot) -> None:
     """Recheck a self write against the locked graph read set."""
     if type(snapshot) is not GraphSnapshot or len(proposal.typed_writes) != 1:

@@ -12,9 +12,11 @@ from sylanne3.domains.d03.self_identity_qualification import (
     AuthorityCurrentSelfIdentityV1, qualify_authority_current_self_identity,
 )
 from sylanne3.domains.d03.self_perspective import (
-    SelfIdentityMapping, build_self_perspective_bundle, build_self_perspective_proposal,
-    self_perspective_id, self_mapping_key,
+    SelfIdentityMapping, build_self_identity_projection_bundle,
+    build_self_identity_projection_proposal, build_self_perspective_bundle,
+    build_self_perspective_proposal, self_perspective_id, self_mapping_key,
     self_perspective_key,
+    validate_self_identity_projection_snapshot,
 )
 from sylanne3.graph_types import (
     AtomKey, GraphAtom, GraphSnapshot, GraphVersion, NamespaceEpoch, Owner,
@@ -122,6 +124,68 @@ def test_self_perspective_rejects_revoked_or_changed_mapping_at_commit():
         ContextProvider().validate(proposal, snapshot)
 
 
+def test_self_identity_projection_atomically_writes_new_mapping_and_perspective():
+    envelope, role, atoms = _fixture()
+    qualified = SelfIdentityMapping(**atoms[3].value)
+    absent_mapping = replace(atoms[3], revision=0, value={}, valid=False)
+    reads = tuple(
+        replace(item, revision=0) if item.key == atoms[3].key else item
+        for item in envelope.version_guard.read_versions
+    )
+    envelope = replace(envelope, version_guard=replace(
+        envelope.version_guard, read_versions=reads,
+    ))
+    proposal = build_self_identity_projection_proposal(
+        envelope, role, qualified, absent_mapping, atoms[4],
+    )
+    bundle = build_self_identity_projection_bundle(
+        envelope, role, qualified, absent_mapping, atoms[4],
+    )
+    snapshot = GraphSnapshot(
+        atoms[:3] + (absent_mapping,) + atoms[4:],
+        (NamespaceEpoch("bot", "persona", 5),),
+    )
+    assert bundle.proposals == (proposal,)
+    assert tuple(write.key.type_name for write in proposal.typed_writes) == (
+        "d03.self_identity_mapping.v1", "d03.self_perspective.v1",
+    )
+    validate_self_identity_projection_snapshot(proposal, snapshot, role, qualified)
+    with pytest.raises(ValueError, match="mapping issuer is unavailable"):
+        ContextProvider().validate(proposal, snapshot)
+    forged = replace(proposal.typed_writes[0], value={
+        **proposal.typed_writes[0].value, "self_entity_ref": "entity:other",
+    })
+    with pytest.raises(ValueError, match="differs from current Authority mapping"):
+        validate_self_identity_projection_snapshot(
+            replace(proposal, typed_writes=(forged, proposal.typed_writes[1])),
+            snapshot, role, qualified,
+        )
+
+
+def test_self_identity_projection_reuses_unchanged_mapping_and_cas_replacement():
+    envelope, role, atoms = _fixture()
+    qualified = SelfIdentityMapping(**atoms[3].value)
+    snapshot = GraphSnapshot(atoms, (NamespaceEpoch("bot", "persona", 5),))
+    unchanged = build_self_identity_projection_proposal(
+        envelope, role, qualified, atoms[3], atoms[4],
+    )
+    assert len(unchanged.typed_writes) == 1
+    validate_self_identity_projection_snapshot(unchanged, snapshot, role, qualified)
+
+    replacement = replace(
+        qualified, self_entity_ref="entity:new-role-self",
+        certification_ref="authority:self-identity:replacement",
+    )
+    updated = build_self_identity_projection_proposal(
+        envelope, role, replacement, atoms[3], atoms[4],
+    )
+    assert len(updated.typed_writes) == 2
+    assert updated.typed_writes[1].value["self_entity_ref"] == "entity:new-role-self"
+    validate_self_identity_projection_snapshot(updated, snapshot, role, replacement)
+    with pytest.raises(ValueError, match="differs from current Authority mapping"):
+        validate_self_identity_projection_snapshot(updated, snapshot, role, qualified)
+
+
 def _admin_inputs():
     _, role, atoms = _fixture()
     namespace = role.namespace
@@ -153,7 +217,8 @@ def _admin_inputs():
     )
     current = AuthorityCurrentSelfIdentityV1(
         namespace, "authority-namespace", "authority", "installation", "a" * 64,
-        1, "graph-incarnation", role.head_id, "persona:persona", "entity:role-self",
+        1, "graph-incarnation", role.head_id, 1, role.graph_epoch,
+        "persona:persona", "entity:role-self",
         "self-map:mapping", 1, 0, "registration-operation", "e" * 64,
         1, "sha256:" + "d" * 64, 0, 0, "mapping-operation", permit,
     )
@@ -200,6 +265,8 @@ def test_authority_self_identity_qualification_binds_exact_installed_role_and_fe
     assert mapping.certification_ref.startswith("authority:self-identity:")
     with pytest.raises(ValueError, match="differs from current role or fence"):
         qualify(replace(current, graph_incarnation="old-graph"))
+    with pytest.raises(ValueError, match="differs from current role or fence"):
+        qualify(replace(current, graph_epoch=role.graph_epoch - 1))
     with pytest.raises(ValueError, match="installed persona or Owner proof"):
         qualify(current_grant=replace(grant, installation_id="another-installation"))
     with pytest.raises(ValueError, match="installed persona or Owner proof"):
