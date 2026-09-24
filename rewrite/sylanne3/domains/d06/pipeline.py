@@ -21,6 +21,11 @@ from ...memory_reconstruction import DetailCue, RecollectionReconstruction, reco
 from ...memory_types import source_key
 from ...model_broker.broker import CallReceipt
 from ...model_broker.first_ingress_encoding import parse_first_ingress_encoding_result
+from ...model_broker.first_ingress_encoding import build_first_ingress_encoding_payload
+from ...authority_service.v2_model_result_read_contract import ModelResultReadV1
+from ...authority_service.v2_model_result_read_contract import ModelResultReadRequestV1
+from ...memory_types import SourceRecord
+from ...runtime.encoding_call_binding import EncodingCallBinding, binding_to_json
 from ..d04.encoding_baseline import EncodingBaseline
 from ...runtime_contracts import canonical_digest
 from ...memory_types import access_key
@@ -107,6 +112,50 @@ class PreparedFirstIngressEncoding:
     possible_meanings: tuple[str, ...]
     possible_feelings: tuple[str, ...]
     status: str = "candidate_hold"
+    authority_observation_digest: str | None = None
+    authority_operation_id: str | None = None
+
+
+def validate_first_encoding_authority_result(
+    read: ModelResultReadV1, frozen_request: Mapping[str, object],
+    original_source: SourceRecord, *, source_revision: int, access_revision: int,
+) -> Mapping[str, object]:
+    """Bind original Authority result bytes to the frozen first-ingress input.
+
+    This checks content and identity, but a constructible DTO is not an
+    authorization token. The caller must obtain ``read`` from the Authority
+    service and the final adopter must repeat its source/job/fence checks.
+    """
+    if type(read) is not ModelResultReadV1 or type(original_source) is not SourceRecord:
+        raise TypeError("typed Authority read and original source are required")
+    if type(frozen_request) is not dict:
+        raise TypeError("frozen encoding request must be an object")
+    if (type(source_revision) is not int or source_revision < 1
+            or type(access_revision) is not int or access_revision < 1):
+        raise ValueError("committed source and access revisions are required")
+    payload, template_digest = build_first_ingress_encoding_payload(original_source)
+    if (frozen_request.get("source_id") != original_source.source_id
+            or frozen_request.get("payload") != payload
+            or frozen_request.get("prompt_template_digest") != template_digest):
+        raise ValueError("frozen request differs from original source")
+    if (frozen_request.get("schema") != "sylanne.first-ingress-encoding-call.v2"
+            or frozen_request.get("work_kind") != "d06.encode_source"
+            or type(frozen_request.get("worker_fence")) is not int
+            or frozen_request["worker_fence"] < 1):
+        raise ValueError("production encoding request and worker fence required")
+    if (frozen_request.get("source_revision") != source_revision
+            or frozen_request.get("access_revision") != access_revision):
+        raise ValueError("current source and access revisions differ")
+    observation = read.observation
+    if read.call_id != frozen_request.get("call_id"):
+        raise ValueError("original call identity differs")
+    if observation.request_digest != frozen_request.get("model_request_digest"):
+        raise ValueError("original request digest differs")
+    result = observation.result
+    if type(result) is not dict:
+        raise ValueError("completed original result is unavailable")
+    parse_first_ingress_encoding_result(result, original_source)
+    return result
 
 
 @dataclass(frozen=True)
@@ -499,6 +548,77 @@ class D06MemoryPipeline:
         return PreparedFirstIngressEncoding(
             prepared, baseline_key.token, receipt, canonical_digest(dict(result)),
             candidate.possible_meanings, candidate.possible_feelings,
+        )
+
+    def prepare_authority_first_ingress_encoding(
+        self, read_request: ModelResultReadRequestV1, read: ModelResultReadV1,
+        binding: EncodingCallBinding, original_source: SourceRecord,
+        context: EncodingContext, *, encoding_baseline_ref: str,
+        audience: str, purpose: str,
+    ) -> PreparedFirstIngressEncoding:
+        """Consume a completed original read as a held D06 candidate only.
+
+        The read DTO is data, not a durable adoption permit. D11 must obtain it
+        from the live Authority service and repeat source, worker/cancel and
+        graph validation at final adoption. This method does no graph write.
+        """
+        if (type(read_request) is not ModelResultReadRequestV1
+                or type(read) is not ModelResultReadV1
+                or type(binding) is not EncodingCallBinding
+                or type(original_source) is not SourceRecord):
+            raise TypeError("typed original Authority read, binding and source required")
+        binding_to_json(binding)  # Checks the frozen request's internal digest.
+        if (read_request.namespace != self.adapter.namespace
+                or binding.namespace != self.adapter.namespace
+                or read_request.call_id != read.call_id
+                or read_request.source_purpose != purpose
+                or read_request.audience != (audience,)
+                or binding.source_id != original_source.source_id):
+            raise ValueError("Authority read, binding or source scope differs")
+        source, proof = self.repository.read_source_evidence(
+            original_source.source_id, audience=audience, purpose=purpose,
+        )
+        if source is None:
+            raise PermissionError("original source is unavailable")
+        if source != original_source:
+            raise ValueError("current source differs from original source")
+        versions = {item.key: item.revision for item in proof.versions}
+        namespace = self.adapter.namespace.as_tuple
+        result = validate_first_encoding_authority_result(
+            read, binding.request, original_source,
+            source_revision=versions.get(source_key(*namespace, source.source_id), 0),
+            access_revision=versions.get(access_key(*namespace, source.source_id), 0),
+        )
+        if (binding.call_id != read.call_id
+                or binding.model_request_digest != read.observation.request_digest
+                or read.observation.authority_id != read_request.authority_id
+                or read.observation.namespace != read_request.authority_namespace):
+            raise ValueError("original Authority result identity differs")
+        # The legacy preparation routine accepts a receipt claim. It performs
+        # the D04 baseline and graph checks, then returns candidate_hold. This
+        # derived claim is never promoted into a graph admission credential.
+        claim = CallReceipt(
+            "completed", read.observation.operation_id,
+            read.observation.operation_id, read.call_id,
+            read.observation.request_digest, "authority-original", "authority-original",
+            read.observation.provider_call_ref,
+            dict(read.observation.usage), dict(read.observation.cost),
+            "confirmed", "eligible", False,
+            read.terminal_receipt.admission_id,
+            read.terminal_receipt.finish_digest,
+        )
+        prepared = self.prepare_first_ingress_encoding(
+            source.source_id, result, claim, context,
+            encoding_baseline_ref=encoding_baseline_ref,
+            audience=audience, purpose=purpose,
+        )
+        if (prepared.prepared.epoch != proof.epochs[0]
+                or any(item not in prepared.prepared.proof_versions
+                       for item in proof.versions)):
+            raise RuntimeError("original source or access changed during preparation")
+        return replace(
+            prepared, authority_observation_digest=read.observation.digest,
+            authority_operation_id=read.observation.operation_id,
         )
 
     def retrieve_candidates(
