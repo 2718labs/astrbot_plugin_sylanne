@@ -238,13 +238,42 @@ pub(crate) fn verify_affine_parameter_switch(
 pub(crate) fn verify_fixed_trajectory(
     steps: &[JointVerificationInput<'_>],
 ) -> Result<FixedTrajectoryBounds, VerifierError> {
+    verify_fixed_trajectory_impl(steps, Interval::point(0.0)?, false)
+}
+
+/// Mathematical continuation from a supplied initial error envelope. The
+/// caller must establish that envelope's external provenance; this verifier
+/// checks its propagation and binds its exact binary64 bounds into the digest.
+pub(crate) fn verify_fixed_trajectory_from_error(
+    steps: &[JointVerificationInput<'_>],
+    initial_error: Interval,
+) -> Result<FixedTrajectoryBounds, VerifierError> {
+    verify_fixed_trajectory_impl(steps, initial_error, true)
+}
+
+fn verify_fixed_trajectory_impl(
+    steps: &[JointVerificationInput<'_>],
+    initial_error: Interval,
+    supplied_initial_error: bool,
+) -> Result<FixedTrajectoryBounds, VerifierError> {
     let Some(first) = steps.first() else {
         return Err(VerifierError::InvalidDimension);
     };
-    let mut prior_error = Interval::point(0.0)?;
+    if !initial_error.lower().is_finite()
+        || !initial_error.upper().is_finite()
+        || initial_error.lower() < 0.0
+    {
+        return Err(VerifierError::InvalidInheritedError);
+    }
+    let mut prior_error = initial_error;
     let mut verified = Vec::with_capacity(steps.len());
     let mut digest = Sha256::new();
-    digest.update(b"sylanne3-fixed-trajectory-math-v1\0");
+    if supplied_initial_error {
+        digest.update(b"sylanne3-fixed-trajectory-math-v2\0");
+        hash_f64_values(&mut digest, &[initial_error.lower(), initial_error.upper()]);
+    } else {
+        digest.update(b"sylanne3-fixed-trajectory-math-v1\0");
+    }
     hash_length(&mut digest, steps.len());
     for (index, step) in steps.iter().enumerate() {
         if index > 0 {
@@ -1263,6 +1292,44 @@ mod tests {
         assert_eq!(
             verify_fixed_trajectory(&[first, changed_drive]),
             Err(VerifierError::TrajectorySourceMismatch)
+        );
+    }
+
+    #[test]
+    fn fixed_trajectory_supplied_initial_error_is_propagated_and_bound_to_digest() {
+        let values = [1.0];
+        let first = JointVerificationInput {
+            k: scalar_matrix(&values),
+            r: scalar_matrix(&values),
+            j: SparseMatrix::new(1, 1, &[0, 0], &[], &[]),
+            a: SparseMatrix::new(0, 1, &[0], &[], &[]),
+            alpha: &[],
+            x: &[1.0],
+            y: &[0.9],
+            h: 0.1,
+            drive: &[0.0],
+        };
+        let second = JointVerificationInput {
+            x: &[0.9],
+            y: &[0.82],
+            ..first
+        };
+        let exact_start = verify_fixed_trajectory(&[first, second]).unwrap();
+        let uncertain =
+            verify_fixed_trajectory_from_error(&[first, second], Interval::new(0.0, 0.01).unwrap())
+                .unwrap();
+        assert!(uncertain.final_time_error.upper() > exact_start.final_time_error.upper());
+        assert!(uncertain.final_time_error.upper() >= (0.82 - 1.01 * (-0.2_f64).exp()).abs());
+        let changed_error =
+            verify_fixed_trajectory_from_error(&[first, second], Interval::new(0.0, 0.02).unwrap())
+                .unwrap();
+        assert_ne!(uncertain.input_sha256, changed_error.input_sha256);
+        assert_eq!(
+            verify_fixed_trajectory_from_error(
+                &[first, second],
+                Interval::point(f64::INFINITY).unwrap(),
+            ),
+            Err(VerifierError::InvalidInheritedError)
         );
     }
 

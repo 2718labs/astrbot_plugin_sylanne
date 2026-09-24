@@ -3,8 +3,8 @@
 //! entire synchronous call and must not mutate them or overlap the output.
 use crate::interval::Interval;
 use crate::interval_verifier::{
-    linear_readout, verify_fixed_trajectory, verify_joint_error_bounds, verify_joint_step,
-    JointVerificationInput, SparseMatrix,
+    linear_readout, verify_fixed_trajectory, verify_fixed_trajectory_from_error,
+    verify_joint_error_bounds, verify_joint_step, JointVerificationInput, SparseMatrix,
 };
 use sha2::{Digest, Sha256};
 use std::{mem, ptr, slice};
@@ -341,6 +341,39 @@ pub unsafe extern "C" fn sylanne3_v2_trajectory_math_report_v1(
     output: *mut TrajectoryMathReport,
     output_size: u32,
 ) -> i32 {
+    trajectory_math_report_impl(steps, step_count, None, output, output_size)
+}
+
+/// Recheck a linked fixed-model trajectory from a supplied initial state-error
+/// upper bound. The caller must independently establish that bound's source.
+/// The mathematical input digest includes this bound. Product flags stay zero.
+///
+/// # Safety
+/// Follows [`sylanne3_v2_trajectory_math_report_v1`] pointer requirements.
+#[no_mangle]
+pub unsafe extern "C" fn sylanne3_v2_trajectory_math_report_from_error_v1(
+    steps: *const TrajectoryMathStep,
+    step_count: u32,
+    initial_error_upper: f64,
+    output: *mut TrajectoryMathReport,
+    output_size: u32,
+) -> i32 {
+    trajectory_math_report_impl(
+        steps,
+        step_count,
+        Some(initial_error_upper),
+        output,
+        output_size,
+    )
+}
+
+unsafe fn trajectory_math_report_impl(
+    steps: *const TrajectoryMathStep,
+    step_count: u32,
+    initial_error_upper: Option<f64>,
+    output: *mut TrajectoryMathReport,
+    output_size: u32,
+) -> i32 {
     if !aligned(output) || output_size as usize != mem::size_of::<TrajectoryMathReport>() {
         return -1;
     }
@@ -393,7 +426,13 @@ pub unsafe extern "C" fn sylanne3_v2_trajectory_math_report_v1(
             drive,
         });
     }
-    let Ok(verified) = verify_fixed_trajectory(&numerical_steps) else {
+    let verified = match initial_error_upper {
+        Some(error) => Interval::new(0.0, error)
+            .ok()
+            .and_then(|bound| verify_fixed_trajectory_from_error(&numerical_steps, bound).ok()),
+        None => verify_fixed_trajectory(&numerical_steps).ok(),
+    };
+    let Some(verified) = verified else {
         report.status = -2;
         ptr::write(output, report);
         return -2;
@@ -504,6 +543,52 @@ mod tests {
         );
         assert!(report.final_time_error.upper > reset_report.final_time_error.upper);
         let original_hash = report.input_sha256;
+        let mut inherited = TrajectoryMathReport::default();
+        assert_eq!(
+            unsafe {
+                sylanne3_v2_trajectory_math_report_from_error_v1(
+                    steps.as_ptr(),
+                    2,
+                    0.01,
+                    &mut inherited,
+                    size,
+                )
+            },
+            0
+        );
+        assert_eq!(inherited.product_certificate_flags, 0);
+        assert!(inherited.final_time_error.upper > report.final_time_error.upper);
+        assert!(inherited.final_time_error.upper >= (0.82 - 1.01 * (-0.2_f64).exp()).abs());
+        assert_ne!(inherited.input_sha256, original_hash);
+        let inherited_hash = inherited.input_sha256;
+        assert_eq!(
+            unsafe {
+                sylanne3_v2_trajectory_math_report_from_error_v1(
+                    steps.as_ptr(),
+                    2,
+                    0.02,
+                    &mut inherited,
+                    size,
+                )
+            },
+            0
+        );
+        assert_ne!(inherited.input_sha256, inherited_hash);
+        assert_eq!(
+            unsafe {
+                sylanne3_v2_trajectory_math_report_from_error_v1(
+                    steps.as_ptr(),
+                    2,
+                    -1.0,
+                    &mut inherited,
+                    size,
+                )
+            },
+            -2
+        );
+        assert_eq!(inherited.product_certificate_flags, 0);
+        assert_eq!(inherited.steps_verified, 0);
+        assert_eq!(inherited.input_sha256, [0; 32]);
         steps[1].y = changed_y1.as_ptr();
         assert_eq!(
             unsafe { sylanne3_v2_trajectory_math_report_v1(steps.as_ptr(), 2, &mut report, size) },

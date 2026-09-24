@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from decimal import Decimal, localcontext
 import math
 from pathlib import Path
 import platform
@@ -8,9 +9,32 @@ import subprocess
 import unittest
 
 from sylanne3.native_runtime.arithmetic_report import (
-    ArithmeticReportLibrary, RawArithmeticReport, ReportInput,
+    ArithmeticReportLibrary, RawArithmeticReport, ReportCSR, ReportInput, ReportInterval,
     parse_arithmetic_report,
 )
+
+
+class TrajectoryMathStep(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("version", ctypes.c_uint32),
+        ("n", ctypes.c_uint32), ("k", ReportCSR), ("r", ReportCSR),
+        ("j", ReportCSR), ("a", ReportCSR),
+        ("alpha", ctypes.POINTER(ctypes.c_double)),
+        ("x", ctypes.POINTER(ctypes.c_double)),
+        ("y", ctypes.POINTER(ctypes.c_double)),
+        ("drive", ctypes.POINTER(ctypes.c_double)), ("h", ctypes.c_double),
+    ]
+
+
+class TrajectoryMathReport(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32), ("version", ctypes.c_uint32),
+        ("status", ctypes.c_int32), ("product_certificate_flags", ctypes.c_uint32),
+        ("steps_verified", ctypes.c_uint32), ("input_sha256", ctypes.c_ubyte * 32),
+        ("final_time_error", ReportInterval),
+        ("max_endpoint_error", ReportInterval),
+        ("max_reconstruction_defect", ReportInterval),
+    ]
 
 
 class ArithmeticReportTests(unittest.TestCase):
@@ -102,6 +126,56 @@ class ArithmeticReportTests(unittest.TestCase):
                                              ctypes.sizeof(raw_input) - 1,
                                              ctypes.byref(raw), ctypes.sizeof(raw)), -1)
         self.assertEqual(raw.status, -1)
+
+    def test_trajectory_inherits_nonzero_initial_error_without_reset(self):
+        offsets = (ctypes.c_uint32 * 2)(0, 1)
+        indices = (ctypes.c_uint32 * 1)(0)
+        values = (ctypes.c_double * 1)(1.0)
+        empty_offsets = (ctypes.c_uint32 * 2)(0, 0)
+        empty_a_offsets = (ctypes.c_uint32 * 1)(0)
+        positive = ReportCSR(1, 1, 1, offsets, indices, values)
+        zero = ReportCSR(1, 1, 0, empty_offsets, None, None)
+        no_nonlinear = ReportCSR(0, 1, 0, empty_a_offsets, None, None)
+        h = 0.001
+        midpoint_factor = (1.0 - h / 2) / (1.0 + h / 2)
+        x0, y0 = (ctypes.c_double * 1)(1.0), (ctypes.c_double * 1)(midpoint_factor)
+        x1, y1 = (ctypes.c_double * 1)(midpoint_factor), (ctypes.c_double * 1)(midpoint_factor**2)
+        drive = (ctypes.c_double * 1)(0.0)
+        steps = (TrajectoryMathStep * 2)(
+            TrajectoryMathStep(ctypes.sizeof(TrajectoryMathStep), 1, 1,
+                               positive, positive, zero, no_nonlinear,
+                               None, x0, y0, drive, h),
+            TrajectoryMathStep(ctypes.sizeof(TrajectoryMathStep), 1, 1,
+                               positive, positive, zero, no_nonlinear,
+                               None, x1, y1, drive, h),
+        )
+        call = self.library.sylanne3_v2_trajectory_math_report_from_error_v1
+        call.argtypes = [ctypes.POINTER(TrajectoryMathStep), ctypes.c_uint32,
+                         ctypes.c_double, ctypes.POINTER(TrajectoryMathReport), ctypes.c_uint32]
+        call.restype = ctypes.c_int32
+        report = TrajectoryMathReport()
+        size = ctypes.sizeof(report)
+        self.assertEqual(call(steps, 2, 0.01, ctypes.byref(report), size), 0)
+        self.assertEqual(report.product_certificate_flags, 0)
+        self.assertEqual(report.steps_verified, 2)
+        first_hash = bytes(report.input_sha256)
+        with localcontext() as context:
+            context.prec = 80
+            d = Decimal.from_float
+            exact = (d(x0[0]) + d(0.01)) * (-2 * d(steps[0].h)).exp()
+            actual_error = abs(d(y1[0]) - exact)
+            self.assertLessEqual(actual_error, d(report.final_time_error.upper))
+        first_bound = report.final_time_error.upper
+        self.assertEqual(call(steps, 2, 0.0, ctypes.byref(report), size), 0)
+        # Falsely claiming an exact first state excludes the real trajectory.
+        # This is why external provenance for e0 remains a production HOLD.
+        self.assertLess(Decimal.from_float(report.final_time_error.upper), actual_error)
+        self.assertEqual(call(steps, 2, 0.02, ctypes.byref(report), size), 0)
+        self.assertGreater(report.final_time_error.upper, first_bound)
+        self.assertNotEqual(bytes(report.input_sha256), first_hash)
+        self.assertEqual(call(steps, 2, -1.0, ctypes.byref(report), size), -2)
+        self.assertEqual(report.steps_verified, 0)
+        self.assertEqual(bytes(report.input_sha256), bytes(32))
 
 
 if __name__ == "__main__":
