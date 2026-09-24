@@ -129,6 +129,9 @@ class V2FencePort:
         self._mapped_namespaces: dict[NamespaceId, str] = {}
         self._pending_begin: _PendingBegin | None = None
         self._pending_finish: _PendingFinish | None = None
+        # Process-local lower UTC bound at the last accepted source monotonic sample.
+        # Keep it across session repair; a new port process has no durable watermark.
+        self._clock_watermark: tuple[str, str, float, float, float] | None = None
         self._closed = False
         self._thread = Thread(target=self._run_loop, name="sylanne-v2-authority", daemon=True)
         self._thread.start()
@@ -242,6 +245,27 @@ class V2FencePort:
         )), math.inf)
         if not math.isfinite(upper):
             raise RuntimeError("v2 ingress clock response is unqualified")
+        prior = self._clock_watermark
+        lower = math.fsum((sample.utc_seconds, -sample.utc_error_seconds))
+        if prior is not None:
+            source_id, epoch, source_monotonic, local_after, prior_lower = prior
+            if (sample.source_id != source_id or sample.epoch != epoch
+                    or sample.monotonic_seconds < source_monotonic
+                    or before < local_after):
+                raise RuntimeError("v2 ingress clock response is unqualified")
+            # Both source monotonic and the gap between local round trips are
+            # lower bounds on elapsed time between the two atomic readings.
+            elapsed = max(sample.monotonic_seconds - source_monotonic,
+                          before - local_after)
+            projected_lower = math.fsum((prior_lower, elapsed))
+            sample_upper = math.fsum((sample.utc_seconds, sample.utc_error_seconds))
+            if (not math.isfinite(projected_lower)
+                    or math.nextafter(sample_upper, math.inf) < projected_lower):
+                raise RuntimeError("v2 ingress clock response is unqualified")
+            lower = max(lower, projected_lower)
+        self._clock_watermark = (
+            sample.source_id, sample.epoch, sample.monotonic_seconds, after, lower,
+        )
         return VerifiedIngressClockV2(sample, before, after, upper)
 
     def provision_namespace(self, *, namespace: NamespaceId,

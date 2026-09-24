@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 import math
 from pathlib import Path
+import time
 
 import pytest
 
@@ -18,7 +19,7 @@ from sylanne3.host.v2_fence_port import V2FencePort, VerifiedIngressClockV2
 from sylanne3.runtime_contracts import InstallationGrantV2
 
 
-def _port(tmp_path, *, sample=None, delay=0):
+def _port(tmp_path, *, sample=None, samples=None, delay=0):
     authority = "authority-a"
     manifest = "a" * 64
     binding = "b" * 64
@@ -39,6 +40,7 @@ def _port(tmp_path, *, sample=None, delay=0):
         authority, grant.installation_id, "admin:ntp-a", 1_800_000_000.25,
         123.5, "boot-a", 0.25,
     )
+    sample_iter = iter(samples) if samples is not None else None
 
     class Transport:
         calls = 0
@@ -61,6 +63,8 @@ def _port(tmp_path, *, sample=None, delay=0):
             )
             if delay:
                 await asyncio.sleep(delay)
+            if sample_iter is not None:
+                return next(sample_iter)
             return valid_sample if sample is None else sample
 
         async def close(self):
@@ -124,6 +128,75 @@ def test_clock_rejects_excessive_round_trip(tmp_path):
     try:
         with pytest.raises(RuntimeError, match="unqualified"):
             port.read_ingress_clock(AdminIngressClockPolicy("admin:ntp-a", 0.5, 0.001))
+    finally:
+        port.close()
+
+
+def test_clock_rejects_utc_rollback_beyond_error_and_keeps_watermark(tmp_path):
+    first = IngressClockSampleV2(
+        "authority-a", "install-a", "admin:ntp-a", 1_800_000_000.25,
+        123.5, "boot-a", 0.25,
+    )
+    samples = (
+        first,
+        replace(first, utc_seconds=first.utc_seconds - 2, monotonic_seconds=124.5),
+        replace(first, utc_seconds=first.utc_seconds + 1, monotonic_seconds=124.5),
+    )
+    port, transport, _ = _port(tmp_path, samples=samples)
+    policy = AdminIngressClockPolicy("admin:ntp-a", 0.5, 2)
+    try:
+        port.read_ingress_clock(policy)
+        with pytest.raises(RuntimeError, match="unqualified"):
+            port.read_ingress_clock(policy)
+        assert port.read_ingress_clock(policy).sample == samples[2]
+        assert transport.calls == 3
+    finally:
+        port.close()
+
+
+def test_clock_accepts_utc_intervals_touching_within_error(tmp_path):
+    first = IngressClockSampleV2(
+        "authority-a", "install-a", "admin:ntp-a", 1_800_000_000.25,
+        123.5, "boot-a", 0.25,
+    )
+    second = replace(first, utc_seconds=first.utc_seconds + 0.6,
+                     monotonic_seconds=124.5)
+    port, _, _ = _port(tmp_path, samples=(first, second))
+    policy = AdminIngressClockPolicy("admin:ntp-a", 0.5, 2)
+    try:
+        port.read_ingress_clock(policy)
+        assert port.read_ingress_clock(policy).sample == second
+    finally:
+        port.close()
+
+
+def test_clock_rejects_stale_source_after_local_monotonic_advance(tmp_path):
+    port, _, _ = _port(tmp_path)
+    policy = AdminIngressClockPolicy("admin:ntp-a", 0.5, 2)
+    try:
+        port.read_ingress_clock(policy)
+        time.sleep(0.75)
+        with pytest.raises(RuntimeError, match="unqualified"):
+            port.read_ingress_clock(policy)
+    finally:
+        port.close()
+
+
+@pytest.mark.parametrize("change", [
+    {"epoch": "boot-b"},
+    {"monotonic_seconds": 123.0},
+])
+def test_clock_rejects_epoch_or_source_monotonic_regression(tmp_path, change):
+    first = IngressClockSampleV2(
+        "authority-a", "install-a", "admin:ntp-a", 1_800_000_000.25,
+        123.5, "boot-a", 0.25,
+    )
+    port, _, _ = _port(tmp_path, samples=(first, replace(first, **change)))
+    policy = AdminIngressClockPolicy("admin:ntp-a", 0.5, 2)
+    try:
+        port.read_ingress_clock(policy)
+        with pytest.raises(RuntimeError, match="unqualified"):
+            port.read_ingress_clock(policy)
     finally:
         port.close()
 
