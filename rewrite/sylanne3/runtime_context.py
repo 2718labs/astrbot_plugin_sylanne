@@ -96,7 +96,7 @@ class RuntimeDependencies:
             missing.append("d02_issuer")
         if not callable(getattr(self.d11_issuer, "admit_runtime", None)):
             missing.append("d11_issuer")
-        if not callable(getattr(self.model_egress_authority, "begin_handoff", None)):
+        if not callable(getattr(self.model_egress_authority, "execute_call", None)):
             missing.append("model_egress_authority")
         if not callable(getattr(self.execution_journal_port, "verify_current_chain", None)):
             missing.append("execution_journal_port")

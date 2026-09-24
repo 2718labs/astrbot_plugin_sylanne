@@ -232,7 +232,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             admit_runtime = lambda *args: None
 
         class Egress:
-            begin_handoff = lambda *args: None
+            execute_call = lambda *args: None
 
         async def ingress(envelope, coordinator):
             return IngressReceipt("rejected")
@@ -274,7 +274,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             admit_runtime = lambda *args: None
 
         class Egress:
-            begin_handoff = lambda *args: None
+            execute_call = lambda *args: None
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -307,6 +307,11 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 ingress_clock=controlled_ingress_clock,
                 ingress_handler_factory=factory,
             )
+            legacy_egress = replace(
+                dependencies,
+                model_egress_authority=types.SimpleNamespace(begin_handoff=lambda *args: None),
+            )
+            self.assertIn("model_egress_authority", legacy_egress.missing())
             context = RuntimeContext(
                 root / "data", package_root=root, dependencies=dependencies,
                 domains=registry_with_test_affect_scheme(),

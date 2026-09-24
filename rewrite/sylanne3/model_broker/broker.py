@@ -101,13 +101,9 @@ class EgressFinishReceipt:
 
 
 class ModelEgressAuthority(Protocol):
-    async def begin_handoff(
+    async def execute_call(
         self, request: "ModelCallRequest", request_digest: str
-    ) -> EgressStartReceipt: ...
-
-    async def finish_handoff(
-        self, start: EgressStartReceipt, outcome_digest: str
-    ) -> EgressFinishReceipt: ...
+    ) -> "AuthorityExecutionResult": ...
 
 
 def _text(value: object, name: str, limit: int = 256) -> str:
@@ -245,6 +241,15 @@ class CallReceipt:
     egress_finish_ref: str | None = None
 
 
+@dataclass(frozen=True)
+class AuthorityExecutionResult:
+    """Authority-owned attempt and durable observation; never a host provider reply."""
+
+    receipt: CallReceipt
+    result: Mapping[str, Any] | None
+    finish: EgressFinishReceipt | None
+
+
 class ModelProvider(Protocol):
     @property
     def descriptor(self) -> ModelProviderDescriptor: ...
@@ -333,189 +338,115 @@ class ModelBroker:
         self._egress_authority = egress_authority
 
     async def call(self, request: ModelCallRequest, *, cancellation: asyncio.Event | None = None) -> tuple[CallReceipt, Mapping[str, Any] | None]:
-        if not isinstance(request, ModelCallRequest): raise TypeError("request must be ModelCallRequest")
+        if not isinstance(request, ModelCallRequest):
+            raise TypeError("request must be ModelCallRequest")
+        cancelled = cancellation or asyncio.Event()
+        if cancelled.is_set():
+            return self._receipt(request, "cancelled", None, {}, {}, "not_charged", "unavailable", True), None
+        if self._production:
+            return await self._call_production(request)
         provider = self._providers.get(request.provider_id)
-        if provider is None: return self._receipt(request, "unavailable", None, {}, {}, "not_charged", "unavailable", False), None
-        descriptor = provider.descriptor
-        if (self._production and descriptor.is_test_double) or descriptor.provider_id != request.provider_id or descriptor.model_id != request.model_id:
+        if provider is None:
             return self._receipt(request, "unavailable", None, {}, {}, "not_charged", "unavailable", False), None
-        if (not request.required_capabilities <= descriptor.capabilities or request.privacy_tier not in descriptor.privacy_tiers
+        descriptor = provider.descriptor
+        if descriptor.provider_id != request.provider_id or descriptor.model_id != request.model_id:
+            return self._receipt(request, "unavailable", None, {}, {}, "not_charged", "unavailable", False), None
+        if (not request.required_capabilities <= descriptor.capabilities
+                or request.privacy_tier not in descriptor.privacy_tiers
                 or request.envelope.authority.purpose not in descriptor.purposes):
             return self._receipt(request, "denied", None, {}, {}, "not_charged", "unavailable", False), None
-        cancelled = cancellation or asyncio.Event()
-        if cancelled.is_set(): return self._receipt(request, "cancelled", None, {}, {}, "not_charged", "unavailable", True), None
-        start: EgressStartReceipt | None = None
-        if self._production:
-            if (self._egress_authority is None
-                    or not callable(getattr(self._egress_authority, "begin_handoff", None))
-                    or not callable(getattr(self._egress_authority, "finish_handoff", None))):
-                return self._receipt(request, "unavailable", None, {}, {}, "not_charged", "unavailable", False), None
-            try:
-                start = await self._egress_authority.begin_handoff(request, request.digest)
-                if not isinstance(start, EgressStartReceipt):
-                    raise TypeError("egress authority did not return a receipt")
-                if (
-                    start.operation_id != request.identity.operation_id
-                    or start.call_id != request.call_id
-                    or start.request_digest != request.digest
-                    or start.source_refs != request.envelope.source_qualification.source_refs
-                    or start.access_epoch != request.envelope.version_guard.access_epoch
-                    or start.delete_epoch != request.envelope.version_guard.delete_epoch
-                    or start.activation_generation != request.envelope.authority.activation_generation
-                ):
-                    raise ValueError("egress handoff receipt does not bind the exact request")
-            except (Exception, asyncio.CancelledError):
-                # The authority may have durably recorded the start before
-                # its response was lost. Do not silently retry this call.
-                return self._receipt(request, "unknown", None, {}, {}, "unconfirmed", "unknown", False), None
-            if start.status != "started":
-                status = "unknown" if start.status == "unknown" else start.status
-                cost_status = "unconfirmed" if status == "unknown" else "not_charged"
-                qualification = "unknown" if status == "unknown" else "unavailable"
-                return self._receipt(request, status, None, {}, {}, cost_status, qualification, False), None
-            if cancelled.is_set():
-                return await self._settle_handoff(
-                    request, start, "cancelled_before_dispatch", None, {}, {},
-                    "cancelled", "unconfirmed", "unknown", True, None,
-                )
         try:
             response = await asyncio.wait_for(provider.invoke(request, cancelled), timeout=request.timeout_seconds)
         except asyncio.CancelledError:
-            was_cancelled = await self._request_cancel(provider, request)
-            if start is not None:
-                # Preserve the permit even if this finishing RPC cannot be
-                # observed.  Shield gives the authority call a chance to make
-                # the durable decision before this task propagates cancellation.
-                await asyncio.shield(self._settle_handoff(
-                    request, start, "cancelled_by_caller", None, {}, {},
-                    "cancelled", "unconfirmed", "unknown", was_cancelled, None,
-                ))
+            await self._request_cancel(provider, request)
             raise
         except TimeoutError:
             was_cancelled = await self._request_cancel(provider, request)
-            # A remote timeout has unknown acceptance/cost unless its adapter can
-            # prove non-dispatch through a ProviderResponse.
-            if start is not None:
-                return await self._settle_handoff(
-                    request, start, "timed_out", None, {}, {}, "timed_out",
-                    "unconfirmed", "unknown", was_cancelled, None,
-                )
             return self._receipt(request, "timed_out", None, {}, {}, "unconfirmed", "unknown", was_cancelled), None
         except ProviderUnavailable:
-            if start is not None:
-                return await self._settle_handoff(
-                    request, start, "provider_unavailable", None, {}, {}, "unknown",
-                    "unconfirmed", "unknown", False, None,
-                )
             return self._receipt(request, "unavailable", None, {}, {}, "not_charged", "unavailable", False), None
         except ProviderUnknown:
-            if start is not None:
-                return await self._settle_handoff(
-                    request, start, "provider_unknown", None, {}, {}, "unknown",
-                    "unconfirmed", "unknown", False, None,
-                )
-            return self._receipt(request, "unknown", None, {}, {}, "unconfirmed", "unknown", False), None
+            return self._unknown(request)
         except Exception:
-            if start is not None:
-                return await self._settle_handoff(
-                    request, start, "provider_failed", None, {}, {}, "failed",
-                    "unconfirmed", "unknown", False, None,
-                )
             return self._receipt(request, "failed", None, {}, {}, "unconfirmed", "unknown", False), None
         if not isinstance(response, ProviderResponse):
-            # The transport returned after the handoff, but its meaning is not
-            # authenticated.  Do not ask the authority to release the permit:
-            # a response-shaped object can conceal a dispatched call or result.
-            if start is not None:
-                return self._receipt(
-                    request, "unknown", None, {}, {}, "unconfirmed", "unknown",
-                    False, start.start_ref,
-                ), None
-            return self._receipt(request, "unknown", None, {}, {}, "unconfirmed", "unknown", False), None
+            return self._unknown(request)
         if cancelled.is_set():
             was_cancelled = await self._request_cancel(provider, request)
-            return await self._settle_handoff(
-                request, start, "cancelled_after_response", response.provider_call_ref,
-                response.usage, response.cost, "cancelled",
-                self._cost_status(descriptor, response, unknown=True), "unknown", was_cancelled, None,
-            )
+            return self._receipt(request, "cancelled", response.provider_call_ref, response.usage,
+                                 response.cost, self._cost_status(descriptor, response, unknown=True),
+                                 "unknown", was_cancelled), None
         if response.status == "not_dispatched":
-            return await self._settle_handoff(
-                request, start, "not_dispatched", response.provider_call_ref,
-                response.usage, response.cost, "failed", "not_charged", "unavailable", False, None,
-            )
+            return self._receipt(request, "failed", response.provider_call_ref, {}, {},
+                                 "not_charged", "unavailable", False), None
         if response.status == "unknown":
-            return await self._settle_handoff(
-                request, start, "provider_unknown", response.provider_call_ref,
-                response.usage, response.cost, "unknown",
-                self._cost_status(descriptor, response, unknown=True), "unknown", False, None,
-            )
-        return await self._settle_handoff(
-            request, start, "completed", response.provider_call_ref, response.usage,
-            response.cost, "completed", self._cost_status(descriptor, response),
-            "eligible", False, response.result,
-        )
+            return self._receipt(request, "unknown", response.provider_call_ref, response.usage,
+                                 response.cost, self._cost_status(descriptor, response, unknown=True),
+                                 "unknown", False), None
+        return self._receipt(request, "completed", response.provider_call_ref, response.usage,
+                             response.cost, self._cost_status(descriptor, response),
+                             "eligible", False), response.result
 
-    async def _settle_handoff(
-        self, request: ModelCallRequest, start: EgressStartReceipt | None,
-        outcome_status: str, provider_call_ref: str | None, usage: Mapping[str, int],
-        cost: Mapping[str, int], status: str, cost_status: str,
-        result_qualification: str, cancellation_requested: bool,
-        result: Mapping[str, Any] | None,
+    async def _call_production(
+        self, request: ModelCallRequest
     ) -> tuple[CallReceipt, Mapping[str, Any] | None]:
-        """End the authority lease before exposing an outcome.
-
-        A production result is never eligible merely because a provider replied:
-        the independent authority must attest that the exact durable handoff has
-        ended.  Failed or lost finish calls deliberately retain the permit.
-        """
-        if start is None:
-            return self._receipt(
-                request, status, provider_call_ref, usage, cost, cost_status,
-                result_qualification, cancellation_requested,
-            ), result if result_qualification == "eligible" else None
+        executor = getattr(self._egress_authority, "execute_call", None)
+        if not callable(executor):
+            return self._receipt(request, "unavailable", None, {}, {}, "not_charged", "unavailable", False), None
         try:
+            execution = await executor(request, request.digest)
+        except (Exception, asyncio.CancelledError):
+            # An attempt may already have reached the network. Only the authority
+            # can recover and settle it; the broker must not retry locally.
+            return self._unknown(request)
+        if not isinstance(execution, AuthorityExecutionResult):
+            return self._unknown(request)
+        receipt = execution.receipt
+        if not isinstance(receipt, CallReceipt) or (
+            receipt.operation_id != request.identity.operation_id
+            or receipt.attempt_id != request.identity.attempt_id
+            or receipt.call_id != request.call_id
+            or receipt.call_digest != request.digest
+            or receipt.provider_id != request.provider_id
+            or receipt.model_id != request.model_id
+        ):
+            return self._unknown(request)
+        if receipt.result_qualification != "eligible":
+            if execution.result is not None:
+                return self._unknown(request)
+            return receipt, None
+        finish, result = execution.finish, execution.result
+        try:
+            if (receipt.status != "completed"
+                    or not receipt.egress_start_ref or not receipt.egress_finish_ref
+                    or not isinstance(finish, EgressFinishReceipt)
+                    or finish.status != "finished"
+                    or finish.operation_id != receipt.operation_id
+                    or finish.call_id != receipt.call_id
+                    or finish.request_digest != receipt.call_digest
+                    or finish.start_ref != receipt.egress_start_ref
+                    or finish.finish_ref != receipt.egress_finish_ref
+                    or not isinstance(result, Mapping)):
+                return self._unknown(request)
+            result_dict = dict(result)
+            json.dumps(result_dict, sort_keys=True, allow_nan=False)
             outcome_digest = canonical_digest({
                 "request_digest": request.digest,
-                "status": outcome_status,
-                "provider_call_ref": provider_call_ref,
-                "usage": dict(usage),
-                "cost": dict(cost),
-                "result_digest": canonical_digest(dict(result)) if result is not None else None,
+                "status": "completed",
+                "provider_call_ref": receipt.provider_call_ref,
+                "usage": dict(receipt.usage),
+                "cost": dict(receipt.cost),
+                "result_digest": canonical_digest(result_dict),
             })
-        except Exception:
-            # This cannot safely be presented to the authority as a completed
-            # handoff.  The existing durable permit must remain open.
-            return self._receipt(
-                request, "unknown", provider_call_ref, usage, cost, "unconfirmed",
-                "unknown", cancellation_requested, start.start_ref,
-            ), None
-        try:
-            finish = await self._egress_authority.finish_handoff(start, outcome_digest)  # type: ignore[union-attr]
-            if not isinstance(finish, EgressFinishReceipt):
-                raise TypeError("egress authority did not return a finish receipt")
-            if (
-                finish.operation_id != request.identity.operation_id
-                or finish.call_id != request.call_id
-                or finish.request_digest != request.digest
-                or finish.start_ref != start.start_ref
-                or finish.outcome_digest != outcome_digest
-            ):
-                raise ValueError("egress finish receipt does not bind the exact handoff")
-        except (Exception, asyncio.CancelledError):
-            return self._receipt(
-                request, "unknown", provider_call_ref, usage, cost, "unconfirmed",
-                "unknown", cancellation_requested, start.start_ref,
-            ), None
-        if finish.status != "finished":
-            return self._receipt(
-                request, "unknown", provider_call_ref, usage, cost, "unconfirmed",
-                "unknown", cancellation_requested, start.start_ref,
-            ), None
-        return self._receipt(
-            request, status, provider_call_ref, usage, cost, cost_status,
-            result_qualification, cancellation_requested, start.start_ref, finish.finish_ref,
-        ), result if result_qualification == "eligible" else None
+            if finish.outcome_digest != outcome_digest:
+                return self._unknown(request)
+        except (TypeError, ValueError):
+            return self._unknown(request)
+        return receipt, result_dict
+
+    @staticmethod
+    def _unknown(request: ModelCallRequest) -> tuple[CallReceipt, None]:
+        return ModelBroker._receipt(request, "unknown", None, {}, {}, "unconfirmed", "unknown", False), None
 
     @staticmethod
     async def _request_cancel(provider: ModelProvider, request: ModelCallRequest) -> bool:
