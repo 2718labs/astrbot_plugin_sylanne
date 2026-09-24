@@ -36,7 +36,7 @@ from .runtime.budget import (
     reserve_budget, settle_budget,
 )
 from .runtime.jobs import (
-    PersistentJob, acquire_job, cancel_job, create_job, get_job,
+    PersistentJob, acquire_job, cancel_job, create_job, get_job, plan_job_acquire,
 )
 from .runtime.d11_types import reconcile_runtime_write
 from .runtime.dispatch_admission import (
@@ -127,6 +127,45 @@ def _operation_capability_ref(namespace: NamespaceId, actor: str,
     })
 
 
+def _first_ingress_encoding_acquire_prefix(
+    namespace: NamespaceId, job_id: str, ingress_operation_id: str,
+    worker_actor: str, activation_generation: int,
+) -> str:
+    return "job-acquire-" + canonical_digest({
+        "schema": "sylanne.first-ingress-job-acquire-id.v2",
+        "namespace": list(namespace.as_tuple), "job_id": job_id,
+        "ingress_operation_id": ingress_operation_id,
+        "worker_actor": worker_actor,
+        "activation_generation": activation_generation,
+    }) + "-"
+
+
+def first_ingress_encoding_acquire_operation_id(
+    namespace: NamespaceId, job_id: str, ingress_operation_id: str,
+    worker_actor: str, activation_generation: int, attempt_nonce: str,
+) -> str:
+    """A trusted scheduler supplies a fresh nonce for each job-bound attempt."""
+    if (type(attempt_nonce) is not str or len(attempt_nonce) != 32
+            or any(char not in "0123456789abcdef" for char in attempt_nonce)):
+        raise ValueError("job acquire attempt nonce must be 32 lowercase hex digits")
+    return _first_ingress_encoding_acquire_prefix(
+        namespace, job_id, ingress_operation_id,
+        worker_actor, activation_generation) + attempt_nonce
+
+
+def _job_acquire_id_matches(
+    acquire_operation_id: str, namespace: NamespaceId, job_id: str,
+    ingress_operation_id: str, worker_actor: str,
+    activation_generation: int,
+) -> bool:
+    prefix = _first_ingress_encoding_acquire_prefix(
+        namespace, job_id, ingress_operation_id,
+        worker_actor, activation_generation)
+    nonce = acquire_operation_id[len(prefix):]
+    return (acquire_operation_id.startswith(prefix) and len(nonce) == 32
+            and all(char in "0123456789abcdef" for char in nonce))
+
+
 class AuthorityDenied(PermissionError):
     pass
 
@@ -137,6 +176,14 @@ class UnavailableGuard(RuntimeError):
 
 class FirstIngressOutcomeUnknown(UnavailableGuard):
     """The original ingress operation needs exact Authority reconciliation."""
+
+    def __init__(self, operation_id: str, message: str):
+        super().__init__(message)
+        self.operation_id = operation_id
+
+
+class JobAcquireOutcomeUnknown(UnavailableGuard):
+    """The original job acquire must be reconciled before another attempt."""
 
     def __init__(self, operation_id: str, message: str):
         super().__init__(message)
@@ -5357,10 +5404,571 @@ class GraphCoordinator:
     def acquire_persistent_job(self, authority: AuthorityContext, lease: object,
                                job_id: str, *, now_utc: str,
                                lease_seconds: int) -> PersistentJob:
+        if isinstance(self.__store, ProductionGraphStore):
+            raise UnavailableGuard("production job acquire requires the v2 fenced command")
         self._authorize(lease, authority, frozenset())
         return self._mutate_job(authority, job_id, lambda db: acquire_job(
             db, job_id, authority.actor, now_utc=now_utc,
             lease_seconds=lease_seconds))
+
+    def _first_ingress_encoding_job_locked(self, namespace: NamespaceId,
+                                           job_id: str):
+        """Join the original business receipt, job table, and graph projections."""
+        from .runtime.d11_types import (
+            RuntimeOutboxValue, job_graph_write, runtime_job_key,
+            runtime_outbox_key,
+        )
+        from .runtime.first_ingress_v2 import ingress_ids
+        from .memory_types import SourceRecord, access_key, source_key, validate_access
+
+        db = self.__store._db
+        job = get_job(db, job_id)
+        if ((job.bot_id, job.persona_id) != namespace.as_tuple
+                or job.work_kind != "d06.encode_source" or job.effect_id is not None):
+            raise AuthorityDenied("job is not an installed first-ingress encoding job")
+        job_key = runtime_job_key(*namespace.as_tuple, job.activity_id, job_id)
+        job_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (job_key.token,),
+        ).fetchone()
+        if (job_row is None or job_row[2] != 1
+                or json.loads(job_row[1]) != job_graph_write(job).value):
+            raise UnavailableGuard("encoding job graph projection differs from durable job")
+        rows = db.execute(
+            "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? "
+            "AND persona=? AND owner_kind='activity' AND subject=? "
+            "AND type_name='runtime.outbox'",
+            namespace.as_tuple + (job.activity_id,),
+        ).fetchall()
+        matches = []
+        for token, revision, value_json, valid in rows:
+            value = json.loads(value_json)
+            if value.get("job_id") == job_id:
+                matches.append((token, revision, value, valid))
+        if len(matches) != 1:
+            raise UnavailableGuard("encoding job needs exactly one original outbox")
+        token, outbox_revision, value, valid = matches[0]
+        outbox = RuntimeOutboxValue(**value)
+        expected = ingress_ids(outbox.payload_ref)
+        source_key_value = source_key(*namespace.as_tuple, outbox.payload_ref)
+        access_key_value = access_key(*namespace.as_tuple, outbox.payload_ref)
+        source_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (source_key_value.token,),
+        ).fetchone()
+        access_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (access_key_value.token,),
+        ).fetchone()
+        if (source_row is None or access_row is None
+                or source_row[2] != 1 or access_row[2] != 1):
+            raise UnavailableGuard("encoding source or access is unavailable")
+        try:
+            source = SourceRecord.from_dict(json.loads(source_row[1]))
+            access_value = json.loads(access_row[1])
+            validate_access(access_value)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("encoding source or access is invalid") from exc
+        source_dependency = db.execute(
+            "SELECT dependency_revision FROM graph_dependencies WHERE dependent_token=? "
+            "AND dependency_token=?",
+            (access_key_value.token, source_key_value.token),
+        ).fetchone()
+        if (source.source_id != outbox.payload_ref
+                or access_value["source_id"] != source.source_id
+                or access_value["status"] != "active"
+                or "consolidation" not in access_value["purposes"]
+                or "consolidation" not in source.purposes
+                or not set(access_value["audiences"]).issubset(source.audiences)
+                or source_dependency != (source_row[0],)):
+            raise UnavailableGuard("encoding source access lost current eligibility")
+        outbox_key = runtime_outbox_key(
+            *namespace.as_tuple, job.activity_id, outbox.outbox_id)
+        receipt_row = db.execute(
+            "SELECT receipt_json FROM graph_bundle_operations WHERE bot=? "
+            "AND persona=? AND operation_id=?",
+            namespace.as_tuple + (job.operation_id,),
+        ).fetchone()
+        dependencies = db.execute(
+            "SELECT dependency_revision FROM graph_dependencies WHERE dependent_token=? "
+            "AND dependency_token=?",
+            (outbox_key.token, job_key.token),
+        ).fetchone()
+        if (valid != 1 or token != outbox_key.token
+                or (expected[1], expected[2], expected[3], expected[4]) != (
+                    job.activity_id, job.operation_id, job.job_id, outbox.outbox_id)
+                or (outbox.bot_id, outbox.persona_id, outbox.activity_id,
+                    outbox.operation_id, outbox.effect_id, outbox.job_ref,
+                    outbox.phase) != (
+                    namespace.bot_id, namespace.persona_id, job.activity_id,
+                    job.operation_id, None, job_key.token, "pending")
+                or dependencies != (job_row[0],)
+                or receipt_row is None
+                or outbox_key.token not in json.loads(receipt_row[0]).get("outbox_refs", ())):
+            raise UnavailableGuard("encoding outbox lost its original business linkage")
+        return (job, job_key, job_row[0], outbox, outbox_key,
+                outbox_revision, GraphVersion(source_key_value, source_row[0]),
+                GraphVersion(access_key_value, access_row[0]))
+
+    def read_first_ingress_encoding_job_v2(
+        self, authority: AuthorityContext, lease: object, job_id: str,
+        acquire_operation_id: str,
+    ) -> PersistentJob:
+        """Read one D11 job only through the current v2 Authority fence."""
+        if not isinstance(self.__store, ProductionGraphStore) or self.__content_fence_v2 is None:
+            raise UnavailableGuard("v2 job read requires the installed graph")
+        self._authorize(lease, authority, frozenset({"d11"}), owner_read=True)
+        if "activity" not in authority.owner_scope:
+            raise AuthorityDenied("D11 job read requires activity owner scope")
+        if (type(acquire_operation_id) is not str or not acquire_operation_id
+                or authority.capability_ref != _operation_capability_ref(
+                    authority.namespace, authority.actor, "d11", frozenset({"d11"}),
+                    authority.activation_generation, acquire_operation_id)):
+            raise AuthorityDenied("D11 job read lease is not scoped to this operation")
+        def reader():
+            job = self._first_ingress_encoding_job_locked(
+                authority.namespace, job_id)[0]
+            if not _job_acquire_id_matches(
+                    acquire_operation_id, authority.namespace, job_id,
+                    job.operation_id, authority.actor,
+                    authority.activation_generation):
+                raise AuthorityDenied("D11 job read lease names another job")
+            return job
+
+        return self._read_v2(authority, reader)
+
+    def _qualified_first_ingress_acquire_return(
+        self, namespace: NamespaceId, job_id: str, expected: PersistentJob,
+        actor: str, clock, lease_seconds: int,
+    ) -> PersistentJob:
+        from datetime import datetime, timezone
+
+        from .runtime.first_ingress_v2 import trusted_upper
+
+        try:
+            now = trusted_upper(clock)
+            now_text = datetime.fromtimestamp(now, timezone.utc).isoformat().replace(
+                "+00:00", "Z")
+            with self.__store._lock:
+                current = self._first_ingress_encoding_job_locked(namespace, job_id)[0]
+                self.__d11_issuer.authorize_existing_encoding_job(
+                    self.__store._db, current, now_utc=now)
+            if (current != expected or current.lease_holder != actor
+                    or plan_job_acquire(current, actor, now_utc=now_text,
+                                        lease_seconds=lease_seconds) != current):
+                raise UnavailableGuard("job acquire result lost runnable eligibility; HOLD")
+        except Exception as exc:
+            raise UnavailableGuard("job acquire result lost runnable eligibility; HOLD") from exc
+        return current
+
+    def acquire_first_ingress_encoding_job_v2(
+        self, authority: AuthorityContext, lease: object, job_id: str,
+        acquire_operation_id: str, *, lease_seconds: int,
+    ) -> PersistentJob:
+        """Acquire exactly one original encoding job under a recoverable v2 write fence."""
+        from datetime import datetime, timezone
+
+        from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .runtime.d11_types import job_graph_write, outbox_graph_write
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D11BudgetJobIssuer
+
+        store = self.__store
+        port = self.__content_fence_v2
+        namespace = authority.namespace
+        if (not isinstance(store, ProductionGraphStore) or port is None
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("installed v2 D11 job and trusted clock are required")
+        self._authorize(lease, authority, frozenset({"d11"}))
+        if (authority.issuer_domain != "d11" or "activity" not in authority.owner_scope
+                or type(acquire_operation_id) is not str
+                or not acquire_operation_id or len(acquire_operation_id) > 128
+                or type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600):
+            raise AuthorityDenied("D11 activity capability and bounded acquire identity required")
+        if authority.capability_ref != _operation_capability_ref(
+                namespace, authority.actor, "d11", frozenset({"d11"}),
+                authority.activation_generation, acquire_operation_id):
+            raise AuthorityDenied("D11 acquire lease is not scoped to this operation")
+
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            intent = store._db.execute(
+                "SELECT request_digest,job_id,original_operation_id,actor,"
+                "fixed_now_utc,lease_seconds,expected_job_revision,expected_fence,"
+                "expected_cancel_epoch,fence_attempt_id,requirements_json,anchor_json,"
+                "graph_revision,graph_epoch FROM graph_job_acquire_intents_v2 "
+                "WHERE bot=? AND persona=? AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            receipt = store._db.execute(
+                "SELECT request_digest,job_json,permit_json,pre_graph_revision,"
+                "pre_graph_epoch,post_graph_revision,post_graph_epoch,"
+                "finish_request_id,finish_request_digest "
+                "FROM graph_job_acquire_receipts_v2 WHERE bot=? AND persona=? "
+                "AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            rejection = store._db.execute(
+                "SELECT status,permit_json,graph_revision,graph_epoch,"
+                "finish_request_id,finish_request_digest "
+                "FROM graph_job_acquire_rejections_v2 WHERE bot=? AND persona=? "
+                "AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            if intent is None:
+                (job, job_key, job_revision, outbox, outbox_key,
+                 outbox_revision, source_version, access_version) = (
+                    self._first_ingress_encoding_job_locked(namespace, job_id))
+            else:
+                job = None
+        original_operation_id = job.operation_id if intent is None else intent[2]
+        if not _job_acquire_id_matches(
+                acquire_operation_id, namespace, job_id,
+                original_operation_id, authority.actor,
+                authority.activation_generation):
+            raise AuthorityDenied("D11 acquire lease names another job")
+        target = metadata.requirements
+        if (target.namespace != namespace
+                or target.activation_generation != authority.activation_generation):
+            raise UnavailableGuard("job acquire activation or namespace changed")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("job acquire Authority anchor differs")
+        try:
+            clock = port.read_ingress_clock(self.__scene_clock_policy)
+            now = trusted_upper(clock)
+            now_text = datetime.fromtimestamp(now, timezone.utc).isoformat().replace(
+                "+00:00", "Z")
+        except Exception as exc:
+            raise UnavailableGuard("paired job clock is unavailable; HOLD") from exc
+        requirements_json = canonical_json(asdict(target))
+        anchor_json = canonical_json(asdict(anchor))
+        if intent is None:
+            if acquire_operation_id == job.operation_id:
+                raise AuthorityDenied("acquire operation must differ from original ingress")
+            try:
+                planned = plan_job_acquire(
+                    job, authority.actor, now_utc=now_text,
+                    lease_seconds=lease_seconds)
+            except Exception as exc:
+                raise UnavailableGuard("encoding job is not runnable; HOLD") from exc
+            if planned == job or job.cancel_epoch:
+                raise UnavailableGuard("encoding job has an active or cancelled lease; HOLD")
+            request_digest = canonical_digest({
+                "schema": "sylanne.job-acquire.v2",
+                "namespace": list(namespace.as_tuple), "job_id": job_id,
+                "original_operation_id": job.operation_id,
+                "acquire_operation_id": acquire_operation_id,
+                "actor": authority.actor,
+                "activation_generation": authority.activation_generation,
+                "expected_job_revision": job_revision, "expected_fence": job.fence,
+                "expected_cancel_epoch": job.cancel_epoch,
+                "fixed_now_utc": now_text, "lease_seconds": lease_seconds,
+            })
+            attempt_id = "job-acquire-" + request_digest[:48]
+            expected_intent = (
+                request_digest, job_id, job.operation_id, authority.actor,
+                now_text, lease_seconds, job_revision, job.fence, job.cancel_epoch,
+                attempt_id, requirements_json, anchor_json,
+                metadata.graph_revision, epoch.revision,
+            )
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("job acquire pre-stamp changed")
+                    db.execute(
+                        "INSERT OR IGNORE INTO graph_job_acquire_intents_v2"
+                        "(bot,persona,acquire_operation_id,request_digest,job_id,"
+                        "original_operation_id,actor,fixed_now_utc,lease_seconds,"
+                        "expected_job_revision,expected_fence,expected_cancel_epoch,"
+                        "fence_attempt_id,requirements_json,anchor_json,"
+                        "graph_revision,graph_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (acquire_operation_id,) + expected_intent,
+                    )
+                    intent = db.execute(
+                        "SELECT request_digest,job_id,original_operation_id,actor,"
+                        "fixed_now_utc,lease_seconds,expected_job_revision,expected_fence,"
+                        "expected_cancel_epoch,fence_attempt_id,requirements_json,anchor_json,"
+                        "graph_revision,graph_epoch FROM graph_job_acquire_intents_v2 "
+                        "WHERE bot=? AND persona=? AND acquire_operation_id=?",
+                        namespace.as_tuple + (acquire_operation_id,),
+                    ).fetchone()
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+            if intent != expected_intent:
+                raise EventConflict("acquire operation identity was reused")
+        else:
+            if (intent[1] != job_id or intent[3] != authority.actor
+                    or intent[5] != lease_seconds
+                    or intent[10] != requirements_json
+                    or intent[11] != anchor_json):
+                raise UnavailableGuard("original job acquire identity differs; HOLD")
+            attempt_id = intent[9]
+            request_digest = intent[0]
+        if request_digest != canonical_digest({
+            "schema": "sylanne.job-acquire.v2",
+            "namespace": list(namespace.as_tuple), "job_id": intent[1],
+            "original_operation_id": intent[2],
+            "acquire_operation_id": acquire_operation_id,
+            "actor": intent[3],
+            "activation_generation": target.activation_generation,
+            "expected_job_revision": intent[6], "expected_fence": intent[7],
+            "expected_cancel_epoch": intent[8],
+            "fixed_now_utc": intent[4], "lease_seconds": intent[5],
+        }) or attempt_id != "job-acquire-" + request_digest[:48]:
+            raise UnavailableGuard("job acquire intent digest differs")
+        if receipt is not None and rejection is not None:
+            raise UnavailableGuard("job acquire terminal ledgers disagree")
+
+        def finish_identity(permit, *, rejected=False):
+            finish_id = ("abort:" if rejected else "finish:") + attempt_id
+            finish_digest = "sha256:" + canonical_digest({
+                "operation_id": attempt_id, "permit_token": permit.token,
+                "action": "rejected_no_commit" if rejected else "finish_job_acquire",
+                "business_operation_id": acquire_operation_id,
+                "request_digest": request_digest,
+            })
+            return finish_id, finish_digest
+
+        if receipt is not None or rejection is not None:
+            row = receipt if receipt is not None else rejection
+            permit = from_wire(json.loads(row[2] if receipt is not None else row[1]))
+            if (type(permit) is not FencePermitV2
+                    or permit.operation_id != attempt_id or permit.operation != "write"
+                    or permit.holder != self.__holder
+                    or permit.subject != port.installation_grant.subject
+                    or permit.pinned_anchor != anchor):
+                raise UnavailableGuard("job acquire durable permit differs")
+            try:
+                observed, state = port.get_fence_operation(
+                    namespace=namespace, authority_namespace=target.authority_namespace,
+                    operation_id=attempt_id)
+            except Exception as exc:
+                raise JobAcquireOutcomeUnknown(
+                    acquire_operation_id, "job acquire Authority state unknown; HOLD") from exc
+            if observed != permit or state not in {"active", "finished"}:
+                raise UnavailableGuard("job acquire Authority state differs")
+            if receipt is not None:
+                if (receipt[0] != request_digest
+                        or receipt[3:5] != intent[12:14]
+                        or receipt[5] != receipt[3] + 1
+                        or receipt[8] != finish_identity(permit)[1]
+                        or receipt[7] != finish_identity(permit)[0]):
+                    raise UnavailableGuard("job acquire receipt identity differs")
+                historical = PersistentJob(**json.loads(receipt[1]))
+                replay_now = trusted_upper(clock)
+                replay_now_text = datetime.fromtimestamp(
+                    replay_now, timezone.utc).isoformat().replace("+00:00", "Z")
+                with store._lock:
+                    current = self._first_ingress_encoding_job_locked(namespace, job_id)[0]
+                    current_stamp = self._v2_graph_stamp(namespace)
+                    try:
+                        self.__d11_issuer.authorize_existing_encoding_job(
+                            store._db, current, now_utc=replay_now)
+                    except Exception as exc:
+                        raise UnavailableGuard(
+                            "replayed job lost its signed authority; HOLD") from exc
+                try:
+                    current_is_live = plan_job_acquire(
+                        current, authority.actor, now_utc=replay_now_text,
+                        lease_seconds=lease_seconds) == current
+                except Exception as exc:
+                    raise UnavailableGuard("replayed job lease expired; HOLD") from exc
+                if (current != historical or current.lease_holder != authority.actor
+                        or not current_is_live):
+                    raise UnavailableGuard("replayed job lease is no longer current; HOLD")
+                if state == "active":
+                    if current_stamp != (metadata, epoch) and (
+                            current_stamp[0].graph_revision != receipt[5]
+                            or current_stamp[1].revision != receipt[6]):
+                        raise UnavailableGuard("unresolved job acquire stamp changed")
+                    scope = FenceScope(namespace, target.authority_namespace,
+                        target.activation_generation, "write", attempt_id, permit,
+                        anchor, NamespaceEpoch(*namespace.as_tuple, receipt[4]),
+                        receipt[3])
+                    if port.validate_fence(scope) != permit:
+                        raise UnavailableGuard("job acquire permit changed")
+                    port.finish_fence(scope, request_id=receipt[7],
+                                      request_digest=receipt[8])
+                return self._qualified_first_ingress_acquire_return(
+                    namespace, job_id, historical, authority.actor, clock,
+                    lease_seconds)
+            if (rejection[0] != "rejected_no_commit"
+                    or rejection[2:4] != intent[12:14]
+                    or rejection[4:6] != finish_identity(permit, rejected=True)):
+                raise UnavailableGuard("job acquire rejection identity differs")
+            if state == "active":
+                scope = FenceScope(namespace, target.authority_namespace,
+                    target.activation_generation, "write", attempt_id, permit,
+                    anchor, NamespaceEpoch(*namespace.as_tuple, intent[13]), intent[12])
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("rejected job acquire permit changed")
+                port.finish_fence(scope, request_id=rejection[4],
+                                  request_digest=rejection[5])
+            raise UnavailableGuard("job acquire is terminal rejected_no_commit")
+
+        if (metadata.graph_revision, epoch.revision) != intent[12:14]:
+            raise UnavailableGuard("uncommitted job acquire graph stamp changed")
+        if job is None:
+            with store._lock:
+                (job, job_key, job_revision, outbox, outbox_key,
+                 outbox_revision, source_version, access_version) = (
+                    self._first_ingress_encoding_job_locked(namespace, job_id))
+        if (job.operation_id != intent[2] or job_revision != intent[6]
+                or job.fence != intent[7] or job.cancel_epoch != intent[8]):
+            raise UnavailableGuard("uncommitted job acquire prestate changed")
+        try:
+            planned = plan_job_acquire(
+                job, authority.actor, now_utc=intent[4], lease_seconds=lease_seconds)
+            plan_job_acquire(job, authority.actor, now_utc=now_text,
+                             lease_seconds=lease_seconds)
+        except Exception as exc:
+            raise UnavailableGuard("encoding job acquire deadline expired; HOLD") from exc
+        if planned == job or job.cancel_epoch:
+            raise UnavailableGuard("encoding job is no longer runnable; HOLD")
+
+        try:
+            permit = port.begin_fence(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                holder=self.__holder, generation=target.activation_generation,
+                operation="write", operation_id=attempt_id,
+                expected_anchor=anchor, retain_on_unknown=True)
+        except Exception as exc:
+            raise JobAcquireOutcomeUnknown(
+                acquire_operation_id, "job acquire begin outcome unknown; HOLD") from exc
+        scope = FenceScope(namespace, target.authority_namespace,
+            target.activation_generation, "write", attempt_id, permit,
+            anchor, epoch, metadata.graph_revision)
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("job acquire write permit changed")
+        finish_id, finish_digest = finish_identity(permit)
+        from .runtime.d11_types import RuntimeOutboxValue
+
+        pending = RuntimeOutboxValue(**asdict(outbox))
+        candidate = GraphCandidate(
+            Event(Scope(*namespace.as_tuple, job.activity_id),
+                  acquire_operation_id,
+                  datetime.fromisoformat(intent[4].replace("Z", "+00:00")).timestamp(),
+                  "job_acquire_v2", {"request_digest": request_digest}),
+            (GraphVersion(job_key, job_revision),
+             GraphVersion(outbox_key, outbox_revision),
+             source_version, access_version),
+            (job_graph_write(planned), outbox_graph_write(pending, job_key)),
+            (epoch,),
+        )
+        transaction_state = {"phase": "before_transaction"}
+
+        def guard(db):
+            try:
+                commit_now = trusted_upper(clock)
+                commit_now_text = datetime.fromtimestamp(
+                    commit_now, timezone.utc).isoformat().replace("+00:00", "Z")
+                plan_job_acquire(job, authority.actor, now_utc=commit_now_text,
+                                 lease_seconds=lease_seconds)
+                planned_expires = datetime.fromisoformat(
+                    planned.lease_expires_utc.replace("Z", "+00:00")).timestamp()
+            except Exception as exc:
+                raise UnavailableGuard("job acquire trusted clock expired; HOLD") from exc
+            if commit_now >= planned_expires:
+                raise UnavailableGuard("job acquire frozen lease expired; HOLD")
+            if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                raise StaleRead("job acquire graph stamp changed")
+            if db.execute(
+                    "SELECT 1 FROM graph_job_acquire_receipts_v2 WHERE bot=? "
+                    "AND persona=? AND acquire_operation_id=?",
+                    namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone():
+                raise UnavailableGuard("job acquire receipt appeared before commit")
+            current = self._first_ingress_encoding_job_locked(namespace, job_id)[0]
+            if current != job:
+                raise StaleRead("job acquire durable prestate changed")
+            self.__d11_issuer.authorize_existing_encoding_job(
+                db, job, now_utc=commit_now)
+            if acquire_job(db, job_id, authority.actor,
+                           now_utc=intent[4], lease_seconds=lease_seconds) != planned:
+                raise StaleRead("job acquire mutation differed from frozen plan")
+            reconcile_runtime_write(db, candidate.writes[0])
+            reconcile_runtime_write(db, candidate.writes[1])
+
+        def receipt_hook(db, graph_receipt):
+            if graph_receipt.status != "committed" or len(graph_receipt.revisions) != 2:
+                raise UnavailableGuard("job acquire graph event was not committed")
+            store.cas_graph_recovery_metadata(
+                metadata, metadata.requirements,
+                _capability=self.__graph_capability)
+            db.execute(
+                "INSERT INTO graph_job_acquire_receipts_v2"
+                "(bot,persona,acquire_operation_id,request_digest,job_json,"
+                "permit_json,pre_graph_revision,pre_graph_epoch,"
+                "post_graph_revision,post_graph_epoch,finish_request_id,"
+                "finish_request_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                namespace.as_tuple + (acquire_operation_id, request_digest,
+                    canonical_json(asdict(planned)), canonical_json(to_wire(permit)),
+                    metadata.graph_revision, epoch.revision,
+                    metadata.graph_revision + 1, graph_receipt.epoch.revision,
+                    finish_id, finish_digest),
+            )
+
+        try:
+            GraphStore.graph_commit(
+                store, candidate, _guard=guard, _receipt_hook=receipt_hook,
+                _capability=self.__graph_capability,
+                _transaction_state=transaction_state)
+        except Exception as exc:
+            if transaction_state["phase"] not in {"before_transaction", "rolled_back"}:
+                raise JobAcquireOutcomeUnknown(
+                    acquire_operation_id, "job acquire commit outcome unknown; HOLD") from exc
+            abort_id, abort_digest = finish_identity(permit, rejected=True)
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise UnavailableGuard("job acquire rollback cannot be proven")
+                    db.execute(
+                        "INSERT OR IGNORE INTO graph_job_acquire_rejections_v2"
+                        "(bot,persona,acquire_operation_id,status,permit_json,"
+                        "graph_revision,graph_epoch,finish_request_id,"
+                        "finish_request_digest) VALUES(?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (acquire_operation_id,
+                            "rejected_no_commit", canonical_json(to_wire(permit)),
+                            metadata.graph_revision, epoch.revision,
+                            abort_id, abort_digest),
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+            try:
+                port.finish_fence(scope, request_id=abort_id,
+                                  request_digest=abort_digest)
+            except Exception as finish_exc:
+                raise JobAcquireOutcomeUnknown(
+                    acquire_operation_id, "job acquire rejection finish unknown; HOLD"
+                ) from finish_exc
+            raise
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("job acquire permit changed after commit")
+            with store._lock:
+                current, current_epoch = self._v2_graph_stamp(namespace)
+                if (current.graph_revision != metadata.graph_revision + 1
+                        or current_epoch.revision != epoch.revision + 1):
+                    raise UnavailableGuard("job acquire committed stamp differs")
+            port.finish_fence(scope, request_id=finish_id,
+                              request_digest=finish_digest)
+        except Exception as exc:
+            raise JobAcquireOutcomeUnknown(
+                acquire_operation_id, "job acquire finish outcome unknown; HOLD") from exc
+        return self._qualified_first_ingress_acquire_return(
+            namespace, job_id, planned, authority.actor, clock, lease_seconds)
 
     def cancel_persistent_job(self, authority: AuthorityContext, lease: object,
                               job_id: str, operation_id: str,

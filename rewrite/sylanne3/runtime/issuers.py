@@ -27,6 +27,7 @@ from ..runtime_contracts import (
     CommandEnvelope, DomainBundle, canonical_serialize,
 )
 from .budget import get_budget_lease
+from .d11_types import runtime_job_key
 from .jobs import PersistentJob, get_job
 
 
@@ -512,6 +513,40 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
     def resource_issuer(self) -> D02ResourceIssuer:
         """Return the D02 authority this budget issuer actually verifies."""
         return self._d02
+
+    def authorize_existing_encoding_job(self, db, job: PersistentJob, *,
+                                        now_utc: float) -> bool:
+        """Recheck the original signed grant and quote without reserving again."""
+        if type(job) is not PersistentJob or job.work_kind != "d06.encode_source":
+            raise IssuerAuthorityDenied("only a typed source encoding job may be acquired")
+        grant = self._load_grant(db, job.budget_ref)
+        lease = get_budget_lease(db, grant.lease_id)
+        quote_ref = job.operator_versions.get("resource_quote")
+        if type(quote_ref) is not str or ":" not in quote_ref:
+            raise IssuerAuthorityDenied("encoding job has no original D02 quote")
+        quote_id, version_text = quote_ref.rsplit(":", 1)
+        try:
+            version = int(version_text)
+        except ValueError as exc:
+            raise IssuerAuthorityDenied("encoding quote version is invalid") from exc
+        quote = self._d02._load_quote(db, quote_id, version)
+        key = runtime_job_key(job.bot_id, job.persona_id, job.activity_id, job.job_id)
+        reservation = db.execute(
+            "SELECT state FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
+            (job.budget_ref, job.operation_id),
+        ).fetchone()
+        if (now_utc >= grant.valid_until_utc or now_utc >= quote.valid_until_utc
+                or lease.state != "active" or reservation is None
+                or reservation[0] != "reserved"
+                or (grant.bot_id, grant.persona_id) != (job.bot_id, job.persona_id)
+                or (quote.bot_id, quote.persona_id, quote.activity_id,
+                    quote.operation_id, quote.graph_job_ref,
+                    quote.parent_budget_lease_ref, quote.work_kind) != (
+                    job.bot_id, job.persona_id, job.activity_id,
+                    job.operation_id, key.token, job.budget_ref, job.work_kind)
+                or job.work_kind not in grant.allowed_work_kinds):
+            raise IssuerAuthorityDenied("encoding job lost its original signed authority")
+        return True
 
     def _admission_state(self, envelope: CommandEnvelope, db, *, now_utc: float):
         quote = self._d02.qualified_quote(envelope, db, now_utc=now_utc)

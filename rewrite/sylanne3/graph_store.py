@@ -371,6 +371,55 @@ class GraphStore(Store):
                 graph_revision INTEGER NOT NULL,
                 graph_epoch INTEGER NOT NULL,
                 PRIMARY KEY(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_job_acquire_intents_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                acquire_operation_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+                job_id TEXT NOT NULL, original_operation_id TEXT NOT NULL,
+                actor TEXT NOT NULL, fixed_now_utc TEXT NOT NULL,
+                lease_seconds INTEGER NOT NULL, expected_job_revision INTEGER NOT NULL,
+                expected_fence INTEGER NOT NULL, expected_cancel_epoch INTEGER NOT NULL,
+                fence_attempt_id TEXT NOT NULL UNIQUE,
+                requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                PRIMARY KEY(bot,persona,acquire_operation_id));
+            CREATE TABLE IF NOT EXISTS graph_job_acquire_receipts_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                acquire_operation_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+                job_json TEXT NOT NULL, permit_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL, pre_graph_epoch INTEGER NOT NULL,
+                post_graph_revision INTEGER NOT NULL, post_graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL, finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,acquire_operation_id),
+                FOREIGN KEY(bot,persona,acquire_operation_id)
+                    REFERENCES graph_job_acquire_intents_v2(bot,persona,acquire_operation_id));
+            CREATE TABLE IF NOT EXISTS graph_job_acquire_rejections_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                acquire_operation_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status='rejected_no_commit'),
+                permit_json TEXT NOT NULL,
+                graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
+                finish_request_id TEXT NOT NULL, finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,acquire_operation_id),
+                FOREIGN KEY(bot,persona,acquire_operation_id)
+                    REFERENCES graph_job_acquire_intents_v2(bot,persona,acquire_operation_id));
+            CREATE TRIGGER IF NOT EXISTS graph_job_acquire_intent_no_update_v2
+                BEFORE UPDATE ON graph_job_acquire_intents_v2
+                BEGIN SELECT RAISE(ABORT, 'job acquire intent is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_job_acquire_intent_no_delete_v2
+                BEFORE DELETE ON graph_job_acquire_intents_v2
+                BEGIN SELECT RAISE(ABORT, 'job acquire intent is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_job_acquire_receipt_no_update_v2
+                BEFORE UPDATE ON graph_job_acquire_receipts_v2
+                BEGIN SELECT RAISE(ABORT, 'job acquire receipt is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_job_acquire_receipt_no_delete_v2
+                BEFORE DELETE ON graph_job_acquire_receipts_v2
+                BEGIN SELECT RAISE(ABORT, 'job acquire receipt is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_job_acquire_rejection_no_update_v2
+                BEFORE UPDATE ON graph_job_acquire_rejections_v2
+                BEGIN SELECT RAISE(ABORT, 'job acquire rejection is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_job_acquire_rejection_no_delete_v2
+                BEFORE DELETE ON graph_job_acquire_rejections_v2
+                BEGIN SELECT RAISE(ABORT, 'job acquire rejection is immutable'); END;
             CREATE TRIGGER IF NOT EXISTS graph_first_ingress_intent_no_update_v2
                 BEFORE UPDATE ON graph_first_ingress_intents_v2
                 BEGIN SELECT RAISE(ABORT, 'first ingress intent is immutable'); END;

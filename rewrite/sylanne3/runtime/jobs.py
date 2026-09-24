@@ -304,11 +304,23 @@ def create_job(db, job: PersistentJob, operation_id: str, digest: str) -> Persis
 
 def acquire_job(db, job_id: str, holder: str, *, now_utc: str,
                 lease_seconds: int) -> PersistentJob:
+    job = get_job(db, job_id)
+    updated = plan_job_acquire(job, holder, now_utc=now_utc,
+                               lease_seconds=lease_seconds)
+    if updated != job:
+        _save_job(db, updated)
+    return updated
+
+
+def plan_job_acquire(job: PersistentJob, holder: str, *, now_utc: str,
+                     lease_seconds: int) -> PersistentJob:
+    """Preview an exact lease mutation before the fenced graph transaction."""
+    if not isinstance(job, PersistentJob):
+        raise TypeError("job must be PersistentJob")
     _identifier(holder, "holder")
     now = _utc(now_utc, "now_utc")
     if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not 1 <= lease_seconds <= MAX_LEASE_SECONDS:
         raise ValueError("lease_seconds is outside the supported range")
-    job = get_job(db, job_id)
     if now >= _utc(job.deadline_utc, "deadline_utc"):
         raise JobNotRunnable("job deadline has expired")
     if job.phase == "running":
@@ -321,13 +333,11 @@ def acquire_job(db, job_id: str, holder: str, *, now_utc: str,
         # effects still require their own execution-journal recovery check.
     elif job.phase != "queued":
         raise JobNotRunnable(f"job phase {job.phase} is not runnable")
-    updated = replace(
+    return replace(
         job, phase="running", lease_holder=holder,
         lease_expires_utc=_utc_text(now + timedelta(seconds=lease_seconds)),
         fence=job.fence + 1,
     )
-    _save_job(db, updated)
-    return updated
 
 
 def _assert_fence(job: PersistentJob, holder: str, fence: int) -> None:
@@ -419,5 +429,6 @@ def cancel_job(db, job_id: str, operation_id: str, digest: str) -> PersistentJob
 __all__ = [
     "JobConflict", "JobError", "JobFenceRejected", "JobNotRunnable",
     "PersistentJob", "acquire_job", "cancel_job", "checkpoint_job",
-    "create_job", "get_job", "install_schema", "transition_job", "wake_job",
+    "create_job", "get_job", "install_schema", "plan_job_acquire",
+    "transition_job", "wake_job",
 ]

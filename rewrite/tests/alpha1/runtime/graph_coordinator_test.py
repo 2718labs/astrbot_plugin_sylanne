@@ -34,7 +34,7 @@ from sylanne3.runtime_journal import ExecutionJournal
 from sylanne3.runtime.budget import (
     BudgetLease, BudgetReceipt, BudgetUnavailable, create_budget_lease, get_budget_lease,
 )
-from sylanne3.runtime.jobs import PersistentJob
+from sylanne3.runtime.jobs import PersistentJob, get_job
 from sylanne3.runtime.d11_types import (
     D11RuntimeProvider, D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
     RuntimeCostSettlement, RuntimeOutboxValue, cost_settlement_graph_write,
@@ -838,56 +838,34 @@ class CoordinatorTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM runtime_jobs").fetchone()[0], 0)
             self.assertEqual(get_budget_lease(db, "parent").reserved, {})
 
-    def test_cancelled_worker_result_cannot_publish_graph_or_outbox(self):
+    def test_production_legacy_acquire_cannot_publish_graph_or_outbox(self):
         candidate = self.bundle(operation="cancelled-worker", outbox=True)
         self.d11_issuer.schedule_graph_job_ref = candidate.persistent_job_refs[0]
         _, queued = self.coordinator.reserve_and_schedule(candidate.envelope, self.lease)
         self.d11_issuer.pre_reserved = True
-        running = self.coordinator.acquire_persistent_job(
-            candidate.envelope.authority, self.lease, queued.job_id,
-            now_utc="2029-01-01T00:00:00Z", lease_seconds=60)
-        worker_authority = replace(candidate.envelope.authority,
-                                   worker_fence=running.fence)
-        worker_envelope = replace(candidate.envelope, authority=worker_authority)
-        worker_bundle = replace(
-            candidate, envelope=worker_envelope,
-            proposals=tuple(replace(proposal, envelope=worker_envelope)
-                            for proposal in candidate.proposals))
-        cancelled = self.coordinator.cancel_persistent_job(
-            candidate.envelope.authority, self.lease, queued.job_id,
-            "cancel-worker", "a" * 64)
-        self.assertEqual(cancelled.phase, "draining")
-        self.assertGreater(cancelled.fence, running.fence)
-        with self.assertRaises(UnavailableGuard):
-            self.coordinator.commit_domain_bundle(worker_bundle, self.lease)
+        with self.assertRaisesRegex(UnavailableGuard, "v2 fenced command"):
+            self.coordinator.acquire_persistent_job(
+                candidate.envelope.authority, self.lease, queued.job_id,
+                now_utc="2029-01-01T00:00:00Z", lease_seconds=60)
         with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(get_job(db, queued.job_id).phase, "queued")
             self.assertEqual(db.execute("SELECT count(*) FROM graph_atoms").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT count(*) FROM graph_bundle_outbox").fetchone()[0], 0)
             self.assertEqual(get_budget_lease(db, "parent").reserved, {"cpu_ms": 1})
 
-    def test_current_worker_fence_can_commit_matching_runtime_projection(self):
+    def test_production_legacy_acquire_does_not_issue_worker_fence(self):
         candidate = self.bundle(operation="current-worker", outbox=True)
         self.d11_issuer.schedule_graph_job_ref = candidate.persistent_job_refs[0]
         _, queued = self.coordinator.reserve_and_schedule(candidate.envelope, self.lease)
         self.d11_issuer.pre_reserved = True
-        running = self.coordinator.acquire_persistent_job(
-            candidate.envelope.authority, self.lease, queued.job_id,
-            now_utc="2029-01-01T00:00:00Z", lease_seconds=60)
-        worker_authority = replace(candidate.envelope.authority,
-                                   worker_fence=running.fence)
-        worker_envelope = replace(candidate.envelope, authority=worker_authority)
-        d11 = candidate.proposals[1]
-        worker_bundle = replace(
-            candidate, envelope=worker_envelope,
-            proposals=(replace(candidate.proposals[0], envelope=worker_envelope),
-                       replace(d11, envelope=worker_envelope,
-                               typed_writes=(job_graph_write(running),
-                                             d11.typed_writes[1]))))
-        self.assertEqual(self.coordinator.commit_domain_bundle(
-            worker_bundle, self.lease).status, "committed")
+        with self.assertRaisesRegex(UnavailableGuard, "v2 fenced command"):
+            self.coordinator.acquire_persistent_job(
+                candidate.envelope.authority, self.lease, queued.job_id,
+                now_utc="2029-01-01T00:00:00Z", lease_seconds=60)
         with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(get_job(db, queued.job_id).fence, 0)
             self.assertEqual(db.execute(
-                "SELECT count(*) FROM graph_outbox_jobs").fetchone()[0], 1)
+                "SELECT count(*) FROM graph_outbox_jobs").fetchone()[0], 0)
 
     def test_unknown_cost_keeps_full_ceiling_and_matches_d11_graph_receipt(self):
         base = self.bundle(operation="unknown-cost")
