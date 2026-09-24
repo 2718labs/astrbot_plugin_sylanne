@@ -232,6 +232,24 @@ def test_d11_admission_is_required_and_unknown_blocks_dependent_segment() -> Non
     assert staged.status == "complete"
     assert provider.prepare_delivery(staged, intent, ()).status == "unavailable"
 
+    # A progress projection must not silently accept a narrowed or altered
+    # finite batch, nor an unrelated D11 observation.
+    for changed in (
+        replace(staged, segments=staged.segments[:1]),
+        replace(staged, segments=(replace(staged.segments[0], payload_digest="0" * 64), staged.segments[1])),
+        replace(staged, segments=(replace(staged.segments[0], body="Other"), staged.segments[1])),
+        replace(staged, segments=(replace(staged.segments[0], prerequisite_segment_ref="segment:2"), staged.segments[1])),
+    ):
+        assert provider.prepare_delivery(changed, intent, ()).status == "rejected"
+    unrelated = AdmissionReceipt(
+        "admission:foreign", "segment:foreign", "effect:foreign", "0" * 64, "accepted",
+    )
+    assert provider.prepare_delivery(staged, intent, (unrelated,)).status == "rejected"
+    wrong_payload = AdmissionReceipt(
+        "admission:wrong", "segment:2", "effect:2", "0" * 64, "accepted",
+    )
+    assert provider.prepare_delivery(staged, intent, (wrong_payload,)).status == "rejected"
+
     first_unknown = AdmissionReceipt(
         "admission:1", "segment:1", "effect:1", staged.segments[0].payload_digest, "unknown",
     )

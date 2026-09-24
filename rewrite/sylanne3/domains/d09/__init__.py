@@ -856,17 +856,36 @@ class D09ExpressionProvider:
         if type(admissions) is not tuple or any(not isinstance(item, AdmissionReceipt) for item in admissions):
             raise TypeError("admissions must be a tuple of AdmissionReceipt")
         grants = {item.segment_id: item for item in intent.segment_grants}
-        if any(
-            segment.intent_ref != intent.intent_ref
-            or segment.action_id != intent.action_id
-            or segment.segment_id not in grants
-            or grants[segment.segment_id].effect_id != segment.effect_id
-            for segment in staged.segments
+        if (
+            len(staged.segments) != len(grants)
+            or tuple(segment.segment_id for segment in staged.segments)
+            != tuple(item.segment_id for item in intent.segment_grants)
+            or any(
+                segment.intent_ref != intent.intent_ref
+                or segment.action_id != intent.action_id
+                or segment.effect_id != grants[segment.segment_id].effect_id
+                or segment.position != grants[segment.segment_id].position
+                or segment.payload_digest != grants[segment.segment_id].payload_digest
+                or segment.payload_digest != segment_payload_digest(
+                    segment.body, segment.media_refs, segment.claim_uses,
+                )
+                or segment.prerequisite_segment_ref
+                != grants[segment.segment_id].prerequisite_segment_ref
+                or segment.audiences != intent.audiences
+                for segment in staged.segments
+            )
         ):
             return DeliveryPreparation("rejected", (), (), ("intent_mismatch",))
         admission_ids = tuple(item.segment_id for item in admissions)
         if len(set(admission_ids)) != len(admission_ids):
             return DeliveryPreparation("rejected", (), (), ("duplicate_admission",))
+        if any(
+            item.segment_id not in grants
+            or item.effect_id != grants[item.segment_id].effect_id
+            or item.payload_digest != grants[item.segment_id].payload_digest
+            for item in admissions
+        ):
+            return DeliveryPreparation("rejected", (), (), ("admission_mismatch",))
         by_segment = {item.segment_id: item for item in admissions}
         admitted: list[str] = []
         blocked: list[str] = []
