@@ -198,6 +198,14 @@ class AdminD03ArrivalPolicy:
             if (type(value) is not str or _RESOURCE_DIMENSION.fullmatch(value) is None):
                 raise ValueError(f"D03 arrival {name} must be a canonical resource ID")
 
+    def digest_payload(self) -> dict[str, object]:
+        return {
+            "deadline_after_seconds": self.deadline_after_seconds,
+            "quote_ceiling": dict(self.quote_ceiling),
+            "snapshot_ref": self.snapshot_ref,
+            "resource_ref": self.resource_ref,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class AdminIngressModelPolicy:

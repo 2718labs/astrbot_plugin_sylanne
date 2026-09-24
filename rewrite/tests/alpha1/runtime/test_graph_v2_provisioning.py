@@ -339,7 +339,8 @@ def test_v2_bundle_cold_restart_finishes_only_after_durable_business_receipt(
 
 def _owner_issue_case(tmp_path, *, first_ingress=False, return_bootstrap=False,
                       role_types=False, scene_types=False,
-                      owner_capabilities=None, extra_specs=()):
+                      owner_capabilities=None, extra_specs=(),
+                      arrival_allowed=False):
     """Exercise the private graph transaction; this is not Authority admission."""
     registry = TypeRegistry()
     registry.register(owner_grant_spec())
@@ -369,7 +370,9 @@ def _owner_issue_case(tmp_path, *, first_ingress=False, return_bootstrap=False,
     policy = policy_for(store)
     if first_ingress:
         policy = replace(policy, root_grant=replace(
-            policy.root_grant, allowed_work_kinds=("d06.encode_source",)))
+            policy.root_grant, allowed_work_kinds=(
+                ("d06.encode_source", "d03.message_received") if arrival_allowed
+                else ("d06.encode_source",))))
         d06 = D06DomainProvider()
         coordinator.register_provider(
             bootstrap, "d06", d06, "d06.contract.v1",

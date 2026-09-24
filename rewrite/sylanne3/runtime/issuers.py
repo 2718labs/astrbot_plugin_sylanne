@@ -222,6 +222,13 @@ def _d03_policy_id(installation_id: str, grant: BudgetLeaseGrant) -> str:
     })[:40]
 
 
+def d03_arrival_quote_id(namespace, operation_id: str) -> str:
+    """The graph can predeclare the exact D02 guard before its transaction."""
+    return "d03-arrival-q-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+    })[:40]
+
+
 def _d03_quote_refs(policy: D03ArrivalQuotePolicy,
                     envelope: CommandEnvelope) -> tuple[str, str]:
     snapshot = "d03snap:" + policy.policy_id + ":" + canonical_digest({
@@ -710,10 +717,7 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
             admin_policy.resource_ref,
         )
         snapshot_ref, resource_ref = _d03_quote_refs(policy, envelope)
-        quote_id = "d03-arrival-q-" + canonical_digest({
-            "namespace": list(authority.namespace.as_tuple),
-            "operation_id": identity.operation_id,
-        })[:40]
+        quote_id = d03_arrival_quote_id(authority.namespace, identity.operation_id)
         quote = ResourceQuote(
             quote_id, 1, *authority.namespace.as_tuple, identity.activity_id,
             identity.operation_id, identity.effect_id, grant.lease_id,
@@ -904,7 +908,7 @@ def build_runtime_issuers(signing_key: bytes, *,
 
 
 __all__ = [
-    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer",
+    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id",
     "IssuerAuthorityDenied", "ResourceOutcome", "ResourceQuote",
     "build_runtime_issuers", "install_schema",
 ]

@@ -6666,12 +6666,37 @@ class GraphCoordinator:
     def _admit_runtime_bundle(self, db, bundle: DomainBundle, *,
                               now_utc: float | None = None) -> RuntimeAdmission:
         """Apply D02/D11 decisions in the graph's existing SQLite transaction."""
+        from .runtime.issuers import D03_ARRIVAL_WORK_KIND
+
         if self.__d02_issuer is None or self.__d11_issuer is None:
             raise UnavailableGuard("D02 and D11 runtime issuers are required")
         time_kwargs = {} if now_utc is None else {"now_utc": now_utc}
         if self.__d02_issuer.authorize_resources(
                 bundle, db, **time_kwargs) is not True:
             raise AuthorityDenied("D02 resource admission did not approve the bundle")
+        quote = self.__d02_issuer.qualified_quote(
+            bundle.envelope, db, **time_kwargs)
+        if quote.work_kind == D03_ARRIVAL_WORK_KIND:
+            if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='graph_d03_arrival_issuance_v2'",
+            ).fetchone() is None:
+                raise AuthorityDenied("D03 arrival quote lacks sealed graph issuance")
+            row = db.execute(
+                "SELECT source_ref,quote_id,bundle_digest FROM "
+                "graph_d03_arrival_issuance_v2 WHERE bot=? AND persona=? "
+                "AND operation_id=?",
+                bundle.envelope.authority.namespace.as_tuple
+                + (bundle.envelope.identity.operation_id,),
+            ).fetchone()
+            source_refs = bundle.envelope.source_qualification.source_refs
+            if (len(bundle.proposals) != 1 or bundle.proposals[0].domain != "d03"
+                    or len(source_refs) != 1
+                    or row != (AtomKey.from_token(source_refs[0]).owner.subject,
+                               quote.quote_id, bundle.digest)
+                    or bundle.persistent_job_refs or bundle.outbox_refs
+                    or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+                raise AuthorityDenied("D03 arrival quote cannot authorize a mixed bundle")
         admission = self.__d11_issuer.admit_runtime(bundle, db, **time_kwargs)
         if not isinstance(admission, RuntimeAdmission):
             raise AuthorityDenied("D11 did not issue a typed runtime admission")
@@ -7637,6 +7662,306 @@ class GraphCoordinator:
         insert_admission(db, receipt, request)
         return receipt
 
+    def commit_d03_message_arrival_v2(
+            self, bootstrap: object, namespace: NamespaceId, source_ref: str,
+            installation_policy, arrival_policy, clock_policy) -> CommitReceipt:
+        """Adopt one committed ingress as a D03 fact with an installed price.
+
+        The source ID selects an existing trusted ingress receipt. Identity,
+        content, scene and source/access guards are rebuilt from this store;
+        no caller candidate or quote is accepted. A committed receipt reports
+        only the graph fact and a D11 reservation, never settled cost.
+        """
+        from .authority_service.v2_contract import FencePermitV2, from_wire
+        from .domains.d03.message_arrival import (
+            build_message_arrival_candidate, build_message_arrival_proposal,
+        )
+        from .host.authority_profile import (
+            AdminD03ArrivalPolicy, AdminIngressClockPolicy,
+        )
+        from .host.ingress import HostIngressEnvelope, SourceLineage
+        from .installation_policy import AdminInstallationPolicy
+        from .runtime.first_ingress_v2 import (
+            scene_ref_for_conversation, trusted_upper,
+        )
+        from .runtime.ingress_observation import read_committed_ingress_identity
+        from .runtime.issuers import D03_ARRIVAL_WORK_KIND, d03_arrival_quote_id
+        from .runtime_contracts import (
+            CommandEnvelope, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA,
+            VersionedRef,
+        )
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId
+                or type(installation_policy) is not AdminInstallationPolicy
+                or type(arrival_policy) is not AdminD03ArrivalPolicy
+                or type(clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("installed D03 arrival policies are required; HOLD")
+        if (namespace != installation_policy.namespace
+                or type(source_ref) is not str or len(source_ref) != 64
+                or any(ch not in "0123456789abcdef" for ch in source_ref)
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__d02_issuer is None or self.__d11_issuer is None):
+            raise UnavailableGuard("D03 arrival v2 identity or authorities unavailable")
+        policy = installation_policy
+        grant = policy.root_grant
+        if (D03_ARRIVAL_WORK_KIND not in grant.allowed_work_kinds
+                or any(amount > grant.max_ceiling.get(name, 0)
+                       for name, amount in arrival_policy.quote_ceiling.items())):
+            raise UnavailableGuard("installed grant does not price D03 arrival")
+        operation_id = "d03-arrival-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "source_ref": source_ref,
+        })[:40]
+        activity_id = "d03-activity-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "source_ref": source_ref,
+            "kind": D03_ARRIVAL_WORK_KIND,
+        })[:40]
+        quote_id = d03_arrival_quote_id(namespace, operation_id)
+        policy_digest = canonical_digest(arrival_policy.digest_payload())
+        store = self.__store
+        port = self.__content_fence_v2
+        with store._lock:
+            provision = self._provision_row(store._db, namespace)
+            if provision is None:
+                raise UnavailableGuard("D03 arrival namespace is not provisioned")
+            genesis = self._decode_provision_receipt(provision)
+            signed_grant, signature = self.__d11_issuer.signed_budget_grant_at_version(
+                store._db, grant.lease_id, grant.version)
+            if (signed_grant != grant or signature != genesis.root_grant_signature
+                    or genesis.root_grant_id != grant.grant_id
+                    or genesis.root_lease_id != grant.lease_id
+                    or genesis.installation_id != policy.installation_id
+                    or genesis.manifest_digest != policy.manifest_digest):
+                raise UnavailableGuard("D03 arrival installed root grant differs")
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            prior_authority = AuthorityContext(
+                "host", "d11", "audit", namespace, ("persona", "event"),
+                "context", (), grant.policy_ref,
+                metadata.requirements.activation_generation)
+            prior = self._get_operation_fenced(prior_authority, operation_id, v2=True)
+            binding = store._db.execute(
+                "SELECT source_ref,quote_id,policy_digest,bundle_digest "
+                "FROM graph_d03_arrival_issuance_v2 WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone() if store._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_d03_arrival_issuance_v2'",
+            ).fetchone() else None
+            saved = store._db.execute(
+                "SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,"
+                "post_graph_revision,post_graph_epoch,finish_request_id,"
+                "finish_request_digest FROM graph_bundle_fences_v2 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+        target = metadata.requirements
+        if (target.namespace != namespace
+                or target.authority_id != policy.expected_authority_id
+                or target.authority_namespace != policy.authority_namespace
+                or target.activation_generation != genesis.generation):
+            raise UnavailableGuard("D03 arrival v2 recovery identity differs")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("D03 arrival Authority anchor differs")
+        if prior is not None:
+            if (binding != (source_ref, quote_id, policy_digest,
+                            prior.operation_digest)
+                    or saved is None or saved[0] != prior.operation_digest
+                    or saved[4] != saved[2] + 1
+                    or saved[5] != prior.invalidated_epochs[0].revision):
+                raise UnavailableGuard("D03 arrival replay receipt differs")
+            attempt_id = "graph-write-" + canonical_digest({
+                "namespace": list(namespace.as_tuple),
+                "operation_id": operation_id,
+                "bundle_digest": prior.operation_digest,
+            })[:48]
+            permit = from_wire(json.loads(saved[1]))
+            if (type(permit) is not FencePermitV2
+                    or permit.operation_id != attempt_id
+                    or permit.pinned_anchor != anchor
+                    or permit.holder != self.__holder):
+                raise UnavailableGuard("D03 arrival replay permit differs")
+            with store._lock:
+                quote = self.__d02_issuer._load_quote(store._db, quote_id, 1)
+                policy_ref = quote.snapshot_ref.split(":")
+                if len(policy_ref) != 3 or policy_ref[0] != "d03snap":
+                    raise UnavailableGuard("D03 arrival replay policy binding differs")
+                signed_policy = self.__d02_issuer._load_d03_arrival_policy(
+                    store._db, policy_ref[1])
+                original, _ = self.__d11_issuer.signed_budget_grant_at_version(
+                    store._db, grant.lease_id, grant.version)
+                budget = get_budget_lease(store._db, grant.lease_id)
+                if (original != grant or quote.operation_id != operation_id
+                        or quote.activity_id != activity_id
+                        or quote.parent_budget_lease_ref != grant.lease_id
+                        or quote.work_kind != D03_ARRIVAL_WORK_KIND
+                        or dict(quote.ceiling) != dict(arrival_policy.quote_ceiling)
+                        or signed_policy.installation_id != policy.installation_id
+                        or signed_policy.grant_id != grant.grant_id
+                        or signed_policy.grant_version != grant.version
+                        or signed_policy.lease_id != grant.lease_id
+                        or signed_policy.provider_policy_ref != grant.policy_ref
+                        or signed_policy.snapshot_ref != arrival_policy.snapshot_ref
+                        or signed_policy.resource_ref != arrival_policy.resource_ref
+                        or signed_policy.deadline_after_seconds
+                        != arrival_policy.deadline_after_seconds
+                        or dict(signed_policy.quote_ceiling)
+                        != dict(arrival_policy.quote_ceiling)
+                        or budget.state != "active"
+                        or (budget.bot_id, budget.persona_id) != namespace.as_tuple):
+                    raise UnavailableGuard("D03 arrival replay quote or lease differs")
+            expected_finish = "sha256:" + canonical_digest({
+                "operation_id": attempt_id, "permit_token": permit.token,
+                "action": "finish_domain_bundle",
+                "business_operation_id": operation_id,
+                "bundle_digest": prior.operation_digest,
+            })
+            if saved[6:] != ("finish:" + attempt_id, expected_finish):
+                raise UnavailableGuard("D03 arrival replay finish receipt differs")
+            observed, state = port.get_fence_operation(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                operation_id=attempt_id)
+            if observed != permit or state not in {"active", "finished"}:
+                raise UnavailableGuard("D03 arrival replay Authority fence differs")
+            if state == "active":
+                if (metadata.graph_revision, epoch.revision) != saved[4:6]:
+                    raise UnavailableGuard("D03 arrival replay graph stamp differs")
+                scope = FenceScope(
+                    namespace, target.authority_namespace,
+                    target.activation_generation, "write", attempt_id,
+                    permit, anchor,
+                    NamespaceEpoch(*namespace.as_tuple, saved[3]), saved[2])
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("D03 arrival replay permit changed")
+                port.finish_fence(scope, request_id=saved[6],
+                                  request_digest=saved[7])
+            elif (metadata.graph_revision < saved[4]
+                  or epoch.revision < saved[5]):
+                raise UnavailableGuard("D03 arrival finished graph stamp regressed")
+            return replace(prior, status="duplicate")
+        if binding is not None or saved is not None:
+            raise UnavailableGuard("D03 arrival lacks a complete replay receipt")
+
+        try:
+            reading = port.read_ingress_clock(clock_policy)
+            now_utc = trusted_upper(reading)
+        except Exception as exc:
+            raise UnavailableGuard("paired D03 arrival clock unavailable; HOLD") from exc
+        deadline = min(
+            math.nextafter(math.fsum((now_utc, arrival_policy.deadline_after_seconds)),
+                           -math.inf), grant.valid_until_utc)
+        if deadline <= now_utc:
+            raise UnavailableGuard("D03 arrival deadline is unavailable")
+        monotonic_deadline = reading.monotonic_after_seconds + (
+            deadline - reading.utc_upper_bound_seconds)
+        if not math.isfinite(monotonic_deadline):
+            raise UnavailableGuard("D03 arrival monotonic deadline is invalid")
+        with store._lock:
+            if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                raise StaleRead("D03 arrival graph stamp changed")
+            db = store._db
+            receipt = read_committed_ingress_identity(db, namespace, source_ref)
+            if receipt is None:
+                raise UnavailableGuard("D03 arrival lacks committed host ingress")
+            identity = json.loads(receipt.identity_json)
+            source_atom_key = source_key(*namespace.as_tuple, source_ref)
+            access_atom_key = access_key(*namespace.as_tuple, source_ref)
+            source_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (source_atom_key.token,),
+            ).fetchone()
+            access_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (access_atom_key.token,),
+            ).fetchone()
+            if (source_row is None or access_row is None
+                    or not source_row[2] or not access_row[2]):
+                raise UnavailableGuard("D03 arrival current source or access is unavailable")
+            source = SourceRecord.from_dict(json.loads(source_row[1]))
+            access = json.loads(access_row[1])
+            ingress = HostIngressEnvelope(
+                namespace, identity["platform_ref"], identity["conversation_ref"],
+                identity["sender_ref"], identity["message_id"], source.text,
+                source.occurred_at, source.recorded_at, identity["visibility"],
+                SourceLineage(**identity["lineage"]),
+            )
+            scene = SimpleNamespace(
+                namespace=namespace, platform_ref=ingress.platform_ref,
+                conversation_ref=ingress.conversation_ref,
+                visibility=ingress.visibility,
+                scene_ref=scene_ref_for_conversation(
+                    namespace, ingress.platform_ref, ingress.conversation_ref),
+            )
+            qualification = SourceQualification(
+                (source_atom_key.token,), "reported", source.occurred_at,
+                source.recorded_at, "external_report", "qualified", 0.5,
+                "not_applicable",
+            )
+            candidate = build_message_arrival_candidate(
+                ingress, scene, source, access, qualification,
+                source_version=GraphVersion(source_atom_key, source_row[0]),
+                access_version=GraphVersion(access_atom_key, access_row[0]),
+            )
+            sender_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (candidate.sender_key.token,),
+            ).fetchone()
+            event_row = db.execute(
+                "SELECT 1 FROM graph_atoms WHERE token=?",
+                (candidate.event_key.token,),
+            ).fetchone()
+            if event_row is not None:
+                raise UnavailableGuard("D03 arrival event exists without this operation")
+            sender_atom = (GraphAtom(candidate.sender_key, sender_row[0],
+                                     json.loads(sender_row[1]), bool(sender_row[2]))
+                           if sender_row else None)
+            guard_versions = dict(db.execute(
+                "SELECT kind,version FROM graph_guard_versions WHERE bot=? "
+                "AND persona=? AND ref='current'", namespace.as_tuple,
+            ).fetchall())
+            authority_epochs = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone() or (0, 0)
+        lease, capability = self.grant(
+            bootstrap, actor="host", issuer_domain="d11", namespace=namespace,
+            domains=("d03",), activation_generation=target.activation_generation,
+            operation_id=operation_id)
+        authority = AuthorityContext(
+            "host", "d11", capability, namespace, ("persona", "event"),
+            "context", (ingress.conversation_ref,), grant.policy_ref,
+            target.activation_generation)
+        envelope = CommandEnvelope(
+            RUNTIME_SCHEMA,
+            OperationIdentity(
+                activity_id, None, "arrival-attempt", "arrival", operation_id,
+                canonical_digest({"input_refs": [source_atom_key.token]})),
+            authority,
+            VersionGuard(
+                (GraphVersion(source_atom_key, source_row[0]),
+                 GraphVersion(access_atom_key, access_row[0]),
+                 GraphVersion(candidate.sender_key,
+                              sender_row[0] if sender_row else 0),
+                 GraphVersion(candidate.event_key, 0)),
+                (QueryEpoch(namespace, "all", epoch.revision),),
+                *authority_epochs, store._registry.catalogue_hash,
+                guard_versions["scheme"], guard_versions["operator"],
+                guard_versions["policy"], (), (),
+                (VersionedRef(quote_id, 1),)),
+            qualification, (source_atom_key.token,), grant.lease_id,
+            deadline, monotonic_deadline, "character-v1", (ingress.message_id,),
+        )
+        proposal = build_message_arrival_proposal(
+            envelope, candidate, sender_atom=sender_atom)
+        bundle = DomainBundle(envelope, (proposal,), (), (), (), (), (), (), ())
+        return self._commit_domain_bundle_v2(
+            bundle, lease, arrival_issuance=(
+                arrival_policy, policy.installation_id, now_utc, source_ref,
+                policy_digest))
+
     def commit_domain_bundle(self, bundle: DomainBundle, lease: object) -> CommitReceipt:
         if not isinstance(bundle, DomainBundle):
             raise TypeError("bundle must be DomainBundle")
@@ -7658,7 +7983,7 @@ class GraphCoordinator:
             return self._commit_domain_bundle_fenced(bundle, lease)
 
     def _commit_domain_bundle_v2(self, bundle: DomainBundle,
-                                 lease: object) -> CommitReceipt:
+                                 lease: object, *, arrival_issuance=None) -> CommitReceipt:
         """Commit under a durable write attempt; reconcile before any duplicate read."""
         from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
 
@@ -7855,7 +8180,9 @@ class GraphCoordinator:
                                          finish_digest, canonical_json(to_wire(permit))),
                 v2_transaction_state=transaction_state,
                 dispatch_clock_reading=dispatch_clock_reading,
-                scene_owner_guard=scene_owner_guard)
+                scene_owner_guard=scene_owner_guard,
+                now_utc=arrival_issuance[2] if arrival_issuance else None,
+                arrival_issuance=arrival_issuance)
         except Exception:
             if transaction_state["phase"] in {"before_transaction", "rolled_back"}:
                 rejection = self._record_rejected_bundle_v2(
@@ -7983,7 +8310,8 @@ class GraphCoordinator:
                                       now_utc: float | None = None,
                                      dispatch_clock_reading=None,
                                      ingress_deadline_check=None,
-                                     scene_owner_guard=None) -> CommitReceipt:
+                                     scene_owner_guard=None,
+                                     arrival_issuance=None) -> CommitReceipt:
         """Join a caller-owned graph transaction when ``in_transaction`` is set.
 
         The caller holds the store lock and owns COMMIT or ROLLBACK.
@@ -8153,6 +8481,46 @@ class GraphCoordinator:
                 if prior[0] != digest:
                     raise EventConflict("operation ID reused with different bundle")
                 return
+            if arrival_issuance is not None:
+                admin_policy, installation_id, arrival_now, source_ref, policy_digest = (
+                    arrival_issuance)
+                if (v2_write is None or len(bundle.proposals) != 1
+                        or bundle.proposals[0].domain != "d03"
+                        or bundle.persistent_job_refs or bundle.outbox_refs
+                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs
+                        or envelope.source_qualification.source_refs
+                        != (source_key(*namespace.as_tuple, source_ref).token,)
+                        or policy_digest != canonical_digest(
+                            admin_policy.digest_payload())):
+                    raise AuthorityDenied("D03 arrival issuance identity differs")
+                pre_quote = replace(envelope, version_guard=replace(
+                    envelope.version_guard, resource_lease_versions=()))
+                quote = self.__d11_issuer.issue_d03_arrival_quote(
+                    db, pre_quote, admin_policy,
+                    installation_id=installation_id, now_utc=arrival_now)
+                refs = envelope.version_guard.resource_lease_versions
+                if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
+                        quote.quote_id, quote.version):
+                    raise AuthorityDenied("D03 arrival quote guard differs")
+                db.execute(
+                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                    "VALUES(?,?,?,?,?)",
+                    namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                          str(quote.version)),
+                )
+                db.execute("""CREATE TABLE IF NOT EXISTS graph_d03_arrival_issuance_v2(
+                    bot TEXT NOT NULL, persona TEXT NOT NULL,
+                    operation_id TEXT NOT NULL, source_ref TEXT NOT NULL,
+                    quote_id TEXT NOT NULL, policy_digest TEXT NOT NULL,
+                    bundle_digest TEXT NOT NULL,
+                    PRIMARY KEY(bot,persona,operation_id))""")
+                db.execute(
+                    "INSERT INTO graph_d03_arrival_issuance_v2"
+                    "(bot,persona,operation_id,source_ref,quote_id,policy_digest,bundle_digest) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (identity.operation_id, source_ref,
+                                          quote.quote_id, policy_digest, digest),
+                )
             snapshot = self._check_guard(
                 db, bundle, ingress_deadline_check=ingress_deadline_check,
                 scene_owner_guard=scene_owner_guard)

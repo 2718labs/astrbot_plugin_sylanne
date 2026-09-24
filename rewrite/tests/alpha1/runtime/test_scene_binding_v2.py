@@ -26,12 +26,14 @@ from test_role_initialization_v2 import _resources
 
 
 def _scene_case(tmp_path, *, owner_capabilities=None,
-                enable_ingress=True, owner_command=True, extra_specs=()):
+                enable_ingress=True, owner_command=True, extra_specs=(),
+                arrival_allowed=False):
     (store, authority_db, port, coordinator, policy, operation,
      pending, grant_value, bootstrap) = _owner_issue_case(
         tmp_path, first_ingress=enable_ingress, return_bootstrap=True,
         role_types=True, scene_types=True,
-        owner_capabilities=owner_capabilities, extra_specs=extra_specs)
+        owner_capabilities=owner_capabilities, extra_specs=extra_specs,
+        arrival_allowed=arrival_allowed)
     port.pending_owner = pending
     proof = coordinator.commit_first_owner_grant_v2(
         bootstrap, namespace=policy.namespace,
