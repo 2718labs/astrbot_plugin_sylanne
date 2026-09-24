@@ -640,6 +640,50 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controlled.envelopes[0].lineage.source_ref.__len__(), 64)
         self.assertEqual(len(plugin.observed_scene_candidates(expected.namespace)), 1)
 
+    async def test_limited_installed_v2_ingress_claims_only_committed_receipts(self) -> None:
+        module = load_plugin_module()
+
+        class ControlledRuntime:
+            v2_ingress_qualified = True
+
+            def __init__(self, receipt):
+                self.receipt = receipt
+                self.envelopes = []
+
+            async def handle_ingress(self, envelope):
+                self.envelopes.append(envelope)
+                return self.receipt
+
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),
+            {"enabled": True},
+        )
+        plugin.context = _IngressContext()
+        plugin.runtime_health = RuntimeHealth("limited", ("scene_binding", "dispatch"))
+        expected = await module.build_astrbot_ingress(Event(), plugin.context)
+        plugin._installed_namespace = expected.namespace
+        for receipt, claimed in (
+            (IngressReceipt("unavailable"), False),
+            (IngressReceipt("rejected"), False),
+            (IngressReceipt("accepted", "operation-1"), True),
+            (IngressReceipt("duplicate", "operation-1"), True),
+            (IngressReceipt("deferred", "operation-1"), True),
+        ):
+            runtime = ControlledRuntime(receipt)
+            plugin._runtime = runtime
+            event = Event()
+            await plugin.ingress(event)
+            self.assertEqual(event.is_stopped(), claimed)
+            self.assertEqual(len(runtime.envelopes), 1)
+            self.assertEqual(plugin.runtime_health.status, "limited")
+        runtime = ControlledRuntime(IngressReceipt("accepted", "operation-2"))
+        plugin._runtime = runtime
+        plugin._installed_namespace = NamespaceId("another-bot", expected.namespace.persona_id)
+        event = Event()
+        await plugin.ingress(event)
+        self.assertFalse(event.is_stopped())
+        self.assertEqual(runtime.envelopes, [])
+
     async def test_limited_runtime_records_only_exact_real_host_scene_identity(self) -> None:
         module = load_plugin_module()
 

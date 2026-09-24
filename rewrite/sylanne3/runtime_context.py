@@ -20,6 +20,7 @@ from .graph_coordinator import (
 from .graph_store import ProductionGraphStore
 from .graph_worker import GraphWorker
 from .host.ingress import HostIngressEnvelope, IngressReceipt
+from .host.authority_profile import AdminIngressClockPolicy, AdminIngressEncodingPolicy
 from .host.v2_ingress_adapter import ingress_host_facts
 from .host.installed_package import verify_installed_package
 from .host.v2_installation import V2InstallationAssembly
@@ -287,7 +288,8 @@ class RuntimeContext:
                 provision = lambda graph, operation_id: graph.provision_namespace_v2(
                     bootstrap, policy, operation_id=operation_id,
                 )
-                if installation.ingress_clock is not None and installation.ingress_encoding is not None:
+                if (type(installation.ingress_clock) is AdminIngressClockPolicy
+                        and type(installation.ingress_encoding) is AdminIngressEncodingPolicy):
                     def ingress(graph, host):
                         return graph.commit_first_ingress_v2(
                             bootstrap, host, policy,
@@ -324,10 +326,10 @@ class RuntimeContext:
                 namespace=policy.namespace, scene_ref=scene_ref,
             )
             self._v2_missing_ingress_policies = tuple(
-                name for name, configured in (
-                    ("ingress_clock", installation.ingress_clock),
-                    ("ingress_encoding", installation.ingress_encoding),
-                ) if configured is None
+                name for name, configured, expected in (
+                    ("ingress_clock", installation.ingress_clock, AdminIngressClockPolicy),
+                    ("ingress_encoding", installation.ingress_encoding, AdminIngressEncodingPolicy),
+                ) if type(configured) is not expected
             )
             self.health = RuntimeHealth(
                 "limited", ("namespace_activation",),
@@ -429,6 +431,26 @@ class RuntimeContext:
                 "limited", tuple(missing), detail,
             )
             return self.health
+
+    @property
+    def v2_ingress_qualified(self) -> bool:
+        """Only the installed v2 ingress path is eligible for a graph attempt."""
+        policy = self._v2_policy
+        grant = self._v2_installation_grant
+        return (
+            self.health.status in {"limited", "ready"}
+            and self._worker is not None
+            and self._v2_namespace_provisioned
+            and type(policy) is AdminInstallationPolicy
+            and type(grant) is InstallationGrantV2
+            and self._v2_namespace == policy.namespace
+            and grant.authority_id == policy.expected_authority_id
+            and grant.installation_id == policy.installation_id
+            and grant.administrator_holder == policy.administrator_holder
+            and grant.manifest_digest == policy.manifest_digest
+            and not self._v2_missing_ingress_policies
+            and callable(self._v2_ingress)
+        )
 
     @property
     def workbench_owner_sessions(self) -> BoundOwnerSessions | None:
@@ -621,8 +643,7 @@ class RuntimeContext:
         if not isinstance(envelope, HostIngressEnvelope):
             raise TypeError("envelope must be HostIngressEnvelope")
         if self._worker is not None:
-            if (self.health.status != "ready" or not self._v2_namespace_provisioned
-                    or self._v2_ingress is None):
+            if not self.v2_ingress_qualified:
                 return IngressReceipt("unavailable")
             try:
                 receipt = await self._worker.call(self._v2_ingress, ingress_host_facts(envelope))

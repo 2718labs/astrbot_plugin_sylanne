@@ -277,11 +277,17 @@ class Sylanne3Plugin(Star):
                     or self.runtime_health.missing_capabilities == ("not_started",)))):
             return
         ready = self.runtime_health.status == "ready"
+        v2_ingress_qualified = (
+            self.runtime_health.status == "limited"
+            and getattr(runtime, "v2_ingress_qualified", False) is True
+        )
         try:
             envelope = await build_astrbot_ingress(event, self.context)
             if envelope.namespace == self._installed_namespace:
                 self._scene_candidates.observe(envelope)
-            if not ready:
+            if not ready and not (
+                v2_ingress_qualified and envelope.namespace == self._installed_namespace
+            ):
                 return
             receipt = await runtime.handle_ingress(envelope)
         except AstrBotIngressError:

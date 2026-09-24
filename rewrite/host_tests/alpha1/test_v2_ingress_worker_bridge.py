@@ -66,7 +66,7 @@ def envelope(namespace, learned_at=11.0):
 
 
 @pytest.mark.asyncio
-async def test_v2_ingress_provisioning_does_not_admit_dialogue_without_role_and_scene(
+async def test_v2_ingress_uses_installed_path_while_global_health_stays_limited(
     tmp_path, monkeypatch,
 ):
     grant = InstallationGrantV2(
@@ -78,6 +78,8 @@ async def test_v2_ingress_provisioning_does_not_admit_dialogue_without_role_and_
         30, {"cpu_ms": 100}, "snapshot", "resource", "interval",
     )
     trace = []
+    admitted = False
+    committed = False
 
     class Store:
         def __init__(self, *_):
@@ -103,6 +105,7 @@ async def test_v2_ingress_provisioning_does_not_admit_dialogue_without_role_and_
             return operation_id
 
         def commit_first_ingress_v2(self, bootstrap, host, policy, clock_policy, encoding_policy):
+            nonlocal committed
             assert bootstrap is self.bootstrap
             assert policy is installed.installation_policy
             assert clock_policy is clock
@@ -110,7 +113,10 @@ async def test_v2_ingress_provisioning_does_not_admit_dialogue_without_role_and_
             assert type(host) is IngressHostFacts
             assert get_ident() == self.worker_thread
             trace.append((host, ingress_host_fingerprint(host)))
-            status = "committed" if len(trace) == 2 else "duplicate"
+            if not admitted:
+                return SimpleNamespace(status="rejected", operation_id=None)
+            status = "duplicate" if committed else "committed"
+            committed = True
             return SimpleNamespace(status=status, operation_id="ingress-op")
 
         def read_active_role_v2(self, *, namespace):
@@ -153,6 +159,8 @@ async def test_v2_ingress_provisioning_does_not_admit_dialogue_without_role_and_
     assert context.health.missing_capabilities == (
         "owner_guard", "active_role", "scene_binding", "dispatch",
     )
+    assert context.v2_ingress_qualified
+    assert await context.handle_ingress(envelope(installed.installation_policy.namespace)) == IngressReceipt("rejected")
     assert (await context.refresh_capabilities()).missing_capabilities == (
         "scene_binding", "dispatch",
     )
@@ -160,13 +168,14 @@ async def test_v2_ingress_provisioning_does_not_admit_dialogue_without_role_and_
         scene_ref="scene:conversation",
     )).missing_capabilities == ("scene_binding", "dispatch")
     assert "record exists" in context.health.detail
+    admitted = True
     first = await context.handle_ingress(envelope(installed.installation_policy.namespace))
-    second = await context.handle_ingress(envelope(installed.installation_policy.namespace, 12.0))
-    assert first == IngressReceipt("unavailable")
-    assert second == IngressReceipt("unavailable")
-    assert trace == [
-        "provision", "trusted-role-read", "trusted-scene-read", "trusted-role-read",
-    ]
+    second = await context.handle_ingress(envelope(installed.installation_policy.namespace))
+    assert first == IngressReceipt("accepted", "ingress-op")
+    assert second == IngressReceipt("duplicate", "ingress-op")
+    ingress_calls = [item for item in trace if isinstance(item, tuple)]
+    assert len(ingress_calls) == 3
+    assert ingress_calls[1] == ingress_calls[2]
     assert context.health.status == "limited"
     await context.stop()
 
@@ -225,11 +234,65 @@ async def test_v2_ingress_missing_policy_stays_limited_and_unavailable(tmp_path,
         "product_ingress", "owner_guard", "active_role", "scene_binding", "dispatch",
     )
     assert "ingress_clock, ingress_encoding" in context.health.detail
+    assert not context.v2_ingress_qualified
     assert (await context.refresh_capabilities()).missing_capabilities == (
         "product_ingress", "owner_guard", "active_role", "scene_binding", "dispatch",
     )
     assert await context.handle_ingress(envelope(installed.installation_policy.namespace)) == IngressReceipt("unavailable")
     await context.stop()
+
+
+def qualified_worker_context(tmp_path, worker):
+    grant = InstallationGrantV2(
+        "authority", "subject", "administrator", "installation",
+        "a" * 64, "publisher-trust", "2", "b" * 64,
+    )
+    installed = assembly(
+        tmp_path, grant, object,
+        clock=AdminIngressClockPolicy("admin:clock", 0.5, 2),
+        encoding=AdminIngressEncodingPolicy(
+            30, {"cpu_ms": 100}, "snapshot", "resource", "interval",
+        ),
+    )
+    context = runtime_context.RuntimeContext(
+        tmp_path / "data", dependencies=None,
+        domains=SimpleNamespace(complete=True, registrations={}, type_registry=object()),
+    )
+    context._worker = worker
+    context._v2_ingress = lambda *_: None
+    context._v2_namespace_provisioned = True
+    context._v2_namespace = installed.installation_policy.namespace
+    context._v2_policy = installed.installation_policy
+    context._v2_installation_grant = grant
+    context.health = runtime_context.RuntimeHealth("limited", ("dispatch",))
+    assert context.v2_ingress_qualified
+    return context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [
+    "_v2_namespace_provisioned", "_v2_ingress", "_v2_policy",
+    "_v2_installation_grant", "_v2_namespace", "_v2_missing_ingress_policies",
+    "health",
+])
+async def test_v2_ingress_requires_each_installed_path_qualification(tmp_path, missing):
+    class Worker:
+        async def call(self, *_):
+            pytest.fail("unqualified ingress reached graph worker")
+
+    context = qualified_worker_context(tmp_path, Worker())
+    invalid = {
+        "_v2_namespace_provisioned": False,
+        "_v2_ingress": None,
+        "_v2_policy": None,
+        "_v2_installation_grant": None,
+        "_v2_namespace": NamespaceId("other", "persona"),
+        "_v2_missing_ingress_policies": ("ingress_clock",),
+        "health": runtime_context.RuntimeHealth("blocked", ("v2_fence_recovery",)),
+    }
+    setattr(context, missing, invalid[missing])
+    assert not context.v2_ingress_qualified
+    assert await context.handle_ingress(envelope(NamespaceId("bot", "persona"))) == IngressReceipt("unavailable")
 
 
 @pytest.mark.asyncio
@@ -248,14 +311,7 @@ async def test_v2_receipt_mapping_preserves_uncertainty(tmp_path, status, expect
             calls.append((function, host))
             return SimpleNamespace(status=status, operation_id="ingress-op")
 
-    context = runtime_context.RuntimeContext(
-        tmp_path / "data", dependencies=None,
-        domains=SimpleNamespace(complete=True, registrations={}, type_registry=object()),
-    )
-    context._worker = Worker()
-    context._v2_ingress = lambda *_: None
-    context._v2_namespace_provisioned = True
-    context.health = runtime_context.RuntimeHealth("ready")
+    context = qualified_worker_context(tmp_path, Worker())
     assert await context.handle_ingress(envelope(NamespaceId("bot", "persona"))) == expected
     assert len(calls) == 1
     assert type(calls[0][1]) is IngressHostFacts
@@ -267,14 +323,7 @@ async def test_v2_worker_error_is_not_reported_as_rejection(tmp_path):
         async def call(self, function, host):
             raise RuntimeError("worker outcome unknown")
 
-    context = runtime_context.RuntimeContext(
-        tmp_path / "data", dependencies=None,
-        domains=SimpleNamespace(complete=True, registrations={}, type_registry=object()),
-    )
-    context._worker = Worker()
-    context._v2_ingress = lambda *_: None
-    context._v2_namespace_provisioned = True
-    context.health = runtime_context.RuntimeHealth("ready")
+    context = qualified_worker_context(tmp_path, Worker())
     with pytest.raises(RuntimeError, match="worker outcome unknown"):
         await context.handle_ingress(envelope(NamespaceId("bot", "persona")))
 
@@ -285,14 +334,7 @@ async def test_v2_unknown_fence_outcome_is_deferred_with_original_operation_id(t
         async def call(self, function, host):
             raise FirstIngressOutcomeUnknown("ingress-op", "finish requires reconciliation")
 
-    context = runtime_context.RuntimeContext(
-        tmp_path / "data", dependencies=None,
-        domains=SimpleNamespace(complete=True, registrations={}, type_registry=object()),
-    )
-    context._worker = Worker()
-    context._v2_ingress = lambda *_: None
-    context._v2_namespace_provisioned = True
-    context.health = runtime_context.RuntimeHealth("ready")
+    context = qualified_worker_context(tmp_path, Worker())
     assert await context.handle_ingress(envelope(NamespaceId("bot", "persona"))) == IngressReceipt(
         "deferred", "ingress-op",
     )

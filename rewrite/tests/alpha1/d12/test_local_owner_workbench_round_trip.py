@@ -14,6 +14,8 @@ from rewrite.tests.alpha1.authority import test_local_owner_round_trip as owner_
 from astrbot.dashboard.api.plugins import _match_registered_web_api
 from astrbot.api.web import bind_request_context
 from sylanne3.domains.d01 import PersonaBlock, PersonaDomain, PersonaPlan, ValueRule
+from sylanne3.domains.d03 import ContextProvider
+from sylanne3.domains.d06 import D06DomainProvider
 from sylanne3.authority_service.v2_owner_contract import OwnerActorBindingV1
 from sylanne3.authority_service.v2_owner_proof import (
     AuthorityV2OwnerProofStore, OwnerCredentialRegistrationV1,
@@ -21,14 +23,19 @@ from sylanne3.authority_service.v2_owner_proof import (
 from sylanne3.authority_service.v2_owner_session import (
     AuthorityV2OwnerSessionStore, OwnerSessionLoginRequestV1,
 )
+from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.graph_types import TypeRegistry, owner_grant_policy_digest_v1
 from sylanne3.graph_worker import GraphWorker
 from sylanne3.host.workbench_mount import WorkbenchHostMount
 from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
 from sylanne3.host.owner_deployment import OwnerDeploymentVerifier
+from sylanne3.host.authority_profile import AdminIngressClockPolicy
+from sylanne3.host.current_scene import CurrentHostScene
 from sylanne3.runtime_context import RuntimeContext
 from sylanne3.runtime.budget import get_budget_lease
 from sylanne3.runtime.role_resources import role_resources_spec
+from sylanne3.runtime.d11_types import graph_type_specs
+from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
 from sylanne3.runtime_contracts import canonical_digest
 from sylanne3.workbench_api.http_transport import (
     SYLANNE_OWNER_SESSION_COOKIE, COMMAND_ROUTE, SESSION_ROUTE,
@@ -36,8 +43,10 @@ from sylanne3.workbench_api.http_transport import (
 )
 from sylanne3.workbench_api.onboarding import TrustedCreateCharacter
 from sylanne3.workbench_api.d01_onboarding import (
-    VerifiedBudgetLease, VerifiedCreationResources, VerifiedModelCapability,
+    CurrentOwnerIdentity, VerifiedBudgetLease, VerifiedCreationResources,
+    VerifiedModelCapability,
 )
+from sylanne3.workbench_api.d03_onboarding import CurrentD03OnboardingResolver
 from sylanne3.workbench_api.service import AuthenticatedSession
 
 
@@ -72,6 +81,10 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         for spec in PersonaDomain().type_specs():
             registry.register(spec)
         registry.register(role_resources_spec())
+        for spec in ContextProvider().type_specs():
+            registry.register(spec)
+        for spec in D06DomainProvider.type_specs() + graph_type_specs():
+            registry.register(spec)
         return registry
 
     monkeypatch.setattr(owner_case, "TypeRegistry", role_registry)
@@ -101,7 +114,9 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         _, tickets = compose()
         ticket, operation, value = owner_case._owner_issue(
             creation, authority_id, principal)
-        value["capabilities"] = ["workbench.create", "workbench.read"]
+        value["capabilities"] = [
+            "workbench.bind_scene", "workbench.create", "workbench.read",
+        ]
         value["purposes"] = ["workbench_user_action", "workbench_view"]
         ticket = replace(ticket, policy_digest=owner_grant_policy_digest_v1(
             value, bot=owner_case.ROLE.bot_id,
@@ -190,13 +205,35 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             return guard, permit
 
         port.get_current_owner_guard_for_fence = current_guard
+        d03 = ContextProvider()
+        d03.compile_scheme({
+            "schema": "d03.context.scheme.v1",
+            "roles": ("scene_participant",), "norms": (),
+        }, None)
+        coordinator.register_provider(
+            bootstrap, "d03", d03, "d03.proposal.v1",
+            d03.descriptor.request_schema_hash)
+        scene_ref = scene_ref_for_conversation(
+            owner_case.ROLE, "platform", "conversation")
+        scene = CurrentHostScene(
+            owner_case.ROLE, "platform", "conversation", "private", scene_ref)
+        scene_port = SimpleNamespace(verify=lambda namespace, ref, visibility: (
+            scene if (namespace, ref, visibility) == (
+                owner_case.ROLE, scene_ref, "private") else None))
+        coordinator._GraphCoordinator__scene_identity_port = scene_port
+        coordinator._GraphCoordinator__scene_clock_policy = AdminIngressClockPolicy(
+            "scene-clock", 1.0, 1.0)
+        port.read_ingress_clock = lambda _: SimpleNamespace(
+            utc_upper_bound_seconds=datetime.now(timezone.utc).timestamp())
         plan = PersonaPlan(
             "plan:first", owner_case.ROLE, 1,
             (PersonaBlock("identity", "semantic_identity", "companion", "read_only"),),
             (ValueRule("truth", "truthful", ("reply",), (), ("fabricate",)),), True)
         owner_session = AuthenticatedSession(
             "owner:paired-account", "paired-session",
-            {"bot/persona": frozenset({"workbench.read", "workbench.create"})},
+            {"bot/persona": frozenset({
+                "workbench.read", "workbench.create", "workbench.bind_scene",
+            })},
             {"bot/persona": frozenset({"owner"})},
             {"bot/persona": frozenset({"workbench_user_action", "workbench_view"})},
             host_username="dashboard-admin", owner_session_token=login_token,
@@ -235,6 +272,26 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
                         permit=permit, request_id="finish:" + permit.operation_id,
                         request_digest="sha256:" + "d" * 64)
 
+        pairing = Pairing()
+
+        class Installed:
+            def resolve_installed_namespace(self, *, scope):
+                return owner_case.ROLE if scope == "bot/persona" else None
+
+        class Owners:
+            def resolve_current_owner_identity(self, *, session, scope, namespace):
+                paired = pairing.resolve_current_owner_session(
+                    username=session.host_username,
+                    owner_session_token=session.owner_session_token)
+                if paired is None or namespace != owner_case.ROLE:
+                    return None
+                return CurrentOwnerIdentity(
+                    session.actor_id, session.session_id, scope, namespace,
+                    paired.principal, paired.guard)
+
+        d03_resolver = CurrentD03OnboardingResolver(
+            namespaces=Installed(), owners=Owners(), scenes=scene_port)
+
         class Onboarding:
             def replay_committed_create_character(
                     self, *, coordinator, session, scope, purpose, audience,
@@ -272,8 +329,11 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
                             "sha256:" + canonical_digest(asdict(budget_lease))),
                     ))
 
-            def resolve_bind_scene(self, **_):
-                return None
+            def replay_committed_bind_scene(self, **kwargs):
+                return d03_resolver.replay_committed_bind_scene(**kwargs)
+
+            def resolve_bind_scene(self, **kwargs):
+                return d03_resolver.resolve_bind_scene(**kwargs)
 
         class OwnerGrants:
             def resolve_current_owner(self, **_):
@@ -287,7 +347,7 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         runtime = RuntimeContext(tmp_path, dependencies=None)
         runtime._worker = worker
         runtime._v2_namespace_provisioned = True
-        mount, context, pairing = WorkbenchHostMount(), _Context(), Pairing()
+        mount, context = WorkbenchHostMount(), _Context()
         mount.register(context)
         command, _ = _match_registered_web_api(
             context.registered_web_apis, COMMAND_ROUTE, "POST")
@@ -326,10 +386,63 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             replayed = await command()
         assert replayed.status_code == 200
         assert json.loads(replayed.body)["receipt"] == receipt
+        scene_operation_id = str(uuid4())
+        scene_body = json.dumps({
+            "schema_version": "d12.contract.v1", "action": "bind_scene",
+            "scope": "bot/persona", "purpose": "workbench_user_action",
+            "audience": "owner", "operation_id": scene_operation_id,
+            "input": {"scene_ref": scene_ref, "visibility": "private",
+                      "acknowledgement": True},
+        }).encode()
+        with bind_request_context(_Request(
+                scene_body, token=token, owner_token=login_token)):
+            bound = await command()
+        assert bound.status_code == 200, bound.body
+        scene_receipt = json.loads(bound.body)["receipt"]
+        assert scene_receipt["phase"] == "scene_bound"
+        assert scene_receipt["scene_ref"] == scene_ref
+        assert dict(resources[0]._db.execute(
+            "SELECT type_name,COUNT(*) FROM graph_atoms WHERE bot=? AND persona=? "
+            "AND type_name IN ('memory.source','memory.access','d03.role_binding') "
+            "GROUP BY type_name", owner_case.ROLE.as_tuple,
+        )) == {"memory.source": 2, "memory.access": 2,
+              "d03.role_binding": 1}
+        assert resources[0]._db.execute(
+            "SELECT COUNT(*) FROM graph_scene_binding_receipts_v1"
+        ).fetchone() == (1,)
+        coordinator._GraphCoordinator__scene_identity_port = None
+        with bind_request_context(_Request(
+                scene_body, token=token, owner_token=login_token)):
+            scene_replay = await command()
+        assert scene_replay.status_code == 200, scene_replay.body
+        assert json.loads(scene_replay.body)["receipt"] == scene_receipt
+        assert resources[0]._db.execute(
+            "SELECT COUNT(*) FROM graph_scene_binding_receipts_v1"
+        ).fetchone() == (1,)
+        scene_digest = resources[0]._db.execute(
+            "SELECT request_digest FROM graph_scene_binding_request_proofs_v1 "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            owner_case.ROLE.as_tuple + (scene_operation_id,),
+        ).fetchone()[0]
         pairing.current = False
-        with bind_request_context(_Request(body, token=token, owner_token=login_token)):
+        with bind_request_context(_Request(
+                scene_body, token=token, owner_token=login_token)):
             denied = await command()
         assert denied.status_code == 401
+        pairing.current = True
+        sessions.logout(
+            transport_credential=owner_case.PEER, token=login_token,
+            request=login_request)
+        with pytest.raises(AuthorityUnavailable, match="Owner session is not current"):
+            coordinator.replay_committed_scene_binding_v2(
+                namespace=owner_case.ROLE, operation_id=scene_operation_id,
+                request_digest=scene_digest, principal=principal,
+                actor_id=owner_session.actor_id,
+                owner_session_token=login_token,
+                owner_session_request=login_request)
+        assert resources[0]._db.execute(
+            "SELECT COUNT(*) FROM graph_scene_binding_receipts_v1"
+        ).fetchone() == (1,)
         mount.close()
     finally:
         if worker is not None:
