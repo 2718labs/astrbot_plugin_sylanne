@@ -8,6 +8,7 @@ from sylanne3.domains.d06 import (
     D06DomainAdapter, D06DomainProvider, EncodingContext, SourceAdmission,
 )
 from sylanne3.domains.d06.pipeline import D06MemoryPipeline
+from sylanne3.domains.d04.encoding_baseline import decode_encoding_baseline
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import (
     AtomKey, GraphCandidate, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec,
@@ -17,6 +18,7 @@ from sylanne3.memory_types import (
     SourceRecord, access_key, register_memory_types, source_key,
     subjective_trace_v2_key,
 )
+from sylanne3.model_broker.broker import CallReceipt
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
     RUNTIME_SCHEMA, VersionGuard, canonical_digest,
@@ -34,6 +36,10 @@ class EncodingWriteTests(unittest.TestCase):
             ("d04.feeling_state.v1", "persona"), ("d07.belief_revision.v1", "persona"),
         ):
             self.registry.register(TypeSpec(name, (owner,), "state", lambda _: None))
+        self.registry.register(TypeSpec(
+            "d04.encoding_baseline.v1", ("event",), "source",
+            decode_encoding_baseline, immutable=True, writer_domain="d04",
+        ))
         self.store = GraphStore(Path(self.tmp.name) / "memory.db", self.registry)
         self.addCleanup(self.store.close)
         self.namespace = NamespaceId("bot", "persona")
@@ -200,6 +206,89 @@ class EncodingWriteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same-namespace"):
             self.adapter.compile_encoding_v2(
                 envelope, with_baseline, encoding_baseline_ref=wrong_namespace.token,
+            )
+
+    def test_first_ingress_result_requires_committed_d04_baseline_and_keeps_feelings_hypothetical(self):
+        self.seed()
+        result = {"text": ('{"event_summary":"A promise was reported",'
+                           '"quoted_details":[{"quote":"promise","salience":0.8}],'
+                           '"possible_meanings":["trust"],"possible_feelings":["relief"]}')}
+        receipt = CallReceipt("completed", "encoding-1", "attempt-1", "call-1",
+                              "digest-1", "provider-1", "model-1", "provider-call-1",
+                              {}, {}, "confirmed", "eligible", False, "start-1", "finish-1")
+        context = EncodingContext(
+            self.event_ref.token, self.perspective.token, (self.feeling.token,),
+            (self.interpretation.token,), (),
+            tuple((key.token, 1) for key in
+                  (self.source, self.event_ref, self.perspective, self.feeling,
+                   self.interpretation, self.baseline)),
+        )
+        with self.assertRaisesRegex(ValueError, "D04 baseline"):
+            self.pipeline.prepare_first_ingress_encoding(
+                "source-1", result, receipt, context,
+                encoding_baseline_ref=self.baseline.token,
+                audience="owner", purpose="context",
+            )
+        baseline_value = {
+            "baseline_id": "baseline-1", "source_refs": [self.source.token],
+            "perspective_ref": self.perspective.token,
+            "then_feeling_versions": [{"ref": self.feeling.token, "revision": 1}],
+            "interpretation_versions": [{"ref": self.interpretation.token, "revision": 1}],
+            "as_known_at": None, "projection_policy_ref": "policy-1",
+            "projection_policy_version": "v1", "basis_version": "scheme-1",
+            "parameter_version": "params-1", "salience_interval": None,
+            "tone_interval": None,
+            "unknown_reasons": ["salience_interval:unknown", "tone_interval:unknown"],
+        }
+        self.store.graph_commit(GraphCandidate(
+            self.event("baseline"), (GraphVersion(self.baseline, 0),),
+            (GraphWrite(self.baseline, baseline_value),),
+        ))
+        model_prepared = self.pipeline.prepare_first_ingress_encoding(
+            "source-1", result, receipt, context,
+            encoding_baseline_ref=self.baseline.token,
+            audience="owner", purpose="context",
+        )
+        self.assertEqual(model_prepared.prepared.proposal.trace.detail_weights,
+                         (("promise", 0.8),))
+        self.assertEqual(model_prepared.prepared.proposal.trace.then_feeling_refs,
+                         (self.feeling.token,))
+        self.assertEqual(model_prepared.possible_feelings, ("relief",))
+        self.assertEqual(model_prepared.status, "candidate_hold")
+        with self.assertRaisesRegex(TypeError, "candidate encoding"):
+            self.adapter.compile_encoding_v2(
+                self.envelope(model_prepared.prepared, baseline=True),
+                model_prepared.prepared, encoding_baseline_ref=self.baseline.token,
+            )
+        with self.assertRaisesRegex(ValueError, "quoted detail"):
+            self.pipeline.prepare_first_ingress_encoding(
+                "source-1", {"text": result["text"].replace("promise\"", "invented\"")},
+                receipt, context, encoding_baseline_ref=self.baseline.token,
+                audience="owner", purpose="context",
+            )
+        self.store.graph_commit(GraphCandidate(
+            self.event("event-update"), (GraphVersion(self.event_ref, 1),),
+            (GraphWrite(self.event_ref, {"committed": "new"}),),
+        ))
+        with self.assertRaisesRegex(RuntimeError, "changed during encoding"):
+            self.pipeline.prepare_first_ingress_encoding(
+                "source-1", result, receipt, context,
+                encoding_baseline_ref=self.baseline.token,
+                audience="owner", purpose="context",
+            )
+
+    def test_first_ingress_result_rejects_unqualified_receipt_and_changed_source_quote(self):
+        self.seed()
+        receipt = CallReceipt("unknown", "encoding-1", "attempt-1", "call-1",
+                              "digest-1", "provider-1", "model-1", None,
+                              {}, {}, "unconfirmed", "unknown", False)
+        context = EncodingContext(self.event_ref.token, self.perspective.token,
+                                  (), (), (), ((self.source.token, 1),))
+        with self.assertRaisesRegex(ValueError, "completed model receipt claim"):
+            self.pipeline.prepare_first_ingress_encoding(
+                "source-1", {"text": "{}"}, receipt, context,
+                encoding_baseline_ref=self.baseline.token,
+                audience="owner", purpose="context",
             )
 
 

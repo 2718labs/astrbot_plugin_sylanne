@@ -8,8 +8,9 @@ place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
+from typing import Mapping
 
 from ...graph_types import GraphVersion, NamespaceEpoch
 from ...memory_repository import MemoryRepository
@@ -18,6 +19,10 @@ from ...memory_retrieval import MemoryHit
 from ...memory_recollection_view import prepare_affective_recollection_view
 from ...memory_reconstruction import DetailCue, RecollectionReconstruction, reconstruct_recollection_candidate
 from ...memory_types import source_key
+from ...model_broker.broker import CallReceipt
+from ...model_broker.first_ingress_encoding import parse_first_ingress_encoding_result
+from ..d04.encoding_baseline import EncodingBaseline
+from ...runtime_contracts import canonical_digest
 from ...memory_types import access_key
 from ...memory_types import episode_key, subjective_trace_key, subjective_trace_v2_key
 from ...memory_types import validate_episode, validate_subjective_trace, validate_subjective_trace_v2
@@ -89,6 +94,19 @@ class PreparedEncoding:
     proof_versions: tuple[GraphVersion, ...]
     epoch: NamespaceEpoch
     status: str = "candidate"
+
+
+@dataclass(frozen=True)
+class PreparedFirstIngressEncoding:
+    """Untrusted result plus a receipt claim; C02 admission remains on HOLD."""
+
+    prepared: PreparedEncoding
+    encoding_baseline_ref: str
+    receipt_claim: CallReceipt
+    result_digest: str
+    possible_meanings: tuple[str, ...]
+    possible_feelings: tuple[str, ...]
+    status: str = "candidate_hold"
 
 
 @dataclass(frozen=True)
@@ -389,6 +407,99 @@ class D06MemoryPipeline:
             raise ValueError("encoding context must bind the committed source revision")
         proposal = self.adapter.prepare_encoding(source.source_id, context)
         return PreparedEncoding(source.source_id, proposal, proof.versions, epoch)
+
+    def prepare_first_ingress_encoding(
+        self,
+        source_ref: str,
+        result: Mapping[str, object],
+        receipt: CallReceipt,
+        context: EncodingContext,
+        *,
+        encoding_baseline_ref: str,
+        audience: str,
+        purpose: str,
+    ) -> PreparedFirstIngressEncoding:
+        """Ground model suggestions without asserting their Authority provenance.
+
+        A CallReceipt is constructible and does not bind result bytes. The
+        returned PreparedEncoding is held until D11 supplies a trusted result
+        observation that binds the result digest to the same operation/call.
+        Model meanings and feelings never become D04 experience evidence.
+        """
+        if (not isinstance(receipt, CallReceipt) or receipt.status != "completed"
+                or receipt.result_qualification != "eligible"
+                or not receipt.egress_start_ref or not receipt.egress_finish_ref):
+            raise ValueError("completed model receipt claim is required")
+        if not isinstance(context, EncodingContext):
+            raise TypeError("context must be EncodingContext")
+        source, proof = self.repository.read_source_evidence(
+            source_ref, audience=audience, purpose=purpose,
+        )
+        if source is None:
+            raise PermissionError("source is unavailable for encoding")
+        candidate = parse_first_ingress_encoding_result(result, source)
+        try:
+            baseline_key = AtomKey.from_token(encoding_baseline_ref)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("committed D04 baseline reference is required") from exc
+        if (baseline_key.type_name != "d04.encoding_baseline.v1"
+                or NamespaceId.from_key(baseline_key) != self.adapter.namespace):
+            raise ValueError("committed D04 baseline must use this namespace")
+        spec = self.repository.store._registry.spec(baseline_key.type_name)
+        if spec.writer_domain != "d04" or not spec.immutable:
+            raise ValueError("registered immutable D04 baseline is required")
+        baseline_atom = self.repository.store.graph_snapshot((baseline_key,)).get(baseline_key)
+        if baseline_atom is None or not baseline_atom.valid or baseline_atom.revision < 1:
+            raise ValueError("committed D04 baseline is unavailable")
+        baseline = spec.validator(baseline_atom.value)
+        if not isinstance(baseline, EncodingBaseline):
+            raise ValueError("committed D04 baseline is invalid")
+        source_key_ref = source_key(*self.adapter.namespace.as_tuple, source_ref)
+        if (source_key_ref.token not in baseline.source_refs
+                or baseline.perspective_ref != context.perspective_ref
+                or tuple(item.ref for item in baseline.then_feeling_versions) != context.then_feeling_refs
+                or tuple(item.ref for item in baseline.interpretation_versions) != context.interpretation_refs):
+            raise ValueError("D04 baseline differs from encoding context")
+        read_versions = dict(context.read_versions)
+        if (len(read_versions) != len(context.read_versions)
+                or read_versions.get(baseline_key.token) != baseline_atom.revision
+                or any(read_versions.get(item.ref) != item.revision for item in (
+                    *baseline.then_feeling_versions, *baseline.interpretation_versions,
+                ))):
+            raise ValueError("D04 baseline and context lack matching committed read versions")
+        context_versions = {}
+        for ref, revision in context.read_versions:
+            key = AtomKey.from_token(ref)
+            if NamespaceId.from_key(key) != self.adapter.namespace:
+                raise ValueError("encoding context crosses namespace")
+            context_versions[key] = revision
+        keys = tuple(dict.fromkeys((*map(AtomKey.from_token, (
+            *baseline.source_refs, baseline.perspective_ref,
+            *(item.ref for item in baseline.then_feeling_versions),
+            *(item.ref for item in baseline.interpretation_versions),
+            baseline_key.token,
+        )), *(version.key for version in proof.versions),
+            *context_versions)))
+        snapshot = self.repository.store.graph_snapshot(keys)
+        baseline.verify_committed_refs(snapshot)
+        if (snapshot.epochs != proof.epochs or snapshot.get(baseline_key) != baseline_atom
+                or any(snapshot.get(key) is None or not snapshot.get(key).valid
+                       or snapshot.get(key).revision != revision
+                       for key, revision in context_versions.items())
+                or any(snapshot.get(version.key) is None
+                       or snapshot.get(version.key).revision != version.revision
+                       or not snapshot.get(version.key).valid for version in proof.versions)):
+            raise RuntimeError("source, access, or D04 baseline changed during encoding")
+        grounded = replace(context, detail_weights=candidate.quoted_details)
+        prepared = self.prepare_encoding(
+            source_ref, grounded, audience=audience, purpose=purpose,
+            expected_epoch=proof.epochs[0],
+        )
+        prepared = replace(prepared, status="candidate_hold")
+        return PreparedFirstIngressEncoding(
+            prepared, baseline_key.token, receipt, canonical_digest(dict(result)),
+            candidate.possible_meanings, candidate.possible_feelings,
+        )
 
     def retrieve_candidates(
         self,
