@@ -83,10 +83,18 @@ class AuthorityV2AccountingMaintenanceService:
         self._fences.core._require(
             credential, "accounting", self._fences.namespace, self._holder)
 
+    def _require_closed_deletion_history(self) -> None:
+        """Consult the frozen independent journal, not only Core's phase row."""
+        phases = self._fences.deletion.latest_phases()
+        if any(namespace == self._fences.namespace and phase != "closed"
+               for (namespace, _operation), phase in phases.items()):
+            raise AuthorityUnavailable("deletion pending or accepted blocks accounting")
+
     def begin(self, *, credential: object,
               request: AccountingMaintenanceRequestV1) -> AccountingMaintenanceGrantV1:
         self._require(credential, request)
         with self._fences._frozen() as (db, deletion_head, execution_head, _history):
+            self._require_closed_deletion_history()
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=request.expected_anchor.activation_generation)
@@ -110,6 +118,7 @@ class AuthorityV2AccountingMaintenanceService:
         if type(grant) is not AccountingMaintenanceGrantV1:
             raise AuthorityUnavailable("typed accounting grant required")
         with self._fences._frozen() as (db, deletion_head, execution_head, _history):
+            self._require_closed_deletion_history()
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=request.expected_anchor.activation_generation)
@@ -142,6 +151,7 @@ class AuthorityV2AccountingMaintenanceService:
                grant: AccountingMaintenanceGrantV1) -> None:
         self.validate(credential=credential, request=request, grant=grant)
         with self._fences._frozen() as (db, deletion_head, execution_head, _history):
+            self._require_closed_deletion_history()
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=request.expected_anchor.activation_generation)
@@ -177,6 +187,7 @@ class AuthorityV2AccountingMaintenanceService:
         # Rebuild the grant solely from the original Authority terminal; this
         # does not read a result body or accept a caller-supplied digest.
         with self._fences._frozen() as (db, deletion_head, execution_head, _history):
+            self._require_closed_deletion_history()
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=request.expected_anchor.activation_generation)

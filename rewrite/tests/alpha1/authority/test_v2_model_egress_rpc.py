@@ -415,7 +415,7 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
             deletion.append_intent(
                 namespace="ns-a", operation_id="delete-accounting",
                 closure_roots=("source-a",), epoch=1, policy_ref="policy-a")
-            with pytest.raises(AuthorityUnavailable, match="behind or differs"):
+            with pytest.raises(AuthorityUnavailable, match="deletion pending"):
                 accounting.begin(
                     credential=_PEER_A,
                     request=replace(accounting_request,
