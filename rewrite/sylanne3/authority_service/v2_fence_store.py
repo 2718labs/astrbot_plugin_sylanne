@@ -774,8 +774,9 @@ class AuthorityV2FenceStore:
         # The strict read rechecks canonical body, digest, and original identity.
         recovery = AuthorityV2ModelEgressStore._read(db, intent.call_id)
         if (recovery is None or recovery.intent != intent or recovery.state != "observed"
-                or recovery.observation is None):
+                or recovery.content_erased):
             raise AuthorityUnavailable("complete original provider observation is absent")
+        AuthorityV2ModelEgressStore._read_observation_locked(db, intent)
         finish_digest = "sha256:" + recovery.observation_digest
         if row[6] == "finished":
             if (row[8], row[9]) == (intent.call_id, finish_digest):
