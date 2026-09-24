@@ -3,7 +3,6 @@
 import json
 import sqlite3
 import time
-from datetime import datetime
 from types import SimpleNamespace
 from dataclasses import replace
 
@@ -15,7 +14,6 @@ from sylanne3.graph_coordinator import (
 )
 from sylanne3.graph_store import ProductionGraphStore
 from sylanne3.memory_types import access_key, source_key, validate_access
-from sylanne3.graph_types import GraphVersion
 from sylanne3.model_broker.broker import ModelCallRequest
 from sylanne3.model_broker.first_ingress_encoding import build_first_ingress_encoding_payload
 from sylanne3.runtime.encoding_call_binding import (
@@ -28,7 +26,7 @@ from sylanne3.runtime.d11_types import (
 from sylanne3.runtime.issuers import build_runtime_issuers
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
-    SourceQualification, VersionGuard, canonical_digest,
+    canonical_digest,
 )
 from sylanne3.runtime import first_ingress_v2
 
@@ -58,9 +56,14 @@ def _worker(coordinator, bootstrap, namespace, operation_id=None):
         namespace=namespace, domains=("d11",), activation_generation=1,
         operation_id=operation_id,
     )
+    (source_json,) = coordinator._GraphCoordinator__store._db.execute(
+        "SELECT value FROM graph_atoms WHERE bot=? AND persona=? "
+        "AND type_name='memory.source' ORDER BY token LIMIT 1",
+        namespace.as_tuple,
+    ).fetchone()
     authority = AuthorityContext(
         "encoding-worker", "d11", capability, namespace, ("activity",),
-        "encode", ("internal",), "policy-1", 1,
+        "consolidation", tuple(json.loads(source_json)["audiences"]), "policy-1", 1,
     )
     return authority, lease
 
@@ -69,7 +72,16 @@ class FixedEncodingRequestIssuer:
     def __init__(self):
         self.config_digest = "c" * 64
 
-    def __call__(self, job, source, source_revision, access_revision):
+    def __call__(self, context):
+        job = context.job
+        source = context.source
+        source_revision = context.source_revision
+        access_revision = context.access_revision
+        assert context.authority.worker_fence == job.fence
+        assert context.authority.issuer_domain == "d11"
+        assert context.source_qualification.source_family == "reported"
+        assert context.version_guard.access_epoch >= 0
+        assert context.now_utc < context.deadline_utc
         namespace = NamespaceId(job.bot_id, job.persona_id)
         source_ref = source_key(*namespace.as_tuple, source.source_id).token
         payload, template_digest = build_first_ingress_encoding_payload(source)
@@ -78,23 +90,11 @@ class FixedEncodingRequestIssuer:
             OperationIdentity(
                 job.activity_id, None, "encoding-attempt", "encode",
                 "encoding-model-operation", canonical_digest({"input_refs": [source_ref]})),
-            AuthorityContext(
-                job.lease_holder, "d06", "encoding-capability", namespace,
-                ("activity",), "consolidation", source.audiences,
-                "policy-1", 1,
-                worker_fence=job.fence),
-            VersionGuard((
-                GraphVersion(source_key(*namespace.as_tuple, source.source_id),
-                             source_revision),
-                GraphVersion(access_key(*namespace.as_tuple, source.source_id),
-                             access_revision),
-            ), (), 0, 0, "catalogue", "scheme", "operator", "policy", (), (), ()),
-            SourceQualification((source_ref,), "reported", source.occurred_at,
-                                source.recorded_at, "external_report", "qualified",
-                                None, "not_applicable"),
+            context.authority,
+            context.version_guard,
+            context.source_qualification,
             (source_ref,), job.budget_ref,
-            datetime.fromisoformat(
-                job.deadline_utc.replace("Z", "+00:00")).timestamp(),
+            context.deadline_utc,
             1.0, "interval", (),
         )
         return EncodingRequestIssueV1(
@@ -184,6 +184,116 @@ def test_encoding_request_binds_in_the_job_acquire_transaction(ingress_system):
     assert coordinator.acquire_first_ingress_encoding_job_v2(
         authority, lease, job_id, operation_id, lease_seconds=30) == acquired
     assert load_binding(store._db, policy.namespace, job_id) == binding
+
+
+def test_original_d06_qualification_is_durable_and_legacy_gap_holds(ingress_system):
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (saved,) = store._db.execute(
+        "SELECT source_qualification_json FROM runtime_ingress_issuance"
+    ).fetchone()
+    original = json.loads(saved)
+    assert original["source_family"] == "reported"
+    assert original["source_refs"] == [source_key(
+        *policy.namespace.as_tuple, host.lineage.source_ref).token]
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    # Emulate a pre-migration row that never stored the original D06 decision.
+    store._db.execute("DROP TRIGGER runtime_ingress_issuance_no_update_v2")
+    store._db.execute(
+        "UPDATE runtime_ingress_issuance SET source_qualification_json=NULL")
+    with pytest.raises(UnavailableGuard, match="original D06 source qualification absent"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_job_acquire_intents_v2").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("tamper", ["authority", "version", "qualification"])
+def test_issuer_cannot_expand_trusted_encoding_context(ingress_system, tamper):
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+
+    class TamperedIssuer(FixedEncodingRequestIssuer):
+        def __call__(self, context):
+            issued = super().__call__(context)
+            envelope = issued.request.envelope
+            if tamper == "authority":
+                envelope = replace(envelope, authority=replace(
+                    envelope.authority, issuer_domain="d06"))
+            elif tamper == "version":
+                envelope = replace(envelope, version_guard=replace(
+                    envelope.version_guard,
+                    access_epoch=envelope.version_guard.access_epoch + 1))
+            else:
+                envelope = replace(envelope, source_qualification=replace(
+                    envelope.source_qualification,
+                    learned_at=envelope.source_qualification.learned_at + 1))
+            return replace(issued, request=replace(issued.request, envelope=envelope))
+
+    coordinator._GraphCoordinator__encoding_request_issuer = TamperedIssuer()
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    with pytest.raises(UnavailableGuard, match="trusted issuance context"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_job_acquire_intents_v2").fetchone()[0] == 0
+
+
+def test_bound_request_replay_rechecks_current_policy_version(ingress_system):
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+    coordinator._GraphCoordinator__encoding_request_issuer = FixedEncodingRequestIssuer()
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    coordinator.acquire_first_ingress_encoding_job_v2(
+        authority, lease, job_id, operation_id, lease_seconds=30)
+    store._db.execute(
+        "UPDATE graph_guard_versions SET version='policy-2' "
+        "WHERE bot=? AND persona=? AND kind='policy' AND ref='current'",
+        policy.namespace.as_tuple)
+    with pytest.raises(UnavailableGuard, match="trusted issuance context"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+
+
+def test_policy_change_after_acquire_intent_blocks_commit(ingress_system):
+    store, coordinator, bootstrap, port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+    coordinator._GraphCoordinator__encoding_request_issuer = FixedEncodingRequestIssuer()
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    begin = port.begin_fence
+
+    def change_policy_after_begin(**kwargs):
+        permit = begin(**kwargs)
+        store._db.execute(
+            "UPDATE graph_guard_versions SET version='policy-2' "
+            "WHERE bot=? AND persona=? AND kind='policy' AND ref='current'",
+            policy.namespace.as_tuple)
+        return permit
+
+    port.begin_fence = change_policy_after_begin
+    with pytest.raises(UnavailableGuard, match="trusted issuance context"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+    assert store._db.execute(
+        "SELECT phase FROM runtime_jobs WHERE job_id=?", (job_id,)
+    ).fetchone()[0] == "queued"
+    assert load_binding(store._db, policy.namespace, job_id) is None
 
 
 def test_lost_begin_cannot_replace_frozen_encoding_config(ingress_system):
