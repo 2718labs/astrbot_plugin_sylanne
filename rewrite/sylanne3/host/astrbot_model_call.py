@@ -1,8 +1,9 @@
-"""One AstrBot chat call behind ModelBroker's egress and receipt boundary.
+"""Local one-attempt AstrBot call mechanics for a future Authority executor.
 
 The UMO is supplied by trusted host composition. This adapter rechecks its
-current chat-provider selection before each call; it does not grant egress or
-infer a conversation from model payload. A lost outcome remains unknown.
+current chat-provider selection before each call. The existing Broker invoke
+port has no admission proof and therefore never sends. A lost outcome remains
+unknown; this process-local registry is not durable Authority observation.
 """
 
 from __future__ import annotations
@@ -10,7 +11,9 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+import re
 from threading import Lock
+from uuid import uuid4
 
 from astrbot.api.star import Context
 from astrbot.core.provider.entities import ProviderMeta, ProviderType
@@ -32,6 +35,9 @@ from ..installation_policy import AdminInstallationPolicy
 @dataclass
 class _CallEntry:
     digest: str
+    admission_id: str
+    host_incarnation: str
+    provider_config_digest: str
     binding: tuple[object, ...]
     terminal: Future[ProviderResponse] = field(default_factory=Future)
     task: asyncio.Task[ProviderResponse] | None = None
@@ -41,6 +47,30 @@ class _CallEntry:
 # a stopped host loop provides no evidence that its provider call did not run.
 _call_lock = Lock()
 _calls: dict[str, _CallEntry] = {}
+_admissions: dict[str, str] = {}
+_HOST_INCARNATION = uuid4().hex
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class LocalModelAdmission:
+    """Executor-supplied local start identity; not an Authority credential."""
+
+    admission_id: str
+    host_incarnation: str
+    call_id: str
+    request_digest: str
+    provider_config_digest: str
+
+    def __post_init__(self) -> None:
+        if (not all(type(value) is str and value for value in (
+                self.admission_id, self.host_incarnation, self.call_id,
+                self.request_digest, self.provider_config_digest))
+                or len(self.admission_id) > 256
+                or len(self.host_incarnation) > 128
+                or _SHA256.fullmatch(self.request_digest) is None
+                or _SHA256.fullmatch(self.provider_config_digest) is None):
+            raise ValueError("invalid local model admission identity")
 
 
 class AstrBotModelProvider:
@@ -78,6 +108,10 @@ class AstrBotModelProvider:
         self._binding = (context, host_loop, trusted_umo,
                          descriptor.provider_id, descriptor.model_id,
                          admin_model.provider_config_ref)
+
+    @property
+    def host_incarnation(self) -> str:
+        return _HOST_INCARNATION
 
     def _same_binding(self, entry: _CallEntry) -> bool:
         return (entry.binding[0] is self._context
@@ -228,8 +262,8 @@ class AstrBotModelProvider:
         except Exception:
             return ProviderResponse("unknown", None, {}, {}, None)
 
-    def terminal_response(self, call_id: str,
-                          request_digest: str) -> ProviderResponse | None:
+    def terminal_response(self, call_id: str, request_digest: str,
+                          admission_id: str) -> ProviderResponse | None:
         """Read an exact call's terminal response; None means absent or unresolved.
 
         The host executor must retain this bound adapter. This process-local
@@ -239,7 +273,10 @@ class AstrBotModelProvider:
             entry = _calls.get(call_id)
             if entry is None:
                 return None
-            if entry.digest != request_digest or not self._same_binding(entry):
+            if (entry.digest != request_digest or entry.admission_id != admission_id
+                    or entry.host_incarnation != self.host_incarnation
+                    or entry.provider_config_digest != self._admin_model.provider_config_digest
+                    or not self._same_binding(entry)):
                 raise ValueError("call_id belongs to a different request or binding")
             if not entry.terminal.done():
                 return None
@@ -272,17 +309,44 @@ class AstrBotModelProvider:
 
     async def invoke(self, request: ModelCallRequest,
                      cancellation: asyncio.Event) -> ProviderResponse:
+        """The old Broker port has no Authority admission or recovery identity."""
+        return ProviderResponse("unknown", None, {}, {}, None)
+
+    async def invoke_admitted(self, request: ModelCallRequest,
+                              admission: LocalModelAdmission,
+                              cancellation: asyncio.Event) -> ProviderResponse:
+        """Exercise one local start claim; a future executor must prove its provenance.
+
+        A process restart loses this registry. No durable replay or remote-stop
+        guarantee follows from this method or from a finished asyncio task.
+        """
         if type(request) is not ModelCallRequest:
             return ProviderResponse("not_dispatched", None, {}, {}, None)
+        if (type(admission) is not LocalModelAdmission
+                or admission.host_incarnation != self.host_incarnation
+                or admission.call_id != request.call_id
+                or admission.request_digest != request.digest
+                or admission.provider_config_digest != self._admin_model.provider_config_digest):
+            raise ValueError("model admission differs from local request or configuration")
         with _call_lock:
             entry = _calls.get(request.call_id)
             if entry is not None:
-                if entry.digest != request.digest or not self._same_binding(entry):
+                if (entry.digest != request.digest
+                        or entry.admission_id != admission.admission_id
+                        or entry.host_incarnation != admission.host_incarnation
+                        or entry.provider_config_digest != admission.provider_config_digest
+                        or not self._same_binding(entry)):
                     raise ValueError("call_id belongs to a different request or binding")
                 first = False
             else:
-                entry = _CallEntry(request.digest, self._binding)
+                old_call = _admissions.get(admission.admission_id)
+                if old_call is not None and old_call != request.call_id:
+                    raise ValueError("model admission already belongs to another call")
+                entry = _CallEntry(
+                    request.digest, admission.admission_id, admission.host_incarnation,
+                    admission.provider_config_digest, self._binding)
                 _calls[request.call_id] = entry
+                _admissions[admission.admission_id] = request.call_id
                 first = True
         if first:
             if (request.provider_id != self._descriptor.provider_id
@@ -309,4 +373,4 @@ class AstrBotModelProvider:
         return False
 
 
-__all__ = ("AstrBotModelProvider",)
+__all__ = ("AstrBotModelProvider", "LocalModelAdmission")

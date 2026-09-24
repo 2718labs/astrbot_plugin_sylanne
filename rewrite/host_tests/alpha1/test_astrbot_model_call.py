@@ -16,7 +16,7 @@ import httpx
 from openai import AsyncOpenAI
 
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
-from sylanne3.host.astrbot_model_call import AstrBotModelProvider
+from sylanne3.host.astrbot_model_call import AstrBotModelProvider, LocalModelAdmission
 from sylanne3.host.authority_profile import (
     AdminIngressEncodingPolicy, AdminIngressModelPolicy,
     AdminInstallationBundle, installed_model_config_ref,
@@ -165,7 +165,66 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
     async def invoke_on_worker(self, request=None):
         request = request or call_request()
         return await asyncio.to_thread(
-            lambda: asyncio.run(self.adapter.invoke(request, asyncio.Event())))
+            lambda: asyncio.run(self.adapter.invoke_admitted(
+                request, self.admission_for(request), asyncio.Event())))
+
+    def admission_for(self, request):
+        return LocalModelAdmission(
+            "admit:" + request.call_id, self.adapter.host_incarnation,
+            request.call_id, request.digest, self.admin_model.provider_config_digest)
+
+    async def test_unadmitted_broker_invoke_never_sends(self):
+        response = await self.adapter.invoke(call_request(), asyncio.Event())
+        self.assertEqual(response.status, "unknown")
+        self.assertEqual(self.requests, [])
+
+    async def test_local_admission_identity_and_replay_are_one_start(self):
+        request = call_request()
+        admission = self.admission_for(request)
+        for changed in (
+            replace(admission, host_incarnation="other-process"),
+            replace(admission, request_digest="e" * 64),
+            replace(admission, provider_config_digest="e" * 64),
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaises(ValueError):
+                    await self.adapter.invoke_admitted(
+                        request, changed, asyncio.Event())
+        self.assertEqual(self.requests, [])
+        first = await self.adapter.invoke_admitted(
+            request, admission, asyncio.Event())
+        self.assertEqual(first.status, "completed")
+        self.assertEqual((await self.adapter.invoke_admitted(
+            request, admission, asyncio.Event())).status, "completed")
+        with self.assertRaises(ValueError):
+            await self.adapter.invoke_admitted(
+                request, replace(admission, admission_id="different"), asyncio.Event())
+        other = replace(request, call_id=uuid4().hex)
+        with self.assertRaises(ValueError):
+            await self.adapter.invoke_admitted(
+                other, replace(self.admission_for(other),
+                               admission_id=admission.admission_id), asyncio.Event())
+        with self.assertRaises(ValueError):
+            self.adapter.terminal_response(request.call_id, request.digest, "different")
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_cancel_after_http_start_cannot_prove_unsent(self):
+        from sylanne3.host.astrbot_model_call import _calls, _call_lock
+        request = call_request()
+        admission = self.admission_for(request)
+        self.response_gate = asyncio.Event()
+        waiter = asyncio.create_task(self.adapter.invoke_admitted(
+            request, admission, asyncio.Event()))
+        await asyncio.wait_for(self.request_started.wait(), 1)
+        with _call_lock:
+            task = _calls[request.call_id].task
+        self.assertIsNotNone(task)
+        task.cancel()
+        response = await asyncio.wait_for(waiter, 1)
+        self.assertEqual(response.status, "unknown")
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.adapter.terminal_response(
+            request.call_id, request.digest, admission.admission_id), response)
 
     async def test_one_http_request_on_host_loop_with_usage(self):
         response = await self.invoke_on_worker()
@@ -252,7 +311,8 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         self.manager.on_selection = cancel_on_second_selection
         response = await asyncio.wait_for(self.invoke_on_worker(request), 1)
         self.assertEqual(response.status, "not_dispatched")
-        self.assertEqual(self.adapter.terminal_response(request.call_id, request.digest),
+        self.assertEqual(self.adapter.terminal_response(
+            request.call_id, request.digest, self.admission_for(request).admission_id),
                          response)
         self.assertEqual(self.requests, [])
 
@@ -286,7 +346,8 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
                                 privacy_tier="public")
         for request in (wrong_purpose, wrong_audience, wrong_privacy):
             with self.subTest(call_id=request.call_id):
-                response = await adapter.invoke(request, asyncio.Event())
+                response = await adapter.invoke_admitted(
+                    request, self.admission_for(request), asyncio.Event())
                 self.assertEqual(response.status, "not_dispatched")
         self.assertEqual(self.requests, [])
 
@@ -307,8 +368,9 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
                     context=self.context, host_loop=asyncio.get_running_loop(),
                     trusted_umo=UMO, descriptor=self.descriptor,
                     admin_model=model, installation_bundle=bundle)
-                result = await adapter.invoke(
-                    replace(request, call_id=uuid4().hex), asyncio.Event())
+                candidate = replace(request, call_id=uuid4().hex)
+                result = await adapter.invoke_admitted(
+                    candidate, self.admission_for(candidate), asyncio.Event())
                 self.assertEqual(result.status, "not_dispatched")
         self.assertEqual(self.requests, [])
 
@@ -323,19 +385,22 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_waiter_can_rejoin_same_call_and_read_terminal(self):
         request = call_request()
         self.response_gate = asyncio.Event()
-        first = asyncio.create_task(self.adapter.invoke(request, asyncio.Event()))
+        first = asyncio.create_task(self.adapter.invoke_admitted(
+            request, self.admission_for(request), asyncio.Event()))
         await asyncio.wait_for(self.request_started.wait(), 1)
         first.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await first
-        self.assertIsNone(self.adapter.terminal_response(request.call_id, request.digest))
+        self.assertIsNone(self.adapter.terminal_response(
+            request.call_id, request.digest, self.admission_for(request).admission_id))
         second = asyncio.create_task(self.invoke_on_worker(request))
         await asyncio.sleep(0)
         self.assertEqual(len(self.requests), 1)
         self.response_gate.set()
         response = await asyncio.wait_for(second, 1)
         self.assertEqual(response.status, "completed")
-        self.assertEqual(self.adapter.terminal_response(request.call_id, request.digest),
+        self.assertEqual(self.adapter.terminal_response(
+            request.call_id, request.digest, self.admission_for(request).admission_id),
                          response)
         self.assertEqual(len(self.requests), 1)
 
@@ -344,20 +409,25 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         response = await self.invoke_on_worker(request)
         different = replace(request, payload={"prompt": "different"})
         with self.assertRaises(ValueError):
-            await self.adapter.invoke(different, asyncio.Event())
-        self.assertEqual(self.adapter.terminal_response(request.call_id, request.digest),
+            await self.adapter.invoke_admitted(
+                different, self.admission_for(different), asyncio.Event())
+        self.assertEqual(self.adapter.terminal_response(
+            request.call_id, request.digest, self.admission_for(request).admission_id),
                          response)
         self.assertEqual(len(self.requests), 1)
 
     async def test_preflight_rejection_is_terminal_and_never_retried(self):
         request = call_request()
         self.provider.provider_config["temperature"] = 0.25
-        response = await self.adapter.invoke(request, asyncio.Event())
+        response = await self.adapter.invoke_admitted(
+            request, self.admission_for(request), asyncio.Event())
         self.assertEqual(response.status, "not_dispatched")
-        self.assertEqual(self.adapter.terminal_response(request.call_id, request.digest),
+        self.assertEqual(self.adapter.terminal_response(
+            request.call_id, request.digest, self.admission_for(request).admission_id),
                          response)
         self.provider.provider_config.pop("temperature")
-        self.assertEqual((await self.adapter.invoke(request, asyncio.Event())).status,
+        self.assertEqual((await self.adapter.invoke_admitted(
+            request, self.admission_for(request), asyncio.Event())).status,
                          "not_dispatched")
         self.assertEqual(self.requests, [])
 
@@ -382,7 +452,8 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
                 installation_bundle=self.bundle,
             )
             request = call_request()
-            waiter = asyncio.create_task(adapter.invoke(request, asyncio.Event()))
+            waiter = asyncio.create_task(adapter.invoke_admitted(
+                request, self.admission_for(request), asyncio.Event()))
             await asyncio.sleep(0)
             self.assertFalse(waiter.done())
             waiter.cancel()
@@ -391,7 +462,8 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await asyncio.to_thread(thread.join, 1)
             self.assertFalse(thread.is_alive())
-            self.assertIsNone(adapter.terminal_response(request.call_id, request.digest))
+            self.assertIsNone(adapter.terminal_response(
+                request.call_id, request.digest, self.admission_for(request).admission_id))
             self.assertEqual(self.requests, [])
             restarted_loop = asyncio.new_event_loop()
             try:
@@ -401,7 +473,8 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
                     installation_bundle=self.bundle,
                 )
                 with self.assertRaises(ValueError):
-                    await restarted.invoke(request, asyncio.Event())
+                    await restarted.invoke_admitted(
+                        request, self.admission_for(request), asyncio.Event())
             finally:
                 restarted_loop.close()
         finally:
