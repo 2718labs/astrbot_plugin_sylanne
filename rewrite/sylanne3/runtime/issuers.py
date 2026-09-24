@@ -181,6 +181,7 @@ class BudgetLeaseGrant:
 
 
 D03_ARRIVAL_WORK_KIND = "d03.message_received"
+D04_BASELINE_WORK_KIND = "d04.encoding_baseline"
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,37 @@ class D03ArrivalQuotePolicy:
         object.__setattr__(self, "quote_ceiling", _amounts(self.quote_ceiling))
 
 
+@dataclass(frozen=True)
+class D04BaselineQuotePolicy:
+    """Signed installed D04 price, separate from D03 and D06 work."""
+
+    policy_id: str
+    bot_id: str
+    persona_id: str
+    installation_id: str
+    grant_id: str
+    grant_version: int
+    lease_id: str
+    provider_policy_ref: str
+    quote_ceiling: Mapping[str, int]
+    deadline_after_seconds: float
+    snapshot_ref: str
+    resource_ref: str
+
+    def __post_init__(self) -> None:
+        for name in ("policy_id", "bot_id", "persona_id", "installation_id",
+                     "grant_id", "lease_id", "provider_policy_ref",
+                     "snapshot_ref", "resource_ref"):
+            _id(getattr(self, name), name)
+        if type(self.grant_version) is not int or self.grant_version < 1:
+            raise ValueError("D04 baseline grant version is invalid")
+        deadline = _finite(self.deadline_after_seconds, "deadline_after_seconds")
+        if deadline <= 0:
+            raise ValueError("D04 baseline deadline bound must be positive")
+        object.__setattr__(self, "deadline_after_seconds", deadline)
+        object.__setattr__(self, "quote_ceiling", _amounts(self.quote_ceiling))
+
+
 def _d03_policy_id(installation_id: str, grant: BudgetLeaseGrant) -> str:
     return "d03-policy-" + canonical_digest({
         "installation_id": installation_id,
@@ -242,6 +274,69 @@ def _d03_quote_refs(policy: D03ArrivalQuotePolicy,
         "input_refs": envelope.input_refs,
     })[:56]
     return snapshot, resource
+
+
+def _d04_policy_id(installation_id: str, grant: BudgetLeaseGrant) -> str:
+    return "d04-baseline-policy-" + canonical_digest({
+        "installation_id": installation_id,
+        "namespace": [grant.bot_id, grant.persona_id],
+        "grant_id": grant.grant_id, "grant_version": grant.version,
+    })[:40]
+
+
+def d04_baseline_quote_id(namespace, operation_id: str) -> str:
+    return "d04-baseline-q-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+    })[:40]
+
+
+def _d04_quote_refs(policy: D04BaselineQuotePolicy,
+                    envelope: CommandEnvelope) -> tuple[str, str]:
+    snapshot = "d04snap:" + policy.policy_id + ":" + canonical_digest({
+        "policy": _payload(policy),
+        "guard": replace(envelope.version_guard, resource_lease_versions=()),
+        "identity": envelope.identity,
+        "source_qualification": envelope.source_qualification,
+        "input_refs": envelope.input_refs,
+    })[:32]
+    resource = "d04src:" + canonical_digest({
+        "policy_id": policy.policy_id, "resource_ref": policy.resource_ref,
+        "input_refs": envelope.input_refs,
+    })[:56]
+    return snapshot, resource
+
+
+def _d04_baseline_input_keys(envelope: CommandEnvelope) -> tuple[AtomKey, AtomKey]:
+    """Require a committed source and a distinct D03 prerequisite event."""
+    identity = envelope.identity
+    authority = envelope.authority
+    if (authority.actor != "host" or authority.issuer_domain != "d11"
+            or authority.worker_fence is not None
+            or "event" not in authority.owner_scope
+            or identity.phase != "encoding_baseline"
+            or identity.effect_id is not None
+            or len(envelope.input_refs) != 2
+            or envelope.source_qualification.source_refs != envelope.input_refs[:1]
+            or identity.canonical_input_digest != canonical_digest({
+                "input_refs": list(envelope.input_refs),
+            })):
+        raise IssuerAuthorityDenied("D04 baseline requires exact host stage identity")
+    try:
+        source, event = (AtomKey.from_token(ref) for ref in envelope.input_refs)
+    except (TypeError, ValueError) as exc:
+        raise IssuerAuthorityDenied("D04 baseline input reference is invalid") from exc
+    if (source.type_name != "memory.source" or event.type_name != "d03.world_event"
+            or source.owner.kind != "event" or event.owner.kind != "event"
+            or (source.owner.bot, source.owner.persona)
+            != authority.namespace.as_tuple
+            or (event.owner.bot, event.owner.persona)
+            != authority.namespace.as_tuple):
+        raise IssuerAuthorityDenied("D04 baseline lacks same-namespace D03 prerequisite")
+    guarded = {item.key: item.revision for item in envelope.version_guard.read_versions}
+    if (len(guarded) != len(envelope.version_guard.read_versions)
+            or guarded.get(source, 0) < 1 or guarded.get(event, 0) < 1):
+        raise IssuerAuthorityDenied("D04 baseline source and event need committed guards")
+    return source, event
 
 
 @dataclass(frozen=True)
@@ -288,6 +383,10 @@ def _decode_grant(payload: str) -> BudgetLeaseGrant:
 
 def _decode_d03_policy(payload: str) -> D03ArrivalQuotePolicy:
     return D03ArrivalQuotePolicy(**json.loads(payload))
+
+
+def _decode_d04_policy(payload: str) -> D04BaselineQuotePolicy:
+    return D04BaselineQuotePolicy(**json.loads(payload))
 
 
 def _decode_outcome(payload: str) -> ResourceOutcome:
@@ -342,6 +441,14 @@ def install_schema(db) -> None:
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS runtime_d03_arrival_quote_policies(
+            policy_id TEXT PRIMARY KEY,
+            policy_json TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            status TEXT NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_d04_baseline_quote_policies(
             policy_id TEXT PRIMARY KEY,
             policy_json TEXT NOT NULL,
             signature TEXT NOT NULL,
@@ -438,8 +545,8 @@ class D02ResourceIssuer:
             raise IssuerAuthorityDenied("signed D03 arrival policy identity differs")
         return policy
 
-    def _issue_d03_arrival_quote(self, db, quote: ResourceQuote) -> str:
-        """Idempotent signed quote; only D11's policy-checked path calls this."""
+    def _issue_bound_stage_quote(self, db, quote: ResourceQuote) -> str:
+        """Idempotent signed quote for a policy-checked stage issuer."""
         row = db.execute(
             "SELECT quote_json,signature,status FROM runtime_resource_quotes "
             "WHERE quote_id=? AND version=?", (quote.quote_id, quote.version),
@@ -447,7 +554,7 @@ class D02ResourceIssuer:
         if row is not None:
             self._signer.verify("resource-quote.v1", row[0], row[1])
             if row[2] != "active" or _decode_quote(row[0]) != quote:
-                raise IssuerAuthorityDenied("D03 arrival quote replay differs")
+                raise IssuerAuthorityDenied("signed stage quote replay differs")
             return row[1]
         return self.issue_quote(db, quote)
 
@@ -469,6 +576,63 @@ class D02ResourceIssuer:
                 or quote.resource_ref != resource_ref
                 or dict(quote.ceiling) != dict(policy.quote_ceiling)):
             raise IssuerAuthorityDenied("D03 arrival quote differs from signed policy")
+        return policy
+
+    def _install_d04_baseline_policy(self, db, policy: D04BaselineQuotePolicy) -> str:
+        payload = canonical_serialize(_payload(policy))
+        signature = self._signer.sign("d04-baseline-policy.v1", payload)
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM runtime_d04_baseline_quote_policies "
+            "WHERE policy_id=?", (policy.policy_id,),
+        ).fetchone()
+        if row is not None:
+            self._signer.verify("d04-baseline-policy.v1", row[0], row[1])
+            if row != (payload, signature, "active"):
+                raise IssuerAuthorityDenied("D04 baseline policy replay differs")
+            return signature
+        db.execute(
+            "INSERT INTO runtime_d04_baseline_quote_policies"
+            "(policy_id,policy_json,signature,status) VALUES(?,?,?,'active')",
+            (policy.policy_id, payload, signature),
+        )
+        return signature
+
+    def _load_d04_baseline_policy(self, db, policy_id: str) -> D04BaselineQuotePolicy:
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM runtime_d04_baseline_quote_policies "
+            "WHERE policy_id=?", (policy_id,),
+        ).fetchone()
+        if row is None or row[2] != "active":
+            raise IssuerAuthorityDenied("active signed D04 baseline policy is absent")
+        self._signer.verify("d04-baseline-policy.v1", row[0], row[1])
+        try:
+            policy = _decode_d04_policy(row[0])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("signed D04 baseline policy is invalid") from exc
+        if policy.policy_id != policy_id:
+            raise IssuerAuthorityDenied("signed D04 baseline policy identity differs")
+        return policy
+
+    def _qualified_d04_baseline_policy(self, db, envelope: CommandEnvelope,
+                                       quote: ResourceQuote,
+                                       grant: BudgetLeaseGrant) -> D04BaselineQuotePolicy:
+        parts = quote.snapshot_ref.split(":")
+        if len(parts) != 3 or parts[0] != "d04snap":
+            raise IssuerAuthorityDenied("D04 baseline quote lacks policy binding")
+        policy = self._load_d04_baseline_policy(db, parts[1])
+        snapshot_ref, resource_ref = _d04_quote_refs(policy, envelope)
+        if (policy.policy_id != _d04_policy_id(policy.installation_id, grant)
+                or (policy.bot_id, policy.persona_id)
+                != envelope.authority.namespace.as_tuple
+                or (policy.grant_id, policy.grant_version, policy.lease_id,
+                    policy.provider_policy_ref) != (
+                    grant.grant_id, grant.version, grant.lease_id, grant.policy_ref)
+                or quote.snapshot_ref != snapshot_ref
+                or quote.resource_ref != resource_ref
+                or quote.quote_id != d04_baseline_quote_id(
+                    envelope.authority.namespace, envelope.identity.operation_id)
+                or dict(quote.ceiling) != dict(policy.quote_ceiling)):
+            raise IssuerAuthorityDenied("D04 baseline quote differs from signed policy")
         return policy
 
     def issue_outcome(self, db, outcome: ResourceOutcome) -> str:
@@ -755,7 +919,94 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
                 for name, amount in policy.quote_ceiling.items()):
             raise IssuerAuthorityDenied("D03 arrival budget has insufficient capacity")
         self._d02._install_d03_arrival_policy(db, policy)
-        self._d02._issue_d03_arrival_quote(db, quote)
+        self._d02._issue_bound_stage_quote(db, quote)
+        return quote
+
+    def issue_d04_baseline_quote(self, db, envelope: CommandEnvelope,
+                                 admin_policy, *, installation_id: str,
+                                 now_utc: float | None = None) -> ResourceQuote:
+        """Issue only a separately installed D04 price in the caller transaction.
+
+        The stage coordinator must still prove current graph reads and commit
+        its own operation/reservation; this method supplies no such receipt.
+        """
+        from ..host.authority_profile import AdminD04EncodingBaselinePolicy
+
+        if type(admin_policy) is not AdminD04EncodingBaselinePolicy:
+            raise IssuerAuthorityDenied("installed D04 baseline policy is required")
+        if not isinstance(envelope, CommandEnvelope):
+            raise TypeError("envelope must be CommandEnvelope")
+        _id(installation_id, "installation_id")
+        if envelope.version_guard.resource_lease_versions:
+            raise IssuerAuthorityDenied("D04 baseline quote request has prior resource refs")
+        source, event = _d04_baseline_input_keys(envelope)
+        now = _now_utc(now_utc)
+        grant = self._load_grant(db, envelope.parent_budget_lease_ref)
+        lease = get_budget_lease(db, grant.lease_id)
+        authority = envelope.authority
+        if (D04_BASELINE_WORK_KIND not in grant.allowed_work_kinds
+                or (grant.bot_id, grant.persona_id) != authority.namespace.as_tuple
+                or (lease.bot_id, lease.persona_id, lease.currency)
+                != (grant.bot_id, grant.persona_id, grant.currency)
+                or lease.state != "active"
+                or grant.policy_ref != authority.provider_policy_ref
+                or grant.valid_until_utc <= now
+                or not now < envelope.deadline_utc <= min(
+                    now + admin_policy.deadline_after_seconds,
+                    grant.valid_until_utc)):
+            raise IssuerAuthorityDenied("D04 baseline lacks current signed grant or deadline")
+        if any(amount > grant.max_ceiling.get(name, 0)
+               for name, amount in admin_policy.quote_ceiling.items()):
+            raise IssuerAuthorityDenied("D04 baseline quote exceeds signed grant")
+        for key in (source, event):
+            row = db.execute(
+                "SELECT revision,valid,value FROM graph_atoms WHERE token=?", (key.token,),
+            ).fetchone()
+            guarded = next(item.revision for item in
+                           envelope.version_guard.read_versions if item.key == key)
+            if row is None or row[:2] != (guarded, 1):
+                raise IssuerAuthorityDenied("D04 baseline prerequisite is not current")
+            if key == event:
+                try:
+                    fact = json.loads(row[2])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise IssuerAuthorityDenied("D04 prerequisite event is invalid") from exc
+                if (type(fact) is not dict
+                        or fact.get("event_id") != event.owner.subject
+                        or fact.get("kind") != "message_received"
+                        or fact.get("reality") != "host_observed"
+                        or fact.get("source_refs") != [source.token]
+                        or fact.get("learned_at")
+                        != envelope.source_qualification.learned_at):
+                    raise IssuerAuthorityDenied("D04 prerequisite does not bind this source")
+        policy = D04BaselineQuotePolicy(
+            _d04_policy_id(installation_id, grant), *authority.namespace.as_tuple,
+            installation_id, grant.grant_id, grant.version, grant.lease_id,
+            grant.policy_ref, dict(admin_policy.quote_ceiling),
+            admin_policy.deadline_after_seconds, admin_policy.snapshot_ref,
+            admin_policy.resource_ref,
+        )
+        snapshot_ref, resource_ref = _d04_quote_refs(policy, envelope)
+        quote = ResourceQuote(
+            d04_baseline_quote_id(authority.namespace, envelope.identity.operation_id),
+            1, *authority.namespace.as_tuple, envelope.identity.activity_id,
+            envelope.identity.operation_id, None, grant.lease_id,
+            D04_BASELINE_WORK_KIND, snapshot_ref, envelope.deadline_utc,
+            resource_ref, None, (), (), dict(policy.quote_ceiling), None,
+            envelope.deadline_utc,
+        )
+        install_schema(db)
+        existing = db.execute(
+            "SELECT 1 FROM runtime_resource_quotes WHERE quote_id=? AND version=1",
+            (quote.quote_id,),
+        ).fetchone()
+        if existing is None and any(
+                amount > lease.limits.get(name, 0) - lease.used.get(name, 0)
+                - lease.reserved.get(name, 0) - lease.unconfirmed.get(name, 0)
+                for name, amount in policy.quote_ceiling.items()):
+            raise IssuerAuthorityDenied("D04 baseline budget has insufficient capacity")
+        self._d02._install_d04_baseline_policy(db, policy)
+        self._d02._issue_bound_stage_quote(db, quote)
         return quote
 
     def authorize_existing_encoding_job(self, db, job: PersistentJob, *,
@@ -813,6 +1064,12 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
             raise IssuerAuthorityDenied("quote ceiling exceeds the signed budget grant")
         if quote.work_kind == D03_ARRIVAL_WORK_KIND:
             self._d02._qualified_d03_arrival_policy(db, envelope, quote, grant)
+        if quote.work_kind == D04_BASELINE_WORK_KIND:
+            _d04_baseline_input_keys(envelope)
+            if (quote.graph_job_ref is not None or quote.outbox_refs
+                    or quote.d02_settlement_refs):
+                raise IssuerAuthorityDenied("D04 baseline quote contains unrelated runtime refs")
+            self._d02._qualified_d04_baseline_policy(db, envelope, quote, grant)
         return quote, grant, lease
 
     @staticmethod
@@ -927,7 +1184,7 @@ def build_runtime_issuers(signing_key: bytes, *,
 
 
 __all__ = [
-    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id",
+    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D04BaselineQuotePolicy", "D04_BASELINE_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id", "d04_baseline_quote_id",
     "IssuerAuthorityDenied", "ResourceOutcome", "ResourceQuote",
     "build_runtime_issuers", "install_schema",
 ]

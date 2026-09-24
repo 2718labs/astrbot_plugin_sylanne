@@ -47,6 +47,7 @@ _INGRESS_ENCODING_FIELDS = frozenset({
 _D03_ARRIVAL_FIELDS = frozenset({
     "deadline_after_seconds", "quote_ceiling", "snapshot_ref", "resource_ref",
 })
+_D04_BASELINE_FIELDS = _D03_ARRIVAL_FIELDS
 _INGRESS_MODEL_FIELDS = frozenset({
     "provider_id", "model_id", "provider_config_ref", "provider_config_digest",
     "timeout_seconds", "max_output_tokens", "required_capabilities", "privacy_tier",
@@ -214,6 +215,46 @@ class AdminD03ArrivalPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class AdminD04EncodingBaselinePolicy:
+    """Installed price for a separate D04 baseline stage."""
+
+    deadline_after_seconds: float
+    quote_ceiling: Mapping[str, int]
+    snapshot_ref: str
+    resource_ref: str
+
+    def __post_init__(self) -> None:
+        from ..runtime.issuers import MAX_DIMENSIONS, MAX_QUANTITY
+
+        deadline = self.deadline_after_seconds
+        if (type(deadline) not in {int, float} or not math.isfinite(deadline)
+                or deadline <= 0):
+            raise ValueError("D04 baseline deadline must be finite and positive")
+        ceiling = self.quote_ceiling
+        if not isinstance(ceiling, Mapping) or not 0 < len(ceiling) <= MAX_DIMENSIONS:
+            raise ValueError("D04 baseline quote ceiling must be nonempty and bounded")
+        normalized: dict[str, int] = {}
+        for name, amount in ceiling.items():
+            if (type(name) is not str or _RESOURCE_DIMENSION.fullmatch(name) is None
+                    or type(amount) is not int or not 0 < amount <= MAX_QUANTITY):
+                raise ValueError("D04 baseline quote ceiling contains an invalid amount")
+            normalized[name] = amount
+        object.__setattr__(self, "quote_ceiling", MappingProxyType(normalized))
+        for name in ("snapshot_ref", "resource_ref"):
+            value = getattr(self, name)
+            if type(value) is not str or _RESOURCE_DIMENSION.fullmatch(value) is None:
+                raise ValueError(f"D04 baseline {name} must be a canonical resource ID")
+
+    def digest_payload(self) -> dict[str, object]:
+        return {
+            "deadline_after_seconds": self.deadline_after_seconds,
+            "quote_ceiling": dict(self.quote_ceiling),
+            "snapshot_ref": self.snapshot_ref,
+            "resource_ref": self.resource_ref,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AdminIngressModelPolicy:
     """Exact administrator selection; it does not grant model egress."""
 
@@ -359,6 +400,7 @@ class AdminInstallationBundle:
     ingress_model: AdminIngressModelPolicy | None = None
     d03_arrival: AdminD03ArrivalPolicy | None = None
     model_workflows: AdminModelWorkflowsV2 | None = None
+    d04_encoding_baseline: AdminD04EncodingBaselinePolicy | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -664,7 +706,7 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "model_workflows"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d04_encoding_baseline", "model_workflows"}
     )
 
 
@@ -773,6 +815,18 @@ def _d03_arrival_from_payload(payload: dict[str, object]) -> AdminD03ArrivalPoli
     return AdminD03ArrivalPolicy(**values)
 
 
+def _d04_baseline_from_payload(payload: dict[str, object]) -> AdminD04EncodingBaselinePolicy | None:
+    if "d04_encoding_baseline" not in payload:
+        return None
+    if type(payload.get("schema")) is not int or payload["schema"] != 2:
+        raise ValueError("D04 baseline requires profile schema 2")
+    values = _exact_object(payload["d04_encoding_baseline"], _D04_BASELINE_FIELDS,
+                           "D04 baseline")
+    if type(values["quote_ceiling"]) is not dict:
+        raise ValueError("D04 baseline quote ceiling must be an object")
+    return AdminD04EncodingBaselinePolicy(**values)
+
+
 def _ingress_model_from_payload(payload: dict[str, object]) -> AdminIngressModelPolicy | None:
     if "ingress_model" not in payload:
         return None
@@ -827,6 +881,7 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     _ingress_clock_from_payload(payload)
     encoding = _ingress_encoding_from_payload(payload)
     arrival = _d03_arrival_from_payload(payload)
+    baseline = _d04_baseline_from_payload(payload)
     model = _ingress_model_from_payload(payload)
     workflows = _model_workflows_from_payload(payload)
     _workbench_origin_from_payload(payload)
@@ -868,6 +923,13 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
         if any(amount > policy.root_grant.max_ceiling.get(name, 0)
                for name, amount in arrival.quote_ceiling.items()):
             raise ValueError("D03 arrival quote exceeds the signed root grant")
+    if baseline is not None:
+        if "d04.encoding_baseline" not in policy.root_grant.allowed_work_kinds:
+            raise ValueError("D04 baseline requires an explicit root grant work kind")
+        if any(amount > policy.root_grant.max_ceiling.get(name, 0)
+               or amount > policy.root_lease.limits.get(name, 0)
+               for name, amount in baseline.quote_ceiling.items()):
+            raise ValueError("D04 baseline quote exceeds the signed root budget")
     if model is not None and encoding is not None:
         output = model.max_output_tokens
         if (encoding.quote_ceiling.get("output_tokens", 0) < output
@@ -1039,7 +1101,8 @@ def _load_installation_bundle_from_root(
                                    _workbench_origin_from_payload(payload),
                                    _ingress_model_from_payload(payload),
                                    _d03_arrival_from_payload(payload),
-                                   _model_workflows_from_payload(payload))
+                                   _model_workflows_from_payload(payload),
+                                   _d04_baseline_from_payload(payload))
 
 
 def _load_windows_installation_bundle(
@@ -1066,7 +1129,8 @@ def _load_windows_installation_bundle(
                                    _workbench_origin_from_payload(payload),
                                    _ingress_model_from_payload(payload),
                                    _d03_arrival_from_payload(payload),
-                                   _model_workflows_from_payload(payload))
+                                   _model_workflows_from_payload(payload),
+                                   _d04_baseline_from_payload(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -1118,7 +1182,7 @@ def load_admin_d11_signing_key(profile_id: str) -> bytes:
 
 
 __all__ = (
-    "AdminD03ArrivalPolicy", "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
+    "AdminD03ArrivalPolicy", "AdminD04EncodingBaselinePolicy", "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
     "AdminModelWorkflowV2", "AdminModelWorkflowsV2",
     "AdminInstallationBundle",
     "AdminInstallationPolicy",

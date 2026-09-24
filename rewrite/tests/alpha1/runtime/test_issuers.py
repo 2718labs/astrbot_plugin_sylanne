@@ -1,8 +1,15 @@
 import sqlite3
+import json
 import time
 import unittest
+from dataclasses import replace
 
 from sylanne3.graph_coordinator import budget_operation_digest
+from sylanne3.graph_types import AtomKey, GraphVersion, Owner
+from sylanne3.host.authority_profile import (
+    AdminD04EncodingBaselinePolicy, _d04_baseline_from_payload,
+    _policy_from_payload,
+)
 from sylanne3.runtime import install_schema as install_runtime_schema
 from sylanne3.runtime.budget import BudgetLease, create_budget_lease, reserve_budget
 from sylanne3.runtime.d11_types import runtime_job_key, runtime_outbox_key
@@ -14,6 +21,8 @@ from sylanne3.runtime.issuers import (
     IssuerAuthorityDenied,
     ResourceOutcome,
     ResourceQuote,
+    D04_BASELINE_WORK_KIND,
+    d04_baseline_quote_id,
     build_runtime_issuers,
     install_schema as install_issuer_schema,
 )
@@ -232,6 +241,144 @@ class ProductionIssuerTests(unittest.TestCase):
         self.issue_authorities(quote=self.quote(worker_fence=1))
         with self.assertRaises(IssuerAuthorityDenied):
             self.d02.authorize_resources(self.bundle(), self.db)
+
+    def test_d04_baseline_uses_own_installed_price_grant_and_committed_prerequisite(self):
+        source = AtomKey(Owner("event", "bot", "persona", "source-event"),
+                         "memory.source", "record")
+        event = AtomKey(Owner("event", "bot", "persona", "arrival-event"),
+                        "d03.world_event", "current")
+        refs = (source.token, event.token)
+        self.db.execute("CREATE TABLE graph_atoms(token TEXT PRIMARY KEY, revision INTEGER, valid INTEGER, value TEXT)")
+        self.db.executemany("INSERT INTO graph_atoms VALUES(?,?,1,?)", (
+            (source.token, 1, "{}"),
+            (event.token, 2, json.dumps({
+                "event_id": "arrival-event", "kind": "message_received",
+                "reality": "host_observed", "source_refs": [source.token],
+                "learned_at": 1.0,
+            })),
+        ))
+        identity = replace(
+            self.envelope.identity, phase="encoding_baseline", effect_id=None,
+            canonical_input_digest=canonical_digest({"input_refs": list(refs)}),
+        )
+        envelope = replace(
+            self.envelope, identity=identity,
+            authority=replace(self.envelope.authority, actor="host",
+                              owner_scope=("event",)),
+            version_guard=replace(
+                self.envelope.version_guard,
+                read_versions=(GraphVersion(source, 1), GraphVersion(event, 2)),
+                resource_lease_versions=(),
+            ),
+            source_qualification=replace(
+                self.envelope.source_qualification, source_refs=(source.token,)),
+            input_refs=refs,
+        )
+        policy = AdminD04EncodingBaselinePolicy(
+            60.0, {"cpu_ms": 30}, "baseline-snapshot", "baseline-resource",
+        )
+        now = envelope.deadline_utc - 30.0
+        d04_grant = replace(self.grant(),
+                            allowed_work_kinds=(D04_BASELINE_WORK_KIND,))
+        self.d11.issue_budget_grant(self.db, d04_grant)
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "installed D04"):
+            self.d11.issue_d04_baseline_quote(
+                self.db, envelope, None, installation_id="installation-1", now_utc=now,
+            )
+        quote = self.d11.issue_d04_baseline_quote(
+            self.db, envelope, policy, installation_id="installation-1", now_utc=now,
+        )
+        self.assertEqual(quote.work_kind, D04_BASELINE_WORK_KIND)
+        self.assertEqual(quote.quote_id, d04_baseline_quote_id(self.namespace, "op-1"))
+        self.assertEqual(quote.ceiling, {"cpu_ms": 30})
+        self.assertEqual(self.d11.issue_d04_baseline_quote(
+            self.db, envelope, policy, installation_id="installation-1", now_utc=now,
+        ), quote)
+        guarded = replace(envelope, version_guard=replace(
+            envelope.version_guard,
+            resource_lease_versions=(VersionedRef(quote.quote_id, 1),),
+        ))
+        admitted, _, _ = self.d11._admission_state(guarded, self.db, now_utc=now)
+        self.assertEqual(admitted, quote)
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "policy binding"):
+            self.d02.issue_quote(self.db, replace(
+                quote, quote_id="unbound-d04", snapshot_ref="d06snap:unrelated",
+            ))
+            self.d11._admission_state(replace(guarded, version_guard=replace(
+                guarded.version_guard,
+                resource_lease_versions=(VersionedRef("unbound-d04", 1),),
+            )), self.db, now_utc=now)
+        self.db.execute("UPDATE graph_atoms SET revision=3 WHERE token=?", (event.token,))
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "prerequisite is not current"):
+            self.d11.issue_d04_baseline_quote(
+                self.db, envelope, policy, installation_id="installation-1", now_utc=now,
+            )
+        self.db.execute(
+            "UPDATE graph_atoms SET revision=2, value=? WHERE token=?",
+            (json.dumps({"event_id": "arrival-event", "kind": "message_received",
+                         "reality": "host_observed", "source_refs": ["other-source"],
+                         "learned_at": 1.0}), event.token),
+        )
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "does not bind this source"):
+            self.d11.issue_d04_baseline_quote(
+                self.db, envelope, policy, installation_id="installation-1", now_utc=now,
+            )
+        self.db.execute("UPDATE runtime_d04_baseline_quote_policies "
+                        "SET policy_json=replace(policy_json,'30','31')")
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "signature is invalid"):
+            self.d11._admission_state(guarded, self.db, now_utc=now)
+
+    def test_d04_profile_requires_explicit_policy_and_matching_root_kind(self):
+        grant = replace(self.grant(),
+                        allowed_work_kinds=(D04_BASELINE_WORK_KIND,))
+        profile = {
+            "schema": 2, "host": "authority.example", "port": 443,
+            "server_name": "authority.example",
+            "expected_authority_id": "authority",
+            "installation_policy": {
+                "namespace": {"bot_id": "bot", "persona_id": "persona"},
+                "authority_namespace": "opaque",
+                "installation_id": "installation-1",
+                "manifest_digest": "a" * 64,
+                "administrator_holder": "administrator",
+                "expected_authority_id": "authority",
+                "catalogue_hash": "b" * 64,
+                "scheme_version": "scheme", "operator_version": "operator",
+                "policy_version": "policy",
+                "root_lease": {
+                    "lease_id": "parent", "parent_id": None, "bot_id": "bot",
+                    "persona_id": "persona", "currency": "USD",
+                    "limits": {"cpu_ms": 10_000, "model_microusd": 5_000},
+                    "used": {}, "reserved": {}, "unconfirmed": {},
+                    "version": 1, "state": "active",
+                },
+                "root_grant": {
+                    "grant_id": grant.grant_id, "version": grant.version,
+                    "bot_id": grant.bot_id, "persona_id": grant.persona_id,
+                    "lease_id": grant.lease_id, "currency": grant.currency,
+                    "max_ceiling": dict(grant.max_ceiling),
+                    "allowed_work_kinds": list(grant.allowed_work_kinds),
+                    "valid_until_utc": grant.valid_until_utc,
+                    "policy_ref": grant.policy_ref,
+                },
+            },
+            "d04_encoding_baseline": {
+                "deadline_after_seconds": 30.0,
+                "quote_ceiling": {"cpu_ms": 30},
+                "snapshot_ref": "baseline-snapshot",
+                "resource_ref": "baseline-resource",
+            },
+        }
+        self.assertEqual(_d04_baseline_from_payload(profile).quote_ceiling,
+                         {"cpu_ms": 30})
+        self.assertEqual(_policy_from_payload(profile).root_grant, grant)
+        profile["installation_policy"]["root_grant"]["allowed_work_kinds"] = [
+            "d06.encode_source",
+        ]
+        with self.assertRaisesRegex(ValueError, "explicit root grant work kind"):
+            _policy_from_payload(profile)
+        profile.pop("d04_encoding_baseline")
+        self.assertIsNone(_d04_baseline_from_payload(profile))
 
 
 if __name__ == "__main__":
