@@ -21,7 +21,7 @@ from .graph_store import (
     DeletionDependencyEdge, DeletionHistoryRow, GraphStore, ProductionGraphStore,
 )
 from .graph_types import (
-    AtomKey, CurrentSceneProof, GraphCandidate, GraphSnapshot, GraphAtom,
+    AtomKey, CurrentSceneProof, GraphCandidate, GraphSnapshot, GraphAtom, GraphPage,
     GraphVersion, GraphWrite,
     NamespaceEpoch, Owner, owner_grant_key, owner_grant_policy_digest_v1,
     validate_owner_grant_v1,
@@ -94,6 +94,58 @@ class DeletionSnapshotCandidate:
     @property
     def epoch(self) -> NamespaceEpoch:
         return self.snapshot.epochs[0]
+
+
+_COMPLETE_PROJECTION_SEAL = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class CompleteProjectionSnapshotV1:
+    namespace: NamespaceId
+    epoch: NamespaceEpoch
+    activation_generation: int
+    view_type: str
+    type_names: tuple[str, ...]
+    owner_kind: str
+    audience: str
+    purpose: str
+    _seal: object
+
+    def __init__(self, namespace, epoch, activation_generation, view_type,
+                 type_names, owner_kind, audience, purpose, *, _seal=None):
+        if _seal is not _COMPLETE_PROJECTION_SEAL:
+            raise TypeError("complete projection proofs are coordinator-issued")
+        object.__setattr__(self, "namespace", namespace)
+        object.__setattr__(self, "epoch", epoch)
+        object.__setattr__(self, "activation_generation", activation_generation)
+        object.__setattr__(self, "view_type", view_type)
+        object.__setattr__(self, "type_names", tuple(type_names))
+        object.__setattr__(self, "owner_kind", owner_kind)
+        object.__setattr__(self, "audience", audience)
+        object.__setattr__(self, "purpose", purpose)
+        object.__setattr__(self, "_seal", _seal)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkbenchProjectionSnapshotV1:
+    namespace: NamespaceId
+    data: Mapping
+
+
+def verify_complete_projection_snapshot_v1(
+        proof, *, authority: AuthorityContext, view_type: str,
+        type_names: tuple[str, ...], owner_kind: str,
+        audience: str, purpose: str) -> bool:
+    return (type(proof) is CompleteProjectionSnapshotV1
+            and proof._seal is _COMPLETE_PROJECTION_SEAL
+            and proof.namespace == authority.namespace
+            and proof.activation_generation == authority.activation_generation
+            and proof.view_type == view_type and proof.type_names == type_names
+            and proof.owner_kind == owner_kind and owner_kind in authority.owner_scope
+            and proof.audience == audience and audience in authority.audience
+            and authority.purpose == purpose == proof.purpose
+            and isinstance(proof.epoch, NamespaceEpoch)
+            and (proof.epoch.bot, proof.epoch.persona) == authority.namespace.as_tuple)
 
 
 @dataclass(frozen=True)
@@ -6937,6 +6989,109 @@ class GraphCoordinator:
                                     "read", tuple(key.token for key in keys))
                 return GraphStore.graph_snapshot(
                     store, keys, _capability=self.__graph_capability)
+
+    def project_workbench_snapshot_v1(
+            self, authority: AuthorityContext, lease: object, *,
+            view_registry: object, view_type: str, audience: str,
+            purpose: str) -> WorkbenchProjectionSnapshotV1:
+        """Read and project one complete D12 view inside one v2 read fence.
+
+        Raw atoms remain inside the coordinator callback. Internal pages are
+        pinned to one namespace epoch, and only the registry-validated field
+        projection is returned to the D12 issuer.
+        """
+        from .workbench_api.domain_registry import (
+            CurrentDomainViewRegistry, PROJECTION_CONTEXT_V2,
+        )
+
+        if not isinstance(authority, AuthorityContext):
+            raise TypeError("authority required")
+        if (authority.issuer_domain != "d12"
+                or type(view_registry) is not CurrentDomainViewRegistry
+                or not isinstance(view_type, str) or not view_type
+                or not isinstance(audience, str) or audience not in authority.audience
+                or purpose != authority.purpose):
+            raise AuthorityDenied("complete D12 projection authority required")
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None):
+            raise UnavailableGuard("complete workbench snapshot requires v2 read fence")
+        try:
+            types = view_registry.view_types(authority).get(view_type)
+            owner_kind = view_registry.view_owner_kind(authority, view_type)
+            context_version = view_registry.projection_context_version(authority, view_type)
+        except Exception as exc:
+            raise UnavailableGuard("complete workbench view is unavailable") from exc
+        if (not isinstance(types, tuple) or not types or owner_kind not in authority.owner_scope
+                or context_version != PROJECTION_CONTEXT_V2):
+            raise AuthorityDenied("view does not require complete fenced projection")
+        if (len(set(types)) != len(types)
+                or any(not isinstance(name, str) or not name for name in types)):
+            raise AuthorityDenied("view has invalid graph type scope")
+        specs = tuple(self.__store._registry.spec(name) for name in types)
+        if any(owner_kind not in spec.owner_kinds or not spec.writer_domain for spec in specs):
+            raise AuthorityDenied("view type ownership is incomplete")
+        domains = frozenset(spec.writer_domain for spec in specs)
+        self._authorize(lease, authority, domains, owner_read=True)
+
+        store = self.__store
+
+        def read_and_project():
+            page_after = None
+            expected_epoch = None
+            atoms = []
+            while True:
+                page = GraphStore.graph_query(
+                    store, *authority.namespace.as_tuple, type_names=types,
+                    owner_kind=owner_kind, after=page_after,
+                    expected_epoch=expected_epoch, limit=512,
+                    _capability=self.__graph_capability,
+                )
+                if not isinstance(page, GraphPage) or len(page.snapshot.epochs) != 1:
+                    raise UnavailableGuard("complete workbench page is invalid")
+                epoch = page.snapshot.epochs[0]
+                if ((epoch.bot, epoch.persona) != authority.namespace.as_tuple
+                        or (expected_epoch is not None and epoch != expected_epoch)):
+                    raise StaleRead("complete workbench snapshot changed between pages")
+                if expected_epoch is None:
+                    expected_epoch = epoch
+                previous_token = page_after.token if page_after is not None else None
+                for atom in page.snapshot.atoms:
+                    if (atom.key.owner.kind != owner_kind
+                            or (atom.key.owner.bot, atom.key.owner.persona)
+                            != authority.namespace.as_tuple
+                            or atom.key.type_name not in types
+                            or (previous_token is not None and atom.key.token <= previous_token)):
+                        raise UnavailableGuard("complete workbench atoms are invalid")
+                    atoms.append({
+                        "key": atom.key.token, "type": atom.key.type_name,
+                        "name": atom.key.name, "revision": atom.revision,
+                        "value": atom.value,
+                    })
+                    previous_token = atom.key.token
+                if page.next_after is None:
+                    break
+                if (not page.snapshot.atoms
+                        or page.next_after != page.snapshot.atoms[-1].key
+                        or page.next_after == page_after):
+                    raise UnavailableGuard("complete workbench continuation is invalid")
+                page_after = page.next_after
+
+            proof = CompleteProjectionSnapshotV1(
+                authority.namespace, expected_epoch, authority.activation_generation,
+                view_type, types, owner_kind, audience, purpose,
+                _seal=_COMPLETE_PROJECTION_SEAL,
+            )
+            projection = view_registry.project_workbench(
+                authority, view_type, tuple(atoms), audience=audience,
+                purpose=purpose, snapshot_proof=proof,
+            )
+            return WorkbenchProjectionSnapshotV1(authority.namespace, projection)
+
+        return self._read_v2(
+            authority, read_and_project,
+            owner_binding=self.__owner_leases.get(lease),
+            owner_session_proof=self.__owner_session_proofs.get(lease),
+        )
 
     def query(self, authority: AuthorityContext, lease: object, *,
               type_names: tuple[str, ...], owner_kind: str, **filters):

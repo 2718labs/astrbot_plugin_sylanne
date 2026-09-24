@@ -64,6 +64,7 @@ _RECOLLECTION_SCHEMA_HASH = schema_hash({
 })
 _WORKBENCH_VIEW = "d06.memory_sources.v1"
 _WORKBENCH_FIELDS = frozenset({"sources", "coverage"})
+_WORKBENCH_TYPES = ("memory.source", "memory.access", "memory.interpretation")
 
 
 def _nonempty(value: object, label: str) -> str:
@@ -496,29 +497,30 @@ class D06DomainProvider:
 
     @property
     def workbench_view_contract(self):
-        # All three types are queried together through the caller's single
-        # event-owner graph snapshot. The D12 issuer currently caps that read
-        # at 100 atoms and hides its truncation bit for context-filtered views;
-        # the projector therefore rejects a full page rather than asserting
-        # completeness it cannot prove.
+        # A v2 context carries coordinator-issued proof that all internal
+        # pages were read under one Owner lease, fence, and graph epoch.
         return {
             _WORKBENCH_VIEW: {
-                "types": ("memory.source", "memory.access", "memory.interpretation"),
+                "types": _WORKBENCH_TYPES,
                 "fields": _WORKBENCH_FIELDS,
-                "projection_context": "d12.projection_context.v1",
+                "projection_context": "d12.projection_context.v2",
             },
         }
 
     @staticmethod
     def project_workbench(view_type, atoms, *, context):
-        from ...workbench_api.domain_registry import PROJECTION_CONTEXT_V1, ProjectionContextV1
+        from ...workbench_api.domain_registry import PROJECTION_CONTEXT_V2, ProjectionContextV2
+        from ...graph_coordinator import verify_complete_projection_snapshot_v1
 
-        if view_type != _WORKBENCH_VIEW or not isinstance(context, ProjectionContextV1):
+        if view_type != _WORKBENCH_VIEW or not isinstance(context, ProjectionContextV2):
             raise ValueError("unsupported D06 workbench projection context")
-        if context.schema_version != PROJECTION_CONTEXT_V1:
-            raise ValueError("unsupported D06 workbench projection context version")
-        if len(atoms) >= 100:
-            raise ValueError("D06 workbench snapshot completeness is not proven")
+        if (context.schema_version != PROJECTION_CONTEXT_V2
+                or not verify_complete_projection_snapshot_v1(
+                    context.snapshot_proof, authority=context.authority,
+                    view_type=view_type, type_names=_WORKBENCH_TYPES,
+                    owner_kind="event", audience=context.audience,
+                    purpose=context.purpose)):
+            raise ValueError("complete fenced snapshot proof is unavailable")
 
         sources = {}
         accesses = {}
@@ -555,23 +557,19 @@ class D06DomainProvider:
                 interpretations[record.interpretation_id] = record
             else:
                 raise ValueError("D06 projection input contains an undeclared type")
-
-        if set(accesses) != set(sources):
-            raise ValueError("D06 source/access closure is incomplete")
-        for interpretation in interpretations.values():
-            if not set(interpretation.source_ids).issubset(sources):
-                raise ValueError("D06 interpretation references an absent source")
         retracted_sources = {
             source_id
             for interpretation in interpretations.values()
             if interpretation.status == "retracted"
             for source_id in interpretation.source_ids
+            if source_id in sources
         }
 
         projected = []
         for source_id, source in sorted(sources.items()):
-            access = accesses[source_id]
-            if access["status"] != "active" or source_id in retracted_sources:
+            access = accesses.get(source_id)
+            if (access is None or access["status"] != "active"
+                    or source_id in retracted_sources):
                 continue
             if (context.audience not in source.audiences
                     or context.purpose not in source.purposes

@@ -12,15 +12,18 @@ from sylanne3.authority_service.v2_owner_contract import (
     canonical_digest as owner_contract_digest,
 )
 from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
-from sylanne3.contracts import canonical_json
+from sylanne3.contracts import Event, Scope, canonical_json
 from sylanne3.graph_coordinator import (
     GraphCoordinator, UnavailableGuard, namespace_ref,
 )
-from sylanne3.graph_store import ProductionGraphStore
+from sylanne3.graph_store import GraphStore, ProductionGraphStore
 from sylanne3.graph_worker import GraphWorker
 from sylanne3.graph_types import (
-    TypeRegistry, owner_grant_key, owner_grant_spec,
+    AtomKey, GraphCandidate, GraphWrite, Owner, TypeRegistry, owner_grant_key, owner_grant_spec,
 )
+from sylanne3.domains.d06 import D06DomainProvider
+from sylanne3.domain_registry import discover_domain_registry
+from sylanne3.memory_types import SourceRecord, access_key, source_key
 from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime_contracts import (
     AuthorityContext, NamespaceId, SnapshotRequirementsV2, canonical_digest,
@@ -29,7 +32,10 @@ from sylanne3.workbench_api.owner_grant import (
     DurableOwnerGrantResolver, GraphCurrentOwnerGrantPort,
 )
 from sylanne3.workbench_api.service import AuthenticatedSession
-from sylanne3.workbench_api import AsyncGraphWorkbenchService, RequestContext
+from sylanne3.workbench_api import (
+    AsyncGraphWorkbenchService, CoordinatorGrant, CurrentDomainViewRegistry,
+    GraphWorkbenchIssuer, RequestContext,
+)
 
 
 NAMESPACE = NamespaceId("bot", "persona")
@@ -111,6 +117,8 @@ class Provider:
 def owner_graph(tmp_path):
     registry = TypeRegistry()
     registry.register(owner_grant_spec())
+    for spec in D06DomainProvider.type_specs():
+        registry.register(spec)
     graph = ProductionGraphStore(tmp_path / "business.db", registry)
     anchor = RestoreAnchor(
         "authority", namespace_ref(NAMESPACE), 1, "deletion", 0, "genesis",
@@ -130,6 +138,10 @@ def owner_graph(tmp_path):
             and namespace == NAMESPACE else None)
     spec = registry.spec(owner_grant_key(*NAMESPACE.as_tuple).type_name)
     coordinator.register_provider(bootstrap, "d11", Provider(), "owner", spec.schema_hash)
+    d06 = D06DomainProvider()
+    coordinator.register_provider(
+        bootstrap, "d06", d06, "d06.contract.v1", d06.descriptor.request_schema_hash,
+    )
     metadata = graph.install_graph_recovery_genesis(
         target, _capability=graph._coordinator_capability)
     grant = {
@@ -142,7 +154,7 @@ def owner_graph(tmp_path):
         "state": "pending_authority", "scope": "bot/persona",
         "issuer_ref": "authority:installation",
         "capabilities": ["workbench.read"],
-        "purposes": ["workbench_view"], "audiences": ["owner"],
+        "purposes": ["context", "workbench_view"], "audiences": ["owner"],
         "activation_generation": 1, "graph_incarnation": "graph-incarnation",
     }
     proof = OwnerGraphCommitProofV1(
@@ -187,6 +199,106 @@ def owner_graph(tmp_path):
         yield graph, coordinator, bootstrap, port, key, pairing
     finally:
         graph.close()
+
+
+def test_d06_workbench_uses_full_fenced_private_scan_without_count_side_channel(
+        owner_graph, monkeypatch):
+    graph, coordinator, bootstrap, _, _, _ = owner_graph
+    authority, lease, _ = coordinator.grant_current_owner(
+        bootstrap, actor="owner-session", namespace=NAMESPACE,
+        domains=("d06", "d11"), purpose="context", audience="owner",
+        activation_generation=1,
+    )
+    views = CurrentDomainViewRegistry(discover_domain_registry)
+
+    class Resolver:
+        def resolve(self, **_kwargs):
+            return CoordinatorGrant("bot/persona", authority, lease)
+
+    issuer = GraphWorkbenchIssuer(coordinator, Resolver(), views)
+    session = AuthenticatedSession(
+        "owner-session", "dashboard-session",
+        {"bot/persona": frozenset({"workbench.read"})},
+        {"bot/persona": frozenset({"owner"})},
+        {"bot/persona": frozenset({"context"})},
+    )
+    baseline = issuer.read_projection(
+        session=session, scope="bot/persona", view_type="d06.memory_sources.v1",
+        purpose="context", audience="owner",
+    )
+    assert baseline["status"] == "ready"
+    assert baseline["projection"]["data"]["sources"] == []
+
+    namespace = NAMESPACE.as_tuple
+    writes = []
+    for index in range(400):
+        source_id = f"private-{index:03d}"
+        source_audiences = ("other",) if index % 3 == 0 else ("owner",)
+        source = SourceRecord(
+            source_id, f"private text {index}", "private speaker", "reported",
+            "reported", None, 1.0, "private-provenance", source_audiences, ("context",),
+        )
+        source_ref = source_key(*namespace, source_id)
+        access_ref = access_key(*namespace, source_id)
+        writes.append(GraphWrite(source_ref, source.to_dict()))
+        if index % 3 != 2:
+            withdrawn = index % 3 == 1
+            writes.append(GraphWrite(access_ref, {
+                "source_id": source_id,
+                "audiences": ["owner"] if withdrawn else ["other"],
+                "purposes": ["context"],
+                "status": "withdrawn" if withdrawn else "active",
+                "recorded_at": 1.0,
+            }, (source_ref,)))
+    reads = GraphStore.graph_snapshot(
+        graph, tuple(write.key for write in writes),
+        _capability=graph._coordinator_capability,
+    )
+    GraphStore.graph_commit(
+        graph,
+        GraphCandidate(
+            Event(Scope("bot", "persona", "seed"), "private-memory-batch", 2.0,
+                  "test", {}),
+            reads.versions, tuple(writes), reads.epochs,
+        ),
+        _capability=graph._coordinator_capability,
+    )
+    with graph._lock:
+        graph._db.execute("BEGIN IMMEDIATE")
+        try:
+            recovery = graph.graph_recovery_metadata(
+                NAMESPACE, _capability=graph._coordinator_capability,
+            )
+            graph.cas_graph_recovery_metadata(
+                recovery, recovery.requirements,
+                _capability=graph._coordinator_capability,
+            )
+            graph._db.execute("COMMIT")
+        except BaseException:
+            graph._db.execute("ROLLBACK")
+            raise
+
+    query_calls = []
+    original_query = GraphStore.graph_query
+
+    def count_memory_pages(store, *args, **kwargs):
+        if set(kwargs.get("type_names", ())) == {
+                "memory.source", "memory.access", "memory.interpretation"}:
+            query_calls.append(kwargs)
+        return original_query(store, *args, **kwargs)
+
+    monkeypatch.setattr(GraphStore, "graph_query", count_memory_pages)
+    after_private_rows = issuer.read_projection(
+        session=session, scope="bot/persona", view_type="d06.memory_sources.v1",
+        purpose="context", audience="owner",
+    )
+    assert len(query_calls) == 2
+    assert after_private_rows["status"] == baseline["status"] == "ready"
+    assert after_private_rows["projection"] == baseline["projection"]
+    assert "private text" not in repr(after_private_rows)
+    assert "private-" not in repr(after_private_rows)
+
+    coordinator.release_current_owner_lease(bootstrap, lease)
 
 
 def test_owner_read_requires_resolved_principal_and_current_heads(owner_graph):

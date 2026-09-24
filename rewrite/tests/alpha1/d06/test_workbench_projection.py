@@ -2,10 +2,11 @@ import pytest
 
 from sylanne3.domains.d06 import D06DomainProvider
 from sylanne3.domain_registry import discover_domain_registry
-from sylanne3.graph_types import AtomKey, Owner
+from sylanne3.graph_coordinator import CompleteProjectionSnapshotV1, _COMPLETE_PROJECTION_SEAL
+from sylanne3.graph_types import AtomKey, NamespaceEpoch, Owner
 from sylanne3.memory_types import InterpretationRecord, SourceRecord
 from sylanne3.runtime_contracts import AuthorityContext, NamespaceId
-from sylanne3.workbench_api.domain_registry import ProjectionContextV1
+from sylanne3.workbench_api.domain_registry import ProjectionContextV1, ProjectionContextV2
 from sylanne3.workbench_api.domain_registry import CurrentDomainViewRegistry
 
 
@@ -14,7 +15,13 @@ def context(*, audience="owner", purpose="context"):
         "actor", "d12", "capability", NamespaceId("bot", "persona"),
         ("event",), purpose, (audience,), "policy", 3,
     )
-    return ProjectionContextV1(authority, audience, purpose)
+    proof = CompleteProjectionSnapshotV1(
+        authority.namespace, NamespaceEpoch("bot", "persona", 1),
+        authority.activation_generation, "d06.memory_sources.v1",
+        ("memory.source", "memory.access", "memory.interpretation"), "event",
+        audience, purpose, _seal=_COMPLETE_PROJECTION_SEAL,
+    )
+    return ProjectionContextV2(authority, audience, purpose, proof)
 
 
 def source(source_id="s1", *, audiences=("owner",), purposes=("context",)):
@@ -71,7 +78,7 @@ def test_projection_hides_withdrawn_or_context_mismatched_sources(access_value):
     assert result["sources"] == []
 
 
-def test_projection_hides_retracted_source_and_fails_on_missing_access_or_source():
+def test_projection_hides_retracted_source_and_fails_closed_on_missing_access():
     retracted = InterpretationRecord("i1", ("s1",), "subject", "private claim",
                                      "retracted", 1.0, 2.0).to_dict()
     result = D06DomainProvider.project_workbench(
@@ -81,22 +88,21 @@ def test_projection_hides_retracted_source_and_fails_on_missing_access_or_source
     )
     assert result["sources"] == []
 
-    with pytest.raises(ValueError, match="source/access closure"):
-        D06DomainProvider.project_workbench(
-            "d06.memory_sources.v1", (atom("memory.source", source()),), context=context(),
-        )
-    with pytest.raises(ValueError, match="source/access closure"):
-        D06DomainProvider.project_workbench(
-            "d06.memory_sources.v1", (atom("memory.access", access("s1")),), context=context(),
-        )
+    missing_access = D06DomainProvider.project_workbench(
+        "d06.memory_sources.v1", (atom("memory.source", source()),), context=context(),
+    )
+    orphan_access = D06DomainProvider.project_workbench(
+        "d06.memory_sources.v1", (atom("memory.access", access("s1")),), context=context(),
+    )
+    assert missing_access == orphan_access == {"sources": [], "coverage": "complete"}
 
 
-def test_projection_rejects_full_page_because_issuer_hides_truncation():
+def test_projection_accepts_more_than_one_page_with_complete_snapshot_proof():
     full_page = tuple(atom("memory.source", source(f"s{i}")) for i in range(100))
-    with pytest.raises(ValueError, match="completeness is not proven"):
-        D06DomainProvider.project_workbench(
-            "d06.memory_sources.v1", full_page, context=context(),
-        )
+    result = D06DomainProvider.project_workbench(
+        "d06.memory_sources.v1", full_page, context=context(),
+    )
+    assert result == {"sources": [], "coverage": "complete"}
 
 
 def test_projection_requires_atom_identity_to_bind_values_to_owner_keys():
@@ -113,7 +119,7 @@ def test_projection_rejects_value_key_identity_mismatch():
     raw = atom("memory.source", source())
     raw["key"] = AtomKey(Owner("event", "bot", "persona", "other"),
                           "memory.source", "record").token
-    with pytest.raises(ValueError, match="identity does not match graph key"):
+    with pytest.raises(ValueError, match="source identity does not match"):
         D06DomainProvider.project_workbench(
             "d06.memory_sources.v1", (raw, atom("memory.access", access("s1"))),
             context=context(),
@@ -125,7 +131,16 @@ def test_projection_contract_uses_same_event_owned_current_snapshot_types():
     assert contract["types"] == (
         "memory.source", "memory.access", "memory.interpretation",
     )
-    assert contract["projection_context"] == "d12.projection_context.v1"
+    assert contract["projection_context"] == "d12.projection_context.v2"
+
+
+def test_projection_rejects_unproven_legacy_context_even_for_small_snapshot():
+    with pytest.raises((TypeError, ValueError), match="complete fenced snapshot|unsupported"):
+        D06DomainProvider.project_workbench(
+            "d06.memory_sources.v1",
+            (atom("memory.source", source()), atom("memory.access", access("s1"))),
+            context=ProjectionContextV1(context().authority, "owner", "context"),
+        )
 
 
 def test_live_domain_registry_exposes_only_declared_d06_projection():
@@ -138,6 +153,6 @@ def test_live_domain_registry_exposes_only_declared_d06_projection():
     projected = registry.project_workbench(
         authority, "d06.memory_sources.v1",
         (atom("memory.source", source()), atom("memory.access", access("s1"))),
-        audience="owner", purpose="context",
+        audience="owner", purpose="context", snapshot_proof=context().snapshot_proof,
     )
     assert projected["sources"][0]["source_id"] == "s1"

@@ -19,6 +19,7 @@ from ..runtime_contracts import AuthorityContext
 
 
 PROJECTION_CONTEXT_V1 = "d12.projection_context.v1"
+PROJECTION_CONTEXT_V2 = "d12.projection_context.v2"
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,15 @@ class ProjectionContextV1:
     audience: str
     purpose: str
     schema_version: str = PROJECTION_CONTEXT_V1
+
+
+@dataclass(frozen=True)
+class ProjectionContextV2:
+    authority: AuthorityContext
+    audience: str
+    purpose: str
+    snapshot_proof: object
+    schema_version: str = PROJECTION_CONTEXT_V2
 
 
 @dataclass(frozen=True)
@@ -94,7 +104,8 @@ class CurrentDomainViewRegistry:
                     fields = frozenset(definition.get("fields", ()))
                     context_version = definition.get("projection_context")
                     if (not isinstance(view_name, str) or not view_name or not names or not fields
-                            or context_version not in (None, PROJECTION_CONTEXT_V1)
+                            or context_version not in (None, PROJECTION_CONTEXT_V1,
+                                                       PROJECTION_CONTEXT_V2)
                             or len(set(names)) != len(names)
                             or any(not isinstance(name, str) or name not in specs_by_name
                                    for name in names)
@@ -146,7 +157,8 @@ class CurrentDomainViewRegistry:
     def project_workbench(self, authority: AuthorityContext, view_type: str,
                           atoms: tuple[Mapping[str, Any], ...], *,
                           audience: str | None = None,
-                          purpose: str | None = None) -> Mapping[str, Any]:
+                          purpose: str | None = None,
+                          snapshot_proof: object | None = None) -> Mapping[str, Any]:
         definitions, _ = self._definitions(authority)
         definition = definitions.get(view_type)
         if definition is None:
@@ -160,6 +172,20 @@ class CurrentDomainViewRegistry:
             result = definition.projector(
                 view_type, atoms,
                 context=ProjectionContextV1(authority, audience, purpose))
+        elif definition.context_version == PROJECTION_CONTEXT_V2:
+            if (not isinstance(audience, str) or audience not in authority.audience
+                    or purpose != authority.purpose):
+                raise PermissionError("projection context does not match authority")
+            from ..graph_coordinator import verify_complete_projection_snapshot_v1
+
+            if not verify_complete_projection_snapshot_v1(
+                    snapshot_proof, authority=authority, view_type=view_type,
+                    type_names=definition.types, owner_kind=definition.owner_kind,
+                    audience=audience, purpose=purpose):
+                raise PermissionError("complete fenced snapshot proof is unavailable")
+            result = definition.projector(
+                view_type, atoms,
+                context=ProjectionContextV2(authority, audience, purpose, snapshot_proof))
         else:
             result = definition.projector(view_type, atoms)
         if not isinstance(result, Mapping) or set(result) - definition.fields:
@@ -172,4 +198,4 @@ class CurrentDomainViewRegistry:
 
 
 __all__ = ("CurrentDomainViewRegistry", "ViewCatalogue", "ProjectionContextV1",
-           "PROJECTION_CONTEXT_V1")
+           "ProjectionContextV2", "PROJECTION_CONTEXT_V1", "PROJECTION_CONTEXT_V2")

@@ -14,11 +14,14 @@ from typing import Any, Mapping, Protocol
 from ..contracts import StaleRead
 from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..graph_types import AtomKey, GraphPage, NamespaceEpoch
-from ..graph_coordinator import RoleInitializationReceiptV1, SceneBindingReceiptV1
+from ..graph_coordinator import (
+    RoleInitializationReceiptV1, SceneBindingReceiptV1,
+    WorkbenchProjectionSnapshotV1,
+)
 from ..domains.d01 import ActiveRoleQualification
 from ..domains.d03.context import RoleBindingResolution
 from ..runtime_contracts import AuthorityContext
-from .domain_registry import PROJECTION_CONTEXT_V1
+from .domain_registry import PROJECTION_CONTEXT_V1, PROJECTION_CONTEXT_V2
 from .onboarding import OnboardingPolicyResolver, TrustedBindScene, TrustedCreateCharacter
 from .d01_onboarding import VerifiedCreationResources
 from .service import AuthenticatedSession, request_digest
@@ -103,6 +106,33 @@ class GraphWorkbenchIssuer:
         # coverage: hidden atoms could reveal their existence through either.
         if context_version == PROJECTION_CONTEXT_V1 and (cursor is not None or page_size != 100):
             return _unavailable("view_pagination_unavailable")
+        if context_version == PROJECTION_CONTEXT_V2:
+            if cursor is not None or page_size != 100:
+                return _unavailable("view_pagination_unavailable")
+            complete_reader = getattr(self._coordinator,
+                                      "project_workbench_snapshot_v1", None)
+            if not callable(complete_reader):
+                return _unavailable("field_projection_unavailable")
+            try:
+                candidate = complete_reader(
+                    grant.authority, grant.lease, view_registry=self._view_registry,
+                    view_type=view_type, audience=audience, purpose=purpose,
+                )
+            except PermissionError:
+                raise
+            except Exception:
+                return _unavailable("graph_query_unavailable")
+            if (type(candidate) is not WorkbenchProjectionSnapshotV1
+                    or candidate.namespace != grant.authority.namespace
+                    or not isinstance(candidate.data, Mapping)):
+                return _unavailable("invalid_field_projection")
+            return {"status": "ready", "projection": {
+                "view_type": view_type,
+                "namespace": {"bot": candidate.namespace.bot_id,
+                              "persona": candidate.namespace.persona_id},
+                "data": dict(candidate.data),
+                "access_generation": grant.authority.activation_generation,
+            }}
         after = expected_epoch = None
         if cursor is not None:
             try:
@@ -440,7 +470,7 @@ class GraphWorkbenchIssuer:
         if not callable(resolver):
             raise TypeError("invalid projection context resolver")
         version = resolver(grant.authority, view_type)
-        if version not in (None, PROJECTION_CONTEXT_V1):
+        if version not in (None, PROJECTION_CONTEXT_V1, PROJECTION_CONTEXT_V2):
             raise ValueError("unsupported projection context version")
         return version
 
