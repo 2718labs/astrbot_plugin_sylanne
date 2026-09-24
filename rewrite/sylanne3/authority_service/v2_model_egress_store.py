@@ -77,9 +77,9 @@ def _decoded_observation(value: str) -> ModelEgressObservationV1:
 class AuthorityV2ModelEgressStore:
     """Transactionally records identity and a one-way send marker.
 
-    `record_dispatch_started` is an internal persistence primitive for a future
-    executor. It must be called only after independent current graph and fence
-    checks. No production service currently exposes that executor.
+    Dispatch admission uses only the fenced locked primitive after independent
+    current graph and policy checks. The public unfenced marker is disabled.
+    No production service currently exposes a provider executor.
     """
 
     def __init__(self, connection: sqlite3.Connection, *, create: bool = False,
@@ -328,15 +328,6 @@ class AuthorityV2ModelEgressStore:
                 raise AuthorityUnavailable("model egress unavailable for subject or namespace")
             return record
 
-    def _transition(self, intent: ModelEgressIntentV1, state: str,
-                    observation_digest: str | None = None) -> ModelEgressRecoveryV1:
-        if state in {"observed", "unknown"}:
-            raise AuthorityUnavailable("digest-only provider observation is forbidden")
-        target = ModelEgressRecoveryV1(intent, state, observation_digest)
-        with self._tx() as db:
-            self._transition_locked(db, target)
-        return target
-
     def _transition_locked(self, db: sqlite3.Connection,
                            target: ModelEgressRecoveryV1) -> None:
         intent = target.intent
@@ -382,8 +373,8 @@ class AuthorityV2ModelEgressStore:
         return target
 
     def record_dispatch_started(self, intent: ModelEgressIntentV1) -> ModelEgressRecoveryV1:
-        """Commit before any future send; no second caller can cross this boundary."""
-        return self._transition(intent, "dispatch_started")
+        """Legacy unfenced entrypoint is forbidden; use Authority admission."""
+        raise AuthorityUnavailable("unfenced model dispatch marker is forbidden")
 
     def record_observed(self, intent: ModelEgressIntentV1, *,
                         observation_digest: str) -> ModelEgressRecoveryV1:

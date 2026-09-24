@@ -184,21 +184,15 @@ class AuthorityV2ModelEgressService:
 
     def _record_provider_observation(self, *, intent: ModelEgressIntentV1,
                                      response):
-        """Future Authority executor hook after parsing the actual provider response."""
-        if self._fences is None:
-            raise AuthorityUnavailable("protected model fence service unavailable")
-        observation = ModelEgressObservationV1.from_response(intent, response)
-        with self._fences._frozen() as (db, deletion_head, execution_head, deletion_history):
-            self._fences._current_locked(db, deletion_head, execution_head)
-            if deletion_history:
-                raise AuthorityUnavailable("deletion history blocks provider observation")
-            record = self._store._record_observation_locked(db, observation)
-        return record
+        """Unbound responses cannot become Authority facts in a separate commit."""
+        raise AuthorityUnavailable(
+            "HOLD: unbound provider response cannot be an Authority observation"
+        )
 
     def _finish_observed_fenced(self, *, credential, subject: str, holder: str,
                                 intent: ModelEgressIntentV1,
                                 expected_anchor: RestoreAnchor):
-        """Future executor hook; finish and observation checks share one Authority commit."""
+        """Close a previously durable observation, including crash recovery."""
         if self._fences is None or type(intent) is not ModelEgressIntentV1:
             raise AuthorityUnavailable("protected typed model egress unavailable")
         identifier(subject, "subject")

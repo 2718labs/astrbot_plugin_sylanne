@@ -63,19 +63,20 @@ def test_reopen_exact_identity_and_conflict(tmp_path):
             store.read("call-1", subject="another", namespace="bot:persona")
 
 
-def test_same_job_cannot_prepare_different_call_id_even_after_unknown(tmp_path):
+def test_same_job_cannot_prepare_different_call_id(tmp_path):
     path = tmp_path / "authority.db"
     with connection(path) as db:
         store = AuthorityV2ModelEgressStore(db, create=True)
         store.prepare(intent())
-        store.record_dispatch_started(intent())
+        with pytest.raises(AuthorityUnavailable, match="unfenced"):
+            store.record_dispatch_started(intent())
         with pytest.raises(AuthorityUnavailable, match="digest-only"):
             store.record_unknown(intent(), observation_digest="e" * 64)
     with connection(path) as db:
         store = AuthorityV2ModelEgressStore(db)
         with pytest.raises(AuthorityUnavailable, match="job already"):
             store.prepare(intent(call_id="call-2", operation_id="job-operation-2"))
-        assert store.read("call-1", subject="worker", namespace="bot:persona").state == "dispatch_started"
+        assert store.read("call-1", subject="worker", namespace="bot:persona").state == "prepared"
 
 
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5])
@@ -110,15 +111,16 @@ def test_v2_fence_token_round_trips_through_recovery(tmp_path, prefix):
         assert recovered.intent == original
 
 
-def test_dispatch_marker_survives_restart_and_cannot_repeat(tmp_path):
+def test_unfenced_dispatch_marker_is_forbidden_after_restart(tmp_path):
     path = tmp_path / "authority.db"
     with connection(path) as db:
         store = AuthorityV2ModelEgressStore(db, create=True)
         store.prepare(intent())
-        assert store.record_dispatch_started(intent()).state == "dispatch_started"
+        with pytest.raises(AuthorityUnavailable, match="unfenced"):
+            store.record_dispatch_started(intent())
     with connection(path) as db:
         store = AuthorityV2ModelEgressStore(db)
-        assert store.read("call-1", subject="worker", namespace="bot:persona").state == "dispatch_started"
+        assert store.read("call-1", subject="worker", namespace="bot:persona").state == "prepared"
         with pytest.raises(AuthorityUnavailable):
             store.record_dispatch_started(intent())
         with pytest.raises(AuthorityUnavailable, match="digest-only"):
@@ -133,7 +135,8 @@ def test_observation_is_terminal_and_cannot_precede_dispatch(tmp_path):
         store.prepare(intent())
         with pytest.raises(AuthorityUnavailable):
             store.record_observed(intent(), observation_digest="e" * 64)
-        store.record_dispatch_started(intent())
+        with pytest.raises(AuthorityUnavailable, match="unfenced"):
+            store.record_dispatch_started(intent())
         with pytest.raises(AuthorityUnavailable, match="digest-only"):
             store.record_observed(intent(), observation_digest="e" * 64)
         with pytest.raises(AuthorityUnavailable):
@@ -165,7 +168,7 @@ def test_same_call_id_one_winner_across_connections(tmp_path):
         assert store.prepare(saved.intent) == saved
 
 
-def test_dispatch_marker_has_one_winner_across_connections(tmp_path):
+def test_unfenced_dispatch_marker_has_no_winner_across_connections(tmp_path):
     path = tmp_path / "authority.db"
     with connection(path) as db:
         AuthorityV2ModelEgressStore(db, create=True).prepare(intent())
@@ -182,7 +185,10 @@ def test_dispatch_marker_has_one_winner_across_connections(tmp_path):
                 return "blocked"
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        assert sorted(pool.map(claim, range(2))) == ["blocked", "claimed"]
+        assert sorted(pool.map(claim, range(2))) == ["blocked", "blocked"]
+    with connection(path) as db:
+        assert AuthorityV2ModelEgressStore(db).read(
+            "call-1", subject="worker", namespace="bot:persona").state == "prepared"
 
 
 def test_service_remains_hold(tmp_path):
@@ -288,6 +294,7 @@ def test_fenced_prepare_is_atomic_and_recoverable(tmp_path, monkeypatch):
 
 def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch):
     from rewrite.tests.alpha1.runtime.test_authority_v2_rpc_content_fences import _PEER_A, rpc
+    from sylanne3.authority_service.v2_model_egress_contract import ModelEgressObservationV1
     from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
 
     fixture = rpc.__wrapped__(tmp_path)
@@ -309,6 +316,16 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
             credential=_PEER_A, subject="worker", holder="holder-a",
             draft=draft, expected_anchor=anchor)
         original = prepared.intent
+
+        def record_for_storage_test(*, intent, response):
+            # This tests old ledger/recovery states, not provider authenticity.
+            observation = ModelEgressObservationV1.from_response(intent, response)
+            with fences._frozen() as (db, deletion_head, execution_head,
+                                     deletion_history):
+                fences._current_locked(db, deletion_head, execution_head)
+                if deletion_history:
+                    raise AuthorityUnavailable("deletion history blocks provider observation")
+                return store._record_observation_locked(db, observation)
         with pytest.raises(AuthorityUnavailable, match="observation"):
             service._finish_observed_fenced(
                 credential=_PEER_A, subject="worker", holder="holder-a",
@@ -320,25 +337,27 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
             store._record_dispatch_started_fenced_locked(
                 db, original, permit, fences.fences, current)
         with pytest.raises(ValueError, match="unsent"):
-            service._record_provider_observation(
+            record_for_storage_test(
                 intent=original,
                 response=ProviderResponse("not_dispatched", None, None, None, None))
         assert store.read(original.call_id, subject="worker", namespace="ns-a").state == "dispatch_started"
         with pytest.raises(ValueError, match="original call"):
-            service._record_provider_observation(
+            record_for_storage_test(
                 intent=replace(original, request_digest="e" * 64),
                 response=ProviderResponse("completed", {"answer": "wrong"},
                                           None, None, "wrong-ref"))
         parsed = ProviderResponse("completed", {"answer": {"parts": ["ok", 2]}},
                                   {"input_tokens": 4, "output_tokens": 2},
                                   {"micro_usd": 30}, "provider/ref 1")
+        with pytest.raises(AuthorityUnavailable, match="HOLD"):
+            service._record_provider_observation(intent=original, response=parsed)
         original_history = fences.deletion.has_deletion_history
         monkeypatch.setattr(fences.deletion, "has_deletion_history", lambda _: True)
         with pytest.raises(AuthorityUnavailable, match="deletion history"):
-            service._record_provider_observation(intent=original, response=parsed)
+            record_for_storage_test(intent=original, response=parsed)
         assert store.read(original.call_id, subject="worker", namespace="ns-a").state == "dispatch_started"
         monkeypatch.setattr(fences.deletion, "has_deletion_history", original_history)
-        observed = service._record_provider_observation(intent=original, response=parsed)
+        observed = record_for_storage_test(intent=original, response=parsed)
         assert not hasattr(observed, "observation")
         assert observed.usage == tuple(sorted(parsed.usage.items()))
         with store._tx() as db:
@@ -353,7 +372,7 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
             credential=_PEER_A, subject="worker", intent=original) == (observed, permit)
         monkeypatch.setattr(fences.deletion, "has_deletion_history", original_history)
         with pytest.raises(AuthorityUnavailable, match="already resolved"):
-            service._record_provider_observation(intent=original, response=parsed)
+            record_for_storage_test(intent=original, response=parsed)
         path = fences.core._db.execute("PRAGMA database_list").fetchone()[2]
         with connection(path) as reopened:
             recovered = AuthorityV2ModelEgressStore(reopened).read(
@@ -438,7 +457,7 @@ def test_full_observation_restart_and_atomic_typed_finish(tmp_path, monkeypatch)
                                               holder="holder-a")
             store._record_dispatch_started_fenced_locked(
                 db, second.intent, second_permit, fences.fences, current)
-        unknown = service._record_provider_observation(
+        unknown = record_for_storage_test(
             intent=second.intent,
             response=ProviderResponse("unknown", None, {"input_tokens": 4},
                                       {"micro_usd": 15}, "provider/ref 2"))
