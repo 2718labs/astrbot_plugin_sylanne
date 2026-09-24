@@ -8004,7 +8004,7 @@ class GraphCoordinator:
         """Apply D02/D11 decisions in the graph's existing SQLite transaction."""
         from .runtime.issuers import (
             D03_ARRIVAL_WORK_KIND, D03_SELF_IDENTITY_PROJECTION_WORK_KIND,
-            D04_BASELINE_WORK_KIND,
+            D04_BASELINE_WORK_KIND, D06_FIRST_INGRESS_C02_WORK_KIND,
         )
 
         if self.__d02_issuer is None or self.__d11_issuer is None:
@@ -8172,7 +8172,9 @@ class GraphCoordinator:
                     or existing.fence != envelope.authority.worker_fence
                     or existing.cancel_epoch != 0):
                 raise UnavailableGuard("worker result lost its job fence")
-        if envelope.authority.worker_fence is not None and not jobs:
+        if (envelope.authority.worker_fence is not None and not jobs
+                and (quote is None or quote.work_kind !=
+                     D06_FIRST_INGRESS_C02_WORK_KIND)):
             raise UnavailableGuard("worker result has no durable job to fence")
         return admission
 
@@ -10342,6 +10344,325 @@ class GraphCoordinator:
         finally:
             self.release_authority_lease(bootstrap, lease)
 
+    def commit_first_ingress_c02_v1(
+        self, bootstrap: object, original_intent, read, installation_policy,
+        admin_policy, clock_policy,
+    ) -> CommitReceipt:
+        """Adopt one finished V3 worker result through the shared D06 graph path."""
+        from datetime import datetime
+        from types import SimpleNamespace
+
+        from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
+        from .authority_service.v2_worker_model_result_contract import WorkerModelResultReadV1
+        from .domains.d04.encoding_baseline import decode_encoding_baseline
+        from .domains.d06 import D06DomainAdapter, EncodingContext
+        from .domains.d06.pipeline import D06MemoryPipeline
+        from .host.authority_profile import (
+            AdminD06FirstIngressC02Policy, AdminIngressClockPolicy,
+        )
+        from .installation_policy import AdminInstallationPolicy
+        from .memory_repository import MemoryRepository
+        from .runtime.encoding_call_binding import load_binding
+        from .runtime.d11_types import (
+            D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH, job_graph_write,
+            runtime_job_key,
+        )
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import d06_first_ingress_c02_quote_id
+        from .runtime_contracts import (
+            CommandEnvelope, DependencySet, DomainProposal, OperationIdentity,
+            QueryEpoch, RUNTIME_SCHEMA,
+            VersionedRef,
+        )
+
+        self._admin(bootstrap)
+        if (type(original_intent) is not ModelEgressIntentV1
+                or type(read) is not WorkerModelResultReadV1
+                or type(installation_policy) is not AdminInstallationPolicy
+                or type(admin_policy) is not AdminD06FirstIngressC02Policy
+                or type(clock_policy) is not AdminIngressClockPolicy
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__worker_result_fact_port is None
+                or self.__d11_issuer is None):
+            raise UnavailableGuard("installed first-ingress C02 authorities required; HOLD")
+        read.require_original_intent(original_intent)
+        request = read.request
+        namespace = request.namespace
+        if installation_policy.namespace != namespace:
+            raise UnavailableGuard("C02 installation namespace differs; HOLD")
+        duplicate = self._first_ingress_c02_duplicate_v1(
+            namespace, request.consumer_operation_id, original_intent, read)
+        if duplicate is not None:
+            return duplicate
+        try:
+            reading = self.__content_fence_v2.read_ingress_clock(clock_policy)
+            now = trusted_upper(reading)
+        except Exception as exc:
+            raise UnavailableGuard("paired C02 clock unavailable; HOLD") from exc
+        store = self.__store
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            job, _, _, outbox, _, _, source_version, access_version = (
+                self._first_ingress_encoding_job_locked(namespace, request.job_id))
+            binding = load_binding(store._db, namespace, request.job_id)
+            if (binding is None
+                    or binding.request.get("schema") !=
+                    "sylanne.first-ingress-encoding-call.v3"
+                    or (binding.call_id, binding.binding_digest,
+                        binding.model_request_digest, binding.source_id) !=
+                       (request.call_id, request.binding_digest,
+                        request.model_request_digest, outbox.payload_ref)
+                    or (job.operation_id, job.phase, job.lease_holder,
+                        job.cancel_epoch, job.fence) !=
+                       (request.original_operation_id, "running",
+                        original_intent.subject, 0, original_intent.worker_fence)
+                    or request.acquire_operation_id !=
+                       binding.request["acquire_operation_id"]
+                    or request.consumer_operation_id == job.operation_id):
+                raise UnavailableGuard("C02 original V3 worker identity differs; HOLD")
+            baseline = self._committed_first_ingress_baseline_locked(
+                namespace, binding.source_id, metadata, epoch)
+            if binding.request.get("baseline") != asdict(baseline):
+                raise UnavailableGuard("C02 frozen baseline differs; HOLD")
+            db = store._db
+            source_row = db.execute(
+                "SELECT value FROM graph_atoms WHERE token=? AND valid=1",
+                (source_version.key.token,),
+            ).fetchone()
+            baseline_row = db.execute(
+                "SELECT value FROM graph_atoms WHERE token=? AND valid=1",
+                (baseline.baseline_ref,),
+            ).fetchone()
+            if source_row is None or baseline_row is None:
+                raise UnavailableGuard("C02 source or baseline absent; HOLD")
+            source = SourceRecord.from_dict(json.loads(source_row[0]))
+            decoded = decode_encoding_baseline(json.loads(baseline_row[0]))
+            perspective_key = AtomKey.from_token(decoded.perspective_ref)
+            perspective_row = db.execute(
+                "SELECT value FROM graph_atoms WHERE token=? AND valid=1",
+                (perspective_key.token,),
+            ).fetchone()
+            if perspective_row is None:
+                raise UnavailableGuard("C02 self perspective absent; HOLD")
+            perspective = json.loads(perspective_row[0])
+            event_key = AtomKey.from_token(perspective["arrival_event_ref"])
+            mapping_key = AtomKey.from_token(perspective["identity_mapping_ref"])
+            keys = tuple(dict.fromkeys((
+                source_version.key, access_version.key, event_key,
+                perspective_key, mapping_key,
+                *(AtomKey.from_token(item.ref) for item in
+                  decoded.then_feeling_versions),
+                *(AtomKey.from_token(item.ref) for item in
+                  decoded.interpretation_versions),
+                AtomKey.from_token(baseline.baseline_ref),
+            )))
+            rows = [db.execute(
+                "SELECT revision,valid FROM graph_atoms WHERE token=?",
+                (key.token,),
+            ).fetchone() for key in keys]
+            if any(row is None or row[1] != 1 for row in rows):
+                raise UnavailableGuard("C02 committed context changed; HOLD")
+            versions = tuple(GraphVersion(key, row[0])
+                             for key, row in zip(keys, rows))
+            context = EncodingContext(
+                event_key.token, perspective_key.token,
+                tuple(item.ref for item in decoded.then_feeling_versions),
+                tuple(item.ref for item in decoded.interpretation_versions),
+                (), tuple((item.key.token, item.revision) for item in versions))
+            qualification = self._original_first_ingress_qualification_locked(
+                namespace, job.operation_id, source_version.key.token)
+            job_key = runtime_job_key(*namespace.as_tuple, job.activity_id,
+                                      job.job_id)
+            job_row = db.execute(
+                "SELECT revision,valid FROM graph_atoms WHERE token=?",
+                (job_key.token,),
+            ).fetchone()
+            if job_row is None or job_row[1] != 1:
+                raise UnavailableGuard("C02 original job projection absent; HOLD")
+            authority_epochs = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone()
+            guards = dict(db.execute(
+                "SELECT kind,version FROM graph_guard_versions WHERE bot=? "
+                "AND persona=? AND ref='current'", namespace.as_tuple,
+            ).fetchall())
+        repository = MemoryRepository(store, *namespace.as_tuple)
+        # D06's preparation reads a snapshot through its repository.store.
+        # Give it only coordinator-authorized reads of this same graph store;
+        # ProductionGraphStore intentionally denies direct domain access.
+        repository.store = SimpleNamespace(
+            _registry=store._registry,
+            graph_snapshot=lambda keys: GraphStore.graph_snapshot(
+                store, keys, _capability=store._coordinator_capability),
+            graph_epoch=lambda bot, persona: GraphStore.graph_epoch(
+                store, bot, persona, _capability=store._coordinator_capability),
+        )
+        pipeline = D06MemoryPipeline(D06DomainAdapter(namespace), repository)
+        audience = tuple(binding.request["envelope"]["authority"]["audience"])
+        if len(audience) != 1:
+            raise UnavailableGuard("C02 requires one original audience; HOLD")
+        prepared = pipeline.prepare_worker_first_ingress_encoding(
+            read, binding, source, context,
+            encoding_baseline_ref=baseline.baseline_ref,
+            audience=audience[0], purpose="consolidation")
+        deadline = min(now + admin_policy.deadline_after_seconds,
+                       installation_policy.root_grant.valid_until_utc,
+                       datetime.fromisoformat(job.lease_expires_utc.replace(
+                           "Z", "+00:00")).timestamp())
+        if deadline <= now:
+            raise UnavailableGuard("C02 worker or quote deadline expired; HOLD")
+        operation_id = request.consumer_operation_id
+        lease, capability = self.grant(
+            bootstrap, actor=job.lease_holder, issuer_domain="d06",
+            namespace=namespace, domains=("d06", "d11"),
+            activation_generation=metadata.requirements.activation_generation,
+            operation_id=operation_id)
+        try:
+            authority = AuthorityContext(
+                job.lease_holder, "d06", capability, namespace,
+                ("event", "activity"),
+                "consolidation", audience,
+                installation_policy.root_grant.policy_ref,
+                metadata.requirements.activation_generation, job.fence)
+            episode = prepared.prepared.proposal.episode
+            trace = prepared.prepared.proposal.trace
+            from .memory_types import episode_key, subjective_trace_v2_key
+            output_versions = (
+                GraphVersion(episode_key(*namespace.as_tuple,
+                                         episode.episode_id), 0),
+                GraphVersion(subjective_trace_v2_key(*namespace.as_tuple,
+                                                     trace.trace_id), 0),
+            )
+            input_refs = (source_version.key.token, event_key.token,
+                          baseline.baseline_ref)
+            envelope = CommandEnvelope(
+                RUNTIME_SCHEMA,
+                OperationIdentity(job.activity_id, None, "first-ingress-c02",
+                                  "first_ingress_c02", operation_id,
+                                  canonical_digest({"input_refs": list(input_refs)})),
+                authority,
+                VersionGuard(
+                    versions + (GraphVersion(job_key, job_row[0]),) + output_versions,
+                    (QueryEpoch(namespace, "all", epoch.revision),),
+                    *authority_epochs, store._registry.catalogue_hash,
+                    guards["scheme"], guards["operator"], guards["policy"],
+                    (), (), (VersionedRef(
+                        d06_first_ingress_c02_quote_id(namespace, operation_id),
+                        1),)),
+                qualification, input_refs, job.budget_ref, deadline,
+                reading.monotonic_after_seconds +
+                (deadline - reading.utc_upper_bound_seconds),
+                binding.request["envelope"]["character_interval_ref"],
+                (job.operation_id, request.acquire_operation_id),
+            )
+            held = pipeline.compile_first_ingress_c02_v2(
+                envelope, prepared, read,
+                audience=audience[0], purpose="consolidation")
+            completed_job = replace(
+                job, phase="completed", result_ref=episode.episode_id,
+                lease_holder=None, lease_expires_utc=None)
+            job_proposal = DomainProposal(
+                "d11", D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
+                envelope, (job_graph_write(completed_job),),
+                DependencySet(), (), ())
+            bundle = DomainBundle(envelope, (held.proposal, job_proposal), (), (), (),
+                                  (), (), (), ())
+            return self._commit_domain_bundle_v2(
+                bundle, lease, c02_adoption=(
+                    original_intent, read, binding, held, installation_policy,
+                    admin_policy, now))
+        finally:
+            self.release_authority_lease(bootstrap, lease)
+
+    def _first_ingress_c02_duplicate_v1(
+        self, namespace: NamespaceId, operation_id: str, original_intent, read,
+    ) -> CommitReceipt | None:
+        """Replay a committed C02 from its immutable result and graph receipts."""
+        from .authority_service.v2_contract import FencePermitV2, from_wire
+
+        store = self.__store
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            row = store._db.execute(
+                "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+                "FROM graph_bundle_operations WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            data = json.loads(row[4])
+            c02 = data.get("first_ingress_c02")
+            if (not isinstance(c02, dict)
+                    or c02.get("read_request_digest") != read.request.digest
+                    or c02.get("read_result_digest") != canonical_digest(asdict(read))
+                    or c02.get("original_intent_digest") != canonical_digest(
+                        asdict(original_intent))
+                    or c02.get("terminal_receipt_digest") != canonical_digest(
+                        asdict(read.terminal_receipt))
+                    or c02.get("observation_digest") != read.observation.digest
+                    or c02.get("result_digest") != canonical_digest(
+                        read.observation.result)):
+                raise EventConflict("C02 operation ID reused with different original result")
+            graph = store._db.execute(
+                "SELECT reads,revisions,epoch_revision FROM graph_events "
+                "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+                namespace.as_tuple + (row[1], operation_id),
+            ).fetchone()
+            fence = store._db.execute(
+                "SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,"
+                "post_graph_revision,post_graph_epoch,finish_request_id,"
+                "finish_request_digest FROM graph_bundle_fences_v2 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if graph is None or fence is None or fence[0] != row[0]:
+                raise UnavailableGuard("C02 committed graph or fence receipt is absent")
+            receipt = CommitReceipt(
+                "duplicate", operation_id, row[0], row[1], row[2], row[3],
+                GraphStore._version_rows(graph[0]),
+                GraphStore._version_rows(graph[1]),
+                (NamespaceEpoch(*namespace.as_tuple, graph[2]),),
+                tuple(data["ledger_refs"]), tuple(data["outbox_refs"]),
+            )
+        anchor = self.__content_fence_v2.current_anchor(
+            namespace=namespace,
+            authority_namespace=metadata.requirements.authority_namespace)
+        if not self._anchor_matches(metadata.requirements, anchor):
+            raise UnavailableGuard("C02 replay Authority anchor differs")
+        try:
+            permit = from_wire(json.loads(fence[1]))
+        except (TypeError, ValueError) as exc:
+            raise UnavailableGuard("C02 replay write permit is invalid") from exc
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.pinned_anchor != anchor or permit.holder != self.__holder
+                or permit.generation != metadata.requirements.activation_generation
+                or fence[4] != fence[2] + 1
+                or fence[5] < fence[3]
+                or metadata.graph_revision < fence[4]
+                or epoch.revision < fence[5]):
+            raise UnavailableGuard("C02 replay graph write fence differs")
+        observed, state = self.__content_fence_v2.get_fence_operation(
+            namespace=namespace,
+            authority_namespace=metadata.requirements.authority_namespace,
+            operation_id=permit.operation_id)
+        if observed != permit or state not in {"active", "finished"}:
+            raise UnavailableGuard("C02 replay Authority write state differs")
+        if state == "active":
+            if (metadata.graph_revision, epoch.revision) != (fence[4], fence[5]):
+                raise UnavailableGuard("C02 replay active fence lost its graph stamp")
+            scope = FenceScope(
+                namespace, metadata.requirements.authority_namespace,
+                metadata.requirements.activation_generation,
+                "write", permit.operation_id, permit, anchor,
+                NamespaceEpoch(*namespace.as_tuple, fence[3]), fence[2])
+            if self.__content_fence_v2.validate_fence(scope) != permit:
+                raise UnavailableGuard("C02 replay active write permit differs")
+            self.__content_fence_v2.finish_fence(
+                scope, request_id=fence[6], request_digest=fence[7])
+        return receipt
+
     def commit_domain_bundle(self, bundle: DomainBundle, lease: object) -> CommitReceipt:
         if not isinstance(bundle, DomainBundle):
             raise TypeError("bundle must be DomainBundle")
@@ -10361,6 +10682,133 @@ class GraphCoordinator:
                             for write in proposal.typed_writes),
                 )
             return self._commit_domain_bundle_fenced(bundle, lease)
+
+    def _validate_first_ingress_c02_adoption_locked(
+        self, db, bundle, adoption, v2_write,
+    ) -> None:
+        """Join the Authority finished-read fact to current graph and cost."""
+        from datetime import datetime
+
+        from .runtime.encoding_call_binding import binding_to_json, load_binding
+        from .runtime.model_cost_settlement import OriginalModelCostCommitV1
+
+        (original_intent, read, binding, held, installation, _admin, now), fact, permit = (
+            adoption)
+        envelope = bundle.envelope
+        request = read.request
+        namespace = envelope.authority.namespace
+        if (v2_write is None or len(bundle.proposals) != 2
+                or bundle.proposals[0] != held.proposal
+                or bundle.proposals[0].domain != "d06"
+                or bundle.proposals[1].domain != "d11"
+                or len(bundle.proposals[1].typed_writes) != 1
+                or held.status != "candidate_hold"
+                or request.namespace != namespace
+                or request.consumer_operation_id != envelope.identity.operation_id
+                or request.installation_id != installation.installation_id
+                or fact.read_request != request
+                or fact.write_permit != permit
+                or fact.result_digest != canonical_digest(asdict(read))
+                or fact.original_intent_digest != canonical_digest(
+                    asdict(original_intent))
+                or fact.terminal_receipt != read.terminal_receipt
+                or held.call_id != request.call_id
+                or held.request_digest != request.model_request_digest
+                or held.observation_digest != read.observation.digest
+                or held.result_digest != canonical_digest(read.observation.result)
+                or held.authority_operation_id != request.acquire_operation_id):
+            raise UnavailableGuard("C02 Authority result or held proposal differs; HOLD")
+        read.require_original_intent(original_intent)
+        job = get_job(db, request.job_id)
+        current_binding = load_binding(db, namespace, request.job_id)
+        acquire = db.execute(
+            "SELECT i.job_id,i.original_operation_id,i.actor,"
+            "i.encoding_binding_json,i.graph_revision,i.graph_epoch,"
+            "r.job_json FROM graph_job_acquire_intents_v2 AS i "
+            "JOIN graph_job_acquire_receipts_v2 AS r "
+            "ON r.bot=i.bot AND r.persona=i.persona "
+            "AND r.acquire_operation_id=i.acquire_operation_id "
+            "WHERE i.bot=? AND i.persona=? AND i.acquire_operation_id=?",
+            namespace.as_tuple + (request.acquire_operation_id,),
+        ).fetchone()
+        if (current_binding != binding or acquire is None
+                or acquire[:4] != (
+                    request.job_id, request.original_operation_id,
+                    envelope.authority.actor, binding_to_json(binding))
+                or binding.request.get("schema") !=
+                "sylanne.first-ingress-encoding-call.v3"
+                or (binding.call_id, binding.binding_digest,
+                    binding.model_request_digest) != (
+                    request.call_id, request.binding_digest,
+                    request.model_request_digest)
+                or (job.bot_id, job.persona_id, job.operation_id,
+                    job.activity_id, job.phase, job.lease_holder,
+                    job.fence, job.cancel_epoch, job.result_ref) != (
+                    *namespace.as_tuple, request.original_operation_id,
+                    envelope.identity.activity_id, "running",
+                    envelope.authority.actor, envelope.authority.worker_fence,
+                    0, None)
+                or json.loads(acquire[6]) != asdict(job)
+                or datetime.fromisoformat(job.lease_expires_utc.replace(
+                    "Z", "+00:00")).timestamp() <= now):
+            raise UnavailableGuard("C02 original V3 worker or acquire differs; HOLD")
+        from .runtime.d11_types import job_graph_write
+
+        expected_job = replace(
+            job, phase="completed",
+            result_ref=held.proposal.typed_writes[0].value["episode_id"],
+            lease_holder=None, lease_expires_utc=None)
+        if bundle.proposals[1].typed_writes[0] != job_graph_write(expected_job):
+            raise UnavailableGuard("C02 completed job projection differs; HOLD")
+        metadata, epoch = self._v2_graph_stamp(namespace)
+        baseline = self._committed_first_ingress_baseline_locked(
+            namespace, binding.source_id, metadata, epoch,
+            acquire_stamp=acquire[4:6])
+        if (binding.request.get("baseline") != asdict(baseline)
+                or held.encoding_baseline_ref != baseline.baseline_ref
+                or held.source_ref != binding.source_id
+                or envelope.input_refs[0] != source_key(
+                    *namespace.as_tuple, binding.source_id).token):
+            raise UnavailableGuard("C02 committed source or baseline differs; HOLD")
+        epochs = db.execute(
+            "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        source = db.execute(
+            "SELECT revision,valid FROM graph_atoms WHERE token=?",
+            (envelope.input_refs[0],),
+        ).fetchone()
+        access = db.execute(
+            "SELECT revision,valid FROM graph_atoms WHERE token=?",
+            (access_key(*namespace.as_tuple, binding.source_id).token,),
+        ).fetchone()
+        if (epochs != (envelope.version_guard.access_epoch,
+                       envelope.version_guard.delete_epoch)
+                or source != (binding.source_revision, 1)
+                or access != (binding.access_revision, 1)):
+            raise UnavailableGuard("C02 source access or epoch changed; HOLD")
+        cost_operation_id = "model-cost-" + canonical_digest({
+            "namespace": list(namespace.as_tuple), "call_id": binding.call_id,
+        })[:48]
+        cost_row = db.execute(
+            "SELECT receipt_json FROM graph_bundle_operations "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (cost_operation_id,),
+        ).fetchone()
+        if cost_row is None:
+            raise UnavailableGuard("C02 original model cost is absent; HOLD")
+        cost = OriginalModelCostCommitV1(
+            **json.loads(cost_row[0])["original_model_cost"])
+        if (cost.status != "committed"
+                or cost.call_id != binding.call_id
+                or cost.terminal_receipt_digest != canonical_digest(
+                    asdict(fact.terminal_receipt))
+                or db.execute(
+                    "SELECT state FROM runtime_budget_reservations "
+                    "WHERE lease_id=? AND operation_id=?",
+                    (job.budget_ref, job.operation_id),
+                ).fetchone() != ("settled",)):
+            raise UnavailableGuard("C02 original terminal cost differs; HOLD")
 
     def _stage_retry_intent_locked(self, db, namespace, stage, source_ref,
                                    original_operation_id, operation_id, digest,
@@ -10456,7 +10904,8 @@ class GraphCoordinator:
     def _commit_domain_bundle_v2(self, bundle: DomainBundle,
                                  lease: object, *, arrival_issuance=None,
                                  baseline_issuance=None,
-                                 self_identity_issuance=None) -> CommitReceipt:
+                                 self_identity_issuance=None,
+                                 c02_adoption=None) -> CommitReceipt:
         """Commit under a durable write attempt; reconcile before any duplicate read."""
         from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
 
@@ -10466,6 +10915,9 @@ class GraphCoordinator:
         namespace = authority.namespace
         operation_id = bundle.envelope.identity.operation_id
         digest = bundle.digest
+        if (bundle.envelope.identity.phase == "first_ingress_c02") != (
+                c02_adoption is not None):
+            raise UnavailableGuard("C02 requires its installed result adoption; HOLD")
         attempt_id = "graph-write-" + canonical_digest({
             "namespace": list(namespace.as_tuple), "operation_id": operation_id,
             "bundle_digest": digest,
@@ -10683,6 +11135,20 @@ class GraphCoordinator:
         })
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("v2 bundle write permit changed")
+        c02_fact = None
+        if c02_adoption is not None:
+            from .authority_service.v2_worker_result_read_fact_contract import (
+                WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+            )
+
+            read = c02_adoption[1]
+            c02_fact = self.__worker_result_fact_port.current_worker_result_read_fact(
+                WorkerResultReadFactRequestV1(read.request, permit))
+            if (type(c02_fact) is not WorkerResultReadFactV1
+                    or c02_fact.read_request != read.request
+                    or c02_fact.write_permit != permit
+                    or c02_fact.result_digest != canonical_digest(asdict(read))):
+                raise UnavailableGuard("original Authority worker result fact differs; HOLD")
         transaction_state = {"phase": "before_transaction"}
         try:
             scene_owner_guard = None
@@ -10782,7 +11248,9 @@ class GraphCoordinator:
                 arrival_issuance=arrival_issuance,
                 baseline_issuance=baseline_issuance,
                 self_identity_issuance=self_identity_issuance,
-                qualified_self=qualified_self)
+                qualified_self=qualified_self,
+                c02_adoption=(c02_adoption, c02_fact, permit)
+                if c02_adoption is not None else None)
         except Exception:
             if transaction_state["phase"] in {"before_transaction", "rolled_back"}:
                 rejection = self._record_rejected_bundle_v2(
@@ -10928,7 +11396,8 @@ class GraphCoordinator:
                                       arrival_issuance=None,
                                       baseline_issuance=None,
                                       self_identity_issuance=None,
-                                      qualified_self=None) -> CommitReceipt:
+                                      qualified_self=None,
+                                      c02_adoption=None) -> CommitReceipt:
         """Join a caller-owned graph transaction when ``in_transaction`` is set.
 
         The caller holds the store lock and owns COMMIT or ROLLBACK.
@@ -10988,7 +11457,9 @@ class GraphCoordinator:
         write_tokens = {write.key.token for write in writes}
         for write in writes:
             if (write.key.type_name == "runtime.job"
-                    and write.key.token not in bundle.persistent_job_refs):
+                    and write.key.token not in bundle.persistent_job_refs
+                    and not (c02_adoption is not None
+                             and write == bundle.proposals[1].typed_writes[0])):
                 raise ValueError("runtime.job write must be a bound persistent job ref")
             if (write.key.type_name == "runtime.outbox"
                     and write.key.token not in bundle.outbox_refs):
@@ -11115,6 +11586,9 @@ class GraphCoordinator:
                 if prior[0] != digest:
                     raise EventConflict("operation ID reused with different bundle")
                 return
+            if c02_adoption is not None:
+                self._validate_first_ingress_c02_adoption_locked(
+                    db, bundle, c02_adoption, v2_write)
             if arrival_issuance is not None:
                 admin_policy, installation_id, arrival_now, source_ref, policy_digest = (
                     arrival_issuance)
@@ -11281,6 +11755,25 @@ class GraphCoordinator:
                                           qualified_mapping.certification_ref,
                                           quote.quote_id, digest),
                 )
+            if c02_adoption is not None:
+                original_intent, read, binding, held, installation, admin, stage_now = (
+                    c02_adoption[0])
+                pre_quote = replace(envelope, version_guard=replace(
+                    envelope.version_guard, resource_lease_versions=()))
+                quote = self.__d11_issuer.issue_d06_first_ingress_c02_quote(
+                    db, pre_quote, admin,
+                    installation_id=installation.installation_id,
+                    job_id=read.request.job_id, now_utc=stage_now)
+                refs = envelope.version_guard.resource_lease_versions
+                if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
+                        quote.quote_id, quote.version):
+                    raise AuthorityDenied("C02 signed quote guard differs")
+                db.execute(
+                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                    "VALUES(?,?,?,?,?)",
+                    namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                          str(quote.version)),
+                )
             snapshot = self._check_guard(
                 db, bundle, ingress_deadline_check=ingress_deadline_check,
                 scene_owner_guard=scene_owner_guard)
@@ -11346,6 +11839,15 @@ class GraphCoordinator:
                     validate_self_identity_projection_snapshot(
                         proposal, snapshot, qualified_self[0], qualified_self[1])
                 else:
+                    if c02_adoption is not None and proposal.domain == "d11":
+                        from .runtime.d11_types import validate_d11_writes
+
+                        validate_d11_writes(
+                            proposal.typed_writes, namespace,
+                            operation_id=c02_adoption[0][2].budget_reservation_operation_id,
+                            activity_id=identity.activity_id,
+                            effect_id=identity.effect_id)
+                        continue
                     provider = self.__providers[proposal.domain][0]
                     # Providers may return approval or the exact unchanged proposal.
                     # A transformed candidate would need its own validation pass.
@@ -11357,6 +11859,17 @@ class GraphCoordinator:
                     self._dispatch_clock_upper(dispatch_clock_reading)
                     if dispatch_clock_reading is not None else now_utc),
                 require_arrival_quote=arrival_issuance is not None))
+            if c02_adoption is not None:
+                from .runtime.jobs import transition_job
+                from .runtime.d11_types import job_graph_write
+
+                completed = transition_job(
+                    db, c02_adoption[0][1].request.job_id,
+                    envelope.authority.actor, envelope.authority.worker_fence,
+                    target_phase="completed",
+                    result_ref=bundle.proposals[1].typed_writes[0].value["result_ref"])
+                if job_graph_write(completed) != bundle.proposals[1].typed_writes[0]:
+                    raise UnavailableGuard("C02 job transition differs from graph write")
             for proposal in bundle.proposals:
                 for write in proposal.typed_writes:
                     if write.key.type_name.startswith("runtime."):
@@ -11433,6 +11946,18 @@ class GraphCoordinator:
                                 for ref in refs)
             data = {"commit_seq": seq, "ledger_refs": list(ledger_refs),
                     "outbox_refs": list(bundle.outbox_refs)}
+            if c02_adoption is not None:
+                original_intent, read, _, held, _, _, _ = c02_adoption[0]
+                fact = c02_adoption[1]
+                data["first_ingress_c02"] = {
+                    "read_request_digest": fact.read_request_digest,
+                    "read_result_digest": fact.result_digest,
+                    "original_intent_digest": fact.original_intent_digest,
+                    "terminal_receipt_digest": canonical_digest(
+                        asdict(fact.terminal_receipt)),
+                    "observation_digest": held.observation_digest,
+                    "result_digest": held.result_digest,
+                }
             if dispatch_candidate is not None:
                 candidate_evidence = (qualified_dispatch_candidates[0]
                                       if qualified_dispatch_candidates else dispatch_candidate)
