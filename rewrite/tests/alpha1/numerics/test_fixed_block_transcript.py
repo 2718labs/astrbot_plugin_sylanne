@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import _ctypes
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from decimal import Decimal, localcontext
 import hashlib
 import json
+import math
 from pathlib import Path
 import platform
 import shutil
@@ -159,19 +160,65 @@ class FixedBlockTranscriptTests(unittest.TestCase):
 
     def test_real_package_bound_step_retains_actual_values_and_hashes(self) -> None:
         block = _block()
+        self.assertEqual(block.j.values, (0.2, -0.2))
         transcript = run_fixed_block_math(self.handle, block)
         self.assertEqual(transcript.input.previous, (0.4, -0.2))
         self.assertEqual(transcript.input.k.offsets, (0, 1, 2))
         self.assertEqual(len(transcript.output), 2)
         self.assertNotEqual(transcript.output, transcript.input.previous)
         self.assertEqual(transcript.bounds.certificate_flags, 1)
+        self.assertEqual(transcript.bounds.status, 0)
+        self.assertLessEqual(transcript.bounds.q_upper, 0.8)
+        self.assertLessEqual(transcript.bounds.iteration_error, block.tolerance)
+        self.assertEqual(transcript.bounds.boundary_eta, 0.0)
+        with localcontext() as context:
+            context.prec = 80
+            d = Decimal.from_float
+            half_step = d(block.h) / 2
+            damping = half_step * d(block.k.values[0]) * d(block.r.values[0])
+            coupling = half_step * d(block.k.values[0]) * d(block.j.values[0])
+            x0, x1 = (d(value) for value in block.previous)
+            rhs0 = (1 - damping) * x0 + coupling * x1
+            rhs1 = -coupling * x0 + (1 - damping) * x1
+            divisor = (1 + damping) ** 2 + coupling ** 2
+            reference = (
+                ((1 + damping) * rhs0 + coupling * rhs1) / divisor,
+                (-coupling * rhs0 + (1 + damping) * rhs1) / divisor,
+            )
+            endpoint_distance = sum(
+                (d(actual) - expected) ** 2
+                for actual, expected in zip(transcript.output, reference)
+            ).sqrt()
+            self.assertLessEqual(endpoint_distance, d(transcript.bounds.iteration_error))
+        decay = math.exp(-0.2)
+        first, second = block.previous
+        continuous = (
+            decay * (math.cos(0.04) * first + math.sin(0.04) * second),
+            decay * (-math.sin(0.04) * first + math.cos(0.04) * second),
+        )
+        self.assertLessEqual(
+            math.dist(transcript.output, continuous), transcript.bounds.trajectory_error,
+        )
+        self.assertGreaterEqual(transcript.bounds.trajectory_error, block.previous_error)
         self.assertEqual(transcript.input_sha256, block.digest())
         self.assertEqual(transcript.production_binding, self.handle.production_binding)
         output_bytes = json.dumps(transcript.output, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
         self.assertEqual(transcript.output_sha256, hashlib.sha256(output_bytes).hexdigest())
         self.assertEqual(transcript.production_binding.native_sha256,
                          hashlib.sha256(self.native_asset.read_bytes()).hexdigest())
-        self.assertEqual(len(transcript.transcript_sha256), 64)
+        expected_transcript = {
+            "schema": "abi2.fixed-block-math-transcript.v1",
+            "input_sha256": transcript.input_sha256,
+            "output_sha256": transcript.output_sha256,
+            "manifest_sha256": transcript.production_binding.manifest_sha256,
+            "native_sha256": transcript.production_binding.native_sha256,
+            "bounds": {field.name: getattr(transcript.bounds, field.name)
+                       for field in fields(transcript.bounds)},
+        }
+        transcript_bytes = json.dumps(
+            expected_transcript, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()
+        self.assertEqual(transcript.transcript_sha256, hashlib.sha256(transcript_bytes).hexdigest())
         self.assertNotEqual(transcript.input_sha256, replace(block, previous_error=2e-4).digest())
         with self.assertRaises(FrozenInstanceError):
             transcript.output = (0.0, 0.0)
