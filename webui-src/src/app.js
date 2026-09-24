@@ -545,7 +545,11 @@ app.addEventListener("click", async (event) => {
   const view = event.target.closest("[data-view]")?.dataset.view;
   if (view) {
     if (view !== state.view) { state.view = view; state.projection = null; }
-    await loadView(); return;
+    const loading = loadView();
+    document.querySelector("#workspace")?.focus();
+    await loading;
+    document.querySelector("#workspace")?.focus();
+    return;
   }
   const action = event.target.closest("[data-command]")?.dataset.command;
   if (action) await command(action);

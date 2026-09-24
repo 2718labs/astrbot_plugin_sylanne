@@ -8,6 +8,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], sce
   const previousLocation = globalThis.location;
   const requests = [];
   const candidateRequests = [];
+  const workspace = { focusCount: 0, focus() { this.focusCount++; } };
   const app = {
     innerHTML: "",
     addEventListener(type, listener) { if (type === "click") this.click = listener; }
@@ -25,6 +26,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], sce
   globalThis.document = {
     querySelector(selector) {
       if (selector === "#app") return app;
+      if (selector === "#workspace") return workspace;
       if (selector === "#role-input") return { value: roleInput };
       if (selector === "#owner-login-form") return { id: "owner-login-form" };
       if (selector === "#page-form") return pageForm;
@@ -78,6 +80,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], sce
   }
   return {
     app, requests, candidateRequests, nextRequest,
+    get workspaceFocusCount() { return workspace.focusCount; },
     get sessionRequests() { return sessionRequests; },
     get statusRequests() { return statusRequests; },
     setRole(value) { roleInput = value; },
@@ -557,6 +560,7 @@ test("creation page renders only the authorized D01 plan summary returned by rea
       snapshot_epoch: 7
     } });
     await selected;
+    assert.equal(ui.workspaceFocusCount, 2, "view selection focuses the loading page and the completed page");
     assert.match(ui.app.innerHTML, /已授权角色方案/);
     assert.match(ui.app.innerHTML, /plan:&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
     assert.match(ui.app.innerHTML, /版本 2 · 创作标记：是/);
