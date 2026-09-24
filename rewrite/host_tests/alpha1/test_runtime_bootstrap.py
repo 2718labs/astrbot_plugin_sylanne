@@ -1060,6 +1060,21 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                     onboarding = plugin._workbench._transport._service._onboarding
                     self.assertIsInstance(onboarding, module.CurrentOnboardingResolver)
                     self.assertIsInstance(
+                        onboarding._d01, module.CurrentD01OnboardingResolver,
+                    )
+                    self.assertIs(
+                        onboarding._d01._catalogue._budgets,
+                        onboarding._d03._owners,
+                    )
+                    self.assertIsInstance(
+                        onboarding._d01._catalogue._models,
+                        module.InstalledModelCapabilityPort,
+                    )
+                    self.assertEqual(
+                        onboarding._d01._catalogue._expected_manifest_digest,
+                        installation.installation_policy.manifest_digest,
+                    )
+                    self.assertIsInstance(
                         onboarding._d03, module.CurrentD03OnboardingResolver,
                     )
                     self.assertIs(

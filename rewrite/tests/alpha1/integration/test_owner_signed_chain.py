@@ -94,7 +94,7 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
                 credential == ADMIN and action in {"owner_identity_pair", "owner_identity_revoke"}
                 or credential == PEER and action in {
                     "owner_pair", "owner_claim", "owner_session",
-                    "owner_guard_read", "read"}
+                    "owner_guard_read", "read", "write"}
                 or credential == WORKER and action in {"owner_guard_read", "read"}
             ) or original_authorizer(credential, action, namespace, holder)
         )
@@ -311,6 +311,22 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
         service.finish_fence(
             credential=WORKER, subject=SUBJECT, permit=permit,
             request_id="finish:signed-owner-guard-read",
+            request_digest="sha256:" + "e" * 64)
+        write_permit = service.begin_fence(
+            credential=WORKER, subject=SUBJECT, holder="administrator",
+            operation="write", operation_id="signed-owner-guard-write",
+            expected_anchor=anchor)
+        assert guard_rpc({**command, "permit": fence_to_wire(write_permit)})[
+            "guard"] is not None
+        with pytest.raises(Exception, match="busy/not_applied"):
+            source.revoke_actor(
+                administrator_credential=ADMIN, binding=actor_binding)
+        with pytest.raises(Exception, match="waits for v2 namespace work"):
+            sessions.logout(
+                transport_credential=PEER, token=token, request=login_request)
+        service.finish_fence(
+            credential=WORKER, subject=SUBJECT, permit=write_permit,
+            request_id="finish:signed-owner-guard-write",
             request_digest="sha256:" + "e" * 64)
         source.revoke_actor(
             administrator_credential=ADMIN, binding=actor_binding)

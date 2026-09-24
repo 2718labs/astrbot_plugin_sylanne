@@ -148,6 +148,24 @@ class AuthorityV2FenceStore:
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'authority_v2_%'")}
 
     @staticmethod
+    def require_idle_owner_write_in_tx(db: sqlite3.Connection,
+                                       authority_namespace: str) -> None:
+        """Serialize Owner session/key changes with an active content write."""
+        if not AuthorityV2FenceStore._v2_tables(db):
+            return
+        AuthorityV2FenceStore._check_schema(db)
+        AuthorityV2FenceStore._require_no_migration(db)
+        if db.execute(
+            "SELECT 1 FROM authority_v2_fences WHERE namespace=? "
+            "AND (state='active' OR pending IS NOT NULL) LIMIT 1",
+            (authority_namespace,),
+        ).fetchone() or db.execute(
+            "SELECT 1 FROM authority_v2_mutations WHERE namespace=? "
+            "AND state='pending' LIMIT 1", (authority_namespace,),
+        ).fetchone():
+            raise AuthorityUnavailable("Owner session/key change waits for v2 namespace work")
+
+    @staticmethod
     def _check_schema(db: sqlite3.Connection) -> None:
         AuthorityV2FenceStore._check_schema_version(db, _VERSION)
 

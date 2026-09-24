@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import hmac
 import json
 from pathlib import Path
+import re
 from typing import Protocol
 
+from ..authority_service.v2_owner_contract import OwnerPrincipalV1
 from ..domains.d01 import PersonaBlock, ValueRule
 from ..runtime_contracts import NamespaceId
 from .d01_onboarding import (
     VerifiedBudgetLease, VerifiedCreationResources, VerifiedModelCapability,
 )
+from .service import AuthenticatedSession
 
 
 _PRESET_PATH = "resources/catalogue/d01-onboarding-presets.json"
 _PRESET_SCHEMA = "sylanne.d01.onboarding-presets.v1"
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class HostModelCapabilityChecker(Protocol):
@@ -27,6 +32,7 @@ class HostModelCapabilityChecker(Protocol):
 class HostBudgetChecker(Protocol):
     def resolve_current_budget_lease(
         self, *, namespace: NamespaceId, budget_ref: str,
+        session: AuthenticatedSession, principal: OwnerPrincipalV1,
     ) -> VerifiedBudgetLease | None: ...
 
 
@@ -39,8 +45,8 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _read_json(path: Path) -> object:
-    return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object,
+def _read_json(content: bytes) -> object:
+    return json.loads(content, object_pairs_hook=_unique_object,
                       parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("invalid JSON number")))
 
 
@@ -51,10 +57,14 @@ class LocalCreationCatalogue:
         self,
         *,
         package_root: Path | str | None = None,
+        expected_manifest_digest: str,
         model_checker: HostModelCapabilityChecker,
         budget_checker: HostBudgetChecker,
     ) -> None:
+        if type(expected_manifest_digest) is not str or not _DIGEST.fullmatch(expected_manifest_digest):
+            raise ValueError("pinned release manifest digest is required")
         self._root = Path(package_root) if package_root is not None else Path(__file__).resolve().parents[3]
+        self._expected_manifest_digest = expected_manifest_digest
         self._models = model_checker
         self._budgets = budget_checker
 
@@ -65,17 +75,27 @@ class LocalCreationCatalogue:
         blueprint_ref: str,
         model_capability_ref: str,
         budget_ref: str,
+        session: AuthenticatedSession,
+        principal: OwnerPrincipalV1,
     ) -> VerifiedCreationResources | None:
         try:
             asset = (self._root / Path(*_PRESET_PATH.split("/"))).read_bytes()
-            manifest = _read_json(self._root / "release-manifest.json")
-            if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+            manifest_bytes = (self._root / "release-manifest.json").read_bytes()
+            if not hmac.compare_digest(sha256(manifest_bytes).hexdigest(), self._expected_manifest_digest):
+                return None
+            manifest = _read_json(manifest_bytes)
+            if (type(manifest) is not dict or manifest.get("schema_version") != 1
+                    or manifest.get("build_mode") != "formal-alpha1"
+                    or type(manifest.get("files")) is not list):
                 return None
             entries = [entry for entry in manifest["files"]
-                       if isinstance(entry, dict) and entry.get("path") == _PRESET_PATH]
-            if len(entries) != 1 or entries[0].get("sha256") != sha256(asset).hexdigest():
+                       if type(entry) is dict and entry.get("path") == _PRESET_PATH]
+            if (len(entries) != 1 or type(entries[0].get("bytes")) is not int
+                    or entries[0]["bytes"] != len(asset)
+                    or type(entries[0].get("sha256")) is not str
+                    or not hmac.compare_digest(entries[0]["sha256"], sha256(asset).hexdigest())):
                 return None
-            data = json.loads(asset.decode("utf-8"), object_pairs_hook=_unique_object)
+            data = _read_json(asset)
             if (not isinstance(data, dict) or set(data) != {"schema", "blueprints"}
                     or data["schema"] != _PRESET_SCHEMA
                     or not isinstance(data["blueprints"], list)):
@@ -87,7 +107,8 @@ class LocalCreationCatalogue:
             model = self._models.resolve_current_model_capability(
                 namespace=namespace, capability_ref=model_capability_ref)
             budget = self._budgets.resolve_current_budget_lease(
-                namespace=namespace, budget_ref=budget_ref)
+                namespace=namespace, budget_ref=budget_ref,
+                session=session, principal=principal)
             if (not isinstance(model, VerifiedModelCapability)
                     or model.namespace != namespace
                     or model.capability_ref != model_capability_ref

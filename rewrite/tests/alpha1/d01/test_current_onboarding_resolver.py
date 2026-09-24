@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationGuardV1, OwnerPrincipalV1
+from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.domains.d01 import PersonaBlock, ValueRule
 from sylanne3.runtime_contracts import NamespaceId
 from sylanne3.workbench_api.d01_onboarding import (
@@ -21,6 +22,10 @@ SESSION = AuthenticatedSession(
     {SCOPE: frozenset({"owner"})},
     {SCOPE: frozenset({"workbench_user_action"})},
     host_username="admin",
+    owner_session_token="x" * 43,
+    owner_session_request=OwnerSessionLoginRequestV1(
+        "authority", "authority-ns", "install", PRINCIPAL,
+        "credential", 1, "owner", "http://localhost:6185"),
 )
 INPUT = {
     "display_name": "小岚", "blueprint": "blank",
@@ -42,7 +47,8 @@ class Owners:
 
 class Catalogue:
     def resolve_current_resources(self, *, namespace, blueprint_ref,
-                                  model_capability_ref, budget_ref):
+                                  model_capability_ref, budget_ref, session, principal):
+        assert session is SESSION and principal is PRINCIPAL
         if (namespace, blueprint_ref, model_capability_ref, budget_ref) != (
                 NAMESPACE, "blank", "model:installed", "budget:installed"):
             return None
@@ -96,6 +102,14 @@ def test_missing_trusted_port_or_unavailable_capability_holds_creation():
         assert resolve(resolver, input_data=payload) is None
 
 
+def test_unsigned_owner_session_holds_before_catalogue_read():
+    from dataclasses import replace
+
+    resolver = CurrentD01OnboardingResolver(
+        namespaces=Namespaces(), owners=Owners(), catalogue=Catalogue())
+    assert resolve(resolver, session=replace(SESSION, owner_session_token=None)) is None
+
+
 def test_dashboard_name_is_not_owner_and_mismatched_pairing_holds_creation():
     class WrongOwner(Owners):
         def resolve_current_owner_identity(self, *, session, scope, namespace):
@@ -141,6 +155,9 @@ def test_committed_replay_uses_owner_pairing_without_current_resource_catalogue(
             assert kwargs == {
                 "namespace": NAMESPACE, "operation_id": operation_id,
                 "request_digest": DIGEST, "principal": PRINCIPAL,
+                "actor_id": SESSION.actor_id,
+                "owner_session_token": SESSION.owner_session_token,
+                "owner_session_request": SESSION.owner_session_request,
             }
             return "original-receipt"
 
@@ -164,6 +181,9 @@ def test_missing_current_model_can_reject_original_pending_intent_with_owner():
             assert kwargs == {
                 "namespace": NAMESPACE, "operation_id": operation_id,
                 "request_digest": DIGEST, "principal": PRINCIPAL,
+                "actor_id": SESSION.actor_id,
+                "owner_session_token": SESSION.owner_session_token,
+                "owner_session_request": SESSION.owner_session_request,
             }
             return True
 

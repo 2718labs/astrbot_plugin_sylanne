@@ -12,6 +12,7 @@ from typing import Mapping, Protocol
 from uuid import UUID
 
 from ..authority_service.v2_owner_contract import OwnerAuthorizationGuardV1, OwnerPrincipalV1
+from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..domains.d01 import PersonaBlock, PersonaPlan, ValueRule
 from ..runtime_contracts import NamespaceId
 from .onboarding import TrustedCreateCharacter
@@ -101,6 +102,7 @@ class LocalCreationCataloguePort(Protocol):
     def resolve_current_resources(
         self, *, namespace: NamespaceId, blueprint_ref: str,
         model_capability_ref: str, budget_ref: str,
+        session: AuthenticatedSession, principal: OwnerPrincipalV1,
     ) -> VerifiedCreationResources | None: ...
 
 
@@ -129,6 +131,9 @@ class CurrentD01OnboardingResolver:
         replay = getattr(coordinator, "replay_committed_role_initialization_v2", None)
         if (not callable(replay) or not isinstance(session, AuthenticatedSession)
                 or not session.allows(scope, "workbench.create", purpose, audience)
+                or type(session.owner_session_token) is not str
+                or not session.owner_session_token
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
                 or self._namespaces is None or self._owners is None
                 or not _receipt_digest(request_digest)):
             return None
@@ -156,7 +161,10 @@ class CurrentD01OnboardingResolver:
             return None
         return replay(
             namespace=namespace, operation_id=operation_id,
-            request_digest=request_digest, principal=owner.principal)
+            request_digest=request_digest, principal=owner.principal,
+            actor_id=owner.actor_id,
+            owner_session_token=session.owner_session_token,
+            owner_session_request=session.owner_session_request)
 
     def reject_unresolvable_create_character(
         self, *, coordinator: object, session: AuthenticatedSession,
@@ -167,6 +175,9 @@ class CurrentD01OnboardingResolver:
         reject = getattr(coordinator, "reject_unresolvable_role_initialization_v2", None)
         if (not callable(reject) or not isinstance(session, AuthenticatedSession)
                 or not session.allows(scope, "workbench.create", purpose, audience)
+                or type(session.owner_session_token) is not str
+                or not session.owner_session_token
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
                 or self._namespaces is None or self._owners is None
                 or not _receipt_digest(request_digest)):
             return False
@@ -194,7 +205,10 @@ class CurrentD01OnboardingResolver:
             return False
         return bool(reject(
             namespace=namespace, operation_id=operation_id,
-            request_digest=request_digest, principal=owner.principal))
+            request_digest=request_digest, principal=owner.principal,
+            actor_id=owner.actor_id,
+            owner_session_token=session.owner_session_token,
+            owner_session_request=session.owner_session_request))
 
     def resolve_create_character(
         self, *, session: AuthenticatedSession, scope: str, purpose: str,
@@ -203,6 +217,9 @@ class CurrentD01OnboardingResolver:
     ) -> TrustedCreateCharacter | None:
         if (not isinstance(session, AuthenticatedSession)
                 or not session.allows(scope, "workbench.create", purpose, audience)
+                or type(session.owner_session_token) is not str
+                or not session.owner_session_token
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1
                 or self._namespaces is None or self._owners is None
                 or self._catalogue is None):
             return None
@@ -245,7 +262,8 @@ class CurrentD01OnboardingResolver:
             return None
         resources = self._catalogue.resolve_current_resources(
             namespace=namespace, blueprint_ref=blueprint_ref,
-            model_capability_ref=model_ref, budget_ref=budget_ref)
+            model_capability_ref=model_ref, budget_ref=budget_ref,
+            session=session, principal=owner.principal)
         if (not isinstance(resources, VerifiedCreationResources)
                 or resources.namespace != namespace
                 or resources.blueprint_ref != blueprint_ref

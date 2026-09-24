@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.core import AuthorityServiceCore
+from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
 from sylanne3.authority_service.v2_owner_proof import (
     AuthorityV2OwnerProofStore, OwnerCredentialRegistrationV1,
@@ -91,6 +92,49 @@ def login(sessions, key, request):
         signature=key.sign(challenge.signed_bytes()),
     )
     return challenge, token
+
+
+def test_active_write_fence_serializes_session_revocation_and_key_rotation(tmp_path):
+    core, _, key, proof, request, sessions = setup(tmp_path / "authority.db")
+    try:
+        _, token = login(sessions, key, request)
+        fences = AuthorityV2FenceStore(core._db, lock=core._lock, create=True)
+        with core._tx() as db:
+            anchor = core._anchor(db, NAMESPACE, core._row(db, NAMESPACE))
+        permit = fences.begin_fence(
+            subject="subject", holder="holder", operation="write",
+            current_anchor=anchor, operation_id="signed-owner-write")
+        next_key = Ed25519PrivateKey.generate()
+        registration = OwnerCredentialRegistrationV1(
+            request.authority_id, NAMESPACE, request.installation_id,
+            PRINCIPAL, "owner-key-2", 2,
+            next_key.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw),
+            "enroll-2")
+        for revoke in (sessions.logout, sessions.revoke_all,
+                       sessions.revoke_credential):
+            with pytest.raises(AuthorityUnavailable, match="waits for v2 namespace work"):
+                revoke(transport_credential="installed-peer", token=token,
+                       request=request)
+        with pytest.raises(AuthorityUnavailable, match="waits for v2 namespace work"):
+            proof.register_credential(
+                transport_credential="installed-peer", registration=registration,
+                rotation_signature=key.sign(registration.rotation_bytes()))
+        assert sessions.require_current(
+            transport_credential="installed-peer", token=token,
+            request=request) == request
+        fences.finish_fence(
+            permit, subject="subject", current_anchor=anchor,
+            request_id="finish-signed-owner-write",
+            request_digest="sha256:" + "a" * 64)
+        sessions.logout(transport_credential="installed-peer", token=token,
+                        request=request)
+        with pytest.raises(AuthorityUnavailable):
+            sessions.require_current(
+                transport_credential="installed-peer", token=token,
+                request=request)
+    finally:
+        core.close()
 
 
 def test_login_requires_registered_key_and_single_use_challenge(tmp_path):

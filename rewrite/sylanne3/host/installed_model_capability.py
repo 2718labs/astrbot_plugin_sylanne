@@ -118,5 +118,10 @@ class InstalledModelCapabilityPort:
             future.cancel()
             return None
 
+    def resolve_current_model_capability(
+        self, *, namespace: NamespaceId, capability_ref: str,
+    ) -> VerifiedModelCapability | None:
+        return self.verify(namespace, capability_ref)
+
 
 __all__ = ("InstalledModelCapabilityPort", "model_capability_ref")

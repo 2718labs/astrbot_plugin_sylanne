@@ -8,6 +8,7 @@ import pytest
 from sylanne3.authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, canonical_digest as owner_contract_digest,
 )
+from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.domains.d01 import PersonaBlock, PersonaDomain, PersonaPlan, ValueRule
 from sylanne3.graph_coordinator import (
     AuthorityDenied, GraphCoordinator, RoleInitializationReceiptV1,
@@ -50,8 +51,10 @@ def _role_case(tmp_path):
     guard = OwnerAuthorizationGuardV1(
         operation.authority_id, operation.installation_id,
         policy.namespace, 1, owner_contract_digest(proof), 0, 0)
+    port.test_guard = guard
 
-    def current_owner_guard_for_fence(*, namespace, authority_namespace, permit):
+    def current_owner_guard_for_fence(*, namespace, authority_namespace, permit,
+                                      **session_kwargs):
         port.outside_graph_lock()
         assert namespace == policy.namespace
         assert authority_namespace == "opaque:" + namespace.persona_id
@@ -59,9 +62,16 @@ def _role_case(tmp_path):
         assert permit.namespace == authority_namespace
         assert port.fences.validate_fence(
             permit, subject="subject", current_anchor=port.anchors[namespace]) == permit
+        if session_kwargs:
+            assert session_kwargs["owner_actor_id"] == "paired-owner"
+            assert session_kwargs["owner_session_token"] == "A" * 43
+            assert session_kwargs["owner_session_request"].principal == operation.principal
         return guard, permit
 
     port.get_current_owner_guard_for_fence = current_owner_guard_for_fence
+    coordinator._GraphCoordinator__owner_principal_resolver = (
+        lambda actor, current_namespace: operation.principal
+        if (actor, current_namespace) == ("paired-owner", policy.namespace) else None)
     plan = PersonaPlan(
         "plan:first", policy.namespace, 1,
         (PersonaBlock("identity", "semantic_identity", "reliable companion", "read_only"),),
@@ -76,6 +86,23 @@ def _role_case(tmp_path):
     })
     return (store, authority_db, port, coordinator, policy.namespace,
             operation.principal, plan, request_digest)
+
+
+def _session(coordinator, namespace, principal):
+    port = coordinator._GraphCoordinator__content_fence_v2
+    anchor = port.anchors[namespace]
+    return {
+        "actor_id": "paired-owner",
+        "owner_session_token": "A" * 43,
+        "owner_session_request": OwnerSessionLoginRequestV1(
+            anchor.authority_id, anchor.namespace,
+            port.installation_grant.installation_id, principal,
+            "credential:owner", 1, "owner", "http://localhost"),
+    }
+
+
+def _guard_for_role_attempt(store, port, namespace):
+    return port.test_guard
 
 
 @pytest.mark.parametrize("lose_finish,bad_identity", [(False, False), (True, False),
@@ -96,7 +123,7 @@ def test_role_missing_guard_terminates_original_fence_without_graph_commit(
         with pytest.raises((UnavailableGuard, AuthorityDenied, RuntimeError)):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
-                principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan))
+                principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal))
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_receipts_v1").fetchone() == (0,)
         assert store._db.execute(
@@ -110,11 +137,74 @@ def test_role_missing_guard_terminates_original_fence_without_graph_commit(
         with pytest.raises(UnavailableGuard, match="terminal rejected_no_commit"):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
-                principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan))
+                principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal))
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_atoms WHERE bot=? AND persona=? "
             "AND type_name IN ('d01.persona_plan.v1','d01.persona_activation.v1')",
             namespace.as_tuple).fetchone() == (0,)
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_revoked_owner_session_after_resource_resolution_blocks_role_write(tmp_path):
+    (store, authority_db, port, coordinator, namespace,
+     principal, plan, request_digest) = _role_case(tmp_path)
+    resources = _resources(store, namespace, plan)
+    original_guard = port.get_current_owner_guard_for_fence
+
+    def revoked_at_write(**kwargs):
+        if kwargs["permit"].operation == "write":
+            assert kwargs["owner_actor_id"] == "paired-owner"
+            assert kwargs["owner_session_token"] == "A" * 43
+            assert kwargs["owner_session_request"].principal == principal
+            raise UnavailableGuard("signed Owner session revoked")
+        return original_guard(**kwargs)
+
+    port.get_current_owner_guard_for_fence = revoked_at_write
+    try:
+        with pytest.raises(UnavailableGuard, match="session revoked"):
+            coordinator.commit_role_initialization_v2(
+                namespace=namespace, operation_id="role-init-1", plan=plan,
+                principal=principal, request_digest=request_digest,
+                resources=resources, **_session(coordinator, namespace, principal))
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_atoms WHERE type_name IN "
+            "('d01.persona_plan.v1','d01.persona_activation.v1',"
+            "'runtime.role_resources.v1')"
+        ).fetchone() == (0,)
+        assert store._db.execute(
+            "SELECT status FROM graph_role_init_rejections_v1"
+        ).fetchone() == ("rejected_no_commit",)
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_pending_role_rejection_uses_signed_original_active_fence(tmp_path):
+    (store, authority_db, port, coordinator, namespace,
+     principal, plan, request_digest) = _role_case(tmp_path)
+    try:
+        port.lose_begin_after_durable = True
+        with pytest.raises(RuntimeError, match="begin response lost"):
+            coordinator.commit_role_initialization_v2(
+                namespace=namespace, operation_id="role-init-1", plan=plan,
+                principal=principal, request_digest=request_digest,
+                resources=_resources(store, namespace, plan),
+                **_session(coordinator, namespace, principal))
+        port.lose_begin_after_durable = False
+        assert coordinator.reject_unresolvable_role_initialization_v2(
+            namespace=namespace, operation_id="role-init-1",
+            request_digest=request_digest, principal=principal,
+            **_session(coordinator, namespace, principal))
+        assert store._db.execute(
+            "SELECT status FROM graph_role_init_rejections_v1"
+        ).fetchone() == ("rejected_no_commit",)
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_atoms WHERE type_name IN "
+            "('d01.persona_plan.v1','d01.persona_activation.v1',"
+            "'runtime.role_resources.v1')"
+        ).fetchone() == (0,)
     finally:
         store.close()
         authority_db.close()
@@ -126,7 +216,7 @@ def test_role_initialization_commits_plan_and_activation_once(tmp_path):
     try:
         receipt = coordinator.commit_role_initialization_v2(
             namespace=namespace, operation_id="role-init-1", plan=plan,
-            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan))
+            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal))
         assert type(receipt) is RoleInitializationReceiptV1
         assert receipt.head_id == plan.head_id
         assert receipt.request_digest == request_digest
@@ -134,7 +224,7 @@ def test_role_initialization_commits_plan_and_activation_once(tmp_path):
         assert (receipt.graph_revision, receipt.graph_epoch) == (2, 2)
         assert coordinator.commit_role_initialization_v2(
             namespace=namespace, operation_id="role-init-1", plan=plan,
-            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan)) == receipt
+            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal)) == receipt
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_receipts_v1").fetchone() == (1,)
         active = coordinator.read_active_role_v2(namespace=namespace)
@@ -155,12 +245,12 @@ def test_role_initialization_replay_rejects_changed_full_request(tmp_path):
     try:
         coordinator.commit_role_initialization_v2(
             namespace=namespace, operation_id="role-init-1", plan=plan,
-            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan))
+            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal))
         changed = "sha256:" + canonical_digest({"budget_ref": "budget:two"})
         with pytest.raises(AuthorityDenied, match="identity differs"):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
-                principal=principal, request_digest=changed, resources=_resources(store, namespace, plan))
+                principal=principal, request_digest=changed, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal))
     finally:
         store.close()
         authority_db.close()
@@ -175,7 +265,7 @@ def test_role_initialization_replay_rejects_changed_verified_resources(
         resources = _resources(store, namespace, plan)
         coordinator.commit_role_initialization_v2(
             namespace=namespace, operation_id="role-init-1", plan=plan,
-            principal=principal, request_digest=request_digest, resources=resources)
+            principal=principal, request_digest=request_digest, resources=resources, **_session(coordinator, namespace, principal))
         changed = (replace(resources, model=replace(resources.model, revision=2))
                    if resource_change == "model" else
                    replace(resources, budget=replace(
@@ -183,7 +273,7 @@ def test_role_initialization_replay_rejects_changed_verified_resources(
         with pytest.raises(AuthorityDenied, match="identity differs"):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
-                principal=principal, request_digest=request_digest, resources=changed)
+                principal=principal, request_digest=request_digest, resources=changed, **_session(coordinator, namespace, principal))
     finally:
         store.close()
         authority_db.close()
@@ -215,7 +305,7 @@ def test_role_creation_budget_must_be_current_and_same_namespace(tmp_path, lease
         with pytest.raises(AuthorityDenied, match="budget lease"):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
-                principal=principal, request_digest=request_digest, resources=resources)
+                principal=principal, request_digest=request_digest, resources=resources, **_session(coordinator, namespace, principal))
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_intents_v1").fetchone() == (0,)
         assert store._db.execute(
@@ -251,7 +341,7 @@ def test_budget_change_after_fence_rejects_no_commit_and_finishes_original_fence
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
                 principal=principal, request_digest=request_digest,
-                resources=resources)
+                resources=resources, **_session(coordinator, namespace, principal))
         assert changed
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_receipts_v1").fetchone() == (0,)
@@ -271,7 +361,7 @@ def test_budget_change_after_fence_rejects_no_commit_and_finishes_original_fence
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
                 principal=principal, request_digest=request_digest,
-                resources=resources)
+                resources=resources, **_session(coordinator, namespace, principal))
     finally:
         store.close()
         authority_db.close()
@@ -285,27 +375,27 @@ def test_committed_role_replay_survives_later_budget_change(tmp_path):
         receipt = coordinator.commit_role_initialization_v2(
             namespace=namespace, operation_id="role-init-1", plan=plan,
             principal=principal, request_digest=request_digest,
-            resources=resources)
+            resources=resources, **_session(coordinator, namespace, principal))
         store._db.execute(
             "UPDATE runtime_budget_leases SET version=version+1 WHERE lease_id=?",
             (resources.budget.lease_ref,))
         assert coordinator.commit_role_initialization_v2(
             namespace=namespace, operation_id="role-init-1", plan=plan,
             principal=principal, request_digest=request_digest,
-            resources=resources) == receipt
+            resources=resources, **_session(coordinator, namespace, principal)) == receipt
         assert coordinator.replay_committed_role_initialization_v2(
             namespace=namespace, operation_id="role-init-1",
-            request_digest=request_digest, principal=principal) == receipt
+            request_digest=request_digest, principal=principal, **_session(coordinator, namespace, principal)) == receipt
         with pytest.raises(AuthorityDenied, match="request identity differs"):
             coordinator.replay_committed_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1",
                 request_digest="sha256:" + "f" * 64,
-                principal=principal)
+                principal=principal, **_session(coordinator, namespace, principal))
         with pytest.raises(AuthorityDenied, match="principal or grant"):
             coordinator.replay_committed_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1",
                 request_digest=request_digest,
-                principal=replace(principal, account_incarnation="other"))
+                principal=replace(principal, account_incarnation="other"), **_session(coordinator, namespace, replace(principal, account_incarnation="other")))
     finally:
         store.close()
         authority_db.close()
@@ -322,7 +412,7 @@ def test_restart_with_pending_fence_and_changed_budget_records_terminal_rejectio
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
                 principal=principal, request_digest=request_digest,
-                resources=resources)
+                resources=resources, **_session(coordinator, namespace, principal))
         attempt = store._db.execute(
             "SELECT fence_attempt_id FROM graph_role_init_intents_v1").fetchone()[0]
         assert port.get_fence_operation(
@@ -331,6 +421,7 @@ def test_restart_with_pending_fence_and_changed_budget_records_terminal_rejectio
         store._db.execute(
             "UPDATE runtime_budget_leases SET version=version+1 WHERE lease_id=?",
             (resources.budget.lease_ref,))
+        guard = _guard_for_role_attempt(store, port, namespace)
         anchors = dict(port.anchors)
         store.close()
         registry = TypeRegistry()
@@ -341,14 +432,17 @@ def test_restart_with_pending_fence_and_changed_budget_records_terminal_rejectio
         store = ProductionGraphStore(tmp_path / "owner-business.db", registry)
         port = AuthorityPort(store, authority_db)
         port.anchors = anchors
-        port.get_current_owner_guard_for_fence = lambda **_: None
+        port.get_current_owner_guard_for_fence = lambda **kw: (guard, kw["permit"])
         coordinator = GraphCoordinator(
             store, object(), holder="administrator", content_fence_v2=port)
+        coordinator._GraphCoordinator__owner_principal_resolver = (
+            lambda actor, current_namespace: principal
+            if (actor, current_namespace) == ("paired-owner", namespace) else None)
         with pytest.raises(AuthorityDenied, match="budget lease changed"):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
                 principal=principal, request_digest=request_digest,
-                resources=resources)
+                resources=resources, **_session(coordinator, namespace, principal))
         assert store._db.execute(
             "SELECT status FROM graph_role_init_rejections_v1").fetchone() == (
                 "rejected_no_commit",)
@@ -375,7 +469,7 @@ def test_restart_pending_intent_with_changed_model_receipt_finishes_original_fen
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
                 principal=principal, request_digest=request_digest,
-                resources=original)
+                resources=original, **_session(coordinator, namespace, principal))
         intent = store._db.execute(
             "SELECT operation_id,input_digest,fence_attempt_id "
             "FROM graph_role_init_intents_v1").fetchone()
@@ -383,6 +477,7 @@ def test_restart_pending_intent_with_changed_model_receipt_finishes_original_fen
             "SELECT operation_id,request_digest,input_digest "
             "FROM graph_role_init_request_proofs_v1").fetchone() == (
                 intent[0], request_digest, intent[1])
+        guard = _guard_for_role_attempt(store, port, namespace)
         anchors = dict(port.anchors)
         store.close()
         registry = TypeRegistry()
@@ -393,9 +488,12 @@ def test_restart_pending_intent_with_changed_model_receipt_finishes_original_fen
         store = ProductionGraphStore(tmp_path / "owner-business.db", registry)
         port = AuthorityPort(store, authority_db)
         port.anchors = anchors
-        port.get_current_owner_guard_for_fence = lambda **_: None
+        port.get_current_owner_guard_for_fence = lambda **kw: (guard, kw["permit"])
         coordinator = GraphCoordinator(
             store, object(), holder="administrator", content_fence_v2=port)
+        coordinator._GraphCoordinator__owner_principal_resolver = (
+            lambda actor, current_namespace: principal
+            if (actor, current_namespace) == ("paired-owner", namespace) else None)
         changed = replace(original, model=replace(
             original.model, revision=original.model.revision + 1,
             digest="sha256:" + "d" * 64))
@@ -403,7 +501,7 @@ def test_restart_pending_intent_with_changed_model_receipt_finishes_original_fen
             coordinator.reject_unresolvable_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1",
                 request_digest="sha256:" + "f" * 64,
-                principal=principal)
+                principal=principal, **_session(coordinator, namespace, principal))
         assert port.get_fence_operation(
             namespace=namespace, authority_namespace="opaque:" + namespace.persona_id,
             operation_id=intent[2])[1] == "active"
@@ -411,7 +509,7 @@ def test_restart_pending_intent_with_changed_model_receipt_finishes_original_fen
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
                 principal=principal, request_digest=request_digest,
-                resources=changed)
+                resources=changed, **_session(coordinator, namespace, principal))
         assert store._db.execute(
             "SELECT status FROM graph_role_init_rejections_v1").fetchone() == (
                 "rejected_no_commit",)
@@ -437,7 +535,7 @@ def test_pending_intent_without_original_request_proof_holds_fence(tmp_path):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
                 principal=principal, request_digest=request_digest,
-                resources=resources)
+                resources=resources, **_session(coordinator, namespace, principal))
         attempt = store._db.execute(
             "SELECT fence_attempt_id FROM graph_role_init_intents_v1").fetchone()[0]
         # Simulate a pre-migration pending intent whose request proof never existed.
@@ -446,7 +544,7 @@ def test_pending_intent_without_original_request_proof_holds_fence(tmp_path):
         with pytest.raises(UnavailableGuard, match="no original request proof"):
             coordinator.reject_unresolvable_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1",
-                request_digest=request_digest, principal=principal)
+                request_digest=request_digest, principal=principal, **_session(coordinator, namespace, principal))
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_rejections_v1").fetchone() == (0,)
         assert port.get_fence_operation(
@@ -465,7 +563,7 @@ def test_role_initialization_rejects_wrong_principal_before_write(tmp_path):
         with pytest.raises(AuthorityDenied, match="principal or grant"):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
-                principal=wrong, request_digest=request_digest, resources=_resources(store, namespace, plan))
+                principal=wrong, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, wrong))
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_intents_v1").fetchone() == (0,)
     finally:
@@ -493,7 +591,7 @@ def test_role_initialization_requires_create_capability_in_graph_grant(tmp_path)
                 namespace=policy.namespace, operation_id="role-init-1", plan=plan,
                 principal=operation.principal,
                 request_digest="sha256:" + canonical_digest({"full": "create"}),
-                resources=_resources(store, policy.namespace, plan))
+                resources=_resources(store, policy.namespace, plan), **_session(coordinator, policy.namespace, operation.principal))
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_intents_v1").fetchone() == (0,)
     finally:
@@ -509,7 +607,7 @@ def test_role_initialization_replays_unknown_begin_from_durable_intent(tmp_path)
         with pytest.raises(RuntimeError, match="begin response lost"):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
-                principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan))
+                principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal))
         original = store._db.execute(
             "SELECT fence_attempt_id,anchor_json,graph_revision,graph_epoch "
             "FROM graph_role_init_intents_v1").fetchone()
@@ -518,7 +616,7 @@ def test_role_initialization_replays_unknown_begin_from_durable_intent(tmp_path)
             "SELECT COUNT(*) FROM graph_role_init_receipts_v1").fetchone() == (0,)
         receipt = coordinator.commit_role_initialization_v2(
             namespace=namespace, operation_id="role-init-1", plan=plan,
-            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan))
+            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal))
         assert receipt.fence_attempt_id == original[0]
         assert store._db.execute(
             "SELECT fence_attempt_id,anchor_json,graph_revision,graph_epoch "
@@ -536,9 +634,10 @@ def test_role_initialization_recovers_lost_finish_after_cold_restart(tmp_path):
         with pytest.raises(RuntimeError, match="finish response lost"):
             coordinator.commit_role_initialization_v2(
                 namespace=namespace, operation_id="role-init-1", plan=plan,
-                principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan))
+                principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal))
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_receipts_v1").fetchone() == (1,)
+        guard = _guard_for_role_attempt(store, port, namespace)
         anchors = dict(port.anchors)
         store.close()
         registry = TypeRegistry()
@@ -549,12 +648,15 @@ def test_role_initialization_recovers_lost_finish_after_cold_restart(tmp_path):
         store = ProductionGraphStore(tmp_path / "owner-business.db", registry)
         port = AuthorityPort(store, authority_db)
         port.anchors = anchors
-        port.get_current_owner_guard_for_fence = lambda **_: None
+        port.get_current_owner_guard_for_fence = lambda **kw: (guard, kw["permit"])
         coordinator = GraphCoordinator(
             store, object(), holder="administrator", content_fence_v2=port)
+        coordinator._GraphCoordinator__owner_principal_resolver = (
+            lambda actor, current_namespace: principal
+            if (actor, current_namespace) == ("paired-owner", namespace) else None)
         receipt = coordinator.commit_role_initialization_v2(
             namespace=namespace, operation_id="role-init-1", plan=plan,
-            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan))
+            principal=principal, request_digest=request_digest, resources=_resources(store, namespace, plan), **_session(coordinator, namespace, principal))
         assert receipt.head_id == plan.head_id
         key = role_resources_key(namespace, plan.plan_id)
         row = store._db.execute(

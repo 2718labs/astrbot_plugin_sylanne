@@ -63,6 +63,9 @@ class InstalledModelCapabilityTests(unittest.IsolatedAsyncioTestCase):
         second = await asyncio.to_thread(self.port.verify, self.namespace, self.ref)
         self.assertIsInstance(first, VerifiedModelCapability)
         self.assertEqual(first, second)
+        self.assertEqual(first, await asyncio.to_thread(
+            self.port.resolve_current_model_capability,
+            namespace=self.namespace, capability_ref=self.ref))
         self.assertEqual(first.capability_ref, self.ref)
         self.assertGreater(first.revision, 0)
         self.assertTrue(first.digest.startswith("sha256:"))

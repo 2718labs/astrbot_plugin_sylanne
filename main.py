@@ -20,14 +20,17 @@ from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_sche
 from .rewrite.sylanne3.host.context_scheme_asset import load_verified_context_scheme
 from .rewrite.sylanne3.host.authority_profile import AuthorityProfileUnavailable
 from .rewrite.sylanne3.host.installed_scene_identity import InstalledSceneIdentityPort
+from .rewrite.sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
 from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, SceneCandidateCatalog
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
 from .rewrite.sylanne3.runtime_context import RuntimeContext, RuntimeHealth
 from .rewrite.sylanne3.runtime_contracts import NamespaceId, canonical_digest
 from .rewrite.sylanne3.workbench_api.current_onboarding import CurrentOnboardingResolver
+from .rewrite.sylanne3.workbench_api.d01_onboarding import CurrentD01OnboardingResolver
 from .rewrite.sylanne3.workbench_api.d03_onboarding import CurrentD03OnboardingResolver
 from .rewrite.sylanne3.workbench_api.http_transport import CurrentOwnerPairingPort
 from .rewrite.sylanne3.workbench_api.onboarding import OnboardingPolicyResolver
+from .rewrite.sylanne3.workbench_api.local_creation_catalogue import LocalCreationCatalogue
 from .rewrite.sylanne3.workbench_api.owner_grant import CurrentOwnerGrantPort
 
 
@@ -216,7 +219,19 @@ class Sylanne3Plugin(Star):
         if onboarding is None and pairing is None and grants is None and origin is not None:
             try:
                 owner_ports = self._runtime.installed_owner_onboarding_ports()
+                model_port = InstalledModelCapabilityPort(
+                    context=self.context, host_loop=asyncio.get_running_loop(),
+                    installed_namespace=installation.installation_policy.namespace,
+                )
                 onboarding = CurrentOnboardingResolver(
+                    d01=CurrentD01OnboardingResolver(
+                        namespaces=owner_ports, owners=owner_ports,
+                        catalogue=LocalCreationCatalogue(
+                            package_root=PACKAGE_ROOT,
+                            expected_manifest_digest=installation.installation_policy.manifest_digest,
+                            model_checker=model_port, budget_checker=owner_ports,
+                        ),
+                    ),
                     d03=CurrentD03OnboardingResolver(
                         namespaces=owner_ports, owners=owner_ports, scenes=scene_port,
                     ),

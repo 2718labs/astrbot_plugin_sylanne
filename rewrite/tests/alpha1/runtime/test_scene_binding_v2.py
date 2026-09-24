@@ -53,6 +53,9 @@ def _scene_case(tmp_path, *, owner_capabilities=None,
         return guard, permit
 
     port.get_current_owner_guard_for_fence = guarded
+    coordinator._GraphCoordinator__owner_principal_resolver = (
+        lambda actor, current_namespace: operation.principal
+        if (actor, current_namespace) == ("paired-owner", policy.namespace) else None)
     plan = PersonaPlan(
         "plan:first", policy.namespace, 1,
         (PersonaBlock("identity", "semantic_identity", "reliable companion", "read_only"),),
@@ -63,6 +66,11 @@ def _scene_case(tmp_path, *, owner_capabilities=None,
         principal=operation.principal,
         request_digest="sha256:" + canonical_digest({"role": "first"}),
         resources=_resources(store, policy.namespace, plan),
+        actor_id="paired-owner", owner_session_token="A" * 43,
+        owner_session_request=OwnerSessionLoginRequestV1(
+            operation.authority_id, "opaque:" + policy.namespace.persona_id,
+            operation.installation_id, operation.principal,
+            "credential:owner", 1, "owner", "http://localhost"),
     )
     d03 = ContextProvider()
     d03.compile_scheme({
@@ -81,9 +89,6 @@ def _scene_case(tmp_path, *, owner_capabilities=None,
     prior = RoleBindingResolution(
         "no_applicable_binding", (), (), (), (),
         QueryEpoch(namespace, "d03.role_binding", 2), None, request)
-    coordinator._GraphCoordinator__owner_principal_resolver = (
-        lambda actor, current_namespace: operation.principal
-        if (actor, current_namespace) == ("paired-owner", namespace) else None)
     return (store, authority_db, port, coordinator, namespace,
             operation.principal, prior, policy, bootstrap)
 

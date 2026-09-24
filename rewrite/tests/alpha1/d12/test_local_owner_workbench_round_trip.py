@@ -1,19 +1,31 @@
 """An independently checked Owner session reaches the real graph."""
 
 from dataclasses import asdict, replace
+from datetime import datetime, timedelta, timezone
 import json
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from rewrite.tests.alpha1.authority import test_local_owner_round_trip as owner_case
 from astrbot.dashboard.api.plugins import _match_registered_web_api
 from astrbot.api.web import bind_request_context
 from sylanne3.domains.d01 import PersonaBlock, PersonaDomain, PersonaPlan, ValueRule
+from sylanne3.authority_service.v2_owner_contract import OwnerActorBindingV1
+from sylanne3.authority_service.v2_owner_proof import (
+    AuthorityV2OwnerProofStore, OwnerCredentialRegistrationV1,
+)
+from sylanne3.authority_service.v2_owner_session import (
+    AuthorityV2OwnerSessionStore, OwnerSessionLoginRequestV1,
+)
 from sylanne3.graph_types import TypeRegistry, owner_grant_policy_digest_v1
 from sylanne3.graph_worker import GraphWorker
 from sylanne3.host.workbench_mount import WorkbenchHostMount
+from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
+from sylanne3.host.owner_deployment import OwnerDeploymentVerifier
 from sylanne3.runtime_context import RuntimeContext
 from sylanne3.runtime.budget import get_budget_lease
 from sylanne3.runtime.role_resources import role_resources_spec
@@ -38,11 +50,11 @@ class _Context:
 
 
 class _Request:
-    def __init__(self, body=b"", *, token=None, session=False):
+    def __init__(self, body=b"", *, token=None, session=False, owner_token=None):
         self.username = "dashboard-admin"
         self.content_type = "application/json"
         self.cookies = {"astrbot_dashboard_jwt": "dashboard-jwt",
-                        SYLANNE_OWNER_SESSION_COOKIE: "owner-token"}
+                        SYLANNE_OWNER_SESSION_COOKIE: owner_token}
         self.headers = ({"referer": "https://dashboard.local/workbench"}
                         if session else {"origin": "https://dashboard.local",
                                          "x-csrf-token": token})
@@ -71,6 +83,12 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         resources[1]._authorize_callback = lambda credential, action, namespace, holder: (
             credential == owner_case.WORKER and action in {"read", "owner_guard_read"}
             and namespace == owner_case.AUTH_NS and holder == "administrator"
+        ) or (
+            credential == owner_case.ADMIN and action == "owner_identity_pair"
+            and namespace == owner_case.AUTH_NS
+        ) or (
+            credential == owner_case.PEER and action in {"owner_pair", "owner_session"}
+            and namespace == owner_case.AUTH_NS
         ) or original_authorize(credential, action, namespace, holder)
         policy = replace(
             owner_case.policy_for(resources[0]), expected_authority_id=authority_id,
@@ -106,9 +124,57 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             operation=operation, proof=proof)
         assert committed.phase == "committed"
 
+        now = lambda: datetime.now(timezone.utc).replace(microsecond=0)
+        source = AuthorityOwnerPairingSource(resources[1], utc_clock=now, create=True)
+        key = Ed25519PrivateKey.generate()
+        registration = OwnerCredentialRegistrationV1(
+            authority_id, owner_case.AUTH_NS, "installation", principal,
+            "owner-key", 1,
+            key.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw),
+            "enroll")
+        source.pair_credential(
+            administrator_credential=owner_case.ADMIN,
+            registration=registration,
+            client_certificate_sha256="a" * 64,
+            valid_until_utc=now() + timedelta(hours=1),
+        )
+        source.pair_actor(
+            administrator_credential=owner_case.ADMIN,
+            binding=OwnerActorBindingV1(
+                authority_id, "installation", owner_case.ROLE,
+                "owner:paired-account", principal, 1),
+        )
+        proofs = AuthorityV2OwnerProofStore(
+            resources[1], utc_clock=now,
+            pairing_verifier=OwnerDeploymentVerifier(source, now).pair_credential,
+            current_pairing_source=source, create=True)
+        proofs.register_credential(
+            transport_credential=owner_case.PEER, registration=registration)
+        sessions = AuthorityV2OwnerSessionStore(
+            resources[1], utc_clock=now, current_pairing_source=source, create=True)
+        login_request = OwnerSessionLoginRequestV1(
+            authority_id, owner_case.AUTH_NS, "installation", principal,
+            "owner-key", 1, "owner", "https://dashboard.local")
+        challenge = sessions.begin_login(
+            transport_credential=owner_case.PEER, request=login_request)
+        login_token = sessions.accept_login(
+            transport_credential=owner_case.PEER, challenge=challenge,
+            signature=key.sign(challenge.signed_bytes()))
+        tickets._owner_sessions = sessions
+        def current_owner_principal(actor, namespace):
+            binding = source.current_actor_binding(
+                authority_namespace=owner_case.AUTH_NS,
+                installation_id="installation", actor_id=actor)
+            return binding.principal if binding is not None and namespace == owner_case.ROLE else None
+
+        coordinator._GraphCoordinator__owner_principal_resolver = current_owner_principal
+
         port = coordinator._GraphCoordinator__content_fence_v2
 
-        def current_guard(*, namespace, authority_namespace, permit):
+        def current_guard(*, namespace, authority_namespace, permit,
+                          owner_actor_id=None, owner_session_token=None,
+                          owner_session_request=None):
             assert namespace == owner_case.ROLE
             assert authority_namespace == owner_case.AUTH_NS
             service.validate_fence(
@@ -118,7 +184,9 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
                 credential=owner_case.WORKER,
                 authority_namespace=owner_case.AUTH_NS,
                 installation_id="installation", subject=owner_case.SUBJECT,
-                permit=permit)
+                permit=permit, owner_actor_id=owner_actor_id,
+                owner_session_token=owner_session_token,
+                owner_session_request=owner_session_request)
             return guard, permit
 
         port.get_current_owner_guard_for_fence = current_guard
@@ -131,14 +199,20 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             {"bot/persona": frozenset({"workbench.read", "workbench.create"})},
             {"bot/persona": frozenset({"owner"})},
             {"bot/persona": frozenset({"workbench_user_action", "workbench_view"})},
-            host_username="dashboard-admin")
+            host_username="dashboard-admin", owner_session_token=login_token,
+            owner_session_request=login_request)
 
         class Pairing:
             current = True
 
             def resolve_current_owner_session(self, *, username, owner_session_token):
                 if (not self.current or username != "dashboard-admin"
-                        or owner_session_token != "owner-token"):
+                        or owner_session_token != login_token):
+                    return None
+                if sessions.describe_current(
+                    transport_credential=owner_case.PEER, token=owner_session_token,
+                    namespace=owner_case.AUTH_NS,
+                    installation_id="installation") != login_request:
                     return None
                 anchor = service.current_anchor(
                     credential=owner_case.WORKER, subject=owner_case.SUBJECT)
@@ -170,7 +244,10 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
                     return None
                 return coordinator.replay_committed_role_initialization_v2(
                     namespace=owner_case.ROLE, operation_id=operation_id,
-                    request_digest=request_digest, principal=principal)
+                    request_digest=request_digest, principal=principal,
+                    actor_id=session.actor_id,
+                    owner_session_token=session.owner_session_token,
+                    owner_session_request=session.owner_session_request)
 
             def resolve_create_character(self, *, session, scope, purpose, audience,
                                          operation_id, request_digest, input_data):
@@ -222,7 +299,7 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             onboarding=Onboarding(), origin="https://dashboard.local"))
         session_route, _ = _match_registered_web_api(
             context.registered_web_apis, SESSION_ROUTE, "GET")
-        with bind_request_context(_Request(session=True)):
+        with bind_request_context(_Request(session=True, owner_token=login_token)):
             opened = await session_route()
         token = json.loads(opened.body)["csrf_token"]
         operation_id = str(uuid4())
@@ -233,9 +310,9 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             "input": {"display_name": "Companion", "blueprint": "blank",
                       "model_capability_ref": "model:one", "budget_ref": "budget:one"},
         }).encode()
-        with bind_request_context(_Request(body, token=token)):
+        with bind_request_context(_Request(body, token=token, owner_token=login_token)):
             response = await command()
-        assert response.status_code == 200
+        assert response.status_code == 200, response.body
         receipt = json.loads(response.body)["receipt"]
         assert receipt["operation_id"] == operation_id
         assert receipt["phase"] == "role_initialized"
@@ -245,12 +322,12 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         resources[0]._db.execute(
             "UPDATE runtime_budget_leases SET version=version+1 WHERE lease_id=?",
             (budget_lease.lease_id,))
-        with bind_request_context(_Request(body, token=token)):
+        with bind_request_context(_Request(body, token=token, owner_token=login_token)):
             replayed = await command()
         assert replayed.status_code == 200
         assert json.loads(replayed.body)["receipt"] == receipt
         pairing.current = False
-        with bind_request_context(_Request(body, token=token)):
+        with bind_request_context(_Request(body, token=token, owner_token=login_token)):
             denied = await command()
         assert denied.status_code == 401
         mount.close()

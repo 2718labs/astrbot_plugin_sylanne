@@ -1595,10 +1595,14 @@ class GraphCoordinator:
 
     def reject_unresolvable_role_initialization_v2(
             self, *, namespace: NamespaceId, operation_id: str,
-            request_digest: str, principal: OwnerPrincipalV1) -> bool:
+            request_digest: str, principal: OwnerPrincipalV1,
+            actor_id: str, owner_session_token: str,
+            owner_session_request: OwnerSessionLoginRequestV1) -> bool:
         """Finish an original pending fence only when no first-role write is proven."""
         from .authority_service.v2_contract import FencePermitV2
-        from .authority_service.v2_owner_contract import OwnerGraphCommitProofV1
+        from .authority_service.v2_owner_contract import (
+            OwnerGraphCommitProofV1, canonical_digest as owner_contract_digest,
+        )
 
         if (type(namespace) is not NamespaceId or type(principal) is not OwnerPrincipalV1
                 or type(operation_id) is not str or not operation_id
@@ -1682,6 +1686,10 @@ class GraphCoordinator:
                 or grant.value["graph_incarnation"] != proof.graph_incarnation
                 or target.graph_incarnation != proof.graph_incarnation):
             raise AuthorityDenied("pending role Owner principal differs")
+        self._check_owner_session_v2(
+            namespace=namespace, principal=principal, actor_id=actor_id,
+            token=owner_session_token, request=owner_session_request,
+            target=target)
         attempt_id = intent[2]
         permit, state = port.get_fence_operation(
             namespace=namespace, authority_namespace=target.authority_namespace,
@@ -1694,6 +1702,26 @@ class GraphCoordinator:
                 or permit.namespace != target.authority_namespace
                 or permit.generation != 1 or permit.pinned_anchor != anchor):
             raise UnavailableGuard("pending role original fence differs")
+        guard_reader = getattr(port, "get_current_owner_guard_for_fence", None)
+        if not callable(guard_reader):
+            raise UnavailableGuard("pending role signed Owner guard is unavailable")
+        guarded = guard_reader(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            permit=permit, owner_actor_id=actor_id,
+            owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
+        if (type(guarded) is not tuple or len(guarded) != 2
+                or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                or guarded[1] != permit
+                or guarded[0].authority_id != target.authority_id
+                or guarded[0].installation_id != grant.value["installation_id"]
+                or guarded[0].namespace != namespace
+                or guarded[0].authorization_revision != 1
+                or guarded[0].authorization_head != owner_contract_digest(proof)
+                or guarded[0].pending_revoke_operation_id is not None
+                or guarded[0].minimum_revocation_revision != 0
+                or guarded[0].minimum_revocation_epoch != 0):
+            raise UnavailableGuard("pending role signed Owner guard differs")
         self._reject_owner_graph_write_v2(
             kind="role_init", namespace=namespace, operation_id=operation_id,
             input_digest=intent[1], attempt_id=attempt_id, metadata=metadata,
@@ -1702,7 +1730,9 @@ class GraphCoordinator:
 
     def replay_committed_role_initialization_v2(
             self, *, namespace: NamespaceId, operation_id: str,
-            request_digest: str, principal: OwnerPrincipalV1):
+            request_digest: str, principal: OwnerPrincipalV1,
+            actor_id: str, owner_session_token: str,
+            owner_session_request: OwnerSessionLoginRequestV1):
         """Recover an already committed first role from its original graph atoms."""
         from .domains.d01 import (
             PersonaPlan, _persona_block, _value_rule,
@@ -1785,7 +1815,9 @@ class GraphCoordinator:
         return self.commit_role_initialization_v2(
             namespace=namespace, operation_id=operation_id, plan=plan,
             principal=principal, request_digest=request_digest,
-            resources=resources)
+            resources=resources, actor_id=actor_id,
+            owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
 
     def read_current_creation_budget_v2(
             self, *, namespace: NamespaceId, budget_ref: str,
@@ -1897,7 +1929,9 @@ class GraphCoordinator:
 
     def commit_role_initialization_v2(self, *, namespace: NamespaceId,
                                       operation_id: str, plan, principal,
-                                      request_digest: str, resources):
+                                      request_digest: str, resources,
+                                      actor_id: str, owner_session_token: str,
+                                      owner_session_request: OwnerSessionLoginRequestV1):
         """Install one authored D01 plan and active head after committed Owner issue.
 
         This internal GraphWorker operation is not an Owner login endpoint. Its
@@ -2050,6 +2084,10 @@ class GraphCoordinator:
                 or port.installation_grant.authority_id != target.authority_id
                 or port.installation_grant.installation_id != grant.value["installation_id"]):
             raise UnavailableGuard("role recovery or installation identity differs")
+        self._check_owner_session_v2(
+            namespace=namespace, principal=principal, actor_id=actor_id,
+            token=owner_session_token, request=owner_session_request,
+            target=target)
         input_digest = "sha256:" + canonical_digest({
             "schema": "sylanne3.graph.role_initialization.v1",
             "namespace": list(namespace.as_tuple), "operation_id": operation_id,
@@ -2072,7 +2110,9 @@ class GraphCoordinator:
             if saved is None and rejection is None:
                 self.reject_unresolvable_role_initialization_v2(
                     namespace=namespace, operation_id=operation_id,
-                    request_digest=request_digest, principal=principal)
+                    request_digest=request_digest, principal=principal,
+                    actor_id=actor_id, owner_session_token=owner_session_token,
+                    owner_session_request=owner_session_request)
             raise AuthorityDenied("role initialization identity differs")
         if (saved is None) != (intent is None) and saved is not None:
             raise UnavailableGuard("role receipt lacks original intent")
@@ -2169,6 +2209,10 @@ class GraphCoordinator:
             elif (metadata.graph_revision < saved[6]
                   or epoch.revision < saved[7]):
                 raise UnavailableGuard("finished role lost business stamp")
+            self._read_current_owner_session_v2(
+                namespace=namespace, principal=principal, actor_id=actor_id,
+                token=owner_session_token, request=owner_session_request,
+                capability="workbench.create")
             return receipt
         if (intent is not None and
                 (metadata.graph_revision, epoch.revision) != intent[5:7]):
@@ -2266,7 +2310,9 @@ class GraphCoordinator:
         try:
             guarded = guard_reader(
                 namespace=namespace, authority_namespace=target.authority_namespace,
-                permit=permit)
+                permit=permit, owner_actor_id=actor_id,
+                owner_session_token=owner_session_token,
+                owner_session_request=owner_session_request)
             if (type(guarded) is not tuple or len(guarded) != 2
                     or type(guarded[0]) is not OwnerAuthorizationGuardV1
                     or guarded[1] != permit):
@@ -2480,8 +2526,8 @@ class GraphCoordinator:
             return role, tuple(bindings), epoch, tuple(versions)
         return role, tuple(bindings), epoch
 
-    def _check_scene_owner_session_v2(self, *, namespace, principal, actor_id,
-                                      token, request, target):
+    def _check_owner_session_v2(self, *, namespace, principal, actor_id,
+                                token, request, target):
         from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 
         port = self.__content_fence_v2
@@ -2495,24 +2541,24 @@ class GraphCoordinator:
                 != port.installation_grant.installation_id
                 or request.audience != "owner"
                 or self._current_owner_principal(actor_id, namespace) != principal):
-            raise UnavailableGuard("current signed scene Owner session differs")
+            raise UnavailableGuard("current signed Owner session differs")
 
-    def _read_scene_owner_session_v2(self, *, namespace, principal, actor_id,
-                                     token, request):
-        """Recheck a completed scene replay with a new signed Owner read fence."""
+    def _read_current_owner_session_v2(self, *, namespace, principal, actor_id,
+                                       token, request, capability):
+        """Recheck a current signed Owner session under a new read fence."""
         port = self.__content_fence_v2
         store = self.__store
         with store._lock:
             metadata, epoch = self._v2_graph_stamp(namespace)
         target = metadata.requirements
-        self._check_scene_owner_session_v2(
+        self._check_owner_session_v2(
             namespace=namespace, principal=principal, actor_id=actor_id,
             token=token, request=request, target=target)
         anchor = port.current_anchor(
             namespace=namespace, authority_namespace=target.authority_namespace)
         if not self._anchor_matches(target, anchor):
             raise UnavailableGuard("scene replay Authority anchor differs")
-        attempt_id = "scene-replay-read-" + secrets.token_hex(16)
+        attempt_id = "owner-session-read-" + secrets.token_hex(16)
         permit = port.begin_fence(
             namespace=namespace, authority_namespace=target.authority_namespace,
             holder=self.__holder, generation=1, operation="read",
@@ -2520,14 +2566,14 @@ class GraphCoordinator:
         scope = FenceScope(namespace, target.authority_namespace, 1, "read",
                            attempt_id, permit, anchor, epoch, metadata.graph_revision)
         authority = AuthorityContext(
-            actor_id, "d12", "scene-replay-read", namespace,
-            ("persona", "scene"), "workbench_user_action", ("owner",),
+            actor_id, "d12", "owner-session-read", namespace,
+            ("persona",), "workbench_user_action", ("owner",),
             "owner-grant-v1", 1)
         try:
             _, owner = self._owner_binding_in_fence(
                 authority, scope, principal, None, (token, request))
-            if "workbench.bind_scene" not in owner.capabilities:
-                raise AuthorityDenied("Owner grant lacks scene binding permission")
+            if capability not in owner.capabilities:
+                raise AuthorityDenied("Owner grant lacks requested permission")
             if port.validate_fence(scope) != permit:
                 raise UnavailableGuard("scene replay read permit changed")
         finally:
@@ -2535,7 +2581,7 @@ class GraphCoordinator:
                 scope, request_id="finish:" + attempt_id,
                 request_digest="sha256:" + canonical_digest({
                     "operation_id": attempt_id, "permit_token": permit.token,
-                    "action": "finish_scene_replay_read",
+                    "action": "finish_owner_session_read",
                 }))
 
     def replay_committed_scene_binding_v2(
@@ -2709,7 +2755,7 @@ class GraphCoordinator:
             namespace, proof_row[0], proof_row[1], proof_row[2], proof_row[3],
             proof_row[4], 1, proof_row[5], proof_row[6], proof_row[7])
         target = metadata.requirements
-        self._check_scene_owner_session_v2(
+        self._check_owner_session_v2(
             namespace=namespace, principal=principal, actor_id=actor_id,
             token=owner_session_token, request=owner_session_request,
             target=target)
@@ -2904,9 +2950,10 @@ class GraphCoordinator:
             elif (metadata.graph_revision < saved[5]
                   or epoch.revision < saved[6]):
                 raise UnavailableGuard("finished scene lost business stamp")
-            self._read_scene_owner_session_v2(
+            self._read_current_owner_session_v2(
                 namespace=namespace, principal=principal, actor_id=actor_id,
-                token=owner_session_token, request=owner_session_request)
+                token=owner_session_token, request=owner_session_request,
+                capability="workbench.bind_scene")
             return receipt
         # This command only creates the first binding for a scene. D03's
         # no_applicable_binding can also describe a revoked or out-of-window

@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 from .contract import AuthorityUnavailable, identifier
 from .core import AuthorityServiceCore
+from .v2_fence_store import AuthorityV2FenceStore
 from .v2_owner_contract import OwnerPrincipalV1
 from .v2_owner_proof import _principal, _stamp, _time, _verify_signature
 
@@ -416,6 +417,8 @@ class AuthorityV2OwnerSessionStore:
         self._core._require(transport_credential, "owner_session", request.authority_namespace)
         with self._core._tx() as db:
             self.require_current_in_tx(db, token=token, request=request)
+            AuthorityV2FenceStore.require_idle_owner_write_in_tx(
+                db, request.authority_namespace)
             db.execute("UPDATE authority_owner_sessions_v1 SET revoked_at_utc=? WHERE verifier=?",
                        (_stamp(self._now()), _verifier(token)))
 
@@ -424,6 +427,8 @@ class AuthorityV2OwnerSessionStore:
         self._core._require(transport_credential, "owner_session_revoke", request.authority_namespace)
         with self._core._tx() as db:
             self.require_current_in_tx(db, token=token, request=request)
+            AuthorityV2FenceStore.require_idle_owner_write_in_tx(
+                db, request.authority_namespace)
             db.execute(
                 "INSERT INTO authority_owner_session_principals_v1 VALUES(?,?,?,1) "
                 "ON CONFLICT(authority_namespace,installation_id,principal_json) "
@@ -436,6 +441,8 @@ class AuthorityV2OwnerSessionStore:
         self._core._require(transport_credential, "owner_session_revoke", request.authority_namespace)
         with self._core._tx() as db:
             self.require_current_in_tx(db, token=token, request=request)
+            AuthorityV2FenceStore.require_idle_owner_write_in_tx(
+                db, request.authority_namespace)
             db.execute(
                 "INSERT INTO authority_owner_session_revoked_keys_v1 VALUES(?,?,?,?,?)",
                 (request.authority_namespace, request.installation_id, _principal(request.principal),

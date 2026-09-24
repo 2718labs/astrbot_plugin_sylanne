@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from .contract import AuthorityUnavailable, identifier
 from .core import AuthorityServiceCore
+from .v2_fence_store import AuthorityV2FenceStore
 from .v2_owner_contract import (
     OwnerAuthorizationOperationV1, OwnerPrincipalV1, canonical_digest,
     from_wire as owner_from_wire, to_wire as owner_to_wire,
@@ -488,6 +489,8 @@ class AuthorityV2OwnerProofStore:
                                        registration.installation_id, principal)
             if current is not None and current[4] == encoded:
                 return registration
+            AuthorityV2FenceStore.require_idle_owner_write_in_tx(
+                db, registration.authority_namespace)
             if registration.credential_epoch != (current[0] + 1 if current else 1):
                 raise AuthorityUnavailable("Owner credential epoch differs")
             if db.execute(

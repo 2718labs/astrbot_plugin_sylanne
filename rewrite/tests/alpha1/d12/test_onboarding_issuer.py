@@ -29,17 +29,21 @@ from sylanne3.workbench_api.d01_onboarding import (
 
 
 SCOPE = "bot/persona"
+PRINCIPAL = OwnerPrincipalV1("installed-account", "account:creator", "incarnation:1")
 SESSION = AuthenticatedSession(
     "creator", "server-session", {SCOPE: frozenset({"workbench.create"})},
     {SCOPE: frozenset({"owner"})},
     {SCOPE: frozenset({"workbench_user_action"})},
+    owner_session_token="x" * 43,
+    owner_session_request=OwnerSessionLoginRequestV1(
+        "authority", "authority-ns", "installation", PRINCIPAL,
+        "credential", 1, "owner", "http://localhost:6185"),
 )
 CONTEXT = RequestContext(True, True, True)
 PLAN = PersonaPlan(
     "initial-plan", NamespaceId("bot", "persona"), 1,
     (PersonaBlock("identity", "semantic_identity", "小岚", "read_only"),), (), True,
 )
-PRINCIPAL = OwnerPrincipalV1("installed-account", "account:creator", "incarnation:1")
 
 
 def command(operation_id: str | None = None, *, budget_ref: str = "host/budget") -> dict:
@@ -122,9 +126,23 @@ def test_create_uses_server_policy_and_exact_graph_receipt():
     assert len(policy.calls) == 1 and len(graph.calls) == 1
     assert graph.calls[0]["plan"] is PLAN
     assert graph.calls[0]["principal"] is PRINCIPAL
+    assert graph.calls[0]["actor_id"] == SESSION.actor_id
+    assert graph.calls[0]["owner_session_token"] == SESSION.owner_session_token
+    assert graph.calls[0]["owner_session_request"] == SESSION.owner_session_request
     assert graph.calls[0]["resources"].model.resource_ref == "provider/model"
     assert graph.calls[0]["resources"].budget.lease_ref == "lease:one"
     assert graph.calls[0]["request_digest"] == policy.calls[0]["request_digest"]
+    assert SESSION.owner_session_token not in repr(answer.receipt)
+
+
+def test_create_requires_signed_owner_session_before_replay_or_commit():
+    graph, policy = Graph(), Policy()
+    answer = WorkbenchService(GraphWorkbenchIssuer(
+        graph, Grants(), Views(), policy)).handle(
+            command(), session=replace(SESSION, owner_session_token=None), context=CONTEXT)
+    assert answer.status == "unavailable"
+    assert answer.problem["code"] == "signed_owner_session_unavailable"
+    assert policy.calls == [] and graph.calls == []
 
 
 def test_committed_replay_returns_original_receipt_without_new_creation():

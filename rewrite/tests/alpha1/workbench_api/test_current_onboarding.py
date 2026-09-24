@@ -9,6 +9,14 @@ class D01:
         self.calls.append(kwargs)
         return "d01-result"
 
+    def replay_committed_create_character(self, **kwargs):
+        self.calls.append(("replay", kwargs))
+        return "d01-receipt"
+
+    def reject_unresolvable_create_character(self, **kwargs):
+        self.calls.append(("reject", kwargs))
+        return True
+
 
 class D03:
     def __init__(self):
@@ -17,6 +25,10 @@ class D03:
     def resolve_bind_scene(self, **kwargs):
         self.calls.append(kwargs)
         return "d03-result"
+
+    def replay_committed_bind_scene(self, **kwargs):
+        self.calls.append(("replay", kwargs))
+        return "d03-receipt"
 
 
 def test_create_and_bind_are_delegated_to_their_domain_resolver():
@@ -53,3 +65,21 @@ def test_missing_domain_resolver_preserves_hold():
     ) is None
     assert d01.calls == []
     assert d03.calls == []
+
+
+def test_replay_and_pending_rejection_are_delegated_without_reselection():
+    d01, d03 = D01(), D03()
+    resolver = CurrentOnboardingResolver(d01=d01, d03=d03)
+    args = {
+        "coordinator": "graph", "session": "signed-session", "scope": "bot/persona",
+        "purpose": "workbench_user_action", "audience": "owner",
+        "operation_id": "operation", "request_digest": "digest",
+    }
+    assert resolver.replay_committed_create_character(**args) == "d01-receipt"
+    assert resolver.reject_unresolvable_create_character(**args) is True
+    assert resolver.replay_committed_bind_scene(**args) == "d03-receipt"
+    assert d01.calls == [("replay", args), ("reject", args)]
+    assert d03.calls == [("replay", args)]
+    assert CurrentOnboardingResolver(d03=d03).replay_committed_create_character(**args) is None
+    assert CurrentOnboardingResolver(d03=d03).reject_unresolvable_create_character(**args) is False
+    assert CurrentOnboardingResolver(d01=d01).replay_committed_bind_scene(**args) is None

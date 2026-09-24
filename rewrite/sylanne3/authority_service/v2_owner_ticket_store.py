@@ -772,7 +772,7 @@ class AuthorityV2OwnerTicketStore:
                           if sessions is not None else None)
                 from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
 
-                if (permit.operation != "read" or guard is None
+                if (guard is None
                         or type(sessions) is not AuthorityV2OwnerSessionStore
                         or type(source) is not AuthorityOwnerPairingSource
                         or source._core is not self._core

@@ -294,6 +294,10 @@ class GraphWorkbenchIssuer:
                           input_data: Mapping[str, Any]) -> Mapping[str, Any]:
         if not session.allows(scope, "workbench.create", purpose, audience):
             return _unavailable("authority_unavailable")
+        if (type(session.owner_session_token) is not str
+                or not session.owner_session_token
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1):
+            return _unavailable("signed_owner_session_unavailable")
         resolver = self._onboarding
         commit = getattr(self._coordinator, "commit_role_initialization_v2", None)
         if resolver is None or not callable(commit):
@@ -329,7 +333,10 @@ class GraphWorkbenchIssuer:
                 return _unavailable("role_initialization_policy_unavailable")
             result = commit(namespace=resolved.plan.namespace, operation_id=operation_id,
                             request_digest=digest, plan=resolved.plan,
-                            principal=resolved.principal, resources=resolved.resources)
+                            principal=resolved.principal, resources=resolved.resources,
+                            actor_id=resolved.actor_id,
+                            owner_session_token=session.owner_session_token,
+                            owner_session_request=session.owner_session_request)
             expected_namespace = resolved.plan.namespace
             expected_plan_id = resolved.plan.plan_id
             expected_head_id = resolved.plan.head_id
