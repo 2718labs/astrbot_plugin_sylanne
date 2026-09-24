@@ -144,13 +144,14 @@ class AuthorityV2DeletionTailMigration:
                     marker["journal_id"], marker["before_seq"], marker["before_digest"]):
                 raise AuthorityUnavailable("deletion head changed after tail blocker")
             version = self.deletion.schema_version()
-            if version == 2:
-                return
             metadata = self.deletion._check_schema()[2]
             if (metadata["namespace"] != self.namespace
-                    or int(metadata["cut_seq"]) != head.seq
-                    or metadata["cut_digest"] != head.digest
-                    or self.deletion._db.execute(
+                    or int(metadata["cut_seq"]) != marker["before_seq"]
+                    or metadata["cut_digest"] != marker["before_digest"]):
+                raise AuthorityUnavailable("tail cut or namespace differs from blocker")
+            if version == 2:
+                return
+            if (self.deletion._db.execute(
                         "SELECT 1 FROM authority_deletion_v2_tail LIMIT 1").fetchone()):
                 raise AuthorityUnavailable("tail upgrade requires exact cut and empty old tail")
             log = self.deletion._db
@@ -171,6 +172,11 @@ class AuthorityV2DeletionTailMigration:
             if self.deletion.schema_version() != 2:
                 raise AuthorityUnavailable("schema-2 tail is absent")
             deletion_head = self.deletion.verified_head()
+            metadata = self.deletion._check_schema()[2]
+            if (metadata["namespace"] != self.namespace
+                    or int(metadata["cut_seq"]) != deletion_head.seq
+                    or metadata["cut_digest"] != deletion_head.digest):
+                raise AuthorityUnavailable("schema-2 tail cut or namespace differs")
             with self.execution.freeze_writes():
                 execution_head = self.execution.verified_head()
                 with self.core._tx() as db:

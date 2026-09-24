@@ -81,6 +81,9 @@ class AuthorityV2FenceService:
                 deletion_history = self.deletion.has_deletion_history(self.namespace)
                 execution_head = self.execution.verified_head()
                 with self.core._tx() as db:
+                    self.deletion.require_target_schema_locked(
+                        db, authority_id=self.core._id(db), namespace=self.namespace,
+                        journal_id=deletion_head.journal_id)
                     yield db, deletion_head, execution_head, deletion_history
 
     def current_anchor(self, *, credential, subject: str) -> RestoreAnchor:

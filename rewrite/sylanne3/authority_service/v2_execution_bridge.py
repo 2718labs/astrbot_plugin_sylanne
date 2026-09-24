@@ -155,6 +155,9 @@ class AuthorityV2ExecutionBridge:
                 raise AuthorityUnavailable("handoff start schema differs")
 
     def _check_deletion_locked(self, db, head):
+        self.deletion.require_target_schema_locked(
+            db, authority_id=self.core._id(db), namespace=self.namespace,
+            journal_id=head.journal_id)
         row = self.core._row(db, self.namespace)
         if row[6:9] != (head.journal_id, head.seq, head.digest) or row[9] != "clear":
             raise AuthorityUnavailable("deletion journal changed or is not settled")
@@ -393,30 +396,33 @@ class AuthorityV2ExecutionBridge:
         if verified is not True:
             raise AuthorityUnavailable("D08 dispatch verification denied")
         pending = self._build_pending(permit, mutation_id, footprint)
-        # Journal observation ends before the Authority write transaction starts.
-        head = self.journal.verified_head()
-        if (head.journal_id, head.seq, head.digest) != (
-                pending.before_anchor.execution_journal_id,
-                pending.before_anchor.execution_seq,
-                pending.before_anchor.execution_digest):
-            raise AuthorityUnavailable("journal before-head differs from Authority fence")
-        with core._tx() as db:
-            self._require_v2_mode_locked(db)
-            self.fences._check_schema(db)
-            mutation = self.fences.mutation_locked(db, mutation_id)
-            if mutation is not None:
-                self._load_mutation_locked(db, pending, subject)
-                return pending
-            self._check_core_owner(db, permit)
-            self._check_fence_locked(db, permit, subject)
-            if db.execute("SELECT 1 FROM authority_permits WHERE namespace=? LIMIT 1",
-                          (self.namespace,)).fetchone():
-                raise AuthorityUnavailable("legacy permit overlaps v2 prepared dispatch")
-            self._check_effects(db, self.namespace, permit.effect_id, keys)
-            self.fences.record_pending_locked(
-                db, pending, subject=subject,
-                current_anchor=permit.pinned_anchor, footprint=footprint,
-                conflict_keys=keys)
+        with self.deletion.freeze_writes():
+            deletion_head = self.deletion.verified_head()
+            with self.journal.freeze_writes():
+                head = self.journal.verified_head()
+                if (head.journal_id, head.seq, head.digest) != (
+                        pending.before_anchor.execution_journal_id,
+                        pending.before_anchor.execution_seq,
+                        pending.before_anchor.execution_digest):
+                    raise AuthorityUnavailable("journal before-head differs from Authority fence")
+                with core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    self.fences._check_schema(db)
+                    self._check_deletion_locked(db, deletion_head)
+                    mutation = self.fences.mutation_locked(db, mutation_id)
+                    if mutation is not None:
+                        self._load_mutation_locked(db, pending, subject)
+                        return pending
+                    self._check_core_owner(db, permit)
+                    self._check_fence_locked(db, permit, subject)
+                    if db.execute("SELECT 1 FROM authority_permits WHERE namespace=? LIMIT 1",
+                                  (self.namespace,)).fetchone():
+                        raise AuthorityUnavailable("legacy permit overlaps v2 prepared dispatch")
+                    self._check_effects(db, self.namespace, permit.effect_id, keys)
+                    self.fences.record_pending_locked(
+                        db, pending, subject=subject,
+                        current_anchor=permit.pinned_anchor, footprint=footprint,
+                        conflict_keys=keys)
         return pending
 
     def prepare_claim_pending(self, *, credential, subject: str,
