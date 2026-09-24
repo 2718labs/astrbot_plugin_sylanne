@@ -6067,6 +6067,83 @@ class GraphCoordinator:
 
         return self._read_v2(authority, reader)
 
+    def read_first_ingress_encoding_binding_v2(
+        self, authority: AuthorityContext, lease: object, job_id: str,
+        acquire_operation_id: str,
+    ):
+        """Return the original frozen request to its current acquired D11 worker.
+
+        This content read is fenced and requires current source access. Cost
+        reconciliation must use an independent content-free terminal query.
+        """
+        from datetime import datetime
+
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .runtime.encoding_call_binding import binding_from_json, load_binding
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D11BudgetJobIssuer
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("v2 encoding binding read requires the installed graph")
+        self._authorize(lease, authority, frozenset({"d11"}), owner_read=True)
+        if (authority.issuer_domain != "d11" or "activity" not in authority.owner_scope
+                or type(acquire_operation_id) is not str
+                or authority.capability_ref != _operation_capability_ref(
+                    authority.namespace, authority.actor, "d11", frozenset({"d11"}),
+                    authority.activation_generation, acquire_operation_id)):
+            raise AuthorityDenied("encoding binding read requires the job-bound D11 lease")
+        try:
+            clock = self.__content_fence_v2.read_ingress_clock(
+                self.__scene_clock_policy)
+            now = trusted_upper(clock)
+        except Exception as exc:
+            raise UnavailableGuard("encoding binding trusted clock unavailable; HOLD") from exc
+
+        def reader():
+            db = self.__store._db
+            (job, _, _, outbox, _, _, source_version, access_version) = (
+                self._first_ingress_encoding_job_locked(authority.namespace, job_id))
+            if (not _job_acquire_id_matches(
+                    acquire_operation_id, authority.namespace, job_id,
+                    job.operation_id, authority.actor,
+                    authority.activation_generation)
+                    or job.phase != "running" or job.lease_holder != authority.actor
+                    or job.cancel_epoch or job.fence < 1
+                    or authority.worker_fence != job.fence):
+                raise UnavailableGuard("encoding binding job lease is not current; HOLD")
+            expiry = datetime.fromisoformat(
+                job.lease_expires_utc.replace("Z", "+00:00")).timestamp()
+            if now >= expiry:
+                raise UnavailableGuard("encoding binding job lease expired; HOLD")
+            self.__d11_issuer.authorize_existing_encoding_job(db, job, now_utc=now)
+            intent = db.execute(
+                "SELECT encoding_binding_json FROM graph_job_acquire_intents_v2 "
+                "WHERE bot=? AND persona=? AND acquire_operation_id=? "
+                "AND job_id=? AND original_operation_id=? AND actor=?",
+                authority.namespace.as_tuple + (
+                    acquire_operation_id, job_id, job.operation_id, authority.actor),
+            ).fetchone()
+            receipt = db.execute(
+                "SELECT 1 FROM graph_job_acquire_receipts_v2 WHERE bot=? "
+                "AND persona=? AND acquire_operation_id=?",
+                authority.namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            binding = load_binding(db, authority.namespace, job_id)
+            if (intent is None or intent[0] is None or receipt is None
+                    or binding is None or binding != binding_from_json(intent[0])
+                    or binding.request.get("schema")
+                    != "sylanne.first-ingress-encoding-call.v2"):
+                raise UnavailableGuard("committed original encoding binding is absent; HOLD")
+            self._validate_first_ingress_encoding_binding_context(
+                authority.namespace, job, outbox, source_version, access_version,
+                authority, now, acquire_operation_id, clock, binding)
+            return binding
+
+        return self._read_v2(authority, reader)
+
     def _qualified_first_ingress_acquire_return(
         self, namespace: NamespaceId, job_id: str, expected: PersistentJob,
         actor: str, clock, lease_seconds: int,

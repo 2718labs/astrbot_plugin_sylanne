@@ -221,6 +221,12 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         assert admission.provider_config_digest == intent2.provider_config_digest
         assert admission.host_incarnation == "a" * 64
         assert admitted2["record"]["state"] == "dispatch_started"
+        terminal_query = {"namespace": "ns-a", "holder": "holder-a",
+                          "intent": to_wire(intent2)}
+        unresolved = call("model_terminal_fact_v2", terminal_query)
+        assert unresolved["record"]["state"] == "dispatch_started"
+        assert unresolved["admission"] == to_wire(admission)
+        assert unresolved["receipt"] is None
         with pytest.raises(RuntimeError, match="authority unavailable"):
             call("model_admit_dispatch_once_v2", admit2)
         report = HostObservedModelCompletionV2(
@@ -258,6 +264,14 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         assert completed["record"]["state"] == "observed"
         assert receipt.report_digest == report.digest
         assert fences.fences._row(fences.core._db, intent2.operation_id)[6] == "finished"
+        terminal = call("model_terminal_fact_v2", terminal_query)
+        assert terminal["record"]["state"] == "observed"
+        assert terminal["record"]["usage"] == [["input_tokens", 1]]
+        assert terminal["record"]["cost"] == [["micro_usd", 2]]
+        assert terminal["receipt"] == to_wire(receipt)
+        assert "result_json" not in json.dumps(terminal)
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            other("model_terminal_fact_v2", terminal_query)
         # The terminal receipt is not a current Owner read grant, even for the
         # observer that submitted the complete response.
         with pytest.raises(AuthorityUnavailable, match="Owner-qualified"):

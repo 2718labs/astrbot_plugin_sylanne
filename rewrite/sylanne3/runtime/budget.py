@@ -127,8 +127,8 @@ class BudgetLease:
         for dimension in set(used) | set(reserved) | set(unconfirmed):
             if dimension not in limits:
                 raise ValueError("budget counter has no declared limit")
-            if used.get(dimension, 0) + reserved.get(dimension, 0) + unconfirmed.get(dimension, 0) > limits[dimension]:
-                raise ValueError("budget counters exceed the lease limit")
+            # A provider can report more than its quoted ceiling. The actual
+            # debt remains in used; availability clamps to zero below.
         object.__setattr__(self, "limits", limits)
         object.__setattr__(self, "used", used)
         object.__setattr__(self, "reserved", reserved)
@@ -152,7 +152,7 @@ class BudgetReceipt:
     unconfirmed: Mapping[str, int]
 
     def __post_init__(self) -> None:
-        if self.status not in {"created", "reserved", "settled", "pending_confirmation", "closed", "duplicate"}:
+        if self.status not in {"created", "reserved", "settled", "overrun", "pending_confirmation", "closed", "duplicate"}:
             raise ValueError("invalid budget receipt status")
         _identifier(self.operation_id, "operation_id")
         _digest(self.digest)
@@ -300,16 +300,18 @@ def _settle_transition(
         reservation_state = "unknown"
     else:
         charged = _amounts(actual)
-        for dimension, amount in charged.items():
-            if amount > ceiling.get(dimension, 0):
-                raise BudgetUnavailable("actual cost exceeds reserved ceiling")
-        if charged != ceiling and not execution_revoked:
+        if any(dimension not in lease.limits for dimension in charged):
+            raise BudgetUnavailable("actual cost uses an undeclared lease dimension")
+        if any(charged.get(dimension, 0) < amount
+               for dimension, amount in ceiling.items()) and not execution_revoked:
             raise BudgetUnavailable("unused reserved budget requires revoked execution authority")
         used = _plus(lease.used, charged)
         unconfirmed = lease.unconfirmed
-        status = "settled"
+        status = ("overrun" if any(amount > ceiling.get(dimension, 0)
+                                   for dimension, amount in charged.items())
+                  else "settled")
         actual_json = _json(charged)
-        reservation_state = "settled"
+        reservation_state = status
     updated = BudgetLease(
         lease.lease_id, lease.parent_id, lease.bot_id, lease.persona_id,
         lease.currency, lease.limits, used, _minus(lease.reserved, ceiling),
@@ -500,11 +502,14 @@ def resolve_unconfirmed(db, lease_id: str, original_operation_id: str,
         raise BudgetConflict("reservation is not awaiting confirmation")
     ceiling = _amounts(json.loads(row[0]), allow_empty=False)
     charged = _amounts(actual)
-    for dimension, amount in charged.items():
-        if amount > ceiling.get(dimension, 0):
-            raise BudgetUnavailable("resolved cost exceeds held ceiling")
-    if charged != ceiling and not execution_revoked:
+    if any(dimension not in lease.limits for dimension in charged):
+        raise BudgetUnavailable("resolved cost uses an undeclared lease dimension")
+    if any(charged.get(dimension, 0) < amount
+           for dimension, amount in ceiling.items()) and not execution_revoked:
         raise BudgetUnavailable("unused unknown ceiling requires revoked execution authority")
+    status = ("overrun" if any(amount > ceiling.get(dimension, 0)
+                               for dimension, amount in charged.items())
+              else "settled")
     updated = BudgetLease(
         lease.lease_id, lease.parent_id, lease.bot_id, lease.persona_id,
         lease.currency, lease.limits, _plus(lease.used, charged), lease.reserved,
@@ -512,11 +517,11 @@ def resolve_unconfirmed(db, lease_id: str, original_operation_id: str,
     )
     _save_lease(db, updated)
     db.execute(
-        "UPDATE runtime_budget_reservations SET state='settled',actual_json=? "
+        "UPDATE runtime_budget_reservations SET state=?,actual_json=? "
         "WHERE lease_id=? AND operation_id=?",
-        (_json(charged), lease_id, original_operation_id),
+        (status, _json(charged), lease_id, original_operation_id),
     )
-    receipt = _receipt(updated, "settled", resolution_operation_id, digest)
+    receipt = _receipt(updated, status, resolution_operation_id, digest)
     _record(db, updated, resolution_operation_id, "resolve", digest, receipt)
     return receipt
 

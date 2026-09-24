@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
 from ..runtime_contracts import canonical_digest
 from .contract import AuthorityUnavailable, identifier
 from .current_model_result_read_graph_verifier import PinnedCurrentModelResultReadGraphVerifier
@@ -33,6 +32,9 @@ class AuthorityV2ModelResultReadService:
         identifier(installation_id, "installation_id")
         identifier(read_subject, "read_subject")
         identifier(holder, "holder")
+        # The host pairing adapter imports local composition; delay this type
+        # check until construction to keep the Authority modules acyclic.
+        from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
         if (type(source_purpose) is not str
                 or source_purpose not in {"context", "expression", "consolidation", "audit"}):
             raise ValueError("administrator-pinned source purpose is required")

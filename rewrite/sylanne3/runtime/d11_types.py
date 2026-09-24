@@ -225,12 +225,13 @@ class RuntimeCostSettlement:
                     or self.budget_operation_id != self.cost_operation_id
                     or self.prior_unknown_ref is not None):
                 raise ValueError("unknown cost must retain its full original ceiling")
-        elif self.status == "settled":
+        elif self.status in {"settled", "overrun"}:
             if actual is None or unconfirmed:
-                raise ValueError("settled cost requires known actual and no unknown balance")
-            if not _within(actual, ceiling):
-                raise ValueError("actual cost exceeds its ceiling")
-            if actual != ceiling and not self.execution_revoked:
+                raise ValueError("known cost requires actual and no unknown balance")
+            exceeds = not _within(actual, ceiling)
+            if exceeds != (self.status == "overrun"):
+                raise ValueError("cost status differs from actual ceiling overrun")
+            if any(actual.get(name, 0) < amount for name, amount in ceiling.items()) and not self.execution_revoked:
                 raise ValueError("released cost ceiling requires revoked execution authority")
             if self.prior_unknown_ref is None:
                 if (self.budget_phase != "settle"
@@ -240,7 +241,7 @@ class RuntimeCostSettlement:
                   or self.budget_operation_id == self.cost_operation_id):
                 raise ValueError("unknown resolution requires an independent resolve receipt")
         else:
-            raise ValueError("cost status must be settled or pending_confirmation")
+            raise ValueError("cost status must be settled, overrun or pending_confirmation")
         object.__setattr__(self, "ceiling", ceiling)
         object.__setattr__(self, "actual", actual)
         object.__setattr__(self, "unconfirmed", unconfirmed)
@@ -544,9 +545,9 @@ def cost_settlement_from_runtime(
         status = "pending_confirmation"
         actual = None
         unconfirmed = ceiling
-    elif reservation[1] == "settled":
-        if receipt["status"] != "settled":
-            raise ValueError("settled cost lacks an independent settled receipt")
+    elif reservation[1] in {"settled", "overrun"}:
+        if receipt["status"] != reservation[1]:
+            raise ValueError("known cost lacks its independent matching receipt")
         if prior_was_unknown:
             if (budget_phase != "resolve" or budget_operation_id == cost_operation_id
                     or prior_unknown_ref is None):
@@ -554,7 +555,7 @@ def cost_settlement_from_runtime(
         elif (budget_phase != "settle" or budget_operation_id != cost_operation_id
               or prior_unknown_ref is not None):
             raise ValueError("direct cost settlement references the wrong receipt")
-        status = "settled"
+        status = reservation[1]
         actual = json.loads(reservation[2]) if reservation[2] is not None else {}
         unconfirmed = {}
     else:

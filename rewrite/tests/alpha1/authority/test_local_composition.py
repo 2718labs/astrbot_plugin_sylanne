@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+import asyncio
 import sqlite3
 
 import pytest
@@ -10,7 +11,15 @@ import pytest
 from rewrite.tests.alpha1.runtime.test_authority_v2_fence_service import installed
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.local_composition import compose_local_owner_authority
-from sylanne3.authority_service.mtls_server import AdministratorInstallationV2
+from sylanne3.authority_service.mtls_server import AdministratorInstallationV2, MtlsPeerCredential
+from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
+from sylanne3.authority_service.v2_model_egress_store import AuthorityV2ModelEgressStore
+from sylanne3.authority_service.v2_model_result_read_service import AuthorityV2ModelResultReadService
+from sylanne3.authority_service.v2_owner_proof import AuthorityV2OwnerProofStore
+from sylanne3.authority_service.v2_owner_session import AuthorityV2OwnerSessionStore
+from sylanne3.authority_service.v2_model_result_read_wire import to_wire as result_to_wire
+from rewrite.tests.alpha1.authority.test_v2_model_result_read import _request as result_request
+from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
 from sylanne3.runtime_contracts import NamespaceId
 
 
@@ -86,6 +95,103 @@ def test_composition_requires_pinned_graph_and_installed_identity(tmp_path):
             _compose(tmp_path, service, core, bindings=False)
         with pytest.raises(ValueError, match="absolute"):
             _compose(tmp_path, service, core, graph_path="relative-graph.db")
+    finally:
+        core.close()
+        deletion.close()
+        guard.close()
+        execution.close()
+
+
+def test_composition_pins_result_read_to_original_store_owner_and_installation(tmp_path):
+    service, core, _, deletion, guard, execution, _ = installed(tmp_path)
+    try:
+        graph_path = tmp_path / "graph.db"
+        sqlite3.connect(graph_path).close()
+        pairing = AuthorityOwnerPairingSource(
+            core, utc_clock=lambda: datetime.now(timezone.utc), create=True)
+        AuthorityV2OwnerProofStore(
+            core, utc_clock=lambda: datetime.now(timezone.utc),
+            pairing_verifier=lambda *_: False,
+            current_pairing_source=pairing, create=True)
+        sessions = AuthorityV2OwnerSessionStore(
+            core, utc_clock=lambda: datetime.now(timezone.utc),
+            current_pairing_source=pairing, create=True)
+        store = AuthorityV2ModelEgressStore(
+            core._db, create=True, lock=core._lock)
+        model = object.__new__(AuthorityV2ModelEgressService)
+        model._store = store
+        model._fences = service
+        model._graph_verifier = object()
+        model._admin_model_policy = object()
+        server = compose_local_owner_authority(
+            core=core, v2_fences={"ns-a": service}, graph_db_path=graph_path,
+            utc_clock=lambda: datetime.now(timezone.utc),
+            first_claim_verifier=lambda *_: False, claimant_verifier=None,
+            administrator_authorizer=lambda *_: False,
+            publisher_manifest_verifier=lambda *_: False,
+            installations_v2={("a" * 64, "profile"): AdministratorInstallationV2(
+                "installation", "holder-a", "policy", "capabilities-v2", "b" * 64)},
+            namespace_bindings_v2={("a" * 64, "profile", ROLE): "ns-a"},
+            v2_model_egress={"ns-a": model},
+            model_observers_v2={"ns-a": ("a" * 64, "profile")},
+            model_result_source_purposes={"ns-a": "audit"},
+            owner_sessions=sessions, creation_pairing_source=pairing,
+            create_owner_schema=True)
+        result = server._v2_model_result_reads["ns-a"]
+        assert type(result) is AuthorityV2ModelResultReadService
+        assert result._store is store and result._fences is service
+        assert result._sessions is sessions
+        assert result._tickets is server._v2_owner_tickets
+        assert (result._installation_id, result._source_purpose,
+                result._read_subject, result._holder) == (
+                    "installation", "audit", "mtls:sha256:" + "a" * 64,
+                    "holder-a")
+        server._administrator_authorizer = lambda *_: True
+        server._publisher_manifest_verifier = lambda *_: True
+        raw = {"protocol": "sylanne3.authority.v2", "profile_id": "profile",
+               "plugin_name": "astrbot_plugin_sylanne", "host_api_version": "4.28.1",
+               "manifest_sha256": "b" * 64}
+        peer = MtlsPeerCredential("a" * 64)
+        binding = server._dispatch_for_test("handshake", raw, peer, b"result-channel")
+        request = result_request()
+        request = replace(
+            request, authority_id=server._authority_id(),
+            authority_namespace="ns-a", namespace=ROLE,
+            installation_id="installation",
+            owner_session_request=replace(
+                request.owner_session_request,
+                authority_id=server._authority_id(),
+                authority_namespace="ns-a", installation_id="installation"))
+        command = {"namespace": "ns-a", "read_request": result_to_wire(request),
+                   "owner_session_token": "a" * 43}
+        reached = []
+
+        def read_completed(**kwargs):
+            reached.append(kwargs["request"])
+            raise RuntimeError("reached trusted result service")
+
+        result.read_completed = read_completed
+        with pytest.raises(RuntimeError, match="reached trusted result service"):
+            server._dispatch_for_test(
+                "model_result_read_v1", raw, peer, b"result-channel",
+                handshake_binding=binding["channel_binding_sha256"], command=command)
+        assert reached == [request]
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            server._dispatch_for_test(
+                "model_result_read_v1", raw, peer, b"result-channel",
+                handshake_binding=binding["channel_binding_sha256"],
+                command={**command, "graph_current": True})
+        assert reached == [request]
+        wrong_peer = MtlsPeerCredential("c" * 64)
+        wrong_binding = server._dispatch_for_test(
+            "handshake", raw, wrong_peer, b"wrong-channel")
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            server._dispatch_for_test(
+                "model_result_read_v1", raw, wrong_peer, b"wrong-channel",
+                handshake_binding=wrong_binding["channel_binding_sha256"],
+                command=command)
+        assert reached == [request]
+        asyncio.run(server.aclose())
     finally:
         core.close()
         deletion.close()

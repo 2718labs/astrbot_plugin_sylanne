@@ -21,6 +21,8 @@ from .v2_contract import FencePermitV2
 from .v2_fence_service import AuthorityV2FenceService
 from .v2_fence_store import AuthorityV2FenceStore
 from .v2_model_egress_service import AuthorityV2ModelEgressService
+from .v2_model_result_read_service import AuthorityV2ModelResultReadService
+from .current_model_result_read_graph_verifier import PinnedCurrentModelResultReadGraphVerifier
 from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 from .v2_owner_proof import AuthorityV2OwnerProofStore, OwnerProofAcceptanceV1
@@ -41,6 +43,7 @@ def compose_local_owner_authority(
     namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
     v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
     model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
+    model_result_source_purposes: Mapping[str, str] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
     owner_proofs: AuthorityV2OwnerProofStore | None = None,
@@ -143,8 +146,42 @@ def compose_local_owner_authority(
         creation_pairing_source=creation_pairing_source,
         create=create_owner_schema,
     )
+    purposes = dict(model_result_source_purposes or {})
+    models = dict(v2_model_egress or {})
+    observers = dict(model_observers_v2 or {})
+    if (any(type(namespace) is not str or namespace not in models
+            or type(purpose) is not str
+            or purpose not in {"context", "expression", "consolidation", "audit"}
+            for namespace, purpose in purposes.items())
+            or (purposes and (owner_sessions is None
+                             or creation_pairing_source is None))):
+        raise AuthorityUnavailable("Owner model result read requires installed dependencies")
+    result_graph = (PinnedCurrentModelResultReadGraphVerifier(graph_db_path)
+                    if purposes else None)
+    result_reads = {}
+    for namespace, purpose in purposes.items():
+        observer = observers.get(namespace)
+        installed = (installations_v2.get(observer)
+                     if observer is not None else None)
+        model = models[namespace]
+        if (installed is None or type(model) is not AuthorityV2ModelEgressService
+                or model._fences is not services[namespace]
+                or not any(peer == observer[0] and profile == observer[1]
+                               and mapped == namespace
+                               for (peer, profile, _), mapped in
+                               namespace_bindings_v2.items())):
+            raise AuthorityUnavailable("model result read observer installation differs")
+        result_reads[namespace] = AuthorityV2ModelResultReadService(
+            store=model._store, fences=services[namespace],
+            owner_tickets=owner_tickets, owner_sessions=owner_sessions,
+            graph_verifier=result_graph,
+            installation_id=installed.installation_id,
+            read_subject="mtls:sha256:" + observer[0],
+            holder=installed.administrator_holder,
+            source_purpose=purpose)
     return AuthorityRpcServer(
         core, v2_fences=services, v2_model_egress=v2_model_egress,
+        v2_model_result_reads=result_reads,
         model_observers_v2=model_observers_v2,
         v2_owner_tickets=owner_tickets,
         v2_owner_proofs=owner_proofs,

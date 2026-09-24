@@ -480,9 +480,8 @@ class D02ResourceIssuer:
                 or outcome.operation_id != quote.operation_id):
             raise IssuerAuthorityDenied("outcome identity differs from its quote")
         if outcome.actual is not None:
-            if not _within(outcome.actual, quote.ceiling):
-                raise IssuerAuthorityDenied("outcome actual exceeds quote ceiling")
-            if outcome.actual != quote.ceiling and not outcome.execution_revoked:
+            if any(outcome.actual.get(name, 0) < amount
+                   for name, amount in quote.ceiling.items()) and not outcome.execution_revoked:
                 raise IssuerAuthorityDenied(
                     "released quote ceiling requires revoked execution authority"
                 )
@@ -559,8 +558,6 @@ class D02ResourceIssuer:
                 or outcome.operation_id != quote.operation_id
                 or outcome.activity_id != quote.activity_id):
             raise IssuerAuthorityDenied("provider outcome differs from resource quote")
-        if outcome.actual is not None and not _within(outcome.actual, quote.ceiling):
-            raise IssuerAuthorityDenied("provider outcome exceeds quote ceiling")
         self._verify_outcome_authority(outcome, quote, db)
         return outcome
 

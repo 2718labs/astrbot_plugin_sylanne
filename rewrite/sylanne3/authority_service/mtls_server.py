@@ -39,6 +39,12 @@ from .v2_model_egress_contract import (
 )
 from .v2_model_egress_service import AuthorityV2ModelEgressService
 from .v2_model_egress_wire import from_wire as model_from_wire, to_wire as model_to_wire
+from .v2_model_result_read_contract import ModelResultReadRequestV1
+from .v2_model_result_read_service import AuthorityV2ModelResultReadService
+from .current_model_result_read_graph_verifier import PinnedCurrentModelResultReadGraphVerifier
+from .v2_model_result_read_wire import (
+    from_wire as result_from_wire, to_wire as result_to_wire,
+)
 from .v2_execution_bridge import AuthorityV2ExecutionBridge
 from .v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
@@ -177,6 +183,7 @@ class AuthorityRpcServer:
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
         v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
+        v2_model_result_reads: Mapping[str, AuthorityV2ModelResultReadService] | None = None,
         model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_owner_tickets: AuthorityV2OwnerTicketStore | None = None,
         v2_owner_proofs: AuthorityV2OwnerProofStore | None = None,
@@ -292,6 +299,29 @@ class AuthorityRpcServer:
                for namespace, observer in observers.items()):
             raise TypeError("model observers require an installed namespace-bound peer")
         self._model_observers_v2 = observers
+        if (v2_model_result_reads is not None
+                and not isinstance(v2_model_result_reads, Mapping)):
+            raise TypeError("Authority model result read mapping required")
+        result_reads = dict(v2_model_result_reads or {})
+        if any(
+                type(namespace) is not str or namespace not in model_services
+                or type(service) is not AuthorityV2ModelResultReadService
+                or v2_owner_tickets is None or v2_owner_sessions is None
+                or v2_owner_pairings is None
+                or service._store is not model_services[namespace]._store
+                or service._fences is not services[namespace]
+                or service._tickets is not v2_owner_tickets
+                or service._sessions is not v2_owner_sessions
+                or service._sessions._current_pairing_source is not v2_owner_pairings
+                or type(service._graph) is not PinnedCurrentModelResultReadGraphVerifier
+                or observers.get(namespace) is None
+                or (service._read_subject, service._installation_id, service._holder) != (
+                    "mtls:sha256:" + observers[namespace][0],
+                    installed[observers[namespace]].installation_id,
+                    installed[observers[namespace]].administrator_holder)
+                for namespace, service in result_reads.items()):
+            raise TypeError("result reads require the installed model and Owner composition")
+        self._v2_model_result_reads = result_reads
         self._sessions: dict[str, tuple[float, str, str]] = {}
         self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="authority-rpc")
         self._worker_slots = threading.BoundedSemaphore(max_inflight_dispatches)
@@ -549,6 +579,89 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method in {"model_result_read_v1", "model_result_read_recover_finish_v1"}:
+                expected = ({"namespace", "read_request", "owner_session_token"}
+                            if method == "model_result_read_v1" else
+                            {"namespace", "read_request"})
+                if set(command) != expected:
+                    raise AuthorityUnavailable("model result read command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                service = self._v2_model_result_reads.get(namespace)
+                if (service is None or service._read_subject != subject
+                        or self._model_observers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("installed result reader unavailable")
+                read_request = result_from_wire(
+                    command["read_request"], ModelResultReadRequestV1)
+                if (read_request.authority_id != self._authority_id()
+                        or read_request.authority_namespace != namespace
+                        or read_request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            read_request.namespace)) != namespace):
+                    raise AuthorityUnavailable("model result read installation differs")
+                if method == "model_result_read_recover_finish_v1":
+                    service.recover_finish(
+                        credential=credential, request=read_request)
+                    return {"finished": True}
+                session = self._owner_session_kwargs(
+                    {"owner_session_token": command["owner_session_token"],
+                     "owner_session_request": session_to_wire(
+                         read_request.owner_session_request)},
+                    namespace, installed.installation_id)
+                result = service.read_completed(
+                    credential=credential,
+                    owner_session_token=session["session_token"],
+                    request=read_request)
+                return {"result": result_to_wire(result)}
+            if method == "model_terminal_fact_v2":
+                if set(command) != {"namespace", "holder", "intent"}:
+                    raise AuthorityUnavailable("terminal fact command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                holder = identifier(command["holder"], "holder")
+                model = self._v2_model_egress.get(namespace)
+                if (model is None or holder != installed.administrator_holder
+                        or self._model_observers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("designated model observer unavailable")
+                intent = model_from_wire(command["intent"], ModelEgressIntentV1)
+                record, permit = model.recover_fenced(
+                    credential=credential, subject=subject, intent=intent)
+                if permit.holder != holder:
+                    raise AuthorityUnavailable("model terminal holder differs")
+                # All returned accounting facts come from one Authority snapshot.
+                with self._core._tx() as db:
+                    if model._store.read_locked(db, intent) != record:
+                        raise AuthorityUnavailable("model terminal changed during query")
+                    admission, report_digest, receipt = model._store.read_admission_locked(
+                        db, intent)
+                    row = model._fences.fences._row(db, intent.operation_id)
+                    if (row is None or model._fences.fences._permit(row) != permit
+                            or admission.installation_id != installed.installation_id
+                            or admission.observer_peer_sha256 != credential.certificate_sha256
+                            or admission.observer_profile_id != profile_id
+                            or admission.manifest_digest != manifest_digest
+                            or (receipt is None) != (report_digest is None)
+                            or (record.state == "observed" and receipt is None)
+                            or (receipt is not None and (
+                                receipt.admission_id != admission.admission_id
+                                or receipt.observation_digest != record.observation_digest
+                                or receipt.report_digest != report_digest
+                                or record.state != "observed"
+                                or row[6] != "finished"
+                                or row[8:10] != (intent.call_id, receipt.finish_digest)))):
+                        raise AuthorityUnavailable("original model terminal facts differ")
+                return {"record": model_to_wire(record), "permit": to_wire(permit),
+                        "admission": model_to_wire(admission),
+                        "receipt": None if receipt is None else model_to_wire(receipt)}
             if method in {"model_admit_dispatch_once_v2", "model_complete_observed_v2"}:
                 expected = ({"namespace", "holder", "intent", "expected_anchor",
                              "request", "host_incarnation"}
