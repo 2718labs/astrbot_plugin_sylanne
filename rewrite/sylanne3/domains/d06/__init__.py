@@ -8,14 +8,16 @@ memory database.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
 import json
 import math
+from typing import Mapping
 
 from ...memory_types import (
-    SourceRecord, association_key, episode_key, register_memory_types, source_key,
+    SourceRecord, association_key, episode_key, interpretation_key,
+    register_memory_types, source_key,
     subjective_trace_key, subjective_trace_v2_key, validate_episode,
     validate_subjective_trace, validate_subjective_trace_v2,
 )
@@ -425,6 +427,52 @@ class CorrectionRequest:
     replacement_claim: str
     access_epoch: int
     deletion_epoch: int
+
+
+@dataclass(frozen=True)
+class SourceCorrectionReadSetV1:
+    """Values from W01's fenced graph read; this DTO is not a read proof."""
+
+    sources: tuple[SourceRecord, ...]
+    accesses: tuple[Mapping[str, object], ...]
+    interpretations: tuple[InterpretationRecord, ...]
+    d07_belief_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (type(self.sources) is not tuple or not self.sources
+                or any(type(item) is not SourceRecord for item in self.sources)):
+            raise ValueError("correction requires typed source reads")
+        if (type(self.accesses) is not tuple or len(self.accesses) != len(self.sources)
+                or any(not isinstance(item, Mapping) for item in self.accesses)):
+            raise ValueError("correction requires paired source access reads")
+        for item in self.accesses:
+            validate_access(dict(item))
+        if (type(self.interpretations) is not tuple or not self.interpretations
+                or any(type(item) is not InterpretationRecord for item in self.interpretations)):
+            raise ValueError("correction requires typed interpretation reads")
+        _names(self.d07_belief_refs, "d07_belief_refs")
+
+
+@dataclass(frozen=True)
+class SourceCorrectionCandidateV1:
+    """D06 writes and cross-domain obligations, pending W01 atomic adoption."""
+
+    proposal: DomainProposal
+    correction_source_ref: str
+    invalidated_target_refs: tuple[str, ...]
+    d07_invalidation_refs: tuple[str, ...]
+    required_reevaluation_domains: tuple[str, ...] = ("d07", "d04", "d05")
+    status: str = "proposal_requires_w01_atomic_bundle"
+
+    def __post_init__(self) -> None:
+        if (type(self.proposal) is not DomainProposal or self.proposal.domain != "d06"
+                or self.status != "proposal_requires_w01_atomic_bundle"):
+            raise ValueError("source correction cannot claim a commit")
+        AtomKey.from_token(self.correction_source_ref)
+        _names(self.invalidated_target_refs, "invalidated_target_refs", allow_empty=False)
+        _names(self.d07_invalidation_refs, "d07_invalidation_refs")
+        if self.required_reevaluation_domains != ("d07", "d04", "d05"):
+            raise ValueError("source correction requires domain reevaluation")
 
 
 @dataclass(frozen=True)
@@ -1493,6 +1541,148 @@ class D06DomainAdapter:
             (("access_epoch", request.access_epoch), ("deletion_epoch", request.deletion_epoch)),
         )
 
+    def correction_source_key(self, request: CorrectionRequest) -> AtomKey:
+        """Stable absence-read target for one correction operation."""
+        self._validate_correction(request)
+        source_id = _stable_id("source-correction", {
+            "namespace": self.namespace.as_tuple, "operation_id": request.request_id,
+        })
+        return source_key(*self.namespace.as_tuple, source_id)
+
+    def compile_source_correction(
+        self, envelope: CommandEnvelope, request: CorrectionRequest,
+        reads: SourceCorrectionReadSetV1, *, recorded_at: float,
+    ) -> SourceCorrectionCandidateV1:
+        """Prepare one reported correction and D06 interpretation retractions.
+
+        W01 must independently bind these values to a current fenced read,
+        verify D07's own invalidation proposal, and commit a persistent job and
+        reevaluation outbox with the D06 proposal. No write occurs here.
+        """
+        self._validate_correction(request)
+        if type(envelope) is not CommandEnvelope or type(reads) is not SourceCorrectionReadSetV1:
+            raise TypeError("correction requires an envelope and typed graph reads")
+        if (envelope.authority.namespace != self.namespace
+                or envelope.authority.issuer_domain != "d06"
+                or envelope.identity.operation_id != request.request_id
+                or envelope.identity.phase != "source-correction"
+                or envelope.version_guard.access_epoch != request.access_epoch
+                or envelope.version_guard.delete_epoch != request.deletion_epoch):
+            raise ValueError("correction envelope does not match the operation and epochs")
+        recorded_at = _finite(recorded_at, "recorded_at")
+        basis = _canonical_graph_refs(request.basis_source_refs, "basis_source_refs",
+                                      self.namespace, allow_empty=False)
+        targets = _canonical_graph_refs(request.target_refs, "target_refs",
+                                        self.namespace, allow_empty=False)
+        basis_keys = tuple(AtomKey.from_token(ref) for ref in basis)
+        target_keys = tuple(AtomKey.from_token(ref) for ref in targets)
+        if (any(key.type_name != "memory.source" or key.name != "record"
+                or key.owner.kind != "event" for key in basis_keys)
+                or any(key.type_name != "memory.interpretation" or key.name != "current"
+                       or key.owner.kind != "event" for key in target_keys)):
+            raise ValueError("correction requires D06 source and interpretation refs")
+        if (tuple(source_key(*self.namespace.as_tuple, item.source_id).token
+                  for item in reads.sources) != basis
+                or tuple(interpretation_key(*self.namespace.as_tuple, item.interpretation_id).token
+                         for item in reads.interpretations) != targets):
+            raise ValueError("correction read values differ from selected graph refs")
+        for source, access in zip(reads.sources, reads.accesses):
+            access = dict(access)
+            if (access["source_id"] != source.source_id or access["status"] != "active"
+                    or not set(envelope.authority.audience).issubset(source.audiences)
+                    or not set(envelope.authority.audience).issubset(access["audiences"])
+                    or envelope.authority.purpose not in source.purposes
+                    or envelope.authority.purpose not in access["purposes"]):
+                raise ValueError("correction basis lacks current source access")
+        source_ids = {source.source_id for source in reads.sources}
+        for interpretation in reads.interpretations:
+            if (interpretation.status == "retracted"
+                    or not source_ids.intersection(interpretation.source_ids)
+                    or recorded_at < max(interpretation.valid_from,
+                                         interpretation.recorded_at)):
+                raise ValueError("correction target is not a current dependent interpretation")
+        if recorded_at < max(source.recorded_at for source in reads.sources):
+            raise ValueError("correction cannot predate its selected sources")
+        d07_keys = tuple(AtomKey.from_token(ref) for ref in reads.d07_belief_refs)
+        if any(key.type_name != "d07.belief_revision.v1"
+               or NamespaceId.from_key(key) != self.namespace for key in d07_keys):
+            raise ValueError("D07 invalidation refs must use the shared graph contract")
+
+        correction_key = self.correction_source_key(request)
+        correction_access = access_key(*self.namespace.as_tuple,
+                                       correction_key.owner.subject)
+        expected_inputs = (correction_key.token, *basis, *targets,
+                           *(key.token for key in d07_keys))
+        if envelope.input_refs != expected_inputs:
+            raise ValueError("correction input refs do not bind the selected closure")
+        guarded = {item.key: item for item in envelope.version_guard.read_versions}
+        if len(guarded) != len(envelope.version_guard.read_versions):
+            raise ValueError("correction read versions must be unique")
+        positive = tuple(dict.fromkeys((
+            *(key for source in reads.sources for key in (
+                source_key(*self.namespace.as_tuple, source.source_id),
+                access_key(*self.namespace.as_tuple, source.source_id),
+            )), *target_keys, *d07_keys,
+        )))
+        if (guarded.get(correction_key) != GraphVersion(correction_key, 0)
+                or guarded.get(correction_access) != GraphVersion(correction_access, 0)
+                or any(guarded.get(key) is None or guarded[key].revision <= 0
+                       for key in positive)):
+            raise ValueError("correction lacks complete CAS reads and absence proofs")
+        if not set(basis).issubset(envelope.source_qualification.source_refs):
+            raise ValueError("correction basis lacks source qualification")
+        audiences = set.intersection(*(
+            set(source.audiences).intersection(access["audiences"])
+            for source, access in zip(reads.sources, reads.accesses)
+        ))
+        purposes = set.intersection(*(
+            set(source.purposes).intersection(access["purposes"])
+            for source, access in zip(reads.sources, reads.accesses)
+        ))
+        if (not audiences or not purposes
+                or not set(envelope.authority.audience).issubset(audiences)
+                or envelope.authority.purpose not in purposes):
+            raise ValueError("correction cannot widen source access")
+        admitted = self.admit_source(SourceAdmission(
+            correction_key.owner.subject, request.replacement_claim,
+            envelope.authority.actor, "reported", "reported", "reported_claim",
+            "not_applicable", None, recorded_at, "owner.correction.v1",
+            tuple(sorted(audiences)), tuple(sorted(purposes)),
+            tuple(source.source_id for source in reads.sources),
+        ))
+        # The envelope qualifies the existing basis. The new claim is always
+        # admitted as a reported statement, never as an external fact.
+        access_value = {
+            "source_id": admitted.source.source_id,
+            "audiences": list(admitted.source.audiences),
+            "purposes": list(admitted.source.purposes),
+            "status": "active", "recorded_at": recorded_at,
+        }
+        validate_access(access_value)
+        writes = [
+            GraphWrite(correction_key, admitted.source.to_dict()),
+            GraphWrite(correction_access, access_value, (correction_key,)),
+        ]
+        for key, old in zip(target_keys, reads.interpretations):
+            retracted = replace(old, status="retracted", valid_to=recorded_at)
+            writes.append(GraphWrite(key, retracted.to_dict(), (correction_key,)))
+        proposal = self.wrap_runtime_proposal(
+            envelope, typed_writes=tuple(writes),
+            dependencies=DependencySet(
+                current_invalidation=(guarded[correction_key], guarded[correction_access],
+                                      *(guarded[key] for key in target_keys),
+                                      *(guarded[key] for key in d07_keys)),
+                historical_provenance=tuple(guarded[key] for key in positive),
+            ),
+            contribution_keys=(f"source-correction:{correction_key.token}",),
+            required_bundle_parts=("persistent_job", "outbox"),
+        )
+        D06DomainProvider().validate(proposal)
+        return SourceCorrectionCandidateV1(
+            proposal, correction_key.token, targets,
+            tuple(key.token for key in d07_keys),
+        )
+
     def prepare_deletion_closure(
         self,
         request: ErasureRequest,
@@ -1627,6 +1817,8 @@ __all__ = [
     "SelectionTicket",
     "SourceAdmission",
     "SourceAdmissionProposal",
+    "SourceCorrectionCandidateV1",
+    "SourceCorrectionReadSetV1",
     "SourceGrantRead",
     "SubjectiveTraceCandidate",
     "TransferRequest",
