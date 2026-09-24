@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from sylanne3.contracts import Event, Scope
@@ -85,13 +87,14 @@ class _Resolver:
 
 
 class _Coordinator:
-    def __init__(self, page):
+    def __init__(self, page, second_page=None):
         self.page = page
+        self.second_page = second_page
         self.calls = []
 
     def query(self, authority, lease, **kwargs):
         self.calls.append(kwargs)
-        return self.page
+        return self.second_page if kwargs.get("after") is not None else self.page
 
 
 def test_issuer_preserves_coverage_and_does_not_project_unreturned_candidates():
@@ -100,7 +103,12 @@ def test_issuer_preserves_coverage_and_does_not_project_unreturned_candidates():
                            item["revision"], item["value"])
     cursor = graph_atom.key
     page = GraphPage(GraphSnapshot((graph_atom,), (NamespaceEpoch("bot", "persona", 8),)), cursor)
-    coordinator = _Coordinator(page)
+    second_item = atom("second")
+    second_atom = GraphAtom(AtomKey(Owner("persona", "bot", "persona"),
+                                    second_item["type"], second_item["name"]),
+                            second_item["revision"], second_item["value"])
+    second_page = GraphPage(GraphSnapshot((second_atom,), (NamespaceEpoch("bot", "persona", 8),)), None)
+    coordinator = _Coordinator(page, second_page)
     issuer = GraphWorkbenchIssuer(coordinator,
                                   _Resolver(CoordinatorGrant("bot/persona", AUTHORITY, object())), registry())
     result = issuer.read_projection(session=SESSION, scope="bot/persona", view_type="creation",
@@ -108,9 +116,25 @@ def test_issuer_preserves_coverage_and_does_not_project_unreturned_candidates():
     assert result["status"] == "ready"
     assert result["projection"]["data"]["candidates"][0]["plan_id"] == "candidate"
     assert result["projection"]["coverage"]["truncated"] is True
-    assert result["projection"]["next_cursor"] == cursor.token
+    next_cursor = result["projection"]["next_cursor"]
+    assert json.loads(next_cursor) == {
+        "schema": "d12.graph_page.v1", "scope": "bot/persona",
+        "view_type": "creation", "audience": "owner", "purpose": "workbench_view",
+        "generation": 4, "epoch": 8, "after": cursor.token,
+    }
     assert coordinator.calls == [{"type_names": ("d01.persona_plan.v1",),
-                                   "owner_kind": "persona", "limit": 100}]
+                                   "owner_kind": "persona", "after": None,
+                                   "expected_epoch": None, "limit": 100}]
+    continued = issuer.read_projection(session=SESSION, scope="bot/persona", view_type="creation",
+                                       purpose="workbench_view", audience="owner",
+                                       cursor=next_cursor, page_size=1)
+    assert continued["status"] == "ready"
+    assert continued["projection"]["data"]["candidates"][0]["plan_id"] == "second"
+    assert continued["projection"]["next_cursor"] is None
+    assert coordinator.calls[-1] == {"type_names": ("d01.persona_plan.v1",),
+                                     "owner_kind": "persona", "after": cursor,
+                                     "expected_epoch": NamespaceEpoch("bot", "persona", 8),
+                                     "limit": 1}
 
 
 def test_issuer_denies_missing_grant_before_query():
