@@ -18,7 +18,9 @@ from .rewrite.sylanne3.host import (
 )
 from .rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
 from .rewrite.sylanne3.host.context_scheme_asset import load_verified_context_scheme
-from .rewrite.sylanne3.host.authority_profile import AuthorityProfileUnavailable
+from .rewrite.sylanne3.host.authority_profile import (
+    AdminIngressModelPolicy, AuthorityProfileUnavailable,
+)
 from .rewrite.sylanne3.host.installed_scene_identity import InstalledSceneIdentityPort
 from .rewrite.sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
 from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, SceneCandidateCatalog
@@ -184,17 +186,22 @@ class Sylanne3Plugin(Star):
             context=self.context, host_loop=asyncio.get_running_loop(),
             candidates=self._scene_candidates,
         )
-        model_port = InstalledModelCapabilityPort(
-            context=self.context, host_loop=asyncio.get_running_loop(),
-            installed_namespace=installation.installation_policy.namespace,
-        )
+        model_port = None
+        if type(getattr(installation, "ingress_model", None)) is AdminIngressModelPolicy:
+            try:
+                model_port = InstalledModelCapabilityPort(
+                    context=self.context, host_loop=asyncio.get_running_loop(),
+                    installed_namespace=installation.installation_policy.namespace,
+                )
+            except (AttributeError, TypeError, ValueError):
+                logger.warning("Sylanne 3 installed model config cannot be checked; HOLD")
         try:
             self._runtime = RuntimeContext(
                 data_dir, package_root=PACKAGE_ROOT, dependencies=None,
                 domains=verified.registry,
                 owner_principal_resolver=self._owner_principal_resolver,
                 scene_identity_port=scene_port,
-                model_selection_port=model_port,
+                **({"model_selection_port": model_port} if model_port is not None else {}),
             )
             health = await self._runtime.start_v2(installation)
             self._installed_namespace = installation.installation_policy.namespace
@@ -224,6 +231,11 @@ class Sylanne3Plugin(Star):
         if onboarding is None and pairing is None and grants is None and origin is not None:
             try:
                 owner_ports = self._runtime.installed_owner_onboarding_ports()
+                if model_port is None:
+                    model_port = InstalledModelCapabilityPort(
+                        context=self.context, host_loop=asyncio.get_running_loop(),
+                        installed_namespace=installation.installation_policy.namespace,
+                    )
                 onboarding = CurrentOnboardingResolver(
                     d01=CurrentD01OnboardingResolver(
                         namespaces=owner_ports, owners=owner_ports,

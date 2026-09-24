@@ -68,10 +68,10 @@ async def test_admin_selection_checks_exact_current_provider_and_config():
         def __init__(self):
             self.provider_config = {"model": "model-1"}
             self.client = SimpleNamespace()
-            self.model = "model-1"
+            self.model_name = "model-1"
 
         def meta(self):
-            return ProviderMeta("provider-1", self.model, "openai_chat_completion",
+            return ProviderMeta("provider-1", self.model_name, "openai_chat_completion",
                                 ProviderType.CHAT_COMPLETION)
 
         def get_current_key(self):
@@ -112,10 +112,10 @@ async def test_admin_selection_checks_exact_current_provider_and_config():
         assert not await asyncio.to_thread(port.verify_admin_config,
                                            namespace, selection)
         provider.provider_config.pop("temperature")
-        provider.model = "model-2"
+        provider.model_name = "model-2"
         assert not await asyncio.to_thread(port.verify_admin_config,
                                            namespace, selection)
-        provider.model = "model-1"
+        provider.model_name = "model-1"
         manager.inst_map.clear()
         assert not await asyncio.to_thread(port.verify_admin_config,
                                            namespace, selection)
