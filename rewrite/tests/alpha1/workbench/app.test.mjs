@@ -467,6 +467,64 @@ test("D06 catalogue opens a read-only memory summary without source text", async
   } finally { ui.restore(); }
 });
 
+test("D05 relations renders only the complete public projection and distinguishes empty or unavailable", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    const selected = ui.clickView("relations");
+    const request = await ui.nextRequest(1);
+    assert.equal(request.payload.input.view_type, "relations");
+    request.resolve({ status: "ready", projection: { view_type: "relations", data: {
+      coverage: "complete", relations: [{ subject_entity_ref: "entity:<unsafe>",
+        dimensions: [{ dimension: "trust", status: "unknown" }] }]
+    } } });
+    await selected;
+    assert.match(ui.app.innerHTML, /关系投影不可用/);
+    assert.doesNotMatch(ui.app.innerHTML, /entity:&lt;unsafe&gt;/);
+    const valid = ui.clickCommand("refresh");
+    await ui.nextRequest(2);
+    ui.requests[2].resolve({ status: "ready", projection: { view_type: "relations", data: {
+      coverage: "complete", relations: [{ subject_entity_ref: "entity:alice",
+        dimensions: [{ dimension: "trust", status: "unknown" }] }]
+    } } });
+    await valid;
+    assert.match(ui.app.innerHTML, /entity:alice/);
+    assert.match(ui.app.innerHTML, /主观维度/);
+    assert.match(ui.app.innerHTML, /trust：unknown/);
+    assert.match(ui.app.innerHTML, /不证明对方行为/);
+    assert.match(ui.app.innerHTML, /服务已确认完整覆盖，共 1 条关系/);
+    assert.doesNotMatch(ui.app.innerHTML, /<unsafe>|<pre class="projection"/);
+
+    const empty = ui.clickCommand("refresh");
+    await ui.nextRequest(3);
+    ui.requests[3].resolve({ status: "ready", projection: { view_type: "relations", data: {
+      coverage: "complete", relations: []
+    } } });
+    await empty;
+    assert.match(ui.app.innerHTML, /当前授权范围内没有已提交的关系记录/);
+
+    const unavailable = ui.clickCommand("refresh");
+    await ui.nextRequest(4);
+    ui.requests[4].resolve({ status: "unavailable", problem: { code: "projection_unavailable", message: "关系来源暂不可用。" } });
+    await unavailable;
+    assert.match(ui.app.innerHTML, /功能暂不可用/);
+    assert.match(ui.app.innerHTML, /关系来源暂不可用/);
+    assert.doesNotMatch(ui.app.innerHTML, /当前授权范围内没有已提交的关系记录/);
+
+    const partial = ui.clickCommand("refresh");
+    await ui.nextRequest(5);
+    ui.requests[5].resolve({ status: "partial", problem: { code: "projection_incomplete", message: "关系快照不完整。" } });
+    await partial;
+    assert.match(ui.app.innerHTML, /投影不完整/);
+    assert.match(ui.app.innerHTML, /关系快照不完整/);
+    assert.doesNotMatch(ui.app.innerHTML, /当前授权范围内没有已提交的关系记录/);
+  } finally { ui.restore(); }
+});
+
 test("D06 memory rejects partial or malformed source coverage and clears prior summary", async () => {
   const ui = await mountWorkbench();
   try {

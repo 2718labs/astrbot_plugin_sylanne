@@ -15,6 +15,7 @@ const pages = [
   ["diagnostics", "实验与诊断", "隔离实验、真实费用与结构化诊断", "experiment"],
   ["lifecycle", "数据与生命周期", "导入、迁移、升级、停用与删除", "transfer"]
 ];
+const relationStatuses = new Set(["unknown", "available", "unavailable", "stale", "blocked_rebuild", "rebuilt", "sanitized", "reset"]);
 
 const state = initialState();
 const api = new WorkbenchApi({ baseUrl: globalThis.SYLANNE_WORKBENCH_API_BASE ?? DEFAULT_WORKBENCH_API_BASE });
@@ -135,6 +136,28 @@ function memoryProjectionMarkup(projection) {
     : `<p class="creation-empty">当前授权范围内没有可显示的记忆来源。</p>`}<p class="creation-coverage" role="status">服务已确认完整覆盖，共 ${sources.length} 条来源。</p></section>`;
 }
 
+function validRelationsProjection(projection) {
+  const data = projection?.data;
+  return projection?.view_type === VIEW_TYPES.relations
+    && data?.coverage === "complete" && Array.isArray(data.relations)
+    && data.relations.every((relation) => relation && typeof relation.subject_entity_ref === "string"
+      && /^entity:[A-Za-z0-9_.:-]{1,96}$/.test(relation.subject_entity_ref)
+      && Array.isArray(relation.dimensions)
+      && relation.dimensions.every((item) => item && typeof item.dimension === "string"
+        && /^[A-Za-z0-9_.:-]{1,96}$/.test(item.dimension)
+        && relationStatuses.has(item.status)));
+}
+
+function relationsProjectionMarkup(projection) {
+  if (!validRelationsProjection(projection)) return `<section class="empty-state" role="alert"><h2>关系投影不可用</h2><p>服务未返回完整且可确认的 D05 关系摘要；请重新请求当前视图。</p></section>`;
+  const relations = projection.data.relations;
+  return `<section class="creation-view" aria-label="已授权关系与经历摘要"><h2>关系与经历</h2><p>以下是服务按当前权限返回的已提交主观关系投影，反映当前记录的理解，不证明对方行为。</p>${relations.length
+    ? `<ul class="creation-list">${relations.map((relation) => `<li><strong>${escapeHtml(relation.subject_entity_ref)}</strong><span>主观维度</span>${relation.dimensions.length
+      ? `<ul>${relation.dimensions.map((item) => `<li>${escapeHtml(item.dimension)}：${escapeHtml(item.status)}</li>`).join("")}</ul>`
+      : `<small>服务未返回主观维度。</small>`}</li>`).join("")}</ul>`
+    : `<p class="creation-empty">当前授权范围内没有已提交的关系记录。</p>`}<p class="creation-coverage" role="status">服务已确认完整覆盖，共 ${relations.length} 条关系。</p></section>`;
+}
+
 function overviewCatalogueMarkup(projection) {
   const views = projection?.views;
   const unavailable = projection?.unavailable_domains;
@@ -241,6 +264,7 @@ function render() {
     ? state.view === "overview" ? overviewCatalogueMarkup(state.projection)
       : state.view === "creation" ? creationProjectionMarkup(state.projection)
       : state.view === "memory" ? memoryProjectionMarkup(state.projection)
+      : state.view === "relations" ? relationsProjectionMarkup(state.projection)
       : `<pre class="projection" aria-label="服务返回的权限过滤投影">${escapeHtml(JSON.stringify(state.projection, null, 2))}</pre>`
     : `<section class="empty-state" aria-live="polite"><div class="empty-mark" aria-hidden="true">◇</div><h2>${sessionVerified ? statusTitle : "Owner 尚未解锁"}</h2><p>${sessionVerified ? statusDetail : "Sylanne Owner 会话尚未核验。请先完成服务端登录，再刷新解锁状态。"}</p><button class="primary" data-command="refresh" ${state.role && sessionVerified ? "" : "disabled"}>重新请求投影</button></section>`;
   app.innerHTML = `
