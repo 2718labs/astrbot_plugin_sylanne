@@ -9,7 +9,9 @@ import sqlite3
 import pytest
 
 from sylanne3.authority_service.contract import AuthorityUnavailable
-from sylanne3.authority_service.v2_model_egress_contract import ModelEgressIntentV1
+from sylanne3.authority_service.v2_model_egress_contract import (
+    ModelEgressDraftV1, ModelEgressIntentV1,
+)
 from sylanne3.authority_service.v2_model_egress_store import AuthorityV2ModelEgressStore
 
 
@@ -58,6 +60,20 @@ def test_reopen_exact_identity_and_conflict(tmp_path):
             store.prepare(intent(max_output_tokens=512))
         with pytest.raises(AuthorityUnavailable):
             store.read("call-1", subject="another", namespace="bot:persona")
+
+
+def test_same_job_cannot_prepare_different_call_id_even_after_unknown(tmp_path):
+    path = tmp_path / "authority.db"
+    with connection(path) as db:
+        store = AuthorityV2ModelEgressStore(db, create=True)
+        store.prepare(intent())
+        store.record_dispatch_started(intent())
+        store.record_unknown(intent(), observation_digest="e" * 64)
+    with connection(path) as db:
+        store = AuthorityV2ModelEgressStore(db)
+        with pytest.raises(AuthorityUnavailable, match="job already"):
+            store.prepare(intent(call_id="call-2", operation_id="job-operation-2"))
+        assert store.read("call-1", subject="worker", namespace="bot:persona").state == "unknown"
 
 
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5])
@@ -174,3 +190,93 @@ def test_service_remains_hold(tmp_path):
             asyncio.run(service.begin_handoff(None, "a" * 64))
         with pytest.raises(AuthorityUnavailable, match="HOLD"):
             asyncio.run(service.finish_handoff(None, "a" * 64))
+
+
+def test_fenced_prepare_is_atomic_and_recoverable(tmp_path, monkeypatch):
+    from rewrite.tests.alpha1.runtime.test_authority_v2_rpc_content_fences import (
+        _PEER_A, rpc,
+    )
+    from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
+
+    fixture = rpc.__wrapped__(tmp_path)
+    server = next(fixture)
+    try:
+        fences = server._v2_fences["ns-a"]
+        store = AuthorityV2ModelEgressStore(
+            fences.core._db, create=True, lock=fences.core._lock)
+        service = AuthorityV2ModelEgressService(store, fences)
+        anchor = fences.current_anchor(credential=_PEER_A, subject="worker")
+        proposed = ModelEgressDraftV1.from_intent(intent(
+            namespace="ns-a", authority_id=anchor.authority_id,
+            authority_activation_generation=anchor.activation_generation,
+            authority_revocation_epoch=anchor.revocation_epoch,
+            authority_deletion_seq=anchor.deletion_seq,
+            authority_execution_seq=anchor.execution_seq,
+        ))
+        original = store.prepare_locked
+
+        def fail_after_fence(db, value):
+            raise RuntimeError("simulated failure before commit")
+
+        monkeypatch.setattr(store, "prepare_locked", fail_after_fence)
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            service.prepare_fenced(
+                credential=_PEER_A, subject="worker", holder="holder-a",
+                draft=proposed, expected_anchor=anchor)
+        assert fences.fences._row(fences.core._db, proposed.operation_id) is None
+        assert store._read(fences.core._db, proposed.call_id) is None
+        assert fences.core._db.execute(
+            "SELECT COUNT(*) FROM authority_model_egress_bindings_v1").fetchone() == (0,)
+        monkeypatch.setattr(store, "prepare_locked", original)
+
+        recovery, permit = service.prepare_fenced(
+            credential=_PEER_A, subject="worker", holder="holder-a",
+            draft=proposed, expected_anchor=anchor)
+        assert recovery.state == "prepared"
+        assert permit.operation == "model_egress"
+        from dataclasses import asdict
+        from sylanne3.runtime_contracts import canonical_digest
+        assert (recovery.intent.fence_token, recovery.intent.fence_epoch,
+                recovery.intent.fence_revision, recovery.intent.anchor_digest) == (
+                    permit.token, permit.fence_epoch, permit.revision,
+                    canonical_digest(asdict(permit.pinned_anchor)))
+        assert service.prepare_fenced(
+            credential=_PEER_A, subject="worker", holder="holder-a",
+            draft=proposed, expected_anchor=anchor) == (recovery, permit)
+        assert service.recover_fenced(
+            credential=_PEER_A, subject="worker", intent=recovery.intent) == (recovery, permit)
+        for field, value in (
+            ("fence_token", "z" * 32), ("fence_epoch", permit.fence_epoch + 1),
+            ("fence_revision", permit.revision + 1), ("anchor_digest", "f" * 64),
+        ):
+            with pytest.raises(AuthorityUnavailable):
+                service.recover_fenced(
+                    credential=_PEER_A, subject="worker",
+                    intent=replace(recovery.intent, **{field: value}))
+        with pytest.raises(AuthorityUnavailable, match="job already"):
+            service.prepare_fenced(
+                credential=_PEER_A, subject="worker", holder="holder-a",
+                draft=replace(proposed, call_id="call-2", operation_id="job-operation-2"),
+                expected_anchor=anchor)
+        assert fences.fences._row(fences.core._db, "job-operation-2") is None
+
+        with fences._frozen() as (db, deletion_head, execution_head, _):
+            current = fences._current_locked(
+                db, deletion_head, execution_head, holder="holder-a")
+            with pytest.raises(AuthorityUnavailable, match="fence and call identity mismatch"):
+                store._record_dispatch_started_fenced_locked(
+                    db, replace(recovery.intent, anchor_digest="f" * 64),
+                    permit, fences.fences, current)
+            assert store._record_dispatch_started_fenced_locked(
+                db, recovery.intent, permit, fences.fences, current).state == "dispatch_started"
+        with fences._frozen() as (db, deletion_head, execution_head, _):
+            current = fences._current_locked(
+                db, deletion_head, execution_head, holder="holder-a")
+            with pytest.raises(AuthorityUnavailable, match="cannot repeat"):
+                store._record_dispatch_started_fenced_locked(
+                    db, recovery.intent, permit, fences.fences, current)
+    finally:
+        try:
+            next(fixture)
+        except StopIteration:
+            pass

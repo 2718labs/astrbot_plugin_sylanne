@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 import re
 
 from .contract import identifier
@@ -111,6 +111,52 @@ class ModelEgressIntentV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelEgressDraftV1:
+    """Stable proposed call; Authority alone fills the new model fence fields."""
+
+    authority_id: str
+    namespace: str
+    subject: str
+    operation_id: str
+    call_id: str
+    request_digest: str
+    job_id: str
+    worker_fence: int
+    source_refs: tuple[str, ...]
+    source_revisions: tuple[tuple[str, int], ...]
+    access_revisions: tuple[tuple[str, int], ...]
+    access_epoch: int
+    delete_epoch: int
+    graph_epoch: int
+    graph_revision: int
+    authority_activation_generation: int
+    authority_revocation_epoch: int
+    authority_deletion_seq: int
+    authority_execution_seq: int
+    budget_lease_id: str
+    budget_reservation_operation_id: str
+    budget_reservation_digest: str
+    budget_ceiling: tuple[tuple[str, int], ...]
+    provider_id: str
+    model_id: str
+    provider_config_digest: str
+    max_output_tokens: int
+
+    def __post_init__(self) -> None:
+        # Keep one validation contract for the shared call fields. The dummy
+        # fence values never leave this constructor or enter persistence.
+        ModelEgressIntentV1(**asdict(self), fence_token="a" * 32,
+                            fence_epoch=1, fence_revision=0,
+                            anchor_digest="0" * 64)
+
+    @classmethod
+    def from_intent(cls, intent: ModelEgressIntentV1) -> ModelEgressDraftV1:
+        if type(intent) is not ModelEgressIntentV1:
+            raise ValueError("typed model egress intent required")
+        return cls(**{field.name: getattr(intent, field.name) for field in fields(cls)})
+
+
+@dataclass(frozen=True, slots=True)
 class ModelEgressRecoveryV1:
     intent: ModelEgressIntentV1
     state: str  # prepared | dispatch_started | observed | unknown
@@ -127,4 +173,4 @@ class ModelEgressRecoveryV1:
             raise ValueError("unobserved egress cannot have an observation digest")
 
 
-__all__ = ["ModelEgressIntentV1", "ModelEgressRecoveryV1"]
+__all__ = ["ModelEgressDraftV1", "ModelEgressIntentV1", "ModelEgressRecoveryV1"]

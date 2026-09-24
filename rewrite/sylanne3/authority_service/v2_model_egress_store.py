@@ -9,6 +9,8 @@ import sqlite3
 import threading
 
 from .contract import AuthorityUnavailable, identifier
+from .v2_contract import FencePermitV2
+from ..runtime_contracts import canonical_digest
 from .v2_model_egress_contract import ModelEgressIntentV1, ModelEgressRecoveryV1
 
 
@@ -20,6 +22,12 @@ _DDL = """CREATE TABLE authority_model_egress_v1(
     observation_digest TEXT,
     CHECK((state IN ('prepared','dispatch_started') AND observation_digest IS NULL)
        OR (state IN ('observed','unknown') AND observation_digest IS NOT NULL))
+)"""
+_JOB_INDEX_DDL = "CREATE UNIQUE INDEX authority_model_egress_one_job ON authority_model_egress_v1(namespace,json_extract(identity_json,'$.job_id'))"
+_BINDING_DDL = """CREATE TABLE authority_model_egress_bindings_v1(
+    call_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE,
+    token TEXT NOT NULL UNIQUE,
+    FOREIGN KEY(call_id) REFERENCES authority_model_egress_v1(call_id)
 )"""
 
 
@@ -70,6 +78,24 @@ class AuthorityV2ModelEgressStore:
                 db.execute(_DDL)
             elif existing != (_DDL,):
                 raise AuthorityUnavailable("unknown model egress schema")
+            index = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='authority_model_egress_one_job'"
+            ).fetchone()
+            if index is None:
+                # The original ledger had no job key. An ambiguous history must
+                # fail migration rather than permit a second call after restart.
+                for (raw,) in db.execute("SELECT identity_json FROM authority_model_egress_v1"):
+                    _decoded(raw)
+                db.execute(_JOB_INDEX_DDL)
+            elif index != (_JOB_INDEX_DDL,):
+                raise AuthorityUnavailable("unknown model egress job index")
+            binding = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='authority_model_egress_bindings_v1'"
+            ).fetchone()
+            if binding is None:
+                db.execute(_BINDING_DDL)
+            elif binding != (_BINDING_DDL,):
+                raise AuthorityUnavailable("unknown model egress binding schema")
 
     @contextmanager
     def _tx(self):
@@ -107,19 +133,57 @@ class AuthorityV2ModelEgressStore:
         if type(intent) is not ModelEgressIntentV1:
             raise AuthorityUnavailable("typed model egress intent required")
         with self._tx() as db:
-            old = self._read(db, intent.call_id)
-            if old is not None:
-                if old.intent != intent:
-                    raise AuthorityUnavailable("model call ID reused with different identity")
-                return old
-            db.execute(
-                "INSERT INTO authority_model_egress_v1 "
-                "(call_id,operation_id,namespace,subject,identity_json,state) "
-                "VALUES(?,?,?,?,?,'prepared')",
-                (intent.call_id, intent.operation_id, intent.namespace,
-                 intent.subject, _encoded(intent)),
-            )
-            return ModelEgressRecoveryV1(intent, "prepared")
+            return self.prepare_locked(db, intent)
+
+    def prepare_locked(self, db: sqlite3.Connection,
+                       intent: ModelEgressIntentV1) -> ModelEgressRecoveryV1:
+        """Persist one call per job inside an Authority-owned immediate transaction."""
+        if type(intent) is not ModelEgressIntentV1 or db is not self._db or not db.in_transaction:
+            raise AuthorityUnavailable("typed model egress intent and Authority transaction required")
+        old = self._read(db, intent.call_id)
+        if old is not None:
+            if old.intent != intent:
+                raise AuthorityUnavailable("model call ID reused with different identity")
+            return old
+        row = db.execute(
+            "SELECT call_id FROM authority_model_egress_v1 WHERE namespace=? AND json_extract(identity_json,'$.job_id')=?",
+            (intent.namespace, intent.job_id),
+        ).fetchone()
+        if row is not None:
+            raise AuthorityUnavailable("model job already has a call identity")
+        db.execute(
+            "INSERT INTO authority_model_egress_v1 "
+            "(call_id,operation_id,namespace,subject,identity_json,state) "
+            "VALUES(?,?,?,?,?,'prepared')",
+            (intent.call_id, intent.operation_id, intent.namespace,
+             intent.subject, _encoded(intent)),
+        )
+        return ModelEgressRecoveryV1(intent, "prepared")
+
+    def read_locked(self, db: sqlite3.Connection, intent: ModelEgressIntentV1) -> ModelEgressRecoveryV1:
+        if type(intent) is not ModelEgressIntentV1 or db is not self._db or not db.in_transaction:
+            raise AuthorityUnavailable("typed model egress identity and Authority transaction required")
+        record = self._read(db, intent.call_id)
+        if record is None or record.intent != intent:
+            raise AuthorityUnavailable("model egress identity changed or absent")
+        return record
+
+    @staticmethod
+    def is_fence_bound_locked(db: sqlite3.Connection,
+                              intent: ModelEgressIntentV1) -> bool:
+        return db.execute(
+            "SELECT operation_id,token FROM authority_model_egress_bindings_v1 WHERE call_id=?",
+            (intent.call_id,),
+        ).fetchone() == (intent.operation_id, intent.fence_token)
+
+    def bind_fence_locked(self, db: sqlite3.Connection,
+                          intent: ModelEgressIntentV1) -> None:
+        self.read_locked(db, intent)
+        if self.is_fence_bound_locked(db, intent):
+            raise AuthorityUnavailable("model fence binding already exists")
+        db.execute(
+            "INSERT INTO authority_model_egress_bindings_v1(call_id,operation_id,token) "
+            "VALUES(?,?,?)", (intent.call_id, intent.operation_id, intent.fence_token))
 
     def read(self, call_id: str, *, subject: str, namespace: str) -> ModelEgressRecoveryV1:
         identifier(call_id, "call_id")
@@ -135,20 +199,52 @@ class AuthorityV2ModelEgressStore:
                     observation_digest: str | None = None) -> ModelEgressRecoveryV1:
         target = ModelEgressRecoveryV1(intent, state, observation_digest)
         with self._tx() as db:
-            old = self._read(db, intent.call_id)
-            if old is None or old.intent != intent:
-                raise AuthorityUnavailable("model egress identity changed or absent")
-            expected = "prepared" if state == "dispatch_started" else "dispatch_started"
-            if old.state != expected:
-                raise AuthorityUnavailable("model egress transition cannot repeat or reverse")
-            updated = db.execute(
-                "UPDATE authority_model_egress_v1 SET state=?,observation_digest=? "
-                "WHERE call_id=? AND state=? AND identity_json=?",
-                (state, observation_digest, intent.call_id, expected, _encoded(intent)),
-            )
-            if updated.rowcount != 1:
-                raise AuthorityUnavailable("model egress transition lost its exact identity")
-            return target
+            self._transition_locked(db, target)
+        return target
+
+    def _transition_locked(self, db: sqlite3.Connection,
+                           target: ModelEgressRecoveryV1) -> None:
+        intent = target.intent
+        old = self.read_locked(db, intent)
+        expected = "prepared" if target.state == "dispatch_started" else "dispatch_started"
+        if old.state != expected:
+            raise AuthorityUnavailable("model egress transition cannot repeat or reverse")
+        updated = db.execute(
+            "UPDATE authority_model_egress_v1 SET state=?,observation_digest=? "
+            "WHERE call_id=? AND state=? AND identity_json=?",
+            (target.state, target.observation_digest, intent.call_id,
+             expected, _encoded(intent)),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityUnavailable("model egress transition lost its exact identity")
+
+    def _record_dispatch_started_fenced_locked(self, db: sqlite3.Connection,
+                                                intent: ModelEgressIntentV1,
+                                                permit: FencePermitV2, fences,
+                                                current_anchor) -> ModelEgressRecoveryV1:
+        """Future executor primitive: exact live fence and single durable CAS.
+
+        The service must first verify the complete graph request and executable
+        provider limit. This primitive alone never grants a provider send.
+        """
+        if (type(intent) is not ModelEgressIntentV1 or type(permit) is not FencePermitV2
+                or permit.operation != "model_egress"
+                or (permit.operation_id, permit.subject, permit.namespace,
+                    permit.authority_id, permit.generation, permit.token,
+                    permit.fence_epoch, permit.revision,
+                    canonical_digest(asdict(permit.pinned_anchor))) !=
+                   (intent.operation_id, intent.subject, intent.namespace,
+                    intent.authority_id, intent.authority_activation_generation,
+                    intent.fence_token, intent.fence_epoch, intent.fence_revision,
+                    intent.anchor_digest)):
+            raise AuthorityUnavailable("typed model fence and call identity mismatch")
+        fences.validate_fence_locked(
+            db, permit, subject=intent.subject, current_anchor=current_anchor)
+        if not self.is_fence_bound_locked(db, intent):
+            raise AuthorityUnavailable("model fence was not atomically bound")
+        target = ModelEgressRecoveryV1(intent, "dispatch_started")
+        self._transition_locked(db, target)
+        return target
 
     def record_dispatch_started(self, intent: ModelEgressIntentV1) -> ModelEgressRecoveryV1:
         """Commit before any future send; no second caller can cross this boundary."""
