@@ -6301,6 +6301,292 @@ class GraphCoordinator:
         )
         return binding, draft, anchor
 
+    def read_first_ingress_original_model_result_context_v1(
+        self, authority: AuthorityContext, lease: object, job_id: str,
+        acquire_operation_id: str,
+    ):
+        """Read historical model identity under a current worker content fence.
+
+        This is a result-consumption context, not another model dispatch.
+        Original D11 reservation, quote expiry, and current outbox phase are
+        deliberately absent from its *current* eligibility checks.
+        """
+        from datetime import datetime
+
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .memory_types import SourceRecord, access_key, source_key, validate_access
+        from .runtime.d11_types import RuntimeOutboxValue, job_graph_write, runtime_job_key
+        from .runtime.encoding_call_binding import (
+            binding_from_json, binding_to_json, load_binding,
+        )
+        from .runtime.first_ingress_v2 import ingress_ids, trusted_upper
+        from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+        from .runtime.original_model_result_context import OriginalModelResultContextV1
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or type(self.__d02_issuer) is not D02ResourceIssuer
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("installed worker result read authorities required")
+        self._authorize(lease, authority, frozenset({"d11"}), owner_read=True)
+        namespace = authority.namespace
+        if (authority.issuer_domain != "d11" or "activity" not in authority.owner_scope
+                or authority.purpose != "consolidation"
+                or type(acquire_operation_id) is not str
+                or authority.capability_ref != _operation_capability_ref(
+                    namespace, authority.actor, "d11", frozenset({"d11"}),
+                    authority.activation_generation, acquire_operation_id)):
+            raise AuthorityDenied("original result read requires the job-bound D11 lease")
+        try:
+            now = trusted_upper(self.__content_fence_v2.read_ingress_clock(
+                self.__scene_clock_policy))
+        except Exception as exc:
+            raise UnavailableGuard("worker result trusted clock unavailable; HOLD") from exc
+
+        def reader():
+            db = self.__store._db
+            job = get_job(db, job_id)
+            if ((job.bot_id, job.persona_id) != namespace.as_tuple
+                    or job.work_kind != "d06.encode_source"
+                    or job.effect_id is not None or job.phase != "running"
+                    or job.lease_holder != authority.actor
+                    or job.fence != authority.worker_fence or job.fence < 1
+                    or job.cancel_epoch != 0 or job.result_ref is not None
+                    or job.lease_expires_utc is None):
+                raise UnavailableGuard("worker result job lease is not current; HOLD")
+            expiry = datetime.fromisoformat(
+                job.lease_expires_utc.replace("Z", "+00:00")).timestamp()
+            deadline = datetime.fromisoformat(
+                job.deadline_utc.replace("Z", "+00:00")).timestamp()
+            if now >= min(expiry, deadline):
+                raise UnavailableGuard("worker result lease or deadline expired; HOLD")
+            if not _job_acquire_id_matches(
+                    acquire_operation_id, namespace, job_id, job.operation_id,
+                    authority.actor, authority.activation_generation):
+                raise AuthorityDenied("original result acquire identity differs")
+
+            job_key = runtime_job_key(*namespace.as_tuple, job.activity_id, job_id)
+            job_atom = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (job_key.token,),
+            ).fetchone()
+            if (job_atom is None or job_atom[2] != 1
+                    or json.loads(job_atom[1]) != job_graph_write(job).value):
+                raise UnavailableGuard("worker result job projection differs; HOLD")
+
+            ingress = db.execute(
+                "SELECT activity_id,effect_id,receipt_json FROM graph_bundle_operations "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (job.operation_id,),
+            ).fetchone()
+            if ingress is None or ingress[:2] != (job.activity_id, None):
+                raise UnavailableGuard("original committed ingress is absent; HOLD")
+            ingress_receipt = json.loads(ingress[2])
+            outbox_refs = ingress_receipt.get("outbox_refs")
+            if (job_key.token not in ingress_receipt.get("ledger_refs", ())
+                    or type(outbox_refs) is not list or len(outbox_refs) != 1):
+                raise UnavailableGuard("original ingress job/outbox identity differs; HOLD")
+            outbox_token = outbox_refs[0]
+            outbox_key = AtomKey.from_token(outbox_token)
+            if (outbox_key.type_name != "runtime.outbox"
+                    or outbox_key.owner != Owner(
+                        "activity", *namespace.as_tuple, job.activity_id)):
+                raise UnavailableGuard("original outbox identity differs; HOLD")
+            # The ingress event's first outbox write is historical evidence.
+            # Its present phase is irrelevant to result consumption.
+            outbox_rows = db.execute(
+                "SELECT value FROM graph_history WHERE token=? AND valid=1 "
+                "AND event_bot=? AND event_persona=? AND event_session=? "
+                "AND event_id=?",
+                (outbox_token, *namespace.as_tuple, job.activity_id,
+                 job.operation_id),
+            ).fetchall()
+            if len(outbox_rows) != 1:
+                raise UnavailableGuard("original ingress outbox write is absent; HOLD")
+            outbox = RuntimeOutboxValue(**json.loads(outbox_rows[0][0]))
+            expected = ingress_ids(outbox.payload_ref)
+            if ((outbox.bot_id, outbox.persona_id, outbox.activity_id,
+                 outbox.operation_id, outbox.effect_id, outbox.job_id,
+                 outbox.job_ref, outbox.outbox_id,
+                 outbox.idempotency_key, outbox.phase) != (
+                    *namespace.as_tuple, job.activity_id, job.operation_id,
+                    None, job_id, job_key.token, expected[4], expected[5],
+                    "pending")
+                    or expected[1:5] != (
+                        job.activity_id, job.operation_id, job_id,
+                        outbox.outbox_id)):
+                raise UnavailableGuard("original outbox does not bind this job; HOLD")
+
+            acquire = db.execute(
+                "SELECT i.job_id,i.original_operation_id,i.actor,"
+                "i.encoding_binding_json,r.job_json,i.requirements_json "
+                "FROM graph_job_acquire_intents_v2 AS i "
+                "JOIN graph_job_acquire_receipts_v2 AS r "
+                "ON r.bot=i.bot AND r.persona=i.persona "
+                "AND r.acquire_operation_id=i.acquire_operation_id "
+                "WHERE i.bot=? AND i.persona=? AND i.acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchall()
+            binding = load_binding(db, namespace, job_id)
+            if len(acquire) != 1 or binding is None or acquire[0][3] is None:
+                raise UnavailableGuard("original committed acquire/binding is absent; HOLD")
+            frozen_job = json.loads(acquire[0][4])
+            historical_requirements = json.loads(acquire[0][5])
+            if (acquire[0][:4] != (
+                    job_id, job.operation_id, authority.actor,
+                    binding_to_json(binding))
+                    or binding_from_json(acquire[0][3]) != binding
+                    or frozen_job.get("job_id") != job_id
+                    or frozen_job.get("fence") != job.fence
+                    or frozen_job.get("lease_holder") != authority.actor
+                    or frozen_job.get("lease_expires_utc") != job.lease_expires_utc
+                    or historical_requirements.get("namespace") != asdict(namespace)
+                    or not historical_requirements.get("graph_incarnation")):
+                raise UnavailableGuard("original acquire differs from current worker; HOLD")
+            if db.execute(
+                    "SELECT 1 FROM runtime_encoding_call_redactions_v1 "
+                    "WHERE bot=? AND persona=? AND "
+                    "(call_id=? OR source_id=?) LIMIT 1",
+                    namespace.as_tuple + (binding.call_id, binding.source_id),
+            ).fetchone() is not None:
+                raise UnavailableGuard("original encoding binding was redacted; HOLD")
+            frozen = binding.request
+            envelope_authority = frozen["envelope"]["authority"]
+            if (frozen["schema"] != "sylanne.first-ingress-encoding-call.v2"
+                    or frozen["acquire_operation_id"] != acquire_operation_id
+                    or frozen["original_operation_id"] != job.operation_id
+                    or frozen["worker_fence"] != job.fence
+                    or frozen["worker_lease_expires_utc"] != job.lease_expires_utc
+                    or frozen["source_id"] != outbox.payload_ref
+                    or binding.source_id != outbox.payload_ref
+                    or binding.budget_lease_id != job.budget_ref
+                    or binding.budget_reservation_operation_id != job.operation_id
+                    or envelope_authority["actor"] != authority.actor
+                    or envelope_authority["worker_fence"] != job.fence
+                    or envelope_authority["purpose"] != "consolidation"):
+                raise UnavailableGuard("original model binding identity differs; HOLD")
+
+            # Historical signatures remain checkable after D11 settlement or
+            # grant/quote revocation. Neither is used as a new-work permit.
+            quote_ref = job.operator_versions.get("resource_quote")
+            if type(quote_ref) is not str or ":" not in quote_ref:
+                raise UnavailableGuard("original encoding quote reference is absent; HOLD")
+            quote_id, version_text = quote_ref.rsplit(":", 1)
+            quote = self.__d02_issuer.original_signed_quote(
+                db, quote_id, int(version_text))
+            issuance = db.execute(
+                "SELECT activation_generation,quote_id,grant_id "
+                "FROM runtime_ingress_issuance WHERE bot=? AND persona=? "
+                "AND operation_id=?",
+                namespace.as_tuple + (job.operation_id,),
+            ).fetchone()
+            provision_row = self._provision_row(db, namespace)
+            if provision_row is None:
+                raise UnavailableGuard("original provisioning receipt is absent; HOLD")
+            provision = self._decode_provision_receipt(provision_row)
+            grant, signature = self.__d11_issuer.signed_budget_grant_at_version(
+                db, provision.root_lease_id, provision.root_grant_version)
+            if (issuance != (authority.activation_generation,
+                            quote_id, grant.grant_id)
+                    or (provision.authority_id, provision.authority_namespace,
+                        provision.generation, provision.root_lease_id,
+                        provision.root_grant_id,
+                        provision.root_grant_signature) != (
+                        historical_requirements["authority_id"],
+                        historical_requirements["authority_namespace"],
+                        authority.activation_generation, job.budget_ref,
+                        grant.grant_id, signature)
+                    or (grant.bot_id, grant.persona_id, grant.lease_id) != (
+                        *namespace.as_tuple, job.budget_ref)
+                    or job.work_kind not in grant.allowed_work_kinds
+                    or (quote.bot_id, quote.persona_id, quote.activity_id,
+                        quote.operation_id, quote.effect_id,
+                        quote.parent_budget_lease_ref, quote.work_kind,
+                        quote.graph_job_ref, quote.outbox_refs) != (
+                        *namespace.as_tuple, job.activity_id,
+                        job.operation_id, None, job.budget_ref, job.work_kind,
+                        job_key.token, (outbox_token,))):
+                raise UnavailableGuard("original signed encoding bounds differ; HOLD")
+            original_reservation = db.execute(
+                "SELECT digest,ceiling_json FROM runtime_budget_reservations "
+                "WHERE lease_id=? AND operation_id=?",
+                (job.budget_ref, job.operation_id),
+            ).fetchone()
+            original_reserve_receipt = db.execute(
+                "SELECT digest FROM runtime_budget_operations WHERE bot_id=? "
+                "AND persona_id=? AND operation_id=? AND phase='reserve'",
+                namespace.as_tuple + (job.operation_id,),
+            ).fetchone()
+            if (original_reservation is None or original_reserve_receipt is None
+                    or original_reservation != (
+                        original_reserve_receipt[0], canonical_json(quote.ceiling))):
+                raise UnavailableGuard("original reservation identity differs; HOLD")
+            self._original_first_ingress_qualification_locked(
+                namespace, job.operation_id,
+                source_key(*namespace.as_tuple, binding.source_id).token)
+
+            source_key_value = source_key(*namespace.as_tuple, binding.source_id)
+            access_key_value = access_key(*namespace.as_tuple, binding.source_id)
+            source_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (source_key_value.token,),
+            ).fetchone()
+            access_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (access_key_value.token,),
+            ).fetchone()
+            dependency = db.execute(
+                "SELECT dependency_revision FROM graph_dependencies WHERE "
+                "dependent_token=? AND dependency_token=?",
+                (access_key_value.token, source_key_value.token),
+            ).fetchone()
+            if (source_row is None or access_row is None
+                    or source_row[2] != 1 or access_row[2] != 1
+                    or source_row[0] != binding.source_revision
+                    or access_row[0] != binding.access_revision
+                    or dependency != (source_row[0],)):
+                raise UnavailableGuard("worker result source/access version changed; HOLD")
+            source = SourceRecord.from_dict(json.loads(source_row[1]))
+            access = json.loads(access_row[1])
+            validate_access(access)
+            audience = envelope_authority["audience"]
+            if (source.source_id != binding.source_id
+                    or access["source_id"] != binding.source_id
+                    or access["status"] != "active"
+                    or "consolidation" not in source.purposes
+                    or "consolidation" not in access["purposes"]
+                    or type(audience) is not list or not audience
+                    or not set(audience).issubset(source.audiences)
+                    or not set(audience).issubset(access["audiences"])):
+                raise UnavailableGuard("worker result source access revoked; HOLD")
+            epochs = db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone()
+            if epochs is None:
+                raise UnavailableGuard("worker result authority epochs absent; HOLD")
+            return (binding, job, epochs,
+                    historical_requirements["graph_incarnation"],
+                    provision.installation_id)
+
+        (prepared, anchor, metadata, graph_epoch) = self._read_v2(
+            authority, reader, return_recovery_context=True)
+        binding, job, epochs, original_incarnation, installation_id = prepared
+        target = metadata.requirements
+        if (target.namespace != namespace
+                or target.graph_incarnation != original_incarnation):
+            raise UnavailableGuard("worker result graph recovery identity differs; HOLD")
+        return OriginalModelResultContextV1(
+            namespace, target.authority_id, target.authority_namespace,
+            installation_id,
+            target.graph_incarnation, metadata.graph_revision,
+            graph_epoch.revision, *epochs, job_id, acquire_operation_id,
+            job.operation_id, binding.call_id, binding.binding_digest,
+            binding.model_request_digest, binding.source_id,
+            binding.source_revision, binding.access_revision,
+            authority.actor, job.fence, job.lease_expires_utc, anchor)
+
     def prepare_first_ingress_model_cost_v1(
         self, bootstrap: object, namespace: NamespaceId, original_intent,
         *, quote_id: str, quote_version: int,
