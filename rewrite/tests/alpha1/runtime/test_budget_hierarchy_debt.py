@@ -6,7 +6,8 @@ import pytest
 
 from sylanne3.runtime.budget import (
     BudgetLease, BudgetUnavailable, create_budget_lease, get_budget_lease,
-    install_schema, reserve_budget, resolve_partial_budget,
+    install_schema, require_budget_family_admissible, reserve_budget,
+    resolve_partial_budget,
     resolve_unconfirmed, settle_budget, settle_budget_partial,
 )
 
@@ -34,6 +35,8 @@ def _hierarchy():
 
 def _assert_new_commitments_blocked(db):
     for lease_id in ("root", "child", "sibling", "grandchild"):
+        with pytest.raises(BudgetUnavailable, match="ancestry"):
+            require_budget_family_admissible(db, lease_id)
         with pytest.raises(BudgetUnavailable, match="ancestry"):
             reserve_budget(db, lease_id, "fresh-" + lease_id, "c" * 64,
                            {"tokens": 1})

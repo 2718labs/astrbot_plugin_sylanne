@@ -24,7 +24,7 @@ from ..model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
     build_first_ingress_encoding_payload,
 )
-from ..runtime.budget import get_budget_lease
+from ..runtime.budget import get_budget_lease, require_budget_family_admissible
 from ..runtime.d11_types import RuntimeOutboxValue, job_graph_write, runtime_job_key, runtime_outbox_key
 from ..runtime.encoding_call_binding import binding_to_json, load_binding
 from ..runtime.first_ingress_v2 import ingress_ids
@@ -392,6 +392,10 @@ class PinnedCurrentModelEgressGraphVerifier:
         quote = self._issuer.resource_issuer._load_quote(db, quote_id, int(version_text))
         grant = self._issuer.current_budget_grant(db, job.budget_ref)
         lease = get_budget_lease(db, job.budget_ref)
+        # A sibling or descendant may already have spent beyond its original
+        # ceiling. The family debt marker is read in this same graph snapshot;
+        # a still-reserved local job is not permission for a new model dispatch.
+        require_budget_family_admissible(db, job.budget_ref)
         reservation = db.execute(
             "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
             "WHERE lease_id=? AND operation_id=?",

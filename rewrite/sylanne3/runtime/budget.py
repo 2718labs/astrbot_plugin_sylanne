@@ -292,6 +292,11 @@ def _assert_no_ancestor_debt(db, lease_id: str) -> None:
             raise BudgetUnavailable("budget ancestry has unresolved overrun debt")
 
 
+def require_budget_family_admissible(db, lease_id: str) -> None:
+    """Read-only dispatch gate, evaluated in the caller's pinned DB snapshot."""
+    _assert_no_ancestor_debt(db, lease_id)
+
+
 def _save_lease(db, lease: BudgetLease) -> None:
     changed = db.execute(
         "UPDATE runtime_budget_leases SET used_json=?,reserved_json=?,unconfirmed_json=?,"
@@ -791,6 +796,7 @@ __all__ = [
     "BudgetReceipt", "BudgetReservation",
     "BudgetUnavailable", "close_budget_lease", "create_budget_lease", "get_budget_lease",
     "install_schema", "predict_budget_partial_settlement",
-    "predict_budget_settlement", "reserve_budget", "resolve_partial_budget",
+    "predict_budget_settlement", "require_budget_family_admissible",
+    "reserve_budget", "resolve_partial_budget",
     "resolve_unconfirmed", "settle_budget", "settle_budget_partial",
 ]
