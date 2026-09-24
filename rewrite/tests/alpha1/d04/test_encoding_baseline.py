@@ -42,7 +42,7 @@ def _proposal_and_snapshot():
         OperationIdentity("activity:1", None, "attempt:1", "prepare", "operation:1",
                           canonical_digest({"input_refs": [SOURCE]})),
         AuthorityContext("host:user", "d11", "capability:affect", NamespaceId("bot", "persona"),
-                         ("persona",), "respond", (), "policy:1", 1),
+                         ("persona", "event"), "respond", (), "policy:1", 1),
         guard,
         SourceQualification((SOURCE,), "reported", 1.0, 1.0, "external_report", "eligible",
                             0.7, "not_applicable"),
@@ -169,6 +169,11 @@ class EncodingBaselineTests(unittest.TestCase):
         uncommitted = GraphSnapshot((replace(snapshot.atoms[0], revision=0), *snapshot.atoms[1:]), ())
         with self.assertRaisesRegex(ValueError, "matching committed guarded revisions"):
             provider.propose_encoding_baseline(prior.envelope, uncommitted, **kwargs)
+        persona_only = replace(prior.envelope, authority=replace(
+            prior.envelope.authority, owner_scope=("persona",),
+        ))
+        with self.assertRaisesRegex(ValueError, "event owner scope"):
+            provider.propose_encoding_baseline(persona_only, snapshot, **kwargs)
 
     def test_unknown_record_is_typed_and_registered_immutable(self):
         value = _baseline()

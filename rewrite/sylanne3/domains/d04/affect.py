@@ -885,6 +885,8 @@ class AffectProvider:
         scheme = self._active_scheme
         if scheme is None:
             raise ValueError("baseline needs the active D04 scheme")
+        if "event" not in envelope.authority.owner_scope:
+            raise ValueError("baseline issue needs event owner scope")
         if not isinstance(source_refs, tuple) or not source_refs:
             raise ValueError("baseline needs committed source refs")
         if any(not isinstance(refs, tuple) for refs in (then_feeling_refs, interpretation_refs)):
