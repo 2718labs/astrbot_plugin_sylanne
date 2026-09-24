@@ -33,6 +33,13 @@ from .v2_contract import (
     SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
 )
 from .v2_fence_service import AuthorityV2FenceService
+from .v2_accounting_contract import (
+    AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
+)
+from .v2_accounting_service import AuthorityV2AccountingMaintenanceService
+from .v2_accounting_wire import (
+    from_wire as accounting_from_wire, to_wire as accounting_to_wire,
+)
 from .v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelAdmissionV2,
     HostObservedModelCompletionV2,
@@ -185,6 +192,8 @@ class AuthorityRpcServer:
         v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
         v2_model_result_reads: Mapping[str, AuthorityV2ModelResultReadService] | None = None,
         model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
+        v2_accounting: Mapping[str, AuthorityV2AccountingMaintenanceService] | None = None,
+        accounting_observers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_owner_tickets: AuthorityV2OwnerTicketStore | None = None,
         v2_owner_proofs: AuthorityV2OwnerProofStore | None = None,
         v2_owner_sessions: AuthorityV2OwnerSessionStore | None = None,
@@ -322,6 +331,29 @@ class AuthorityRpcServer:
                 for namespace, service in result_reads.items()):
             raise TypeError("result reads require the installed model and Owner composition")
         self._v2_model_result_reads = result_reads
+        if v2_accounting is not None and not isinstance(v2_accounting, Mapping):
+            raise TypeError("Authority accounting service mapping required")
+        accounting_services = dict(v2_accounting or {})
+        accounting_observers = dict(accounting_observers_v2 or {})
+        if (set(accounting_services) != set(accounting_observers)
+                or any(type(namespace) is not str or namespace not in model_services
+                       or type(service) is not AuthorityV2AccountingMaintenanceService
+                       or service._store is not model_services[namespace]._store
+                       or service._fences is not services[namespace]
+                       or type(accounting_observers[namespace]) is not tuple
+                       or len(accounting_observers[namespace]) != 2
+                       or accounting_observers[namespace] not in installed
+                       or not any(peer == accounting_observers[namespace][0]
+                                      and profile == accounting_observers[namespace][1]
+                                      and mapped == namespace
+                                      for (peer, profile, _), mapped in bindings.items())
+                       or (service._subject, service._holder) != (
+                           "mtls:sha256:" + accounting_observers[namespace][0],
+                           installed[accounting_observers[namespace]].administrator_holder)
+                       for namespace, service in accounting_services.items())):
+            raise TypeError("accounting requires installed designated observer and original model")
+        self._v2_accounting = accounting_services
+        self._accounting_observers_v2 = accounting_observers
         self._sessions: dict[str, tuple[float, str, str]] = {}
         self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="authority-rpc")
         self._worker_slots = threading.BoundedSemaphore(max_inflight_dispatches)
@@ -579,6 +611,39 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method in {"accounting_begin_v1", "accounting_validate_v1",
+                          "accounting_finish_v1", "accounting_recover_finish_v1"}:
+                expected = ({"namespace", "request"} if method in {
+                    "accounting_begin_v1", "accounting_recover_finish_v1"} else
+                    {"namespace", "request", "grant"})
+                if set(command) != expected:
+                    raise AuthorityUnavailable("accounting command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                service = self._v2_accounting.get(namespace)
+                if (service is None or self._accounting_observers_v2.get(namespace)
+                        != (credential.certificate_sha256, profile_id)
+                        or service._subject != subject):
+                    raise AuthorityUnavailable("designated accounting observer unavailable")
+                request = accounting_from_wire(
+                    command["request"], AccountingMaintenanceRequestV1)
+                if (request.intent.authority_id != self._authority_id()
+                        or request.intent.namespace != namespace):
+                    raise AuthorityUnavailable("accounting request installation differs")
+                if method == "accounting_begin_v1":
+                    grant = service.begin(credential=credential, request=request)
+                    return {"grant": accounting_to_wire(grant)}
+                if method == "accounting_recover_finish_v1":
+                    service.recover_finish(credential=credential, request=request)
+                    return {"finished": True}
+                grant = accounting_from_wire(
+                    command["grant"], AccountingMaintenanceGrantV1)
+                if method == "accounting_validate_v1":
+                    service.validate(credential=credential, request=request, grant=grant)
+                    return {"valid": True}
+                service.finish(credential=credential, request=request, grant=grant)
+                return {"finished": True}
             if method in {"model_result_read_v1", "model_result_read_recover_finish_v1"}:
                 expected = ({"namespace", "read_request", "owner_session_token"}
                             if method == "model_result_read_v1" else

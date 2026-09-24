@@ -14,6 +14,7 @@ from sylanne3.authority_service.local_composition import compose_local_owner_aut
 from sylanne3.authority_service.mtls_server import AdministratorInstallationV2, MtlsPeerCredential
 from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
 from sylanne3.authority_service.v2_model_egress_store import AuthorityV2ModelEgressStore
+from sylanne3.authority_service.v2_accounting_service import AuthorityV2AccountingMaintenanceService
 from sylanne3.authority_service.v2_model_result_read_service import AuthorityV2ModelResultReadService
 from sylanne3.authority_service.v2_owner_proof import AuthorityV2OwnerProofStore
 from sylanne3.authority_service.v2_owner_session import AuthorityV2OwnerSessionStore
@@ -134,10 +135,15 @@ def test_composition_pins_result_read_to_original_store_owner_and_installation(t
             namespace_bindings_v2={("a" * 64, "profile", ROLE): "ns-a"},
             v2_model_egress={"ns-a": model},
             model_observers_v2={"ns-a": ("a" * 64, "profile")},
+            accounting_observers_v2={"ns-a": ("a" * 64, "profile")},
             model_result_source_purposes={"ns-a": "audit"},
             owner_sessions=sessions, creation_pairing_source=pairing,
             create_owner_schema=True)
         result = server._v2_model_result_reads["ns-a"]
+        accounting = server._v2_accounting["ns-a"]
+        assert type(accounting) is AuthorityV2AccountingMaintenanceService
+        assert accounting._store is store and accounting._fences is service
+        assert accounting._subject == "mtls:sha256:" + "a" * 64
         assert type(result) is AuthorityV2ModelResultReadService
         assert result._store is store and result._fences is service
         assert result._sessions is sessions

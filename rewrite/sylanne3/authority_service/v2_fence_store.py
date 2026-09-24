@@ -398,9 +398,9 @@ class AuthorityV2FenceStore:
                     effect_id: str | None = None, command_digest: str | None = None,
                     footprint_digest: str | None = None) -> FencePermitV2:
         """Issue a service-generated token; same active operation ID is retryable."""
-        if operation == "model_egress":
+        if operation in {"model_egress", "accounting"}:
             raise AuthorityUnavailable(
-                "model_egress fence requires atomic typed model preparation")
+                "special fence requires atomic typed service preparation")
         identifier(subject, "subject")
         identifier(holder, "holder")
         operation_id = identifier(str(uuid.uuid4()) if operation_id is None else operation_id,
@@ -427,6 +427,9 @@ class AuthorityV2FenceStore:
         identifier(subject, "subject")
         identifier(holder, "holder")
         identifier(operation_id, "operation_id")
+        if operation == "accounting" and (effect_id is not None or footprint_digest is not None
+                                          or type(command_digest) is not str):
+            raise AuthorityUnavailable("typed accounting binding digest required")
         self._require_anchor(current_anchor, current_anchor.namespace)
         namespace = current_anchor.namespace
         self._check_schema(db)

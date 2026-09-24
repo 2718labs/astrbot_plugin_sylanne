@@ -25,7 +25,7 @@ _HEAD_DIGEST = re.compile(r"^(?:genesis|sha256:[0-9a-f]{64})$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
 _UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _OPERATIONS = CONTENT_OPERATIONS | frozenset({
-    "delete", "migrate", "journal_maintenance", "recovery",
+    "delete", "migrate", "journal_maintenance", "recovery", "accounting",
 })
 _PHASES = frozenset({"prepared", "claimed", "observed", "settled"})
 _PLATFORM_OUTCOMES = frozenset({
@@ -139,6 +139,10 @@ class FencePermitV2:
             identifier(self.effect_id, "effect_id")
             _digest(self.command_digest, "command_digest")
             _digest(self.footprint_digest, "footprint_digest")
+        elif self.operation == "accounting":
+            _digest(self.command_digest, "accounting binding digest")
+            if self.effect_id is not None or self.footprint_digest is not None:
+                raise ValueError("accounting fence cannot bind an effect or footprint")
         elif any(value is not None for value in (
                 self.effect_id, self.command_digest, self.footprint_digest)):
             raise ValueError("effect binding requires dispatch operation")

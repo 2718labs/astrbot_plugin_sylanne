@@ -17,6 +17,13 @@ from rewrite.tests.alpha1.authority.test_v2_model_egress_store import intent
 from sylanne3.authority_service.current_model_egress_graph_verifier import (
     PinnedCurrentModelEgressGraphVerifier,
 )
+from sylanne3.authority_service.v2_accounting_contract import (
+    AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
+)
+from sylanne3.authority_service.v2_accounting_service import AuthorityV2AccountingMaintenanceService
+from sylanne3.authority_service.v2_accounting_wire import (
+    from_wire as accounting_from_wire, to_wire as accounting_to_wire,
+)
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.mtls_server import AuthorityRpcServer
 from sylanne3.authority_service.mtls_server import AuthorityServerTlsConfig, MtlsPeerCredential
@@ -35,6 +42,7 @@ from sylanne3.host.authority_client import (
 from sylanne3.host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 from sylanne3.model_broker.broker import ModelCallRequest
 from sylanne3.runtime_contracts import NamespaceId
+from sylanne3.runtime.deletion import DeletionJournal
 
 
 def test_real_mtls_generic_model_begin_cannot_leave_orphan_fence(tmp_path, monkeypatch):
@@ -163,12 +171,16 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         monkeypatch.setattr(verifier, "complete_graph_current", graph_current)
         model = AuthorityV2ModelEgressService(
             store, fences, graph_verifier=verifier, admin_model_policy=policy)
+        accounting = AuthorityV2AccountingMaintenanceService(
+            store=store, fences=fences, subject=subject, holder="holder-a")
         server = AuthorityRpcServer(
             base._core,
             administrator_authorizer=base._administrator_authorizer,
             publisher_manifest_verifier=base._publisher_manifest_verifier,
             v2_fences=fences, v2_model_egress={"ns-a": model},
             model_observers_v2={"ns-a": (_PEER_A.certificate_sha256, "profile-a")},
+            v2_accounting={"ns-a": accounting},
+            accounting_observers_v2={"ns-a": (_PEER_A.certificate_sha256, "profile-a")},
             installations_v2=base._installations_v2,
             namespace_bindings_v2=base._namespace_bindings_v2,
         )
@@ -221,6 +233,11 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         assert admission.provider_config_digest == intent2.provider_config_digest
         assert admission.host_incarnation == "a" * 64
         assert admitted2["record"]["state"] == "dispatch_started"
+        accounting_request = AccountingMaintenanceRequestV1(
+            "accounting-original-call", intent2, anchor)
+        with pytest.raises(AuthorityUnavailable, match="unresolved"):
+            accounting.begin(credential=_PEER_A, request=accounting_request)
+        assert fences.fences._row(fences.core._db, intent2.operation_id)[6] == "active"
         terminal_query = {"namespace": "ns-a", "holder": "holder-a",
                           "intent": to_wire(intent2)}
         unresolved = call("model_terminal_fact_v2", terminal_query)
@@ -270,6 +287,64 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         assert terminal["record"]["cost"] == [["micro_usd", 2]]
         assert terminal["receipt"] == to_wire(receipt)
         assert "result_json" not in json.dumps(terminal)
+        original_body_read = store._read_observation_locked
+        monkeypatch.setattr(store, "_read_observation_locked",
+                            lambda *_: (_ for _ in ()).throw(
+                                AssertionError("accounting read provider body")))
+        accounting_command = {
+            "namespace": "ns-a", "request": accounting_to_wire(accounting_request)}
+        with pytest.raises(AuthorityUnavailable, match="special"):
+            fences.begin_fence(
+                credential=_PEER_A, subject=subject, holder="holder-a",
+                operation="accounting", operation_id="generic-accounting",
+                expected_anchor=anchor)
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            other("accounting_begin_v1", accounting_command)
+        accounting_grant = accounting_from_wire(
+            call("accounting_begin_v1", accounting_command)["grant"],
+            AccountingMaintenanceGrantV1)
+        assert accounting_grant.permit.operation == "accounting"
+        assert accounting_grant.reservation_digest == intent2.budget_reservation_digest
+        assert accounting_grant.observation_digest == receipt.observation_digest
+        with pytest.raises(RuntimeError, match="authority unavailable"):
+            call("accounting_validate_v1", {
+                **accounting_command,
+                "grant": accounting_to_wire(replace(
+                    accounting_grant,
+                    reservation_digest="f" * 64))})
+        assert call("accounting_validate_v1", {
+            **accounting_command, "grant": accounting_to_wire(accounting_grant)})["valid"] is True
+        with pytest.raises(AuthorityUnavailable, match="active"):
+            fences.begin_fence(
+                credential=_PEER_A, subject=subject, holder="holder-a",
+                operation="read", operation_id="read-during-accounting",
+                expected_anchor=anchor)
+        with pytest.raises(AuthorityUnavailable, match="dedicated"):
+            fences.finish_fence(
+                credential=_PEER_A, subject=subject,
+                permit=accounting_grant.permit,
+                request_id="generic-finish", request_digest="sha256:" + "e" * 64)
+        original_accounting_finish = fences.fences.finish_fence_locked
+
+        def lose_accounting_finish(*args, **kwargs):
+            original_accounting_finish(*args, **kwargs)
+            raise RuntimeError("lost accounting commit")
+
+        monkeypatch.setattr(fences.fences, "finish_fence_locked",
+                            lose_accounting_finish)
+        with pytest.raises(RuntimeError, match="lost accounting commit"):
+            call("accounting_finish_v1", {
+                **accounting_command, "grant": accounting_to_wire(accounting_grant)})
+        assert fences.fences._row(fences.core._db,
+                                  accounting_request.operation_id)[6] == "active"
+        monkeypatch.setattr(fences.fences, "finish_fence_locked",
+                            original_accounting_finish)
+        assert call("accounting_finish_v1", {
+            **accounting_command, "grant": accounting_to_wire(accounting_grant)})["finished"] is True
+        assert call("accounting_recover_finish_v1", accounting_command)["finished"] is True
+        assert fences.fences._row(fences.core._db,
+                                  accounting_request.operation_id)[6] == "finished"
+        monkeypatch.setattr(store, "_read_observation_locked", original_body_read)
         with pytest.raises(RuntimeError, match="authority unavailable"):
             other("model_terminal_fact_v2", terminal_query)
         # The terminal receipt is not a current Owner read grant, even for the
@@ -335,6 +410,18 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
         malformed["envelope"]["authority"]["namespace"]["persona_id"] = "persona-b"
         with pytest.raises(RuntimeError, match="authority unavailable"):
             call("model_admit_dispatch_once_v1", {**admit, "request": malformed})
+        deletion = DeletionJournal(tmp_path / "deletion.db")
+        try:
+            deletion.append_intent(
+                namespace="ns-a", operation_id="delete-accounting",
+                closure_roots=("source-a",), epoch=1, policy_ref="policy-a")
+            with pytest.raises(AuthorityUnavailable, match="behind or differs"):
+                accounting.begin(
+                    credential=_PEER_A,
+                    request=replace(accounting_request,
+                                    operation_id="accounting-after-delete-pending"))
+        finally:
+            deletion.close()
 
 
     finally:

@@ -20,6 +20,7 @@ from .v2_clock import AuthorityClockReadingV2
 from .v2_contract import FencePermitV2
 from .v2_fence_service import AuthorityV2FenceService
 from .v2_fence_store import AuthorityV2FenceStore
+from .v2_accounting_service import AuthorityV2AccountingMaintenanceService
 from .v2_model_egress_service import AuthorityV2ModelEgressService
 from .v2_model_result_read_service import AuthorityV2ModelResultReadService
 from .current_model_result_read_graph_verifier import PinnedCurrentModelResultReadGraphVerifier
@@ -43,6 +44,7 @@ def compose_local_owner_authority(
     namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
     v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
     model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
+    accounting_observers_v2: Mapping[str, tuple[str, str]] | None = None,
     model_result_source_purposes: Mapping[str, str] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
@@ -179,10 +181,29 @@ def compose_local_owner_authority(
             read_subject="mtls:sha256:" + observer[0],
             holder=installed.administrator_holder,
             source_purpose=purpose)
+    accounting_observers = dict(accounting_observers_v2 or {})
+    accounting_services = {}
+    for namespace, observer in accounting_observers.items():
+        model = models.get(namespace)
+        installed = (installations_v2.get(observer)
+                     if type(observer) is tuple and len(observer) == 2 else None)
+        if (type(namespace) is not str or type(model) is not AuthorityV2ModelEgressService
+                or model._fences is not services.get(namespace)
+                or installed is None
+                or not any(peer == observer[0] and profile == observer[1]
+                               and mapped == namespace
+                               for (peer, profile, _), mapped in namespace_bindings_v2.items())):
+            raise AuthorityUnavailable("D11 accounting observer installation differs")
+        accounting_services[namespace] = AuthorityV2AccountingMaintenanceService(
+            store=model._store, fences=services[namespace],
+            subject="mtls:sha256:" + observer[0],
+            holder=installed.administrator_holder)
     return AuthorityRpcServer(
         core, v2_fences=services, v2_model_egress=v2_model_egress,
         v2_model_result_reads=result_reads,
         model_observers_v2=model_observers_v2,
+        v2_accounting=accounting_services,
+        accounting_observers_v2=accounting_observers,
         v2_owner_tickets=owner_tickets,
         v2_owner_proofs=owner_proofs,
         v2_owner_sessions=owner_sessions,

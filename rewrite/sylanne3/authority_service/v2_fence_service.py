@@ -239,9 +239,9 @@ class AuthorityV2FenceService:
         identifier(subject, "subject")
         identifier(holder, "holder")
         identifier(operation_id, "operation_id")
-        if operation == "model_egress":
+        if operation in {"model_egress", "accounting"}:
             raise AuthorityUnavailable(
-                "model_egress fence requires atomic typed model preparation")
+                "special fence requires atomic typed service preparation")
         if type(expected_anchor) is not RestoreAnchor or expected_anchor.namespace != self.namespace:
             raise AuthorityUnavailable("expected full v2 anchor is required")
         self.core._require(credential, operation, self.namespace, holder)
@@ -286,6 +286,8 @@ class AuthorityV2FenceService:
         if (type(permit) is not FencePermitV2
                 or permit.namespace != self.namespace or permit.subject != subject):
             raise AuthorityUnavailable("v2 fence subject or namespace mismatch")
+        if permit.operation == "accounting":
+            raise AuthorityUnavailable("accounting requires its dedicated service")
         self.core._require(credential, permit.operation, self.namespace, permit.holder)
 
     def validate_fence(self, *, credential, subject: str,
