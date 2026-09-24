@@ -32,6 +32,9 @@ from .host.installed_package import verify_installed_package
 from .host.model_egress_executor import (
     FrozenEncodingEgressResult, HostModelEgressExecutor,
 )
+from .host.first_ingress_result import OriginalFirstIngressRead
+from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
+from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from .host.v2_installation import V2InstallationAssembly
 from .host.v2_fence_port import V2FenceOutcomeUnknown, V2FencePort
 from .installation_policy import AdminInstallationPolicy
@@ -781,6 +784,43 @@ class RuntimeContext:
             return None
         return await executor.execute_frozen_encoding_once(
             binding=binding, draft=draft, expected_anchor=expected_anchor)
+
+    async def read_first_ingress_encoding_for_owner_v2(
+        self, authority: AuthorityContext, lease: object,
+        job_id: str, acquire_operation_id: str, *,
+        intent: ModelEgressIntentV1,
+        owner_actor_id: str,
+        owner_session_request: OwnerSessionLoginRequestV1,
+        owner_session_token: str,
+        executor: HostModelEgressExecutor,
+    ) -> OriginalFirstIngressRead | None:
+        """Use the current job fence before an Owner-qualified original read.
+
+        The graph worker returns only the original preparation. Both Authority
+        queries run afterward on the host loop, outside the graph lock.
+        """
+        if (type(executor) is not HostModelEgressExecutor
+                or type(authority) is not AuthorityContext
+                or self._worker is None
+                or not self._v2_namespace_provisioned
+                or authority.namespace != self._v2_namespace
+                or executor._bundle is not self._v2_model_bundle
+                or executor._grant != self._v2_installation_grant
+                or executor._bundle.installation_policy != self._v2_policy):
+            return None
+        try:
+            binding, draft, expected_anchor = await self._worker.call(
+                lambda graph, auth, bound_lease, job, acquire: (
+                    graph.read_first_ingress_model_egress_preparation_v2(
+                        auth, bound_lease, job, acquire)),
+                authority, lease, job_id, acquire_operation_id)
+        except Exception:
+            return None
+        return await executor.read_original_for_owner(
+            binding=binding, draft=draft, expected_anchor=expected_anchor,
+            intent=intent, owner_actor_id=owner_actor_id,
+            owner_session_request=owner_session_request,
+            owner_session_token=owner_session_token)
 
     async def run_committed_first_ingress_encoding_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,

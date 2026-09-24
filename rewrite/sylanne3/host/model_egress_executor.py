@@ -7,6 +7,7 @@ Only the paired Authority v2 response may supply the local start identity.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import asdict, dataclass
 
 from ..authority_service.v2_model_egress_contract import (
@@ -14,6 +15,8 @@ from ..authority_service.v2_model_egress_contract import (
     ModelTerminalReceiptV2,
 )
 from ..authority_service.v2_model_egress_wire import from_wire as model_from_wire
+from ..authority_service.v2_model_result_read_contract import ModelResultReadRequestV1
+from ..authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from ..graph_types import AtomKey
 from ..model_broker.broker import ModelCallRequest, ProviderResponse
 from ..model_broker.first_ingress_encoding import (
@@ -29,6 +32,7 @@ from .authority_client import AuthorityClient
 from .authority_profile import (
     AdminIngressModelPolicy, AdminInstallationBundle, AdminModelWorkflowV2,
 )
+from .first_ingress_result import OriginalFirstIngressRead
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +209,102 @@ class HostModelEgressExecutor:
                 or record.state != "observed"):
             return None
         return receipt
+
+    async def read_original_for_owner(
+        self, *, binding: EncodingCallBinding, draft: ModelEgressDraftV1,
+        expected_anchor: RestoreAnchor, intent: ModelEgressIntentV1,
+        owner_actor_id: str, owner_session_request: OwnerSessionLoginRequestV1,
+        owner_session_token: str,
+    ) -> OriginalFirstIngressRead | None:
+        """Read the original cost fact, then Owner-authorized content once.
+
+        The binding/draft/anchor must come from the current W01 job read. An
+        uncertain terminal or Owner read remains HOLD. No model admission or
+        provider call occurs on this path.
+        """
+        if (type(intent) is not ModelEgressIntentV1
+                or type(owner_session_request) is not OwnerSessionLoginRequestV1
+                or type(owner_session_token) is not str or not owner_session_token):
+            return None
+        try:
+            request = self._frozen_encoding_request(binding, draft, expected_anchor)
+        except (KeyError, TypeError, ValueError):
+            return None
+        authority = request.envelope.authority
+        if (ModelEgressDraftV1.from_intent(intent) != draft
+                or intent.call_id != request.call_id
+                or intent.request_digest != request.digest
+                or intent.operation_id != request.identity.operation_id
+                or intent.source_refs != (binding.source_id,)
+                or intent.source_revisions != ((binding.source_id, binding.source_revision),)
+                or intent.access_revisions != ((binding.source_id, binding.access_revision),)
+                or len(authority.audience) != 1
+                or owner_session_request.authority_id != intent.authority_id
+                or owner_session_request.authority_namespace != intent.namespace
+                or owner_session_request.installation_id != self._grant.installation_id):
+            return None
+        try:
+            record, permit, admission, terminal = (
+                await self._authority.model_terminal_fact_v2(
+                    self._bundle, self._grant, intent=intent))
+        except Exception:
+            return None
+        if (record.intent != intent or record.state != "observed"
+                or terminal is None
+                or permit.operation != "model_egress"
+                or permit.operation_id != intent.operation_id
+                or (admission.authority_id, admission.namespace,
+                    admission.operation_id, admission.call_id,
+                    admission.request_digest, admission.installation_id) !=
+                   (intent.authority_id, intent.namespace, intent.operation_id,
+                    intent.call_id, intent.request_digest,
+                    self._grant.installation_id)
+                or (terminal.admission_id, terminal.call_id,
+                    terminal.request_digest, terminal.installation_id,
+                    terminal.observation_digest) !=
+                   (admission.admission_id, intent.call_id,
+                    intent.request_digest, self._grant.installation_id,
+                    record.observation_digest)):
+            return None
+        operation_key = hashlib.sha256((
+            intent.operation_id + ":" + intent.call_id + ":"
+            + owner_actor_id + ":" + owner_session_request.credential_id
+            + ":" + owner_session_token
+        ).encode("utf-8")).hexdigest()
+        try:
+            read_request = ModelResultReadRequestV1(
+                intent.authority_id, intent.namespace, binding.namespace,
+                self._grant.installation_id, owner_actor_id, owner_session_request,
+                "workbench_view", authority.purpose, tuple(authority.audience),
+                intent.call_id, "first-ingress-result-read:" + operation_key)
+        except (TypeError, ValueError):
+            return None
+        try:
+            read = await self._authority.model_result_read_v1(
+                self._bundle, self._grant, read_request=read_request,
+                owner_session_token=owner_session_token)
+        except Exception:
+            # A lost read reply cannot be treated as content proof. Closing
+            # its original fence is safe and never calls the model again.
+            try:
+                await self._authority.model_result_read_recover_finish_v1(
+                    self._bundle, self._grant, read_request=read_request)
+            except Exception:
+                pass
+            return None
+        observation = read.observation
+        if (read.call_id != intent.call_id
+                or read.terminal_receipt != terminal
+                or record.usage != observation.usage
+                or record.cost != observation.cost
+                or (observation.authority_id, observation.namespace,
+                    observation.subject, observation.operation_id,
+                    observation.call_id, observation.request_digest) !=
+                   (intent.authority_id, intent.namespace, intent.subject,
+                    intent.operation_id, intent.call_id, intent.request_digest)):
+            return None
+        return OriginalFirstIngressRead(
+            intent, record, permit, admission, terminal, read_request, read)
 
     async def execute_once(
         self, *, intent: ModelEgressIntentV1, expected_anchor: RestoreAnchor,

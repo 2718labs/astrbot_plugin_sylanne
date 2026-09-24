@@ -9,8 +9,11 @@ from rewrite.host_tests.alpha1.test_first_ingress_encoding_egress import frozen_
 from rewrite.host_tests.alpha1.test_host_model_egress_executor import fixture_values
 from sylanne3.host.ingress import HostIngressEnvelope, IngressReceipt, SourceLineage
 from sylanne3.host.model_egress_executor import HostModelEgressExecutor
+from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
+from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.runtime.first_ingress_v2 import ingress_ids
 from sylanne3.runtime_context import RuntimeContext
+from sylanne3.runtime_contracts import AuthorityContext
 
 
 class Worker:
@@ -21,6 +24,58 @@ class Worker:
     async def call(self, fn, *args):
         self.calls += 1
         return fn(self.graph, *args)
+
+
+@pytest.mark.asyncio
+async def test_owner_result_reads_current_job_before_authority_query(tmp_path):
+    host = model_fixture.AstrBotModelCallTests(
+        methodName="test_one_http_request_on_host_loop_with_usage")
+    await host.asyncSetUp()
+    try:
+        bundle, adapter, _ = host.v2_adapters()
+        binding, draft, anchor, request = frozen_case(host, bundle)
+        intent, _, _, _, grant, client = fixture_values(host, request)
+        executor = HostModelEgressExecutor(
+            authority=client, bundle=bundle, grant=grant, adapter=adapter)
+        order = []
+
+        class Graph:
+            def read_first_ingress_model_egress_preparation_v2(
+                self, auth, lease, job, acquire,
+            ):
+                order.append("graph")
+                assert job == binding.job_id and acquire == "acquire-1"
+                return binding, draft, anchor
+
+        async def read_owner(self, **kwargs):
+            order.append("authority")
+            assert kwargs["binding"] is binding
+            assert kwargs["owner_session_token"] == "current-owner-token"
+            return "held-read"
+
+        executor.read_original_for_owner = MethodType(read_owner, executor)
+        runtime = RuntimeContext(tmp_path, dependencies=None)
+        runtime._worker = Worker(Graph())
+        runtime._v2_policy = bundle.installation_policy
+        runtime._v2_installation_grant = grant
+        runtime._v2_model_bundle = bundle
+        runtime._v2_namespace = bundle.installation_policy.namespace
+        runtime._v2_namespace_provisioned = True
+        auth = AuthorityContext(
+            "worker", "d11", "capability", bundle.installation_policy.namespace,
+            ("activity",), "consolidation", ("owner",), "policy", 1, 1)
+        session = OwnerSessionLoginRequestV1(
+            "authority", draft.namespace, grant.installation_id,
+            OwnerPrincipalV1("provider", "account", "incarnation"),
+            "credential", 1, "owner", "https://dashboard.example")
+        assert await runtime.read_first_ingress_encoding_for_owner_v2(
+            auth, object(), binding.job_id, "acquire-1", intent=intent,
+            owner_actor_id="owner-actor", owner_session_request=session,
+            owner_session_token="current-owner-token", executor=executor,
+        ) == "held-read"
+        assert order == ["graph", "authority"]
+    finally:
+        await host.asyncTearDown()
 
 
 @pytest.mark.asyncio
