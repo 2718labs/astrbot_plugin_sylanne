@@ -799,6 +799,20 @@ class CoordinatorTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM runtime_jobs").fetchone()[0], 0)
             self.assertEqual(get_budget_lease(db, "parent").reserved, {})
 
+    def test_schedule_requires_current_namespace_query(self):
+        candidate = self.bundle(operation="schedule-query-guard", outbox=True)
+        guard = candidate.envelope.version_guard
+        for queries in ((), (replace(guard.query_epochs[0],
+                                    revision=guard.query_epochs[0].revision + 1),)):
+            with self.subTest(queries=queries):
+                envelope = replace(candidate.envelope, version_guard=replace(
+                    guard, query_epochs=queries))
+                with self.assertRaises((UnavailableGuard, StaleRead)):
+                    self.coordinator.reserve_and_schedule(envelope, self.lease)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM runtime_jobs").fetchone()[0], 0)
+            self.assertEqual(get_budget_lease(db, "parent").reserved, {})
+
     def test_schedule_job_insert_failure_rolls_back_budget_reservation(self):
         candidate = self.bundle(operation="schedule-fault", outbox=True)
         self.d11_issuer.schedule_graph_job_ref = candidate.persistent_job_refs[0]

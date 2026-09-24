@@ -5784,7 +5784,8 @@ class GraphCoordinator:
                                           envelope.version_guard.read_versions))
                 store._db.execute("BEGIN IMMEDIATE")
                 try:
-                    self._check_guard(store._db, SimpleNamespace(envelope=envelope))
+                    self._check_guard(store._db, SimpleNamespace(
+                        envelope=envelope, proposals=()))
                     if self.__d02_issuer.authorize_schedule(envelope, store._db) is not True:
                         raise AuthorityDenied("D02 did not authorize scheduling resources")
                     admission = self.__d11_issuer.admit_schedule(envelope, store._db)
