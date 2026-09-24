@@ -1,6 +1,7 @@
 """Admin model selection is parsed exactly and checked against the installed host."""
 
 import asyncio
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,7 +9,8 @@ from unittest.mock import patch
 import pytest
 
 from sylanne3.host.authority_profile import (
-    AdminIngressModelPolicy, installed_model_config_ref, _ingress_model_from_payload,
+    AdminIngressModelPolicy, AdminIngressEncodingPolicy, AdminInstallationBundle,
+    installed_model_config_ref, _ingress_model_from_payload,
     _policy_from_payload, _read_profile_json,
 )
 from sylanne3.runtime_contracts import NamespaceId, canonical_digest
@@ -56,6 +58,44 @@ def test_invalid_admin_model_selection_fails_profile_parse(change):
         _policy_from_payload(payload)
 
 
+def test_model_output_budget_requires_same_dimension_in_quote_lease_and_grant():
+    payload = _schema2_payload()
+    payload["ingress_model"] = _selection() | {"max_output_tokens": 64}
+    payload["ingress_encoding"] = {
+        "deadline_after_seconds": 5, "quote_ceiling": {"output_tokens": 64},
+        "snapshot_ref": "snapshot", "resource_ref": "resource",
+        "character_interval_ref": "interval",
+    }
+    for missing in ("quote", "lease", "grant"):
+        changed = json.loads(json.dumps(payload))
+        if missing == "quote":
+            changed["ingress_encoding"]["quote_ceiling"]["output_tokens"] = 63
+        elif missing == "lease":
+            changed["installation_policy"]["root_lease"]["limits"] = {"tokens": 1000}
+        else:
+            changed["installation_policy"]["root_grant"]["max_ceiling"] = {"tokens": 100}
+        with pytest.raises(ValueError, match="output_tokens"):
+            _policy_from_payload(changed)
+
+
+def test_explicit_admin_scope_is_required_and_validated():
+    payload = _schema2_payload()
+    payload["ingress_model"] = _selection() | {
+        "allowed_purposes": ["proposal"],
+        "allowed_audiences": ["owner"],
+        "allowed_privacy_tiers": ["private"],
+    }
+    selection = _ingress_model_from_payload(payload)
+    assert selection.allowed_purposes == ("proposal",)
+    assert selection.allowed_audiences == ("owner",)
+    assert selection.allowed_privacy_tiers == ("private",)
+    for field in ("allowed_purposes", "allowed_audiences", "allowed_privacy_tiers"):
+        changed = json.loads(json.dumps(payload))
+        changed["ingress_model"][field] = []
+        with pytest.raises(ValueError):
+            _policy_from_payload(changed)
+
+
 @pytest.mark.asyncio
 async def test_admin_selection_checks_exact_current_provider_and_config():
     pytest.importorskip("astrbot")
@@ -92,7 +132,7 @@ async def test_admin_selection_checks_exact_current_provider_and_config():
     )
     context = Context(asyncio.Queue(), {}, None, manager, None, None,
                       None, None, None, None, None)
-    namespace = NamespaceId("bot", "persona")
+    namespace = NamespaceId("bot-a", "persona-a")
     port = InstalledModelCapabilityPort(
         context=context, host_loop=asyncio.get_running_loop(),
         installed_namespace=namespace,
@@ -108,9 +148,38 @@ async def test_admin_selection_checks_exact_current_provider_and_config():
                                        namespace, selection)
         assert not await asyncio.to_thread(port.verify_admin_selection,
                                            namespace, selection)
+        payload = _schema2_payload()
+        payload["installation_policy"]["root_lease"]["limits"]["output_tokens"] = 256
+        payload["installation_policy"]["root_grant"]["max_ceiling"]["output_tokens"] = 128
+        policy = _policy_from_payload(payload)
+        encoding = AdminIngressEncodingPolicy(
+            5, {"output_tokens": 128}, "snapshot", "resource", "interval")
+        authorized = replace(
+            selection, required_capabilities=("text",),
+            allowed_purposes=("proposal",), allowed_audiences=("owner",),
+            allowed_privacy_tiers=("private",),
+        )
+        bundle = AdminInstallationBundle(
+            SimpleNamespace(), policy, b"k" * 32, b"d" * 32,
+            ingress_encoding=encoding, ingress_model=authorized,
+        )
+        eligible = InstalledModelCapabilityPort(
+            context=context, host_loop=asyncio.get_running_loop(),
+            installed_namespace=namespace, installation_bundle=bundle,
+        )
+        assert await asyncio.to_thread(eligible.verify_admin_selection,
+                                       namespace, authorized)
+        assert not await asyncio.to_thread(
+            eligible.verify_admin_selection, namespace,
+            replace(authorized, required_capabilities=("structured",)))
+        assert not await asyncio.to_thread(
+            eligible.verify_admin_selection, namespace,
+            replace(authorized, privacy_tier="secret"))
         provider.provider_config["temperature"] = 0.5
         assert not await asyncio.to_thread(port.verify_admin_config,
                                            namespace, selection)
+        assert not await asyncio.to_thread(eligible.verify_admin_selection,
+                                           namespace, authorized)
         provider.provider_config.pop("temperature")
         provider.model_name = "model-2"
         assert not await asyncio.to_thread(port.verify_admin_config,

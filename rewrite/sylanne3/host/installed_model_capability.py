@@ -14,7 +14,11 @@ from astrbot.core.provider.provider import Provider
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
-from .authority_profile import AdminIngressModelPolicy, installed_model_config_ref
+from .authority_profile import (
+    AdminIngressEncodingPolicy, AdminIngressModelPolicy,
+    AdminInstallationBundle, installed_model_config_ref,
+)
+from ..installation_policy import AdminInstallationPolicy
 from ..runtime_contracts import NamespaceId, canonical_digest
 from ..workbench_api.d01_onboarding import VerifiedModelCapability
 
@@ -37,6 +41,7 @@ class InstalledModelCapabilityPort:
 
     def __init__(self, *, context: Context, host_loop: asyncio.AbstractEventLoop,
                  installed_namespace: NamespaceId,
+                 installation_bundle: AdminInstallationBundle | None = None,
                  timeout_seconds: float = 2.0) -> None:
         if (not isinstance(context, Context)
                 or not isinstance(host_loop, asyncio.AbstractEventLoop)
@@ -46,6 +51,7 @@ class InstalledModelCapabilityPort:
         self._context = context
         self._host_loop = host_loop
         self._installed_namespace = installed_namespace
+        self._installation_bundle = installation_bundle
         self._timeout_seconds = timeout_seconds
 
     async def _verify_on_host_loop(
@@ -188,8 +194,38 @@ class InstalledModelCapabilityPort:
     def verify_admin_selection(
         self, namespace: NamespaceId, selection: AdminIngressModelPolicy,
     ) -> bool:
-        """Full selection remains HOLD without host capability/privacy/limit proof."""
-        return False
+        """Check installed selection eligibility; each request still needs scope checks.
+
+        This does not inspect a ModelCallRequest or authorize model egress.
+        A caller must compare its actual purpose and audience with the explicit
+        administrator scope before dispatch under the Authority fence.
+        """
+        bundle = self._installation_bundle
+        policy = (bundle.installation_policy
+                  if type(bundle) is AdminInstallationBundle else None)
+        encoding = (bundle.ingress_encoding
+                    if type(bundle) is AdminInstallationBundle else None)
+        if (type(namespace) is not NamespaceId
+                or namespace != self._installed_namespace
+                or type(selection) is not AdminIngressModelPolicy
+                or type(bundle) is not AdminInstallationBundle
+                or selection is not bundle.ingress_model
+                or type(policy) is not AdminInstallationPolicy
+                or policy.namespace != namespace
+                or type(encoding) is not AdminIngressEncodingPolicy
+                or not selection.allowed_purposes
+                or not selection.allowed_audiences
+                or selection.privacy_tier not in selection.allowed_privacy_tiers
+                or not set(selection.required_capabilities) <= {"text"}
+                or "proposal" not in selection.allowed_purposes
+                or "reply" not in policy.root_grant.allowed_work_kinds):
+            return False
+        output = selection.max_output_tokens
+        if (encoding.quote_ceiling.get("output_tokens", 0) < output
+                or policy.root_lease.limits.get("output_tokens", 0) < output
+                or policy.root_grant.max_ceiling.get("output_tokens", 0) < output):
+            return False
+        return self.verify_admin_config(namespace, selection)
 
 
 __all__ = ("InstalledModelCapabilityPort", "model_capability_ref")

@@ -48,6 +48,9 @@ _INGRESS_MODEL_FIELDS = frozenset({
     "provider_id", "model_id", "provider_config_ref", "provider_config_digest",
     "timeout_seconds", "max_output_tokens", "required_capabilities", "privacy_tier",
 })
+_INGRESS_MODEL_SCOPE_FIELDS = frozenset({
+    "allowed_purposes", "allowed_audiences", "allowed_privacy_tiers",
+})
 _RESOURCE_DIMENSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
 _INSTALLATION_FIELDS = frozenset({
     "namespace", "authority_namespace", "installation_id", "manifest_digest",
@@ -173,6 +176,9 @@ class AdminIngressModelPolicy:
     max_output_tokens: int
     required_capabilities: tuple[str, ...]
     privacy_tier: str
+    allowed_purposes: tuple[str, ...] = ()
+    allowed_audiences: tuple[str, ...] = ()
+    allowed_privacy_tiers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("provider_id", "model_id", "privacy_tier"):
@@ -203,6 +209,16 @@ class AdminIngressModelPolicy:
                        for item in capabilities)
                 or len(set(capabilities)) != len(capabilities)):
             raise ValueError("ingress model capabilities must be unique bounded strings")
+        scopes = (self.allowed_purposes, self.allowed_audiences,
+                  self.allowed_privacy_tiers)
+        if any(scopes) and not all(scopes):
+            raise ValueError("ingress model egress scope must be complete")
+        for scope in scopes:
+            if (type(scope) is not tuple or len(scope) > 16
+                    or any(type(item) is not str or not item.strip()
+                           or len(item) > 128 for item in scope)
+                    or len(set(scope)) != len(scope)):
+                raise ValueError("ingress model egress scope is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,12 +640,20 @@ def _ingress_model_from_payload(payload: dict[str, object]) -> AdminIngressModel
         return None
     if type(payload.get("schema")) is not int or payload["schema"] != 2:
         raise ValueError("ingress model requires profile schema 2")
-    values = _exact_object(payload["ingress_model"], _INGRESS_MODEL_FIELDS,
-                           "ingress model")
+    raw = payload["ingress_model"]
+    if type(raw) is not dict or set(raw) not in (
+            _INGRESS_MODEL_FIELDS,
+            _INGRESS_MODEL_FIELDS | _INGRESS_MODEL_SCOPE_FIELDS):
+        raise ValueError("ingress model schema is invalid")
+    values = raw
     if type(values["required_capabilities"]) is not list:
         raise ValueError("ingress model capabilities must be an array")
+    for field in _INGRESS_MODEL_SCOPE_FIELDS & set(values):
+        if type(values[field]) is not list or not values[field]:
+            raise ValueError("ingress model egress scope must be a nonempty array")
     return AdminIngressModelPolicy(**{
         **values, "required_capabilities": tuple(values["required_capabilities"]),
+        **{field: tuple(values[field]) for field in _INGRESS_MODEL_SCOPE_FIELDS & set(values)},
     })
 
 
@@ -641,8 +665,8 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
             or not _valid_schema2_fields(payload)):
         raise ValueError("administrator installation policy requires profile schema 2")
     _ingress_clock_from_payload(payload)
-    _ingress_encoding_from_payload(payload)
-    _ingress_model_from_payload(payload)
+    encoding = _ingress_encoding_from_payload(payload)
+    model = _ingress_model_from_payload(payload)
     _workbench_origin_from_payload(payload)
     values = _exact_object(payload["installation_policy"], _INSTALLATION_FIELDS,
                            "installation policy")
@@ -660,7 +684,7 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
         raise ValueError("root lease requires explicit positive limits")
     if type(grant["allowed_work_kinds"]) is not list:
         raise ValueError("root grant work kinds must be a list")
-    return AdminInstallationPolicy(
+    policy = AdminInstallationPolicy(
         namespace=NamespaceId(**namespace),
         authority_namespace=values["authority_namespace"],
         installation_id=values["installation_id"],
@@ -676,6 +700,13 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
             **grant, "allowed_work_kinds": tuple(grant["allowed_work_kinds"]),
         }),
     )
+    if model is not None and encoding is not None:
+        output = model.max_output_tokens
+        if (encoding.quote_ceiling.get("output_tokens", 0) < output
+                or policy.root_lease.limits.get("output_tokens", 0) < output
+                or policy.root_grant.max_ceiling.get("output_tokens", 0) < output):
+            raise ValueError("ingress output_tokens exceeds quote or root budget")
+    return policy
 
 
 def _load_profile_from_root(profile_id: str, profile_root: Path,
