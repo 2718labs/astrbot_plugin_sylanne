@@ -20,6 +20,7 @@ from .v2_clock import AuthorityClockReadingV2
 from .v2_contract import FencePermitV2
 from .v2_fence_service import AuthorityV2FenceService
 from .v2_fence_store import AuthorityV2FenceStore
+from .v2_model_egress_service import AuthorityV2ModelEgressService
 from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 from .v2_owner_proof import AuthorityV2OwnerProofStore, OwnerProofAcceptanceV1
@@ -38,6 +39,7 @@ def compose_local_owner_authority(
     publisher_manifest_verifier: Callable[[str, str, str, str], bool],
     installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2],
     namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
+    v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
     owner_proofs: AuthorityV2OwnerProofStore | None = None,
@@ -141,7 +143,8 @@ def compose_local_owner_authority(
         create=create_owner_schema,
     )
     return AuthorityRpcServer(
-        core, v2_fences=services, v2_owner_tickets=owner_tickets,
+        core, v2_fences=services, v2_model_egress=v2_model_egress,
+        v2_owner_tickets=owner_tickets,
         v2_owner_proofs=owner_proofs,
         v2_owner_sessions=owner_sessions,
         v2_owner_pairings=creation_pairing_source,
