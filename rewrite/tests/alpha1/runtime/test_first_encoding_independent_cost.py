@@ -2,6 +2,7 @@
 
 import sqlite3
 import unittest
+from dataclasses import replace
 
 from sylanne3.authority_service.v2_model_egress_contract import (
     ModelAdmissionV2, ModelEgressIntentV1, ModelEgressRecoveryV1,
@@ -11,15 +12,18 @@ from sylanne3.runtime.budget import (
     BudgetLease, create_budget_lease, get_budget_lease, install_schema,
     reserve_budget, resolve_unconfirmed, settle_budget,
 )
-from sylanne3.runtime.d11_types import cost_settlement_from_runtime
+from sylanne3.runtime.d11_types import cost_settlement_from_runtime, runtime_job_key
 from sylanne3.runtime.model_cost_settlement import (
     ModelCostUnavailable, OriginalModelCostFactV1,
+    apply_original_model_budget_in_transaction,
     original_model_budget_actual, outcome_from_original_model_cost,
+    prepare_original_model_cost_plan,
 )
 from sylanne3.runtime.issuers import (
     D02ResourceIssuer, IssuerAuthorityDenied, ResourceQuote,
     install_schema as install_issuer_schema,
 )
+from sylanne3.runtime_contracts import NamespaceId
 
 
 class IndependentCostTests(unittest.TestCase):
@@ -136,7 +140,6 @@ class IndependentCostTests(unittest.TestCase):
         fact = self.original_fact(
             usage={"input_tokens": 40, "output_tokens": 72},
         )
-        from dataclasses import replace
         intent = replace(fact.intent, budget_ceiling=(("output_tokens", 80),))
         fact = OriginalModelCostFactV1(
             intent, replace(fact.recovery, intent=intent),
@@ -180,6 +183,64 @@ class IndependentCostTests(unittest.TestCase):
         )
         with self.assertRaises(IssuerAuthorityDenied):
             issuer._load_quote(self.db, quote.quote_id, quote.version)
+
+    def test_plan_joins_original_authority_quote_and_reservation(self):
+        issuer = D02ResourceIssuer(b"k" * 32)
+        namespace = NamespaceId("bot", "persona")
+        quote = replace(
+            self.quote(),
+            graph_job_ref=runtime_job_key(
+                "bot", "persona", "activity", "job").token,
+        )
+        issuer.issue_quote(self.db, quote)
+        self.db.execute(
+            "CREATE TABLE graph_bundle_operations("
+            "bot TEXT,persona TEXT,operation_id TEXT,activity_id TEXT)")
+        self.db.execute(
+            "INSERT INTO graph_bundle_operations VALUES(?,?,?,?)",
+            ("bot", "persona", "original", "activity"),
+        )
+        self.db.execute(
+            "UPDATE runtime_resource_quotes SET status='revoked' "
+            "WHERE quote_id=? AND version=?", (quote.quote_id, quote.version),
+        )
+        fact = self.original_fact(
+            usage={"input_tokens": 80, "output_tokens": 40},
+            cost={"model_microusd": 90},
+        )
+        plan = prepare_original_model_cost_plan(
+            self.db, issuer, namespace, fact,
+            quote_id=quote.quote_id, quote_version=quote.version,
+        )
+        self.assertEqual(plan.schema, "sylanne.d11.original-model-cost-plan.v1")
+        self.assertEqual(plan.predicted_budget.receipt.status, "overrun")
+        self.assertEqual(plan.outcome.actual,
+                         {"model_tokens": 120, "model_microusd": 90})
+        self.assertEqual(get_budget_lease(self.db, "lease").reserved, self.ceiling)
+        self.db.commit()
+        self.db.execute("BEGIN IMMEDIATE")
+        application = apply_original_model_budget_in_transaction(
+            self.db, issuer, plan, fact)
+        self.assertEqual(application.receipt.status, "overrun")
+        self.assertEqual(application.cost_write.key.type_name,
+                         "runtime.cost_settlement")
+        self.assertEqual(application.cost_write.value["actual"],
+                         {"model_tokens": 120, "model_microusd": 90})
+        self.db.execute("ROLLBACK")
+        self.assertEqual(get_budget_lease(self.db, "lease").reserved, self.ceiling)
+        missing_price = self.original_fact(
+            usage={"input_tokens": 80, "output_tokens": 40})
+        unknown_plan = prepare_original_model_cost_plan(
+            self.db, issuer, namespace, missing_price,
+            quote_id=quote.quote_id, quote_version=quote.version,
+        )
+        self.db.execute("BEGIN IMMEDIATE")
+        unknown = apply_original_model_budget_in_transaction(
+            self.db, issuer, unknown_plan, missing_price)
+        self.assertEqual(unknown.receipt.status, "pending_confirmation")
+        self.assertEqual(get_budget_lease(self.db, "lease").unconfirmed,
+                         self.ceiling)
+        self.db.execute("ROLLBACK")
 
 
 if __name__ == "__main__":

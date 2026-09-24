@@ -640,7 +640,7 @@ class GraphCoordinator:
                  owner_principal_resolver=None,
                  dispatch_admission_issuer=None, dispatch_clock_policy=None,
                  scene_identity_port=None, scene_clock_policy=None,
-                 encoding_request_issuer=None):
+                 encoding_request_issuer=None, model_terminal_cost_port=None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -673,6 +673,9 @@ class GraphCoordinator:
         if encoding_request_issuer is not None and not callable(encoding_request_issuer):
             raise TypeError("encoding_request_issuer must be callable")
         self.__encoding_request_issuer = encoding_request_issuer
+        if model_terminal_cost_port is not None and not callable(model_terminal_cost_port):
+            raise TypeError("model_terminal_cost_port must be callable")
+        self.__model_terminal_cost_port = model_terminal_cost_port
         # Installed by trusted host composition only.  A missing issuer leaves
         # D08/D09 candidates in HOLD; caller receipt strings are never enough.
         self.__dispatch_admission_issuer = dispatch_admission_issuer
@@ -6143,6 +6146,65 @@ class GraphCoordinator:
             return binding
 
         return self._read_v2(authority, reader)
+
+    def prepare_first_ingress_model_cost_v1(
+        self, bootstrap: object, namespace: NamespaceId, original_intent,
+        *, quote_id: str, quote_version: int,
+    ):
+        """Read authenticated original cost and business bounds without writes.
+
+        The installation port makes its Authority mTLS call before a GraphStore
+        lock or transaction is acquired. The subsequent business read is v2
+        fenced. Its plan must be recomputed in a separate cost write transaction;
+        this method cannot settle a budget or release a reservation.
+        """
+        from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
+        from .runtime.model_cost_settlement import (
+            ModelCostUnavailable, prepare_original_model_cost_plan,
+            read_original_model_cost,
+        )
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId
+                or type(original_intent) is not ModelEgressIntentV1
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__model_terminal_cost_port is None
+                or self.__d02_issuer is None):
+            raise UnavailableGuard("installed v2 original cost authorities are required")
+        # The installed port owns the designated-observer credential. This is
+        # intentionally outside both the graph lock and the read fence.
+        try:
+            fact = read_original_model_cost(
+                self.__model_terminal_cost_port, original_intent)
+        except Exception as exc:
+            raise UnavailableGuard("original Authority terminal cost is unavailable; HOLD") from exc
+        with self.__store._lock:
+            metadata, _ = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        if (original_intent.authority_id != target.authority_id
+                or original_intent.namespace != target.authority_namespace):
+            raise UnavailableGuard("original model call belongs to another authority")
+        operation_id = "model-cost-read-" + canonical_digest({
+            "namespace": list(namespace.as_tuple),
+            "call_id": original_intent.call_id,
+        })[:48]
+        lease, capability = self.grant(
+            bootstrap, actor="host", issuer_domain="d11", namespace=namespace,
+            domains=("d11",), activation_generation=target.activation_generation,
+            operation_id=operation_id,
+        )
+        authority = AuthorityContext(
+            "host", "d11", capability, namespace, ("activity",), "audit",
+            ("internal",), "model-cost-accounting-v1", target.activation_generation,
+        )
+        self._authorize(lease, authority, frozenset({"d11"}), owner_read=True)
+        try:
+            return self._read_v2(authority, lambda: prepare_original_model_cost_plan(
+                self.__store._db, self.__d02_issuer, namespace, fact,
+                quote_id=quote_id, quote_version=quote_version))
+        except ModelCostUnavailable as exc:
+            raise UnavailableGuard(str(exc)) from exc
 
     def _qualified_first_ingress_acquire_return(
         self, namespace: NamespaceId, job_id: str, expected: PersistentJob,
