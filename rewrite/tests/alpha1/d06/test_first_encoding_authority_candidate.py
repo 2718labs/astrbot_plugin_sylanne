@@ -9,7 +9,11 @@ from sylanne3.authority_service.v2_model_egress_contract import (
     ModelEgressObservationV1, ModelTerminalReceiptV2,
 )
 from sylanne3.authority_service.v2_model_result_read_contract import ModelResultReadV1
+from sylanne3.authority_service.v2_worker_model_result_contract import (
+    WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
+)
 from sylanne3.model_broker.first_ingress_encoding import build_first_ingress_encoding_payload
+from sylanne3.runtime_contracts import NamespaceId
 
 
 def test_authority_result_boundary_rejects_changed_original_source():
@@ -72,4 +76,19 @@ def test_authority_result_boundary_rejects_changed_original_source():
         validate_first_encoding_authority_result(
             read, {**frozen_request, "call_id": "another-call"}, original,
             source_revision=1, access_revision=1,
+        )
+
+    worker_request = WorkerModelResultReadRequestV1(
+        "authority-1", "namespace-1", NamespaceId("bot", "persona"),
+        "installation-1", "job-1", "operation-1", "ingress-1", "call-1",
+        "b" * 64, "a" * 64, "consumer-1", "read-attempt-1",
+    )
+    worker_read = WorkerModelResultReadV1(worker_request, observation, terminal)
+    assert validate_first_encoding_authority_result(
+        worker_read, frozen_request, original, source_revision=1, access_revision=1,
+    ) == observation.result
+    with pytest.raises(ValueError, match="request digest"):
+        validate_first_encoding_authority_result(
+            worker_read, {**frozen_request, "model_request_digest": "f" * 64},
+            original, source_revision=1, access_revision=1,
         )

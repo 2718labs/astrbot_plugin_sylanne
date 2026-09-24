@@ -380,6 +380,142 @@ class EncodingWriteTests(unittest.TestCase):
                 envelope, held, read, audience="owner", purpose="context",
             )
 
+    def test_worker_original_result_prepares_and_compiles_only_held_c02(self):
+        import json
+        from sylanne3.authority_service.v2_model_egress_contract import (
+            ModelEgressObservationV1, ModelTerminalReceiptV2,
+        )
+        from sylanne3.authority_service.v2_worker_model_result_contract import (
+            WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
+        )
+        from sylanne3.model_broker.first_ingress_encoding import build_first_ingress_encoding_payload
+        from sylanne3.runtime.encoding_call_binding import EncodingCallBinding
+        from sylanne3.runtime_contracts import canonical_serialize, DomainProposal
+
+        original = SourceRecord(
+            "source-1", "A reported promise", "alice", "reported", "reported",
+            None, 2.0, "family-1", ("owner",), ("context", "consolidation"),
+        )
+        self.pipeline.repository.ingest(self.event("source"), original)
+        refs = (self.event_ref, self.perspective, self.feeling, self.interpretation)
+        self.store.graph_commit(GraphCandidate(
+            self.event("context"), tuple(GraphVersion(key, 0) for key in refs),
+            tuple(GraphWrite(key, {"committed": True}) for key in refs),
+        ))
+        self.store.graph_commit(GraphCandidate(
+            self.event("baseline"), (GraphVersion(self.baseline, 0),),
+            (GraphWrite(self.baseline, {
+                "baseline_id": "baseline-1", "source_refs": [self.source.token],
+                "perspective_ref": self.perspective.token,
+                "then_feeling_versions": [{"ref": self.feeling.token, "revision": 1}],
+                "interpretation_versions": [{"ref": self.interpretation.token, "revision": 1}],
+                "as_known_at": None, "projection_policy_ref": "policy-1",
+                "projection_policy_version": "v1", "basis_version": "scheme-1",
+                "parameter_version": "params-1", "salience_interval": None,
+                "tone_interval": None,
+                "unknown_reasons": ["salience_interval:unknown", "tone_interval:unknown"],
+            }),),
+        ))
+        context = EncodingContext(
+            self.event_ref.token, self.perspective.token, (self.feeling.token,),
+            (self.interpretation.token,), (),
+            tuple((key.token, 1) for key in
+                  (self.source, self.event_ref, self.perspective, self.feeling,
+                   self.interpretation, self.baseline)),
+        )
+        payload, template = build_first_ingress_encoding_payload(original)
+        frozen = {
+            "schema": "sylanne.first-ingress-encoding-call.v2",
+            "namespace": ["bot", "persona"], "job_id": "job-1",
+            "source_id": "source-1", "source_revision": 1, "access_revision": 1,
+            "budget_lease_id": "budget-1", "budget_reservation_operation_id": "ingress-1",
+            "call_id": "call-1", "envelope": {
+                "identity": {"operation_id": "acquire-1", "phase": "encode"},
+                "authority": {"worker_fence": 1, "purpose": "consolidation",
+                              "owner_scope": ["activity"], "actor": "worker-1",
+                              "audience": ["owner"]},
+                "character_interval_ref": "interval-1", "monotonic_deadline": 10.0,
+            },
+            "provider_id": "provider-1", "model_id": "model-1",
+            "required_capabilities": [], "privacy_tier": "private",
+            "prompt_template_digest": template, "payload": payload,
+            "timeout_seconds": 10.0, "max_output_tokens": 100,
+            "acquire_operation_id": "acquire-1", "original_operation_id": "ingress-1",
+            "work_kind": "d06.encode_source", "worker_fence": 1,
+            "worker_lease_expires_utc": "2100-01-01T00:00:00Z", "clock_epoch": "clock-1",
+        }
+        frozen["model_request_digest"] = canonical_digest({
+            "envelope": frozen["envelope"], "call_id": "call-1",
+            "provider_id": "provider-1", "model_id": "model-1",
+            "purpose": "consolidation", "required_capabilities": [],
+            "privacy_tier": "private", "template": template, "payload": payload,
+            "timeout_seconds": 10.0, "max_output_tokens": 100,
+        })
+        binding = EncodingCallBinding(
+            self.namespace, "job-1", "source-1", 1, 1, "budget-1", "ingress-1",
+            canonical_digest(frozen), frozen["model_request_digest"], "call-1",
+            canonical_serialize(frozen),
+        )
+        request = WorkerModelResultReadRequestV1(
+            "authority-1", "namespace-1", self.namespace, "installation-1",
+            "job-1", "acquire-1", "ingress-1", "call-1",
+            binding.binding_digest, binding.model_request_digest,
+            "operation-1", "read-1",
+        )
+        result = {"text": json.dumps({
+            "event_summary": "A promise was reported",
+            "quoted_details": [{"quote": "promise", "salience": 0.8}],
+            "possible_meanings": ["trust"], "possible_feelings": ["relief"],
+        })}
+        observation = ModelEgressObservationV1(
+            "authority-1", "namespace-1", "worker-1", "acquire-1", "call-1",
+            binding.model_request_digest, "completed",
+            canonical_serialize(result), (), (), None,
+        )
+        terminal = ModelTerminalReceiptV2(
+            "b" * 64, "call-1", binding.model_request_digest, "c" * 64,
+            observation.digest, "sha256:" + "d" * 64, "installation-1", "e" * 64,
+        )
+        read = WorkerModelResultReadV1(request, observation, terminal)
+        held = self.pipeline.prepare_worker_first_ingress_encoding(
+            read, binding, original, context,
+            encoding_baseline_ref=self.baseline.token,
+            audience="owner", purpose="consolidation",
+        )
+        self.assertEqual(held.status, "candidate_hold")
+        self.assertEqual(held.consumer_operation_id, "operation-1")
+        envelope = self.envelope(held.prepared, baseline=True)
+        envelope = replace(envelope, authority=replace(
+            envelope.authority, purpose="consolidation"))
+        compiled = self.pipeline.compile_first_ingress_c02_v2(
+            envelope, held, read, audience="owner", purpose="consolidation",
+        )
+        self.assertNotIsInstance(compiled, DomainProposal)
+        self.assertEqual(compiled.status, "candidate_hold")
+        self.assertNotIn("possible_feelings", compiled.proposal.typed_writes[1].value)
+        with self.assertRaisesRegex(ValueError, "consumer operation"):
+            self.pipeline.compile_first_ingress_c02_v2(
+                replace(envelope, identity=replace(
+                    envelope.identity, operation_id="other-operation")),
+                held, read, audience="owner", purpose="consolidation",
+            )
+        with self.assertRaisesRegex(ValueError, "worker original result"):
+            self.pipeline.prepare_worker_first_ingress_encoding(
+                replace(read, request=replace(request, binding_digest="f" * 64)),
+                binding, original, context,
+                encoding_baseline_ref=self.baseline.token,
+                audience="owner", purpose="consolidation",
+            )
+        self.pipeline.repository.set_access(
+            self.event("withdraw"), "source-1", audiences=("owner",),
+            purposes=("context", "consolidation"), status="withdrawn",
+            recorded_at=3.0,
+        )
+        with self.assertRaisesRegex(PermissionError, "unavailable"):
+            self.pipeline.compile_first_ingress_c02_v2(
+                envelope, held, read, audience="owner", purpose="consolidation",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

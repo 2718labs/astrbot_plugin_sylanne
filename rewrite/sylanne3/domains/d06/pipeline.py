@@ -24,6 +24,7 @@ from ...model_broker.first_ingress_encoding import parse_first_ingress_encoding_
 from ...model_broker.first_ingress_encoding import build_first_ingress_encoding_payload
 from ...authority_service.v2_model_result_read_contract import ModelResultReadV1
 from ...authority_service.v2_model_result_read_contract import ModelResultReadRequestV1
+from ...authority_service.v2_worker_model_result_contract import WorkerModelResultReadV1
 from ...memory_types import SourceRecord
 from ...runtime.encoding_call_binding import EncodingCallBinding, binding_to_json
 from ..d04.encoding_baseline import EncodingBaseline
@@ -114,6 +115,7 @@ class PreparedFirstIngressEncoding:
     status: str = "candidate_hold"
     authority_observation_digest: str | None = None
     authority_operation_id: str | None = None
+    consumer_operation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,7 +136,8 @@ class HeldFirstIngressC02:
 
 
 def validate_first_encoding_authority_result(
-    read: ModelResultReadV1, frozen_request: Mapping[str, object],
+    read: ModelResultReadV1 | WorkerModelResultReadV1,
+    frozen_request: Mapping[str, object],
     original_source: SourceRecord, *, source_revision: int, access_revision: int,
 ) -> Mapping[str, object]:
     """Bind original Authority result bytes to the frozen first-ingress input.
@@ -143,7 +146,7 @@ def validate_first_encoding_authority_result(
     authorization token. The caller must obtain ``read`` from the Authority
     service and the final adopter must repeat its source/job/fence checks.
     """
-    if type(read) is not ModelResultReadV1 or type(original_source) is not SourceRecord:
+    if type(read) not in {ModelResultReadV1, WorkerModelResultReadV1} or type(original_source) is not SourceRecord:
         raise TypeError("typed Authority read and original source are required")
     if type(frozen_request) is not dict:
         raise TypeError("frozen encoding request must be an object")
@@ -164,7 +167,8 @@ def validate_first_encoding_authority_result(
             or frozen_request.get("access_revision") != access_revision):
         raise ValueError("current source and access revisions differ")
     observation = read.observation
-    if read.call_id != frozen_request.get("call_id"):
+    call_id = read.call_id if type(read) is ModelResultReadV1 else read.request.call_id
+    if call_id != frozen_request.get("call_id"):
         raise ValueError("original call identity differs")
     if observation.request_digest != frozen_request.get("model_request_digest"):
         raise ValueError("original request digest differs")
@@ -584,14 +588,62 @@ class D06MemoryPipeline:
                 or type(binding) is not EncodingCallBinding
                 or type(original_source) is not SourceRecord):
             raise TypeError("typed original Authority read, binding and source required")
-        binding_to_json(binding)  # Checks the frozen request's internal digest.
         if (read_request.namespace != self.adapter.namespace
                 or binding.namespace != self.adapter.namespace
                 or read_request.call_id != read.call_id
                 or read_request.source_purpose != purpose
                 or read_request.audience != (audience,)
-                or binding.source_id != original_source.source_id):
+                or read.observation.authority_id != read_request.authority_id
+                or read.observation.namespace != read_request.authority_namespace):
             raise ValueError("Authority read, binding or source scope differs")
+        return self._prepare_bound_first_ingress_result(
+            read, binding, original_source, context,
+            encoding_baseline_ref=encoding_baseline_ref,
+            audience=audience, purpose=purpose,
+        )
+
+    def prepare_worker_first_ingress_encoding(
+        self, read: WorkerModelResultReadV1, binding: EncodingCallBinding,
+        original_source: SourceRecord, context: EncodingContext, *,
+        encoding_baseline_ref: str, audience: str, purpose: str,
+    ) -> PreparedFirstIngressEncoding:
+        """Prepare a worker's original completed result as held D06 material."""
+        if (type(read) is not WorkerModelResultReadV1
+                or type(binding) is not EncodingCallBinding
+                or type(original_source) is not SourceRecord):
+            raise TypeError("typed worker result, binding and source required")
+        request = read.request
+        frozen = binding.request
+        frozen_authority = frozen.get("envelope", {}).get("authority", {})
+        if (request.namespace != self.adapter.namespace
+                or binding.namespace != self.adapter.namespace
+                or request.job_id != binding.job_id
+                or request.original_operation_id != binding.budget_reservation_operation_id
+                or request.acquire_operation_id != frozen.get("acquire_operation_id")
+                or request.call_id != binding.call_id
+                or request.binding_digest != binding.binding_digest
+                or request.model_request_digest != binding.model_request_digest
+                or read.observation.operation_id != request.acquire_operation_id
+                or read.observation.subject != frozen_authority.get("actor")
+                or frozen_authority.get("audience") != [audience]
+                or frozen_authority.get("purpose") != purpose):
+            raise ValueError("worker original result and frozen encoding scope differ")
+        return self._prepare_bound_first_ingress_result(
+            read, binding, original_source, context,
+            encoding_baseline_ref=encoding_baseline_ref,
+            audience=audience, purpose=purpose,
+            consumer_operation_id=request.consumer_operation_id,
+        )
+
+    def _prepare_bound_first_ingress_result(
+        self, read: ModelResultReadV1 | WorkerModelResultReadV1,
+        binding: EncodingCallBinding, original_source: SourceRecord,
+        context: EncodingContext, *, encoding_baseline_ref: str,
+        audience: str, purpose: str, consumer_operation_id: str | None = None,
+    ) -> PreparedFirstIngressEncoding:
+        binding_to_json(binding)  # Checks the frozen request's internal digest.
+        if binding.source_id != original_source.source_id:
+            raise ValueError("original source differs from encoding binding")
         source, proof = self.repository.read_source_evidence(
             original_source.source_id, audience=audience, purpose=purpose,
         )
@@ -606,17 +658,17 @@ class D06MemoryPipeline:
             source_revision=versions.get(source_key(*namespace, source.source_id), 0),
             access_revision=versions.get(access_key(*namespace, source.source_id), 0),
         )
-        if (binding.call_id != read.call_id
+        call_id = read.call_id if type(read) is ModelResultReadV1 else read.request.call_id
+        if (binding.call_id != call_id
                 or binding.model_request_digest != read.observation.request_digest
-                or read.observation.authority_id != read_request.authority_id
-                or read.observation.namespace != read_request.authority_namespace):
+                or read.terminal_receipt.observation_digest != read.observation.digest):
             raise ValueError("original Authority result identity differs")
         # The legacy preparation routine accepts a receipt claim. It performs
         # the D04 baseline and graph checks, then returns candidate_hold. This
         # derived claim is never promoted into a graph admission credential.
         claim = CallReceipt(
             "completed", read.observation.operation_id,
-            read.observation.operation_id, read.call_id,
+            read.observation.operation_id, call_id,
             read.observation.request_digest, "authority-original", "authority-original",
             read.observation.provider_call_ref,
             dict(read.observation.usage), dict(read.observation.cost),
@@ -636,11 +688,13 @@ class D06MemoryPipeline:
         return replace(
             prepared, authority_observation_digest=read.observation.digest,
             authority_operation_id=read.observation.operation_id,
+            consumer_operation_id=consumer_operation_id,
         )
 
     def compile_first_ingress_c02_v2(
         self, envelope, held: PreparedFirstIngressEncoding,
-        read: ModelResultReadV1, *, audience: str, purpose: str,
+        read: ModelResultReadV1 | WorkerModelResultReadV1, *,
+        audience: str, purpose: str,
     ) -> HeldFirstIngressC02:
         """Recheck a held model candidate and compile C02 without granting adoption.
 
@@ -651,15 +705,21 @@ class D06MemoryPipeline:
         if (type(held) is not PreparedFirstIngressEncoding
                 or held.status != "candidate_hold"
                 or held.prepared.status != "candidate_hold"
-                or type(read) is not ModelResultReadV1):
+                or type(read) not in {ModelResultReadV1, WorkerModelResultReadV1}):
             raise TypeError("held first-ingress candidate and original read required")
         if type(envelope) is not CommandEnvelope:
             raise TypeError("typed C02 envelope required")
+        call_id = read.call_id if type(read) is ModelResultReadV1 else read.request.call_id
         if (held.authority_observation_digest != read.observation.digest
                 or held.authority_operation_id != read.observation.operation_id
-                or held.receipt_claim.call_id != read.call_id
+                or held.receipt_claim.call_id != call_id
                 or held.receipt_claim.call_digest != read.observation.request_digest):
             raise ValueError("original Authority result identity differs")
+        if type(read) is WorkerModelResultReadV1 and (
+                held.consumer_operation_id != read.request.consumer_operation_id
+                or envelope.identity.operation_id != read.request.consumer_operation_id
+                or envelope.authority.namespace != read.request.namespace):
+            raise ValueError("worker result consumer operation differs from C02 envelope")
         result = read.observation.result
         if (type(result) is not dict
                 or canonical_digest(result) != held.result_digest):
@@ -690,7 +750,7 @@ class D06MemoryPipeline:
         )
         return HeldFirstIngressC02(
             compiled, held.prepared.source_ref, held.encoding_baseline_ref,
-            read.call_id, read.observation.request_digest,
+            call_id, read.observation.request_digest,
             read.observation.digest, held.result_digest,
             read.observation.operation_id,
             held.possible_meanings, held.possible_feelings,
