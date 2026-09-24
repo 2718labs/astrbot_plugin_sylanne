@@ -139,6 +139,7 @@ def validate_first_encoding_authority_result(
     read: ModelResultReadV1 | WorkerModelResultReadV1,
     frozen_request: Mapping[str, object],
     original_source: SourceRecord, *, source_revision: int, access_revision: int,
+    binding: EncodingCallBinding | None = None,
 ) -> Mapping[str, object]:
     """Bind original Authority result bytes to the frozen first-ingress input.
 
@@ -158,7 +159,9 @@ def validate_first_encoding_authority_result(
             or frozen_request.get("payload") != payload
             or frozen_request.get("prompt_template_digest") != template_digest):
         raise ValueError("frozen request differs from original source")
-    if (frozen_request.get("schema") != "sylanne.first-ingress-encoding-call.v2"
+    schema = frozen_request.get("schema")
+    if (schema not in {"sylanne.first-ingress-encoding-call.v2",
+                       "sylanne.first-ingress-encoding-call.v3"}
             or frozen_request.get("work_kind") != "d06.encode_source"
             or type(frozen_request.get("worker_fence")) is not int
             or frozen_request["worker_fence"] < 1):
@@ -166,6 +169,71 @@ def validate_first_encoding_authority_result(
     if (frozen_request.get("source_revision") != source_revision
             or frozen_request.get("access_revision") != access_revision):
         raise ValueError("current source and access revisions differ")
+    if schema == "sylanne.first-ingress-encoding-call.v3":
+        # V3 pins a committed D04 baseline into the original request. Validate
+        # that the complete identity, namespace, graph reference, and all
+        # source/access/baseline versions match the frozen guard. The live
+        # coordinator still proves that identity against committed graph state.
+        try:
+            from ...runtime.encoding_call_binding import CommittedEncodingBaselineV1
+            from ...graph_types import AtomKey
+            from ...runtime_contracts import NamespaceId
+
+            namespace = NamespaceId(*frozen_request["namespace"])
+            baseline = CommittedEncodingBaselineV1(**frozen_request["baseline"])
+            baseline_key = AtomKey.from_token(baseline.baseline_ref)
+            if baseline_key.type_name != "d04.encoding_baseline.v1":
+                raise ValueError("baseline type differs")
+            guard = frozen_request["envelope"]["version_guard"]
+            versions = guard["read_versions"]
+            expected = {
+                source_key(*namespace.as_tuple, original_source.source_id).token:
+                    source_revision,
+                access_key(*namespace.as_tuple, original_source.source_id).token:
+                    access_revision,
+                baseline_key.token: baseline.baseline_revision,
+            }
+            seen: dict[str, int] = {}
+            for item in versions:
+                key_data = item["key"]
+                key = AtomKey.from_token(key_data["token"])
+                if (key.token in seen or NamespaceId.from_key(key) != namespace
+                        or type(item["revision"]) is not int or item["revision"] < 1):
+                    raise ValueError("version guard contains duplicate or foreign references")
+                seen[key.token] = item["revision"]
+            if any(seen.get(ref) != revision for ref, revision in expected.items()):
+                raise ValueError("committed baseline or source proof differs")
+            if len(frozen_request["baseline"]) != len(CommittedEncodingBaselineV1.__dataclass_fields__):
+                raise ValueError("baseline proof fields differ")
+            digest = canonical_digest({
+                "envelope": frozen_request["envelope"],
+                "call_id": frozen_request["call_id"],
+                "provider_id": frozen_request["provider_id"],
+                "model_id": frozen_request["model_id"],
+                "purpose": frozen_request["envelope"]["authority"]["purpose"],
+                "required_capabilities": frozen_request["required_capabilities"],
+                "privacy_tier": frozen_request["privacy_tier"],
+                "template": frozen_request["prompt_template_digest"],
+                "payload": frozen_request["payload"],
+                "timeout_seconds": frozen_request["timeout_seconds"],
+                "max_output_tokens": frozen_request["max_output_tokens"],
+            })
+            if digest != frozen_request.get("model_request_digest"):
+                raise ValueError("model request digest differs")
+            if (type(binding) is not EncodingCallBinding
+                    or dict(binding.request) != dict(frozen_request)
+                    or binding.namespace != namespace
+                    or binding.source_id != original_source.source_id
+                    or binding.source_revision != source_revision
+                    or binding.access_revision != access_revision
+                    or binding.call_id != frozen_request["call_id"]
+                    or binding.model_request_digest != digest
+                    or canonical_digest(dict(frozen_request)) != binding.binding_digest):
+                raise ValueError("V3 frozen binding object is required")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("V3 committed baseline proof or binding differs") from exc
+    elif "baseline" in frozen_request:
+        raise ValueError("legacy V2 request cannot claim a D04 baseline")
     observation = read.observation
     call_id = read.call_id if type(read) is ModelResultReadV1 else read.request.call_id
     if call_id != frozen_request.get("call_id"):
@@ -710,6 +778,7 @@ class D06MemoryPipeline:
             read, binding.request, original_source,
             source_revision=versions.get(source_key(*namespace, source.source_id), 0),
             access_revision=versions.get(access_key(*namespace, source.source_id), 0),
+            binding=binding,
         )
         call_id = read.call_id if type(read) is ModelResultReadV1 else read.request.call_id
         if (binding.call_id != call_id
