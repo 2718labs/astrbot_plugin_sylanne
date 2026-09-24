@@ -15,7 +15,11 @@ from .scene_applicability import (
     SceneIngressScopeV1,
     check_current_scene_applicability,
 )
-from .message_arrival import MessageArrivalCandidate, build_message_arrival_candidate
+from .message_arrival import (
+    MessageArrivalCandidate,
+    build_message_arrival_candidate,
+    build_message_arrival_proposal,
+)
 
 __all__ = (
     "AccountBinding",
@@ -30,5 +34,6 @@ __all__ = (
     "WorldEvent",
     "MessageArrivalCandidate",
     "build_message_arrival_candidate",
+    "build_message_arrival_proposal",
     "check_current_scene_applicability",
 )

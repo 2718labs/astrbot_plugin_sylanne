@@ -1,17 +1,22 @@
 """A committed D06 source, rather than the host clock, anchors D03 arrival."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
 
+from sylanne3.domains.d03 import message_arrival
+from sylanne3.domains.d03.context import ContextProvider
 from sylanne3.domains.d03.message_arrival import build_message_arrival_candidate
 from sylanne3.domains.d06 import D06DomainAdapter, SourceAdmission
-from sylanne3.graph_types import GraphVersion
+from sylanne3.graph_types import GraphAtom, GraphSnapshot, GraphVersion, NamespaceEpoch
 from sylanne3.host.ingress import HostIngressEnvelope, SourceLineage
 from sylanne3.memory_types import access_key, source_key
 from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
-from sylanne3.runtime_contracts import NamespaceId
+from sylanne3.runtime_contracts import (
+    AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
+    QueryEpoch, RUNTIME_SCHEMA, VersionGuard, canonical_digest,
+)
 
 
 def _inputs(occurred_at=10.0):
@@ -78,3 +83,133 @@ def test_arrival_rejects_currently_withdrawn_access():
             ingress, scene, admitted.source, access, admitted.qualification,
             source_version=source_version, access_version=access_version,
         )
+
+
+def _proposal_inputs(*, sender_revision=0, event_revision=0):
+    ingress, scene, admitted, access, source_version, access_version = _inputs()
+    candidate = build_message_arrival_candidate(
+        ingress, scene, admitted.source, access, admitted.qualification,
+        source_version=source_version, access_version=access_version,
+    )
+    namespace = ingress.namespace
+    sender_atom = None
+    if sender_revision:
+        prior = asdict(candidate.sender_anchor)
+        prior["creation_evidence_refs"] = [
+            source_key("bot", "persona", "b" * 64).token,
+        ]
+        sender_atom = GraphAtom(candidate.sender_key, sender_revision, prior)
+    reads = (
+        source_version, access_version,
+        GraphVersion(candidate.sender_key, sender_revision),
+        GraphVersion(candidate.event_key, event_revision),
+    )
+    envelope = CommandEnvelope(
+        RUNTIME_SCHEMA,
+        OperationIdentity(
+            "arrival-activity", None, "arrival-attempt", "arrival",
+            "arrival-operation", canonical_digest({"input_refs": [source_version.key.token]}),
+        ),
+        AuthorityContext(
+            "trusted-host", "d11", "arrival-lease", namespace,
+            ("persona", "event"), "context", (ingress.conversation_ref,),
+            "host-ingress-policy", 1,
+        ),
+        VersionGuard(
+            reads, (QueryEpoch(namespace, "all", 1),), 0, 0,
+            "catalogue", "scheme", "operator", "policy", (), (), (),
+        ),
+        admitted.qualification, (source_version.key.token,),
+        "budget", 30.0, 30.0, "interval", (ingress.message_id,),
+    )
+    return envelope, candidate, sender_atom
+
+
+def test_compiled_arrival_guards_source_access_and_both_target_keys():
+    assert hasattr(message_arrival, "build_message_arrival_proposal")
+    envelope, candidate, _ = _proposal_inputs()
+    proposal = message_arrival.build_message_arrival_proposal(
+        envelope, candidate, sender_atom=None,
+    )
+    assert proposal.domain == "d03"
+    assert proposal.proposal_schema == "d03.proposal.v1"
+    assert {write.key for write in proposal.typed_writes} == {
+        candidate.sender_key, candidate.event_key,
+    }
+    source_and_access = {candidate.source_version.key, candidate.access_version.key}
+    sender_write, event_write = proposal.typed_writes
+    assert set(sender_write.dependencies) == source_and_access
+    assert set(event_write.dependencies) == source_and_access | {candidate.sender_key}
+    assert "hello" not in str(tuple(write.value for write in proposal.typed_writes))
+    assert event_write.value["reality"] == "host_observed"
+    assert event_write.value["kind"] == "message_received"
+    _, _, admitted, access, _, _ = _inputs()
+    snapshot = GraphSnapshot((
+        GraphAtom(candidate.source_version.key, 1, admitted.source.to_dict()),
+        GraphAtom(candidate.access_version.key, 1, access),
+        GraphAtom(candidate.sender_key, 0, {}, False),
+        GraphAtom(candidate.event_key, 0, {}, False),
+    ), (NamespaceEpoch("bot", "persona", 1),))
+    assert ContextProvider().validate(proposal, snapshot) == proposal
+
+
+def test_compiled_arrival_reuses_existing_compatible_account_anchor():
+    envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
+    proposal = message_arrival.build_message_arrival_proposal(
+        envelope, candidate, sender_atom=sender_atom,
+    )
+    assert tuple(write.key for write in proposal.typed_writes) == (candidate.event_key,)
+    assert candidate.sender_key in proposal.typed_writes[0].dependencies
+
+
+def test_compiled_arrival_rejects_existing_event_and_conflicting_anchor():
+    envelope, candidate, _ = _proposal_inputs(event_revision=1)
+    with pytest.raises(ValueError, match="event.*revision-0"):
+        message_arrival.build_message_arrival_proposal(
+            envelope, candidate, sender_atom=None,
+        )
+    envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
+    bad_anchor = GraphAtom(
+        candidate.sender_key, 3,
+        {**sender_atom.value, "kind": "person"},
+    )
+    with pytest.raises(ValueError, match="sender anchor"):
+        message_arrival.build_message_arrival_proposal(
+            envelope, candidate, sender_atom=bad_anchor,
+        )
+
+
+def test_compiled_arrival_rejects_missing_current_source_guard():
+    envelope, candidate, _ = _proposal_inputs()
+    guard = replace(
+        envelope.version_guard,
+        read_versions=tuple(read for read in envelope.version_guard.read_versions
+                            if read.key != candidate.access_version.key),
+    )
+    with pytest.raises(ValueError, match="source.*access"):
+        message_arrival.build_message_arrival_proposal(
+            replace(envelope, version_guard=guard), candidate, sender_atom=None,
+        )
+
+
+def test_provider_rechecks_reused_anchor_against_transaction_snapshot():
+    envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
+    proposal = message_arrival.build_message_arrival_proposal(
+        envelope, candidate, sender_atom=sender_atom,
+    )
+    _, _, admitted, access, _, _ = _inputs()
+    source_atom = GraphAtom(candidate.source_version.key, 1, admitted.source.to_dict())
+    access_atom = GraphAtom(candidate.access_version.key, 1, access)
+    event_absent = GraphAtom(candidate.event_key, 0, {}, False)
+    good = GraphSnapshot(
+        (source_atom, access_atom, sender_atom, event_absent),
+        (NamespaceEpoch("bot", "persona", 1),),
+    )
+    provider = ContextProvider()
+    assert provider.validate(proposal, good) == proposal
+    conflicting = GraphAtom(
+        candidate.sender_key, 3, {**sender_atom.value, "kind": "person"},
+    )
+    bad = replace(good, atoms=(source_atom, access_atom, conflicting, event_absent))
+    with pytest.raises(ValueError, match="sender anchor"):
+        provider.validate(proposal, bad)

@@ -307,6 +307,11 @@ class ContextProvider:
                         or (write.key.owner.kind == "scene"
                             and write.key.owner.subject != decoded.scene_ref)):
                     raise ValueError("role binding graph identity differs from its payload")
+        if any(write.key.type_name == "d03.world_event"
+               and write.value.get("kind") == "message_received"
+               for write in proposal.typed_writes):
+            from .message_arrival import validate_message_arrival_snapshot
+            validate_message_arrival_snapshot(proposal, snapshot)
         return proposal
 
     def compile_scheme(self, draft: dict, snapshot: object) -> dict:

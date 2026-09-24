@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
 
-from ...graph_types import AtomKey, GraphVersion, Owner
+from ...graph_types import AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite, Owner
 from ...host.ingress import HostIngressEnvelope
 from ...memory_types import SourceRecord, access_key, source_key, validate_access
 from ...runtime.first_ingress_v2 import scene_ref_for_conversation
-from ...runtime_contracts import SourceQualification, canonical_digest
-from .context import EntityAnchor, WorldEvent
+from ...runtime_contracts import (
+    CommandEnvelope, DependencySet, DomainProposal, SourceQualification,
+    canonical_digest,
+)
+from .context import ContextProvider, EntityAnchor, WorldEvent
 
 if TYPE_CHECKING:
     from ...host.current_scene import CurrentHostScene
@@ -120,4 +123,180 @@ def build_message_arrival_candidate(
     )
 
 
-__all__ = ("MessageArrivalCandidate", "build_message_arrival_candidate")
+def build_message_arrival_proposal(
+    envelope: CommandEnvelope,
+    candidate: MessageArrivalCandidate,
+    *,
+    sender_atom: GraphAtom | None,
+) -> DomainProposal:
+    """Compile guarded D03 writes; the coordinator alone can adopt them.
+
+    ``sender_atom`` is the current graph read for the account key, or None
+    when that key was absent. The caller must obtain it alongside the D06
+    source/access read and carry the same revisions into ``envelope``.
+    """
+    if type(envelope) is not CommandEnvelope or type(candidate) is not MessageArrivalCandidate:
+        raise TypeError("typed command and message arrival candidate are required")
+    namespace = envelope.authority.namespace
+    authority = envelope.authority
+    source, access = candidate.source_version, candidate.access_version
+    sender_key, event_key = candidate.sender_key, candidate.event_key
+    sender = candidate.sender_anchor
+    event = candidate.event
+    if (
+        authority.issuer_domain != "d11" or authority.purpose != "context"
+        or not {"persona", "event"}.issubset(authority.owner_scope)
+        or len(authority.audience) != 1
+        or any(key.owner.bot != namespace.bot_id or key.owner.persona != namespace.persona_id
+               for key in (source.key, access.key, sender_key, event_key))
+        or source.key != source_key(*namespace.as_tuple, source.key.owner.subject or "")
+        or access.key != access_key(*namespace.as_tuple, source.key.owner.subject or "")
+        or sender_key != AtomKey(Owner("persona", *namespace.as_tuple),
+                                 "d03.entity_anchor", sender.entity_id)
+        or event_key != AtomKey(Owner("event", *namespace.as_tuple, event.event_id),
+                                "d03.world_event", "current")
+        or sender.kind != "account" or sender.owner_scope != f"persona:{namespace.persona_id}"
+        or event.kind != "message_received" or event.reality != "host_observed"
+        or event.source_refs != (source.key.token,)
+        or event.participant_roles != ((sender.entity_id, "sender_account"),)
+        or event.learned_at != envelope.source_qualification.learned_at
+        or envelope.source_qualification.source_refs != (source.key.token,)
+        or envelope.source_qualification.source_family != "reported"
+        or envelope.source_qualification.content_reality != "external_report"
+        or envelope.source_qualification.evidence_eligibility != "qualified"
+        or envelope.input_refs != (source.key.token,)
+    ):
+        raise ValueError("arrival command differs from qualified source and host account")
+    reads = {version.key: version.revision for version in envelope.version_guard.read_versions}
+    if reads.get(source.key) != source.revision or reads.get(access.key) != access.revision:
+        raise ValueError("arrival command lacks current source and access guards")
+    if (reads.get(event_key) != 0
+            or not any(query.namespace == namespace and query.scope_ref == "all"
+                       for query in envelope.version_guard.query_epochs)):
+        raise ValueError("arrival event needs a revision-0 guard and namespace query")
+    sender_revision = reads.get(sender_key)
+    if sender_atom is None:
+        if sender_revision != 0:
+            raise ValueError("new sender anchor needs a revision-0 guard")
+    else:
+        if (type(sender_atom) is not GraphAtom or sender_atom.key != sender_key
+                or not sender_atom.valid or sender_atom.revision < 1
+                or sender_revision != sender_atom.revision):
+            raise ValueError("existing sender anchor lacks a matching current guard")
+        prior = EntityAnchor(**{
+            **sender_atom.value,
+            "creation_evidence_refs": tuple(sender_atom.value.get("creation_evidence_refs", ())),
+        })
+        if (prior.entity_id != sender.entity_id or prior.kind != "account"
+                or prior.owner_scope != sender.owner_scope or prior.status != "active"
+                or any(AtomKey.from_token(ref).type_name != "memory.source"
+                       or AtomKey.from_token(ref).owner.bot != namespace.bot_id
+                       or AtomKey.from_token(ref).owner.persona != namespace.persona_id
+                       for ref in prior.creation_evidence_refs)):
+            raise ValueError("existing sender anchor is not a compatible account")
+    dependencies = (source, access, GraphVersion(sender_key, sender_revision))
+    writes = []
+    if sender_atom is None:
+        sender_value = asdict(sender)
+        sender_value["creation_evidence_refs"] = list(sender.creation_evidence_refs)
+        writes.append(GraphWrite(sender_key, sender_value, (source.key, access.key)))
+    event_value = asdict(event)
+    event_value["participant_roles"] = [list(role) for role in event.participant_roles]
+    event_value["source_refs"] = list(event.source_refs)
+    writes.append(GraphWrite(event_key, event_value, tuple(item.key for item in dependencies)))
+    return DomainProposal(
+        "d03", "d03.proposal.v1", ContextProvider().descriptor.request_schema_hash,
+        envelope, tuple(writes), DependencySet(current_invalidation=dependencies), (), (),
+    )
+
+
+def validate_message_arrival_snapshot(
+    proposal: DomainProposal, snapshot: GraphSnapshot,
+) -> None:
+    """Recheck arrival semantics against the coordinator's locked read set."""
+    if type(snapshot) is not GraphSnapshot:
+        raise ValueError("message arrival needs a current graph snapshot")
+    events = tuple(write for write in proposal.typed_writes
+                   if write.key.type_name == "d03.world_event"
+                   and write.value.get("kind") == "message_received")
+    if len(events) != 1 or len(proposal.typed_writes) not in (1, 2):
+        raise ValueError("message arrival must contain one received event")
+    event_write = events[0]
+    event = WorldEvent(**{
+        **event_write.value,
+        "participant_roles": tuple(tuple(pair) for pair in event_write.value["participant_roles"]),
+        "source_refs": tuple(event_write.value["source_refs"]),
+    })
+    namespace = proposal.envelope.authority.namespace
+    if len(event.source_refs) != 1 or len(event.participant_roles) != 1:
+        raise ValueError("message arrival needs one source and sender account")
+    source = AtomKey.from_token(event.source_refs[0])
+    access = access_key(*namespace.as_tuple, source.owner.subject or "")
+    sender_id, role = event.participant_roles[0]
+    sender = AtomKey(Owner("persona", *namespace.as_tuple), "d03.entity_anchor", sender_id)
+    event_prior = snapshot.get(event_write.key)
+    source_atom = snapshot.get(source)
+    access_atom = snapshot.get(access)
+    sender_atom = snapshot.get(sender)
+    if (source != source_key(*namespace.as_tuple, source.owner.subject or "")
+            or event_write.key != AtomKey(Owner("event", *namespace.as_tuple, event.event_id),
+                                          "d03.world_event", "current")
+            or event_prior is None or event_prior.revision != 0
+            or source_atom is None or not source_atom.valid or source_atom.revision < 1
+            or access_atom is None or not access_atom.valid or access_atom.revision < 1
+            or sender_atom is None or role != "sender_account"
+            or event.reality != "host_observed"
+            or event.occurred_from != event.learned_at
+            or event.occurred_until != event.learned_at):
+        raise ValueError("message arrival snapshot is incomplete or inconsistent")
+    record = SourceRecord.from_dict(source_atom.value)
+    validate_access(access_atom.value)
+    qualification = proposal.envelope.source_qualification
+    if (qualification.source_refs != (source.token,)
+            or qualification.source_family != "reported"
+            or qualification.content_reality != "external_report"
+            or qualification.evidence_eligibility != "qualified"
+            or qualification.occurred_at != record.occurred_at
+            or qualification.learned_at != record.recorded_at
+            or proposal.envelope.input_refs != (source.token,)
+            or record.source_id != source.owner.subject or record.source_kind != "reported"
+            or record.assertion_status != "reported"
+            or record.recorded_at != event.learned_at
+            or not set(proposal.envelope.authority.audience).issubset(record.audiences)
+            or "context" not in record.purposes
+            or access_atom.value["source_id"] != record.source_id
+            or access_atom.value["status"] != "active"
+            or not set(proposal.envelope.authority.audience).issubset(access_atom.value["audiences"])
+            or "context" not in access_atom.value["purposes"]):
+        raise ValueError("message arrival source or access lost current eligibility")
+    anchor_writes = tuple(write for write in proposal.typed_writes
+                          if write.key.type_name == "d03.entity_anchor")
+    if sender_atom.revision == 0:
+        if len(anchor_writes) != 1 or anchor_writes[0].key != sender:
+            raise ValueError("new sender anchor write is missing")
+        anchor_value = anchor_writes[0].value
+        if (anchor_value.get("creation_evidence_refs") != [source.token]
+                or set(anchor_writes[0].dependencies) != {source, access}):
+            raise ValueError("new sender anchor has invalid source dependencies")
+    else:
+        if not sender_atom.valid or anchor_writes:
+            raise ValueError("existing sender anchor cannot be overwritten")
+        anchor_value = sender_atom.value
+    anchor = EntityAnchor(**{
+        **anchor_value,
+        "creation_evidence_refs": tuple(anchor_value["creation_evidence_refs"]),
+    })
+    if (anchor.entity_id != sender_id or anchor.kind != "account"
+            or anchor.owner_scope != f"persona:{namespace.persona_id}"
+            or anchor.status != "active"):
+        raise ValueError("sender anchor differs from current account identity")
+    if (set(event_write.dependencies) != {source, access, sender}
+            or {ref.key for ref in proposal.dependencies.current_invalidation}
+            != {source, access, sender}):
+        raise ValueError("message arrival lost source, access, or sender dependencies")
+
+
+__all__ = (
+    "MessageArrivalCandidate", "build_message_arrival_candidate",
+    "build_message_arrival_proposal",
+)
