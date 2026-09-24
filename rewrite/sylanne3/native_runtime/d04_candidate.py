@@ -17,9 +17,16 @@ from ..domains.d04 import AffectScheme
 
 from .fixed_block_transcript import (
     FixedBlockCSR,
+    FixedBlockContinuation,
     FixedBlockMathTranscript,
     FixedBlockStep,
+    _same_csr_bits,
+    _same_float_bits,
     run_fixed_block_math,
+)
+from .initial_box_trajectory import (
+    FixedBlockBoxTrajectoryMathTranscript,
+    run_fixed_block_box_trajectory_math,
 )
 from .loader import ABI2NativeLibrary, NativeIntegrityError
 
@@ -59,6 +66,19 @@ class D04FixedBlockCandidate:
     parameter_version: str
     coupling_version: str
     math: FixedBlockMathTranscript
+
+
+@dataclass(frozen=True, slots=True)
+class D04FixedBlockBoxTrajectoryCandidate:
+    """Asset-bound nonlinear math candidate, never an adopted D04 state."""
+
+    affect_scheme_sha256: str
+    operator_sha256: str
+    scheme_version: str
+    operator_version: str
+    parameter_version: str
+    coupling_version: str
+    math: FixedBlockBoxTrajectoryMathTranscript
 
 
 def _assets(root: Path, handle: ABI2NativeLibrary) -> tuple[dict[str, object], str, dict[str, object], str]:
@@ -129,16 +149,12 @@ def _matrix(value: object) -> FixedBlockCSR:
     return FixedBlockCSR(value["rows"], value["cols"], value["offsets"], value["indices"], value["values"])
 
 
-def run_d04_fixed_block_candidate(
+def _verified_fixed_block_binding(
     handle: ABI2NativeLibrary,
     package_root: Path | str,
     scheme: AffectScheme,
     block: FixedBlockStep,
-) -> D04FixedBlockCandidate:
-    """Bind one complete mathematical call to a trusted asset and D04 scheme.
-
-    The result remains a candidate even when ABI2 reports its interval flag.
-    """
+) -> tuple[str, str, tuple[str, str, str, str]]:
     if not isinstance(handle, ABI2NativeLibrary) or not isinstance(scheme, AffectScheme):
         raise TypeError("D04 candidate needs an ABI2 handle and AffectScheme")
     if not isinstance(block, FixedBlockStep):
@@ -173,19 +189,61 @@ def run_d04_fixed_block_candidate(
         alpha = tuple(float(value) for value in operator["alpha"])
     except (KeyError, TypeError, ValueError) as exc:
         raise D04CandidateError("D04 fixed-block operator is invalid") from exc
-    if matrices != (block.k, block.r, block.j, block.a) or alpha != block.alpha:
+    if (not all(_same_csr_bits(expected, actual)
+                for expected, actual in zip(matrices, (block.k, block.r, block.j, block.a)))
+            or not _same_float_bits(alpha, block.alpha)):
         raise D04CandidateError("D04 fixed-block input differs from trusted complete operator")
     if len(block.previous) != len(scheme.axes):
         raise D04CandidateError("D04 fixed-block dimension differs from affect axes")
+    return affect_digest, operator_digest, tuple(getattr(scheme, name) for name in versions)
+
+
+def run_d04_fixed_block_candidate(
+    handle: ABI2NativeLibrary,
+    package_root: Path | str,
+    scheme: AffectScheme,
+    block: FixedBlockStep,
+) -> D04FixedBlockCandidate:
+    """Bind one native math call to a trusted asset; never product admission."""
+    affect_digest, operator_digest, versions = _verified_fixed_block_binding(
+        handle, package_root, scheme, block,
+    )
     transcript = run_fixed_block_math(handle, block)
     return D04FixedBlockCandidate(
-        affect_digest, operator_digest, *(getattr(scheme, name) for name in versions), transcript,
+        affect_digest, operator_digest, *versions, transcript,
     )
 
 
-def require_d04_production_readout(candidate: D04FixedBlockCandidate) -> None:
+def run_d04_fixed_block_box_trajectory_candidate(
+    handle: ABI2NativeLibrary,
+    package_root: Path | str,
+    scheme: AffectScheme,
+    first: FixedBlockStep,
+    continuations: tuple[FixedBlockContinuation, ...],
+    *,
+    lower: tuple[float, ...],
+    upper: tuple[float, ...],
+) -> D04FixedBlockBoxTrajectoryCandidate:
+    """Bind a native box/trajectory chain to exact trusted D04 operator bytes.
+
+    The box's source, graph closure, and D04 adoption remain external premises.
+    """
+    affect_digest, operator_digest, versions = _verified_fixed_block_binding(
+        handle, package_root, scheme, first,
+    )
+    math = run_fixed_block_box_trajectory_math(
+        handle, first, continuations, lower=lower, upper=upper,
+    )
+    return D04FixedBlockBoxTrajectoryCandidate(
+        affect_digest, operator_digest, *versions, math,
+    )
+
+
+def require_d04_production_readout(
+    candidate: D04FixedBlockCandidate | D04FixedBlockBoxTrajectoryCandidate,
+) -> None:
     """Fail closed until a product issuer proves all D04 admission conditions."""
-    if not isinstance(candidate, D04FixedBlockCandidate):
+    if not isinstance(candidate, (D04FixedBlockCandidate, D04FixedBlockBoxTrajectoryCandidate)):
         raise TypeError("D04 production readout requires a bound candidate")
     raise D04ProductionReadoutUnavailable(
         "ABI2 fixed-block interval math is conditional; D04 source, full graph "

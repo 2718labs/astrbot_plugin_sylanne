@@ -46,8 +46,10 @@ from .initial_box_trajectory import (
 from .d04_candidate import (
     D04CandidateError,
     D04FixedBlockCandidate,
+    D04FixedBlockBoxTrajectoryCandidate,
     D04ProductionReadoutUnavailable,
     run_d04_fixed_block_candidate,
+    run_d04_fixed_block_box_trajectory_candidate,
     require_d04_production_readout,
 )
 
@@ -87,7 +89,9 @@ __all__ = [
     "run_fixed_block_box_linear_readout_math",
     "D04CandidateError",
     "D04FixedBlockCandidate",
+    "D04FixedBlockBoxTrajectoryCandidate",
     "D04ProductionReadoutUnavailable",
     "run_d04_fixed_block_candidate",
+    "run_d04_fixed_block_box_trajectory_candidate",
     "require_d04_production_readout",
 ]
