@@ -7831,7 +7831,7 @@ class GraphCoordinator:
                               now_utc: float | None = None,
                               require_arrival_quote: bool = False) -> RuntimeAdmission:
         """Apply D02/D11 decisions in the graph's existing SQLite transaction."""
-        from .runtime.issuers import D03_ARRIVAL_WORK_KIND
+        from .runtime.issuers import D03_ARRIVAL_WORK_KIND, D04_BASELINE_WORK_KIND
 
         if self.__d02_issuer is None or self.__d11_issuer is None:
             raise UnavailableGuard("D02 and D11 runtime issuers are required")
@@ -7868,6 +7868,27 @@ class GraphCoordinator:
                     or bundle.persistent_job_refs or bundle.outbox_refs
                     or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
                 raise AuthorityDenied("D03 arrival quote cannot authorize a mixed bundle")
+        if quote is not None and quote.work_kind == D04_BASELINE_WORK_KIND:
+            if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='graph_d04_baseline_issuance_v1'",
+            ).fetchone() is None:
+                raise AuthorityDenied("D04 baseline quote lacks sealed graph issuance")
+            row = db.execute(
+                "SELECT source_ref,event_ref,quote_id,bundle_digest FROM "
+                "graph_d04_baseline_issuance_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=?",
+                bundle.envelope.authority.namespace.as_tuple
+                + (bundle.envelope.identity.operation_id,),
+            ).fetchone()
+            if (len(bundle.proposals) != 1 or bundle.proposals[0].domain != "d04"
+                    or len(bundle.proposals[0].typed_writes) != 1
+                    or bundle.proposals[0].typed_writes[0].key.type_name
+                    != "d04.encoding_baseline.v1"
+                    or row != (*bundle.envelope.input_refs, quote.quote_id, bundle.digest)
+                    or bundle.persistent_job_refs or bundle.outbox_refs
+                    or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+                raise AuthorityDenied("D04 baseline quote cannot authorize a mixed bundle")
         admission = self.__d11_issuer.admit_runtime(bundle, db, **time_kwargs)
         if not isinstance(admission, RuntimeAdmission):
             raise AuthorityDenied("D11 did not issue a typed runtime admission")
@@ -9257,7 +9278,8 @@ class GraphCoordinator:
             return self._commit_domain_bundle_fenced(bundle, lease)
 
     def _commit_domain_bundle_v2(self, bundle: DomainBundle,
-                                 lease: object, *, arrival_issuance=None) -> CommitReceipt:
+                                 lease: object, *, arrival_issuance=None,
+                                 baseline_issuance=None) -> CommitReceipt:
         """Commit under a durable write attempt; reconcile before any duplicate read."""
         from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
 
@@ -9455,8 +9477,10 @@ class GraphCoordinator:
                 v2_transaction_state=transaction_state,
                 dispatch_clock_reading=dispatch_clock_reading,
                 scene_owner_guard=scene_owner_guard,
-                now_utc=arrival_issuance[2] if arrival_issuance else None,
-                arrival_issuance=arrival_issuance)
+                now_utc=(arrival_issuance[2] if arrival_issuance else
+                         baseline_issuance[2] if baseline_issuance else None),
+                arrival_issuance=arrival_issuance,
+                baseline_issuance=baseline_issuance)
         except Exception:
             if transaction_state["phase"] in {"before_transaction", "rolled_back"}:
                 rejection = self._record_rejected_bundle_v2(
@@ -9585,7 +9609,8 @@ class GraphCoordinator:
                                      dispatch_clock_reading=None,
                                      ingress_deadline_check=None,
                                      scene_owner_guard=None,
-                                     arrival_issuance=None) -> CommitReceipt:
+                                      arrival_issuance=None,
+                                      baseline_issuance=None) -> CommitReceipt:
         """Join a caller-owned graph transaction when ``in_transaction`` is set.
 
         The caller holds the store lock and owns COMMIT or ROLLBACK.
@@ -9794,6 +9819,52 @@ class GraphCoordinator:
                     "VALUES(?,?,?,?,?,?,?)",
                     namespace.as_tuple + (identity.operation_id, source_ref,
                                           quote.quote_id, policy_digest, digest),
+                )
+            if baseline_issuance is not None:
+                admin_policy, installation_id, baseline_now, source_ref, event_ref, job_id = (
+                    baseline_issuance)
+                if (v2_write is None or len(bundle.proposals) != 1
+                        or bundle.proposals[0].domain != "d04"
+                        or envelope.input_refs != (source_ref, event_ref)
+                        or bundle.persistent_job_refs or bundle.outbox_refs
+                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+                    raise AuthorityDenied("D04 baseline stage identity differs")
+                job, _, _, outbox, _, _, source_version, access_version = (
+                    self._first_ingress_encoding_job_locked(namespace, job_id))
+                if (job.phase != "queued" or job.cancel_epoch != 0
+                        or job.fence != 0 or job.lease_holder is not None
+                        or source_version.key.token != source_ref
+                        or outbox.payload_ref != source_version.key.owner.subject
+                        or source_version not in envelope.version_guard.read_versions
+                        or access_version not in envelope.version_guard.read_versions):
+                    raise UnavailableGuard("D04 baseline job/source changed; HOLD")
+                pre_quote = replace(envelope, version_guard=replace(
+                    envelope.version_guard, resource_lease_versions=()))
+                quote = self.__d11_issuer.issue_d04_baseline_quote(
+                    db, pre_quote, admin_policy,
+                    installation_id=installation_id, now_utc=baseline_now)
+                refs = envelope.version_guard.resource_lease_versions
+                if len(refs) != 1 or (refs[0].ref, refs[0].version) != (
+                        quote.quote_id, quote.version):
+                    raise AuthorityDenied("D04 baseline quote guard differs")
+                db.execute(
+                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                    "VALUES(?,?,?,?,?)",
+                    namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                          str(quote.version)),
+                )
+                db.execute("""CREATE TABLE IF NOT EXISTS graph_d04_baseline_issuance_v1(
+                    bot TEXT NOT NULL, persona TEXT NOT NULL,
+                    operation_id TEXT NOT NULL, source_ref TEXT NOT NULL,
+                    event_ref TEXT NOT NULL, quote_id TEXT NOT NULL,
+                    bundle_digest TEXT NOT NULL,
+                    PRIMARY KEY(bot,persona,operation_id))""")
+                db.execute(
+                    "INSERT INTO graph_d04_baseline_issuance_v1"
+                    "(bot,persona,operation_id,source_ref,event_ref,quote_id,bundle_digest) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (identity.operation_id, source_ref,
+                                          event_ref, quote.quote_id, digest),
                 )
             snapshot = self._check_guard(
                 db, bundle, ingress_deadline_check=ingress_deadline_check,
