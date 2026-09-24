@@ -7,8 +7,12 @@ import secrets
 
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest
-from ..host.authority_profile import AdminIngressModelPolicy
+from ..host.authority_profile import AdminIngressModelPolicy, AdminModelWorkflowsV2
 from ..model_broker.broker import ModelCallRequest
+from ..model_broker.first_ingress_encoding import (
+    FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
+    FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+)
 from .contract import AuthorityUnavailable, identifier
 from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
 from .v2_model_egress_contract import (
@@ -23,7 +27,8 @@ class AuthorityV2ModelEgressService:
     def __init__(self, store: AuthorityV2ModelEgressStore,
                  fences: AuthorityV2FenceService | None = None, *,
                  graph_verifier: PinnedCurrentModelEgressGraphVerifier | None = None,
-                 admin_model_policy: AdminIngressModelPolicy | None = None):
+                 admin_model_policy: (AdminIngressModelPolicy |
+                                      AdminModelWorkflowsV2 | None) = None):
         if type(store) is not AuthorityV2ModelEgressStore:
             raise TypeError("Authority-owned model egress store required")
         if fences is not None and (type(fences) is not AuthorityV2FenceService
@@ -34,7 +39,8 @@ class AuthorityV2ModelEgressService:
                 and type(graph_verifier) is not PinnedCurrentModelEgressGraphVerifier):
             raise TypeError("administrator-pinned model egress graph verifier required")
         if (admin_model_policy is not None
-                and type(admin_model_policy) is not AdminIngressModelPolicy):
+                and type(admin_model_policy) not in (
+                    AdminIngressModelPolicy, AdminModelWorkflowsV2)):
             raise TypeError("administrator-installed model policy required")
         self._store = store
         self._fences = fences
@@ -45,9 +51,50 @@ class AuthorityV2ModelEgressService:
                              request: ModelCallRequest | None) -> bool:
         """Match a graph-bound request to this Authority installation's policy."""
         policy = self._admin_model_policy
-        if type(policy) is not AdminIngressModelPolicy or type(request) is not ModelCallRequest:
+        if type(request) is not ModelCallRequest:
             return False
         authority = request.envelope.authority
+        if type(policy) is AdminModelWorkflowsV2:
+            encode = policy.encode
+            if (encode.work_kind != "d06.encode_source"
+                    or encode.purpose != "consolidation"
+                    or encode.template_version
+                       != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION):
+                return False
+            ceiling = dict(intent.budget_ceiling)
+            return (
+                request.digest == intent.request_digest
+                and request.call_id == intent.call_id
+                and request.identity.operation_id == intent.operation_id
+                and authority.actor == intent.subject
+                and authority.issuer_domain == "d11"
+                and authority.activation_generation
+                    == intent.authority_activation_generation
+                and authority.worker_fence == intent.worker_fence
+                and authority.purpose == encode.purpose
+                and bool(authority.audience)
+                and set(authority.audience) <= set(encode.audiences)
+                and request.privacy_tier == encode.privacy_tier
+                and request.required_capabilities
+                    == frozenset(encode.required_capabilities)
+                and (request.provider_id, request.model_id,
+                     intent.provider_id, intent.model_id) == (
+                        encode.provider_id, encode.model_id,
+                        encode.provider_id, encode.model_id)
+                and intent.provider_config_digest
+                    == encode.provider_config_digest
+                and request.prompt_template_digest
+                    == FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST
+                and request.max_output_tokens == intent.max_output_tokens
+                and request.max_output_tokens <= encode.max_output_tokens
+                and request.max_output_tokens
+                    <= ceiling.get("output_tokens", 0)
+                and request.timeout_seconds == encode.timeout_seconds
+                and all(amount <= encode.quote_ceiling.get(dimension, 0)
+                        for dimension, amount in intent.budget_ceiling)
+            )
+        if type(policy) is not AdminIngressModelPolicy:
+            return False
         return (
             bool(policy.allowed_purposes and policy.allowed_audiences
                  and policy.allowed_privacy_tiers)

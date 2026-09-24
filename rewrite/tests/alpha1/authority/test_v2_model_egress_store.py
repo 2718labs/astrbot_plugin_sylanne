@@ -202,6 +202,80 @@ def test_service_remains_hold(tmp_path):
             asyncio.run(service.finish_handoff(None, "a" * 64))
 
 
+def test_authority_v2_model_policy_keeps_encoding_and_reply_separate(tmp_path):
+    from rewrite.tests.alpha1.model_broker.test_broker import request as broker_request
+    from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
+    from sylanne3.host.authority_profile import (
+        AdminModelWorkflowV2, AdminModelWorkflowsV2, installed_model_config_ref,
+    )
+    from sylanne3.model_broker.first_ingress_encoding import (
+        FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
+        FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+    )
+
+    digest = "d" * 64
+    shared = dict(
+        provider_id="provider-1", model_id="model-1",
+        provider_config_ref=installed_model_config_ref(
+            "provider-1", "model-1", digest),
+        provider_config_digest=digest, required_capabilities=("text",),
+        privacy_tier="private", timeout_seconds=20.0,
+    )
+    encode = AdminModelWorkflowV2(
+        work_kind="d06.encode_source", purpose="consolidation",
+        audiences=("owner",),
+        template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+        max_output_tokens=64, quote_ceiling={"output_tokens": 64}, **shared)
+    reply = AdminModelWorkflowV2(
+        work_kind="reply", purpose="proposal", audiences=("owner",),
+        template_version="d09.reply.v1", max_output_tokens=32,
+        quote_ceiling={"output_tokens": 32}, **shared)
+    workflows = AdminModelWorkflowsV2(2, encode, reply)
+    base = broker_request()
+    envelope = replace(
+        base.envelope,
+        identity=replace(base.identity, operation_id="job-operation"),
+        authority=replace(base.envelope.authority, actor="worker",
+                          issuer_domain="d11", purpose="consolidation",
+                          worker_fence=7),
+    )
+    model_request = replace(
+        base, envelope=envelope, call_id="call-1", provider_id="provider-1",
+        model_id="model-1", required_capabilities=frozenset({"text"}),
+        prompt_template_digest=FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
+        timeout_seconds=20.0, max_output_tokens=64)
+    original = intent(
+        request_digest=model_request.digest,
+        provider_config_digest=digest, max_output_tokens=64,
+        budget_ceiling=(("output_tokens", 64),))
+    with connection(tmp_path / "authority.db") as db:
+        service = AuthorityV2ModelEgressService(
+            AuthorityV2ModelEgressStore(db, create=True),
+            admin_model_policy=workflows)
+        assert service._admin_model_matches(original, model_request)
+        assert not service._admin_model_matches(
+            original, replace(model_request, envelope=replace(
+                envelope, authority=replace(envelope.authority,
+                                            purpose="proposal"))))
+        assert not service._admin_model_matches(
+            original, replace(model_request, envelope=replace(
+                envelope, authority=replace(envelope.authority,
+                                            audience=("private",)))))
+        assert not service._admin_model_matches(
+            original, replace(model_request,
+                              prompt_template_digest="0" * 64))
+        assert not service._admin_model_matches(
+            replace(original, budget_ceiling=(("output_tokens", 65),)),
+            model_request)
+        assert not service._admin_model_matches(
+            replace(original, provider_config_digest="e" * 64),
+            model_request)
+        assert not service._admin_model_matches(
+            replace(original, max_output_tokens=32), model_request)
+        assert not service._admin_model_matches(
+            original, replace(model_request, timeout_seconds=19.0))
+
+
 def test_fenced_prepare_is_atomic_and_recoverable(tmp_path, monkeypatch):
     from rewrite.tests.alpha1.runtime.test_authority_v2_rpc_content_fences import (
         _PEER_A, rpc,
