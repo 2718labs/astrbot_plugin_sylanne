@@ -68,6 +68,25 @@ def _worker(coordinator, bootstrap, namespace, operation_id=None):
     return authority, lease
 
 
+def _narrow_access_grant(store, namespace, source_id, *,
+                         audiences=None, purposes=None):
+    token, value = store._db.execute(
+        "SELECT token,value FROM graph_atoms WHERE bot=? AND persona=? "
+        "AND type_name='memory.access' AND subject=?",
+        namespace.as_tuple + (source_id,),
+    ).fetchone()
+    access = json.loads(value)
+    if audiences is not None:
+        access["audiences"] = audiences
+    if purposes is not None:
+        access["purposes"] = purposes
+    validate_access(access)
+    store._db.execute(
+        "UPDATE graph_atoms SET value=? WHERE token=?",
+        (json.dumps(access, sort_keys=True, separators=(",", ":")), token),
+    )
+
+
 class FixedEncodingRequestIssuer:
     def __init__(self):
         self.config_digest = "c" * 64
@@ -265,6 +284,64 @@ def test_bound_request_replay_rechecks_current_policy_version(ingress_system):
     with pytest.raises(UnavailableGuard, match="trusted issuance context"):
         coordinator.acquire_first_ingress_encoding_job_v2(
             authority, lease, job_id, operation_id, lease_seconds=30)
+
+
+@pytest.mark.parametrize("stage", ["before_issue", "before_commit", "replay"])
+def test_encoding_binding_requires_current_access_audience(ingress_system, stage):
+    store, coordinator, bootstrap, port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+    coordinator._GraphCoordinator__encoding_request_issuer = FixedEncodingRequestIssuer()
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    if stage == "before_commit":
+        begin = port.begin_fence
+
+        def narrow_after_begin(**kwargs):
+            permit = begin(**kwargs)
+            _narrow_access_grant(
+                store, policy.namespace, host.lineage.source_ref,
+                audiences=[])
+            return permit
+
+        port.begin_fence = narrow_after_begin
+    elif stage == "replay":
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+        _narrow_access_grant(
+            store, policy.namespace, host.lineage.source_ref, audiences=[])
+    else:
+        _narrow_access_grant(
+            store, policy.namespace, host.lineage.source_ref, audiences=[])
+    with pytest.raises(UnavailableGuard, match="current access"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+    if stage != "replay":
+        assert load_binding(store._db, policy.namespace, job_id) is None
+        assert store._db.execute(
+            "SELECT phase FROM runtime_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()[0] == "queued"
+
+
+def test_encoding_binding_requires_current_access_purpose(ingress_system):
+    store, coordinator, bootstrap, _port, policy, clock, encoding, host = ingress_system
+    coordinator._GraphCoordinator__scene_clock_policy = clock
+    coordinator._GraphCoordinator__encoding_request_issuer = FixedEncodingRequestIssuer()
+    coordinator.commit_first_ingress_v2(bootstrap, host, policy, clock, encoding)
+    (job_id,) = store._db.execute("SELECT job_id FROM runtime_jobs").fetchone()
+    operation_id = _op(coordinator, job_id)
+    authority, lease = _worker(coordinator, bootstrap, policy.namespace,
+                               operation_id=operation_id)
+    authority = replace(authority, purpose="context")
+    _narrow_access_grant(
+        store, policy.namespace, host.lineage.source_ref,
+        purposes=["consolidation"])
+    with pytest.raises(UnavailableGuard, match="current access"):
+        coordinator.acquire_first_ingress_encoding_job_v2(
+            authority, lease, job_id, operation_id, lease_seconds=30)
+    assert load_binding(store._db, policy.namespace, job_id) is None
 
 
 def test_policy_change_after_acquire_intent_blocks_commit(ingress_system):

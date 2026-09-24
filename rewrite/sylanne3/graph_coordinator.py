@@ -23,7 +23,7 @@ from .graph_types import (
     NamespaceEpoch, Owner, owner_grant_key, owner_grant_policy_digest_v1,
     validate_owner_grant_v1,
 )
-from .memory_types import SourceRecord, access_key, source_key
+from .memory_types import SourceRecord, access_key, source_key, validate_access
 from .runtime_contracts import (
     AuthorityContext, CommitReceipt, ContentFencePortV2, DomainBundle, FenceScope,
     NamespaceId, ProductAdvanceEvidenceV1, SourceQualification, VersionGuard,
@@ -216,6 +216,8 @@ class FirstIngressEncodingIssueContextV1:
     authority: AuthorityContext
     source_revision: int
     access_revision: int
+    access_audiences: tuple[str, ...]
+    access_purposes: tuple[str, ...]
     version_guard: VersionGuard
     source_qualification: SourceQualification
     now_utc: float
@@ -5734,6 +5736,25 @@ class GraphCoordinator:
                 "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
                 (source_version.key.token,),
             ).fetchone()
+            access_row = self.__store._db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (access_version.key.token,),
+            ).fetchone()
+            if (access_row is None or access_row[0] != access_version.revision
+                    or access_row[2] != 1):
+                raise UnavailableGuard("encoding current access changed; HOLD")
+            try:
+                access_value = json.loads(access_row[1])
+                validate_access(access_value)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("encoding current access invalid; HOLD") from exc
+            if (access_value["status"] != "active"
+                    or access_value["source_id"] != outbox.payload_ref
+                    or authority.purpose not in access_value["purposes"]
+                    or not set(authority.audience).issubset(
+                        access_value["audiences"])):
+                raise UnavailableGuard(
+                    "encoding worker exceeds current access grant; HOLD")
             epochs = self.__store._db.execute(
                 "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
                 "WHERE bot=? AND persona=?", namespace.as_tuple,
@@ -5765,6 +5786,7 @@ class GraphCoordinator:
         return FirstIngressEncodingIssueContextV1(
             planned, source, replace(authority, worker_fence=planned.fence),
             source_version.revision, access_version.revision,
+            tuple(access_value["audiences"]), tuple(access_value["purposes"]),
             guard, qualification, now_utc, deadline, worker_deadline)
 
     def _issue_first_ingress_encoding_binding(
