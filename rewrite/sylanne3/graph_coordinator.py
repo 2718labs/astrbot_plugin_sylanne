@@ -6872,9 +6872,14 @@ class GraphCoordinator:
                 namespace.as_tuple + (last,
                     "sylanne.first-ingress-encoding-call.v3", limit + 1),
             ).fetchall()
-            items = tuple(self._first_ingress_recovery_item_locked_v1(
-                namespace, provision.installation_id, current, epoch, now, row)
-                          for row in rows[:limit])
+            items = []
+            for row in rows[:limit]:
+                if self._first_ingress_recovery_ineligible_locked_v1(
+                        namespace, epoch, row):
+                    continue
+                items.append(self._first_ingress_recovery_item_locked_v1(
+                    namespace, provision.installation_id, current, epoch, now,
+                    row))
             next_cursor = None
             if len(rows) > limit:
                 payload = {**stamp, "last_acquire_operation_id": rows[limit - 1][0]}
@@ -6883,7 +6888,7 @@ class GraphCoordinator:
             return FirstIngressRecoveryPageV1(
                 namespace, provision.installation_id,
                 target.graph_incarnation, current.graph_revision,
-                epoch.revision, items, next_cursor)
+                epoch.revision, tuple(items), next_cursor)
 
         return self._read_v2(authority, reader)
 
@@ -6910,6 +6915,74 @@ class GraphCoordinator:
         except (TypeError, ValueError, KeyError, AttributeError) as exc:
             raise UnavailableGuard("invalid V3 recovery cursor") from exc
         return parsed
+
+    def _first_ingress_recovery_ineligible_locked_v1(
+        self, namespace, epoch, row,
+    ):
+        """Skip only a graph-committed source/access withdrawal, never drift."""
+        from .memory_types import access_key, source_key, validate_access
+        from .runtime.encoding_call_binding import binding_from_json, load_binding
+
+        db = self.__store._db
+        acquire_id, job_id, original_id, actor, binding_json = row[:5]
+        binding = binding_from_json(binding_json)
+        request = binding.request
+        if (binding.namespace != namespace or binding.job_id != job_id
+                or binding != load_binding(db, namespace, job_id)
+                or row[8] != row[9]
+                or request.get("schema") !=
+                "sylanne.first-ingress-encoding-call.v3"
+                or request.get("acquire_operation_id") != acquire_id
+                or request.get("original_operation_id") != original_id
+                or request.get("envelope", {}).get("authority", {}).get(
+                    "actor") != actor):
+            raise UnavailableGuard("V3 recovery withdrawn row identity differs; HOLD")
+
+        def proven_current_change(key, original_revision, *, access):
+            current = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (key.token,),
+            ).fetchone()
+            if current is None or current[0] <= original_revision:
+                return False
+            withdrawn = current[2] == 0
+            if access and current[2] == 1:
+                value = json.loads(current[1])
+                validate_access(value)
+                withdrawn = value["status"] == "withdrawn"
+            if not withdrawn:
+                return False
+            original = db.execute(
+                "SELECT valid FROM graph_history WHERE token=? AND revision=?",
+                (key.token, original_revision),
+            ).fetchone()
+            history = db.execute(
+                "SELECT value,valid,event_bot,event_persona,event_session,"
+                "event_id FROM graph_history WHERE token=? AND revision=?",
+                (key.token, current[0]),
+            ).fetchone()
+            if (original != (1,) or history is None
+                    or history[:2] != (current[1], current[2])
+                    or history[2:4] != namespace.as_tuple):
+                raise UnavailableGuard("V3 recovery withdrawal has no graph history")
+            event = db.execute(
+                "SELECT revisions,invalidated,epoch_revision FROM graph_events "
+                "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+                history[2:6],
+            ).fetchone()
+            expected = [key.token, current[0]]
+            if (event is None or expected not in json.loads(
+                    event[1] if current[2] == 0 else event[0])
+                    or event[2] > epoch.revision):
+                raise UnavailableGuard("V3 recovery withdrawal event differs")
+            return True
+
+        source = source_key(*namespace.as_tuple, binding.source_id)
+        access = access_key(*namespace.as_tuple, binding.source_id)
+        return (proven_current_change(source, binding.source_revision,
+                                      access=False)
+                or proven_current_change(access, binding.access_revision,
+                                         access=True))
 
     def _first_ingress_recovery_item_locked_v1(
         self, namespace, installation_id, metadata, epoch, now, row,
