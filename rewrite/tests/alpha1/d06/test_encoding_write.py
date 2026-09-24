@@ -291,6 +291,95 @@ class EncodingWriteTests(unittest.TestCase):
                 audience="owner", purpose="context",
             )
 
+    def test_held_first_ingress_compilation_requires_original_result_and_keeps_hold(self):
+        import json
+        from sylanne3.authority_service.v2_model_egress_contract import (
+            ModelEgressObservationV1, ModelTerminalReceiptV2,
+        )
+        from sylanne3.authority_service.v2_model_result_read_contract import ModelResultReadV1
+        from sylanne3.runtime_contracts import DomainProposal
+
+        self.seed()
+        baseline_value = {
+            "baseline_id": "baseline-1", "source_refs": [self.source.token],
+            "perspective_ref": self.perspective.token,
+            "then_feeling_versions": [{"ref": self.feeling.token, "revision": 1}],
+            "interpretation_versions": [{"ref": self.interpretation.token, "revision": 1}],
+            "as_known_at": None, "projection_policy_ref": "policy-1",
+            "projection_policy_version": "v1", "basis_version": "scheme-1",
+            "parameter_version": "params-1", "salience_interval": None,
+            "tone_interval": None,
+            "unknown_reasons": ["salience_interval:unknown", "tone_interval:unknown"],
+        }
+        self.store.graph_commit(GraphCandidate(
+            self.event("baseline"), (GraphVersion(self.baseline, 0),),
+            (GraphWrite(self.baseline, baseline_value),),
+        ))
+        context = EncodingContext(
+            self.event_ref.token, self.perspective.token, (self.feeling.token,),
+            (self.interpretation.token,), (),
+            tuple((key.token, 1) for key in
+                  (self.source, self.event_ref, self.perspective, self.feeling,
+                   self.interpretation, self.baseline)),
+        )
+        result = {"text": json.dumps({
+            "event_summary": "A promise was reported",
+            "quoted_details": [{"quote": "promise", "salience": 0.8}],
+            "possible_meanings": ["trust"], "possible_feelings": ["relief"],
+        })}
+        receipt = CallReceipt("completed", "operation-1", "attempt-1", "call-1",
+                              "a" * 64, "provider-1", "model-1", "provider-call-1",
+                              {}, {}, "confirmed", "eligible", False, "start-1", "finish-1")
+        claim = self.pipeline.prepare_first_ingress_encoding(
+            "source-1", result, receipt, context,
+            encoding_baseline_ref=self.baseline.token,
+            audience="owner", purpose="context",
+        )
+        observation = ModelEgressObservationV1(
+            "authority-1", "namespace-1", "worker-1", "operation-1", "call-1",
+            "a" * 64, "completed", json.dumps(result, sort_keys=True, separators=(",", ":")),
+            (), (), "provider-call-1",
+        )
+        terminal = ModelTerminalReceiptV2(
+            "b" * 64, "call-1", "a" * 64, "c" * 64,
+            observation.digest, "sha256:" + "d" * 64, "installation-1", "e" * 64,
+        )
+        read = ModelResultReadV1("call-1", observation, terminal)
+        held = replace(claim, authority_observation_digest=observation.digest,
+                       authority_operation_id=observation.operation_id)
+        envelope = self.envelope(held.prepared, baseline=True)
+        with self.assertRaisesRegex(TypeError, "candidate encoding"):
+            self.adapter.compile_encoding_v2(
+                envelope, held.prepared, encoding_baseline_ref=self.baseline.token)
+        compiled = self.pipeline.compile_first_ingress_c02_v2(
+            envelope, held, read, audience="owner", purpose="context",
+        )
+        self.assertEqual(compiled.status, "candidate_hold")
+        self.assertNotIsInstance(compiled, DomainProposal)
+        self.assertEqual(compiled.proposal.typed_writes[1].value["then_feeling_refs"],
+                         [self.feeling.token])
+        self.assertEqual(compiled.possible_feelings, ("relief",))
+        self.assertNotIn("possible_feelings", compiled.proposal.typed_writes[1].value)
+        D06DomainProvider().validate(compiled.proposal)
+        with self.assertRaisesRegex(ValueError, "original Authority result"):
+            self.pipeline.compile_first_ingress_c02_v2(
+                envelope, replace(held, authority_observation_digest="f" * 64),
+                read, audience="owner", purpose="context",
+            )
+        with self.assertRaisesRegex(ValueError, "committed read proof"):
+            self.pipeline.compile_first_ingress_c02_v2(
+                self.envelope(held.prepared, baseline=True, missing=(self.baseline,)),
+                held, read, audience="owner", purpose="context",
+            )
+        self.pipeline.repository.set_access(
+            self.event("withdraw"), "source-1", audiences=("owner",),
+            purposes=("context",), status="withdrawn", recorded_at=3.0,
+        )
+        with self.assertRaisesRegex(PermissionError, "unavailable"):
+            self.pipeline.compile_first_ingress_c02_v2(
+                envelope, held, read, audience="owner", purpose="context",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

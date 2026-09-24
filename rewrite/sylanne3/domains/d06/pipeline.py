@@ -31,7 +31,7 @@ from ...runtime_contracts import canonical_digest
 from ...memory_types import access_key
 from ...memory_types import episode_key, subjective_trace_key, subjective_trace_v2_key
 from ...memory_types import validate_episode, validate_subjective_trace, validate_subjective_trace_v2
-from ...runtime_contracts import NamespaceId, SourceQualification
+from ...runtime_contracts import CommandEnvelope, DomainProposal, NamespaceId, SourceQualification
 from ...graph_types import AtomKey, GraphSnapshot
 from ..d04 import AffectCoupling, AffectScheme
 from . import (
@@ -114,6 +114,23 @@ class PreparedFirstIngressEncoding:
     status: str = "candidate_hold"
     authority_observation_digest: str | None = None
     authority_operation_id: str | None = None
+
+
+@dataclass(frozen=True)
+class HeldFirstIngressC02:
+    """Compiled D06 material awaiting fresh D11 Authority and fence admission."""
+
+    proposal: DomainProposal
+    source_ref: str
+    encoding_baseline_ref: str
+    call_id: str
+    request_digest: str
+    observation_digest: str
+    result_digest: str
+    authority_operation_id: str
+    possible_meanings: tuple[str, ...]
+    possible_feelings: tuple[str, ...]
+    status: str = "candidate_hold"
 
 
 def validate_first_encoding_authority_result(
@@ -619,6 +636,64 @@ class D06MemoryPipeline:
         return replace(
             prepared, authority_observation_digest=read.observation.digest,
             authority_operation_id=read.observation.operation_id,
+        )
+
+    def compile_first_ingress_c02_v2(
+        self, envelope, held: PreparedFirstIngressEncoding,
+        read: ModelResultReadV1, *, audience: str, purpose: str,
+    ) -> HeldFirstIngressC02:
+        """Recheck a held model candidate and compile C02 without granting adoption.
+
+        The returned wrapper is deliberately not a DomainProposal. D11 must
+        repeat the live Authority read and source/worker/cancel checks before
+        it may use the enclosed proposal in a coordinated graph transaction.
+        """
+        if (type(held) is not PreparedFirstIngressEncoding
+                or held.status != "candidate_hold"
+                or held.prepared.status != "candidate_hold"
+                or type(read) is not ModelResultReadV1):
+            raise TypeError("held first-ingress candidate and original read required")
+        if type(envelope) is not CommandEnvelope:
+            raise TypeError("typed C02 envelope required")
+        if (held.authority_observation_digest != read.observation.digest
+                or held.authority_operation_id != read.observation.operation_id
+                or held.receipt_claim.call_id != read.call_id
+                or held.receipt_claim.call_digest != read.observation.request_digest):
+            raise ValueError("original Authority result identity differs")
+        result = read.observation.result
+        if (type(result) is not dict
+                or canonical_digest(result) != held.result_digest):
+            raise ValueError("original Authority result digest differs")
+        if (envelope.authority.purpose != purpose
+                or envelope.authority.audience != (audience,)):
+            raise ValueError("C02 envelope source access scope differs")
+        trace = held.prepared.proposal.trace
+        proposal = held.prepared.proposal
+        context = EncodingContext(
+            proposal.episode.event_ref, trace.perspective_ref,
+            trace.then_feeling_refs, trace.interpretation_refs,
+            trace.detail_weights, proposal.read_versions,
+        )
+        fresh = self.prepare_first_ingress_encoding(
+            held.prepared.source_ref, result, held.receipt_claim, context,
+            encoding_baseline_ref=held.encoding_baseline_ref,
+            audience=audience, purpose=purpose,
+        )
+        if (fresh.prepared != held.prepared
+                or fresh.result_digest != held.result_digest
+                or fresh.possible_meanings != held.possible_meanings
+                or fresh.possible_feelings != held.possible_feelings):
+            raise RuntimeError("held encoding or committed baseline changed")
+        compiled = self.adapter.compile_encoding_v2(
+            envelope, replace(fresh.prepared, status="candidate"),
+            encoding_baseline_ref=held.encoding_baseline_ref,
+        )
+        return HeldFirstIngressC02(
+            compiled, held.prepared.source_ref, held.encoding_baseline_ref,
+            read.call_id, read.observation.request_digest,
+            read.observation.digest, held.result_digest,
+            read.observation.operation_id,
+            held.possible_meanings, held.possible_feelings,
         )
 
     def retrieve_candidates(
