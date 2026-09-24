@@ -34,7 +34,7 @@ def intent(**changes):
         budget_lease_id="lease-1", budget_reservation_operation_id="reserve-1",
         budget_reservation_digest="c" * 64, budget_ceiling=(("USD", 100),),
         provider_id="provider-1", model_id="model-1",
-        provider_config_digest="d" * 64,
+        provider_config_digest="d" * 64, max_output_tokens=256,
     )
     return replace(value, **changes)
 
@@ -55,7 +55,15 @@ def test_reopen_exact_identity_and_conflict(tmp_path):
         with pytest.raises(AuthorityUnavailable):
             store.prepare(intent(budget_ceiling=(("USD", 101),)))
         with pytest.raises(AuthorityUnavailable):
+            store.prepare(intent(max_output_tokens=512))
+        with pytest.raises(AuthorityUnavailable):
             store.read("call-1", subject="another", namespace="bot:persona")
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_max_output_tokens_requires_positive_exact_integer(limit):
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        intent(max_output_tokens=limit)
 
 
 def test_dispatch_marker_survives_restart_and_cannot_repeat(tmp_path):

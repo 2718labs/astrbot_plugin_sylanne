@@ -83,6 +83,7 @@ class AstrBotModelProvider:
             response = await client.chat.completions.create(
                 model=self._descriptor.model_id,
                 messages=messages, stream=False,
+                max_completion_tokens=request.max_output_tokens,
             )
             if (not isinstance(response, ChatCompletion)
                     or len(response.choices) != 1

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import json
 import pytest
 
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
@@ -24,7 +25,8 @@ def envelope():
 def request(**changes):
     values = dict(envelope=envelope(), call_id="call", provider_id="provider", model_id="model",
                   required_capabilities=frozenset({"structured"}), privacy_tier="private",
-                  prompt_template_digest="a" * 64, payload={"input_ref": "input"}, timeout_seconds=0.05)
+                  prompt_template_digest="a" * 64, payload={"input_ref": "input"},
+                  timeout_seconds=0.05, max_output_tokens=128)
     values.update(changes); return ModelCallRequest(**values)
 
 
@@ -33,11 +35,15 @@ def test_call_digest_binds_timeout_and_required_capabilities():
     shorter_timeout = request(timeout_seconds=0.01)
     changed_capabilities = request(
         required_capabilities=frozenset({"structured", "tool"}))
+    changed_output_limit = request(max_output_tokens=64)
     assert original.digest != shorter_timeout.digest
     assert original.digest != changed_capabilities.digest
     assert shorter_timeout.digest != changed_capabilities.digest
+    assert original.digest != changed_output_limit.digest
     assert request(timeout_seconds=0.05).digest == original.digest
     assert request(required_capabilities=frozenset({"structured"})).digest == original.digest
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        request(max_output_tokens=0)
 
 
 class Provider:
@@ -226,6 +232,26 @@ def test_http_adapter_requires_host_attestation_and_never_borrows_a_credential()
         pass
     else:
         raise AssertionError("unattested configuration must fail before HTTP")
+
+
+def test_generic_http_request_carries_output_limit_without_claiming_enforcement():
+    descriptor = replace(Provider().descriptor, timeout_cancellable=False)
+    adapter = VerifiedHttpProvider(
+        descriptor,
+        VerifiedHttpConfiguration("https://provider.invalid/v1", "credential:provider", True),
+        lambda _: "test-secret",
+    )
+    sent = []
+
+    def capture(body, secret, timeout):
+        sent.append((body, secret, timeout))
+        return '{"status":"completed","result":{"text":"ok"}}'
+
+    adapter._post = capture
+    response = run(adapter.invoke(request(max_output_tokens=73), asyncio.Event()))
+    assert response.status == "completed"
+    assert len(sent) == 1
+    assert json.loads(sent[0][0])["max_output_tokens"] == 73
 
 
 def test_provider_receipt_cannot_claim_non_dispatch_after_usage_or_false_cancellation():

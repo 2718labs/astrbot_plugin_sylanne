@@ -165,6 +165,7 @@ class ModelCallRequest:
     prompt_template_digest: str
     payload: Mapping[str, Any]
     timeout_seconds: float
+    max_output_tokens: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.envelope, CommandEnvelope):
@@ -181,6 +182,8 @@ class ModelCallRequest:
         except (TypeError, ValueError) as exc: raise ValueError("payload must be JSON-safe") from exc
         if not isinstance(self.timeout_seconds, (int, float)) or isinstance(self.timeout_seconds, bool) or not 0 < self.timeout_seconds <= 300:
             raise ValueError("timeout_seconds must be in (0,300]")
+        if type(self.max_output_tokens) is not int or self.max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be a positive integer")
         if self.envelope.identity.operation_id == self.call_id:
             raise ValueError("call_id must be distinct from operation_id")
 
@@ -195,7 +198,8 @@ class ModelCallRequest:
                                  "required_capabilities": sorted(self.required_capabilities),
                                  "privacy_tier": self.privacy_tier,
                                  "template": self.prompt_template_digest, "payload": dict(self.payload),
-                                 "timeout_seconds": float(self.timeout_seconds)})
+                                 "timeout_seconds": float(self.timeout_seconds),
+                                 "max_output_tokens": self.max_output_tokens})
 
 
 @dataclass(frozen=True)
@@ -295,8 +299,9 @@ class VerifiedHttpProvider:
         if cancellation.is_set(): return ProviderResponse("not_dispatched", None, {}, {}, None)
         secret = self._credential()
         payload = json.dumps({"model": request.model_id, "call_id": request.call_id,
-                              "operation_id": request.identity.operation_id,
-                              "payload": dict(request.payload)}, separators=(",", ":"), allow_nan=False).encode("utf-8")
+                               "operation_id": request.identity.operation_id,
+                               "max_output_tokens": request.max_output_tokens,
+                               "payload": dict(request.payload)}, separators=(",", ":"), allow_nan=False).encode("utf-8")
         try:
             raw = await asyncio.to_thread(self._post, payload, secret, request.timeout_seconds)
         except (HTTPError, URLError, TimeoutError, OSError) as exc:

@@ -55,6 +55,7 @@ class ModelEgressIntentV1:
     provider_id: str
     model_id: str
     provider_config_digest: str
+    max_output_tokens: int
 
     def __post_init__(self) -> None:
         for name in (
@@ -73,9 +74,11 @@ class ModelEgressIntentV1:
             "delete_epoch", "graph_epoch", "graph_revision",
             "authority_activation_generation", "authority_revocation_epoch",
             "authority_deletion_seq", "authority_execution_seq",
+            "max_output_tokens",
         ):
             _integer(getattr(self, name), name, positive=name in {
-                "worker_fence", "fence_epoch", "authority_activation_generation"})
+                "worker_fence", "fence_epoch", "authority_activation_generation",
+                "max_output_tokens"})
         if (type(self.source_refs) is not tuple or not self.source_refs
                 or len(set(self.source_refs)) != len(self.source_refs)):
             raise ValueError("source references must be a nonempty unique tuple")

@@ -55,7 +55,7 @@ def call_request():
     )
     return ModelCallRequest(
         envelope, "call", "provider-1", "model-1", frozenset({"text"}),
-        "private", "a" * 64, {"prompt": "say hello"}, 0.2,
+        "private", "a" * 64, {"prompt": "say hello"}, 0.2, 64,
     )
 
 
@@ -135,6 +135,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.seen_umo, [UMO])
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.requests[0][0], self.host_thread)
+        self.assertIn(b'"max_completion_tokens":64', self.requests[0][1].content)
         self.assertEqual(self.shared_client.max_retries, 2)
 
     async def test_500_429_and_timeout_each_make_one_request(self):
