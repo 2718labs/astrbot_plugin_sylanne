@@ -249,6 +249,63 @@ class NativeV2FFITests(unittest.TestCase):
         self.assertLess(result.trajectory_error, old_envelope)
         self.assertTrue(keepalive)
 
+    def test_near_equal_nonlinear_avf_certificate_contains_decimal_root(self) -> None:
+        offsets = (ctypes.c_uint32 * 2)(0, 1)
+        indices = (ctypes.c_uint32 * 1)(0)
+        one = (ctypes.c_double * 1)(1.0)
+        empty_offsets = (ctypes.c_uint32 * 2)(0, 0)
+        empty_indices = (ctypes.c_uint32 * 0)()
+        empty_values = (ctypes.c_double * 0)()
+        alpha = (ctypes.c_double * 1)(0.5)
+        previous = (ctypes.c_double * 1)(0.7)
+        drive = (ctypes.c_double * 1)(0.7 + 0.5 * math.tanh(0.7) + 1e-11)
+        iterate = (ctypes.c_double * 1)(0.7)
+        positive = self._csr(1, 1, offsets, indices, one)
+        empty = self._csr(1, 1, empty_offsets, empty_indices, empty_values)
+        step = ABI2StepInput(
+            ctypes.sizeof(ABI2StepInput), 2, 1,
+            positive, positive, empty, positive, alpha,
+            previous, drive, iterate, 0.1, 0.0, 80, 1e-14, 0.0,
+        )
+        output = (ctypes.c_double * 1)()
+        result = ABI2StepResult()
+        status = self.library.sylanne3_v2_step(
+            ctypes.byref(step), output, 1, ctypes.byref(result)
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(result.certificate_flags, ABI2_FIXED_BLOCK_INTERVAL_V1)
+        self.assertGreater(output[0] - previous[0], 0.0)
+        self.assertLess(output[0] - previous[0], 1e-11)
+
+        with localcontext() as context:
+            context.prec = 80
+            d = Decimal.from_float
+            x, h, u, nonlinear_alpha = (
+                d(previous[0]), d(step.h), d(drive[0]), d(alpha[0])
+            )
+
+            def log_cosh(value: Decimal) -> Decimal:
+                return ((value.exp() + (-value).exp()) / 2).ln()
+
+            def residual(y: Decimal) -> Decimal:
+                if y == x:
+                    secant = (x.exp() - (-x).exp()) / (x.exp() + (-x).exp())
+                else:
+                    secant = (log_cosh(y) - log_cosh(x)) / (y - x)
+                return y - x + h * ((x + y) / 2 + nonlinear_alpha * secant - u)
+
+            lower, upper = x - Decimal('1e-8'), x + Decimal('1e-8')
+            self.assertLess(residual(lower), 0)
+            self.assertGreater(residual(upper), 0)
+            for _ in range(180):
+                midpoint = (lower + upper) / 2
+                if residual(midpoint) < 0:
+                    lower = midpoint
+                else:
+                    upper = midpoint
+            error = abs(d(output[0]) - (lower + upper) / 2)
+            self.assertLessEqual(error, d(result.iteration_error))
+
     def test_nonzero_boundary_remains_diagnostic(self) -> None:
         step, keepalive = self._linear_input()
         step.boundary_eta = 0.01

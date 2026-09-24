@@ -403,11 +403,33 @@ pub(crate) fn verify_joint_step(
             return Err(VerifierError::NonlinearArgumentOutOfRange);
         }
         // The AVF quotient is the integral mean of tanh on this segment.
-        // Its monotone hull remains sound at coincident arguments; when the
-        // endpoint difference excludes zero, intersect it with the independently
-        // enclosed log-cosh secant to make useful tight step certificates.
+        // Its monotone hull is sound even for coincident arguments. Midpoint
+        // quadrature has mean error at most sup|tanh''| * delta^2 / 24;
+        // |tanh''| <= 2 globally, so delta^2 / 12 is a verified remainder.
+        // This stays useful when the log-cosh secant loses digits at tiny delta.
         let mut quotient = finite_interval(hull.tanh()?)?;
         let difference = finite_interval(ay[row].sub(ax[row])?)?;
+        let midpoint_argument = finite_interval(ax[row].add(ay[row])?.div(two)?)?;
+        let midpoint_argument = Interval::new(
+            midpoint_argument.lower().max(hull.lower()),
+            midpoint_argument.upper().min(hull.upper()),
+        )?;
+        let delta_abs = difference.lower().abs().max(difference.upper().abs());
+        let radius = finite_interval(
+            Interval::point(delta_abs)?
+                .mul(Interval::point(delta_abs)?)?
+                .div(Interval::point(12.0)?)?,
+        )?
+        .upper();
+        let midpoint_mean = finite_interval(
+            midpoint_argument
+                .tanh()?
+                .add(Interval::new(-radius, radius)?)?,
+        )?;
+        quotient = Interval::new(
+            quotient.lower().max(midpoint_mean.lower()),
+            quotient.upper().min(midpoint_mean.upper()),
+        )?;
         if difference.lower() > 0.0 || difference.upper() < 0.0 {
             let energy_difference = finite_interval(ay[row].log_cosh()?.sub(ax[row].log_cosh()?)?)?;
             let secant = finite_interval(energy_difference.div(difference)?)?;
@@ -1074,6 +1096,27 @@ mod tests {
         let argument = 0.125_f64;
         let exact = 0.25 + 0.4 * 0.5 * argument.tanh();
         contains(envelope.gradient[0], exact);
+    }
+
+    #[test]
+    fn near_equal_avf_arguments_need_a_second_order_mean_bound() {
+        let values = [1.0];
+        let x = [0.7];
+        let y = [0.7 + 1e-12];
+        let input = JointVerificationInput {
+            k: scalar_matrix(&values),
+            r: scalar_matrix(&values),
+            j: SparseMatrix::new(1, 1, &[0, 0], &[], &[]),
+            a: scalar_matrix(&values),
+            alpha: &[0.5],
+            x: &x,
+            y: &y,
+            h: 0.1,
+            drive: &[0.0],
+        };
+        let envelope = verify_joint_step(&input).unwrap();
+        let width = envelope.gradient[0].upper() - envelope.gradient[0].lower();
+        assert!(width < 2e-13, "near-equal AVF mean width: {width}");
     }
 
     #[test]
