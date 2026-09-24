@@ -28,6 +28,7 @@ from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVe
 from .current_worker_model_result_graph_verifier import PinnedCurrentWorkerModelResultGraphVerifier
 from .v2_worker_model_result_attempts import AuthorityV2WorkerModelResultAttempts
 from .v2_worker_model_result_read_service import AuthorityV2WorkerModelResultReadService
+from .v2_worker_result_read_fact_service import AuthorityV2WorkerResultReadFactService
 from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 from .v2_owner_proof import AuthorityV2OwnerProofStore, OwnerProofAcceptanceV1
@@ -52,6 +53,7 @@ def compose_local_owner_authority(
     model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
     accounting_observers_v2: Mapping[str, tuple[str, str]] | None = None,
     worker_result_readers_v2: Mapping[str, tuple[str, str]] | None = None,
+    worker_result_fact_committers_v2: Mapping[str, tuple[str, str]] | None = None,
     self_identity_readers_v2: Mapping[str, tuple[str, str]] | None = None,
     model_result_source_purposes: Mapping[str, str] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
@@ -249,6 +251,21 @@ def compose_local_owner_authority(
             installation_id=installed.installation_id,
             read_subject="mtls:sha256:" + observer[0],
             holder=installed.administrator_holder)
+    fact_committers = dict(worker_result_fact_committers_v2 or {})
+    fact_services = {}
+    for namespace, committer in fact_committers.items():
+        installed = (installations_v2.get(committer)
+                     if type(committer) is tuple and len(committer) == 2 else None)
+        if (namespace not in worker_result_reads or installed is None
+                or not any(peer == committer[0] and profile == committer[1]
+                               and mapped == namespace
+                               for (peer, profile, _), mapped in
+                               namespace_bindings_v2.items())):
+            raise AuthorityUnavailable("C02 fact committer installation differs")
+        fact_services[namespace] = AuthorityV2WorkerResultReadFactService(
+            worker_reads=worker_result_reads[namespace],
+            committer_subject="mtls:sha256:" + committer[0],
+            committer_holder=installed.administrator_holder)
     accounting_observers = dict(accounting_observers_v2 or {})
     accounting_services = {}
     for namespace, observer in accounting_observers.items():
@@ -271,6 +288,8 @@ def compose_local_owner_authority(
         v2_model_result_reads=result_reads,
         v2_worker_model_result_reads=worker_result_reads,
         worker_result_readers_v2=worker_result_readers_v2,
+        v2_worker_result_read_facts=fact_services,
+        worker_result_fact_committers_v2=fact_committers,
         model_observers_v2=model_observers_v2,
         v2_accounting=accounting_services,
         accounting_observers_v2=accounting_observers,

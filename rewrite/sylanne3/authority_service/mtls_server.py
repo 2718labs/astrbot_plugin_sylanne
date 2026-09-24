@@ -60,6 +60,11 @@ from .v2_worker_model_result_contract import (
 from .v2_worker_model_result_read_service import (
     AuthorityV2WorkerModelResultReadService, WorkerResultDeliveryV1,
 )
+from .v2_worker_result_read_fact_contract import (
+    WorkerResultReadFactRequestV1, from_wire as worker_fact_from_wire,
+    to_wire as worker_fact_to_wire,
+)
+from .v2_worker_result_read_fact_service import AuthorityV2WorkerResultReadFactService
 from .current_worker_model_result_graph_verifier import (
     PinnedCurrentWorkerModelResultGraphVerifier,
 )
@@ -225,6 +230,8 @@ class AuthorityRpcServer:
         v2_model_result_reads: Mapping[str, AuthorityV2ModelResultReadService] | None = None,
         v2_worker_model_result_reads: Mapping[str, AuthorityV2WorkerModelResultReadService] | None = None,
         worker_result_readers_v2: Mapping[str, tuple[str, str]] | None = None,
+        v2_worker_result_read_facts: Mapping[str, AuthorityV2WorkerResultReadFactService] | None = None,
+        worker_result_fact_committers_v2: Mapping[str, tuple[str, str]] | None = None,
         model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_accounting: Mapping[str, AuthorityV2AccountingMaintenanceService] | None = None,
         accounting_observers_v2: Mapping[str, tuple[str, str]] | None = None,
@@ -423,6 +430,27 @@ class AuthorityRpcServer:
             raise TypeError("worker results require installed original model and reader")
         self._v2_worker_model_result_reads = worker_reads
         self._worker_result_readers_v2 = worker_readers
+        fact_services = dict(v2_worker_result_read_facts or {})
+        fact_committers = dict(worker_result_fact_committers_v2 or {})
+        if (set(fact_services) != set(fact_committers)
+                or any(type(namespace) is not str
+                       or namespace not in worker_reads
+                       or type(service) is not AuthorityV2WorkerResultReadFactService
+                       or service._reads is not worker_reads[namespace]
+                       or type(fact_committers[namespace]) is not tuple
+                       or len(fact_committers[namespace]) != 2
+                       or fact_committers[namespace] not in installed
+                       or not any(peer == fact_committers[namespace][0]
+                                      and profile == fact_committers[namespace][1]
+                                      and mapped == namespace
+                                      for (peer, profile, _), mapped in bindings.items())
+                       or (service._committer_subject, service._committer_holder) != (
+                           "mtls:sha256:" + fact_committers[namespace][0],
+                           installed[fact_committers[namespace]].administrator_holder)
+                       for namespace, service in fact_services.items())):
+            raise TypeError("worker read fact requires designated installed C02 committer")
+        self._v2_worker_result_read_facts = fact_services
+        self._worker_result_fact_committers_v2 = fact_committers
         if v2_accounting is not None and not isinstance(v2_accounting, Mapping):
             raise TypeError("Authority accounting service mapping required")
         accounting_services = dict(v2_accounting or {})
@@ -777,6 +805,28 @@ class AuthorityRpcServer:
                 return _DeferredWorkerDelivery(
                     {"result": result_wire},
                     service, credential, delivery)
+            if method == "worker_result_read_fact_v1":
+                if set(command) != {"namespace", "fact_request"}:
+                    raise AuthorityUnavailable("worker read fact command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                peer = (credential.certificate_sha256, profile_id)
+                service = self._v2_worker_result_read_facts.get(namespace)
+                if (service is None
+                        or self._worker_result_fact_committers_v2.get(namespace) != peer
+                        or service._committer_subject != subject):
+                    raise AuthorityUnavailable("designated C02 committer unavailable")
+                request = worker_fact_from_wire(
+                    command["fact_request"], WorkerResultReadFactRequestV1)
+                if (request.read_request.authority_id != self._authority_id()
+                        or request.read_request.authority_namespace != namespace
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            request.read_request.namespace)) != namespace):
+                    raise AuthorityUnavailable("C02 committer installation differs")
+                fact = service.current(credential=credential, request=request)
+                return {"fact": worker_fact_to_wire(fact)}
             if method in {"accounting_begin_v1", "accounting_validate_v1",
                           "accounting_finish_v1", "accounting_recover_finish_v1"}:
                 expected = ({"namespace", "request"} if method in {
