@@ -7,7 +7,7 @@ claim or returns a platform handoff authorization.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import math
 
@@ -79,6 +79,14 @@ def _authority_digest(raw_digest: str) -> str:
     return "sha256:" + raw_digest
 
 
+def _authority_namespace(namespace: NamespaceId) -> str:
+    # Imported at call time because GraphCoordinator imports this module for
+    # its private prerequisite callback.
+    from ..graph_coordinator import namespace_ref
+
+    return namespace_ref(namespace)
+
+
 def read_final_claim_prerequisite(
     db, namespace: NamespaceId, binding: ExecutionBindingV2,
     claimed_receipt: MutationReceiptV2, handoff_id: str, *, now_utc: float,
@@ -105,7 +113,8 @@ def read_final_claim_prerequisite(
             or pending.permit.fence_epoch != binding.permit.fence_epoch
             or pending.permit.revision != binding.permit.revision + 1
             or claimed_receipt.updated_revision != binding.permit.revision + 2
-            or binding.namespace != "/".join(namespace.as_tuple)):
+            or binding.namespace != _authority_namespace(namespace)
+            or binding.graph_namespace != "/".join(namespace.as_tuple)):
         raise CurrentDispatchHold("claim does not continue the original dispatch P0")
     loaded = load_request(db, namespace, binding.origin.admission_ref)
     if loaded is None:
@@ -139,12 +148,13 @@ def read_final_claim_prerequisite(
     )
     origin = binding.origin
     expected_command = (
-        origin.namespace, origin.operation_id, origin.activity_id,
+        binding.graph_namespace, origin.operation_id, origin.activity_id,
         origin.effect_id, origin.attempt_id, origin.payload_digest,
         origin.platform_capability_ref, origin.verified_check_refs,
         origin.dispatch_generation,
         origin.activation_generation, origin.worker_fence,
-        origin.content_fence, origin.cancel_epoch, origin.footprint,
+        origin.content_fence, origin.cancel_epoch,
+        replace(origin.footprint, namespace=binding.graph_namespace),
         origin.proactive_contact, origin.segment_authorization_ref,
         origin.segment_manifest_digest, origin.segment_index,
         origin.segment_count, origin.contact_policy_check_ref,
@@ -228,7 +238,8 @@ def assemble_final_claim_evidence(
             or claimed_receipt.durable_state != "committed"
             or claimed_receipt.pending.prepared_receipt is None
             or claimed_receipt.pending.prepared_receipt.durable_state != "committed"
-            or binding.namespace != "/".join(namespace.as_tuple)):
+            or binding.namespace != _authority_namespace(namespace)
+            or binding.graph_namespace != "/".join(namespace.as_tuple)):
         raise CurrentDispatchHold("final claim P0/P2 or admission identity differs")
     identity = intent.identity
     if (query != QueryEpoch(namespace, "all", projection.graph_epoch)

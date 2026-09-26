@@ -10,6 +10,7 @@ from sylanne3.authority_service.v2_contract import (
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
     PendingMutationV2,
 )
+from sylanne3.graph_coordinator import namespace_ref
 from sylanne3.runtime.dispatch_admission import load_request
 from sylanne3.runtime.dispatch_current_source_budget import CurrentDispatchHold
 from sylanne3.runtime.dispatch_final_claim import read_final_claim_prerequisite
@@ -21,20 +22,22 @@ from test_dispatch_current_source_budget import _admitted
 def _chain(db, namespace):
     receipt, request = load_request(db, namespace, "admission:one")
     admission = receipt.admission
+    authority_namespace = namespace_ref(namespace)
+    authority_footprint = replace(request.footprint, namespace=authority_namespace)
     anchor = RestoreAnchor(
-        "authority:test", request.namespace, request.activation_generation,
+        "authority:test", authority_namespace, request.activation_generation,
         "deletion:test", 0, "genesis", "execution:test", 0, "genesis", 0,
         "proof:test",
     )
     permit = FencePermitV2(
-        "authority:test", request.namespace, "subject:test", "holder:test",
+        "authority:test", authority_namespace, "subject:test", "holder:test",
         request.activation_generation, "dispatch", request.operation_id,
         "A" * 43, 1, 1, anchor, request.effect_id,
         "sha256:" + request.command_digest,
-        "sha256:" + hashlib.sha256(request.footprint._json().encode()).hexdigest(),
+        "sha256:" + hashlib.sha256(authority_footprint._json().encode()).hexdigest(),
     )
     origin = ExecutionBindingV1(
-        permit=permit, namespace=request.namespace,
+        permit=permit, namespace=authority_namespace,
         activity_id=request.activity_id, effect_id=request.effect_id,
         attempt_id=request.attempt_id, operation_id=request.operation_id,
         dispatch_generation=request.dispatch_generation,
@@ -46,7 +49,7 @@ def _chain(db, namespace):
         adapter_ref="adapter:test", account_ref=admission.account_ref,
         destination_ref=admission.destination_ref,
         worker_fence=request.worker_fence, content_fence=request.content_fence,
-        cancel_epoch=request.cancel_epoch, footprint=request.footprint,
+        cancel_epoch=request.cancel_epoch, footprint=authority_footprint,
         proactive_contact=request.proactive_contact,
         segment_authorization_ref=request.segment_authorization_ref,
         segment_manifest_digest=(
