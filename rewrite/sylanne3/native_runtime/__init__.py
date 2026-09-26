@@ -43,6 +43,12 @@ from .initial_box_trajectory import (
     run_fixed_block_box_linear_readout_math,
     run_fixed_block_box_trajectory_math,
 )
+from .authored_root_initial_box import (
+    AuthoredRootInitialBoxBlockMathCandidate,
+    AuthoredRootInitialBoxMathCandidate,
+    run_authored_root_initial_box_math,
+    verify_authored_root_initial_box_math,
+)
 from .d04_candidate import (
     D04CandidateError,
     D04FixedBlockCandidate,
@@ -87,6 +93,10 @@ __all__ = [
     "run_fixed_block_box_trajectory_math",
     "FixedBlockBoxLinearReadoutMathTranscript",
     "run_fixed_block_box_linear_readout_math",
+    "AuthoredRootInitialBoxBlockMathCandidate",
+    "AuthoredRootInitialBoxMathCandidate",
+    "run_authored_root_initial_box_math",
+    "verify_authored_root_initial_box_math",
     "D04CandidateError",
     "D04FixedBlockCandidate",
     "D04FixedBlockBoxTrajectoryCandidate",
