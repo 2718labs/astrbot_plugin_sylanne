@@ -21,7 +21,8 @@ from ...runtime_contracts import (
     RUNTIME_SCHEMA,
     schema_hash,
 )
-from ...graph_types import TypeSpec
+from ...graph_types import AtomKey, GraphWrite, Owner, TypeSpec, owner_grant_key
+from ...memory_types import access_key
 from ...runtime_contracts import CheckReceipt, VersionedRef
 from ..d08.execution import ActionIntent
 
@@ -309,6 +310,84 @@ class ContactClaim:
         object.__setattr__(self, "observations", observations)
 
 
+def contact_policy_key(namespace: NamespaceId, policy_id: str) -> AtomKey:
+    _id(policy_id, "policy_id")
+    return AtomKey(Owner("persona", *namespace.as_tuple), "d10.contact_policy.v1", policy_id)
+
+
+def opportunity_key(namespace: NamespaceId, opportunity_id: str) -> AtomKey:
+    _id(opportunity_id, "opportunity_id")
+    return AtomKey(Owner("persona", *namespace.as_tuple), "d10.proactive_opportunity.v1", opportunity_id)
+
+
+def decode_contact_policy(value: object, namespace: NamespaceId, *, enforce_namespace: bool = True) -> ContactPolicy:
+    fields = frozenset({"policy_id", "version", "subject_ref", "channel", "category",
+                        "consent", "quiet", "quota_limit", "window_start", "window_end",
+                        "owner_grant_ref", "owner_grant_revision", "approval_ref",
+                        "approval_authority_id", "installation_id"})
+    data = _exact_fields(value, fields, "contact policy")
+    grant = AtomKey.from_token(data["owner_grant_ref"])
+    if (grant.type_name != "d11.owner_grant.v1" or grant.owner.kind != "persona"
+            or grant.name != "primary"
+            or enforce_namespace and grant != owner_grant_key(*namespace.as_tuple)):
+        raise ValueError("policy must bind this namespace's Owner grant")
+    if type(data["owner_grant_revision"]) is not int or data["owner_grant_revision"] < 1:
+        raise ValueError("policy Owner grant revision is required")
+    for field in ("approval_ref", "approval_authority_id", "installation_id"):
+        _id(data[field], field)
+    return ContactPolicy(data["policy_id"], namespace, *(data[field] for field in (
+        "version", "subject_ref", "channel", "category", "consent", "quiet",
+        "quota_limit", "window_start", "window_end")))
+
+
+def decode_proactive_opportunity(value: object, namespace: NamespaceId, *, enforce_namespace: bool = True) -> ProactiveOpportunity:
+    fields = frozenset({"opportunity_id", "source_ref", "source_revision", "access_revision",
+                        "subject_ref", "channel", "category", "opens_at", "expires_at"})
+    data = _exact_fields(value, fields, "proactive opportunity")
+    source = AtomKey.from_token(data["source_ref"])
+    if (source.owner.kind != "event" or source.type_name != "memory.source"
+            or source.name != "record"
+            or enforce_namespace and (source.owner.bot, source.owner.persona) != namespace.as_tuple):
+        raise ValueError("opportunity must bind a D06 source in this namespace")
+    for field in ("source_revision", "access_revision"):
+        if type(data[field]) is not int or data[field] < 1:
+            raise ValueError(f"{field} must be a positive exact integer")
+    return ProactiveOpportunity(data["opportunity_id"], namespace, data["source_ref"],
+                                *(data[field] for field in (
+                                    "subject_ref", "channel", "category", "opens_at", "expires_at")))
+
+
+def contact_policy_graph_write(
+    policy: ContactPolicy, *, owner_grant_revision: int, approval_ref: str,
+    approval_authority_id: str, installation_id: str,
+) -> GraphWrite:
+    """Candidate only: W01 must authenticate the Owner/installation approval."""
+    grant = owner_grant_key(*policy.namespace.as_tuple)
+    value = {field: getattr(policy, field) for field in (
+        "policy_id", "version", "subject_ref", "channel", "category", "consent",
+        "quiet", "quota_limit", "window_start", "window_end")}
+    value.update(owner_grant_ref=grant.token, owner_grant_revision=owner_grant_revision,
+                 approval_ref=approval_ref, approval_authority_id=approval_authority_id,
+                 installation_id=installation_id)
+    decode_contact_policy(value, policy.namespace)
+    return GraphWrite(contact_policy_key(policy.namespace, policy.policy_id), value, (grant,))
+
+
+def proactive_opportunity_graph_write(
+    opportunity: ProactiveOpportunity, *, source_revision: int, access_revision: int,
+) -> GraphWrite:
+    """Candidate only: source and access heads require fenced W01 adoption."""
+    source = AtomKey.from_token(opportunity.source_ref)
+    access = access_key(*opportunity.namespace.as_tuple, source.owner.subject)
+    value = {field: getattr(opportunity, field) for field in (
+        "opportunity_id", "source_ref", "subject_ref", "channel", "category",
+        "opens_at", "expires_at")}
+    value.update(source_revision=source_revision, access_revision=access_revision)
+    decode_proactive_opportunity(value, opportunity.namespace)
+    return GraphWrite(opportunity_key(opportunity.namespace, opportunity.opportunity_id),
+                      value, (source, access))
+
+
 class LifeDomain:
     def __init__(self, *, contact_read_verifier: Callable[[ContactPolicyReadSet], bool] | None = None) -> None:
         if contact_read_verifier is not None and not callable(contact_read_verifier):
@@ -345,10 +424,20 @@ class LifeDomain:
             data = _exact_fields(value, frozenset({"contact_id", "communication_action_id", "subject_ref", "channel", "category", "segment_effects", "observations", "status", "policy_id", "policy_version"}), "contact claim")
             ContactClaim(data["contact_id"], data["communication_action_id"], data["subject_ref"], data["channel"], data["category"], tuple(data["segment_effects"]), tuple(tuple(item) for item in data["observations"]), data["status"], data["policy_id"], data["policy_version"])
 
+        validation_namespace = NamespaceId("catalogue", "validation")
+
+        def policy(value: object) -> None:
+            decode_contact_policy(value, validation_namespace, enforce_namespace=False)
+
+        def opportunity(value: object) -> None:
+            decode_proactive_opportunity(value, validation_namespace, enforce_namespace=False)
+
         return (
             D10TypeSpec("d10.life_project.v1", "d10", schema_hash({"d10.life_project.v1": 1}), ("persona",), "state", project),
             D10TypeSpec("d10.activity_recipe.v1", "d10", schema_hash({"d10.activity_recipe.v1": 1}), ("persona",), "state", recipe),
             D10TypeSpec("d10.contact_claim.v1", "d10", schema_hash({"d10.contact_claim.v1": 1}), ("persona",), "state", contact),
+            D10TypeSpec("d10.contact_policy.v1", "d10", schema_hash({"d10.contact_policy.v1": 1}), ("persona",), "state", policy),
+            D10TypeSpec("d10.proactive_opportunity.v1", "d10", schema_hash({"d10.proactive_opportunity.v1": 1}), ("persona",), "state", opportunity),
         )
 
     def proposal_for(self, envelope: CommandEnvelope, contribution_keys: tuple[str, ...] = ()) -> DomainProposal:
