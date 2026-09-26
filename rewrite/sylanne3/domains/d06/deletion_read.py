@@ -466,7 +466,47 @@ def read_deletion_closure_candidate_from_coordinator(
             pair = (dependent.key, dependent.revision)
             if pair not in history_closure:
                 history_closure.add(pair)
-                pending.append(dependent)
+                pending.append(pair)
+    # Historical semantic references may not have corresponding graph edges.
+    # Pull available interpretation versions into this bounded closure and
+    # continue through their reverse-history dependents.
+    for key, revision in tuple(history_closure):
+        row = history_by_version.get((key, revision))
+        if (row is None or key.type_name not in {
+                "memory.subjective_trace.v1", "memory.subjective_trace.v2"}):
+            continue
+        if row.atom.value.get("episode_ref") not in episode_tokens:
+            continue
+        try:
+            for token in row.atom.value["interpretation_refs"]:
+                try:
+                    ref = AtomKey.from_token(token)
+                except (TypeError, ValueError):
+                    missing.append("unresolved_historical_interpretation_ref")
+                    continue
+                if ((ref.owner.bot, ref.owner.persona) != namespace.as_tuple
+                        or ref.type_name != "memory.interpretation"):
+                    missing.append("unresolved_historical_interpretation_ref")
+                    continue
+                referenced_versions = {
+                    pair for pair in history_by_version if pair[0] == ref
+                }
+                current = d06_atoms.get(ref)
+                if not referenced_versions and (current is None or not current.valid):
+                    missing.append("unresolved_historical_interpretation_ref")
+                for pair in referenced_versions - history_closure:
+                    history_closure.add(pair)
+                    pending.append(pair)
+        except (TypeError, KeyError, ValueError):
+            missing.append("unreadable_historical_payload")
+    while pending:
+        version = pending.pop()
+        for dependent in reverse_history.get(GraphVersion(*version), ()):
+            pair = (dependent.key, dependent.revision)
+            if pair not in history_closure:
+                history_closure.add(pair)
+                pending.append((pair[0], pair[1]))
+
     historical_versions = tuple(sorted(
         (GraphVersion(key, revision) for key, revision in history_closure),
         key=lambda item: (item.key.token, item.revision),
@@ -503,6 +543,10 @@ def read_deletion_closure_candidate_from_coordinator(
             elif kind in {"memory.subjective_trace.v1", "memory.subjective_trace.v2"}:
                 if value["episode_ref"] in episode_tokens:
                     traces.add(key)
+                    interpretations.update(
+                        AtomKey.from_token(ref) for ref in value["interpretation_refs"]
+                        if ref in by_key
+                    )
             elif kind == "memory.association.v1":
                 if ({value["source_ref"], value["target_ref"], *value["basis_source_refs"]}
                         & affected_tokens):
@@ -525,7 +569,8 @@ def read_deletion_closure_candidate_from_coordinator(
     complete = first.complete and query_complete and not any(
         item in unique_missing for item in (
             "unread_historical_pages", "unread_current_d06_pages",
-            "current_snapshot_drift",
+            "current_snapshot_drift", "unresolved_historical_interpretation_ref",
+            "unreadable_historical_payload",
         )
     )
     source_descendants = {

@@ -10,9 +10,11 @@ from sylanne3.domains.d06.deletion_read import (
     read_deletion_closure_candidate_from_coordinator,
 )
 from sylanne3.graph_coordinator import AuthorityDenied, GraphCoordinator
-from sylanne3.graph_store import GraphStore, ProductionGraphStore
+from sylanne3.graph_store import (
+    DeletionDependencyEdge, DeletionHistoryRow, GraphStore, ProductionGraphStore,
+)
 from sylanne3.graph_types import (
-    AtomKey, GraphCandidate, GraphVersion, GraphWrite, Owner, TypeRegistry,
+    AtomKey, GraphAtom, GraphCandidate, GraphVersion, GraphWrite, Owner, TypeRegistry,
 )
 from sylanne3.runtime.c02_bundle_codec import c02_bundle_to_wire
 from sylanne3.memory_types import SourceRecord, source_key
@@ -237,6 +239,74 @@ def test_coordinator_candidate_includes_current_and_historical_d06_dependencies(
     )
     assert limited.status == "partial_hold"
     assert not limited.scan_complete
+
+
+@pytest.mark.parametrize("interpretation_history_available", [True, False])
+def test_historical_trace_semantic_interpretation_ref_is_closed_or_reported(
+        deletion_runtime, interpretation_history_available):
+    _, coordinator, _, _, authority, lease, commit, allow_epoch = deletion_runtime
+    root = source_key("bot", "persona", "root")
+    episode = AtomKey(Owner("event", "bot", "persona", "episode"),
+                      "memory.episode.v1", "current")
+    trace = AtomKey(Owner("event", "bot", "persona", "trace"),
+                    "memory.subjective_trace.v1", "record")
+    interpretation = AtomKey(Owner("event", "bot", "persona", "interpretation"),
+                             "memory.interpretation", "current")
+    event = AtomKey(Owner("event", "bot", "persona", "event"),
+                    "d03.world_event", "current")
+    commit("root", (GraphWrite(root, _source("root").to_dict()),))
+    commit("episode", (GraphWrite(episode, {
+        "episode_id": "episode", "source_refs": [root.token], "event_ref": event.token,
+    }),))
+    allow_epoch()
+
+    original_read = coordinator.read_deletion_snapshot_candidate
+    history_trace = GraphAtom(trace, 1, {
+        "trace_id": "trace", "episode_ref": episode.token,
+        "perspective_ref": "perspective", "then_feeling_refs": [],
+        "interpretation_refs": [interpretation.token], "detail_weights": [],
+    })
+    history_rows = None
+
+    def read_with_historical_trace(*args, **kwargs):
+        nonlocal history_rows
+        candidate = original_read(*args, **kwargs)
+        if history_rows is None:
+            root_atom = candidate.snapshot.get(root)
+            history_rows = (
+                DeletionHistoryRow(root_atom, "session", "root", 0),
+                DeletionHistoryRow(history_trace, "session", "trace-old", 1),
+            )
+            if interpretation_history_available:
+                history_interpretation = GraphAtom(interpretation, 1, {
+                    "interpretation_id": "interpretation", "source_ids": ["root"],
+                    "subject_id": "self", "claim": "historical", "status": "confirmed",
+                    "valid_from": 1.0, "recorded_at": 1.0, "valid_to": None,
+                })
+                history_rows += (DeletionHistoryRow(
+                    history_interpretation, "session", "interpretation-old", 0),)
+        return replace(
+            candidate, history_rows=history_rows,
+            history_edges=(DeletionDependencyEdge(
+                GraphVersion(trace, 1), GraphVersion(root, 1)),),
+        )
+
+    coordinator.read_deletion_snapshot_candidate = read_with_historical_trace
+
+    result = read_deletion_closure_candidate_from_coordinator(
+        coordinator, authority, lease,
+        ErasureRequest("erase-trace", (root.token,), "all_derived", 1, 0),
+    )
+
+    assert trace.token in result.trace_refs
+    if interpretation_history_available:
+        assert result.status == "hold" and result.scan_complete
+        assert GraphVersion(trace, 1) in result.historical_read_versions
+        assert GraphVersion(interpretation, 1) in result.historical_read_versions
+        assert interpretation.token in result.interpretation_refs
+    else:
+        assert result.status == "partial_hold"
+        assert "unresolved_historical_interpretation_ref" in result.missing_facets
 
 
 def test_coordinator_candidate_rejects_generic_and_released_leases(deletion_runtime):
