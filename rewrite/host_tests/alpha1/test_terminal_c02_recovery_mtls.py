@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
 import ssl
 import tempfile
+
+import pytest
 
 from rewrite.host_tests.alpha1.test_authority_mtls_loopback import (
     AuthorityMtlsLoopbackTests,
@@ -26,6 +28,7 @@ from sylanne3.host.authority_client import (
 from sylanne3.host.mtls_transport import (
     AuthorityTlsProfile, MtlsAuthorityTransport, _Session,
 )
+from sylanne3.host.terminal_c02_recovery_query import PinnedTerminalC02RecoveryQueryV1
 from sylanne3.runtime_contracts import InstallationGrantV2
 
 
@@ -133,11 +136,26 @@ def test_terminal_c02_ack_is_required_on_pinned_mtls_channel(tmp_path, monkeypat
                     request.original_key.authority_id, "mtls:sha256:" + peer_digest,
                     "holder-a", request.original_key.installation_id, "a" * 64,
                     "policy", "v2", binding)
+                with pytest.raises(RuntimeError, match="installation binding"):
+                    PinnedTerminalC02RecoveryQueryV1(
+                        transport=transport, provisioning=provision,
+                        handshake=handshake,
+                        grant=replace(grant, channel_binding_sha256="0" * 64),
+                        namespace=request.original_key.authority_namespace,
+                        request=request)
+                pinned_query = PinnedTerminalC02RecoveryQueryV1(
+                    transport=transport, provisioning=provision,
+                    handshake=handshake, grant=grant,
+                    namespace=request.original_key.authority_namespace,
+                    request=request)
+                assert pinned_query.request == request
                 queried_attempt, queried_fact = await transport.terminal_c02_recovery_query_v1(
                     provision, handshake, grant,
                     namespace=request.original_key.authority_namespace,
                     read_request=request)
                 assert queried_attempt.state == "active" and queried_fact is None
+                with pytest.raises(RuntimeError, match="not finished"):
+                    await pinned_query.query_finished()
                 observation, result_fact = await transport.terminal_c02_recovery_read_v1(
                     provision, handshake, grant,
                     namespace=request.original_key.authority_namespace,
@@ -152,6 +170,7 @@ def test_terminal_c02_ack_is_required_on_pinned_mtls_channel(tmp_path, monkeypat
                     namespace=request.original_key.authority_namespace,
                     read_request=request)
                 assert queried_attempt == attempt and queried_fact == fact
+                assert await pinned_query.query_finished() == fact
                 writer.close()
                 await writer.wait_closed()
             finally:
