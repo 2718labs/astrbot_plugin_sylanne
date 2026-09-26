@@ -1537,7 +1537,7 @@ class AffectProvider:
         raise ValueError("a typed D04 projection contract with purpose and audience is required")
 
     def invalidate(self, refs: tuple[object, ...]) -> tuple[object, ...]:
-        return tuple(refs)
+        raise ValueError("D04 invalidation requires a current correction snapshot and W01 adoption")
 
     def cleanup(self, plan: object) -> tuple[str, object]:
         return "delegated_to_runtime", plan

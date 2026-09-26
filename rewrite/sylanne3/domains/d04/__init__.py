@@ -58,6 +58,7 @@ from .root import (
     encode_root_preset,
     encode_numeric_checkpoint,
 )
+from .source_correction import D04SourceReevaluationCandidate, compile_d04_source_reevaluation
 
 __all__ = (
     "AdvanceRequirements",
@@ -111,4 +112,6 @@ __all__ = (
     "encode_root_checkpoint_candidate",
     "encode_root_preset",
     "encode_numeric_checkpoint",
+    "D04SourceReevaluationCandidate",
+    "compile_d04_source_reevaluation",
 )
