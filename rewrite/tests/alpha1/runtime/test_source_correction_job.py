@@ -50,6 +50,11 @@ def test_correction_acquire_preflight_freezes_real_commit_without_mutation(tmp_p
         with pytest.raises(SourceCorrectionJobHold):
             plan_source_correction_job_acquire(
                 running, "worker-1", now_utc=now + 1, lease_seconds=1)
+        deadline_running = replace(snapshot, job=plan_source_correction_job_acquire(
+            snapshot, "worker-1", now_utc=now, lease_seconds=5))
+        assert plan_source_correction_job_acquire(
+            deadline_running, "worker-1", now_utc=now + 4,
+            lease_seconds=5) == deadline_running.job
         assert db.execute("SELECT phase FROM runtime_jobs WHERE job_id=?",
                           (job_id,)).fetchone() == ("queued",)
         assert db.execute("SELECT phase FROM graph_bundle_outbox WHERE outbox_ref=?",
@@ -131,7 +136,7 @@ def test_correction_apply_rechecks_frozen_identity_inside_v2_write_transaction(t
             db.execute("BEGIN IMMEDIATE")
             acquired = acquire_source_correction_job_in_transaction(
                 db, issuer, snapshot, scope, "worker-1", now_utc=now,
-                lease_seconds=1)
+                fence_holder="worker-1", lease_seconds=1)
             assert acquired.phase == "running" and acquired.fence == 1
             assert db.execute("SELECT phase FROM graph_bundle_outbox WHERE outbox_ref=?",
                               (snapshot.outbox_ref,)).fetchone() == ("pending",)
@@ -142,7 +147,7 @@ def test_correction_apply_rechecks_frozen_identity_inside_v2_write_transaction(t
             with pytest.raises(SourceCorrectionJobHold):
                 acquire_source_correction_job_in_transaction(
                     db, issuer, snapshot, scope, "worker-1", now_utc=now,
-                    lease_seconds=1)
+                    fence_holder="worker-1", lease_seconds=1)
             db.execute("ROLLBACK")
         assert db.execute("SELECT phase FROM runtime_jobs WHERE job_id=?",
                           (job_id,)).fetchone() == ("queued",)

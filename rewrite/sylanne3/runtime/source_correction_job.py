@@ -324,6 +324,17 @@ def plan_source_correction_job_acquire(
           and now_utc < snapshot.quote.valid_until_utc
           and now_utc < snapshot.quote.deadline_utc,
           "correction acquisition deadline expired; HOLD")
+    _need(type(lease_seconds) is int and 1 <= lease_seconds <= 3600,
+          "correction worker lease is invalid; HOLD")
+    signed_deadline = min(snapshot.quote.valid_until_utc,
+                          snapshot.quote.deadline_utc)
+    if snapshot.job.phase == "queued":
+        _need(now_utc + lease_seconds <= signed_deadline,
+              "correction worker lease exceeds signed deadline; HOLD")
+    elif snapshot.job.lease_expires_utc is not None:
+        _need(datetime.fromisoformat(snapshot.job.lease_expires_utc.replace(
+            "Z", "+00:00")).timestamp() <= signed_deadline,
+            "correction worker lease exceeds signed deadline; HOLD")
     _need(snapshot.job.phase == "queued" or (
         snapshot.job.phase == "running" and snapshot.job.lease_holder == holder
         and snapshot.job.lease_expires_utc is not None
@@ -342,7 +353,7 @@ def plan_source_correction_job_acquire(
 def acquire_source_correction_job_in_transaction(
         db: sqlite3.Connection, issuer: D11BudgetJobIssuer,
         snapshot: SourceCorrectionJobSnapshot, scope: FenceScope,
-        holder: str, *, now_utc: float, lease_seconds: int,
+        holder: str, *, fence_holder: str, now_utc: float, lease_seconds: int,
 ) -> PersistentJob:
     """Acquire only after the caller validated its V2 write permit outside lock.
 
@@ -355,7 +366,7 @@ def acquire_source_correction_job_in_transaction(
         raise SourceCorrectionJobHold("correction acquire needs V2 write transaction; HOLD")
     _need(scope.operation == "write" and scope.namespace == snapshot.namespace
           and scope.generation == snapshot.activation_generation
-          and scope.permit.holder == holder
+          and scope.permit.holder == fence_holder
           and _scope_matches_recovery(db, scope)
           and (scope.graph_revision, scope.graph_epoch.revision)
           == (snapshot.graph_revision, snapshot.graph_epoch),

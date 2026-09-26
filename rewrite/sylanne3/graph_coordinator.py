@@ -258,6 +258,23 @@ def _job_acquire_id_matches(
             and all(char in "0123456789abcdef" for char in nonce))
 
 
+def source_correction_acquire_operation_id(
+    namespace: NamespaceId, job_id: str, original_operation_id: str,
+    worker_actor: str, activation_generation: int, attempt_nonce: str,
+) -> str:
+    """Give one D11 correction acquire attempt a job-bound scheduler identity."""
+    if (type(attempt_nonce) is not str or len(attempt_nonce) != 32
+            or any(char not in "0123456789abcdef" for char in attempt_nonce)):
+        raise ValueError("correction acquire nonce must be 32 lowercase hex digits")
+    return "d06-acquire-" + canonical_digest({
+        "schema": "sylanne.d06-source-correction-acquire-id.v1",
+        "namespace": list(namespace.as_tuple), "job_id": job_id,
+        "original_operation_id": original_operation_id,
+        "worker_actor": worker_actor,
+        "activation_generation": activation_generation,
+    }) + "-" + attempt_nonce
+
+
 class AuthorityDenied(PermissionError):
     pass
 
@@ -8971,6 +8988,537 @@ class GraphCoordinator:
         return self.acquire_first_ingress_encoding_job_v2(
             authority, lease, job_id, acquire_operation_id,
             lease_seconds=lease_seconds, _require_baseline_v3=True)
+
+    def _acquire_source_correction_job_v1(
+        self, authority: AuthorityContext, lease: object, job_id: str,
+        acquire_operation_id: str, *, lease_seconds: int,
+    ) -> PersistentJob:
+        """Acquire a committed correction job; leave its head and outbox pending.
+
+        The caller is a trusted D11 scheduler. Authority RPCs occur outside the
+        graph lock; the job mutation, graph projection and V2 receipt share one
+        GraphStore transaction. This is not a reevaluation or cost settlement.
+        """
+        from datetime import datetime, timezone
+
+        from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .runtime.d11_types import (
+            RuntimeOutboxValue, job_graph_write, outbox_graph_write,
+        )
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D11BudgetJobIssuer
+        from .runtime.source_correction_job import (
+            SourceCorrectionJobHold, acquire_source_correction_job_in_transaction,
+            plan_source_correction_job_acquire, read_source_correction_job_snapshot,
+        )
+
+        store = self.__store
+        port = self.__content_fence_v2
+        namespace = authority.namespace
+        if (not isinstance(store, ProductionGraphStore) or port is None
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("installed V2 D11 job and trusted clock are required; HOLD")
+        self._authorize(lease, authority, frozenset({"d11"}))
+        if (authority.issuer_domain != "d11" or "activity" not in authority.owner_scope
+                or authority.worker_fence is not None
+                or type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600
+                or type(acquire_operation_id) is not str
+                or not acquire_operation_id or len(acquire_operation_id) > 128
+                or authority.capability_ref != _operation_capability_ref(
+                    namespace, authority.actor, "d11", frozenset({"d11"}),
+                    authority.activation_generation, acquire_operation_id)):
+            raise AuthorityDenied("D11 correction activity capability differs")
+        try:
+            clock = port.read_ingress_clock(self.__scene_clock_policy)
+            now = trusted_upper(clock)
+            now_text = datetime.fromtimestamp(now, timezone.utc).isoformat().replace(
+                "+00:00", "Z")
+        except Exception as exc:
+            raise UnavailableGuard("correction trusted clock is unavailable; HOLD") from exc
+
+        def read_snapshot():
+            db = store._db
+            db.execute("BEGIN")
+            try:
+                snapshot = read_source_correction_job_snapshot(
+                    db, self.__d11_issuer, namespace, job_id, now_utc=now)
+                db.execute("COMMIT")
+                return snapshot
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+
+        with store._lock:
+            pre_intent = store._db.execute(
+                "SELECT fence_attempt_id,graph_revision,graph_epoch FROM "
+                "graph_job_acquire_intents_v2 WHERE bot=? AND persona=? "
+                "AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            pre_receipt = store._db.execute(
+                "SELECT post_graph_revision,post_graph_epoch FROM "
+                "graph_job_acquire_receipts_v2 WHERE bot=? AND persona=? "
+                "AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            pre_metadata, _ = self._v2_graph_stamp(namespace)
+        active_scope = None
+        if pre_intent is not None:
+            pre_target = pre_metadata.requirements
+            try:
+                pre_anchor = port.current_anchor(
+                    namespace=namespace,
+                    authority_namespace=pre_target.authority_namespace)
+                observed_permit, observed_state = port.get_fence_operation(
+                    namespace=namespace,
+                    authority_namespace=pre_target.authority_namespace,
+                    operation_id=pre_intent[0])
+            except Exception as exc:
+                raise JobAcquireOutcomeUnknown(
+                    acquire_operation_id,
+                    "correction acquire Authority recovery unknown; HOLD") from exc
+            if not self._anchor_matches(pre_target, pre_anchor):
+                raise UnavailableGuard("correction recovery anchor changed; HOLD")
+            if observed_state == "active":
+                if (type(observed_permit) is not FencePermitV2
+                        or observed_permit.operation != "write"
+                        or observed_permit.operation_id != pre_intent[0]
+                        or observed_permit.holder != self.__holder
+                        or observed_permit.subject != port.installation_grant.subject
+                        or observed_permit.pinned_anchor != pre_anchor):
+                    raise UnavailableGuard("correction active write permit differs; HOLD")
+                try:
+                    active_scope = FenceScope(
+                        namespace, pre_target.authority_namespace,
+                        pre_target.activation_generation, "write", pre_intent[0],
+                        observed_permit, pre_anchor,
+                        NamespaceEpoch(*namespace.as_tuple, pre_intent[2]),
+                        pre_intent[1])
+                except (TypeError, ValueError) as exc:
+                    raise UnavailableGuard(
+                        "correction recovery write scope differs; HOLD") from exc
+            elif observed_state not in {"absent", "finished"}:
+                raise UnavailableGuard("correction acquire Authority state differs; HOLD")
+        try:
+            if active_scope is None:
+                snapshot, anchor, metadata, epoch = self._read_v2(
+                    authority, read_snapshot, return_recovery_context=True)
+            else:
+                # A durable write fence may block a new read fence after an
+                # unknown begin or finish. It is independently validated before
+                # and after the pinned SQLite read, without an RPC under lock.
+                if port.validate_fence(active_scope) != active_scope.permit:
+                    raise UnavailableGuard("correction recovery write permit changed; HOLD")
+                with store._lock:
+                    metadata, epoch = self._v2_graph_stamp(namespace)
+                    if (pre_receipt is None and (metadata.graph_revision,
+                                                epoch.revision) != pre_intent[1:3]
+                            or pre_receipt is not None and (
+                                metadata.graph_revision < pre_receipt[0]
+                                or epoch.revision < pre_receipt[1])):
+                        raise UnavailableGuard("correction recovery graph stamp differs; HOLD")
+                    snapshot = read_snapshot()
+                if port.validate_fence(active_scope) != active_scope.permit:
+                    raise UnavailableGuard("correction recovery write permit changed; HOLD")
+                anchor = pre_anchor
+        except (UnavailableGuard, SourceCorrectionJobHold) as exc:
+            raise UnavailableGuard("correction V2 read or identity unavailable; HOLD") from exc
+        try:
+            expected_acquire_id = source_correction_acquire_operation_id(
+                namespace, job_id, snapshot.job.operation_id, authority.actor,
+                authority.activation_generation, acquire_operation_id[-32:])
+        except ValueError as exc:
+            raise AuthorityDenied("correction acquire operation is invalid") from exc
+        if acquire_operation_id != expected_acquire_id:
+            raise AuthorityDenied("correction acquire operation names another job")
+        target = metadata.requirements
+        if (target.namespace != namespace
+                or target.activation_generation != authority.activation_generation
+                or snapshot.activation_generation != target.activation_generation):
+            raise UnavailableGuard("correction activation changed; HOLD")
+        requirements_json = canonical_json(asdict(target))
+        anchor_json = canonical_json(asdict(anchor))
+
+        def digest_for(*, fixed_now: str, expected_revision: int,
+                       expected_fence: int, expected_cancel: int,
+                       graph_revision: int, graph_epoch: int) -> str:
+            return canonical_digest({
+                "schema": "sylanne.d06-source-correction-job-acquire.v1",
+                "namespace": list(namespace.as_tuple), "job_id": job_id,
+                "original_operation_id": snapshot.job.operation_id,
+                "original_bundle_digest": snapshot.original_digest,
+                "original_graph_revision": snapshot.original_graph_revision,
+                "request_digest": snapshot.request_digest,
+                "correction_source_ref": snapshot.correction_source_ref,
+                "source_refs": list(snapshot.source_refs),
+                "head_refs": list(snapshot.head_refs),
+                "target_refs": list(snapshot.target_refs),
+                "outbox_ref": snapshot.outbox_ref,
+                "quote_id": snapshot.quote.quote_id,
+                "quote_version": snapshot.quote.version,
+                "quote_ceiling": dict(snapshot.quote.ceiling),
+                "reservation_digest": snapshot.reservation_digest,
+                "acquire_operation_id": acquire_operation_id,
+                "actor": authority.actor,
+                "activation_generation": authority.activation_generation,
+                "expected_job_revision": expected_revision,
+                "expected_fence": expected_fence,
+                "expected_cancel_epoch": expected_cancel,
+                "fixed_now_utc": fixed_now,
+                "lease_seconds": lease_seconds,
+                "graph_revision": graph_revision, "graph_epoch": graph_epoch,
+            })
+
+        with store._lock:
+            db = store._db
+            intent = db.execute(
+                "SELECT request_digest,job_id,original_operation_id,actor,"
+                "fixed_now_utc,lease_seconds,expected_job_revision,expected_fence,"
+                "expected_cancel_epoch,fence_attempt_id,requirements_json,anchor_json,"
+                "graph_revision,graph_epoch,encoding_binding_json "
+                "FROM graph_job_acquire_intents_v2 WHERE bot=? AND persona=? "
+                "AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            receipt = db.execute(
+                "SELECT request_digest,job_json,permit_json,pre_graph_revision,"
+                "pre_graph_epoch,post_graph_revision,post_graph_epoch,"
+                "finish_request_id,finish_request_digest "
+                "FROM graph_job_acquire_receipts_v2 WHERE bot=? AND persona=? "
+                "AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            rejection = db.execute(
+                "SELECT status,permit_json,graph_revision,graph_epoch,"
+                "finish_request_id,finish_request_digest "
+                "FROM graph_job_acquire_rejections_v2 WHERE bot=? AND persona=? "
+                "AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+        if intent is None:
+            if snapshot.job.phase != "queued":
+                raise UnavailableGuard("correction job already has a worker lease; HOLD")
+            try:
+                planned = plan_source_correction_job_acquire(
+                    snapshot, authority.actor, now_utc=now,
+                    lease_seconds=lease_seconds)
+            except SourceCorrectionJobHold as exc:
+                raise UnavailableGuard(str(exc)) from exc
+            if planned == snapshot.job:
+                raise UnavailableGuard("correction job already acquired; HOLD")
+            request_digest = digest_for(
+                fixed_now=now_text, expected_revision=snapshot.job_revision,
+                expected_fence=snapshot.job.fence,
+                expected_cancel=snapshot.job.cancel_epoch,
+                graph_revision=metadata.graph_revision, graph_epoch=epoch.revision)
+            attempt_id = "d06-acquire-write-" + request_digest[:48]
+            expected_intent = (
+                request_digest, job_id, snapshot.job.operation_id, authority.actor,
+                now_text, lease_seconds, snapshot.job_revision, snapshot.job.fence,
+                snapshot.job.cancel_epoch, attempt_id, requirements_json, anchor_json,
+                metadata.graph_revision, epoch.revision, None,
+            )
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("correction acquire pre-stamp changed")
+                    db.execute(
+                        "INSERT OR IGNORE INTO graph_job_acquire_intents_v2"
+                        "(bot,persona,acquire_operation_id,request_digest,job_id,"
+                        "original_operation_id,actor,fixed_now_utc,lease_seconds,"
+                        "expected_job_revision,expected_fence,expected_cancel_epoch,"
+                        "fence_attempt_id,requirements_json,anchor_json,"
+                        "graph_revision,graph_epoch,encoding_binding_json) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (acquire_operation_id,) + expected_intent,
+                    )
+                    observed = db.execute(
+                        "SELECT request_digest,job_id,original_operation_id,actor,"
+                        "fixed_now_utc,lease_seconds,expected_job_revision,expected_fence,"
+                        "expected_cancel_epoch,fence_attempt_id,requirements_json,anchor_json,"
+                        "graph_revision,graph_epoch,encoding_binding_json "
+                        "FROM graph_job_acquire_intents_v2 WHERE bot=? AND persona=? "
+                        "AND acquire_operation_id=?",
+                        namespace.as_tuple + (acquire_operation_id,),
+                    ).fetchone()
+                    if observed != expected_intent:
+                        raise EventConflict("correction acquire identity was reused")
+                    db.execute("COMMIT")
+                    intent = observed
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+        if (intent[1:4] != (job_id, snapshot.job.operation_id, authority.actor)
+                or intent[5] != lease_seconds or intent[10:12]
+                != (requirements_json, anchor_json) or intent[14] is not None):
+            raise UnavailableGuard("correction acquire intent differs; HOLD")
+        request_digest = digest_for(
+            fixed_now=intent[4], expected_revision=intent[6],
+            expected_fence=intent[7], expected_cancel=intent[8],
+            graph_revision=intent[12], graph_epoch=intent[13])
+        attempt_id = "d06-acquire-write-" + request_digest[:48]
+        if intent[0] != request_digest or intent[9] != attempt_id:
+            raise UnavailableGuard("correction acquire digest differs; HOLD")
+        if receipt is not None and rejection is not None:
+            raise UnavailableGuard("correction acquire terminal ledgers disagree; HOLD")
+
+        def finish_identity(permit, *, rejected=False):
+            finish_id = ("abort:" if rejected else "finish:") + attempt_id
+            finish_digest = "sha256:" + canonical_digest({
+                "operation_id": attempt_id, "permit_token": permit.token,
+                "action": "rejected_no_commit" if rejected else
+                          "finish_source_correction_job_acquire",
+                "business_operation_id": acquire_operation_id,
+                "request_digest": request_digest,
+            })
+            return finish_id, finish_digest
+
+        if receipt is not None or rejection is not None:
+            terminal = receipt if receipt is not None else rejection
+            permit = from_wire(json.loads(terminal[2] if receipt is not None
+                                          else terminal[1]))
+            if (type(permit) is not FencePermitV2
+                    or permit.operation_id != attempt_id
+                    or permit.operation != "write" or permit.holder != self.__holder
+                    or permit.subject != port.installation_grant.subject
+                    or permit.pinned_anchor != anchor):
+                raise UnavailableGuard("correction acquire durable permit differs; HOLD")
+            try:
+                observed, state = port.get_fence_operation(
+                    namespace=namespace,
+                    authority_namespace=target.authority_namespace,
+                    operation_id=attempt_id)
+            except Exception as exc:
+                raise JobAcquireOutcomeUnknown(
+                    acquire_operation_id,
+                    "correction acquire Authority state unknown; HOLD") from exc
+            if observed != permit or state not in {"active", "finished"}:
+                raise UnavailableGuard("correction acquire Authority state differs; HOLD")
+            if receipt is None:
+                if (rejection[0] != "rejected_no_commit"
+                        or rejection[2:4] != intent[12:14]
+                        or rejection[4:6] != finish_identity(permit, rejected=True)):
+                    raise UnavailableGuard("correction acquire rejection differs; HOLD")
+                if state == "active":
+                    scope = FenceScope(
+                        namespace, target.authority_namespace,
+                        target.activation_generation, "write", attempt_id,
+                        permit, anchor, NamespaceEpoch(*namespace.as_tuple,
+                                                       intent[13]), intent[12])
+                    if port.validate_fence(scope) != permit:
+                        raise UnavailableGuard("correction acquire permit changed; HOLD")
+                    port.finish_fence(scope, request_id=rejection[4],
+                                      request_digest=rejection[5])
+                raise UnavailableGuard("correction acquire was rejected; HOLD")
+            if (receipt[0] != request_digest
+                    or receipt[3:5] != intent[12:14]
+                    or receipt[5:7] != (intent[12] + 1, intent[13] + 1)
+                    or receipt[7:9] != finish_identity(permit)):
+                raise UnavailableGuard("correction acquire receipt differs; HOLD")
+            try:
+                historical = PersistentJob(**json.loads(receipt[1]))
+                current_is_live = plan_source_correction_job_acquire(
+                    snapshot, authority.actor, now_utc=now,
+                    lease_seconds=lease_seconds) == snapshot.job
+            except Exception as exc:
+                raise UnavailableGuard("correction acquired lease expired; HOLD") from exc
+            if (historical != snapshot.job or not current_is_live
+                    or historical.lease_holder != authority.actor
+                    or snapshot.graph_revision < receipt[5]
+                    or snapshot.graph_epoch < receipt[6]):
+                raise UnavailableGuard("correction acquired job is no longer current; HOLD")
+            if state == "active":
+                if ((snapshot.graph_revision, snapshot.graph_epoch)
+                        != receipt[5:7]):
+                    raise UnavailableGuard("unresolved correction acquire stamp changed; HOLD")
+                scope = FenceScope(
+                    namespace, target.authority_namespace,
+                    target.activation_generation, "write", attempt_id,
+                    permit, anchor, NamespaceEpoch(*namespace.as_tuple,
+                                                   receipt[4]), receipt[3])
+                if port.validate_fence(scope) != permit:
+                    raise UnavailableGuard("correction acquire permit changed; HOLD")
+                port.finish_fence(scope, request_id=receipt[7],
+                                  request_digest=receipt[8])
+            return historical
+
+        if ((metadata.graph_revision, epoch.revision) != intent[12:14]
+                or (snapshot.job_revision, snapshot.job.fence,
+                    snapshot.job.cancel_epoch) != intent[6:9]):
+            raise UnavailableGuard("uncommitted correction acquire prestate changed; HOLD")
+        fixed_now = datetime.fromisoformat(intent[4].replace("Z", "+00:00")).timestamp()
+        try:
+            planned = plan_source_correction_job_acquire(
+                snapshot, authority.actor, now_utc=fixed_now,
+                lease_seconds=lease_seconds)
+            plan_source_correction_job_acquire(
+                snapshot, authority.actor, now_utc=now,
+                lease_seconds=lease_seconds)
+        except SourceCorrectionJobHold as exc:
+            raise UnavailableGuard(str(exc)) from exc
+        if planned == snapshot.job:
+            raise UnavailableGuard("correction acquire has no new worker lease; HOLD")
+        try:
+            permit = port.begin_fence(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                holder=self.__holder, generation=target.activation_generation,
+                operation="write", operation_id=attempt_id,
+                expected_anchor=anchor, retain_on_unknown=True)
+        except Exception as exc:
+            raise JobAcquireOutcomeUnknown(
+                acquire_operation_id,
+                "correction acquire begin outcome unknown; HOLD") from exc
+        scope = FenceScope(namespace, target.authority_namespace,
+                           target.activation_generation, "write", attempt_id,
+                           permit, anchor, epoch, metadata.graph_revision)
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("correction acquire write permit changed; HOLD")
+        finish_id, finish_digest = finish_identity(permit)
+        job_key = AtomKey.from_token(snapshot.quote.graph_job_ref)
+        outbox_key = AtomKey.from_token(snapshot.outbox_ref)
+        with store._lock:
+            if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                raise UnavailableGuard("correction acquire graph stamp changed; HOLD")
+            guarded_refs = (snapshot.correction_source_ref, *snapshot.source_refs,
+                            *snapshot.head_refs, *snapshot.target_refs)
+            rows = store._db.execute(
+                "SELECT token,revision FROM graph_atoms WHERE token IN (" +
+                ",".join("?" for _ in guarded_refs) + ")", guarded_refs,
+            ).fetchall()
+            outbox_row = store._db.execute(
+                "SELECT value FROM graph_atoms WHERE token=?",
+                (snapshot.outbox_ref,),
+            ).fetchone()
+        if len(rows) != len(set(guarded_refs)):
+            raise UnavailableGuard("correction acquire graph reads absent; HOLD")
+        if outbox_row is None:
+            raise UnavailableGuard("correction acquire outbox is absent; HOLD")
+        pending_outbox = RuntimeOutboxValue(**json.loads(outbox_row[0]))
+        candidate = GraphCandidate(
+            Event(Scope(*namespace.as_tuple, snapshot.job.activity_id),
+                  acquire_operation_id, fixed_now,
+                  "source_correction_job_acquire_v1",
+                  {"request_digest": request_digest}),
+            (GraphVersion(job_key, snapshot.job_revision),
+             GraphVersion(outbox_key, snapshot.outbox_revision),
+             *(GraphVersion(AtomKey.from_token(ref), revision)
+               for ref, revision in rows)),
+            (job_graph_write(planned),
+             outbox_graph_write(pending_outbox, job_key)), (epoch,),
+        )
+        transaction_state = {"phase": "before_transaction"}
+
+        def guard(db):
+            try:
+                commit_now = trusted_upper(clock)
+                expires = datetime.fromisoformat(
+                    planned.lease_expires_utc.replace("Z", "+00:00")).timestamp()
+            except Exception as exc:
+                raise UnavailableGuard("correction acquire trusted clock expired; HOLD") from exc
+            if commit_now >= expires:
+                raise UnavailableGuard("correction frozen worker lease expired; HOLD")
+            if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                raise StaleRead("correction acquire graph stamp changed")
+            if db.execute(
+                    "SELECT 1 FROM graph_job_acquire_receipts_v2 WHERE bot=? "
+                    "AND persona=? AND acquire_operation_id=?",
+                    namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone():
+                raise UnavailableGuard("correction acquire receipt appeared before commit")
+            current = read_source_correction_job_snapshot(
+                db, self.__d11_issuer, namespace, job_id, now_utc=commit_now)
+            if current != snapshot:
+                raise StaleRead("correction original identity changed")
+            acquired = acquire_source_correction_job_in_transaction(
+                db, self.__d11_issuer, snapshot, scope, authority.actor,
+                fence_holder=self.__holder, now_utc=fixed_now,
+                lease_seconds=lease_seconds)
+            if acquired != planned:
+                raise StaleRead("correction acquired job differs from frozen plan")
+            reconcile_runtime_write(db, candidate.writes[0])
+            reconcile_runtime_write(db, candidate.writes[1])
+
+        def receipt_hook(db, graph_receipt):
+            if (graph_receipt.status != "committed"
+                    or len(graph_receipt.revisions) != 2
+                    or {item.key for item in graph_receipt.revisions}
+                    != {job_key, outbox_key}):
+                raise UnavailableGuard("correction job graph write was not committed")
+            store.cas_graph_recovery_metadata(
+                metadata, metadata.requirements,
+                _capability=self.__graph_capability)
+            db.execute(
+                "INSERT INTO graph_job_acquire_receipts_v2"
+                "(bot,persona,acquire_operation_id,request_digest,job_json,"
+                "permit_json,pre_graph_revision,pre_graph_epoch,"
+                "post_graph_revision,post_graph_epoch,finish_request_id,"
+                "finish_request_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                namespace.as_tuple + (acquire_operation_id, request_digest,
+                    canonical_json(asdict(planned)), canonical_json(to_wire(permit)),
+                    metadata.graph_revision, epoch.revision,
+                    metadata.graph_revision + 1, graph_receipt.epoch.revision,
+                    finish_id, finish_digest),
+            )
+
+        try:
+            GraphStore.graph_commit(
+                store, candidate, _guard=guard, _receipt_hook=receipt_hook,
+                _capability=self.__graph_capability,
+                _transaction_state=transaction_state)
+        except Exception as exc:
+            if transaction_state["phase"] not in {"before_transaction", "rolled_back"}:
+                raise JobAcquireOutcomeUnknown(
+                    acquire_operation_id,
+                    "correction acquire commit outcome unknown; HOLD") from exc
+            abort_id, abort_digest = finish_identity(permit, rejected=True)
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise UnavailableGuard("correction acquire rollback cannot be proven")
+                    db.execute(
+                        "INSERT OR IGNORE INTO graph_job_acquire_rejections_v2"
+                        "(bot,persona,acquire_operation_id,status,permit_json,"
+                        "graph_revision,graph_epoch,finish_request_id,"
+                        "finish_request_digest) VALUES(?,?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (acquire_operation_id,
+                            "rejected_no_commit", canonical_json(to_wire(permit)),
+                            metadata.graph_revision, epoch.revision,
+                            abort_id, abort_digest),
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+            try:
+                port.finish_fence(scope, request_id=abort_id,
+                                  request_digest=abort_digest)
+            except Exception as finish_exc:
+                raise JobAcquireOutcomeUnknown(
+                    acquire_operation_id,
+                    "correction acquire rejection finish unknown; HOLD") from finish_exc
+            raise
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("correction acquire permit changed after commit")
+            with store._lock:
+                current, current_epoch = self._v2_graph_stamp(namespace)
+                if (current.graph_revision != metadata.graph_revision + 1
+                        or current_epoch.revision != epoch.revision + 1):
+                    raise UnavailableGuard("correction acquire committed stamp differs")
+            port.finish_fence(scope, request_id=finish_id,
+                              request_digest=finish_digest)
+        except Exception as exc:
+            raise JobAcquireOutcomeUnknown(
+                acquire_operation_id,
+                "correction acquire finish outcome unknown; HOLD") from exc
+        return planned
 
     def acquire_first_ingress_encoding_job_v2(
         self, authority: AuthorityContext, lease: object, job_id: str,
