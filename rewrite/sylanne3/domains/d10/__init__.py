@@ -21,7 +21,7 @@ from ...runtime_contracts import (
     RUNTIME_SCHEMA,
     schema_hash,
 )
-from ...graph_types import AtomKey, GraphWrite, Owner, TypeSpec, owner_grant_key
+from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeSpec, owner_grant_key
 from ...memory_types import access_key
 from ...runtime_contracts import CheckReceipt, VersionedRef
 from ..d08.execution import ActionIntent
@@ -446,6 +446,72 @@ class LifeDomain:
         return DomainProposal("d10", "d10.proposal.v1", schema_hash({"domain": "d10", "proposal": 1}),
                               envelope, (), DependencySet(), contribution_keys, ())
 
+    @staticmethod
+    def _guarded_version(envelope: CommandEnvelope, key: AtomKey) -> GraphVersion:
+        matches = tuple(item for item in envelope.version_guard.read_versions if item.key == key)
+        if len(matches) != 1:
+            raise ValueError("D10 proposal requires exactly one guarded graph version per input")
+        return matches[0]
+
+    def contact_policy_proposal(
+        self, envelope: CommandEnvelope, policy: ContactPolicy, *, approval_ref: str,
+        approval_authority_id: str, installation_id: str,
+    ) -> DomainProposal:
+        """Owner-approved policy candidate; W01 still authenticates the approval."""
+        if not isinstance(envelope, CommandEnvelope) or not isinstance(policy, ContactPolicy):
+            raise TypeError("D10 policy proposal requires typed envelope and policy")
+        if envelope.authority.namespace != policy.namespace:
+            raise ValueError("policy and envelope namespace differ")
+        grant = owner_grant_key(*policy.namespace.as_tuple)
+        grant_version = self._guarded_version(envelope, grant)
+        write = contact_policy_graph_write(
+            policy, owner_grant_revision=grant_version.revision, approval_ref=approval_ref,
+            approval_authority_id=approval_authority_id, installation_id=installation_id,
+        )
+        if (self._guarded_version(envelope, write.key).revision != policy.version - 1
+                or approval_ref not in envelope.input_refs
+                or policy.policy_id not in envelope.input_refs):
+            raise ValueError("policy revision or approval is not bound to the command")
+        proposal = DomainProposal(
+            "d10", "d10.proposal.v1", self.descriptor.request_schema_hash,
+            envelope, (write,), DependencySet(current_invalidation=(grant_version,)), (), (),
+        )
+        return self.validate(proposal)
+
+    def proactive_opportunity_proposal(
+        self, envelope: CommandEnvelope, opportunity: ProactiveOpportunity,
+    ) -> DomainProposal:
+        """D06-source-derived opportunity candidate; W01 checks access/correction heads."""
+        if not isinstance(envelope, CommandEnvelope) or not isinstance(opportunity, ProactiveOpportunity):
+            raise TypeError("D10 opportunity proposal requires typed envelope and opportunity")
+        if envelope.authority.namespace != opportunity.namespace:
+            raise ValueError("opportunity and envelope namespace differ")
+        source = AtomKey.from_token(opportunity.source_ref)
+        if (source.owner.kind != "event" or source.type_name != "memory.source"
+                or source.name != "record" or
+                (source.owner.bot, source.owner.persona) != opportunity.namespace.as_tuple):
+            raise ValueError("opportunity must bind a same-namespace D06 source")
+        access = access_key(*opportunity.namespace.as_tuple, source.owner.subject)
+        source_version = self._guarded_version(envelope, source)
+        access_version = self._guarded_version(envelope, access)
+        write = proactive_opportunity_graph_write(
+            opportunity, source_revision=source_version.revision,
+            access_revision=access_version.revision,
+        )
+        self._guarded_version(envelope, write.key)
+        if (opportunity.source_ref not in envelope.input_refs
+                or opportunity.source_ref not in envelope.source_qualification.source_refs
+                or opportunity.opportunity_id not in envelope.input_refs):
+            raise ValueError("opportunity source or ID is not bound to the command")
+        proposal = DomainProposal(
+            "d10", "d10.proposal.v1", self.descriptor.request_schema_hash,
+            envelope, (write,), DependencySet(
+                current_invalidation=(source_version, access_version),
+                historical_provenance=(source_version,),
+            ), (), (),
+        )
+        return self.validate(proposal)
+
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):
             raise TypeError("proposal must be DomainProposal")
@@ -453,6 +519,63 @@ class LifeDomain:
             raise ValueError("proposal is not a D10 proposal")
         if proposal.proposal_schema_hash != self.descriptor.request_schema_hash:
             raise ValueError("unrecognized D10 proposal schema")
+        if snapshot is not None and not isinstance(snapshot, GraphSnapshot):
+            raise TypeError("D10 snapshot must be GraphSnapshot")
+        if not proposal.typed_writes:
+            if proposal.dependencies != DependencySet():
+                raise ValueError("empty D10 proposal cannot carry graph dependencies")
+            return proposal
+        if len(proposal.typed_writes) != 1 or proposal.contribution_keys or proposal.required_bundle_parts:
+            raise ValueError("D10 contact proposal requires one typed write only")
+        write = proposal.typed_writes[0]
+        namespace = proposal.envelope.authority.namespace
+        if write.key.owner != Owner("persona", *namespace.as_tuple):
+            raise ValueError("D10 contact write owner differs from envelope")
+        current = self._guarded_version(proposal.envelope, write.key)
+        if snapshot is not None:
+            atom = snapshot.get(write.key)
+            if (atom.revision if atom is not None and atom.valid else 0) != current.revision:
+                raise ValueError("D10 contact write guard differs from snapshot")
+        if write.key.type_name == "d10.contact_policy.v1":
+            policy = decode_contact_policy(write.value, namespace)
+            grant = owner_grant_key(*namespace.as_tuple)
+            grant_version = self._guarded_version(proposal.envelope, grant)
+            if (write.key != contact_policy_key(namespace, policy.policy_id)
+                    or current.revision != policy.version - 1
+                    or write.value["owner_grant_revision"] != grant_version.revision
+                    or write.dependencies != (grant,)
+                    or proposal.dependencies != DependencySet(current_invalidation=(grant_version,))
+                    or write.value["approval_ref"] not in proposal.envelope.input_refs
+                    or policy.policy_id not in proposal.envelope.input_refs):
+                raise ValueError("D10 policy write, approval, or guarded dependency differs")
+            if snapshot is not None:
+                grant_atom = snapshot.get(grant)
+                if grant_atom is None or not grant_atom.valid or grant_atom.revision != grant_version.revision:
+                    raise ValueError("D10 policy Owner grant is absent from snapshot")
+        elif write.key.type_name == "d10.proactive_opportunity.v1":
+            opportunity = decode_proactive_opportunity(write.value, namespace)
+            source = AtomKey.from_token(opportunity.source_ref)
+            access = access_key(*namespace.as_tuple, source.owner.subject)
+            source_version = self._guarded_version(proposal.envelope, source)
+            access_version = self._guarded_version(proposal.envelope, access)
+            if (write.key != opportunity_key(namespace, opportunity.opportunity_id)
+                    or write.value["source_revision"] != source_version.revision
+                    or write.value["access_revision"] != access_version.revision
+                    or write.dependencies != (source, access)
+                    or proposal.dependencies != DependencySet(
+                        current_invalidation=(source_version, access_version),
+                        historical_provenance=(source_version,))
+                    or opportunity.source_ref not in proposal.envelope.input_refs
+                    or opportunity.source_ref not in proposal.envelope.source_qualification.source_refs
+                    or opportunity.opportunity_id not in proposal.envelope.input_refs):
+                raise ValueError("D10 opportunity write or guarded D06 source differs")
+            if snapshot is not None and any(
+                (atom := snapshot.get(ref.key)) is None or not atom.valid
+                or atom.revision != ref.revision for ref in (source_version, access_version)
+            ):
+                raise ValueError("D10 opportunity source or access absent from snapshot")
+        else:
+            raise ValueError("D10 proposal contains an unregistered contact write")
         return proposal
 
     @staticmethod
