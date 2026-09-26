@@ -20,6 +20,7 @@ from ...runtime_contracts import (
     schema_hash,
 )
 from .encoding_baseline import CommittedRef, EncodingBaseline, decode_encoding_baseline
+from .root import root_type_specs
 
 
 def _nonempty(value: object, label: str) -> str:
@@ -726,6 +727,9 @@ class AffectProvider:
             "d04.regulation_observation.v1",
             "d04.recollection_experience.v1",
             "d04.encoding_baseline.v1",
+            "d04.authored_root_preset.v1",
+            "d04.authored_root_candidate.v1",
+            "d04.root_numeric_checkpoint_candidate.v1",
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
@@ -750,7 +754,7 @@ class AffectProvider:
                 schema_hash=schema_hash({"type": name, "version": 1, "writer_domain": "d04"}),
             )
             for name, owner_kinds, storage_role, validator in definitions
-        )
+        ) + root_type_specs()
 
     def compile_scheme(self, draft: AffectScheme, snapshot: object = None) -> AffectScheme:
         if not isinstance(draft, AffectScheme):

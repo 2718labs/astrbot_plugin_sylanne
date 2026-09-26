@@ -26,6 +26,19 @@ from .affect import (
     UnresolvedMechanism,
 )
 from .encoding_baseline import CommittedRef, EncodingBaseline
+from .root import (
+    AuthoredRootCandidate,
+    AuthoredRootPreset,
+    RootAssetBindings,
+    RootBlockIdentity,
+    RootNumericCheckpointCandidate,
+    decode_root_candidate,
+    decode_root_checkpoint_candidate,
+    decode_root_preset,
+    encode_root_candidate,
+    encode_root_checkpoint_candidate,
+    encode_root_preset,
+)
 
 __all__ = (
     "AdvanceRequirements",
@@ -53,4 +66,15 @@ __all__ = (
     "UnresolvedMechanism",
     "CommittedRef",
     "EncodingBaseline",
+    "AuthoredRootCandidate",
+    "AuthoredRootPreset",
+    "RootAssetBindings",
+    "RootBlockIdentity",
+    "RootNumericCheckpointCandidate",
+    "decode_root_candidate",
+    "decode_root_checkpoint_candidate",
+    "decode_root_preset",
+    "encode_root_candidate",
+    "encode_root_checkpoint_candidate",
+    "encode_root_preset",
 )
