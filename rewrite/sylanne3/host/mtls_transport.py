@@ -1648,10 +1648,13 @@ class MtlsAuthorityTransport:
                 or effect.effect_id != start.effect_id
                 or effect.activation_generation != permit.generation
                 or effect.state != "unresolved"
+                or effect.execution_head_seq != anchor.execution_seq
+                or effect.execution_head_digest != anchor.execution_digest
                 or effect.mutation_id != claimed_receipt.pending.mutation_id
                 or effect.effect_seq != claimed_receipt.after_anchor.execution_seq
                 or effect.append_id != claimed_receipt.pending.expected_append_id
-                or effect.append_digest != claimed_receipt.after_anchor.execution_digest):
+                or effect.append_digest != claimed_receipt.after_anchor.execution_digest
+                or effect.observation_id is not None):
             raise RuntimeError("current dispatch handoff binding differs")
         return permit, anchor, effect
 
