@@ -39,7 +39,7 @@ def _write(root: Path, value: dict) -> bytes:
 def test_committed_identity_asset_loads_as_candidate(tmp_path: Path) -> None:
     raw = CATALOGUE_ASSET.read_bytes()
     assert hashlib.sha256(raw).hexdigest() == (
-        "229b4d25fbcccd52507be0fd11a5aff22328a1acfba11985d3c3824c576557f6"
+        "5d56a8de7a98c9792bc850cbd7b62a2a77d0b75e31a0ec02138e5640937d6004"
     )
     (tmp_path / ASSET_NAME).write_bytes(raw)
     loaded = load_d04_tanh_readout_asset(
