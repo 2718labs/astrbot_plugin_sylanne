@@ -62,8 +62,8 @@ class DomainViewRegistry(Protocol):
 class GraphWorkbenchIssuer:
     """Thin D12 issuer over ``GraphCoordinator.query``.
 
-    It supports only C01 and C04.  The remaining D12 commands require their
-    respective domain issuers and deliberately return ``unavailable`` here.
+    It supports C01/C04 reads and dedicated Owner-gated creation, scene and
+    source-correction ports. Other commands require their domain issuers.
     """
 
     def __init__(self, coordinator: object, grants: GrantResolver,
