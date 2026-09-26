@@ -9,17 +9,23 @@ from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.authority_service.v2_execution_bridge import CurrentEffectReadV2
 from sylanne3.contracts import canonical_json
 from sylanne3.domains.d08.execution import ActionIntent, GoalPredicate, RequiredCheckSpec
-from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, Owner
+from sylanne3.graph_types import (
+    AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch, Owner,
+)
+from sylanne3.runtime.d11_types import job_graph_write
 from sylanne3.runtime.dispatch_current_commitments import (
     read_current_d08_action_conflict_evidence, read_current_job_cancellation,
 )
 from sylanne3.runtime.jobs import (
-    PersistentJob, acquire_job, cancel_job, create_job, install_schema,
+    PersistentJob, acquire_job, cancel_job, create_job, get_job, install_schema,
 )
 from sylanne3.runtime.restore_anchor import RestoreAnchor
-from sylanne3.runtime_contracts import OperationIdentity, VersionedRef, canonical_digest
+from sylanne3.runtime_contracts import (
+    OperationIdentity, QueryEpoch, VersionedRef, canonical_digest,
+)
 
 from test_dispatch_current_commitments import _case
+from test_dispatch_action_job_binding import _case as _bound_case
 
 
 def _evidence_case():
@@ -74,6 +80,117 @@ def _job(namespace):
         "2030-01-01T00:00:00Z", "budget:one", "resource:one", {},
         None, None, 0, 0, {}, None,
     )
+
+
+def _bound_evidence_case():
+    db, namespace, intent, admission, _job_row, bind, _load = _bound_case()
+    db.execute("CREATE TABLE graph_epochs(bot TEXT,persona TEXT,revision INTEGER)")
+    db.execute("INSERT INTO graph_epochs VALUES('bot','persona',5)")
+    db.commit()
+    action_key = AtomKey(Owner("activity", "bot", "persona", "activity:one"),
+                         "d08.action_intent.v1", intent.action_id)
+    atom = GraphAtom(action_key, intent.revision,
+                     json.loads(json.dumps(asdict(intent))))
+    snapshot = GraphSnapshot((atom,), (NamespaceEpoch("bot", "persona", 5),))
+    query = QueryEpoch(namespace, "all", 5)
+    anchor = RestoreAnchor(
+        "authority:test", "bot/persona", 1, "deletion:test", 0, "genesis",
+        "execution:test", 2, "sha256:" + "a" * 64, 0, "proof:test")
+    p2 = FencePermitV2(
+        "authority:test", "bot/persona", "subject:test", "holder:test", 1,
+        "dispatch", intent.identity.operation_id, "A" * 43, 1, 3, anchor,
+        intent.identity.effect_id, "sha256:" + "b" * 64,
+        "sha256:" + "c" * 64)
+    effect = CurrentEffectReadV2(
+        "authority:test", "bot/persona", intent.identity.effect_id, 1,
+        "unresolved", 2, anchor.execution_digest, 2, "append:one",
+        anchor.execution_digest, "mutation:one")
+    return db, namespace, intent, admission, bind, snapshot, query, p2, effect
+
+
+def _advance_job_projection(db, namespace, job_id, revision):
+    projected = job_graph_write(get_job(db, job_id))
+    db.execute(
+        "UPDATE graph_atoms SET revision=?,value=? WHERE token=? "
+        "AND bot=? AND persona=?",
+        (revision, canonical_json(projected.value), projected.key.token,
+         *namespace.as_tuple),
+    )
+
+
+def test_durable_action_job_binding_proves_local_link_but_keeps_authority_hold():
+    db, namespace, intent, admission, bind, snapshot, query, p2, effect = (
+        _bound_evidence_case())
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        binding = bind(db, intent, admission)
+        current = read_current_d08_action_conflict_evidence(
+            db, namespace, snapshot, query, intent.action_id, p2, effect)
+        assert current.action_job_binding_digest == binding.digest
+        assert current.job_graph_version.revision == binding.job_graph_revision
+        assert (current.job_id, current.job_fence, current.job_cancel_epoch) == (
+            binding.job_id, 0, 0)
+        assert current.job_cancellation_state == "clear"
+        assert current.action_cancellation_state == "unknown"
+        assert "action_attempt_to_job_binding" not in current.missing_sources
+        assert "current_action_cancellation_read" in current.missing_sources
+        assert "trusted_authority_effect_read_provenance" in current.missing_sources
+        assert "authority_post_graph_p2_cas" in current.missing_sources
+
+        acquired = acquire_job(
+            db, binding.job_id, "worker:one", now_utc="2026-09-26T00:00:00Z",
+            lease_seconds=60)
+        assert acquired.fence == 1
+        stale_projection = read_current_d08_action_conflict_evidence(
+            db, namespace, snapshot, query, intent.action_id, p2, effect)
+        assert "current_bound_job_graph_mismatch" in stale_projection.missing_sources
+        assert "action_attempt_to_job_binding" in stale_projection.missing_sources
+        _advance_job_projection(db, namespace, binding.job_id, 2)
+        running = read_current_d08_action_conflict_evidence(
+            db, namespace, snapshot, query, intent.action_id, p2, effect)
+        assert running.job_fence == 1
+        assert "action_attempt_to_job_binding" not in running.missing_sources
+        assert "current_worker_lease_unverified" in running.missing_sources
+
+        cancel_job(db, binding.job_id, "job-cancel:one", "b" * 64)
+        _advance_job_projection(db, namespace, binding.job_id, 3)
+        cancelled = read_current_d08_action_conflict_evidence(
+            db, namespace, snapshot, query, intent.action_id, p2, effect)
+        assert cancelled.job_cancellation_state == "cancelled"
+        assert cancelled.job_cancel_epoch == 1
+        assert "matching_job_cancelled" in cancelled.missing_sources
+        assert "action_attempt_to_job_binding" not in cancelled.missing_sources
+    finally:
+        db.close()
+
+
+def test_stale_action_or_forged_binding_never_proves_current_link():
+    db, namespace, intent, admission, bind, snapshot, query, p2, effect = (
+        _bound_evidence_case())
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        binding = bind(db, intent, admission)
+        db.execute("UPDATE graph_dispatch_action_job_bindings_v1 "
+                   "SET binding_digest=? WHERE admission_ref=?",
+                   ("0" * 64, admission.admission.admission_ref))
+        with pytest.raises(ValueError, match="binding digest differs"):
+            read_current_d08_action_conflict_evidence(
+                db, namespace, snapshot, query, intent.action_id, p2, effect)
+        db.execute("UPDATE graph_dispatch_action_job_bindings_v1 "
+                   "SET binding_digest=? WHERE admission_ref=?",
+                   (binding.digest, admission.admission.admission_ref))
+        revised = replace(intent, revision=2)
+        revised_atom = GraphAtom(snapshot.atoms[0].key, 2,
+                                 json.loads(json.dumps(asdict(revised))))
+        db.execute("UPDATE graph_atoms SET revision=2,value=? WHERE token=?",
+                   (canonical_json(revised_atom.value), revised_atom.key.token))
+        revised_snapshot = GraphSnapshot((revised_atom,), snapshot.epochs)
+        stale_action = read_current_d08_action_conflict_evidence(
+            db, namespace, revised_snapshot, query, intent.action_id, p2, effect)
+        assert "current_action_job_binding_stale" in stale_action.missing_sources
+        assert "action_attempt_to_job_binding" in stale_action.missing_sources
+    finally:
+        db.close()
 
 
 def test_exact_effect_and_job_cancellation_remain_partial():

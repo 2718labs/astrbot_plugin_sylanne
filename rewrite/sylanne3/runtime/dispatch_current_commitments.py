@@ -7,9 +7,13 @@ import json
 
 from ..authority_service.v2_contract import FencePermitV2
 from ..authority_service.v2_execution_bridge import CurrentEffectReadV2
+from ..contracts import canonical_json
 from ..domains.d08.execution import ActionIntent, ActionOutcome, Commitment, GoalExecutionProvider
 from ..graph_types import AtomKey, GraphSnapshot, GraphVersion
-from ..runtime_contracts import NamespaceId, QueryEpoch
+from ..runtime_contracts import NamespaceId, QueryEpoch, canonical_digest
+from .d11_types import job_graph_write
+from .dispatch_action_job_binding import load_action_job_binding
+from .dispatch_admission import load_admission
 from .jobs import JobConflict, PersistentJob, get_job
 
 
@@ -40,8 +44,8 @@ class CurrentD08ActionConflictEvidenceV1:
 
     `effect_state=clear` means the verified Authority read found no effect at
     its pinned head. For a claimed P2 this is contradictory, so it cannot pass.
-    A job's cancellation observation is not an action cancellation proof until
-    a durable action/attempt-to-job binding exists.
+    The durable action/attempt-to-job binding and current job row are checked
+    together. Independent D08 cancellation authority remains unresolved.
     """
 
     action_id: str
@@ -50,13 +54,15 @@ class CurrentD08ActionConflictEvidenceV1:
     graph_query_epoch: QueryEpoch
     effect_state: str  # clear, unresolved, unknown
     job_cancellation_state: str  # clear, cancelled, unknown
-    action_cancellation_state: str  # currently always unknown
+    action_cancellation_state: str  # independent D08 cancellation remains unknown
     job_id: str | None
     job_fence: int | None
     job_cancel_epoch: int | None
     authority_effect: CurrentEffectReadV2
     status: str = "hold"
     missing_sources: tuple[str, ...] = ()
+    action_job_binding_digest: str | None = None
+    job_graph_version: GraphVersion | None = None
 
 
 @dataclass(frozen=True)
@@ -280,7 +286,7 @@ def read_current_d08_action_conflict_evidence(
 
     blockers = ["trusted_authority_effect_read_provenance",
                 "claimed_append_identity_binding", "action_attempt_to_job_binding",
-                "authority_post_graph_p2_cas"]
+                "current_action_cancellation_read", "authority_post_graph_p2_cas"]
     anchor = p2.pinned_anchor
     effect_state = "unknown"
     if (effect.authority_id != p2.authority_id
@@ -304,9 +310,32 @@ def read_current_d08_action_conflict_evidence(
     else:
         blockers.append("authority_effect_phase_or_append_unproven")
 
-    # The durable job table is in this same graph transaction. Its schema has
-    # no action_id/attempt_id key or uniqueness constraint for this triple.
-    # Even a sole matching row therefore describes a job, not a proven action.
+    # The binding table supplies the action/attempt/admission key missing from
+    # runtime_jobs. Recheck it and the current job projection in this same
+    # transaction; an admission-time binding alone cannot prove current state.
+    binding = None
+    admission = None
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                  "AND name='graph_dispatch_action_job_bindings_v1'").fetchone():
+        bound_row = db.execute(
+            "SELECT admission_ref FROM graph_dispatch_action_job_bindings_v1 "
+            "WHERE bot=? AND persona=? AND action_id=? AND attempt_id=?",
+            namespace.as_tuple + (action_id, identity.attempt_id),
+        ).fetchone()
+        if bound_row is not None:
+            binding = load_action_job_binding(db, namespace, bound_row[0])
+            admission = load_admission(db, namespace, bound_row[0])
+            if binding is None or admission is None:
+                raise ValueError("durable action/job binding disappeared")
+            if ((binding.namespace, binding.action_id, binding.attempt_id,
+                 binding.activity_id, binding.effect_id, binding.operation_id,
+                 binding.action_digest, binding.action_graph_revision) != (
+                    "/".join(namespace.as_tuple), action_id,
+                    identity.attempt_id, identity.activity_id,
+                    identity.effect_id, identity.operation_id,
+                    canonical_digest(intent), intent.revision)):
+                blockers.append("current_action_job_binding_stale")
+
     rows = db.execute(
         "SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? "
         "AND (effect_id=? OR operation_id=?) ORDER BY job_id",
@@ -324,6 +353,8 @@ def read_current_d08_action_conflict_evidence(
     job_fence = None
     job_cancel_epoch = None
     job_cancellation_state = "unknown"
+    binding_digest = None
+    job_graph_version = None
     if len(matching) == 1 and len(rows) == 1:
         job = matching[0]
         job_read = read_current_job_cancellation(db, namespace, job.job_id)
@@ -333,6 +364,30 @@ def read_current_d08_action_conflict_evidence(
         blockers.extend(job_read.missing_sources)
         if job_cancellation_state == "cancelled":
             blockers.append("matching_job_cancelled")
+        if binding is not None and admission is not None:
+            projected = job_graph_write(job)
+            graph_row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms WHERE token=? "
+                "AND bot=? AND persona=? AND type_name='runtime.job'",
+                (projected.key.token, *namespace.as_tuple),
+            ).fetchone()
+            if (binding.job_id != job.job_id
+                    or job.work_kind != "dispatch"
+                    or job.budget_ref != admission.admission.budget_lease_ref
+                    or job.fence < binding.job_fence
+                    or job.cancel_epoch < binding.job_cancel_epoch):
+                blockers.append("current_bound_job_identity_or_epoch_mismatch")
+            elif (graph_row is None or graph_row[2] != 1
+                  or type(graph_row[0]) is not int
+                  or graph_row[0] < binding.job_graph_revision
+                  or graph_row[1] != canonical_json(projected.value)):
+                blockers.append("current_bound_job_graph_mismatch")
+            elif "current_action_job_binding_stale" not in blockers:
+                blockers.remove("action_attempt_to_job_binding")
+                binding_digest = binding.digest
+                job_graph_version = GraphVersion(projected.key, graph_row[0])
+                if job.lease_holder is not None:
+                    blockers.append("current_worker_lease_unverified")
     else:
         blockers.append("unique_current_action_job_unproven")
     return CurrentD08ActionConflictEvidenceV1(
@@ -340,6 +395,8 @@ def read_current_d08_action_conflict_evidence(
         facts.query_epoch, effect_state, job_cancellation_state, "unknown",
         job_id, job_fence, job_cancel_epoch, effect,
         missing_sources=tuple(dict.fromkeys(blockers)),
+        action_job_binding_digest=binding_digest,
+        job_graph_version=job_graph_version,
     )
 
 
