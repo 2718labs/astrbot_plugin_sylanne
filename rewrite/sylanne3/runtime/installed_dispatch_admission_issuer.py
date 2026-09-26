@@ -1,13 +1,9 @@
-"""Installed outbound admission seam with transaction-backed D06 inspection.
-
-This issuer remains HOLD until each required provider and the independent
-deletion/Authority barriers are installed.  A caller's receipt, boolean, or
-snapshot cannot turn a partial inspection into a dispatch admission.
-"""
+"""Installed outbound admission from current graph and authenticated V2 reads."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import json
 import math
 import sqlite3
@@ -15,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from ..domains.d06 import SourceGrantRead, provide_source_grant_check
 from ..domains.d03 import ContextProvider, RoleBindingRequest
+from ..domains.d03 import RoleBinding
 from ..domains.d05 import RelationshipProvider
 from ..domains.d08 import (
     ActionIntent, ActionSchema, ActionSchemaRecord, CommitmentConflictSnapshot,
@@ -23,11 +20,15 @@ from ..domains.d08 import (
 from ..domains.d09 import D09ExpressionProvider
 from ..graph_types import AtomKey, GraphAtom, GraphReceipt, GraphSnapshot, NamespaceEpoch
 from ..runtime.dispatch_candidate import DispatchCandidateEvidenceV1
+from ..runtime.dispatch_candidate import dispatch_segment_payload_ref
+from ..dispatch_runtime import DispatchRequest
+from ..runtime_journal import BudgetConstraint, RecoveryConstraintFootprint
 from ..runtime_contracts import (
     CheckReceipt, FenceScope, NamespaceId, QueryEpoch, VersionedRef,
     canonical_digest,
 )
 from .budget import BudgetError, get_budget_lease, require_budget_family_admissible
+from .dispatch_admission import DispatchAdmissionV1
 from .dispatch_budget_check import provide_dispatch_budget_check
 from .dispatch_current_projection import (
     CurrentDispatchProjectionV1, derive_current_domain_reads,
@@ -35,6 +36,8 @@ from .dispatch_current_projection import (
 )
 from .dispatch_current_commitments import read_current_d08_conflict_facts
 from .dispatch_current_commitment_check import CRITERIA_REF, CRITERIA_VERSION
+from .d11_types import RuntimeOutboxValue, job_graph_write
+from .jobs import JobConflict, get_job
 from .issuers import D02ResourceIssuer, D11BudgetGrantIssuer, IssuerAuthorityDenied
 
 if TYPE_CHECKING:
@@ -59,14 +62,6 @@ class TrustedDispatchAdmissionContextV1:
     graph_receipt: GraphReceipt
     owner_guard: OwnerAuthorizationGuardV1 | None
     current_effect: CurrentEffectReadV2 | None
-
-
-_MISSING_PROVIDER_PORTS = (
-    "d11.execution_journal_current_constraints",
-    "d11.command_provenance.current_provider",
-    "d11.domain_context.current_provider",
-    "d06.independent_deletion_authority_barrier",
-)
 
 
 @dataclass(frozen=True)
@@ -120,6 +115,135 @@ class DispatchOwnerInspectionV1:
     status: str
     missing: tuple[str, ...]
     grant_id: str | None = None
+
+
+@dataclass(frozen=True)
+class DispatchCommandInspectionV1:
+    status: str
+    missing: tuple[str, ...]
+    request: DispatchRequest | None = None
+    budget_ceiling: dict[str, int] | None = None
+    budget_reservation_digest: str | None = None
+
+
+def inspect_current_private_command(
+    db, bundle, candidate: DispatchCandidateEvidenceV1,
+    budget: DispatchBudgetInspectionV1,
+    route: DispatchPrivateRouteInspectionV1, *,
+    trusted_context: TrustedDispatchAdmissionContextV1 | None,
+    now_utc: float,
+) -> DispatchCommandInspectionV1:
+    """Construct a private text command from current D09/D11 graph and ledger."""
+    def hold(reason: str) -> DispatchCommandInspectionV1:
+        return DispatchCommandInspectionV1("hold", (reason,))
+
+    if not getattr(db, "in_transaction", False):
+        return hold("graph.current_write_transaction")
+    if (type(trusted_context) is not TrustedDispatchAdmissionContextV1
+            or budget.status != "check_pass" or route.status != "route_verified"
+            or type(now_utc) not in (int, float) or not math.isfinite(now_utc)):
+        return hold("dispatch.current_authority_budget_route_inputs")
+    if (len(bundle.persistent_job_refs) != 1 or len(bundle.outbox_refs) != 1):
+        return hold("dispatch.unique_d11_job_outbox")
+    try:
+        namespace = trusted_context.scope.namespace
+        identity = bundle.envelope.identity
+        batch = _current_atom(db, namespace, candidate.batch_ref,
+                              "d09.verified_segment_batch.v1").value
+        grant = _current_atom(db, namespace, candidate.grant_ref,
+                              "d08.communication_intent_grant.v1").value
+        next(item for item in D09ExpressionProvider.register_types()
+             if item.name == "d09.verified_segment_batch.v1").validator(batch)
+        grant_type = next(item for item in GoalExecutionProvider().register_types()
+                          if item.name == "d08.communication_intent_grant.v1")
+        frozen_grant = grant_type.validator(grant)
+        job_ref = bundle.persistent_job_refs[0]
+        outbox_ref = bundle.outbox_refs[0]
+        job_atom = _current_atom(db, namespace, job_ref, "runtime.job")
+        outbox_atom = _current_atom(db, namespace, outbox_ref, "runtime.outbox")
+        outbox = RuntimeOutboxValue(**outbox_atom.value)
+        job = get_job(db, outbox.job_id)
+        lease = get_budget_lease(db, budget.lease_id)
+        reservation = db.execute(
+            "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
+            "WHERE lease_id=? AND operation_id=?",
+            (budget.lease_id, identity.operation_id),
+        ).fetchone()
+        if reservation is None:
+            return hold("dispatch.current_budget_reservation_missing")
+        ceiling = json.loads(reservation[1])
+        if (job_atom.value != job_graph_write(job).value
+                or outbox.job_ref != job_ref or outbox.job_id != job.job_id
+                or outbox.phase != "pending" or job.phase != "queued"
+                or (job.bot_id, job.persona_id) != namespace.as_tuple
+                or (job.activity_id, job.operation_id, job.effect_id) != (
+                    identity.activity_id, identity.operation_id, identity.effect_id)
+                or (outbox.activity_id, outbox.operation_id, outbox.effect_id) != (
+                    identity.activity_id, identity.operation_id, identity.effect_id)
+                or outbox.dispatch_generation != trusted_context.scope.generation
+                or outbox.payload_ref != dispatch_segment_payload_ref(
+                    candidate.batch_ref, 0)
+                or reservation[2] != "reserved" or not ceiling
+                or len(ceiling) != 1 or len(lease.limits) != 1
+                or budget.receipt is None
+                or frozen_grant.required_check_refs
+                != tuple(batch["required_check_refs"])
+                or frozen_grant.contact_id != batch["contact_id"]
+                or frozen_grant.segment_manifest_digest
+                != batch["grant_manifest_digest"]):
+            return hold("dispatch.current_job_outbox_budget_batch_differs")
+        dimension, limit = next(iter(lease.limits.items()))
+        if (set(ceiling) != {dimension} or ceiling[dimension] <= 0
+                or lease.state != "active"):
+            return hold("dispatch.narrow_single_dimension_budget")
+        segment = batch["segments"][0]
+        deadline = min(
+            float(batch["valid_until"]),
+            datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp(),
+        )
+        deadline = int(deadline)
+        if deadline <= now_utc:
+            return hold("dispatch.current_job_or_batch_expired")
+        footprint = RecoveryConstraintFootprint(
+            "/".join(namespace.as_tuple), identity.activity_id,
+            identity.effect_id,
+            external_idempotency_ref=outbox.idempotency_key,
+            conflict_keys=(f"target:{frozen_grant.target_ref}",),
+            communication_action=frozen_grant.communication_action_id,
+            contact_id=frozen_grant.contact_id,
+            segment_id=segment["segment_id"],
+            budgets=(BudgetConstraint(
+                lease.lease_id, str(lease.used.get(dimension, 0)),
+                str(lease.reserved.get(dimension, 0)
+                    + lease.unconfirmed.get(dimension, 0)), str(limit),
+            ),),
+        )
+        command_digest = canonical_digest({
+            "operation_id": identity.operation_id,
+            "outbox_ref": outbox_ref,
+            "idempotency_key": outbox.idempotency_key,
+            "batch_ref": candidate.batch_ref,
+            "segment_index": 0,
+            "payload_digest": segment["payload_digest"],
+            "fence_token": trusted_context.scope.permit.token,
+        })
+        request = DispatchRequest(
+            "/".join(namespace.as_tuple), identity.operation_id,
+            identity.activity_id, identity.effect_id, identity.attempt_id,
+            command_digest, outbox.payload_ref, segment["payload_digest"],
+            "platform:astrbot-private-v1", frozen_grant.required_check_refs,
+            outbox.dispatch_generation, trusted_context.scope.generation,
+            job.fence, trusted_context.scope.permit.token,
+            batch["cancellation_epoch"],
+            footprint, False, segment["segment_authorization_ref"],
+            frozen_grant.segment_manifest_digest, 0, 1,
+        )
+    except (sqlite3.OperationalError, JobConflict, BudgetError, KeyError,
+            TypeError, ValueError, StopIteration, json.JSONDecodeError):
+        return hold("dispatch.current_command_journal_read_unavailable")
+    return DispatchCommandInspectionV1(
+        "command_verified", (), request, ceiling, reservation[0],
+    )
 
 
 def inspect_current_owner_grant(
@@ -313,7 +437,15 @@ def inspect_current_d06_source_grant(
         "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
         namespace.as_tuple,
     ).fetchone()
-    if epoch_row is None or epoch_row[0] != candidate.query_epoch:
+    expected_epoch = (trusted_context.graph_receipt.epoch.revision
+                      if type(trusted_context) is TrustedDispatchAdmissionContextV1
+                      else candidate.query_epoch)
+    if (epoch_row is None or epoch_row[0] != expected_epoch
+            or (trusted_context is not None
+                and (expected_epoch != candidate.query_epoch + 1
+                     or trusted_context.scope.graph_epoch.revision
+                     != candidate.query_epoch
+                     or trusted_context.scope.namespace != namespace))):
         raise DispatchAdmissionHold(("d06.current_graph_epoch",))
     guard_row = db.execute(
         "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
@@ -352,7 +484,7 @@ def inspect_current_d06_source_grant(
     if canonical_digest(proof) != candidate.source_proof_digest:
         raise DispatchAdmissionHold(("d06.current_source_access_content",))
     snapshot = GraphSnapshot(tuple(atoms), (
-        NamespaceEpoch(*namespace.as_tuple, candidate.query_epoch),
+        NamespaceEpoch(*namespace.as_tuple, expected_epoch),
     ))
     barrier = False
     if trusted_context is not None:
@@ -408,6 +540,7 @@ def _current_atom(db, namespace: NamespaceId, ref: str, expected_type: str,
 def inspect_current_d03_d05(
     db, candidate: DispatchCandidateEvidenceV1, *,
     context: ContextProvider, now_utc: float,
+    trusted_context: TrustedDispatchAdmissionContextV1 | None = None,
 ) -> DispatchSocialInspectionV1:
     """Issue scoped D03/D05 candidates from a complete current namespace read.
 
@@ -432,7 +565,15 @@ def inspect_current_d03_d05(
             "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
             namespace.as_tuple,
         ).fetchone()
-        if epoch_row is None or epoch_row[0] != candidate.query_epoch:
+        expected_epoch = (trusted_context.graph_receipt.epoch.revision
+                          if type(trusted_context) is TrustedDispatchAdmissionContextV1
+                          else candidate.query_epoch)
+        if (epoch_row is None or epoch_row[0] != expected_epoch
+                or (trusted_context is not None
+                    and (expected_epoch != candidate.query_epoch + 1
+                         or trusted_context.scope.graph_epoch.revision
+                         != candidate.query_epoch
+                         or trusted_context.scope.namespace != namespace))):
             return hold("social.current_graph_epoch")
         epoch = epoch_row[0]
         action_atom = _current_atom(db, namespace, candidate.action_ref,
@@ -682,7 +823,15 @@ def inspect_current_d08_commitments(
             "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
             namespace.as_tuple,
         ).fetchone()
-        if epoch_row is None or epoch_row[0] != candidate.query_epoch:
+        expected_epoch = (trusted_context.graph_receipt.epoch.revision
+                          if type(trusted_context) is TrustedDispatchAdmissionContextV1
+                          else candidate.query_epoch)
+        if (epoch_row is None or epoch_row[0] != expected_epoch
+                or (trusted_context is not None
+                    and (expected_epoch != candidate.query_epoch + 1
+                         or trusted_context.scope.graph_epoch.revision
+                         != candidate.query_epoch
+                         or trusted_context.scope.namespace != namespace))):
             return hold("d08.current_graph_epoch_differs")
         epoch = epoch_row[0]
         rows = db.execute(
@@ -857,7 +1006,7 @@ def inspect_current_d08_commitments(
 
 
 class InstalledDispatchAdmissionIssuer:
-    """The only production integration shape; all incomplete paths HOLD."""
+    """Narrow private admission from installed Authority and current graph reads."""
 
     def __init__(self, *, context: ContextProvider | None = None,
                  d11_issuer: D11BudgetGrantIssuer | None = None,
@@ -865,10 +1014,12 @@ class InstalledDispatchAdmissionIssuer:
         self._context = context
         self._d11 = d11_issuer
         self._d02 = d02_issuer
+        self._issued = None
 
     def issue_dispatch_admission(self, bundle, snapshot, candidate, db, *,
                                  graph_incarnation: str, now_utc: float,
                                  trusted_context: TrustedDispatchAdmissionContextV1 | None = None):
+        self._issued = None
         if not getattr(db, "in_transaction", False):
             raise DispatchAdmissionHold(("graph.current_write_transaction",))
         if type(candidate) is not DispatchCandidateEvidenceV1:
@@ -907,6 +1058,7 @@ class InstalledDispatchAdmissionIssuer:
         if self._context is not None:
             social = inspect_current_d03_d05(
                 db, candidate, context=self._context, now_utc=now_utc,
+                trusted_context=trusted_context,
             )
             social_missing = social.missing
         budget = inspect_current_d11_dispatch_budget(
@@ -923,23 +1075,183 @@ class InstalledDispatchAdmissionIssuer:
             trusted_context=trusted_context,
             graph_incarnation=graph_incarnation,
         )
-        raise DispatchAdmissionHold((
+        command = inspect_current_private_command(
+            db, bundle, candidate, budget, route,
+            trusted_context=trusted_context, now_utc=now_utc,
+        )
+        missing = (
             *inspection.missing, *social_missing, *budget.missing,
             *commitments.missing, *route.missing, *owner.missing,
-            *_MISSING_PROVIDER_PORTS,
+            *command.missing,
+        )
+        if missing:
+            raise DispatchAdmissionHold(missing)
+        if (type(trusted_context) is not TrustedDispatchAdmissionContextV1
+                or type(snapshot) is not GraphSnapshot
+                or len(snapshot.epochs) != 1
+                or trusted_context.scope.namespace != NamespaceId(
+                    action_key.owner.bot, action_key.owner.persona)
+                or trusted_context.projection.coverage != "full"
+                or trusted_context.current_effect.state != "absent"
+                or bundle.envelope.parent_budget_lease_ref != budget.lease_id):
+            raise DispatchAdmissionHold(("dispatch.current_trusted_context_scope",))
+        receipts = (
+            social.role_receipt, social.boundary_receipt,
+            inspection.receipt, commitments.receipt, budget.receipt,
+        )
+        if (any(item is None or item.result != "pass" or item.coverage != "full"
+                for item in receipts)
+                or {item.check_kind for item in action.required_checks}
+                != {"role_binding", "boundary", "source_grant",
+                    "commitment_conflict", "dispatch_budget"}):
+            raise DispatchAdmissionHold(("dispatch.narrow_passive_check_set",))
+        by_kind = {receipt.check_kind: receipt for receipt in receipts}
+        if any(by_kind[spec.check_kind].issuer != spec.provider_id
+               for spec in action.required_checks):
+            raise DispatchAdmissionHold(("dispatch.frozen_check_provider_differs",))
+        receipts = tuple(by_kind[spec.check_kind] for spec in action.required_checks)
+        projection = trusted_context.projection
+        bindings = []
+        for atom in projection.role_bindings:
+            try:
+                binding = RoleBinding(**{
+                    **atom.value, "norm_refs": tuple(atom.value["norm_refs"]),
+                    "source_refs": tuple(atom.value["source_refs"]),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (binding.role_binding_id == atom.key.name
+                    and binding.binding_version == atom.revision
+                    and binding.status == "active"
+                    and binding.scene_ref == route.scene_ref
+                    and binding.target_entity_ref == action.target_ref
+                    and binding.effective_from <= now_utc
+                    and (binding.effective_until is None
+                         or now_utc <= binding.effective_until)):
+                bindings.append(binding)
+        if len(bindings) != 1:
+            raise DispatchAdmissionHold(("d03.unique_current_private_binding",))
+        request = command.request
+        lease = get_budget_lease(db, budget.lease_id)
+        from ..graph_coordinator import budget_operation_digest
+        if command.budget_reservation_digest != budget_operation_digest(
+                bundle.envelope, budget.lease_id, command.budget_ceiling):
+            raise DispatchAdmissionHold(("d11.current_reservation_operation_digest",))
+        deadline = int(min(
+            *(receipt.valid_until for receipt in receipts),
+            float(_current_atom(db, trusted_context.scope.namespace,
+                                candidate.batch_ref,
+                                "d09.verified_segment_batch.v1").value["valid_until"]),
         ))
+        if deadline <= now_utc:
+            raise DispatchAdmissionHold(("dispatch.current_deadline",))
+        admission = DispatchAdmissionV1(
+            namespace="/".join(trusted_context.scope.namespace.as_tuple),
+            graph_incarnation=graph_incarnation,
+            activity_id=action.identity.activity_id,
+            effect_id=action.identity.effect_id,
+            attempt_id=action.identity.attempt_id,
+            operation_id=action.identity.operation_id,
+            dispatch_generation=request.dispatch_generation,
+            admission_ref="admission:" + canonical_digest({
+                "operation_id": request.operation_id,
+                "effect_id": request.effect_id,
+                "candidate": candidate.digest,
+            })[:40],
+            candidate_digest=candidate.digest,
+            request_digest=canonical_digest(request),
+            action_intent_digest=candidate.action_digest,
+            action_intent_schema_version="d08.action_intent.v1",
+            action_schema_digest=candidate.schema_digest,
+            action_schema_version="d08.action_schema.v1",
+            required_checks_digest=canonical_digest(action.required_checks),
+            required_checks_schema_version="d08.required_check_spec.v1",
+            grant_digest=candidate.grant_digest,
+            batch_digest=candidate.batch_digest,
+            segment_index=0,
+            payload_digest=request.payload_digest,
+            account_ref=route.account_ref,
+            destination_ref=route.destination_ref,
+            scene_ref=route.scene_ref,
+            owner_head_ref=owner.grant_id,
+            role_ref=bindings[0].social_role,
+            binding_ref=bindings[0].role_binding_id,
+            object_ref=action.target_ref,
+            action_ref=action.action_id,
+            purpose=action.purpose,
+            audience=(route.destination_ref,),
+            graph_reads=tuple((item.key.token, item.revision)
+                              for item in snapshot.versions),
+            query_epoch=snapshot.epochs[0].revision,
+            access_epoch=candidate.access_epoch,
+            delete_epoch=candidate.delete_epoch,
+            check_receipts=receipts,
+            budget_parent_lease_ref=budget.lease_id,
+            budget_lease_ref=budget.lease_id,
+            budget_reservation_operation_id=request.operation_id,
+            budget_reservation_digest=command.budget_reservation_digest,
+            budget_ceiling=command.budget_ceiling,
+            budget_currency=lease.currency,
+            budget_version=lease.version,
+            contact_reservation_ref=None,
+            utc_deadline=datetime.fromtimestamp(
+                deadline, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            clock_policy_ref=trusted_context.clock_policy.source_id,
+            clock_policy_digest=canonical_digest(asdict(trusted_context.clock_policy)),
+        )
+        self._issued = (db, trusted_context, bundle, snapshot, candidate,
+                        action, budget, route, command, request, admission,
+                        now_utc)
+        return request, admission
 
-    def verify_required_check(self, spec, receipt, snapshot, db) -> bool:
-        return False
+    def verify_required_check(self, spec, receipt, snapshot, db, *,
+                              trusted_context=None) -> bool:
+        state = self._issued
+        return bool(state is not None and state[0] is db
+                    and state[1] is trusted_context and state[3] == snapshot
+                    and receipt in state[10].check_receipts
+                    and spec in state[5].required_checks
+                    and receipt == state[10].check_receipts[
+                        next(i for i, item in enumerate(state[5].required_checks)
+                             if item == spec)])
 
-    def verify_domain_context(self, admission, snapshot, db) -> bool:
-        return False
+    def verify_domain_context(self, admission, snapshot, db, *,
+                              trusted_context=None) -> bool:
+        state = self._issued
+        return bool(state is not None and state[0] is db
+                    and state[1] is trusted_context and state[3] == snapshot
+                    and state[10] == admission
+                    and trusted_context.projection.coverage == "full")
 
-    def verify_command_provenance(self, request, admission, db) -> bool:
-        return False
+    def verify_command_provenance(self, request, admission, db, *,
+                                  trusted_context=None) -> bool:
+        state = self._issued
+        if (state is None or state[0] is not db or state[1] is not trusted_context
+                or state[9] != request or state[10] != admission):
+            return False
+        current = inspect_current_private_command(
+            db, state[2], state[4], state[6], state[7],
+            trusted_context=trusted_context, now_utc=state[11],
+        )
+        return current.status == "command_verified" and current.request == request
 
-    def verify_journal_constraints(self, request, admission) -> bool:
-        return False
+    def verify_journal_constraints(self, request, admission, *,
+                                   trusted_context=None) -> bool:
+        state = self._issued
+        if (state is None or state[1] is not trusted_context
+                or state[9] != request or state[10] != admission):
+            return False
+        effect = trusted_context.current_effect
+        anchor = trusted_context.scope.pinned_anchor
+        verified = (effect.state == "absent"
+                    and (effect.execution_head_seq, effect.execution_head_digest)
+                    == (anchor.execution_seq, anchor.execution_digest)
+                    and request.footprint.effect_id == admission.effect_id
+                    and any(item.parent_budget_ref == admission.budget_lease_ref
+                            and item.upper_bound is not None
+                            for item in request.footprint.budgets))
+        self._issued = None
+        return verified
 
 
 __all__ = [

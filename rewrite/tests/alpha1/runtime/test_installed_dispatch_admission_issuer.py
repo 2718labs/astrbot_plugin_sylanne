@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from sylanne3.graph_types import AtomKey, Owner
-from sylanne3.graph_types import NamespaceEpoch
+from sylanne3.graph_types import GraphReceipt, NamespaceEpoch
 from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.authority_service.v2_execution_bridge import CurrentEffectReadV2
 from sylanne3.domains.d03 import ContextProvider, RoleBinding
@@ -442,7 +442,7 @@ def test_d08_fixed_pre_p2_policy_recomputes_current_goal_and_effect():
                 json.dumps(asdict(value)), 1, name,
             ))
         candidate = replace(candidate, action_digest=canonical_digest(intent),
-                            schema_digest=canonical_digest(schema))
+                            schema_digest=canonical_digest(schema), query_epoch=4)
         anchor = RestoreAnchor("authority", "ns", 1, "deletion", 0,
                                "genesis", "execution", 0, "genesis", 0,
                                "service-proof")
@@ -450,11 +450,13 @@ def test_d08_fixed_pre_p2_policy_recomputes_current_goal_and_effect():
                                 "write", "attempt:one", "t" * 32, 1, 1, anchor)
         scope = FenceScope(NamespaceId("bot", "persona"), "ns", 1, "write",
                            "attempt:one", permit, anchor,
-                           NamespaceEpoch("bot", "persona", 5), 1)
+                           NamespaceEpoch("bot", "persona", 4), 1)
         effect = CurrentEffectReadV2("authority", "ns", "effect:one", 1,
                                      "absent", 0, "genesis")
         trusted = TrustedDispatchAdmissionContextV1(
-            scope, None, None, None, None, None, effect,
+            scope, None, None, None,
+            GraphReceipt("committed", (), (), NamespaceEpoch("bot", "persona", 5)),
+            None, effect,
         )
         passed = inspect_current_d08_commitments(
             db, candidate, trusted_context=trusted, now_utc=2.0,
