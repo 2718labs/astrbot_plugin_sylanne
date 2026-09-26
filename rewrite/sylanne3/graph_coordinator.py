@@ -9632,6 +9632,46 @@ class GraphCoordinator:
                                     authority.activation_generation, "read")
                 return reader()
 
+    def get_committed_dispatch_action_job_binding(
+            self, authority: AuthorityContext, lease: object,
+            admission_ref: str):
+        """Read an admission's historical D08/D11 job identity, never send authority."""
+        from .runtime.dispatch_action_job_binding import load_action_job_binding
+
+        self._authorize(lease, authority, frozenset({"d08", "d09", "d11"}))
+
+        def reader():
+            db = self.__store._db
+            binding = load_action_job_binding(db, authority.namespace, admission_ref)
+            if binding is None:
+                return None
+            if self._get_committed_dispatch_request_locked(
+                    authority.namespace, admission_ref) is None:
+                raise UnavailableGuard("dispatch action/job binding lacks its command")
+            row = db.execute(
+                "SELECT receipt_json FROM graph_bundle_operations WHERE bot=? "
+                "AND persona=? AND operation_id=? AND effect_id=?",
+                authority.namespace.as_tuple + (
+                    binding.operation_id, binding.effect_id),
+            ).fetchone()
+            recorded = (json.loads(row[0]).get("dispatch_action_job_binding")
+                        if row else None)
+            if recorded != {
+                    "schema": binding.schema, "ref": binding.admission_ref,
+                    "digest": binding.digest, "job_id": binding.job_id}:
+                raise UnavailableGuard("dispatch action/job binding differs from graph receipt")
+            return binding
+
+        if (isinstance(self.__store, ProductionGraphStore)
+                and self.__content_fence_v2 is not None):
+            return self._read_v2(authority, reader)
+        with self._content_fence(authority.namespace,
+                                 authority.activation_generation, "read"):
+            with self.__store._lock:
+                self._admit_content(authority.namespace,
+                                    authority.activation_generation, "read")
+                return reader()
+
     def get_committed_dispatch_request(self, authority: AuthorityContext,
                                        lease: object, admission_ref: str):
         """Recover a historical D11 command, never a current platform send permit."""
@@ -13657,6 +13697,18 @@ class GraphCoordinator:
                 }
                 if self.__dispatch_admission_issuer is not None:
                     from .domains.d08 import GoalExecutionProvider
+                    from .runtime.dispatch_action_job_binding import bind_action_job
+
+                    admission_jobs = runtime_admissions[0].jobs
+                    if (len(admission_jobs) != 1
+                            or len(bundle.persistent_job_refs) != 1
+                            or len(bundle.outbox_refs) != 1
+                            or admission_jobs[0].graph_job_ref
+                            != bundle.persistent_job_refs[0]
+                            or set(admission_jobs[0].outbox_refs)
+                            != set(bundle.outbox_refs)):
+                        raise UnavailableGuard(
+                            "dispatch admission requires one D11 job and its outbox")
 
                     d08_types = {spec.name: spec for spec in
                                  GoalExecutionProvider().register_types()}
@@ -13666,10 +13718,11 @@ class GraphCoordinator:
                                   "d08.communication_intent_grant.v1",
                                   "d09.verified_segment_batch.v1",
                               }}
+                    action = d08_types["d08.action_intent.v1"].validator(
+                        linked["d08.action_intent.v1"])
                     admission_receipt = self._issue_dispatch_admission(
                         db, bundle, guard_snapshots[0], candidate_evidence,
-                        d08_types["d08.action_intent.v1"].validator(
-                            linked["d08.action_intent.v1"]),
+                        action,
                         d08_types["d08.action_schema.v1"].validator(
                             linked["d08.action_schema.v1"]),
                         d08_types["d08.communication_intent_grant.v1"].validator(
@@ -13682,10 +13735,47 @@ class GraphCoordinator:
                             if dispatch_clock_reading is not None else now_utc),
                         clock_reading=dispatch_clock_reading,
                     )
+                    issued = load_request(
+                        db, namespace, admission_receipt.admission.admission_ref)
+                    outbox_writes = tuple(
+                        write for write in writes
+                        if write.key.type_name == "runtime.outbox")
+                    if (issued is None or issued[0] != admission_receipt
+                            or len(outbox_writes) != 1
+                            or outbox_writes[0].key.token != bundle.outbox_refs[0]):
+                        raise UnavailableGuard("dispatch outbox payload is unbound")
+                    request = issued[1]
+                    outbox = outbox_writes[0].value
+                    job = admission_jobs[0].job
+                    if (outbox.get("job_id") != job.job_id
+                            or outbox.get("job_ref")
+                            != admission_jobs[0].graph_job_ref
+                            or outbox.get("operation_id") != request.operation_id
+                            or outbox.get("effect_id") != request.effect_id
+                            or outbox.get("activity_id") != request.activity_id
+                            or (outbox.get("bot_id"), outbox.get("persona_id"))
+                            != namespace.as_tuple
+                            or outbox.get("payload_ref") != request.payload_ref
+                            or outbox.get("dispatch_generation")
+                            != request.dispatch_generation
+                            or outbox.get("phase") != "pending"):
+                        raise UnavailableGuard("dispatch outbox payload differs from request")
+                    try:
+                        action_job_binding = bind_action_job(
+                            db, action, admission_receipt)
+                    except ValueError as exc:
+                        raise UnavailableGuard(
+                            "dispatch action/attempt lacks an exact D11 job binding") from exc
                     data["dispatch_admission"] = {
                         "schema": admission_receipt.admission.schema,
                         "ref": admission_receipt.admission.admission_ref,
                         "digest": admission_receipt.receipt_digest,
+                    }
+                    data["dispatch_action_job_binding"] = {
+                        "schema": action_job_binding.schema,
+                        "ref": action_job_binding.admission_ref,
+                        "digest": action_job_binding.digest,
+                        "job_id": action_job_binding.job_id,
                     }
             if product_advances:
                 data["product_advance_candidate"] = product_advances[0]

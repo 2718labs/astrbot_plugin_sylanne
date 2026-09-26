@@ -17,7 +17,7 @@ from sylanne3.domains.d09 import (
     ClaimKind, ClaimUse, D09ExpressionProvider, ExpressionClaim, SegmentCandidate,
 )
 from sylanne3.graph_coordinator import (
-    GraphCoordinator, UnavailableGuard, budget_operation_digest,
+    GraphCoordinator, JobBinding, UnavailableGuard, budget_operation_digest,
 )
 from sylanne3.authority_service.v2_clock import IngressClockSampleV2
 from sylanne3.host.v2_fence_port import VerifiedIngressClockV2
@@ -31,12 +31,15 @@ from sylanne3.runtime.budget import BudgetLease, create_budget_lease
 from sylanne3.runtime.budget import get_budget_lease
 from sylanne3.runtime.d11_types import (
     D11RuntimeProvider, D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
+    RuntimeOutboxValue, job_graph_write, outbox_graph_write,
 )
+from sylanne3.runtime.dispatch_action_job_binding import load_action_job_binding
 from sylanne3.runtime.dispatch_admission import (
     DispatchAdmissionReceiptV1, DispatchAdmissionV1, install_schema,
     load_admission, load_request,
 )
 from sylanne3.runtime.dispatch_candidate import dispatch_segment_payload_ref
+from sylanne3.runtime.jobs import PersistentJob
 from sylanne3.runtime_contracts import (
     CheckReceipt, CommandEnvelope, DependencySet, DomainBundle, DomainProposal,
     NamespaceId, QueryEpoch, RUNTIME_SCHEMA, SourceQualification, VersionGuard,
@@ -51,7 +54,7 @@ from test_dispatch_candidate_graph import (
 
 
 def _qualified_bundle(coordinator, authority, lease, providers, *,
-                      projection_keys=(), scene_ref="scene:one"):
+                      projection_keys=(), scene_ref="scene:one", with_job=False):
     """Use actual D06 source/access graph versions for the source check."""
     bot, persona = authority.namespace.as_tuple
     audience = authority.audience[0]
@@ -108,6 +111,23 @@ def _qualified_bundle(coordinator, authority, lease, providers, *,
         AtomKey(owner, kind, name),
         value if isinstance(value, dict) else _json(asdict(value)),
     ) for kind, name, value in values)
+    job = None
+    if with_job:
+        job = PersistentJob(
+            "job:dispatch-one", identity.operation_id, identity.activity_id,
+            identity.effect_id, bot, persona, "snapshot:dispatch-one", "queued",
+            "dispatch", {}, None, "2099-01-01T00:00:00Z", "parent",
+            "resource:dispatch-one", {}, None, None, 0, 0, {}, None,
+        )
+        job_write = job_graph_write(job)
+        outbox = RuntimeOutboxValue(
+            bot, persona, identity.activity_id, identity.operation_id,
+            identity.effect_id, "outbox:dispatch-one", job.job_id,
+            job_write.key.token, dispatch_segment_payload_ref(writes[3].key.token, 0),
+            "idempotency:dispatch-one", "pending", 1,
+        )
+        outbox_write = outbox_graph_write(outbox, job_write.key)
+        writes += (job_write, outbox_write)
     snapshot = coordinator.read_snapshot(
         authority, lease, (source, access) + tuple(projection_keys)
         + tuple(write.key for write in writes))
@@ -130,11 +150,23 @@ def _qualified_bundle(coordinator, authority, lease, providers, *,
                        envelope, writes[:3], DependencySet(), (), ()),
         DomainProposal("d09", "d09.proposal.v1",
                        providers[2].descriptor.request_schema_hash,
-                       envelope, writes[3:], DependencySet(), (), ()),
+                       envelope, writes[3:4], DependencySet(), (), ()),
     )
-    return DomainBundle(envelope, proposals, (), (), (), (), (), (), ()), (
+    if job is not None:
+        proposals += (DomainProposal(
+            "d11", D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
+            envelope, writes[4:], DependencySet(
+                current_invalidation=(GraphVersion(job_write.key, 0),),
+            ), (), (),
+        ),)
+    return DomainBundle(
+        envelope, proposals, (), (), (), (),
+        ("idempotency:dispatch-one",) if job is not None else (),
+        (job_write.key.token,) if job is not None else (),
+        (outbox_write.key.token,) if job is not None else (),
+    ), (
         intent, schema, grant, batch,
-    )
+    ), job
 
 
 class _TestAdmissionIssuer:
@@ -263,10 +295,17 @@ class _TestAdmissionIssuer:
 class _ClockBudget(_Budget):
     def __init__(self):
         self.last_now_utc = None
+        self.job = None
 
     def admit_runtime(self, bundle, db, *, now_utc=None):
         self.last_now_utc = now_utc
-        return super().admit_runtime(bundle, db, now_utc=now_utc)
+        admission = super().admit_runtime(bundle, db, now_utc=now_utc)
+        if self.job is None:
+            return admission
+        return replace(admission, jobs=(JobBinding(
+            job_graph_write(self.job).key.token, self.job,
+            bundle.outbox_refs,
+        ),))
 
 
 def _admission():
@@ -410,6 +449,8 @@ def _issuer_case(tmp_path, *, with_projection=False,
     )
     if with_projection:
         registry, providers = _registry()
+        for spec in D11RuntimeProvider().type_specs():
+            registry.register(spec)
         for provider in (ContextProvider(), RelationshipProvider()):
             for spec in provider.type_specs():
                 registry.register(spec)
@@ -467,7 +508,28 @@ def _issuer_case(tmp_path, *, with_projection=False,
             ), _capability=seed_coordinator._GraphCoordinator__graph_capability,
         )
     else:
-        store, _old, _authority, _lease, providers, _registry_unused = _ready(tmp_path)
+        registry, providers = _registry()
+        for spec in D11RuntimeProvider().type_specs():
+            registry.register(spec)
+        store = GraphStore(tmp_path / "candidate.db", registry)
+        seed = object()
+        seed_coordinator = GraphCoordinator(
+            store, seed, d02_issuer=_Resources(), d11_issuer=_Budget())
+        for kind, version in (("scheme", "scheme-1"), ("operator", "operator-1"),
+                              ("policy", "policy-1"), ("activation", 1)):
+            seed_coordinator.set_guard_version(
+                seed, namespace, kind, "current", version)
+        with store._lock:
+            create_budget_lease(store._db, BudgetLease(
+                "parent", None, bot, persona, "USD", {"cpu_ms": 10},
+                {}, {}, {}, 1, "active"), "install-parent", "0" * 64)
+        MemoryRepository(store, bot, persona).ingest(
+            Event(Scope(bot, persona, "session"), "source-ingress", 1.0,
+                  "ingress", {}),
+            SourceRecord("source-1", "Hello", "alice", "observed",
+                         "confirmed", 1.0, 2.0, "family-1", (audience,),
+                         ("expression",)),
+        )
     bootstrap = object()
     issuer = _TestAdmissionIssuer()
     issuer.namespace = namespace
@@ -511,11 +573,12 @@ def _issuer_case(tmp_path, *, with_projection=False,
         else ("event", "activity"),
         "expression", (audience,), "policy-1", 1,
     )
-    bundle, values = _qualified_bundle(
+    bundle, values, job = _qualified_bundle(
         coordinator, authority, lease, providers,
         projection_keys=tuple(write.key for write in writes) if with_projection else (),
-        scene_ref=scene_ref,
+        scene_ref=scene_ref, with_job=True,
     )
+    budget.job = job
     issuer.bind(values)
     return store, coordinator, authority, lease, bundle, issuer
 
@@ -575,11 +638,18 @@ def test_current_d03_d05_projection_preserves_admission_transaction_test(
         ).fetchone()
         assert row is not None
         assert json.loads(row[0])["dispatch_admission"]["ref"] == "admission:one"
+        assert json.loads(row[0])["dispatch_action_job_binding"]["job_id"] == "job:dispatch-one"
         stored = load_admission(store._db, authority.namespace, "admission:one")
+        job_binding = load_action_job_binding(
+            store._db, authority.namespace, "admission:one")
+        assert job_binding is not None
+        assert json.loads(row[0])["dispatch_action_job_binding"]["digest"] == job_binding.digest
     assert stored is not None and stored.admission == issuer.admission
     assert stored.graph_epoch == committed.invalidated_epochs[0].revision
     assert coordinator.get_committed_dispatch_request(
         authority, lease, "admission:one") == issuer.request
+    assert coordinator.get_committed_dispatch_action_job_binding(
+        authority, lease, "admission:one") == job_binding
     # The fixture admission uses abstract account/destination strings. It
     # proves D11 persistence, but cannot authorize an AstrBot UMO route.
     with pytest.raises(UnavailableGuard, match="route"):
@@ -595,6 +665,77 @@ def test_current_d03_d05_projection_preserves_admission_transaction_test(
             stored, issuer.request)
     finally:
         reopened.close()
+
+
+def test_issuer_without_d11_job_rolls_back_admission_and_graph(tmp_path):
+    store, coordinator, authority, lease, bundle, issuer = _issuer_case(
+        tmp_path, with_projection=True)
+    issuer.budget.job = None
+    bundle = replace(bundle, proposals=bundle.proposals[:2],
+                     idempotency_keys=(), persistent_job_refs=(), outbox_refs=())
+    with pytest.raises(UnavailableGuard, match="dispatch admission requires one D11 job"):
+        coordinator._commit_domain_bundle_fenced(bundle, lease)
+    with store._lock:
+        assert load_admission(store._db, authority.namespace, "admission:one") is None
+        assert store._db.execute(
+            "SELECT 1 FROM graph_bundle_operations WHERE operation_id=?",
+            (bundle.envelope.identity.operation_id,),
+        ).fetchone() is None
+    store.close()
+
+
+def test_dispatch_outbox_must_name_the_issued_payload(tmp_path):
+    store, coordinator, authority, lease, bundle, _issuer = _issuer_case(
+        tmp_path, with_projection=True)
+    d11 = bundle.proposals[-1]
+    outbox = d11.typed_writes[-1]
+    wrong = GraphWrite(
+        outbox.key, {**outbox.value, "payload_ref": "d09:wrong"},
+        outbox.dependencies)
+    bundle = replace(bundle, proposals=bundle.proposals[:-1] + (
+        replace(d11, typed_writes=d11.typed_writes[:-1] + (wrong,)),
+    ))
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic - 0.01, monotonic, time.time() + 0.2,
+    )
+    with pytest.raises(UnavailableGuard, match="dispatch outbox payload"):
+        coordinator._commit_domain_bundle_fenced(
+            bundle, lease, dispatch_clock_reading=reading)
+    with store._lock:
+        assert load_admission(store._db, authority.namespace, "admission:one") is None
+        assert store._db.execute("SELECT 1 FROM runtime_jobs").fetchone() is None
+    store.close()
+
+
+def test_action_job_binding_read_rejects_changed_graph_receipt(tmp_path):
+    store, coordinator, authority, lease, bundle, _issuer = _issuer_case(
+        tmp_path, with_projection=True)
+    monotonic = time.monotonic()
+    reading = VerifiedIngressClockV2(
+        IngressClockSampleV2("authority:test", "installation:test", "clock:test",
+                             time.time(), monotonic, "epoch:test", 0.1),
+        monotonic - 0.01, monotonic, time.time() + 0.2,
+    )
+    assert coordinator._commit_domain_bundle_fenced(
+        bundle, lease, dispatch_clock_reading=reading).status == "committed"
+    with store._lock:
+        raw = store._db.execute(
+            "SELECT receipt_json FROM graph_bundle_operations WHERE operation_id=?",
+            (bundle.envelope.identity.operation_id,),
+        ).fetchone()[0]
+        recorded = json.loads(raw)
+        recorded["dispatch_action_job_binding"]["digest"] = "f" * 64
+        store._db.execute(
+            "UPDATE graph_bundle_operations SET receipt_json=? WHERE operation_id=?",
+            (json.dumps(recorded), bundle.envelope.identity.operation_id),
+        )
+    with pytest.raises(UnavailableGuard, match="binding differs from graph receipt"):
+        coordinator.get_committed_dispatch_action_job_binding(
+            authority, lease, "admission:one")
+    store.close()
 
 
 def test_committed_request_rejects_same_id_changed_command_and_graph_receipt(tmp_path):
