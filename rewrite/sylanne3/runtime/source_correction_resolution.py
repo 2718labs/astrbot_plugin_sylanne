@@ -17,6 +17,8 @@ from ..graph_types import AtomKey, GraphVersion
 from ..memory_types import access_key
 from ..runtime_contracts import NamespaceId
 from ..domains.d06.source_correction_resolution import CurrentCorrectionSourceV1
+from .d11_types import job_graph_write
+from .jobs import get_job
 
 
 class SourceCorrectionResolutionHold(RuntimeError):
@@ -34,6 +36,21 @@ class SourceCorrectionResolutionPreflightV1:
         "d07_reevaluation_receipt", "d02_actual_cost_receipt",
         "d11_job_outbox_settlement_receipt", "w01_atomic_commit",
     )
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCorrectionDurableStateV1:
+    """Observed persisted progress, never an authorization to resolve a head."""
+
+    preflight: SourceCorrectionResolutionPreflightV1
+    job_id: str
+    job_phase: str
+    outbox_ref: str
+    outbox_ledger_phase: str
+    outbox_graph_phase: str
+    d11_budget_state: str
+    d11_actual_usage: tuple[tuple[str, int], ...] | None
+    status: str = "HOLD"
 
 
 def _atom(db: sqlite3.Connection, namespace: NamespaceId,
@@ -108,6 +125,90 @@ def read_source_correction_resolution_preflight(
         GraphVersion(head_key, head_revision), head, current)
 
 
+def read_source_correction_durable_state_v1(
+        db: sqlite3.Connection, namespace: NamespaceId, source_id: str,
+) -> SourceCorrectionDurableStateV1:
+    """Inspect real D11 progress in one pinned snapshot; keep D06 pending.
+
+    D11 budget settlement is not the missing D02 role-cost receipt. An outbox
+    phase is dispatch progress, not proof that D04/D05/D07 reevaluated.
+    """
+    preflight = read_source_correction_resolution_preflight(
+        db, namespace, source_id)
+    operation_id = preflight.pending_head["operation_id"]
+    rows = db.execute(
+        "SELECT b.outbox_ref,b.phase,j.job_id,j.operation_id "
+        "FROM graph_bundle_outbox AS b JOIN graph_outbox_jobs AS j "
+        "ON j.bot=b.bot AND j.persona=b.persona AND j.outbox_ref=b.outbox_ref "
+        "WHERE b.bot=? AND b.persona=? AND b.operation_id=?",
+        namespace.as_tuple + (operation_id,),
+    ).fetchall()
+    if len(rows) != 1 or rows[0][3] != operation_id:
+        raise SourceCorrectionResolutionHold("correction D11 outbox binding absent; HOLD")
+    outbox_ref, ledger_phase, job_id, _ = rows[0]
+    try:
+        job = get_job(db, job_id)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise SourceCorrectionResolutionHold("correction D11 job absent; HOLD") from exc
+    if ((job.bot_id, job.persona_id, job.operation_id) !=
+            (*namespace.as_tuple, operation_id)
+            or job.work_kind != "d06.source_correction" or job.effect_id is not None):
+        raise SourceCorrectionResolutionHold("correction D11 job identity changed; HOLD")
+    job_key = job_graph_write(job).key
+    _, graph_job = _atom(db, namespace, job_key)
+    if graph_job != job_graph_write(job).value:
+        raise SourceCorrectionResolutionHold("correction D11 job projection changed; HOLD")
+    outbox_key = AtomKey.from_token(outbox_ref)
+    if outbox_key.type_name != "runtime.outbox":
+        raise SourceCorrectionResolutionHold("correction D11 outbox identity changed; HOLD")
+    _, graph_outbox = _atom(db, namespace, outbox_key)
+    if (graph_outbox.get("job_id") != job_id
+            or graph_outbox.get("job_ref") != job_key.token
+            or graph_outbox.get("operation_id") != operation_id
+            or graph_outbox.get("phase") not in {
+                "pending", "sending", "ack", "delivered", "failed",
+                "unknown", "cancelled"}):
+        raise SourceCorrectionResolutionHold("correction D11 outbox projection changed; HOLD")
+    reservation = db.execute(
+        "SELECT digest,state,actual_json FROM runtime_budget_reservations "
+        "WHERE lease_id=? AND operation_id=?",
+        (job.budget_ref, operation_id),
+    ).fetchone()
+    if reservation is None or reservation[1] not in {
+            "reserved", "settled", "overrun", "pending_confirmation",
+            "pending_overrun"}:
+        raise SourceCorrectionResolutionHold("correction D11 budget absent; HOLD")
+    actual = None
+    if reservation[1] == "settled":
+        receipt_row = db.execute(
+            "SELECT digest,lease_id,receipt_json FROM runtime_budget_operations "
+            "WHERE bot_id=? AND persona_id=? AND operation_id=? "
+            "AND phase='settle'", namespace.as_tuple + (operation_id,),
+        ).fetchone()
+        if (receipt_row is None or receipt_row[:2] !=
+                (reservation[0], job.budget_ref)):
+            raise SourceCorrectionResolutionHold("correction D11 settlement receipt absent; HOLD")
+        try:
+            receipt = json.loads(receipt_row[2])
+            actual_value = json.loads(reservation[2])
+        except (TypeError, ValueError) as exc:
+            raise SourceCorrectionResolutionHold("correction D11 settlement invalid; HOLD") from exc
+        if (type(receipt) is not dict or receipt.get("status") != "settled"
+                or receipt.get("operation_id") != operation_id
+                or receipt.get("digest") != reservation[0]
+                or receipt.get("lease_id") != job.budget_ref
+                or type(actual_value) is not dict or not actual_value
+                or any(type(name) is not str or not name or type(amount) is not int
+                       or amount < 0 for name, amount in actual_value.items())):
+            raise SourceCorrectionResolutionHold("correction D11 settlement invalid; HOLD")
+        actual = tuple(sorted(actual_value.items()))
+    elif reservation[2] is not None and reservation[1] == "reserved":
+        raise SourceCorrectionResolutionHold("correction reserved cost has actual usage; HOLD")
+    return SourceCorrectionDurableStateV1(
+        preflight, job_id, job.phase, outbox_ref, ledger_phase,
+        graph_outbox["phase"], reservation[1], actual)
+
+
 def plan_source_correction_resolution_v1(
         preflight: SourceCorrectionResolutionPreflightV1,
 ) -> None:
@@ -123,6 +224,7 @@ def plan_source_correction_resolution_v1(
 
 __all__ = (
     "SourceCorrectionResolutionHold", "SourceCorrectionResolutionPreflightV1",
+    "SourceCorrectionDurableStateV1", "read_source_correction_durable_state_v1",
     "read_source_correction_resolution_preflight",
     "plan_source_correction_resolution_v1",
 )
