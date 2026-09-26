@@ -19,11 +19,13 @@ from typing import Awaitable, Callable
 from ..authority_service.v2_contract import (
     DispatchGraphClaimReceiptV1, DispatchHandoffContextV1,
     ExecutionBindingV2, MutationReceiptV2, OwnerDispatchWitnessV1,
+    AuthorityDispatchSnapshotV1,
     canonical_digest, from_wire, to_wire,
 )
 from ..authority_service.v2_execution_bridge import HandoffStartV2
 from ..authority_service.reverse_handoff import (
-    require_exact_owner_witness, require_exact_reverse_handoff_identity,
+    require_exact_authority_snapshot, require_exact_owner_witness,
+    require_exact_reverse_handoff_identity,
 )
 from ..graph_worker import GraphWorker
 
@@ -76,6 +78,7 @@ class _Registration:
     window: object
     claim_writer: Callable
     witness: OwnerDispatchWitnessV1 | None = None
+    snapshot: AuthorityDispatchSnapshotV1 | None = None
     task: asyncio.Task | None = None
     receipt: DispatchGraphClaimReceiptV1 | None = None
 
@@ -163,7 +166,8 @@ class HostReverseGraphClaimServer:
         profile = self.profile
         if (type(message) is not dict or set(message) != {
                 "profile_id", "installation_id", "namespace", "context",
-                "binding", "claimed_receipt", "owner_witness"}
+                "binding", "claimed_receipt", "owner_witness",
+                "authority_snapshot"}
                 or (message["profile_id"], message["installation_id"],
                     message["namespace"]) !=
                    (profile.profile_id, profile.installation_id, profile.namespace)):
@@ -172,19 +176,23 @@ class HostReverseGraphClaimServer:
         binding = from_wire(message["binding"])
         claimed = from_wire(message["claimed_receipt"])
         witness = from_wire(message["owner_witness"])
+        snapshot = from_wire(message["authority_snapshot"])
         if (type(context) is not DispatchHandoffContextV1
                 or type(binding) is not ExecutionBindingV2
                 or type(claimed) is not MutationReceiptV2
                 or type(witness) is not OwnerDispatchWitnessV1
+                or type(snapshot) is not AuthorityDispatchSnapshotV1
                 or to_wire(context) != message["context"]
                 or to_wire(binding) != message["binding"]
                 or to_wire(claimed) != message["claimed_receipt"]
-                or to_wire(witness) != message["owner_witness"]):
+                or to_wire(witness) != message["owner_witness"]
+                or to_wire(snapshot) != message["authority_snapshot"]):
             raise RuntimeError("reverse graph claim wire identity differs")
         require_exact_reverse_handoff_identity(
             profile.namespace, context, binding, claimed,
         )
         require_exact_owner_witness(profile, context, binding, witness)
+        require_exact_authority_snapshot(context, witness, snapshot)
         async with self._lock:
             registration = self._registration
             if (registration is None or registration.context != context
@@ -193,12 +201,16 @@ class HostReverseGraphClaimServer:
                 raise RuntimeError("reverse graph claim handoff is not registered")
             if registration.witness is not None and registration.witness != witness:
                 raise RuntimeError("reverse graph claim Owner witness changed")
+            if registration.snapshot is not None and registration.snapshot != snapshot:
+                raise RuntimeError("reverse graph claim Authority snapshot changed")
             if registration.receipt is not None:
                 return registration.receipt
             if registration.task is None:
                 registration.witness = witness
+                registration.snapshot = snapshot
                 registration.task = asyncio.create_task(registration.window.call(
-                    registration.claim_writer, context, binding, claimed, witness))
+                    registration.claim_writer, context, binding, claimed,
+                    witness, snapshot))
             task = registration.task
         receipt = await asyncio.shield(task)
         if (type(receipt) is not DispatchGraphClaimReceiptV1

@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 import ssl
 import tempfile
@@ -22,7 +23,9 @@ from sylanne3.authority_service.v2_execution_bridge import HandoffStartV2
 from sylanne3.authority_service.v2_contract import (
     DispatchGraphClaimReceiptV1, DispatchHandoffContextV1,
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2,
-    MutationReceiptV2, OwnerDispatchWitnessV1, PendingMutationV2, canonical_digest,
+    MutationReceiptV2, OwnerDispatchWitnessV1, PendingMutationV2,
+    AuthorityDispatchSnapshotV1, AuthorityUnresolvedEffectV1,
+    canonical_digest, to_wire,
 )
 from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
 from sylanne3.graph_worker import GraphWorker
@@ -99,6 +102,27 @@ def _witness(context: DispatchHandoffContextV1,
         binding.graph_namespace, guard, "owner-issue-a", "grant-a", _digest("8"))
 
 
+def _snapshot(context: DispatchHandoffContextV1, binding: ExecutionBindingV2,
+              claimed: MutationReceiptV2,
+              witness: OwnerDispatchWitnessV1) -> AuthorityDispatchSnapshotV1:
+    return AuthorityDispatchSnapshotV1(
+        context_digest=canonical_digest(context),
+        authority_id=context.permit.authority_id,
+        namespace=context.permit.namespace,
+        anchor=context.permit.pinned_anchor,
+        owner_witness_digest=canonical_digest(witness),
+        admission_epoch=1, authority_schema_version=1,
+        active_dispatch_operation_id=context.permit.operation_id,
+        pending_mutation_ids=(),
+        unresolved_effects=(AuthorityUnresolvedEffectV1(
+            effect_id=context.permit.effect_id,
+            operation_id=context.permit.operation_id,
+            mutation_id=claimed.pending.mutation_id,
+            phase="claimed", execution_seq=claimed.after_anchor.execution_seq,
+            append_digest=claimed.after_anchor.execution_digest,
+            footprint=binding.origin.footprint),))
+
+
 class _Store:
     def close(self) -> None:
         pass
@@ -133,11 +157,13 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                                              capacity=1)
             binding, claimed, context = _claim()
             witness = _witness(context, binding)
+            snapshot = _snapshot(context, binding, claimed, witness)
             calls = []
 
             def graph_claim(_coordinator, callback_context, callback_binding,
-                            _claimed, callback_witness):
+                            _claimed, callback_witness, callback_snapshot):
                 self.assertEqual(callback_witness, witness)
+                self.assertEqual(callback_snapshot, snapshot)
                 calls.append(callback_context.handoff_id)
                 return DispatchGraphClaimReceiptV1(
                     canonical_digest(callback_context), callback_binding.graph_namespace,
@@ -156,18 +182,35 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                         async with server.register(context=context, binding=binding,
                                                    claimed=claimed, window=window,
                                                    claim_writer=graph_claim):
+                            legacy = {
+                                "profile_id": "profile-a", "installation_id": "install-a",
+                                "namespace": AUTH_NS, "context": to_wire(context),
+                                "binding": to_wire(binding),
+                                "claimed_receipt": to_wire(claimed),
+                                "owner_witness": to_wire(witness),
+                            }
+                            old_reader, old_writer = await asyncio.open_connection(
+                                "127.0.0.1", port, ssl=client._ssl,
+                                server_hostname="localhost")
+                            old_writer.write(json.dumps(legacy).encode() + b"\n")
+                            await old_writer.drain()
+                            self.assertEqual(await old_reader.readline(), b"")
+                            old_writer.close()
+                            await old_writer.wait_closed()
+                            self.assertFalse(calls)
                             receipt = await asyncio.wait_for(
                                 call_authority(client.claim, context, binding, claimed,
-                                               witness), 3)
+                                               witness, snapshot), 3)
                             self.assertEqual(receipt.graph_claim_ref, "claim-a")
                             self.assertEqual(calls, ["handoff-a"])
                             # Exact replay observes the one graph transaction.
                             self.assertEqual(await call_authority(
-                                client.claim, context, binding, claimed, witness), receipt)
+                                client.claim, context, binding, claimed,
+                                witness, snapshot), receipt)
                             self.assertEqual(calls, ["handoff-a"])
                             concurrent = await asyncio.gather(*(
                                 asyncio.to_thread(client.claim, context, binding, claimed,
-                                                  witness)
+                                                  witness, snapshot)
                                 for _ in range(2)
                             ))
                             self.assertEqual(concurrent, [receipt, receipt])
@@ -175,20 +218,24 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                             with self.assertRaises(RuntimeError):
                                 await call_authority(
                                     client.claim, context, binding, claimed,
-                                    replace(witness, grant_id="other-grant"))
+                                    replace(witness, grant_id="other-grant"), snapshot)
+                            with self.assertRaises(RuntimeError):
+                                await call_authority(
+                                    client.claim, context, binding, claimed,
+                                    witness, replace(snapshot, admission_epoch=2))
                             self.assertEqual(calls, ["handoff-a"])
                             with self.assertRaises(RuntimeError):
                                 await call_authority(client.claim,
                                     replace(context, handoff_id="wrong-handoff"),
-                                    binding, claimed, witness)
+                                    binding, claimed, witness, snapshot)
                             with self.assertRaises(RuntimeError):
                                 await call_authority(
                                     wrong_peer_client.claim, context, binding, claimed,
-                                    witness)
+                                    witness, snapshot)
                             with self.assertRaises(RuntimeError):
                                 await call_authority(
                                     wrong_install_client.claim, context, binding, claimed,
-                                    witness)
+                                    witness, snapshot)
                             with self.assertRaises(RuntimeError):
                                 await worker.call(lambda _coordinator: None)
                         # GraphWorker is drained before ordinary work resumes.
@@ -196,11 +243,12 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                 wrong_namespace = replace(client_profile, namespace="ns-other")
                 with self.assertRaises(RuntimeError):
                     await asyncio.to_thread(ReverseGraphClaimClient(
-                        wrong_namespace).claim, context, binding, claimed, witness)
+                        wrong_namespace).claim, context, binding, claimed,
+                        witness, snapshot)
 
                 async def begin(_claimed, _handoff_id):
                     receipt = await asyncio.to_thread(
-                        client.claim, context, binding, claimed, witness)
+                        client.claim, context, binding, claimed, witness, snapshot)
                     return HandoffStartV2(
                         context.handoff_id, context.permit.operation_id,
                         context.permit.effect_id, context.permit.namespace,
@@ -270,11 +318,12 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                                              capacity=1)
             binding, claimed, context = _claim()
             witness = _witness(context, binding)
+            snapshot = _snapshot(context, binding, claimed, witness)
             entered = threading.Event()
             release = threading.Event()
 
             def slow_claim(_coordinator, callback_context, callback_binding,
-                           _claimed, _witness_value):
+                           _claimed, _witness_value, _snapshot_value):
                 entered.set()
                 if not release.wait(3):
                     raise RuntimeError("test graph writer was not released")
@@ -289,7 +338,7 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                                                claimed=claimed, window=window,
                                                claim_writer=slow_claim):
                         task = asyncio.create_task(asyncio.to_thread(
-                            client.claim, context, binding, claimed, witness))
+                            client.claim, context, binding, claimed, witness, snapshot))
                         self.assertTrue(await asyncio.to_thread(entered.wait, 2))
                         with self.assertRaises(RuntimeError):
                             await worker.call(lambda _coordinator: None)
