@@ -2012,3 +2012,15 @@ __all__ = [
     "TriggerKind",
     "provide_source_grant_check",
 ]
+
+from .recollection_read import (  # noqa: E402
+    RecollectionProjectionSnapshotCandidate,
+    RecollectionProjectionUnavailable,
+    inspect_recollection_projection_snapshot,
+)
+
+__all__ += [
+    "RecollectionProjectionSnapshotCandidate",
+    "RecollectionProjectionUnavailable",
+    "inspect_recollection_projection_snapshot",
+]
