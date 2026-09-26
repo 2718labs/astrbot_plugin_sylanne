@@ -12,6 +12,7 @@ import time
 from typing import Awaitable, Callable, Coroutine, Mapping, TypeVar
 
 from ..authority_service.contract import CONTENT_OPERATIONS, identifier
+from ..authority_service.final_handoff_pairing import FinalHandoffPairingV1
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
@@ -219,6 +220,23 @@ class V2FencePort:
         with self._lock:
             _, grant = self._identity()
             return grant
+
+    def read_final_handoff_pairing_v1(
+        self, *, namespace: str, installation_id: str,
+    ) -> FinalHandoffPairingV1:
+        """Read P2 configuration through this port's existing paired mTLS session."""
+        return self._submit(self._with_session_repair(
+            lambda: self._read_final_handoff_pairing_v1(namespace, installation_id)))
+
+    async def _read_final_handoff_pairing_v1(
+        self, namespace: str, installation_id: str,
+    ) -> FinalHandoffPairingV1:
+        handshake, grant = self._identity()
+        if installation_id != grant.installation_id:
+            raise RuntimeError("final handoff installation differs")
+        return await self._transport.read_final_handoff_pairing_v1(
+            self._request, handshake,
+            namespace=namespace, installation_id=installation_id)
 
     def read_ingress_clock(self, policy: AdminIngressClockPolicy) -> VerifiedIngressClockV2:
         """Read a bounded Authority clock on the dedicated synchronous graph worker."""

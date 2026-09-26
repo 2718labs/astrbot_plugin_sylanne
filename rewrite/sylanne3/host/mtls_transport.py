@@ -18,6 +18,7 @@ import ssl
 from typing import Mapping
 
 from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit, identifier
+from ..authority_service.final_handoff_pairing import FinalHandoffPairingV1
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
@@ -251,6 +252,33 @@ class MtlsAuthorityTransport:
         if not isinstance(profile_id, str) or profile_id not in self._profiles:
             raise ValueError("authority profile is not installed by an administrator")
         return self._profiles[profile_id]
+
+    async def read_final_handoff_pairing_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, installation_id: str,
+    ) -> FinalHandoffPairingV1:
+        """Read the installed reverse pairing on the live paired v2 channel."""
+        if not handshake.valid_pairing():
+            raise RuntimeError("paired Authority handshake required")
+        identifier(namespace, "namespace")
+        identifier(installation_id, "installation_id")
+        response = await self._content_rpc(
+            request, handshake, "read_final_handoff_pairing_v1",
+            {"namespace": namespace, "installation_id": installation_id},
+            protocol=AUTHORITY_V2_PROTOCOL,
+        )
+        try:
+            pairing = FinalHandoffPairingV1.from_wire({
+                key: value for key, value in response.items()
+                if key != "channel_binding_sha256"
+            })
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Authority final handoff pairing differs") from exc
+        if (pairing.namespace != namespace
+                or pairing.installation_id != installation_id
+                or pairing.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("Authority final handoff pairing identity differs")
+        return pairing
 
     @staticmethod
     def _channel_binding(writer: asyncio.StreamWriter) -> bytes:
