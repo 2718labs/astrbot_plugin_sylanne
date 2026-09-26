@@ -245,6 +245,7 @@ class AuthorityRpcServer:
         v2_self_identity: Mapping[str, AuthorityV2SelfIdentityService] | None = None,
         self_identity_readers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_final_handoff_authorizers: Mapping[str, Callable] | None = None,
+        v2_final_handoff_issuers: Mapping[str, str] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
         clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
@@ -306,14 +307,20 @@ class AuthorityRpcServer:
             raise TypeError("v2 Owner pairings must use the same Authority core")
         self._v2_owner_pairings = v2_owner_pairings
         handoff_authorizers = dict(v2_final_handoff_authorizers or {})
+        handoff_issuers = dict(v2_final_handoff_issuers or {})
         if any(namespace not in services or not callable(callback)
                for namespace, callback in handoff_authorizers.items()):
             raise TypeError("v2 final handoff authorizers must be installed per namespace")
+        if (set(handoff_issuers) != set(handoff_authorizers)
+                or any(type(issuer) is not str or not issuer
+                       for issuer in handoff_issuers.values())):
+            raise TypeError("v2 graph claim issuers must match installed authorizers")
         self._v2_execution = {
             namespace: AuthorityV2ExecutionBridge(
                 core=core, fences=service.fences, journal=service.execution,
                 namespace=namespace, deletion=service.deletion,
                 final_handoff_authorizer=handoff_authorizers.get(namespace),
+                final_handoff_issuer_id=handoff_issuers.get(namespace),
             ) for namespace, service in services.items()
         }
         installed = dict(installations_v2 or {})

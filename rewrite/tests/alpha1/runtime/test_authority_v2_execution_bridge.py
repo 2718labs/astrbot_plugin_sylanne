@@ -8,12 +8,15 @@ import pytest
 
 from sylanne3.authority_service.contract import AuthorityUnavailable, JournalHead
 from sylanne3.authority_service.core import AuthorityServiceCore
-from sylanne3.authority_service.v2_execution_bridge import AuthorityV2ExecutionBridge
+from sylanne3.authority_service.v2_execution_bridge import (
+    AuthorityV2ExecutionBridge, HandoffStartV2,
+)
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
 from sylanne3.authority_service.v2_contract import (
-    ExecutionBindingV1, PendingMutationV2, PlatformObservationV1,
+    DispatchGraphClaimReceiptV1, ExecutionBindingV1, ExecutionBindingV2,
+    PendingMutationV2, PlatformObservationV1,
     canonical_bytes, canonical_digest, decode_bytes,
 )
 from sylanne3.runtime.deletion import DeletionJournal
@@ -63,7 +66,9 @@ def setup_service(tmp_path, *, create=True, observation_verifier=None,
                                         journal=journal, namespace="ns-a",
                                         deletion=deletion,
                                         observation_verifier=observation_verifier,
-                                        final_handoff_authorizer=final_handoff_authorizer)
+                                        final_handoff_authorizer=final_handoff_authorizer,
+                                        final_handoff_issuer_id=("graph-writer-a" if
+                                            final_handoff_authorizer is not None else None))
     bridge._test_deletion_journal = deletion_journal
     return core, fences, journal, bridge, calls
 
@@ -120,6 +125,30 @@ def execution_binding(permit, item, **changes):
     return ExecutionBindingV1(**fields)
 
 
+def execution_binding_v2(permit, item):
+    return ExecutionBindingV2(
+        execution_binding(permit, item), "ns-a", "incarnation-a",
+        "sha256:" + "a" * 64, "graph-version-a", 1, 0, 0,
+        "sha256:" + "b" * 64, "intent-schema-a",
+        "sha256:" + "c" * 64, "action-schema-a",
+        "sha256:" + "d" * 64, "checks-schema-a",
+        "sha256:" + "e" * 64, "2026-09-30T00:00:00Z", "clock-a",
+        "sha256:" + "f" * 64,
+    )
+
+
+def graph_receipt(context, **changes):
+    fields = dict(
+        context_digest=canonical_digest(context), graph_namespace="ns-a",
+        graph_incarnation="incarnation-a", graph_version="graph-version-b",
+        graph_epoch=2, graph_access_epoch=0, graph_deletion_epoch=0,
+        graph_claim_ref="graph-final-claim-a",
+        graph_claim_digest="sha256:" + "1" * 64, issuer_id="graph-writer-a",
+    )
+    fields.update(changes)
+    return DispatchGraphClaimReceiptV1(**fields)
+
+
 def platform_observation(binding, **changes):
     fields = dict(
         binding=binding, handoff_start_ref="handoff-a",
@@ -138,15 +167,16 @@ def test_handoff_start_requires_final_graph_authority_and_durable_current_claim(
     calls = []
     refs = {}
 
-    def authorize(binding, claimed, handoff_id):
+    def authorize(context, binding, claimed):
         core = refs["core"]
         journal = refs["journal"]
         assert not core._db.in_transaction
         assert journal._guard_owner is None
-        assert binding.verified_check_refs == ("check-a",)
+        assert binding.origin.verified_check_refs == ("check-a",)
         assert claimed.pending.phase == "claimed"
-        calls.append(handoff_id)
-        return "graph-final-claim-a"
+        assert decode_bytes(canonical_bytes(context)) == context
+        calls.append(context.handoff_id)
+        return graph_receipt(context)
 
     core, fences, journal, bridge, _ = setup_service(tmp_path)
     refs.update(core=core, journal=journal)
@@ -155,36 +185,181 @@ def test_handoff_start_requires_final_graph_authority_and_durable_current_claim(
     prepared, _ = bridge.execution_prepare(
         credential="ok", subject="subject-a", permit=permit,
         mutation_id="mutation-a", footprint=item)
-    claimed, updated = bridge.execution_claim(
+    claimed, updated = bridge.execution_claim_v2(
         credential="ok", subject="subject-a",
-        prepared_receipt=prepared, binding=execution_binding(permit, item))
+        prepared_receipt=prepared, binding=execution_binding_v2(permit, item))
     with pytest.raises(AuthorityUnavailable, match="final handoff authorizer"):
-        bridge.begin_handoff(
+        bridge.begin_handoff_v2(
             credential="ok", subject="subject-a",
             claimed_receipt=claimed, handoff_id="handoff-a")
     assert core._db.execute(
         "SELECT count(*) FROM authority_execution_handoff_starts_v1"
     ).fetchone() == (0,)
     bridge._final_handoff_authorizer = authorize
-    start = bridge.begin_handoff(
+    bridge._final_handoff_issuer_id = "graph-writer-a"
+    start = bridge.begin_handoff_v2(
         credential="ok", subject="subject-a",
         claimed_receipt=claimed, handoff_id="handoff-a")
     assert start.graph_claim_ref == "graph-final-claim-a"
     assert start.replay is False
     assert start.permit == updated
     assert start.claim_digest == canonical_digest(claimed)
-    replay = bridge.begin_handoff(
+    assert HandoffStartV2.from_wire(start.to_wire()) == start
+    assert start.graph_claim_receipt is not None
+    with pytest.raises(ValueError, match="requires a graph claim receipt"):
+        HandoffStartV2.from_wire({**start.to_wire(), "graph_claim_receipt": None})
+    with pytest.raises(ValueError, match="graph receipt identity differs"):
+        HandoffStartV2.from_wire({
+            **start.to_wire(),
+            "graph_claim_receipt": {
+                **start.to_wire()["graph_claim_receipt"],
+                "context_digest": "sha256:" + "0" * 64,
+            },
+        })
+    replay = bridge.begin_handoff_v2(
         credential="ok", subject="subject-a",
         claimed_receipt=claimed, handoff_id="handoff-a")
     assert replay.replay is True
     assert replace(replay, replay=False) == start
     assert calls == ["handoff-a"]
     with pytest.raises(AuthorityUnavailable, match="replay identity"):
-        bridge.begin_handoff(
+        bridge.begin_handoff_v2(
             credential="ok", subject="subject-a",
             claimed_receipt=claimed, handoff_id="handoff-other")
     # The additional execution table does not alter the fenced schema inventory.
     AuthorityV2FenceStore._check_schema(core._db)
+    core.close()
+    journal.close()
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, create=False,
+        final_handoff_authorizer=lambda *_: (_ for _ in ()).throw(
+            AssertionError("replay called graph writer")))
+    bridge._final_handoff_issuer_id = "other-writer"
+    with pytest.raises(AuthorityUnavailable, match="replay graph receipt differs"):
+        bridge.begin_handoff_v2(
+            credential="ok", subject="subject-a",
+            claimed_receipt=claimed, handoff_id="handoff-a")
+    bridge._final_handoff_issuer_id = "graph-writer-a"
+    recovered = bridge.begin_handoff_v2(
+        credential="ok", subject="subject-a",
+        claimed_receipt=claimed, handoff_id="handoff-a")
+    assert recovered.replay is True
+    assert recovered.graph_claim_receipt == start.graph_claim_receipt
+    core.close()
+    journal.close()
+
+
+@pytest.mark.parametrize("receipt_changes", [
+    {"context_digest": "sha256:" + "0" * 64},
+    {"graph_namespace": "other-ns"},
+    {"graph_incarnation": "other-incarnation"},
+    {"graph_epoch": 1},
+    {"graph_access_epoch": 0, "graph_deletion_epoch": 0,
+     "issuer_id": "other-writer"},
+])
+def test_handoff_rejects_receipt_identity_tampering(tmp_path, receipt_changes):
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, final_handoff_authorizer=lambda context, *_:
+            graph_receipt(context, **receipt_changes))
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    claimed, _ = bridge.execution_claim_v2(
+        credential="ok", subject="subject-a", prepared_receipt=prepared,
+        binding=execution_binding_v2(permit, item))
+    with pytest.raises(AuthorityUnavailable, match="graph claim receipt identity"):
+        bridge.begin_handoff_v2(
+            credential="ok", subject="subject-a",
+            claimed_receipt=claimed, handoff_id="handoff-a")
+    assert core._db.execute(
+        "SELECT count(*) FROM authority_execution_handoff_starts_v1"
+    ).fetchone() == (0,)
+    core.close()
+    journal.close()
+
+
+def test_handoff_context_binds_exact_p2_a2_and_rejects_misbound_echo(tmp_path):
+    seen = []
+
+    def authorize(context, binding, claimed):
+        assert context.permit.revision == claimed.updated_revision
+        assert context.permit.pinned_anchor == claimed.after_anchor
+        assert context.permit.effect_id == binding.origin.effect_id
+        assert context.permit.subject == "subject-a"
+        assert context.permit.holder == "holder-a"
+        seen.append(context)
+        return graph_receipt(replace(context, handoff_id="other-handoff"))
+
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, final_handoff_authorizer=authorize)
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    claimed, _ = bridge.execution_claim_v2(
+        credential="ok", subject="subject-a", prepared_receipt=prepared,
+        binding=execution_binding_v2(permit, item))
+    with pytest.raises(AuthorityUnavailable, match="graph claim receipt identity"):
+        bridge.begin_handoff_v2(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            handoff_id="handoff-a")
+    assert len(seen) == 1
+    core.close()
+    journal.close()
+
+
+def test_handoff_rechecks_exact_a2_after_graph_callback(tmp_path):
+    refs = {}
+
+    def change_head(context, _binding, _claimed):
+        with refs["core"]._tx() as db:
+            db.execute("UPDATE authority_namespaces SET anchor_nonce=? "
+                       "WHERE namespace=?",
+                       (refs["core"]._new_nonce(), "ns-a"))
+        return graph_receipt(context)
+
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, final_handoff_authorizer=change_head)
+    refs["core"] = core
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    claimed, _ = bridge.execution_claim_v2(
+        credential="ok", subject="subject-a", prepared_receipt=prepared,
+        binding=execution_binding_v2(permit, item))
+    with pytest.raises(AuthorityUnavailable, match="head differs"):
+        bridge.begin_handoff_v2(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            handoff_id="handoff-a")
+    assert core._db.execute(
+        "SELECT count(*) FROM authority_execution_handoff_starts_v1"
+    ).fetchone() == (0,)
+    core.close()
+    journal.close()
+
+
+def test_v1_claim_cannot_create_new_handoff_start(tmp_path):
+    called = []
+    core, fences, journal, bridge, _ = setup_service(
+        tmp_path, final_handoff_authorizer=lambda *_: called.append(True))
+    item = footprint()
+    permit = begin(core, fences, item)
+    prepared, _ = bridge.execution_prepare(
+        credential="ok", subject="subject-a", permit=permit,
+        mutation_id="mutation-a", footprint=item)
+    claimed, _ = bridge.execution_claim(
+        credential="ok", subject="subject-a", prepared_receipt=prepared,
+        binding=execution_binding(permit, item))
+    with pytest.raises(AuthorityUnavailable, match="requires V2 admission"):
+        bridge.begin_handoff(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            handoff_id="handoff-a")
+    assert called == []
     core.close()
     journal.close()
 
@@ -192,21 +367,21 @@ def test_handoff_start_requires_final_graph_authority_and_durable_current_claim(
 def test_stale_fence_is_rejected_before_graph_handoff_claim(tmp_path):
     called = []
     core, fences, journal, bridge, _ = setup_service(
-        tmp_path, final_handoff_authorizer=lambda *_:
-            called.append(True) or "graph-claim")
+        tmp_path, final_handoff_authorizer=lambda context, *_:
+            called.append(True) or graph_receipt(context))
     item = footprint()
     permit = begin(core, fences, item)
     prepared, _ = bridge.execution_prepare(
         credential="ok", subject="subject-a", permit=permit,
         mutation_id="mutation-a", footprint=item)
-    claimed, updated = bridge.execution_claim(
+    claimed, updated = bridge.execution_claim_v2(
         credential="ok", subject="subject-a",
-        prepared_receipt=prepared, binding=execution_binding(permit, item))
+        prepared_receipt=prepared, binding=execution_binding_v2(permit, item))
     fences.finish_fence(
         updated, subject="subject-a", current_anchor=authority_anchor(core),
         request_id="finish-before-handoff", request_digest="sha256:" + "f" * 64)
     with pytest.raises(AuthorityUnavailable, match="active v2 fence"):
-        bridge.begin_handoff(
+        bridge.begin_handoff_v2(
             credential="ok", subject="subject-a",
             claimed_receipt=claimed, handoff_id="handoff-a")
     assert called == []
@@ -220,13 +395,13 @@ def test_stale_fence_is_rejected_before_graph_handoff_claim(tmp_path):
 def test_fence_change_during_graph_handoff_claim_blocks_authority_start(tmp_path):
     refs = {}
 
-    def claim_then_finish(_binding, _claimed, _handoff_id):
+    def claim_then_finish(context, _binding, _claimed):
         core, fences, updated = refs["core"], refs["fences"], refs["permit"]
         assert not core._db.in_transaction
         fences.finish_fence(
             updated, subject="subject-a", current_anchor=authority_anchor(core),
             request_id="finish-during-handoff", request_digest="sha256:" + "f" * 64)
-        return "graph-claim"
+        return graph_receipt(context)
 
     core, fences, journal, bridge, _ = setup_service(
         tmp_path, final_handoff_authorizer=claim_then_finish)
@@ -235,12 +410,12 @@ def test_fence_change_during_graph_handoff_claim_blocks_authority_start(tmp_path
     prepared, _ = bridge.execution_prepare(
         credential="ok", subject="subject-a", permit=permit,
         mutation_id="mutation-a", footprint=item)
-    claimed, updated = bridge.execution_claim(
+    claimed, updated = bridge.execution_claim_v2(
         credential="ok", subject="subject-a",
-        prepared_receipt=prepared, binding=execution_binding(permit, item))
+        prepared_receipt=prepared, binding=execution_binding_v2(permit, item))
     refs.update(core=core, fences=fences, permit=updated)
     with pytest.raises(AuthorityUnavailable, match="active v2 fence"):
-        bridge.begin_handoff(
+        bridge.begin_handoff_v2(
             credential="ok", subject="subject-a",
             claimed_receipt=claimed, handoff_id="handoff-a")
     assert core._db.execute(

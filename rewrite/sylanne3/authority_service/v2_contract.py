@@ -496,6 +496,54 @@ class MutationReceiptV2:
             raise ValueError("cancelled mutation must preserve exact before-head")
 
 
+@dataclass(frozen=True, slots=True)
+class DispatchHandoffContextV1:
+    """Exact P2/A2 identity handed to the trusted graph claim writer."""
+
+    permit: FencePermitV2
+    claimed_receipt_digest: str
+    binding_digest: str
+    handoff_id: str
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        if type(self.permit) is not FencePermitV2 or self.permit.operation != "dispatch":
+            raise ValueError("handoff context requires P2 dispatch permit")
+        if self.permit.revision < 2:
+            raise ValueError("handoff context requires claimed P2 revision")
+        identifier(self.handoff_id, "handoff_id")
+        _digest(self.claimed_receipt_digest, "claimed_receipt_digest")
+        _digest(self.binding_digest, "binding_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchGraphClaimReceiptV1:
+    """Graph writer's committed claim identity; only a trusted callback may supply it."""
+
+    context_digest: str
+    graph_namespace: str
+    graph_incarnation: str
+    graph_version: str
+    graph_epoch: int
+    graph_access_epoch: int
+    graph_deletion_epoch: int
+    graph_claim_ref: str
+    graph_claim_digest: str
+    issuer_id: str
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        for name in ("graph_namespace", "graph_incarnation", "graph_version",
+                     "graph_claim_ref", "issuer_id"):
+            identifier(getattr(self, name), name)
+        for name in ("graph_epoch", "graph_access_epoch", "graph_deletion_epoch"):
+            _exact_int(getattr(self, name), name)
+        _digest(self.context_digest, "context_digest")
+        _digest(self.graph_claim_digest, "graph_claim_digest")
+
+
 def deletion_scope_digest(roots: tuple[str, ...], epoch: int,
                           policy_ref: str) -> str:
     """Canonical binding for content-free roots, epoch and policy identity."""
@@ -676,7 +724,8 @@ def _footprint_from_wire(value: object) -> RecoveryConstraintFootprint:
 
 def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1 |
-            ExecutionBindingV1 | ExecutionBindingV2 | PlatformObservationV1) -> dict[str, Any]:
+            ExecutionBindingV1 | ExecutionBindingV2 | PlatformObservationV1 |
+            DispatchHandoffContextV1 | DispatchGraphClaimReceiptV1) -> dict[str, Any]:
     """Produce a fresh, JSON-shaped dict with an explicit object kind."""
     if type(value) is FencePermitV2:
         return {
@@ -689,6 +738,24 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             "effect_id": value.effect_id, "command_digest": value.command_digest,
             "footprint_digest": value.footprint_digest,
         }
+    if type(value) is DispatchHandoffContextV1:
+        return {"schema": value.schema, "kind": "dispatch_handoff_context_v1",
+                "permit": to_wire(value.permit),
+                "claimed_receipt_digest": value.claimed_receipt_digest,
+                "binding_digest": value.binding_digest,
+                "handoff_id": value.handoff_id}
+    if type(value) is DispatchGraphClaimReceiptV1:
+        return {"schema": value.schema, "kind": "dispatch_graph_claim_receipt_v1",
+                "context_digest": value.context_digest,
+                "graph_namespace": value.graph_namespace,
+                "graph_incarnation": value.graph_incarnation,
+                "graph_version": value.graph_version,
+                "graph_epoch": value.graph_epoch,
+                "graph_access_epoch": value.graph_access_epoch,
+                "graph_deletion_epoch": value.graph_deletion_epoch,
+                "graph_claim_ref": value.graph_claim_ref,
+                "graph_claim_digest": value.graph_claim_digest,
+                "issuer_id": value.issuer_id}
     if type(value) is PendingMutationV2:
         wire = {
             "schema": value.schema, "kind": "pending_mutation", "permit": to_wire(value.permit),
@@ -816,11 +883,31 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
 def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                                  DeletionEvidenceV1 | DeletionPendingV1 |
                                  DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
-                                 PlatformObservationV1):
+                                 PlatformObservationV1 | DispatchHandoffContextV1 |
+                                 DispatchGraphClaimReceiptV1):
     """Reject unknown schemas, fields, kinds and nested shapes before use."""
     if type(value) is not dict or value.get("schema") != SCHEMA:
         raise ValueError("unknown authority schema")
     kind = value.get("kind")
+    if kind == "dispatch_handoff_context_v1":
+        _fields(value, frozenset({"schema", "kind", "permit",
+                                  "claimed_receipt_digest", "binding_digest",
+                                  "handoff_id"}), "handoff context")
+        permit = from_wire(value["permit"])
+        if type(permit) is not FencePermitV2:
+            raise ValueError("handoff context permit kind mismatch")
+        return DispatchHandoffContextV1(
+            permit=permit, **{key: item for key, item in value.items()
+                             if key not in ("kind", "permit")})
+    if kind == "dispatch_graph_claim_receipt_v1":
+        _fields(value, frozenset({"schema", "kind", "context_digest",
+                                  "graph_namespace", "graph_incarnation",
+                                  "graph_version", "graph_epoch",
+                                  "graph_access_epoch", "graph_deletion_epoch",
+                                  "graph_claim_ref", "graph_claim_digest",
+                                  "issuer_id"}), "graph claim receipt")
+        return DispatchGraphClaimReceiptV1(**{key: item for key, item in value.items()
+                                             if key != "kind"})
     if kind == "fence_permit":
         _fields(value, frozenset({
             "schema", "kind", "authority_id", "namespace", "subject", "holder",
@@ -984,7 +1071,8 @@ def _reject_constant(value: str) -> None:
 def canonical_bytes(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                     DeletionEvidenceV1 | DeletionPendingV1 |
                     DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
-                    PlatformObservationV1) -> bytes:
+                    PlatformObservationV1 | DispatchHandoffContextV1 |
+                    DispatchGraphClaimReceiptV1) -> bytes:
     return json.dumps(to_wire(value), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
@@ -992,7 +1080,8 @@ def canonical_bytes(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2
 def canonical_digest(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                      DeletionEvidenceV1 | DeletionPendingV1 |
                      DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
-                     PlatformObservationV1) -> str:
+                     PlatformObservationV1 | DispatchHandoffContextV1 |
+                     DispatchGraphClaimReceiptV1) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
@@ -1011,4 +1100,5 @@ __all__ = ["SCHEMA", "FencePermitV2", "PendingMutationV2", "MutationReceiptV2",
            "ExecutionBindingV1", "ExecutionBindingV2", "PlatformObservationV1",
            "DeletionEvidenceV1", "DeletionPendingV1", "DeletionMutationReceiptV1",
            "deletion_scope_digest", "to_wire", "from_wire", "canonical_bytes",
-           "canonical_digest", "decode_bytes"]
+           "canonical_digest", "decode_bytes", "DispatchHandoffContextV1",
+           "DispatchGraphClaimReceiptV1"]
