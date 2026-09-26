@@ -10,6 +10,7 @@ import pytest
 from sylanne3.authority_service.contract import AuthorityUnavailable, JournalHead
 from sylanne3.authority_service.core import AuthorityServiceCore
 from sylanne3.authority_service.v2_contract import (
+    DispatchGraphClaimReceiptV1, DispatchHandoffContextV1,
     ExecutionBindingV1, ExecutionBindingV2, canonical_digest,
     from_wire, to_wire,
 )
@@ -49,7 +50,7 @@ def _binding_v2(origin: ExecutionBindingV1, **changes: object) -> ExecutionBindi
     return ExecutionBindingV2(**fields)
 
 
-def _service(tmp_path, *, create=True, final_authorizer=None):
+def _service(tmp_path, *, create=True, final_authorizer=None, final_issuer=None):
     deletion_journal = DeletionJournal(tmp_path / "deletion.db", create=create)
     deletion = AuthorityV2DeletionGuard(tmp_path / "deletion.db")
     head = deletion_journal.latest_head()
@@ -74,7 +75,8 @@ def _service(tmp_path, *, create=True, final_authorizer=None):
     fences = AuthorityV2FenceStore(core._db, create=create, lock=core._lock)
     bridge = AuthorityV2ExecutionBridge(
         core=core, fences=fences, journal=journal, namespace="ns-a",
-        deletion=deletion, final_handoff_authorizer=final_authorizer)
+        deletion=deletion, final_handoff_authorizer=final_authorizer,
+        final_handoff_issuer_id=final_issuer)
     return core, fences, journal, bridge
 
 
@@ -144,27 +146,64 @@ def test_v2_claim_replay_preserves_original_p0_and_complete_admission(tmp_path):
 def test_v2_handoff_requires_graph_claim_and_replay_cannot_send(tmp_path):
     calls = []
 
-    def graph_claim(binding, claimed, handoff_id):
+    def graph_claim(context, binding, claimed):
+        assert type(context) is DispatchHandoffContextV1
         assert type(binding) is ExecutionBindingV2
         assert binding.initial_check_evidence_digest == _digest("5")
-        calls.append((canonical_digest(claimed), handoff_id))
-        return "graph-claim-a"
+        assert context.claimed_receipt_digest == canonical_digest(claimed)
+        assert context.binding_digest == canonical_digest(binding)
+        calls.append((canonical_digest(claimed), context.handoff_id))
+        return DispatchGraphClaimReceiptV1(
+            context_digest=canonical_digest(context),
+            graph_namespace=binding.graph_namespace,
+            graph_incarnation=binding.graph_incarnation,
+            graph_version="graph-version-b",
+            graph_epoch=binding.admission_graph_epoch + 1,
+            graph_access_epoch=binding.admission_access_epoch,
+            graph_deletion_epoch=binding.admission_deletion_epoch,
+            graph_claim_ref="graph-claim-a",
+            graph_claim_digest=_digest("8"), issuer_id="graph-issuer-a")
 
-    core, fences, journal, bridge = _service(tmp_path)
+    core, fences, journal, bridge = _service(
+        tmp_path, final_authorizer=graph_claim, final_issuer="graph-issuer-a")
     prepared, origin = _prepared(core, fences, bridge)
     claimed, _ = bridge.execution_claim_v2(
         credential="ok", subject="subject-a", prepared_receipt=prepared,
         binding=_binding_v2(origin))
+    bridge._final_handoff_authorizer = None
     with pytest.raises(AuthorityUnavailable, match="final handoff authorizer"):
         bridge.begin_handoff_v2(
             credential="ok", subject="subject-a",
             claimed_receipt=claimed, handoff_id="handoff-a")
+    bridge._final_handoff_authorizer = graph_claim
+    bridge._final_handoff_issuer_id = None
+    with pytest.raises(AuthorityUnavailable, match="final handoff authorizer"):
+        bridge.begin_handoff_v2(
+            credential="ok", subject="subject-a",
+            claimed_receipt=claimed, handoff_id="handoff-a")
+    bridge._final_handoff_issuer_id = "graph-issuer-a"
+    bridge._final_handoff_authorizer = lambda *_: "graph-claim-a"
+    with pytest.raises(AuthorityUnavailable, match="graph claim receipt identity"):
+        bridge.begin_handoff_v2(
+            credential="ok", subject="subject-a",
+            claimed_receipt=claimed, handoff_id="handoff-a")
+    bridge._final_handoff_authorizer = lambda *args: replace(
+        graph_claim(*args), issuer_id="wrong-issuer")
+    with pytest.raises(AuthorityUnavailable, match="graph claim receipt identity"):
+        bridge.begin_handoff_v2(
+            credential="ok", subject="subject-a",
+            claimed_receipt=claimed, handoff_id="handoff-a")
+    assert core._db.execute(
+        "SELECT COUNT(*) FROM authority_execution_handoff_starts_v1").fetchone() == (0,)
+    calls.clear()
     bridge._final_handoff_authorizer = graph_claim
     start = bridge.begin_handoff_v2(
         credential="ok", subject="subject-a",
         claimed_receipt=claimed, handoff_id="handoff-a")
     assert start.replay is False
     assert start.binding_digest == canonical_digest(claimed.pending.binding)
+    assert start.graph_claim_receipt is not None
+    assert start.graph_claim_receipt.issuer_id == "graph-issuer-a"
     assert bridge.begin_handoff_v2(
         credential="ok", subject="subject-a",
         claimed_receipt=claimed, handoff_id="handoff-a").replay is True
