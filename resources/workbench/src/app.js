@@ -1,6 +1,5 @@
 import { ACTIONS, VIEW_TYPES, makeOwnerLoginRequest } from "./api/contract.js";
 import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "./api/client.js";
-import { PendingOperationIds } from "./api/pending_operations.js";
 import { applyProblem, applyResponse, initialState, switchRole } from "./state.js";
 import { needsFreshProjection, workflowForPage } from "./workflows.js";
 
@@ -36,12 +35,19 @@ let sceneCandidatesProblem = null;
 let sceneCandidatesEpoch = 0;
 const ownerDraft = {};
 const setupReceipts = { roleInitialized: null, sceneBound: null };
-const pendingOperationIds = new PendingOperationIds();
+const correctionDraft = {};
+let correctionAttempt = null;
+
+function clearCorrectionDraft() {
+  for (const key of Object.keys(correctionDraft)) delete correctionDraft[key];
+  correctionAttempt = null;
+}
+
+function correctionField(name) { return escapeHtml(correctionDraft[name] ?? ""); }
 
 function clearSetupReceipts() {
   setupReceipts.roleInitialized = null;
   setupReceipts.sceneBound = null;
-  pendingOperationIds.clear();
 }
 
 function rememberSetupReceipt(action, result) {
@@ -77,7 +83,7 @@ function statusCopy(status, problem) {
 function formMarkup(page) {
   if (page[0] === "setup") return `<p class="setup-hint">近期场景候选仅来自宿主已观察到的会话，供 Owner 点选。点选不会绑定场景；服务端仍会核验场景和权限，可能暂缓绑定。</p><button type="button" class="quiet" data-command="refresh-scene-candidates" ${state.sessionReady ? "" : "disabled"}>刷新场景候选</button><div class="scene-candidates" aria-label="近期场景候选">${sceneCandidatesProblem ? `<p>${escapeHtml(sceneCandidatesProblem)}</p>` : sceneCandidates.length ? sceneCandidates.map((item, index) => `<button type="button" class="quiet" data-scene-candidate="${index}">${escapeHtml(item.platform_ref)} · ${escapeHtml(item.conversation_ref)} · ${item.visibility === "group" ? "群聊" : "私聊"}</button>`).join("") : "<p>暂无近期场景候选；需在目标会话中产生真实消息后刷新。</p>"}</div><label>场景引用<input name="scene_ref" required autocomplete="off" placeholder="scene:conversation-v1:（64 位小写十六进制值）" /></label><label>可见范围<select name="visibility" required><option value="">请选择</option><option value="private">私聊</option><option value="group">群聊</option></select></label><label class="acknowledgement"><input type="checkbox" name="acknowledgement" required /><span>我确认所选场景和可见范围适用于当前角色，并明确申请绑定。</span></label>`;
   if (page[0] === "creation") return `<label>方案草稿（JSON 对象，可编辑）<textarea name="draft_json" placeholder='{"fields":{},"field_sources":{}}'></textarea></label><label>已有方案草稿引用（与 JSON 二选一）<input name="draft_ref" placeholder="由已授权草稿提供" /></label><label>已编译候选引用<input name="compiled_scheme_ref" placeholder="采用前由服务签发" /></label><label>操作<select name="mode"><option value="compile">编译候选</option><option value="activate">采用方案</option></select></label>`;
-  if (page[0] === "memory") return `<p>提交来源更正申请需要已核验的来源/目标引用和访问、删除纪元。服务端当前可能返回 HOLD；申请不代表更正已采用。</p><label>更正说明<textarea name="statement" required maxlength="4096"></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" required /></label><label>目标引用（逗号分隔）<input name="target_refs" required /></label><label>访问纪元<input name="access_epoch" type="number" min="0" step="1" required /></label><label>删除纪元<input name="deletion_epoch" type="number" min="0" step="1" required /></label><label>影响预览引用（可选）<input name="impact_preview_ref" /></label><button type="button" class="quiet" data-command="memory-correction" ${state.role && state.sessionReady && state.status !== "loading" ? "" : "disabled"}>提交来源更正申请</button>`;
+  if (page[0] === "memory") return `<p>可从左侧已授权来源摘要选择来源。目标引用和当前访问、删除纪元须从可信记录核对后填写；服务端仍会重新核验。HOLD 或超时不代表更正已提交。</p><label>更正说明<textarea name="statement" required maxlength="4096">${correctionField("statement")}</textarea></label><label>来源引用（逗号分隔）<input name="source_refs" value="${correctionField("source_refs")}" required /></label><label>目标引用（逗号分隔）<input name="target_refs" value="${correctionField("target_refs")}" required /></label><label>访问纪元<input name="access_epoch" type="number" min="0" step="1" value="${correctionField("access_epoch")}" required /></label><label>删除纪元<input name="deletion_epoch" type="number" min="0" step="1" value="${correctionField("deletion_epoch")}" required /></label><label>影响预览引用（可选）<input name="impact_preview_ref" value="${correctionField("impact_preview_ref")}" /></label><button type="button" class="quiet" data-command="memory-correction" ${state.role && state.sessionReady && state.status !== "loading" ? "" : "disabled"}>提交来源更正申请</button>`;
   if (page[0] === "relations") return `<p>当前仅支持按 D12 source_claim 合同提交来源更正申请；申请可能保持 HOLD，不代表关系或记忆已修改。解释质疑和创作调整暂不可提交。</p><label>更正说明<textarea name="statement" required maxlength="4096"></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" required /></label><label>目标引用（逗号分隔）<input name="target_refs" required /></label><label>访问纪元<input name="access_epoch" type="number" min="0" step="1" required /></label><label>删除纪元<input name="deletion_epoch" type="number" min="0" step="1" required /></label><label>影响预览引用（可选）<input name="impact_preview_ref" /></label>`;
   if (["cognition", "action", "expression"].includes(page[0])) return `<label>对象引用<input name="object_ref" required /></label><label>控制请求<input name="control" placeholder="只提交领域可解释的控制请求" /></label>`;
   if (page[0] === "diagnostics") return `<label>操作<select name="mode"><option value="experiment">隔离实验</option><option value="support">生成脱敏支持诊断</option></select></label><label>假设或问题<textarea name="hypothesis"></textarea><input name="question" placeholder="支持问题" /></label>`;
@@ -135,7 +141,7 @@ function memoryProjectionMarkup(projection) {
   if (!validMemoryProjection(projection)) return `<section class="empty-state" role="alert"><h2>记忆来源不可用</h2><p>服务未返回完整且可确认的 D06 来源摘要；请重新请求当前视图。</p></section>`;
   const sources = projection.data.sources;
   return `<section class="creation-view" aria-label="已授权记忆来源摘要"><h2>记忆来源</h2><p>仅显示服务按当前权限返回的来源元数据，不包含记忆原文。来源资格未记录时，不能据此认定其为事实证据。</p>${sources.length
-    ? `<ul class="creation-list">${sources.map((item) => `<li><strong>${escapeHtml(item.source_id)}</strong><span>来源类型：${escapeHtml(item.source_kind)} · 断言状态：${escapeHtml(item.assertion_status)}</span><small>记录时间戳：${item.recorded_at} · 来源资格：未记录</small></li>`).join("")}</ul>`
+    ? `<ul class="creation-list">${sources.map((item, index) => `<li><strong>${escapeHtml(item.source_id)}</strong><span>来源类型：${escapeHtml(item.source_kind)} · 断言状态：${escapeHtml(item.assertion_status)}</span><small>记录时间戳：${item.recorded_at} · 来源资格：未记录</small><button type="button" class="quiet source-select" data-source-index="${index}" aria-label="将来源 ${escapeHtml(item.source_id)} 填入更正表单">选择此来源</button></li>`).join("")}</ul>`
     : `<p class="creation-empty">当前授权范围内没有可显示的记忆来源。</p>`}<p class="creation-coverage" role="status">服务已确认完整覆盖，共 ${sources.length} 条来源。</p></section>`;
 }
 
@@ -257,7 +263,7 @@ function setupMarkup() {
 }
 
 function render() {
-  if (!state.sessionReady) sceneCandidates = [];
+  if (!state.sessionReady) { sceneCandidates = []; clearCorrectionDraft(); }
   const page = pages.find(([id]) => id === state.view) ?? pages[0];
   const [statusTitle, statusDetail] = state.view === "setup" && hasVerifiedCatalogue()
     ? ["工作台会话已核验", "角色初始化、场景绑定与验证对话仍需各自的真实回执。"]
@@ -270,6 +276,9 @@ function render() {
       : state.view === "relations" ? relationsProjectionMarkup(state.projection)
       : `<pre class="projection" aria-label="服务返回的权限过滤投影">${escapeHtml(JSON.stringify(state.projection, null, 2))}</pre>`
     : `<section class="empty-state" aria-live="polite"><div class="empty-mark" aria-hidden="true">◇</div><h2>${sessionVerified ? statusTitle : "Owner 尚未解锁"}</h2><p>${sessionVerified ? statusDetail : "Sylanne Owner 会话尚未核验。请先完成服务端登录，再刷新解锁状态。"}</p><button class="primary" data-command="refresh" ${state.role && sessionVerified ? "" : "disabled"}>重新请求投影</button></section>`;
+  const correctionReceipt = state.view === "memory" && state.sessionReady && state.receipt?.schema === "d12.source_correction_receipt.v1"
+    && state.receipt.phase === "source_correction_committed" && state.status === "ready"
+    ? `<p class="correction-receipt" role="status">服务端已提交来源更正，图版本 ${escapeHtml(state.receipt.graph_revision)}；关联内容仍需重新评估。操作 ID：${escapeHtml(state.receipt.operation_id)}</p>` : "";
   app.innerHTML = `
     <div class="shell">
       <header class="topbar">
@@ -290,7 +299,7 @@ function render() {
           <aside class="inspector" aria-label="操作面板"><h2>操作</h2><p>操作由服务端能力、当前作用域和版本核验。页面不会直接改图或调用平台发送。</p>
           <form id="page-form">${formMarkup(page)}<button type="button" class="primary" data-command="page-action" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>${page[0] === "setup" ? "提交场景绑定" : page[0] === "relations" ? "提交来源更正申请" : page[3] === "read" ? "读取当前视图" : "提交给服务端"}</button></form>
           ${page[0] === "setup" ? `<section class="owner-operation"><h3>角色初始化</h3><p>模型能力和预算目录不会由工作台推测。请从可信安装资料填写引用；服务端未配置或无法核验时会保持 HOLD。</p><form id="create-character-form"><label>角色名称<input name="display_name" required maxlength="80" /></label><label>角色预设<select name="blueprint" required><option value="">请选择</option><option value="d01.persona.warm-listener.v1">温和倾听者</option><option value="d01.persona.curious-maker.v1">好奇探索者</option></select></label><label>模型能力引用<input name="model_capability_ref" required autocomplete="off" placeholder="来自可信安装资料" /></label><label>预算引用<input name="budget_ref" required autocomplete="off" placeholder="来自可信安装资料" /></label><button type="button" class="primary" data-command="create-character" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>提交角色初始化</button></form></section>` : ""}
-          <dl><dt>操作收据</dt><dd>${escapeHtml(state.receipt?.operation_id ?? "尚无")}</dd><dt>状态</dt><dd>${escapeHtml(state.receipt?.phase ?? statusTitle)}</dd></dl></aside>
+          ${correctionReceipt}<dl><dt>操作收据</dt><dd>${escapeHtml(state.receipt?.operation_id ?? "尚无")}</dd><dt>状态</dt><dd>${escapeHtml(state.receipt?.phase ?? statusTitle)}</dd></dl></aside>
         </div>
       </main>
     </div>`;
@@ -306,14 +315,14 @@ async function loadView() {
       : await api.readView({ scope: state.role, viewType: VIEW_TYPES[state.view] });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
-    if (result.status === "unauthorized") clearSetupReceipts();
+    if (result.status === "unauthorized") { clearSetupReceipts(); clearCorrectionDraft(); }
     Object.assign(state, state.view === "memory" && result.status === "ready" && !validMemoryProjection(result.projection)
       ? applyProblem(state, { code: "invalid_memory_projection", message: "D06 未返回完整且可确认的来源摘要；请重新请求记忆视图。" })
       : applyResponse(state, result));
   } catch (error) {
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
-    if (!state.sessionReady) clearSetupReceipts();
+    if (!state.sessionReady) { clearSetupReceipts(); clearCorrectionDraft(); }
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
@@ -400,6 +409,7 @@ async function ownerAction(action) {
     api.clearSession();
     state.sessionReady = false;
     clearSetupReceipts();
+    clearCorrectionDraft();
     Object.assign(state, applyProblem(state, { code: "owner_session_locked", message: "页面已锁定，正在等待服务端确认 Owner 退出。" }));
     render();
     try {
@@ -483,6 +493,7 @@ async function command(action) {
     sceneCandidates = [];
     sceneCandidatesProblem = null;
     clearSetupReceipts();
+    clearCorrectionDraft();
     Object.assign(state, switchRole(state, value)); render(); await loadView(); return;
   }
   if (action === "retry-session") return verifySession(true);
@@ -490,10 +501,16 @@ async function command(action) {
   if (action === "refresh") return loadView();
   if (action === "creation-next") return loadMoreCreation();
   if (action === "memory-correction") {
-    if (state.view !== "memory" || !state.sessionReady) return;
+    if (state.view !== "memory" || !state.sessionReady || state.status === "loading") return;
     try {
-      const [nextAction, input] = workflowForPage("memory", Object.fromEntries(new FormData(document.querySelector("#page-form")).entries()));
-      return commandAction(nextAction, input);
+      const values = Object.fromEntries(new FormData(document.querySelector("#page-form")).entries());
+      Object.assign(correctionDraft, values);
+      const [nextAction, input] = workflowForPage("memory", values);
+      const fingerprint = JSON.stringify([state.role, input]);
+      if (correctionAttempt?.fingerprint !== fingerprint) {
+        correctionAttempt = { fingerprint, operationId: crypto.randomUUID() };
+      }
+      return commandAction(nextAction, input, "workbench_user_action", correctionAttempt.operationId);
     } catch (error) {
       Object.assign(state, applyProblem(state, { code: "invalid_input", message: error.message, retryable: false })); render(); return;
     }
@@ -540,33 +557,27 @@ async function loadSceneCandidates() {
   } catch (error) {
     if (epoch !== sceneCandidatesEpoch) return;
     sceneCandidatesProblem = normalizeError(error).message;
-    if (!api.hasSession) { state.sessionReady = false; clearSetupReceipts(); }
+    if (!api.hasSession) { state.sessionReady = false; clearSetupReceipts(); clearCorrectionDraft(); }
   }
   render();
 }
 
-async function commandAction(action, input, purpose = "workbench_user_action") {
+async function commandAction(action, input, purpose = "workbench_user_action", operationId) {
   if (!state.role) return loadView();
   const epoch = ++requestEpoch;
-  const operationKeyValue = needsFreshProjection(action)
-    ? pendingOperationIds.key(action, state.role, purpose, input) : null;
   state.status = "loading"; state.problem = null; render();
   try {
-    const result = await api.command(action, {
-      scope: state.role, purpose, input,
-      ...(operationKeyValue ? { operationId: pendingOperationIds.get(operationKeyValue) } : {})
-    });
+    const result = await api.command(action, { scope: state.role, purpose, input, operationId });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
-    if (result.status === "unauthorized") clearSetupReceipts();
-    else if (result.status === "ready" && operationKeyValue) pendingOperationIds.complete(operationKeyValue);
+    if (result.status === "unauthorized") { clearSetupReceipts(); clearCorrectionDraft(); }
     Object.assign(state, applyResponse(state, result));
     rememberSetupReceipt(action, result);
     if (result.status === "ready" && needsFreshProjection(action)) return loadView();
   } catch (error) {
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
-    if (!state.sessionReady) clearSetupReceipts();
+    if (!state.sessionReady) { clearSetupReceipts(); clearCorrectionDraft(); }
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
@@ -583,6 +594,7 @@ async function verifySession(refreshRole = false) {
     api.clearSession();
     state.sessionReady = false;
     clearSetupReceipts();
+    clearCorrectionDraft();
     state.projection = null;
     state.receipt = null;
     state.status = "loading";
@@ -603,6 +615,7 @@ async function verifySession(refreshRole = false) {
     if (checkEpoch !== sessionCheckEpoch) return;
     state.sessionReady = false;
     clearSetupReceipts();
+    clearCorrectionDraft();
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
@@ -632,6 +645,18 @@ app.addEventListener("click", async (event) => {
     form.elements.namedItem("acknowledgement").checked = false;
     return;
   }
+  const sourceIndex = event.target.closest("[data-source-index]")?.dataset.sourceIndex;
+  if (sourceIndex !== undefined) {
+    if (state.view !== "memory" || state.status !== "ready" || !state.sessionReady
+        || !validMemoryProjection(state.projection)) return;
+    const source = state.projection.data.sources[Number(sourceIndex)];
+    const field = document.querySelector('#page-form [name="source_refs"]');
+    if (!source || !field) return;
+    field.value = source.source_id;
+    correctionDraft.source_refs = source.source_id;
+    field.focus();
+    return;
+  }
   const view = event.target.closest("[data-view]")?.dataset.view;
   if (view) {
     if (view !== state.view) { state.view = view; state.projection = null; }
@@ -650,6 +675,9 @@ app.addEventListener("input", (event) => {
     ownerDraft[event.target.name] = event.target.value;
   }
   if (event.target?.id === "owner-signature") ownerSignature = event.target.value;
+  if (state.view === "memory" && event.target?.form?.id === "page-form" && event.target.name) {
+    correctionDraft[event.target.name] = event.target.value;
+  }
 });
 
 app.addEventListener("keydown", (event) => {
