@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, replace
 import math
 
 from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeSpec
+from ...memory_types import SourceRecord, validate_access
 from ...runtime_contracts import (
     CommandEnvelope,
     DependencySet,
@@ -23,7 +24,10 @@ from .encoding_baseline import CommittedRef, EncodingBaseline, decode_encoding_b
 from .numeric_coupling import (
     NumericCoupling, numeric_coupling_type_spec, validate_numeric_coupling,
 )
-from .root import root_type_specs
+from .numeric_drive import (
+    SourcedNumericDrive, sourced_numeric_drive_type_spec, sourced_numeric_drive_write,
+)
+from .root import decode_numeric_checkpoint, root_type_specs
 
 
 def _nonempty(value: object, label: str) -> str:
@@ -735,6 +739,7 @@ class AffectProvider:
             "d04.root_numeric_checkpoint_candidate.v1",
             "d04.numeric_checkpoint.v1",
             "d04.numeric_coupling.v1",
+            "d04.sourced_numeric_drive.v1",
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
@@ -759,7 +764,7 @@ class AffectProvider:
                 schema_hash=schema_hash({"type": name, "version": 1, "writer_domain": "d04"}),
             )
             for name, owner_kinds, storage_role, validator in definitions
-        ) + root_type_specs() + (numeric_coupling_type_spec(),)
+        ) + root_type_specs() + (numeric_coupling_type_spec(), sourced_numeric_drive_type_spec())
 
     def compile_scheme(self, draft: AffectScheme, snapshot: object = None) -> AffectScheme:
         if not isinstance(draft, AffectScheme):
@@ -872,6 +877,59 @@ class AffectProvider:
             contribution_keys=contribution_keys,
             required_bundle_parts=required_bundle_parts,
         )
+
+    def propose_sourced_numeric_drive(
+        self, envelope: CommandEnvelope, snapshot: GraphSnapshot,
+        drive: SourcedNumericDrive,
+    ) -> DomainProposal:
+        """Pin one compiled drive candidate to committed source and checkpoint rows.
+
+        The graph check cannot authenticate ``mapping_compiler_ref``. W01 must
+        verify that issuer and source correction/access heads before adoption.
+        """
+        if (type(envelope) is not CommandEnvelope or type(snapshot) is not GraphSnapshot
+                or type(drive) is not SourcedNumericDrive):
+            raise TypeError("numeric drive proposal needs envelope, snapshot and typed drive")
+        write = sourced_numeric_drive_write(drive)
+        namespace = envelope.authority.namespace
+        if (write.key.owner.bot, write.key.owner.persona) != namespace.as_tuple:
+            raise ValueError("numeric drive crosses command namespace")
+        guarded = {item.key: item for item in envelope.version_guard.read_versions}
+        if len(guarded) != len(envelope.version_guard.read_versions):
+            raise ValueError("numeric drive guard repeats a graph key")
+        if guarded.get(write.key) != GraphVersion(write.key, 0):
+            raise ValueError("numeric drive needs an absent-row version guard")
+        refs = (drive.checkpoint_ref, drive.source_ref, drive.access_ref)
+        versions = (drive.checkpoint_revision, drive.source_revision, drive.access_revision)
+        for ref, revision in zip(refs, versions):
+            key = AtomKey.from_token(ref)
+            atom = snapshot.get(key)
+            if (atom is None or not atom.valid or atom.revision != revision
+                    or guarded.get(key) != GraphVersion(key, revision)):
+                raise ValueError("numeric drive input is absent or not version guarded")
+        if (drive.source_ref not in envelope.source_qualification.source_refs
+                or not {drive.drive_id, drive.checkpoint_ref, drive.source_ref,
+                        drive.mapping_compiler_ref} <= set(envelope.input_refs)):
+            raise ValueError("numeric drive provenance is not command-bound")
+        checkpoint = decode_numeric_checkpoint(snapshot.get(write.dependencies[0]).value)
+        source = SourceRecord.from_dict(snapshot.get(write.dependencies[1]).value)
+        access = snapshot.get(write.dependencies[2]).value
+        validate_access(access)
+        if (checkpoint.cursor != drive.role_start
+                or checkpoint.namespace != namespace.as_tuple
+                or checkpoint.assets.scheme_version != drive.scheme_version
+                or source.source_id != write.dependencies[1].owner.subject
+                or access["source_id"] != source.source_id or access["status"] != "active"):
+            raise ValueError("numeric drive interval or D06 source/access differs")
+        dependencies = DependencySet(
+            current_invalidation=tuple(guarded[key] for key in write.dependencies),
+            historical_provenance=(guarded[write.dependencies[1]],),
+        )
+        proposal = self.proposal_for(
+            envelope, typed_writes=(write,), dependencies=dependencies,
+            contribution_keys=(), required_bundle_parts=(),
+        )
+        return self.validate(proposal, snapshot)
 
     def propose_encoding_baseline(
         self,
@@ -1451,6 +1509,40 @@ class AffectProvider:
                     raise ValueError("numeric coupling graph key differs from canonical edge identity")
                 if decoded.source_ref not in proposal.envelope.source_qualification.source_refs:
                     raise ValueError("numeric coupling source lacks command qualification")
+            if isinstance(decoded, SourcedNumericDrive):
+                expected = sourced_numeric_drive_write(decoded)
+                guarded = {item.key: item for item in proposal.envelope.version_guard.read_versions}
+                if (write != expected or guarded.get(write.key) != GraphVersion(write.key, 0)
+                        or any(guarded.get(key) != GraphVersion(key, revision)
+                               for key, revision in zip(write.dependencies, (
+                                   decoded.checkpoint_revision, decoded.source_revision,
+                                   decoded.access_revision)))
+                        or proposal.dependencies != DependencySet(
+                            current_invalidation=tuple(guarded[key] for key in write.dependencies),
+                            historical_provenance=(guarded[write.dependencies[1]],))
+                        or decoded.source_ref not in proposal.envelope.source_qualification.source_refs
+                        or not {decoded.drive_id, decoded.checkpoint_ref, decoded.source_ref,
+                                decoded.mapping_compiler_ref} <= set(proposal.envelope.input_refs)):
+                    raise ValueError("numeric drive graph write or provenance differs")
+                if not isinstance(snapshot, GraphSnapshot):
+                    raise ValueError("numeric drive requires the committed graph snapshot")
+                for key, revision in zip(write.dependencies, (
+                        decoded.checkpoint_revision, decoded.source_revision,
+                        decoded.access_revision)):
+                    atom = snapshot.get(key)
+                    if atom is None or not atom.valid or atom.revision != revision:
+                        raise ValueError("numeric drive dependency is absent from snapshot")
+                checkpoint = decode_numeric_checkpoint(snapshot.get(write.dependencies[0]).value)
+                source = SourceRecord.from_dict(snapshot.get(write.dependencies[1]).value)
+                access = snapshot.get(write.dependencies[2]).value
+                validate_access(access)
+                if (checkpoint.cursor != decoded.role_start
+                        or checkpoint.namespace != proposal.envelope.authority.namespace.as_tuple
+                        or checkpoint.assets.scheme_version != decoded.scheme_version
+                        or source.source_id != write.dependencies[1].owner.subject
+                        or access["source_id"] != source.source_id
+                        or access["status"] != "active"):
+                    raise ValueError("numeric drive interval or D06 source/access differs")
             if isinstance(decoded, RecollectionExperience) and (
                 write.key.name != decoded.experience_id
                 or write.key.owner.subject != decoded.activity_id
