@@ -193,6 +193,57 @@ class GeneratedNonlinearPackageTests(unittest.TestCase):
         with self.assertRaises(D04ProductionReadoutUnavailable):
             require_d04_production_readout(candidate)
 
+    def test_real_native_chain_binds_current_unsigned_graph_but_stays_hold(self) -> None:
+        from sylanne3.domains.d04.numeric_drive import sourced_numeric_drive_write
+        from sylanne3.native_runtime.d04_product_admission import (
+            d04_numeric_graph_binding_digest, preflight_d04_product_numeric_readout,
+        )
+        from sylanne3.native_runtime.d04_snapshot_compiler import (
+            D04NumericTopologyRow, compile_d04_fixed_chain_snapshot_candidate,
+        )
+        from rewrite.tests.alpha1.runtime.test_authoritative_coupling_snapshot import (
+            _fixture, _insert, _read,
+        )
+        from rewrite.tests.alpha1.runtime.test_current_numeric_sources import _drive
+        from rewrite.tests.alpha1.numerics.test_current_numeric_sources_multisource import _read_v2
+
+        with tempfile.TemporaryDirectory() as directory:
+            store, namespace, scheme, assets, source, root = _fixture(Path(directory))
+            try:
+                drive = sourced_numeric_drive_write(_drive(root, source))
+                _insert(store._db, namespace, drive.key, drive.value)
+                graph = _read(store, namespace, scheme, assets, root)
+                sources = _read_v2(store, graph, scheme, (drive.key.token,))
+                snapshot = compile_d04_fixed_chain_snapshot_candidate(
+                    affect_template=(self.package / "resources/catalogue/d04-affect-scheme.json").read_bytes(),
+                    operator_template=(self.package / "resources/catalogue/d04-fixed-block-operator.json").read_bytes(),
+                    graph_version=d04_numeric_graph_binding_digest(graph, sources),
+                    topology_rows=tuple(D04NumericTopologyRow(axis, ()) for axis in graph.axis_ids),
+                    external_numeric_nodes=(), initial_state=sources.initial_state,
+                    drive=sources.drive, readout=(1.0,) + (0.0,) * 23,
+                )
+                model = build_d04_engineering_candidate()
+                first = FixedBlockStep(
+                    model.k, model.r, model.j, model.a, model.alpha,
+                    sources.initial_state, sources.drive, sources.initial_state,
+                    1.0 / 256.0, 0.0, 64, 1e-5,
+                )
+                candidate = run_d04_fixed_block_box_trajectory_candidate(
+                    self.handle, self.package, self.scheme, first,
+                    (FixedBlockContinuation.from_step(first),),
+                    lower=(1.9,) * 24, upper=(2.1,) * 24,
+                )
+                preflight = preflight_d04_product_numeric_readout(
+                    self.handle, self.package, graph, sources, snapshot, candidate,
+                )
+                self.assertEqual(preflight.status, "candidate_hold")
+                self.assertEqual(preflight.snapshot_sha256, snapshot.snapshot_sha256)
+                self.assertLess(preflight.readout_lower, preflight.readout_upper)
+                with self.assertRaises(D04ProductionReadoutUnavailable):
+                    require_d04_production_readout(candidate)
+            finally:
+                store.close()
+
     def test_generated_asset_rejects_missing_coupling_or_changed_alpha(self) -> None:
         first = self._first()
         lower = first.previous
