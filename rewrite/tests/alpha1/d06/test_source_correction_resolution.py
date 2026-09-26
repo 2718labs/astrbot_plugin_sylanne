@@ -5,7 +5,10 @@ from dataclasses import replace
 import pytest
 
 from rewrite.tests.alpha1.d06.test_source_correction_candidate import ADAPTER, setup
-from sylanne3.domains.d06 import validate_source_correction_head
+from sylanne3.domains.d06 import (
+    D06DomainProvider, validate_source_correction_head,
+    validate_source_correction_head_transition_v1,
+)
 from sylanne3.domains.d06.source_correction_resolution import (
     ActualCorrectionCostV1, CorrectionJobOutboxSettlementV1,
     CurrentCorrectionSourceV1, ReevaluationReceiptRefV1,
@@ -52,9 +55,54 @@ def test_resolved_candidate_preserves_pending_barrier_until_w01_atomic_adoption(
     assert candidate.status == "requires_w01_atomic_receipt_verification"
     validate_resolved_source_correction_head_candidate_v1(
         candidate, pending_head=args["pending_head"], pending_revision=1)
-    with pytest.raises(ValueError, match="fields differ"):
-        validate_source_correction_head(candidate.head_key, candidate.next_value)
+    validate_source_correction_head(candidate.head_key, candidate.next_value)
+    validate_source_correction_head_transition_v1(
+        candidate.head_key, args["pending_head"], candidate.next_value,
+        expected_revision=1)
+    spec = next(item for item in D06DomainProvider.type_specs()
+                if item.name == candidate.head_key.type_name)
+    assert spec.schema_version == 2
+    spec.validator(candidate.next_value)
     assert args["pending_head"]["state"] == "pending_reevaluation"
+
+
+def test_resolved_head_shape_and_pending_transition_are_restricted():
+    args = _case()
+    candidate = compile_resolved_source_correction_head_v1(**args)
+    key, pending, resolved = (
+        candidate.head_key, args["pending_head"], candidate.next_value)
+    for changed in (
+        {**resolved, "resolution_proof_digest": "unverified"},
+        {**resolved, "unexpected": True},
+        {**pending, "resolution_proof_digest": "a" * 64},
+    ):
+        with pytest.raises(ValueError):
+            validate_source_correction_head(key, changed)
+    with pytest.raises(ValueError, match="historical identity"):
+        validate_source_correction_head_transition_v1(
+            key, pending, {**resolved, "operation_id": "other"},
+            expected_revision=1)
+    with pytest.raises(ValueError, match="regressed authority epoch"):
+        validate_source_correction_head_transition_v1(
+            key, {**pending, "access_epoch": 2},
+            {**resolved, "access_epoch": 1},
+            expected_revision=1)
+    with pytest.raises(ValueError, match="pending CAS"):
+        validate_source_correction_head_transition_v1(
+            key, resolved, pending, expected_revision=2)
+
+
+def test_generic_d06_proposal_cannot_adopt_resolved_head_without_w01_receipts():
+    request, reads, envelope = setup()
+    prepared = ADAPTER.compile_source_correction(
+        envelope, request, reads, recorded_at=5.0)
+    candidate = compile_resolved_source_correction_head_v1(**_case())
+    writes = tuple(
+        replace(write, value=candidate.next_value)
+        if write.key == candidate.head_key else write
+        for write in prepared.proposal.typed_writes)
+    with pytest.raises(ValueError, match="W01 receipt verification"):
+        D06DomainProvider().validate(replace(prepared.proposal, typed_writes=writes))
 
 
 def test_candidate_validator_rejects_tampered_next_value_or_stale_head_version():

@@ -1,6 +1,6 @@
 """Pure resolved-head candidate for a previously committed D06 correction.
 
-This module does not register a resolved graph value or grant a write. W01 must
+This module does not grant a resolved graph write. W01 must
 verify each cited durable receipt in its current fenced graph/Authority read,
 then perform the head-version CAS in the same atomic bundle before lifting the
 current-recollection barrier. Historical source and feeling atoms stay intact.
@@ -14,10 +14,13 @@ import re
 
 from ...graph_types import AtomKey, GraphVersion
 from ...runtime_contracts import NamespaceId, canonical_digest
-from . import validate_source_correction_head
+from . import (
+    SOURCE_CORRECTION_RESOLUTION_SCHEMA, validate_source_correction_head,
+    validate_source_correction_head_transition_v1,
+)
 
 
-SCHEMA = "sylanne.d06.source-correction-resolution.v1"
+SCHEMA = SOURCE_CORRECTION_RESOLUTION_SCHEMA
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _DOMAINS = frozenset({"d04", "d05", "d07"})
 
@@ -170,8 +173,10 @@ def compile_resolved_source_correction_head_v1(
     d11: CorrectionJobOutboxSettlementV1 | None,
     now_utc: float,
 ) -> ResolvedSourceCorrectionHeadCandidateV1 | SourceCorrectionResolutionHoldV1:
-    """Prepare an untrusted next value; never validate it as a registered write."""
+    """Prepare an untrusted next value; never authenticate its receipt refs."""
     validate_source_correction_head(head_key, pending_head)
+    if pending_head["state"] != "pending_reevaluation":
+        raise ValueError("resolution requires a pending correction head")
     _integer(pending_revision, "pending head revision", positive=True)
     if type(current) is not CurrentCorrectionSourceV1:
         raise TypeError("typed current source/access snapshot required")
@@ -223,7 +228,8 @@ def compile_resolved_source_correction_head_v1(
         "resolution_proof_digest": canonical_digest(evidence),
         "resolved_at_utc": now,
     }
-    # This value intentionally fails the registered pending-only v1 validator.
+    validate_source_correction_head_transition_v1(
+        head_key, pending_head, next_value, expected_revision=pending_revision)
     return ResolvedSourceCorrectionHeadCandidateV1(
         head_key, GraphVersion(head_key, pending_revision), current,
         tuple(by_domain[domain] for domain in sorted(_DOMAINS)), cost, d11,

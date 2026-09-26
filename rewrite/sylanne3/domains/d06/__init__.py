@@ -13,6 +13,7 @@ from enum import Enum
 import hashlib
 import json
 import math
+import re
 from typing import Mapping
 
 from ...memory_types import (
@@ -81,16 +82,23 @@ _RECOLLECTION_PROJECTION_SCHEMA_HASH = schema_hash({
     "fields": sorted(_RECOLLECTION_PROJECTION_FIELDS),
 })
 SOURCE_CORRECTION_HEAD_TYPE = "d06.source_correction_head.v1"
-_SOURCE_CORRECTION_HEAD_FIELDS = frozenset({
+SOURCE_CORRECTION_RESOLUTION_SCHEMA = "sylanne.d06.source-correction-resolution.v1"
+_SOURCE_CORRECTION_HEAD_PENDING_FIELDS = frozenset({
     "source_ref", "source_revision", "correction_source_ref", "target_refs",
     "operation_id", "state", "access_epoch", "deletion_epoch",
 })
+_SOURCE_CORRECTION_HEAD_RESOLVED_FIELDS = (
+    _SOURCE_CORRECTION_HEAD_PENDING_FIELDS
+    | {"resolution_schema", "resolution_proof_digest", "resolved_at_utc"}
+)
 _SOURCE_CORRECTION_HEAD_SCHEMA_HASH = schema_hash({
     "type": SOURCE_CORRECTION_HEAD_TYPE,
-    "version": 1,
+    "version": 2,
     "owner_kinds": ("event",),
     "storage_role": "state",
-    "fields": sorted(_SOURCE_CORRECTION_HEAD_FIELDS),
+    "pending_fields": sorted(_SOURCE_CORRECTION_HEAD_PENDING_FIELDS),
+    "resolved_fields": sorted(_SOURCE_CORRECTION_HEAD_RESOLVED_FIELDS),
+    "transition": "pending_reevaluation->resolved_reevaluation.v1",
 })
 _WORKBENCH_VIEW = "d06.memory_sources.v1"
 _WORKBENCH_FIELDS = frozenset({"sources", "coverage"})
@@ -245,7 +253,13 @@ def validate_source_correction_head(key: AtomKey, value: object) -> None:
     if (type(key) is not AtomKey or key.type_name != SOURCE_CORRECTION_HEAD_TYPE
             or key.name != "current" or key.owner.kind != "event"):
         raise ValueError("source correction head key is not canonical")
-    if type(value) is not dict or frozenset(value) != _SOURCE_CORRECTION_HEAD_FIELDS:
+    if type(value) is not dict or value.get("state") not in {
+            "pending_reevaluation", "resolved_reevaluation"}:
+        raise ValueError("source correction head state differs")
+    required = (_SOURCE_CORRECTION_HEAD_PENDING_FIELDS
+                if value["state"] == "pending_reevaluation"
+                else _SOURCE_CORRECTION_HEAD_RESOLVED_FIELDS)
+    if frozenset(value) != required:
         raise ValueError("source correction head fields differ")
     namespace = NamespaceId.from_key(key)
     source = source_key(*namespace.as_tuple, key.owner.subject)
@@ -269,11 +283,36 @@ def validate_source_correction_head(key: AtomKey, value: object) -> None:
                 or target.name != "current" or target.owner.kind != "event"):
             raise ValueError("source correction head target crosses contract")
     _nonempty(value["operation_id"], "operation_id")
-    if value["state"] != "pending_reevaluation":
-        raise ValueError("source correction head requires pending reevaluation")
     for name in ("access_epoch", "deletion_epoch"):
         if type(value[name]) is not int or value[name] < 0:
             raise ValueError(f"source correction head {name} must be nonnegative")
+    if value["state"] == "resolved_reevaluation":
+        if (value["resolution_schema"] != SOURCE_CORRECTION_RESOLUTION_SCHEMA
+                or type(value["resolution_proof_digest"]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}",
+                                value["resolution_proof_digest"]) is None):
+            raise ValueError("resolved correction head proof binding differs")
+        _finite(value["resolved_at_utc"], "resolved_at_utc")
+
+
+def validate_source_correction_head_transition_v1(
+    key: AtomKey, previous: dict, next_value: dict, *,
+    expected_revision: int,
+) -> None:
+    """Check a head CAS shape; W01 must authenticate receipts before writing."""
+    validate_source_correction_head(key, previous)
+    validate_source_correction_head(key, next_value)
+    if (type(expected_revision) is not int or expected_revision < 1
+            or previous["state"] != "pending_reevaluation"
+            or next_value["state"] != "resolved_reevaluation"):
+        raise ValueError("correction head transition requires pending CAS")
+    for field in ("source_ref", "source_revision", "correction_source_ref",
+                  "target_refs", "operation_id"):
+        if next_value[field] != previous[field]:
+            raise ValueError("correction head transition changed historical identity")
+    if any(next_value[field] < previous[field]
+           for field in ("access_epoch", "deletion_epoch")):
+        raise ValueError("correction head transition regressed authority epoch")
 
 
 def _validate_source_correction_head_value(value: object) -> None:
@@ -822,6 +861,7 @@ class D06DomainProvider:
             "state",
             _validate_source_correction_head_value,
             immutable=False,
+            schema_version=2,
             writer_domain="d06",
             schema_hash=_SOURCE_CORRECTION_HEAD_SCHEMA_HASH,
         ))
@@ -847,6 +887,8 @@ class D06DomainProvider:
             registry.validate(write.key, write.value)
             if write.key.type_name == SOURCE_CORRECTION_HEAD_TYPE:
                 validate_source_correction_head(write.key, write.value)
+                if write.value["state"] != "pending_reevaluation":
+                    raise ValueError("resolved correction head requires W01 receipt verification")
         heads = [write for write in proposal.typed_writes
                  if write.key.type_name == SOURCE_CORRECTION_HEAD_TYPE]
         if heads:
@@ -2119,11 +2161,14 @@ __all__ = [
     "SourceAdmissionProposal",
     "SourceCorrectionCandidateV1",
     "SourceCorrectionReadSetV1",
+    "SOURCE_CORRECTION_RESOLUTION_SCHEMA",
     "SourceGrantRead",
     "SubjectiveTraceCandidate",
     "TransferRequest",
     "TriggerKind",
     "provide_source_grant_check",
+    "validate_source_correction_head",
+    "validate_source_correction_head_transition_v1",
 ]
 
 from .recollection_read import (  # noqa: E402
