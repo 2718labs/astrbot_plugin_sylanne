@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 import math
 from typing import Mapping
 
-from ...graph_types import GraphVersion, NamespaceEpoch
+from ...graph_types import GraphVersion, NamespaceEpoch, Owner
 from ...memory_repository import MemoryRepository
 from ...memory_retrieval import MemoryBatch, MemoryQuery, MemoryRetriever
 from ...memory_retrieval import MemoryHit
@@ -32,9 +32,9 @@ from ...runtime_contracts import canonical_digest
 from ...memory_types import access_key
 from ...memory_types import episode_key, subjective_trace_key, subjective_trace_v2_key
 from ...memory_types import validate_episode, validate_subjective_trace, validate_subjective_trace_v2
-from ...runtime_contracts import CommandEnvelope, DomainProposal, NamespaceId, SourceQualification
+from ...runtime_contracts import CommandEnvelope, DependencySet, DomainBundle, DomainProposal, NamespaceId, SourceQualification
 from ...graph_types import AtomKey, GraphSnapshot
-from ..d04 import AffectCoupling, AffectScheme
+from ..d04 import AffectCoupling, AffectProvider, AffectScheme, MoodField
 from . import (
     CandidateSet,
     D06DomainAdapter,
@@ -504,6 +504,114 @@ class D06MemoryPipeline:
         )):
             raise RuntimeError("recollection source, access, or mood changed during preparation")
         return result
+
+    def assemble_affective_recollection_bundle(
+        self,
+        envelope: CommandEnvelope,
+        outcome: RetrievalOutcome,
+        ticket: SelectionTicket,
+        reconstruction: RecollectionReconstruction,
+        *,
+        mood_snapshot: GraphSnapshot,
+        mood_key: AtomKey,
+        scheme: AffectScheme,
+        coupling: AffectCoupling,
+        base_salience: tuple[float, float],
+        base_tone: tuple[float, float],
+        affect_provider: AffectProvider,
+        experience_id: str,
+        supporting_proposals: tuple[DomainProposal, ...],
+        choice_ref: str,
+        d02_settlement_ref: str,
+        d11_cost_settlement_ref: str,
+        persistent_job_ref: str,
+        outbox_ref: str,
+    ) -> DomainBundle:
+        """Join a prepared source/mood candidate to D04 and the five-domain C04 bundle.
+
+        Base intervals remain caller projections, not a certified C02 baseline.
+        D11 owns the final locked version check and commit receipt.
+        """
+        candidates = outcome.candidates
+        if (outcome.status != "candidate" or candidates is None or outcome.epoch is None
+                or reconstruction.status != "candidate_hold"
+                or reconstruction.epoch != outcome.epoch
+                or mood_snapshot.epochs != (outcome.epoch,)
+                or envelope.identity.activity_id != ticket.activity_id
+                or envelope.authority.namespace != self.adapter.namespace):
+            raise ValueError("C04 reconstruction, selection, mood, and envelope must share one activity and epoch")
+        context = RecollectionContext(
+            reconstruction.now_interpretation_refs,
+            reconstruction.feeling_experience_refs,
+            reconstruction.self_understanding_refs,
+        )
+        expected = self.adapter.prepare_recollection(ticket, candidates, context)
+        if len(expected.content_refs) != 1:
+            raise ValueError("C04 affective join requires one selected source")
+        selected_source = source_key(*self.adapter.namespace.as_tuple, expected.content_refs[0])
+        experience_key = AtomKey(
+            Owner("activity", *self.adapter.namespace.as_tuple, ticket.activity_id),
+            "d04.recollection_experience.v1", experience_id,
+        )
+        if (reconstruction.recollection_id != expected.recollection_id
+                or reconstruction.source_ref != selected_source.token
+                or context.feeling_experience_refs != (experience_key.token,)
+                or reconstruction.mood_ref != mood_key.token
+                or reconstruction.coupling_version != coupling.version):
+            raise ValueError("C04 prepared reconstruction differs from the selected source or experience")
+        guarded = set(envelope.version_guard.read_versions)
+        if (not reconstruction.read_versions
+                or not set(reconstruction.read_versions) <= guarded
+                or not any(v.key == selected_source and v.revision > 0
+                           for v in reconstruction.read_versions)
+                or not any(v.key == mood_key and v.revision > 0
+                           for v in reconstruction.read_versions)):
+            raise ValueError("C04 envelope lacks the source or mood reconstruction versions")
+        mood_atom = mood_snapshot.get(mood_key)
+        if (mood_atom is None or not mood_atom.valid
+                or GraphVersion(mood_key, mood_atom.revision) not in reconstruction.read_versions):
+            raise ValueError("C04 mood snapshot differs from the prepared reconstruction")
+        mood_spec = next(spec for spec in affect_provider.type_specs()
+                         if spec.name == "d04.mood_field.v1")
+        mood = mood_spec.validator(mood_atom.value)
+        if (not isinstance(mood, MoodField)
+                or (mood.basis_version, mood.parameter_version, mood.coupling_version)
+                != (scheme.scheme_version, scheme.parameter_version, scheme.coupling_version)
+                or coupling.version != scheme.coupling_version
+                or not {selected_source.token, *mood.source_refs}
+                <= set(envelope.source_qualification.source_refs)):
+            raise ValueError("C04 mood or its source qualification differs from the active scheme")
+        influence = affect_provider.condition_recollection(
+            memory_ref=selected_source.token,
+            memory_source_refs=(selected_source.token,),
+            base_salience_interval=base_salience,
+            base_tone_interval=base_tone,
+            mood=mood,
+            coupling=coupling,
+        )
+        if (influence.salience_interval != reconstruction.subjective_weight
+                or influence.tone_interval != reconstruction.subjective_tone
+                or influence.evidence_weight_delta != 0.0):
+            raise ValueError("C04 D04 experience differs from the mood-shaped reconstruction")
+        recollection_ref = AtomKey(
+            Owner("activity", *self.adapter.namespace.as_tuple, ticket.activity_id),
+            "d06.recollection.v1", reconstruction.recollection_id,
+        ).token
+        d04 = affect_provider.propose_recollection_experience(
+            envelope, experience_id=experience_id, recollection_ref=recollection_ref,
+            influence=influence, mood=mood, coupling=coupling,
+            source_versions=reconstruction.read_versions,
+            dependencies=DependencySet(),
+        )
+        return self.adapter.assemble_recollection_bundle(
+            envelope, ticket, candidates, context,
+            supporting_proposals=(*supporting_proposals, d04),
+            choice_ref=choice_ref,
+            d02_settlement_ref=d02_settlement_ref,
+            d11_cost_settlement_ref=d11_cost_settlement_ref,
+            persistent_job_ref=persistent_job_ref,
+            outbox_ref=outbox_ref,
+        )
 
     def prepare_association(
         self,
