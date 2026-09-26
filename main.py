@@ -30,7 +30,9 @@ from .rewrite.sylanne3.host.first_ingress_c02_driver import (
     installed_first_ingress_c02_pairing_ready_v1,
     original_acquired_handoff_v1,
     original_unacquired_handoff_v1,
-    run_installed_first_ingress_c02_v1,
+    run_installed_first_ingress_c02_v2,
+    run_installed_pending_first_ingress_c02_v2,
+    run_installed_committed_first_ingress_c02_cost_v2,
 )
 from .rewrite.sylanne3.host.ingress import IngressReceipt
 from .rewrite.sylanne3.installation_policy import AdminInstallationPolicy
@@ -359,7 +361,7 @@ class Sylanne3Plugin(Star):
         original_recovery: FirstIngressRecoveryItemV1 | None = None,
     ) -> None:
         try:
-            committed = await run_installed_first_ingress_c02_v1(
+            committed = await run_installed_first_ingress_c02_v2(
                 runtime, installation, context=self.context,
                 trusted_umo=trusted_umo, envelope=envelope, receipt=receipt,
                 original_recovery=original_recovery,
@@ -499,13 +501,13 @@ class Sylanne3Plugin(Star):
                 for line in pending_ids:
                     if self._encoding_stopping:
                         return
-                    committed = await runtime.recover_pending_first_ingress_c02_v1(
-                        line.rstrip("\n"))
-                    if committed is None:
+                    outcome = await run_installed_pending_first_ingress_c02_v2(
+                        runtime, installation, line.rstrip("\n"))
+                    if outcome is None:
                         logger.warning("Sylanne 3 pending C02 remains HOLD")
                     else:
-                        if not await runtime.recover_committed_first_ingress_c02_unknown_cost_v1(
-                                committed.operation_id):
+                        committed, settled = outcome
+                        if not settled:
                             logger.warning(
                                 "Sylanne 3 pending C02 committed but cost remains HOLD")
                         else:
@@ -580,8 +582,15 @@ class Sylanne3Plugin(Star):
                 for line in ids:
                     if self._encoding_stopping:
                         return
-                    if not await runtime.recover_committed_first_ingress_c02_unknown_cost_v1(
-                            line.rstrip("\n")):
+                    operation_id = line.rstrip("\n")
+                    terminal = await run_installed_committed_first_ingress_c02_cost_v2(
+                        runtime, installation, operation_id)
+                    if terminal is False:
+                        settled = await runtime.recover_committed_first_ingress_c02_unknown_cost_v1(
+                            operation_id)
+                    else:
+                        settled = terminal is True
+                    if not settled:
                         logger.warning("Sylanne 3 committed C02 cost remains HOLD")
         except asyncio.CancelledError:
             raise

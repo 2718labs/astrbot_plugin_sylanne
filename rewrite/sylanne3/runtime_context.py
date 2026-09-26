@@ -1260,7 +1260,7 @@ class RuntimeContext:
             yield PreparedFirstIngressWorkerResultV1(
                 egress, context, read_request, result_read)
 
-    async def commit_first_ingress_c02_v1(
+    async def commit_first_ingress_c02_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
         executor: HostModelEgressExecutor,
         original_recovery: FirstIngressRecoveryItemV1 | None = None,
@@ -1284,7 +1284,7 @@ class RuntimeContext:
                 return None
             try:
                 committed = await self._worker.call(
-                    lambda graph: graph.commit_first_ingress_c02_v1(
+                    lambda graph: graph.commit_first_ingress_c02_v2(
                         self._v2_bootstrap, prepared.egress.intent,
                         prepared.result_read, policy,
                         bundle.d06_first_ingress_c02, bundle.ingress_clock))
@@ -1301,6 +1301,16 @@ class RuntimeContext:
                            for version in committed.write_versions)):
                 return None
             return committed
+
+    async def commit_first_ingress_c02_v1(
+        self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
+        executor: HostModelEgressExecutor,
+        original_recovery: FirstIngressRecoveryItemV1 | None = None,
+    ) -> CommitReceipt | None:
+        """Compatibility entry; installed host always takes the v2 first seal."""
+        return await self.commit_first_ingress_c02_v2(
+            envelope, receipt, executor=executor,
+            original_recovery=original_recovery)
 
     async def first_ingress_c02_accounting_installed_v1(
         self, *, require_worker_result: bool = True,
@@ -1424,6 +1434,119 @@ class RuntimeContext:
                        for version in receipt.write_versions)):
             return None
         return receipt
+
+    async def read_pending_first_ingress_c02_terminal_request_v2(
+        self, consumer_operation_id: str,
+    ):
+        """Obtain the first-sealed attempt ID on the graph worker thread."""
+        if (type(consumer_operation_id) is not str or not consumer_operation_id
+                or self._worker is None or self._v2_bootstrap is None
+                or self._v2_namespace is None or not self._v2_namespace_provisioned
+                or self._v2_cost_transport is None):
+            return None
+        try:
+            return await self._worker.call(
+                lambda graph: graph.read_pending_first_ingress_c02_terminal_request_v2(
+                    self._v2_bootstrap, self._v2_namespace, consumer_operation_id))
+        except Exception:
+            return None
+
+    async def claim_pending_first_ingress_c02_terminal_read_v2(
+        self, consumer_operation_id: str, request,
+    ) -> bool | None:
+        """Persist one read attempt before the host issues its body RPC."""
+        from .authority_service.v2_terminal_c02_recovery_contract import (
+            TerminalRecoveryReadRequestV1,
+        )
+
+        if (type(consumer_operation_id) is not str or not consumer_operation_id
+                or type(request) is not TerminalRecoveryReadRequestV1
+                or request.consumer_operation_id != consumer_operation_id
+                or self._worker is None or self._v2_bootstrap is None
+                or self._v2_namespace is None or not self._v2_namespace_provisioned
+                or self._v2_cost_transport is None):
+            return None
+        try:
+            claimed = await self._worker.call(
+                lambda graph: graph.claim_pending_first_ingress_c02_terminal_read_v2(
+                    self._v2_bootstrap, self._v2_namespace,
+                    consumer_operation_id, request))
+            return claimed if type(claimed) is bool else None
+        except Exception:
+            return None
+
+    async def recover_pending_first_ingress_c02_v2_pinned(
+        self, consumer_operation_id: str, pinned_query, pinned_read,
+    ) -> CommitReceipt | None:
+        """Complete v2 recovery synchronously on the graph worker thread."""
+        from .host.terminal_c02_recovery_query import PinnedTerminalC02RecoveryQueryV1
+        from .runtime.c02_terminal_job import _PinnedTerminalRead
+
+        bundle = self._v2_model_bundle
+        policy = self._v2_policy
+        if (type(consumer_operation_id) is not str or not consumer_operation_id
+                or type(pinned_query) is not PinnedTerminalC02RecoveryQueryV1
+                or type(pinned_read) is not _PinnedTerminalRead
+                or self._worker is None or self._v2_bootstrap is None
+                or self._v2_namespace is None or not self._v2_namespace_provisioned
+                or self._v2_cost_transport is None
+                or type(bundle) is not AdminInstallationBundle
+                or type(policy) is not AdminInstallationPolicy
+                or type(bundle.d06_first_ingress_c02)
+                   is not AdminD06FirstIngressC02Policy
+                or type(bundle.ingress_clock) is not AdminIngressClockPolicy):
+            return None
+        try:
+            receipt = await self._worker.call(
+                lambda graph: graph.recover_pending_first_ingress_c02_v2_pinned(
+                    self._v2_bootstrap, policy.namespace, consumer_operation_id,
+                    policy, bundle.d06_first_ingress_c02, bundle.ingress_clock,
+                    pinned_query, pinned_read))
+        except Exception:
+            return None
+        if (type(receipt) is not CommitReceipt
+                or receipt.status not in {"committed", "duplicate"}
+                or receipt.operation_id != consumer_operation_id
+                or not {"memory.episode.v1", "memory.subjective_trace.v2"}
+                   <= {version.key.type_name for version in receipt.write_versions}):
+            return None
+        return receipt
+
+    async def read_committed_first_ingress_c02_terminal_request_v2(
+        self, consumer_operation_id: str,
+    ):
+        """Classify a committed terminal v2 cost without a body read."""
+        if (type(consumer_operation_id) is not str or not consumer_operation_id
+                or self._worker is None or self._v2_bootstrap is None
+                or self._v2_namespace is None or not self._v2_namespace_provisioned
+                or self._v2_cost_transport is None):
+            return None
+        try:
+            return await self._worker.call(
+                lambda graph: graph.read_committed_first_ingress_c02_terminal_request_v2(
+                    self._v2_bootstrap, self._v2_namespace, consumer_operation_id))
+        except Exception:
+            return None
+
+    async def recover_committed_first_ingress_c02_unknown_cost_v2_pinned(
+        self, consumer_operation_id: str, pinned_read,
+    ) -> bool:
+        from .runtime.c02_terminal_job import _PinnedTerminalRead
+
+        if (type(consumer_operation_id) is not str or not consumer_operation_id
+                or type(pinned_read) is not _PinnedTerminalRead
+                or self._worker is None or self._v2_bootstrap is None
+                or self._v2_namespace is None or not self._v2_namespace_provisioned
+                or self._v2_cost_transport is None):
+            return False
+        try:
+            await self._worker.call(
+                lambda graph: graph.recover_committed_first_ingress_c02_unknown_cost_v2_pinned(
+                    self._v2_bootstrap, self._v2_namespace,
+                    consumer_operation_id, pinned_read))
+        except Exception:
+            return False
+        return True
 
     async def discover_committed_first_ingress_c02_cost_v1(
         self, *, cursor: str | None = None, limit: int = 50,

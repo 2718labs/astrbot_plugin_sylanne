@@ -7,14 +7,22 @@ import json
 
 from astrbot.api.star import Context
 
+from ..authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
+from ..authority_service.v2_terminal_c02_recovery_contract import (
+    TerminalRecoveryReadRequestV1,
+)
 from ..model_broker.broker import ModelProviderDescriptor
+from ..runtime.c02_terminal_job import pin_finished_terminal_read_from_host
 from ..runtime_context import RuntimeContext
 from ..runtime.first_ingress_recovery import FirstIngressRecoveryItemV1
 from ..runtime.first_ingress_unacquired import FirstIngressUnacquiredItemV1
 from ..runtime.first_ingress_v2 import ingress_ids
 from ..runtime_contracts import CommitReceipt, InstallationGrantV2
 from .astrbot_model_call import AstrBotModelProvider
-from .authority_client import AuthorityClient, AuthoritySelection
+from .authority_client import (
+    AUTHORITY_PROTOCOL, AuthorityClient, AuthorityProvisioningRequest,
+    AuthoritySelection, PublisherPackageIdentity,
+)
 from .authority_profile import (
     AdminD06FirstIngressC02Policy, AdminIngressClockPolicy,
     AdminInstallationBundle, AdminModelWorkflowV2,
@@ -22,6 +30,7 @@ from .authority_profile import (
 from .ingress import HostIngressEnvelope, IngressReceipt
 from .model_egress_executor import HostModelEgressExecutor
 from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
+from .terminal_c02_recovery_query import PinnedTerminalC02RecoveryQueryV1
 from .v2_installation import V2InstallationAssembly
 
 
@@ -103,7 +112,7 @@ async def installed_first_ingress_c02_pairing_ready_v1(
         await transport.close()
 
 
-async def run_installed_first_ingress_c02_v1(
+async def run_installed_first_ingress_c02_v2(
     runtime: RuntimeContext, installation: V2InstallationAssembly, *,
     context: Context, trusted_umo: str, envelope: HostIngressEnvelope,
     receipt: IngressReceipt,
@@ -168,7 +177,7 @@ async def run_installed_first_ingress_c02_v1(
         executor = HostModelEgressExecutor(
             authority=client, bundle=bundle, grant=grant, adapter=adapter)
         try:
-            return await runtime.commit_first_ingress_c02_v1(
+            return await runtime.commit_first_ingress_c02_v2(
                 envelope, receipt, executor=executor,
                 original_recovery=original_recovery)
         except asyncio.CancelledError:
@@ -182,8 +191,162 @@ async def run_installed_first_ingress_c02_v1(
         await transport.close()
 
 
+async def run_installed_pending_first_ingress_c02_v2(
+    runtime: RuntimeContext, installation: V2InstallationAssembly,
+    consumer_operation_id: str,
+) -> tuple[CommitReceipt, bool] | None:
+    """Query the exact durable attempt; resend its same ID if still absent."""
+    if (type(runtime) is not RuntimeContext
+            or type(installation) is not V2InstallationAssembly
+            or type(consumer_operation_id) is not str or not consumer_operation_id
+            or type(installation.admin_bundle) is not AdminInstallationBundle
+            or type(installation.admin_bundle.tls_profile) is not AuthorityTlsProfile
+            or installation.admin_bundle.installation_policy
+               is not installation.installation_policy):
+        return None
+    request = await runtime.read_pending_first_ingress_c02_terminal_request_v2(
+        consumer_operation_id)
+    if (type(request) is CommitReceipt
+            and request.status == "duplicate"
+            and request.operation_id == consumer_operation_id):
+        return request, False
+    if (type(request) is not TerminalRecoveryReadRequestV1
+            or request.original_key.namespace
+               != installation.installation_policy.namespace
+            or request.original_key.installation_id
+               != installation.installation_grant.installation_id):
+        return None
+    profile = installation.admin_bundle.tls_profile
+    provisioning = AuthorityProvisioningRequest(
+        protocol=AUTHORITY_PROTOCOL, profile_id=profile.profile_id,
+        plugin_name="astrbot_plugin_sylanne", host_api_version="4.28.1",
+        package_root=installation.package_root, data_dir=installation.data_dir,
+        publisher_package=PublisherPackageIdentity(
+            installation.installation_policy.manifest_digest),
+    )
+    transport = MtlsAuthorityTransport({profile.profile_id: profile})
+    try:
+        handshake = await transport.handshake(
+            provisioning, protocol=AUTHORITY_V2_PROTOCOL)
+        grant = await transport.installation_grant_v2(provisioning, handshake)
+        if (not handshake.valid_pairing()
+                or grant != installation.installation_grant
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
+            return None
+        pinned_query = PinnedTerminalC02RecoveryQueryV1(
+            transport=transport, provisioning=provisioning,
+            handshake=handshake, grant=grant,
+            namespace=request.original_key.authority_namespace,
+            request=request)
+        attempt, _ = await transport.terminal_c02_recovery_query_v1(
+            provisioning, handshake, grant,
+            namespace=request.original_key.authority_namespace,
+            read_request=request)
+        if attempt is None:
+            # A prior process may have committed the local claim but died
+            # before sending the read. A repeated exact claim verifies that
+            # identity; Authority de-duplicates the same attempt ID.
+            claim = await runtime.claim_pending_first_ingress_c02_terminal_read_v2(
+                consumer_operation_id, request)
+            if claim is None:
+                return None
+            try:
+                # The mTLS transport returns only after the exact body is
+                # acknowledged on this channel. A lost response is resolved
+                # solely by querying this same durable attempt ID.
+                await transport.terminal_c02_recovery_read_v1(
+                    provisioning, handshake, grant,
+                    namespace=request.original_key.authority_namespace,
+                    read_request=request)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        elif attempt.state != "finished":
+            return None
+        pinned_read = await pin_finished_terminal_read_from_host(pinned_query)
+        receipt = await runtime.recover_pending_first_ingress_c02_v2_pinned(
+            consumer_operation_id, pinned_query, pinned_read)
+        if receipt is None:
+            return None
+        settled = await runtime.recover_committed_first_ingress_c02_unknown_cost_v2_pinned(
+            consumer_operation_id, pinned_read)
+        return receipt, settled
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+    finally:
+        await transport.close()
+
+
+async def run_installed_committed_first_ingress_c02_cost_v2(
+    runtime: RuntimeContext, installation: V2InstallationAssembly,
+    consumer_operation_id: str,
+) -> bool | None:
+    """Return False for legacy cost, True for settled terminal v2, None on HOLD."""
+    if (type(runtime) is not RuntimeContext
+            or type(installation) is not V2InstallationAssembly
+            or type(consumer_operation_id) is not str or not consumer_operation_id
+            or type(installation.admin_bundle) is not AdminInstallationBundle
+            or type(installation.admin_bundle.tls_profile) is not AuthorityTlsProfile):
+        return None
+    request = await runtime.read_committed_first_ingress_c02_terminal_request_v2(
+        consumer_operation_id)
+    if request is False:
+        return False
+    if (type(request) is not TerminalRecoveryReadRequestV1
+            or request.original_key.namespace
+               != installation.installation_policy.namespace
+            or request.original_key.installation_id
+               != installation.installation_grant.installation_id):
+        return None
+    profile = installation.admin_bundle.tls_profile
+    provisioning = AuthorityProvisioningRequest(
+        protocol=AUTHORITY_PROTOCOL, profile_id=profile.profile_id,
+        plugin_name="astrbot_plugin_sylanne", host_api_version="4.28.1",
+        package_root=installation.package_root, data_dir=installation.data_dir,
+        publisher_package=PublisherPackageIdentity(
+            installation.installation_policy.manifest_digest),
+    )
+    transport = MtlsAuthorityTransport({profile.profile_id: profile})
+    try:
+        handshake = await transport.handshake(
+            provisioning, protocol=AUTHORITY_V2_PROTOCOL)
+        grant = await transport.installation_grant_v2(provisioning, handshake)
+        if (not handshake.valid_pairing()
+                or grant != installation.installation_grant
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
+            return None
+        pinned_query = PinnedTerminalC02RecoveryQueryV1(
+            transport=transport, provisioning=provisioning,
+            handshake=handshake, grant=grant,
+            namespace=request.original_key.authority_namespace,
+            request=request)
+        pinned = await pin_finished_terminal_read_from_host(pinned_query)
+        return (True if await runtime.recover_committed_first_ingress_c02_unknown_cost_v2_pinned(
+            consumer_operation_id, pinned) else None)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None
+    finally:
+        await transport.close()
+
+
+async def run_installed_first_ingress_c02_v1(
+    runtime: RuntimeContext, installation: V2InstallationAssembly, **kwargs,
+) -> CommitReceipt | None:
+    """Compatibility entry uses the v2 first seal on the installed host."""
+    return await run_installed_first_ingress_c02_v2(
+        runtime, installation, **kwargs)
+
+
 __all__ = (
     "run_installed_first_ingress_c02_v1",
+    "run_installed_first_ingress_c02_v2",
+    "run_installed_pending_first_ingress_c02_v2",
+    "run_installed_committed_first_ingress_c02_cost_v2",
     "original_unacquired_handoff_v1",
     "original_acquired_handoff_v1",
     "installed_first_ingress_c02_pairing_ready_v1",

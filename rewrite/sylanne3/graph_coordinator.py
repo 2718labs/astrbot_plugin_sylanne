@@ -12693,6 +12693,7 @@ class GraphCoordinator:
 
     def recover_committed_first_ingress_c02_unknown_cost_v1(
         self, bootstrap: object, namespace: NamespaceId, operation_id: str,
+        *, _terminal_pinned=None,
     ) -> None:
         """Settle a durable C02 completion without re-reading its model body.
 
@@ -12709,8 +12710,17 @@ class GraphCoordinator:
             first_ingress_c02_consumer_operation_id_v1,
         )
         from .runtime.model_cost_settlement import read_original_model_cost
+        from .runtime.c02_terminal_job import _PinnedTerminalRead
+        from .authority_service.v2_terminal_c02_recovery_contract import (
+            OriginalC02ResultKeyV1, from_wire as terminal_from_wire,
+        )
+        from .runtime.terminal_c02_recovery_candidate_v2 import (
+            FrozenTerminalC02CandidateV2,
+        )
 
         self._admin(bootstrap)
+        if _terminal_pinned is not None and type(_terminal_pinned) is not _PinnedTerminalRead:
+            raise UnavailableGuard("installed pinned C02 terminal fact required; HOLD")
         lookup = self.__original_c02_cost_intent_port
         if (type(namespace) is not NamespaceId or type(operation_id) is not str
                 or not operation_id or not callable(lookup)
@@ -12741,6 +12751,19 @@ class GraphCoordinator:
                     "activity", *namespace.as_tuple, row[0])))
             if type(detail) is not dict or len(job_writes) != 1:
                 raise UnavailableGuard("committed C02 job receipt differs; HOLD")
+            terminal_seal = None
+            if _terminal_pinned is not None:
+                archived = db.execute(
+                    "SELECT seal_json FROM graph_first_ingress_c02_committed_seals_v2 "
+                    "WHERE bot=? AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (operation_id,),
+                ).fetchone()
+                if archived is None or "terminal_read_fact_digest" not in detail:
+                    raise UnavailableGuard("committed terminal C02 seal differs; HOLD")
+                raw = json.loads(archived[0])
+                raw["original_key"] = terminal_from_wire(
+                    raw["original_key"], OriginalC02ResultKeyV1)
+                terminal_seal = FrozenTerminalC02CandidateV2(**raw)
             job_id = job_writes[0].key.name
             job = db.execute(
                 "SELECT operation_id,phase,lease_holder,fence "
@@ -12852,16 +12875,33 @@ class GraphCoordinator:
                     asdict(fact.receipt))
                 or proof.observation_digest != fact.recovery.observation_digest):
             raise UnavailableGuard("Authority original C02 terminal differs; HOLD")
-        verified = self._first_ingress_c02_duplicate_v1(
-            namespace, operation_id, original_intent,
-            terminal_receipt_digest=proof.terminal_receipt_digest)
+        verified = (self._first_ingress_c02_duplicate_v2(
+            namespace, operation_id, original_intent=original_intent,
+            pinned_read=_terminal_pinned,
+            request=_terminal_pinned.fact.request)
+            if terminal_seal is not None else
+            self._first_ingress_c02_duplicate_v1(
+                namespace, operation_id, original_intent,
+                terminal_receipt_digest=proof.terminal_receipt_digest))
         if verified is None:
             raise UnavailableGuard("committed C02 fence receipt is absent; HOLD")
         self._commit_first_ingress_c02_unknown_cost_v1(
-            namespace, original_intent, proof, verified)
+            namespace, original_intent, proof, verified,
+            terminal=(terminal_seal, _terminal_pinned)
+            if terminal_seal is not None else None)
+
+    def recover_committed_first_ingress_c02_unknown_cost_v2_pinned(
+        self, bootstrap: object, namespace: NamespaceId, operation_id: str,
+        pinned_read,
+    ) -> None:
+        """Settle the original terminal C02 price from a pinned v2 ACK."""
+        self.recover_committed_first_ingress_c02_unknown_cost_v1(
+            bootstrap, namespace, operation_id,
+            _terminal_pinned=pinned_read)
 
     def _commit_first_ingress_c02_unknown_cost_v1(
         self, namespace: NamespaceId, original_intent, read, verified_completion,
+        *, terminal=None,
     ) -> None:
         """Move completed local C02's entire upper bound to unconfirmed once."""
         from .authority_service.v2_accounting_contract import (
@@ -12870,13 +12910,16 @@ class GraphCoordinator:
         from .runtime.c02_cost_settlement import (
             C02CommittedCostProofV1,
             apply_c02_unknown_budget_in_transaction,
+            apply_c02_terminal_unknown_budget_in_transaction,
             prepare_c02_unknown_cost_plan,
+            prepare_c02_terminal_unknown_cost_plan,
         )
         from .runtime.d11_types import validate_d11_writes
         from .runtime.model_cost_settlement import read_original_model_cost
 
         if not self.first_ingress_c02_accounting_installed_v1(
-                require_worker_result=type(read) is not C02CommittedCostProofV1):
+                require_worker_result=(type(read) is not C02CommittedCostProofV1
+                                       and terminal is None)):
             raise UnavailableGuard("C02 local accounting authority unavailable; HOLD")
         store = self.__store
         port = self.__accounting_maintenance_port
@@ -13022,14 +13065,25 @@ class GraphCoordinator:
                             or not self._accounting_anchor_covers(
                                 current.requirements, anchor)):
                         raise StaleRead("C02 cost graph changed")
-                    plan = prepare_c02_unknown_cost_plan(
-                        db, self.__d02_issuer, namespace, original_intent,
-                        read, verified_completion)
+                    if terminal is None:
+                        plan = prepare_c02_unknown_cost_plan(
+                            db, self.__d02_issuer, namespace, original_intent,
+                            read, verified_completion)
+                    else:
+                        plan = prepare_c02_terminal_unknown_cost_plan(
+                            db, self.__d02_issuer, namespace, original_intent,
+                            terminal[0], terminal[1], verified_completion)
                     if plan.bundle_operation_id != cost_operation_id or plan.quote != quote:
                         raise EventConflict("C02 accounting plan differs")
-                    application = apply_c02_unknown_budget_in_transaction(
-                        db, self.__d02_issuer, plan, original_intent,
-                        read, verified_completion)
+                    if terminal is None:
+                        application = apply_c02_unknown_budget_in_transaction(
+                            db, self.__d02_issuer, plan, original_intent,
+                            read, verified_completion)
+                    else:
+                        application = apply_c02_terminal_unknown_budget_in_transaction(
+                            db, self.__d02_issuer, plan, namespace,
+                            original_intent, terminal[0], terminal[1],
+                            verified_completion)
                     write = application.cost_write
                     if not validate_d11_writes(
                             (write,), namespace, operation_id=cost_operation_id,
@@ -13106,10 +13160,211 @@ class GraphCoordinator:
             raise
         port.finish(request, grant)
 
-    async def recover_pending_first_ingress_c02_v2(
+    @staticmethod
+    def _terminal_c02_read_attempt_id_v2(request, original_key, bundle_digest):
+        return "terminal-c02-read-" + canonical_digest({
+            "schema": "sylanne.first-ingress-c02-terminal-attempt.v2",
+            "original_read_attempt_id": request.read_attempt_id,
+            "original_key": asdict(original_key),
+            "consumer_operation_id": request.consumer_operation_id,
+            "bundle_digest": bundle_digest,
+        })[:48]
+
+    def read_pending_first_ingress_c02_terminal_request_v2(
+        self, bootstrap: object, namespace: NamespaceId,
+        consumer_operation_id: str,
+    ):
+        """Worker-owned read of one durable, original terminal read identity."""
+        from .authority_service.v2_terminal_c02_recovery_contract import (
+            OriginalC02ResultKeyV1, TerminalRecoveryReadRequestV1,
+            from_wire as terminal_from_wire,
+        )
+        from .authority_service.v2_worker_model_result_contract import (
+            WorkerModelResultReadRequestV1, from_wire as worker_from_wire,
+        )
+        from .runtime.terminal_c02_recovery_candidate_v2 import (
+            FrozenTerminalC02CandidateV2,
+            inspect_frozen_terminal_c02_candidate_v2,
+        )
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId
+                or type(consumer_operation_id) is not str
+                or not consumer_operation_id
+                or not self.first_ingress_c02_accounting_installed_v1(
+                    require_worker_result=False)):
+            raise UnavailableGuard("installed terminal C02 preflight required; HOLD")
+        with self.__store._lock:
+            db = self.__store._db
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            intent = db.execute(
+                "SELECT digest,fence_attempt_id,graph_revision,graph_epoch "
+                "FROM graph_bundle_intents_v2 WHERE bot=? AND persona=? "
+                "AND operation_id=?",
+                namespace.as_tuple + (consumer_operation_id,),
+            ).fetchone()
+            candidate = db.execute(
+                "SELECT schema,bundle_digest,fence_attempt_id,bundle_json,"
+                "evidence_json,quote_json,seal_json FROM "
+                "graph_first_ingress_c02_candidates_v2 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (consumer_operation_id,),
+            ).fetchone()
+            committed = db.execute(
+                "SELECT 1 FROM graph_bundle_operations WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (consumer_operation_id,),
+            ).fetchone()
+            rejected = db.execute(
+                "SELECT 1 FROM graph_bundle_rejections_v2 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (consumer_operation_id,),
+            ).fetchone()
+        if committed is not None:
+            return self._first_ingress_c02_duplicate_v2(
+                namespace, consumer_operation_id)
+        if (intent is None or candidate is None
+                or rejected is not None
+                or candidate[0] != "sylanne.first-ingress-c02-candidate.v2"
+                or candidate[1:3] != intent[:2]
+                or intent[2:] != (metadata.graph_revision, epoch.revision)):
+            raise UnavailableGuard("terminal C02 first seal is unavailable; HOLD")
+        try:
+            raw = json.loads(candidate[6])
+            raw["original_key"] = terminal_from_wire(
+                raw["original_key"], OriginalC02ResultKeyV1)
+            seal = FrozenTerminalC02CandidateV2(**raw)
+            inspection = inspect_frozen_terminal_c02_candidate_v2(
+                namespace=namespace, operation_id=consumer_operation_id,
+                seal=seal, bundle_json=candidate[3], quote_json=candidate[5])
+            evidence = json.loads(candidate[4])
+            worker_request = worker_from_wire(
+                evidence["read_request"], WorkerModelResultReadRequestV1)
+            attempt_id = self._terminal_c02_read_attempt_id_v2(
+                worker_request, seal.original_key, inspection.bundle.digest)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("terminal C02 durable attempt is invalid; HOLD") from exc
+        if (canonical_json(evidence) != candidate[4]
+                or canonical_serialize(asdict(seal)) != candidate[6]
+                or inspection.bundle.digest != intent[0]
+                or evidence.get("terminal_read_attempt_id") != attempt_id
+                or worker_request.consumer_operation_id != consumer_operation_id
+                or worker_request.namespace != namespace):
+            raise UnavailableGuard("terminal C02 durable attempt differs; HOLD")
+        return TerminalRecoveryReadRequestV1(
+            seal.original_key, consumer_operation_id, attempt_id)
+
+    def read_committed_first_ingress_c02_terminal_request_v2(
+        self, bootstrap: object, namespace: NamespaceId,
+        consumer_operation_id: str,
+    ):
+        """Return the original finished terminal attempt, or False for legacy cost."""
+        from .authority_service.v2_terminal_c02_recovery_contract import (
+            OriginalC02ResultKeyV1, TerminalRecoveryReadRequestV1,
+            from_wire as terminal_from_wire,
+        )
+        from .authority_service.v2_worker_model_result_contract import (
+            WorkerModelResultReadRequestV1, from_wire as worker_from_wire,
+        )
+        from .runtime.terminal_c02_recovery_candidate_v2 import (
+            FrozenTerminalC02CandidateV2,
+        )
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId
+                or type(consumer_operation_id) is not str
+                or not consumer_operation_id):
+            raise UnavailableGuard("committed C02 identity required")
+        with self.__store._lock:
+            db = self.__store._db
+            row = db.execute(
+                "SELECT receipt_json FROM graph_bundle_operations WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (consumer_operation_id,),
+            ).fetchone()
+            if row is None:
+                raise UnavailableGuard("committed C02 receipt absent; HOLD")
+            detail = json.loads(row[0]).get("first_ingress_c02")
+            if type(detail) is not dict:
+                raise UnavailableGuard("committed C02 identity differs; HOLD")
+            if "terminal_read_fact_digest" not in detail:
+                return False
+            archive = db.execute(
+                "SELECT evidence_json,seal_json FROM "
+                "graph_first_ingress_c02_committed_seals_v2 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (consumer_operation_id,),
+            ).fetchone()
+        if archive is None:
+            raise UnavailableGuard("committed C02 terminal seal absent; HOLD")
+        try:
+            evidence = json.loads(archive[0])
+            raw = json.loads(archive[1])
+            raw["original_key"] = terminal_from_wire(
+                raw["original_key"], OriginalC02ResultKeyV1)
+            seal = FrozenTerminalC02CandidateV2(**raw)
+            worker_request = worker_from_wire(
+                evidence["read_request"], WorkerModelResultReadRequestV1)
+            request = TerminalRecoveryReadRequestV1(
+                seal.original_key, consumer_operation_id,
+                self._terminal_c02_read_attempt_id_v2(
+                    worker_request, seal.original_key, seal.bundle_digest))
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("committed C02 terminal attempt invalid") from exc
+        if evidence.get("terminal_read_attempt_id") != request.read_attempt_id:
+            raise UnavailableGuard("committed C02 terminal attempt differs")
+        self._first_ingress_c02_duplicate_v2(
+            namespace, consumer_operation_id, request=request)
+        return request
+
+    def claim_pending_first_ingress_c02_terminal_read_v2(
+        self, bootstrap: object, namespace: NamespaceId,
+        consumer_operation_id: str, request,
+    ) -> bool:
+        """Durably mark the only permitted terminal read before any body RPC."""
+        expected = self.read_pending_first_ingress_c02_terminal_request_v2(
+            bootstrap, namespace, consumer_operation_id)
+        if request != expected:
+            raise UnavailableGuard("terminal C02 read attempt identity differs; HOLD")
+        with self.__store._lock:
+            db = self.__store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if self.read_pending_first_ingress_c02_terminal_request_v2(
+                        bootstrap, namespace, consumer_operation_id) != expected:
+                    raise UnavailableGuard("terminal C02 first seal changed before read")
+                db.execute("""CREATE TABLE IF NOT EXISTS
+                    graph_first_ingress_c02_terminal_reads_v2 (
+                    bot TEXT NOT NULL, persona TEXT NOT NULL,
+                    operation_id TEXT NOT NULL, read_attempt_id TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    PRIMARY KEY(bot,persona,operation_id),
+                    UNIQUE(read_attempt_id))""")
+                inserted = db.execute(
+                    "INSERT OR IGNORE INTO graph_first_ingress_c02_terminal_reads_v2 "
+                    "(bot,persona,operation_id,read_attempt_id,request_digest) "
+                    "VALUES(?,?,?,?,?)",
+                    namespace.as_tuple + (consumer_operation_id,
+                                          expected.read_attempt_id, expected.digest),
+                )
+                row = db.execute(
+                    "SELECT read_attempt_id,request_digest FROM "
+                    "graph_first_ingress_c02_terminal_reads_v2 WHERE bot=? "
+                    "AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (consumer_operation_id,),
+                ).fetchone()
+                if row != (expected.read_attempt_id, expected.digest):
+                    raise UnavailableGuard("terminal C02 read claim differs; HOLD")
+                db.execute("COMMIT")
+                return inserted.rowcount == 1
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+
+    def recover_pending_first_ingress_c02_v2_pinned(
         self, bootstrap: object, namespace: NamespaceId,
         consumer_operation_id: str, installation_policy, admin_policy,
-        clock_policy, pinned_query,
+        clock_policy, pinned_query, pinned_read,
     ) -> CommitReceipt:
         """Commit one first-sealed result after its original worker lease expires."""
         from datetime import datetime
@@ -13126,7 +13381,7 @@ class GraphCoordinator:
         from .host.terminal_c02_recovery_query import PinnedTerminalC02RecoveryQueryV1
         from .installation_policy import AdminInstallationPolicy
         from .runtime.c02_terminal_job import (
-            OriginalC02JobLeaseV1, pin_finished_terminal_read_from_host,
+            OriginalC02JobLeaseV1, _PinnedTerminalRead,
         )
         from .runtime.encoding_call_binding import load_binding
         from .runtime.first_ingress_v2 import trusted_upper
@@ -13143,6 +13398,7 @@ class GraphCoordinator:
                 or type(admin_policy) is not AdminD06FirstIngressC02Policy
                 or type(clock_policy) is not AdminIngressClockPolicy
                 or type(pinned_query) is not PinnedTerminalC02RecoveryQueryV1
+                or type(pinned_read) is not _PinnedTerminalRead
                 or installation_policy.namespace != namespace
                 or not self.first_ingress_c02_accounting_installed_v1(
                     require_worker_result=False)):
@@ -13214,6 +13470,7 @@ class GraphCoordinator:
             "admin_policy_digest", "installation_id", "manifest_digest",
             "source_ref", "encoding_baseline_ref", "call_id",
             "model_request_digest", "authority_operation_id", "binding_digest",
+            "terminal_read_attempt_id",
         }
         if (type(evidence) is not dict or set(evidence) != evidence_keys
                 or canonical_json(evidence) != candidate[4]
@@ -13243,6 +13500,10 @@ class GraphCoordinator:
                 or evidence.get("model_request_digest") != key.model_request_digest
                 or evidence.get("authority_operation_id") != key.acquire_operation_id
                 or evidence.get("binding_digest") != key.binding_digest
+                or evidence.get("terminal_read_attempt_id") !=
+                   self._terminal_c02_read_attempt_id_v2(
+                       request, key, bundle.digest)
+                or pinned_query.request != pinned_read.fact.request
                 or pinned_query.request.original_key != key
                 or pinned_query.request.consumer_operation_id != consumer_operation_id
                 or not seal.original_worker_lease_expires_utc <= now
@@ -13250,11 +13511,24 @@ class GraphCoordinator:
                 or not math.isfinite(local_deadline)
                 or time.monotonic() >= local_deadline):
             raise UnavailableGuard("terminal C02 frozen identity or deadline differs; HOLD")
-        # The installed host performs its authenticated async query before the
-        # graph lock or SQLite business transaction is held.
-        pinned = await pin_finished_terminal_read_from_host(pinned_query)
+        with self.__store._lock:
+            db = self.__store._db
+            if db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='graph_first_ingress_c02_terminal_reads_v2'",
+            ).fetchone() is None:
+                raise UnavailableGuard("terminal C02 original read was never claimed; HOLD")
+            claimed = db.execute(
+                "SELECT read_attempt_id,request_digest FROM "
+                "graph_first_ingress_c02_terminal_reads_v2 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (consumer_operation_id,),
+            ).fetchone()
+        if claimed != (pinned_query.request.read_attempt_id,
+                       pinned_query.request.digest):
+            raise UnavailableGuard("terminal C02 original read claim differs; HOLD")
         if not recovery_fact_matches_frozen_v2(
-                seal=seal, fact=pinned.fact, trusted_now_utc=now):
+                seal=seal, fact=pinned_read.fact, trusted_now_utc=now):
             raise UnavailableGuard("terminal C02 pinned read differs; HOLD")
         with self.__store._lock:
             db = self.__store._db
@@ -13289,7 +13563,7 @@ class GraphCoordinator:
             if capability != bundle.envelope.authority.capability_ref:
                 raise UnavailableGuard("terminal C02 process authority differs; HOLD")
             witness = _C02TerminalRecovery(
-                seal, evidence, pinned, original, now, clock_reading,
+                seal, evidence, pinned_read, original, now, clock_reading,
                 local_deadline, candidate[:5], candidate[3], candidate[5])
             return self._commit_domain_bundle_v2(
                 bundle, lease, c02_terminal_recovery=witness)
@@ -13711,6 +13985,176 @@ class GraphCoordinator:
         return self.commit_first_ingress_c02_v1(
             bootstrap, original_intent, read, installation_policy,
             admin_policy, clock_policy, _first_seal_v2=True)
+
+    def _first_ingress_c02_duplicate_v2(
+        self, namespace: NamespaceId, operation_id: str, *,
+        original_intent=None, pinned_read=None, request=None,
+    ) -> CommitReceipt | None:
+        """Verify an exact v2 seal, business receipt and finished write fence."""
+        from .authority_service.v2_contract import FencePermitV2, from_wire
+        from .authority_service.v2_terminal_c02_recovery_contract import (
+            OriginalC02ResultKeyV1, TerminalRecoveryReadRequestV1,
+            from_wire as terminal_from_wire,
+        )
+        from .authority_service.v2_worker_model_result_contract import (
+            WorkerModelResultReadRequestV1, from_wire as worker_from_wire,
+        )
+        from .runtime.c02_terminal_job import _PinnedTerminalRead
+        from .runtime.terminal_c02_recovery_candidate_v2 import (
+            FrozenTerminalC02CandidateV2,
+            inspect_frozen_terminal_c02_candidate_v2,
+        )
+
+        store = self.__store
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            db = store._db
+            archive = db.execute(
+                "SELECT schema,bundle_digest,fence_attempt_id,bundle_json,"
+                "evidence_json,quote_json,seal_json FROM "
+                "graph_first_ingress_c02_committed_seals_v2 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            row = db.execute(
+                "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+                "FROM graph_bundle_operations WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if archive is None:
+                raise EventConflict("committed C02 v2 seal is absent")
+            try:
+                raw = json.loads(archive[6])
+                raw["original_key"] = terminal_from_wire(
+                    raw["original_key"], OriginalC02ResultKeyV1)
+                seal = FrozenTerminalC02CandidateV2(**raw)
+                inspection = inspect_frozen_terminal_c02_candidate_v2(
+                    namespace=namespace, operation_id=operation_id, seal=seal,
+                    bundle_json=archive[3], quote_json=archive[5])
+                evidence = json.loads(archive[4])
+                worker_request = worker_from_wire(
+                    evidence["read_request"], WorkerModelResultReadRequestV1)
+                data = json.loads(row[4])
+                c02 = data["first_ingress_c02"]
+            except (TypeError, ValueError, KeyError) as exc:
+                raise UnavailableGuard("committed C02 v2 wire differs; HOLD") from exc
+            expected_attempt = self._terminal_c02_read_attempt_id_v2(
+                worker_request, seal.original_key, seal.bundle_digest)
+            expected_request = TerminalRecoveryReadRequestV1(
+                seal.original_key, operation_id, expected_attempt)
+            common = {
+                "read_request_digest": worker_request.digest,
+                "read_result_digest": evidence["read_result_digest"],
+                "original_intent_digest": seal.original_key.original_intent_digest,
+                "terminal_receipt_digest": seal.original_key.terminal_receipt_digest,
+                "observation_digest": seal.original_key.observation_digest,
+                "result_digest": evidence["result_payload_digest"],
+                "seal_schema": seal.schema,
+                "original_key_digest": seal.original_key.digest,
+                "signed_quote_digest": seal.quote_digest,
+                "terminal_read_attempt_id": expected_attempt,
+            }
+            if (type(c02) is not dict or archive[0] != seal.schema
+                    or archive[1] != row[0]
+                    or archive[2] != domain_bundle_write_attempt_id_v1(
+                        namespace, operation_id, row[0])
+                    or inspection.bundle.digest != row[0]
+                    or canonical_json(evidence) != archive[4]
+                    or canonical_serialize(asdict(seal)) != archive[6]
+                    or evidence.get("terminal_read_attempt_id") != expected_attempt
+                    or worker_request.consumer_operation_id != operation_id
+                    or (request is not None and request != expected_request)
+                    or (original_intent is not None and
+                        canonical_digest(asdict(original_intent)) !=
+                        seal.original_key.original_intent_digest)):
+                raise EventConflict("committed C02 v2 original identity differs")
+            if "terminal_read_fact_digest" in c02:
+                if (type(pinned_read) is _PinnedTerminalRead
+                        and (pinned_read.fact.request != expected_request
+                             or pinned_read.fact.digest != c02["terminal_read_fact_digest"])):
+                    raise EventConflict("committed C02 v2 terminal fact differs")
+                if (set(c02) != set(common) | {
+                        "terminal_read_request_digest", "terminal_read_fact_digest"}
+                        or any(c02[key] != value for key, value in common.items())
+                        or c02["terminal_read_request_digest"] != expected_request.digest):
+                    raise EventConflict("committed C02 v2 terminal receipt differs")
+            elif c02 != {key: common[key] for key in (
+                    "read_request_digest", "read_result_digest",
+                    "original_intent_digest", "terminal_receipt_digest",
+                    "observation_digest", "result_digest")}:
+                raise EventConflict("committed C02 v2 live receipt differs")
+            quote = self.__d02_issuer.original_signed_quote(
+                db, seal.quote_id, seal.quote_version)
+            if canonical_serialize(asdict(quote)) != archive[5]:
+                raise UnavailableGuard("committed C02 v2 historical quote differs; HOLD")
+            graph = db.execute(
+                "SELECT reads,revisions,epoch_revision FROM graph_events "
+                "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+                namespace.as_tuple + (row[1], operation_id),
+            ).fetchone()
+            fence = db.execute(
+                "SELECT digest,permit_json,pre_graph_revision,pre_graph_epoch,"
+                "post_graph_revision,post_graph_epoch,finish_request_id,"
+                "finish_request_digest FROM graph_bundle_fences_v2 WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if graph is None or fence is None or fence[0] != row[0]:
+                raise UnavailableGuard("committed C02 v2 graph or fence absent; HOLD")
+            receipt = CommitReceipt(
+                "duplicate", operation_id, row[0], row[1], row[2], row[3],
+                GraphStore._version_rows(graph[0]),
+                GraphStore._version_rows(graph[1]),
+                (NamespaceEpoch(*namespace.as_tuple, graph[2]),),
+                tuple(data["ledger_refs"]), tuple(data["outbox_refs"]),
+            )
+        anchor = self.__content_fence_v2.current_anchor(
+            namespace=namespace,
+            authority_namespace=metadata.requirements.authority_namespace)
+        if not self._anchor_matches(metadata.requirements, anchor):
+            raise UnavailableGuard("C02 v2 replay Authority anchor differs")
+        try:
+            permit = from_wire(json.loads(fence[1]))
+        except (TypeError, ValueError) as exc:
+            raise UnavailableGuard("C02 v2 replay permit invalid") from exc
+        attempt_id = domain_bundle_write_attempt_id_v1(
+            namespace, operation_id, row[0])
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.operation_id != attempt_id
+                or permit.pinned_anchor != anchor or permit.holder != self.__holder
+                or permit.generation != metadata.requirements.activation_generation
+                or fence[4] != fence[2] + 1 or fence[5] < fence[3]
+                or fence[6] != "finish:" + attempt_id
+                or fence[7] != "sha256:" + canonical_digest({
+                    "operation_id": attempt_id, "permit_token": permit.token,
+                    "action": "finish_domain_bundle",
+                    "business_operation_id": operation_id,
+                    "bundle_digest": row[0],
+                })
+                or metadata.graph_revision < fence[4]
+                or epoch.revision < fence[5]):
+            raise UnavailableGuard("C02 v2 replay write fence differs")
+        observed, state = self.__content_fence_v2.get_fence_operation(
+            namespace=namespace,
+            authority_namespace=metadata.requirements.authority_namespace,
+            operation_id=permit.operation_id)
+        if observed != permit or state not in {"active", "finished"}:
+            raise UnavailableGuard("C02 v2 replay Authority write state differs")
+        if state == "active":
+            if (metadata.graph_revision, epoch.revision) != (fence[4], fence[5]):
+                raise UnavailableGuard("C02 v2 replay active fence lost its graph stamp")
+            scope = FenceScope(
+                namespace, metadata.requirements.authority_namespace,
+                metadata.requirements.activation_generation,
+                "write", permit.operation_id, permit, anchor,
+                NamespaceEpoch(*namespace.as_tuple, fence[3]), fence[2])
+            if self.__content_fence_v2.validate_fence(scope) != permit:
+                raise UnavailableGuard("C02 v2 replay active write permit differs")
+            self.__content_fence_v2.finish_fence(
+                scope, request_id=fence[6], request_digest=fence[7])
+        return receipt
 
     def _first_ingress_c02_duplicate_v1(
         self, namespace: NamespaceId, operation_id: str, original_intent, read=None,
@@ -14289,6 +14733,9 @@ class GraphCoordinator:
                     evidence["original_intent_digest"],
                     evidence["observation_digest"],
                     evidence["terminal_receipt_digest"])
+                evidence["terminal_read_attempt_id"] = (
+                    self._terminal_c02_read_attempt_id_v2(
+                        request, c02_first_seal_key, digest))
             bundle_json = c02_bundle_to_wire(bundle)
             if (type(bundle_json) is not str
                     or c02_bundle_from_wire(bundle_json) != bundle):
@@ -15594,11 +16041,15 @@ class GraphCoordinator:
                 else:
                     fact = c02_terminal_recovery.pinned_read.fact
                     data["first_ingress_c02"] = {
-                        "recovery_schema": "sylanne.first-ingress-c02-candidate.v2",
+                        "seal_schema": c02_terminal_recovery.seal.schema,
+                        "read_request_digest": canonical_digest(
+                            c02_terminal_recovery.evidence["read_request"]),
+                        "read_result_digest": c02_terminal_recovery.evidence["read_result_digest"],
                         "terminal_read_request_digest": fact.request.digest,
                         "terminal_read_fact_digest": fact.digest,
                         "original_key_digest": c02_terminal_recovery.seal.original_key.digest,
                         "signed_quote_digest": c02_terminal_recovery.seal.quote_digest,
+                        "terminal_read_attempt_id": fact.request.read_attempt_id,
                         "original_intent_digest": c02_terminal_recovery.seal.original_key.original_intent_digest,
                         "terminal_receipt_digest": c02_terminal_recovery.seal.original_key.terminal_receipt_digest,
                         "observation_digest": observation_digest,
@@ -15792,6 +16243,29 @@ class GraphCoordinator:
                                       identity.effect_id, seq, canonical_json(data)),
             )
             if c02_adoption is not None:
+                if c02_first_seal_quote is not None:
+                    db.execute("""CREATE TABLE IF NOT EXISTS
+                        graph_first_ingress_c02_committed_seals_v2 (
+                        bot TEXT NOT NULL, persona TEXT NOT NULL,
+                        operation_id TEXT NOT NULL,
+                        schema TEXT NOT NULL CHECK(schema=
+                            'sylanne.first-ingress-c02-candidate.v2'),
+                        bundle_digest TEXT NOT NULL,
+                        fence_attempt_id TEXT NOT NULL,
+                        bundle_json TEXT NOT NULL,
+                        evidence_json TEXT NOT NULL,
+                        quote_json TEXT NOT NULL,
+                        seal_json TEXT NOT NULL,
+                        PRIMARY KEY(bot,persona,operation_id))""")
+                    copied = db.execute(
+                        "INSERT INTO graph_first_ingress_c02_committed_seals_v2 "
+                        "SELECT * FROM graph_first_ingress_c02_candidates_v2 "
+                        "WHERE bot=? AND persona=? AND operation_id=? "
+                        "AND bundle_digest=?",
+                        namespace.as_tuple + (identity.operation_id, digest),
+                    )
+                    if copied.rowcount != 1:
+                        raise UnavailableGuard("C02 v2 committed seal was lost")
                 deleted = db.execute(
                     "DELETE FROM " + (
                         "graph_first_ingress_c02_candidates_v2 "
