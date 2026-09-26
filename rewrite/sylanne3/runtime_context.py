@@ -73,6 +73,7 @@ from .host.post_c02_attention_driver import (
     post_c02_attention_operation_id, prepare_post_c02_attention_v1,
 )
 from .runtime.first_ingress_v2 import trusted_upper
+from .runtime.reply_model_job import ReplyModelQueuedPreparationV1
 from .runtime.first_ingress_unacquired import FirstIngressUnacquiredPageV1
 from .runtime.first_ingress_recovery import (
     FirstIngressRecoveryItemV1, FirstIngressRecoveryPageV1,
@@ -1477,6 +1478,47 @@ class RuntimeContext:
                 graph.release_authority_lease(bootstrap, lease)
 
         return await self._worker.call(commit)
+
+    async def prepare_post_c02_reply_model_job_v1(
+        self, *, c02_operation_id: str,
+        attention_receipt: CommitReceipt,
+        source_ref: str | None = None,
+    ) -> ReplyModelQueuedPreparationV1 | None:
+        """Queue the original signed reply model job after durable D07 selection."""
+        bundle = self._v2_model_bundle
+        policy = self._v2_policy
+        if (self._worker is None or self._v2_bootstrap is None
+                or not self._v2_namespace_provisioned
+                or type(bundle) is not AdminInstallationBundle
+                or type(policy) is not AdminInstallationPolicy
+                or bundle.installation_policy != policy
+                or bundle.model_workflows is None
+                or bundle.model_workflows.reply is None
+                or type(attention_receipt) is not CommitReceipt
+                or attention_receipt.status not in {"committed", "duplicate"}
+                or {"d07.attention_ticket.v1", "d07.focus.v1"}
+                   != {item.key.type_name for item in attention_receipt.write_versions}):
+            return None
+
+        def prepare(graph: GraphCoordinator) -> ReplyModelQueuedPreparationV1 | None:
+            c02, _, qualification, _, _, _, _ = (
+                graph.read_post_c02_attention_inputs_v1(
+                    self._v2_bootstrap, policy.namespace, c02_operation_id,
+                    source_ref, bundle))
+            exact_source = qualification.source_refs[0]
+            if (c02.operation_id != c02_operation_id
+                    or attention_receipt.operation_id !=
+                       post_c02_attention_operation_id(
+                           c02_operation_id, exact_source)):
+                return None
+            return graph.prepare_post_c02_reply_model_job_v1(
+                self._v2_bootstrap, policy.namespace, c02_operation_id,
+                exact_source, bundle)
+
+        try:
+            return await self._worker.call(prepare)
+        except Exception:
+            return None
 
     async def commit_prepared_post_c02_reply_v1(
         self, *, c02_operation_id: str, source_ref: str,

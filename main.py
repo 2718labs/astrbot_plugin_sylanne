@@ -410,7 +410,13 @@ class Sylanne3Plugin(Star):
                 if attention is None or attention.status not in {"committed", "duplicate"}:
                     logger.warning("Sylanne 3 settled C02 attention remains HOLD")
                     return
-                logger.info("Sylanne 3 C02 and D07 attention committed; reply HOLD")
+                queued = await runtime.prepare_post_c02_reply_model_job_v1(
+                    c02_operation_id=committed.operation_id,
+                    attention_receipt=attention, source_ref=source_ref)
+                if queued is None:
+                    logger.warning("Sylanne 3 post-C02 reply model job remains HOLD")
+                    return
+                logger.info("Sylanne 3 post-C02 reply model job queued; dispatch HOLD")
         except asyncio.CancelledError:
             logger.warning("Sylanne 3 first encoding interrupted; original call HOLD")
             raise
@@ -559,8 +565,15 @@ class Sylanne3Plugin(Star):
                                 logger.warning(
                                     "Sylanne 3 recovered C02 attention remains HOLD")
                             else:
-                                logger.info(
-                                    "Sylanne 3 recovered C02 and D07 attention committed; reply HOLD")
+                                queued = await runtime.prepare_post_c02_reply_model_job_v1(
+                                    c02_operation_id=committed.operation_id,
+                                    attention_receipt=attention)
+                                if queued is None:
+                                    logger.warning(
+                                        "Sylanne 3 recovered reply model job remains HOLD")
+                                else:
+                                    logger.info(
+                                        "Sylanne 3 recovered reply model job queued; dispatch HOLD")
                 ids.seek(0)
                 for line in ids:
                     if self._encoding_stopping:
@@ -647,6 +660,16 @@ class Sylanne3Plugin(Star):
                                 "committed", "duplicate"}:
                             logger.warning(
                                 "Sylanne 3 settled C02 attention remains HOLD")
+                        else:
+                            queued = await runtime.prepare_post_c02_reply_model_job_v1(
+                                c02_operation_id=operation_id,
+                                attention_receipt=attention)
+                            if queued is None:
+                                logger.warning(
+                                    "Sylanne 3 settled reply model job remains HOLD")
+                            else:
+                                logger.info(
+                                    "Sylanne 3 settled reply model job queued; dispatch HOLD")
         except asyncio.CancelledError:
             raise
         except Exception:
