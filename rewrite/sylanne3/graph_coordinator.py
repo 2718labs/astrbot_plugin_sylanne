@@ -4239,6 +4239,378 @@ class GraphCoordinator:
             authority, lambda: None, owner_principal=expected_principal,
             owner_view=True, owner_session_proof=proof)
 
+    def commit_source_correction_v1(
+            self, *, request, actor_id: str, principal: OwnerPrincipalV1,
+            purpose: str, audience: str, installation_policy, admin_policy,
+            owner_session_token: str,
+            owner_session_request: OwnerSessionLoginRequestV1,
+    ):
+        """Commit one Owner correction and queue its bounded reevaluation."""
+        from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
+        from .domains.d04.source_head import D04SourceHeadRead, _qualified_head
+        from .domains.d06 import (
+            CorrectionRequest, D06DomainAdapter, SourceCorrectionReadSetV1,
+        )
+        from .domains.d07 import D07DomainProvider
+        from .host.authority_profile import (
+            AdminD06SourceCorrectionPolicy, AdminIngressClockPolicy,
+        )
+        from .installation_policy import AdminInstallationPolicy
+        from .memory_types import InterpretationRecord, interpretation_key
+        from .runtime.d11_types import (
+            D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH, RuntimeOutboxValue,
+            job_graph_write, outbox_graph_write,
+        )
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime_contracts import (
+            CommandEnvelope, DependencySet, DomainProposal, OperationIdentity,
+            QueryEpoch, RUNTIME_SCHEMA, VersionedRef,
+        )
+        from .workbench_api.source_correction import (
+            SourceCorrectionCommitReceiptV1, SourceCorrectionRequestV1,
+        )
+
+        if (type(request) is not SourceCorrectionRequestV1
+                or type(principal) is not OwnerPrincipalV1
+                or type(owner_session_request) is not OwnerSessionLoginRequestV1
+                or type(installation_policy) is not AdminInstallationPolicy
+                or type(admin_policy) is not AdminD06SourceCorrectionPolicy
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None or self.__d11_issuer is None):
+            raise UnavailableGuard("installed source correction authority unavailable; HOLD")
+        namespace = request.namespace
+        if (installation_policy.namespace != namespace
+                or installation_policy.installation_id
+                != self.__content_fence_v2.installation_grant.installation_id
+                or type(actor_id) is not str or not actor_id
+                or purpose != "workbench_user_action"
+                or audience != "owner"
+                or owner_session_request.audience != audience):
+            raise AuthorityDenied("source correction Owner or installation differs")
+        original_input = {
+            "schema": request.schema, "correction_kind": "source_claim",
+            "statement": request.statement,
+            "source_refs": list(request.source_refs),
+            "target_refs": list(request.target_refs),
+            "access_epoch": request.access_epoch,
+            "deletion_epoch": request.deletion_epoch,
+        }
+        if request.impact_preview_ref is not None:
+            original_input["impact_preview_ref"] = request.impact_preview_ref
+        original_command = {
+            "action": "correct_or_edit", "scope": "/".join(namespace.as_tuple),
+            "purpose": purpose, "audience": audience,
+            "operation_id": request.operation_id, "input": original_input,
+        }
+        actual_digest = "sha256:" + hashlib.sha256(json.dumps(
+            original_command, sort_keys=True, separators=(",", ":"),
+            allow_nan=False).encode("utf-8")).hexdigest()
+        if actual_digest != request.request_digest:
+            raise AuthorityDenied("source correction original command digest differs")
+        store = self.__store
+        with store._lock:
+            metadata, _ = self._v2_graph_stamp(namespace)
+        self._check_owner_session_v2(
+            namespace=namespace, principal=principal, actor_id=actor_id,
+            token=owner_session_token, request=owner_session_request,
+            target=metadata.requirements)
+        owner_authority = AuthorityContext(
+            actor_id, "d12", "owner-correction:" + secrets.token_hex(16),
+            namespace, ("persona", "event", "activity"),
+            "workbench_user_action", (audience,), "owner-grant-v1",
+            metadata.requirements.activation_generation)
+        session_proof = (owner_session_token, owner_session_request)
+        owner_binding = self._read_v2(
+            owner_authority,
+            lambda: self._owner_graph_binding_locked(owner_authority, principal),
+            owner_principal=principal, owner_session_proof=session_proof)
+        if "workbench.correct" not in owner_binding.capabilities:
+            raise AuthorityDenied("Owner grant lacks correction capability")
+
+        correction = CorrectionRequest(
+            request.operation_id, request.target_refs, request.source_refs,
+            request.statement, request.access_epoch, request.deletion_epoch)
+        adapter = D06DomainAdapter(namespace)
+        correction_key = adapter.correction_source_key(correction)
+
+        def prior_or_pending():
+            db = store._db
+            row = db.execute(
+                "SELECT activity_id,receipt_json FROM graph_bundle_operations "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (request.operation_id,),
+            ).fetchone()
+            if row is not None:
+                detail = json.loads(row[1]).get("source_correction")
+                fence = db.execute(
+                    "SELECT digest FROM graph_bundle_fences_v2 WHERE bot=? "
+                    "AND persona=? AND operation_id=?",
+                    namespace.as_tuple + (request.operation_id,),
+                ).fetchone()
+                committed = self._get_operation_fenced(
+                    owner_authority, request.operation_id, v2=True)
+                if (type(detail) is not dict or committed is None
+                        or committed.status != "committed"
+                        or fence is None or fence[0] != committed.operation_digest
+                        or not {item.key.token for item in committed.write_versions}
+                        .issuperset({correction_key.token, *request.target_refs,
+                                    detail.get("reevaluation_outbox_ref")})
+                        or detail.get("request_digest") != request.request_digest
+                        or detail.get("correction_source_ref") != correction_key.token
+                        or detail.get("source_refs") != list(request.source_refs)
+                        or detail.get("invalidated_target_refs")
+                        != list(request.target_refs)
+                        or detail.get("reevaluation_status") != "pending"):
+                    raise EventConflict("source correction operation ID differs")
+                return SourceCorrectionCommitReceiptV1(
+                    namespace, request.operation_id, request.request_digest,
+                    detail["correction_source_ref"], request.source_refs,
+                    request.target_refs, detail["reevaluation_outbox_ref"],
+                    detail["audit_event_ref"], detail["graph_revision"],
+                    detail["access_epoch"], detail["deletion_epoch"])
+            if db.execute(
+                "SELECT 1 FROM graph_bundle_intents_v2 WHERE bot=? AND persona=? "
+                "AND operation_id=?", namespace.as_tuple + (request.operation_id,),
+            ).fetchone() is not None:
+                raise UnavailableGuard("source correction outcome unknown; HOLD")
+            return None
+
+        prior = self._read_v2(
+            owner_authority, prior_or_pending, owner_binding=owner_binding,
+            owner_session_proof=session_proof)
+        if prior is not None:
+            return prior
+
+        lease, capability = self._grant_registered(
+            actor=actor_id, issuer_domain="d06", namespace=namespace,
+            domains=("d06", "d07", "d11"),
+            activation_generation=metadata.requirements.activation_generation,
+            operation_id=request.operation_id)
+        try:
+            authority = AuthorityContext(
+                actor_id, "d06", capability, namespace,
+                tuple(sorted(self.__leases[lease][5])), "context", (audience,),
+                installation_policy.root_grant.policy_ref,
+                metadata.requirements.activation_generation)
+            try:
+                reading = self.__content_fence_v2.read_ingress_clock(
+                    self.__scene_clock_policy)
+                now = trusted_upper(reading)
+            except Exception as exc:
+                raise UnavailableGuard("paired correction clock unavailable; HOLD") from exc
+            deadline = min(math.nextafter(
+                now + admin_policy.deadline_after_seconds, -math.inf),
+                installation_policy.root_grant.valid_until_utc)
+            if deadline <= now:
+                raise UnavailableGuard("source correction deadline unavailable; HOLD")
+
+            def read_candidate():
+                db = store._db
+                if db.in_transaction:
+                    raise UnavailableGuard("source correction needs idle graph connection")
+                db.execute("BEGIN")
+                try:
+                    if prior_or_pending() is not None:
+                        raise UnavailableGuard("source correction committed during read; retry")
+                    _, epoch = self._v2_graph_stamp(namespace)
+                    epochs = db.execute(
+                        "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                        "WHERE bot=? AND persona=?", namespace.as_tuple,
+                    ).fetchone()
+                    if epochs != (request.access_epoch, request.deletion_epoch):
+                        raise StaleRead("source correction access or deletion epoch changed")
+                    atoms: dict[AtomKey, GraphAtom] = {}
+
+                    def load(key: AtomKey) -> GraphAtom:
+                        if NamespaceId.from_key(key) != namespace:
+                            raise AuthorityDenied("source correction crosses namespace")
+                        if key not in atoms:
+                            if len(atoms) >= 512:
+                                raise UnavailableGuard("source correction closure exceeds bound")
+                            store._validate_key(key)
+                            row = db.execute(
+                                "SELECT revision,value,valid FROM graph_atoms "
+                                "WHERE token=?", (key.token,),
+                            ).fetchone()
+                            atoms[key] = (GraphAtom(
+                                key, row[0], json.loads(row[1]), bool(row[2]))
+                                if row else GraphAtom(key, 0, {}, False))
+                        return atoms[key]
+
+                    selected_sources = []
+                    selected_accesses = []
+                    pending = list(request.source_refs)
+                    seen: set[str] = set()
+                    while pending:
+                        ref = pending.pop()
+                        if ref in seen:
+                            continue
+                        seen.add(ref)
+                        if len(seen) > 256:
+                            raise UnavailableGuard("source correction ancestry exceeds bound")
+                        key = self._parse_ref(ref, namespace)
+                        if key != source_key(*namespace.as_tuple, key.owner.subject or ""):
+                            raise AuthorityDenied("correction source ref is not canonical")
+                        source = load(key)
+                        access = load(access_key(
+                            *namespace.as_tuple, key.owner.subject))
+                        if not source.valid or not access.valid:
+                            raise UnavailableGuard("correction source or ancestor unavailable")
+                        record = SourceRecord.from_dict(source.value)
+                        validate_access(access.value)
+                        pending.extend(source_key(*namespace.as_tuple, parent).token
+                                       for parent in record.parent_source_ids)
+                    snapshot = GraphSnapshot(tuple(atoms.values()), (epoch,))
+                    head_read = D04SourceHeadRead(
+                        snapshot, namespace, (audience,), "context", None,
+                        False, False, False)
+                    for ref in request.source_refs:
+                        head, reason = _qualified_head(ref, atoms, head_read)
+                        if head is None:
+                            raise UnavailableGuard(
+                                f"source correction ancestor access unavailable: {reason}")
+                        key = self._parse_ref(ref, namespace)
+                        selected_sources.append(SourceRecord.from_dict(load(key).value))
+                        selected_accesses.append(load(access_key(
+                            *namespace.as_tuple, key.owner.subject)).value)
+                    interpretations = []
+                    for ref in request.target_refs:
+                        key = self._parse_ref(ref, namespace)
+                        if key != interpretation_key(
+                                *namespace.as_tuple, key.owner.subject or ""):
+                            raise AuthorityDenied("correction target is not canonical")
+                        atom = load(key)
+                        if not atom.valid:
+                            raise UnavailableGuard("correction target unavailable")
+                        interpretations.append(InterpretationRecord.from_dict(atom.value))
+                    beliefs = db.execute(
+                        "SELECT token,revision,value,valid FROM graph_atoms "
+                        "WHERE bot=? AND persona=? AND type_name=? AND valid=1 "
+                        "ORDER BY token LIMIT 513",
+                        namespace.as_tuple + ("d07.belief_revision.v1",),
+                    ).fetchall()
+                    if len(beliefs) > 512:
+                        raise UnavailableGuard("correction belief scan exceeds bound")
+                    affected = set(request.source_refs + request.target_refs)
+                    belief_refs = []
+                    for token, revision, encoded, valid in beliefs:
+                        value = json.loads(encoded)
+                        if value.get("current") and affected.intersection(
+                                value.get("source_refs", ())):
+                            key = self._parse_ref(token, namespace)
+                            atoms[key] = GraphAtom(key, revision, value, bool(valid))
+                            belief_refs.append(token)
+                    load(correction_key)
+                    load(access_key(*namespace.as_tuple, correction_key.owner.subject))
+                    reads = SourceCorrectionReadSetV1(
+                        tuple(selected_sources), tuple(selected_accesses),
+                        tuple(interpretations), tuple(belief_refs))
+                    activity_id = "source-correction-" + request.operation_id
+                    input_refs = (correction_key.token, *request.source_refs,
+                                  *request.target_refs, *belief_refs)
+                    guard_versions = {
+                        kind: self._version(db, namespace, kind, "current")
+                        for kind in ("scheme", "operator", "policy")
+                    }
+                    from .runtime.issuers import (
+                        d06_source_correction_job_ref,
+                        d06_source_correction_outbox_ref,
+                    )
+                    job_ref = d06_source_correction_job_ref(
+                        namespace, activity_id, request.operation_id)
+                    outbox_ref = d06_source_correction_outbox_ref(
+                        namespace, activity_id, request.operation_id)
+                    job_key = self._parse_ref(job_ref, namespace)
+                    outbox_key = self._parse_ref(outbox_ref, namespace)
+                    if (job_key.type_name != "runtime.job"
+                            or outbox_key.type_name != "runtime.outbox"):
+                        raise UnavailableGuard("correction runtime refs differ")
+                    load(job_key)
+                    load(outbox_key)
+                    snapshot = GraphSnapshot(tuple(atoms.values()), (epoch,))
+                    qualification = SourceQualification(
+                        (correction_key.token, *request.source_refs), "reported",
+                        None, now, "external_report", "eligible", None,
+                        "not_applicable")
+                    envelope = CommandEnvelope(
+                        RUNTIME_SCHEMA,
+                        OperationIdentity(
+                            activity_id, None, "source-correction",
+                            "source-correction", request.operation_id,
+                            canonical_digest({"input_refs": list(input_refs)})),
+                        authority,
+                        VersionGuard(
+                            snapshot.versions,
+                            (QueryEpoch(namespace, "all", epoch.revision),),
+                            *epochs, store._registry.catalogue_hash,
+                            guard_versions["scheme"],
+                            guard_versions["operator"],
+                            guard_versions["policy"], (), (), ()),
+                        qualification, input_refs,
+                        installation_policy.root_grant.lease_id, deadline,
+                        reading.monotonic_after_seconds + (
+                            deadline - reading.utc_upper_bound_seconds),
+                        "character-v1",
+                        (request.operation_id,),
+                    )
+                    quote, job = self.__d11_issuer.plan_d06_source_correction_quote(
+                        db, envelope, admin_policy, request,
+                        installation_id=installation_policy.installation_id,
+                        now_utc=now)
+                    db.execute("COMMIT")
+                    return snapshot, reads, envelope, quote, job
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                    raise
+
+            snapshot, reads, pre_quote, quote, job = self._read_v2(
+                owner_authority, read_candidate, owner_binding=owner_binding,
+                owner_session_proof=session_proof)
+            envelope = replace(pre_quote, version_guard=replace(
+                pre_quote.version_guard,
+                resource_lease_versions=(VersionedRef(
+                    quote.quote_id, quote.version),)))
+            d06 = adapter.compile_source_correction(
+                envelope, correction, reads, recorded_at=now)
+            proposals = [d06.proposal]
+            if reads.d07_belief_refs:
+                proposals.append(D07DomainProvider().source_correction_belief_proposal(
+                    envelope, GraphSnapshot(tuple(
+                        atom for atom in snapshot.atoms
+                        if atom.key != correction_key), snapshot.epochs),
+                    belief_refs=reads.d07_belief_refs,
+                    correction_source_ref=d06.correction_source_ref,
+                    source_refs=request.source_refs,
+                    target_refs=request.target_refs))
+            job_key = self._parse_ref(quote.graph_job_ref, namespace)
+            outbox_key = self._parse_ref(quote.outbox_refs[0], namespace)
+            idempotency_key = "source-correction:" + request.operation_id
+            outbox = RuntimeOutboxValue(
+                *namespace.as_tuple, envelope.identity.activity_id,
+                request.operation_id, None, outbox_key.name, job.job_id,
+                job_key.token, correction_key.owner.subject, idempotency_key,
+                "pending", authority.activation_generation)
+            d11 = DomainProposal(
+                "d11", D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
+                envelope, (job_graph_write(job), outbox_graph_write(outbox, job_key)),
+                DependencySet(current_invalidation=(GraphVersion(job_key, 0),)),
+                (), ())
+            bundle = DomainBundle(
+                envelope, (*proposals, d11), (), (), (), (),
+                (idempotency_key,), (job_key.token,), (outbox_key.token,))
+            self._commit_domain_bundle_v2(
+                bundle, lease, correction_issuance=(
+                    admin_policy, installation_policy.installation_id,
+                    now, request, pre_quote, quote, owner_authority,
+                    principal, owner_binding, session_proof))
+            return self._read_v2(
+                owner_authority, prior_or_pending, owner_binding=owner_binding,
+                owner_session_proof=session_proof)
+        finally:
+            del self.__leases[lease]
+
     def read_current_recollection_experience_v1(
             self, *, namespace: NamespaceId, operation_id: str,
             experience_ref: str, actor_id: str, principal: OwnerPrincipalV1,
@@ -12684,6 +13056,7 @@ class GraphCoordinator:
                                  lease: object, *, arrival_issuance=None,
                                  baseline_issuance=None,
                                  self_identity_issuance=None,
+                                 correction_issuance=None,
                                  c02_adoption=None,
                                  c02_recovery: _C02PendingRecovery | None = None) -> CommitReceipt:
         """Commit under a durable write attempt; reconcile before any duplicate read."""
@@ -13015,6 +13388,14 @@ class GraphCoordinator:
         transaction_state = {"phase": "before_transaction"}
         try:
             scene_owner_guard = None
+            if correction_issuance is not None:
+                owner_authority, principal, binding, session_proof = correction_issuance[6:]
+                _, current_binding = self._owner_binding_in_fence(
+                    owner_authority, scope, principal, binding, session_proof)
+                if (current_binding != binding
+                        or "workbench.correct" not in current_binding.capabilities
+                        or port.validate_fence(scope) != permit):
+                    raise UnavailableGuard("current correction Owner authority changed; HOLD")
             if any(
                     proposal.domain == "d03" and any(
                         write.key.type_name == "d03.world_event"
@@ -13108,12 +13489,14 @@ class GraphCoordinator:
                 now_utc=(arrival_issuance[2] if arrival_issuance else
                          baseline_issuance[2] if baseline_issuance else
                          self_identity_issuance[3] if self_identity_issuance else
+                         correction_issuance[2] if correction_issuance else
                          c02_witness.now if isinstance(
                              c02_witness, _C02PendingRecovery) else
                          c02_adoption[6] if c02_adoption is not None else None),
                 arrival_issuance=arrival_issuance,
                 baseline_issuance=baseline_issuance,
                 self_identity_issuance=self_identity_issuance,
+                correction_issuance=correction_issuance,
                 qualified_self=qualified_self,
                 c02_adoption=(c02_witness, c02_fact, permit)
                 if c02_witness is not None else None)
@@ -13268,6 +13651,7 @@ class GraphCoordinator:
                                       arrival_issuance=None,
                                       baseline_issuance=None,
                                       self_identity_issuance=None,
+                                      correction_issuance=None,
                                       qualified_self=None,
                                       c02_adoption=None) -> CommitReceipt:
         """Join a caller-owned graph transaction when ``in_transaction`` is set.
@@ -13500,6 +13884,31 @@ class GraphCoordinator:
                     "VALUES(?,?,?,?,?,?,?)",
                     namespace.as_tuple + (identity.operation_id, source_ref,
                                           quote.quote_id, policy_digest, digest),
+                )
+            if correction_issuance is not None:
+                admin_policy, installation_id, correction_now, request, pre_quote, planned = (
+                    correction_issuance[:6])
+                if (v2_write is None or identity.phase != "source-correction"
+                        or tuple(item.domain for item in bundle.proposals)
+                        not in {("d06", "d07", "d11"), ("d06", "d11")}
+                        or bundle.persistent_job_refs != (planned.graph_job_ref,)
+                        or bundle.outbox_refs != planned.outbox_refs
+                        or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+                    raise AuthorityDenied("source correction bundle identity differs")
+                quote = self.__d11_issuer.issue_d06_source_correction_quote(
+                    db, pre_quote, admin_policy, request,
+                    installation_id=installation_id, now_utc=correction_now,
+                    planned_quote=planned)
+                refs = envelope.version_guard.resource_lease_versions
+                if (quote != planned or len(refs) != 1
+                        or (refs[0].ref, refs[0].version)
+                        != (quote.quote_id, quote.version)):
+                    raise AuthorityDenied("source correction quote plan changed")
+                db.execute(
+                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                    "VALUES(?,?,?,?,?)",
+                    namespace.as_tuple + ("resource_lease", quote.quote_id,
+                                          str(quote.version)),
                 )
             if baseline_issuance is not None:
                 (admin_policy, installation_id, baseline_now, source_ref,
@@ -13974,6 +14383,29 @@ class GraphCoordinator:
                     }
             if product_advances:
                 data["product_advance_candidate"] = product_advances[0]
+            if correction_issuance is not None:
+                request = correction_issuance[3]
+                correction_ref = bundle.proposals[0].typed_writes[0].key.token
+                expected_writes = {
+                    correction_ref, *request.target_refs,
+                    bundle.persistent_job_refs[0], bundle.outbox_refs[0],
+                }
+                written = {item.key.token for item in graph_receipt.revisions}
+                if (not expected_writes.issubset(written)
+                        or v2_write is None or len(bundle.outbox_refs) != 1):
+                    raise UnavailableGuard("source correction graph writes differ")
+                data["source_correction"] = {
+                    "request_digest": request.request_digest,
+                    "correction_source_ref": correction_ref,
+                    "source_refs": list(request.source_refs),
+                    "invalidated_target_refs": list(request.target_refs),
+                    "reevaluation_outbox_ref": bundle.outbox_refs[0],
+                    "audit_event_ref": identity.operation_id,
+                    "graph_revision": v2_write[0].graph_revision + 1,
+                    "access_epoch": request.access_epoch,
+                    "deletion_epoch": request.deletion_epoch,
+                    "reevaluation_status": "pending",
+                }
             db.execute(
                 "INSERT INTO graph_bundle_operations(bot,persona,operation_id,digest,"
                 "activity_id,effect_id,commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
