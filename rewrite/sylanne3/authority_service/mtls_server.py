@@ -143,8 +143,8 @@ class _DeferredWorkerDelivery:
     credential: MtlsPeerCredential
     delivery: WorkerResultDeliveryV1 | TerminalC02RecoveryDeliveryV1
 
-    def finish(self) -> None:
-        self.service.finish_delivery(
+    def finish(self):
+        return self.service.finish_delivery(
             credential=self.credential, delivery=self.delivery)
 
     def abandon(self) -> None:
@@ -1975,7 +1975,47 @@ class AuthorityRpcServer:
                         result.abandon()
                     raise
                 if response["ok"] is True and type(result) is _DeferredWorkerDelivery:
-                    await asyncio.shield(asyncio.to_thread(result.finish))
+                    if type(result.delivery) is TerminalC02RecoveryDeliveryV1:
+                        # Local writer.drain() does not prove that the pinned host
+                        # consumed the result. Only its ACK on this mTLS channel,
+                        # after parsing the exact response, can finish the fact.
+                        try:
+                            ack_line = await asyncio.wait_for(
+                                reader.readuntil(b"\n"), timeout_seconds)
+                            if len(ack_line) > max_message_bytes:
+                                raise RuntimeError("terminal C02 ACK exceeds limit")
+                            ack = json.loads(ack_line)
+                            expected = {
+                                "kind": "terminal_c02_recovery_drain_ack_v1",
+                                "request_id": payload["request_id"],
+                                "channel_binding_sha256":
+                                    result.payload["channel_binding_sha256"],
+                                "response_digest": hashlib.sha256(encoded).hexdigest(),
+                                "original_key_digest":
+                                    result.delivery.request.original_key.digest,
+                                "read_request_digest": result.delivery.request.digest,
+                            }
+                            if type(ack) is not dict or ack != expected:
+                                raise RuntimeError("terminal C02 transport ACK differs")
+                        except BaseException:
+                            result.abandon()
+                            raise
+                        fact = await asyncio.shield(asyncio.to_thread(result.finish))
+                        terminal_response = {
+                            "request_id": payload["request_id"], "ok": True,
+                            "result": {
+                                "read_fact": terminal_c02_to_wire(fact),
+                                "channel_binding_sha256":
+                                    result.payload["channel_binding_sha256"],
+                            },
+                        }
+                        final_bytes = _canonical(terminal_response)
+                        if len(final_bytes) + 1 > max_message_bytes:
+                            raise RuntimeError("terminal C02 fact exceeds limit")
+                        writer.write(final_bytes + b"\n")
+                        await asyncio.wait_for(writer.drain(), timeout_seconds)
+                    else:
+                        await asyncio.shield(asyncio.to_thread(result.finish))
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, RuntimeError,
                 TimeoutError, TypeError, ValueError, ConnectionError):
             pass

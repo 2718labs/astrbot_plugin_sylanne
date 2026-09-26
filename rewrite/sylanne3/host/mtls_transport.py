@@ -8,7 +8,7 @@ they are never copied from an AstrBot setting or an Authority request.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 import hashlib
 import json
 from pathlib import Path
@@ -43,6 +43,12 @@ from ..authority_service.v2_execution_bridge import CurrentEffectReadV2, Handoff
 from ..authority_service.v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
     ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
+    ModelEgressObservationV1,
+)
+from ..authority_service.v2_terminal_c02_recovery_contract import (
+    TerminalRecoveryReadRequestV1, TerminalRecoveryReadAttemptV1,
+    TerminalRecoveryReadFactV1, from_wire as terminal_c02_from_wire,
+    to_wire as terminal_c02_to_wire,
 )
 from ..authority_service.v2_model_egress_wire import (
     from_wire as model_from_wire, to_wire as model_to_wire,
@@ -101,6 +107,26 @@ def _canonical(value: object) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
+
+
+def _terminal_c02_observation(raw: object) -> ModelEgressObservationV1:
+    if type(raw) is not dict or set(raw) != {
+            item.name for item in fields(ModelEgressObservationV1)}:
+        raise RuntimeError("terminal C02 observation fields differ")
+    data = dict(raw)
+    for name in ("usage", "cost"):
+        pairs = data[name]
+        if type(pairs) is not list or any(
+                type(pair) is not list or len(pair) != 2 for pair in pairs):
+            raise RuntimeError("terminal C02 observation accounting differs")
+        data[name] = tuple(tuple(pair) for pair in pairs)
+    try:
+        observation = ModelEgressObservationV1(**data)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("terminal C02 observation is invalid") from exc
+    if json.loads(_canonical(asdict(observation))) != raw:
+        raise RuntimeError("terminal C02 observation is noncanonical")
+    return observation
 
 
 def _request_payload(request: AuthorityProvisioningRequest) -> dict[str, str]:
@@ -282,6 +308,63 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority response is invalid")
         if response.get("ok") is not True or not isinstance(response.get("result"), dict):
             raise RuntimeError("authority service unavailable")
+        if method == "terminal_c02_recovery_read_v1":
+            try:
+                if command is None or set(command) != {"namespace", "read_request"}:
+                    raise RuntimeError("terminal C02 read command differs")
+                read_request = terminal_c02_from_wire(
+                    command["read_request"], TerminalRecoveryReadRequestV1)
+                result = response["result"]
+                if (set(result) != {"result", "channel_binding_sha256"}
+                        or result["channel_binding_sha256"] != session.binding
+                        or type(result["result"]) is not dict
+                        or set(result["result"]) != {"request", "observation"}):
+                    raise RuntimeError("terminal C02 response fields differ")
+                delivered = terminal_c02_from_wire(
+                    result["result"]["request"], TerminalRecoveryReadRequestV1)
+                observation = _terminal_c02_observation(result["result"]["observation"])
+                key = read_request.original_key
+                if (delivered != read_request or observation.status != "completed"
+                        or (observation.authority_id, observation.namespace,
+                            observation.operation_id, observation.call_id,
+                            observation.request_digest, observation.digest) !=
+                           (key.authority_id, key.authority_namespace,
+                            key.original_model_operation_id, key.call_id,
+                            key.model_request_digest, key.observation_digest)):
+                    raise RuntimeError("terminal C02 original result differs")
+                ack = {
+                    "kind": "terminal_c02_recovery_drain_ack_v1",
+                    "request_id": message["request_id"],
+                    "channel_binding_sha256": session.binding,
+                    "response_digest": hashlib.sha256(line[:-1]).hexdigest(),
+                    "original_key_digest": key.digest,
+                    "read_request_digest": read_request.digest,
+                }
+                session.writer.write(_canonical(ack) + b"\n")
+                await asyncio.wait_for(session.writer.drain(), profile.timeout_seconds)
+                final_line = await asyncio.wait_for(
+                    session.reader.readuntil(b"\n"), profile.timeout_seconds)
+                if not final_line or len(final_line) > profile.max_message_bytes:
+                    raise RuntimeError("terminal C02 fact response is invalid")
+                final = json.loads(final_line)
+                if (type(final) is not dict or final.get("request_id") != message["request_id"]
+                        or final.get("ok") is not True or type(final.get("result")) is not dict
+                        or set(final["result"]) != {"read_fact", "channel_binding_sha256"}
+                        or final["result"]["channel_binding_sha256"] != session.binding):
+                    raise RuntimeError("terminal C02 fact response differs")
+                fact = terminal_c02_from_wire(
+                    final["result"]["read_fact"], TerminalRecoveryReadFactV1)
+                if (fact.request != read_request
+                        or fact.handoff_digest != runtime_canonical_digest({
+                            "request": asdict(read_request),
+                            "observation": asdict(observation)})):
+                    raise RuntimeError("terminal C02 handoff fact differs")
+                return {"observation": json.loads(_canonical(asdict(observation))),
+                        "read_fact": terminal_c02_to_wire(fact),
+                        "channel_binding_sha256": session.binding}
+            except BaseException:
+                await self._discard(session, profile.timeout_seconds)
+                raise
         return response["result"]
 
     @staticmethod
@@ -946,6 +1029,66 @@ class MtlsAuthorityTransport:
                 or fact.write_permit != fact_request.write_permit):
             raise RuntimeError("authority worker result fact differs")
         return fact
+
+    async def terminal_c02_recovery_read_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: TerminalRecoveryReadRequestV1,
+    ) -> tuple[ModelEgressObservationV1, TerminalRecoveryReadFactV1]:
+        """Read an original terminal body with a same-channel, exact-body ACK.
+
+        An exception after the ACK leaves the outcome unknown. Call
+        terminal_c02_recovery_query_v1 with this exact request before retrying.
+        """
+        if type(read_request) is not TerminalRecoveryReadRequestV1:
+            raise TypeError("typed terminal C02 recovery request required")
+        key = read_request.original_key
+        if ((key.authority_id, key.authority_namespace, key.installation_id) !=
+                (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed terminal C02 identity differs")
+        response = await self._content_rpc(
+            request, handshake, "terminal_c02_recovery_read_v1",
+            {"namespace": namespace, "read_request": terminal_c02_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"observation", "read_fact", "channel_binding_sha256"}:
+            raise RuntimeError("terminal C02 recovery response is invalid")
+        observation = _terminal_c02_observation(response["observation"])
+        fact = terminal_c02_from_wire(response["read_fact"], TerminalRecoveryReadFactV1)
+        if (fact.request != read_request or observation.digest != key.observation_digest):
+            raise RuntimeError("terminal C02 recovery result differs")
+        return observation, fact
+
+    async def terminal_c02_recovery_query_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: TerminalRecoveryReadRequestV1,
+    ) -> tuple[TerminalRecoveryReadAttemptV1 | None,
+               TerminalRecoveryReadFactV1 | None]:
+        """Resolve an unknown handoff from the content-free durable attempt."""
+        if type(read_request) is not TerminalRecoveryReadRequestV1:
+            raise TypeError("typed terminal C02 recovery request required")
+        key = read_request.original_key
+        if ((key.authority_id, key.authority_namespace, key.installation_id) !=
+                (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed terminal C02 identity differs")
+        response = await self._content_rpc(
+            request, handshake, "terminal_c02_recovery_query_v1",
+            {"namespace": namespace, "read_request": terminal_c02_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"attempt", "read_fact", "channel_binding_sha256"}:
+            raise RuntimeError("terminal C02 query response is invalid")
+        attempt = None if response["attempt"] is None else terminal_c02_from_wire(
+            response["attempt"], TerminalRecoveryReadAttemptV1)
+        fact = None if response["read_fact"] is None else terminal_c02_from_wire(
+            response["read_fact"], TerminalRecoveryReadFactV1)
+        if ((attempt is not None and attempt.request != read_request)
+                or (fact is not None and fact.request != read_request)
+                or (fact is not None and attempt is not None
+                    and (fact.permit_digest, fact.result_digest) !=
+                        (attempt.permit_digest, attempt.result_digest))
+                or (fact is None) != (attempt is None or attempt.state == "active")):
+            raise RuntimeError("terminal C02 query identity differs")
+        return attempt, fact
 
     async def worker_result_read_fact_v2(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

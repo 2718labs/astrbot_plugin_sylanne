@@ -226,7 +226,7 @@ class AuthorityV2TerminalC02RecoveryReadService:
                     fences.fences.finish_fence_locked(
                         db, permit, subject=self._read_subject, current_anchor=anchor,
                         request_id=request_id, request_digest=request_digest)
-                    self._attempts.finish_locked(
+                    return self._attempts.finish_locked(
                         db, request, permit=permit,
                         handoff_digest=delivery.handoff_digest)
             finally:
