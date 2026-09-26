@@ -11013,6 +11013,139 @@ class GraphCoordinator:
             now_utc=now_utc,
         )
 
+    def _dispatch_full_graph_snapshot_locked(self, namespace: NamespaceId):
+        """Read the complete namespace at one epoch in the final write transaction.
+
+        GraphStore.graph_query starts its own transaction, so it cannot be
+        nested in the final BEGIN IMMEDIATE. This reader is intentionally
+        private and does not authorize a claim by itself.
+        """
+        from .runtime_contracts import QueryEpoch
+
+        store = self.__store
+        db = store._db
+        if not store._lock._is_owned() or not db.in_transaction:
+            raise RuntimeError("final graph snapshot requires held write transaction")
+        epoch = GraphStore.graph_epoch(
+            store, *namespace.as_tuple, _capability=self.__graph_capability)
+        rows = db.execute(
+            "SELECT token,revision,value,valid FROM graph_atoms "
+            "WHERE bot=? AND persona=? ORDER BY token", namespace.as_tuple,
+        ).fetchall()
+        atoms = []
+        for token, revision, encoded, valid in rows:
+            key = AtomKey.from_token(token)
+            if (NamespaceId.from_key(key) != namespace
+                    or type(revision) is not int or revision < 1
+                    or valid not in (0, 1)):
+                raise UnavailableGuard("final graph snapshot row is invalid")
+            store._validate_key(key)
+            atoms.append(GraphAtom(key, revision, json.loads(encoded), bool(valid)))
+        count = db.execute(
+            "SELECT COUNT(*) FROM graph_atoms WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()[0]
+        if count != len(atoms):
+            raise StaleRead("final graph snapshot coverage changed")
+        return GraphSnapshot(tuple(atoms), (epoch,)), QueryEpoch(
+            namespace, "all", epoch.revision)
+
+    def _commit_dispatch_claim_atom_in_transaction(
+            self, namespace: NamespaceId, value, claimed_receipt):
+        """Persist an already verified final claim and recovery stamp atomically.
+
+        This is a private transaction primitive, not the handoff authorizer.
+        Its caller must have checked every current guard in this same write
+        transaction. No public route invokes it until that verifier exists.
+        """
+        from .authority_service.v2_contract import (
+            MutationReceiptV2, canonical_digest as authority_digest,
+        )
+        from .runtime.dispatch_graph_claim import (
+            DispatchGraphClaimValueV1, dispatch_claim_graph_write,
+        )
+
+        store = self.__store
+        db = store._db
+        if not store._lock._is_owned() or not db.in_transaction:
+            raise RuntimeError("dispatch claim requires the final graph transaction")
+        if (type(namespace) is not NamespaceId
+                or type(value) is not DispatchGraphClaimValueV1
+                or type(claimed_receipt) is not MutationReceiptV2
+                or namespace.as_tuple != (value.bot_id, value.persona_id)):
+            raise UnavailableGuard("dispatch claim typed identity differs")
+        pending = claimed_receipt.pending
+        anchor = claimed_receipt.after_anchor
+        if (claimed_receipt.durable_state != "committed"
+                or pending.phase != "claimed"
+                or pending.binding.operation_id != value.operation_id
+                or pending.binding.origin.effect_id != value.effect_id
+                or pending.binding.origin.activity_id != value.activity_id
+                or pending.binding.origin.admission_ref != value.admission_ref
+                or pending.binding.graph_incarnation != value.graph_incarnation
+                or pending.permit.namespace != value.authority_namespace
+                or pending.permit.fence_epoch != value.p2_fence_epoch
+                or claimed_receipt.updated_revision != value.p2_revision
+                or anchor.execution_seq != value.p2_execution_seq
+                or anchor.execution_digest != value.p2_execution_digest
+                or authority_digest(pending.binding) != value.binding_digest
+                or authority_digest(claimed_receipt)
+                != value.claimed_receipt_digest
+                or authority_digest(replace(
+                    pending.permit, revision=claimed_receipt.updated_revision,
+                    pinned_anchor=anchor)) != value.p2_permit_digest):
+            raise UnavailableGuard("dispatch claim differs from committed P2")
+        metadata, epoch = self._v2_graph_stamp(namespace)
+        requirements = metadata.requirements
+        if (requirements.graph_incarnation != value.graph_incarnation
+                or requirements.authority_namespace != value.authority_namespace
+                or not self._accounting_anchor_covers(requirements, anchor)):
+            raise StaleRead("dispatch claim recovery watermark differs from P2")
+        write = dispatch_claim_graph_write(value)
+        event_id = "dispatch-claim:" + value.effect_id
+        existing = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (write.key.token,),
+        ).fetchone()
+        if existing is not None:
+            if (existing[0] != 1 or existing[2] != 1
+                    or json.loads(existing[1]) != write.value):
+                raise EventConflict("dispatch effect already has a different graph claim")
+            event_row = db.execute(
+                "SELECT epoch_revision FROM graph_events WHERE bot=? AND persona=? "
+                "AND session=? AND event_id=?",
+                namespace.as_tuple + (value.activity_id, event_id),
+            ).fetchone()
+            if event_row is None or event_row[0] > epoch.revision:
+                raise UnavailableGuard("dispatch claim event is unavailable")
+            return GraphVersion(write.key, 1), event_row[0], False
+        event = Event(
+            Scope(*namespace.as_tuple, value.activity_id), event_id, time.time(),
+            "dispatch_graph_claim_v1", {"claim_digest": canonical_digest(write.value)},
+        )
+        candidate = GraphCandidate(
+            event, (GraphVersion(write.key, 0),), (write,), (epoch,))
+        replacement = replace(
+            requirements,
+            deletion_seq=anchor.deletion_seq,
+            deletion_digest=anchor.deletion_digest,
+            execution_seq=anchor.execution_seq,
+            execution_digest=anchor.execution_digest,
+            revocation_epoch=anchor.revocation_epoch,
+        )
+
+        def stamp_claim(_db, receipt):
+            if (receipt.status != "committed"
+                    or receipt.revisions != (GraphVersion(write.key, 1),)):
+                raise EventConflict("dispatch claim graph commit differs")
+            store.cas_graph_recovery_metadata(
+                metadata, replacement, _capability=self.__graph_capability)
+
+        receipt = GraphStore._graph_commit_in_transaction(
+            store, candidate, _receipt_hook=stamp_claim,
+            _capability=self.__graph_capability)
+        return receipt.revisions[0], receipt.epoch.revision, True
+
     def get_dispatch_text_segment(self, authority: AuthorityContext,
                                   lease: object, request):
         """Read one D09 body through its committed D11 admission and graph fence.

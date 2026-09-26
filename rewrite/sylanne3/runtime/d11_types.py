@@ -22,6 +22,7 @@ from ..runtime_contracts import (
 from .budget import get_budget_lease
 from .jobs import PersistentJob, get_job
 from .role_resources import role_resources_spec
+from .dispatch_graph_claim import dispatch_claim_type_spec
 
 
 D11_PROPOSAL_SCHEMA = "d11.runtime.proposal.v1"
@@ -471,7 +472,7 @@ class D11RuntimeProvider:
             provider_id="d11.runtime", contract_version=RUNTIME_SCHEMA,
             request_schema_hash=D11_PROPOSAL_SCHEMA_HASH,
             response_schema_hash=schema_hash({"domain": "d11", "response": "validated.v1"}),
-            owner_capabilities=("activity",),
+            owner_capabilities=("activity", "persona"),
             supported_modalities=("runtime",),
             supported_purposes=("schedule", "settle", "dispatch"),
             supported_platforms=("windows", "linux", "macos"),
@@ -484,7 +485,7 @@ class D11RuntimeProvider:
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
-        return graph_type_specs() + (role_resources_spec(),)
+        return graph_type_specs() + (role_resources_spec(), dispatch_claim_type_spec())
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())

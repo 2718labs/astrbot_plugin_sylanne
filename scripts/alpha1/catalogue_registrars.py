@@ -45,4 +45,5 @@ def register_all(registry: TypeRegistry) -> None:
     # include it automatically; absence remains visible in current.json.
     if importlib.util.find_spec("sylanne3.runtime.d11_types") is not None:
         from sylanne3.runtime.d11_types import graph_type_specs as d11_graph_type_specs
-        _register(registry, d11_graph_type_specs())
+        from sylanne3.runtime.dispatch_graph_claim import dispatch_claim_type_spec
+        _register(registry, d11_graph_type_specs() + (dispatch_claim_type_spec(),))
