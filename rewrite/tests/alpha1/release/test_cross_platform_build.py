@@ -11,6 +11,7 @@ import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "alpha1" / "cross_platform_build.py"
+PROBE_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "alpha1" / "probe_current_platform_package.py"
 
 
 def _load_script():
@@ -24,6 +25,7 @@ def _load_script():
 def test_rust_host_must_match_runtime_profile() -> None:
     script = _load_script()
     assert script.select_rust_target("x86_64-pc-windows-msvc", "windows", "x86_64", None) == "x86_64-pc-windows-msvc"
+    assert script.select_rust_target("x86_64-apple-darwin", "macos", "x86_64", None) == "x86_64-apple-darwin"
     assert script.select_rust_target("aarch64-apple-darwin", "macos", "aarch64", None) == "aarch64-apple-darwin"
     assert (
         script.select_rust_target("x86_64-unknown-linux-musl", "linux", "x86_64", "musl") == "x86_64-unknown-linux-musl"
@@ -32,6 +34,30 @@ def test_rust_host_must_match_runtime_profile() -> None:
         script.select_rust_target("x86_64-unknown-linux-gnu", "linux", "aarch64", "glibc")
     with pytest.raises(RuntimeError, match="does not match runtime"):
         script.select_rust_target("x86_64-unknown-linux-gnu", "linux", "x86_64", "musl")
+    with pytest.raises(RuntimeError, match="does not match runtime"):
+        script.select_rust_target("aarch64-apple-darwin", "macos", "x86_64", None)
+
+
+def test_cold_probe_strips_dynamic_loader_and_toolchain_overrides() -> None:
+    spec = importlib.util.spec_from_file_location("probe_current_platform_package", PROBE_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    environment = module._cold_environment(
+        {
+            "PATH": "host-tools",
+            "PYTHONPATH": "source-tree",
+            "CARGO_HOME": "cargo-home",
+            "DYLD_LIBRARY_PATH": "host-libraries",
+            "DYLD_INSERT_LIBRARIES": "injected.dylib",
+            "LD_LIBRARY_PATH": "host-libraries",
+            "LD_PRELOAD": "injected.so",
+            "HOME": "home",
+        }
+    )
+
+    assert environment == {"PATH": "", "HOME": "home"}
 
 
 def test_build_selects_host_asset_and_runs_existing_cold_probe(tmp_path: Path) -> None:

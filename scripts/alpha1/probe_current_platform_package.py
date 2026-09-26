@@ -161,6 +161,16 @@ def probe_nonlinear(library, binding):
 '''
 
 
+def _cold_environment(source: dict[str, str] | None = None) -> dict[str, str]:
+    """Remove toolchain, Python injection, and dynamic-loader overrides."""
+    environment = os.environ if source is None else source
+    blocked_prefixes = ("PYTHON", "RUST", "CARGO", "DYLD_", "LD_")
+    return {
+        name: value for name, value in environment.items()
+        if not name.upper().startswith(blocked_prefixes) and name.upper() != "PATH"
+    } | {"PATH": ""}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cold-load a current-platform non-release ZIP")
     parser.add_argument(
@@ -287,11 +297,7 @@ def main() -> None:
                 "print(json.dumps({'abi_version': capabilities.abi_version, 'max_dimension': capabilities.max_dimension, 'fixed_block_interval_math_v1': capabilities.supports_fixed_block_interval_math_v1, 'numerically_certified': capabilities.numerically_certified, 'diagnostic_only': capabilities.diagnostic_only, 'binding': expected, 'fixed_block_math': math_receipt, 'coupled_fixed_block_math': coupled_receipt, 'nonlinear_fixed_block_math': nonlinear_receipt}))",
             )
         )
-        cold_env = {
-            name: value for name, value in os.environ.items()
-            if not name.upper().startswith(("PYTHON", "RUST", "CARGO"))
-        }
-        cold_env["PATH"] = ""
+        cold_env = _cold_environment()
         loaded = subprocess.run(
             [
                 sys.executable, "-I", "-S", "-c", code,
