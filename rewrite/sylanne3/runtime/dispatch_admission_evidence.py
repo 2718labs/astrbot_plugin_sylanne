@@ -54,11 +54,12 @@ def read_current_admission_facts(
     db, bundle: DomainBundle, snapshot: GraphSnapshot,
     candidate: DispatchCandidateEvidenceV1, *, now_utc: float,
 ) -> CurrentAdmissionFactsV1:
-    """Re-read a staged D08/D09 candidate under the graph write transaction.
+    """Re-read a staged D08/D09 candidate before graph writes are applied.
 
-    The caller must retain that transaction and its Authority fence.  This
-    function only returns facts that it can independently compare to SQLite;
-    no caller-supplied check receipt or status flag can promote it to READY.
+    The caller must retain the graph transaction and its Authority fence.
+    The coordinator's receipt hook runs after graph writes and cannot pass its
+    old guard snapshot here.  This only returns facts that it can independently
+    compare to SQLite; no caller-supplied check receipt promotes it to READY.
     """
     if not db.in_transaction:
         raise ValueError("dispatch facts require a held graph transaction")
