@@ -8,7 +8,9 @@ import pytest
 from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.authority_service.v2_execution_bridge import CurrentEffectReadV2
 from sylanne3.contracts import canonical_json
-from sylanne3.domains.d08.execution import ActionIntent, GoalPredicate, RequiredCheckSpec
+from sylanne3.domains.d08.execution import (
+    ActionCancellationState, ActionIntent, GoalPredicate, RequiredCheckSpec,
+)
 from sylanne3.graph_types import (
     AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch, Owner,
 )
@@ -118,6 +120,46 @@ def _advance_job_projection(db, namespace, job_id, revision):
     )
 
 
+def _install_action_cancel_head(db, namespace, snapshot, intent, *, cancelled=False):
+    db.executescript("""
+        CREATE TABLE graph_events(bot TEXT,persona TEXT,session TEXT,event_id TEXT,
+                                  reads TEXT,revisions TEXT,epoch_revision INTEGER);
+        CREATE TABLE graph_history(token TEXT,revision INTEGER,value TEXT,valid INTEGER,
+                                   event_bot TEXT,event_persona TEXT,event_session TEXT,
+                                   event_id TEXT);
+    """)
+    action_key = snapshot.atoms[0].key
+    key = AtomKey(action_key.owner, "d08.action_cancellation.v1", intent.action_id)
+    initial = ActionCancellationState.for_action(
+        intent, state="active", actor="host:user", source_refs=("source:one",),
+        operation_id=intent.identity.operation_id,
+    )
+    values = [initial]
+    if cancelled:
+        values.append(replace(initial, state="cancelled", cancel_epoch=1,
+                              operation_id="operation:cancel-action"))
+    for revision, state in enumerate(values, 1):
+        encoded = canonical_json(json.loads(json.dumps(asdict(state))))
+        reads = canonical_json([[action_key.token, intent.revision],
+                                [key.token, revision - 1]])
+        revisions = canonical_json([[key.token, revision]])
+        db.execute("INSERT INTO graph_events VALUES(?,?,?,?,?,?,?)", (
+            *namespace.as_tuple, intent.identity.activity_id, state.operation_id,
+            reads, revisions, 5,
+        ))
+        db.execute("INSERT INTO graph_history VALUES(?,?,?,?,?,?,?,?)", (
+            key.token, revision, encoded, 1, *namespace.as_tuple,
+            intent.identity.activity_id, state.operation_id,
+        ))
+    current = values[-1]
+    atom = GraphAtom(key, len(values), json.loads(json.dumps(asdict(current))))
+    db.execute("INSERT INTO graph_atoms VALUES(?,?,?,?,?,?,?)", (
+        key.token, *namespace.as_tuple, key.type_name, atom.revision,
+        canonical_json(atom.value), 1,
+    ))
+    return GraphSnapshot(snapshot.atoms + (atom,), snapshot.epochs)
+
+
 def test_durable_action_job_binding_proves_local_link_but_keeps_authority_hold():
     db, namespace, intent, admission, bind, snapshot, query, p2, effect = (
         _bound_evidence_case())
@@ -189,6 +231,64 @@ def test_stale_action_or_forged_binding_never_proves_current_link():
             db, namespace, revised_snapshot, query, intent.action_id, p2, effect)
         assert "current_action_job_binding_stale" in stale_action.missing_sources
         assert "action_attempt_to_job_binding" in stale_action.missing_sources
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("cancelled,expected", [
+    (False, "clear"), (True, "cancelled"),
+])
+def test_action_cancellation_requires_current_head_and_admission_origin(cancelled, expected):
+    db, namespace, intent, admission, bind, snapshot, query, p2, effect = (
+        _bound_evidence_case())
+    try:
+        snapshot = _install_action_cancel_head(
+            db, namespace, snapshot, intent, cancelled=cancelled)
+        db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        bind(db, intent, admission)
+        current = read_current_d08_action_conflict_evidence(
+            db, namespace, snapshot, query, intent.action_id, p2, effect)
+        assert current.action_cancellation_state == expected
+        assert current.action_cancellation_graph_version.revision == (2 if cancelled else 1)
+        assert "current_action_cancellation_read" not in current.missing_sources
+        assert ("matching_action_cancelled" in current.missing_sources) == cancelled
+        assert current.status == "hold"
+        assert "authority_post_graph_p2_cas" in current.missing_sources
+    finally:
+        db.close()
+
+
+def test_action_cancellation_fails_closed_for_missing_origin_or_wrong_attempt():
+    db, namespace, intent, admission, bind, snapshot, query, p2, effect = (
+        _bound_evidence_case())
+    try:
+        snapshot = _install_action_cancel_head(db, namespace, snapshot, intent)
+        db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        bind(db, intent, admission)
+        key = snapshot.atoms[-1].key
+        db.execute("UPDATE graph_history SET event_id='operation:other' WHERE token=?", (key.token,))
+        missing = read_current_d08_action_conflict_evidence(
+            db, namespace, snapshot, query, intent.action_id, p2, effect)
+        assert missing.action_cancellation_state == "unknown"
+        assert "current_action_cancellation_read" in missing.missing_sources
+        db.execute("UPDATE graph_history SET event_id=? WHERE token=?",
+                   (intent.identity.operation_id, key.token))
+        wrong = replace(intent, identity=replace(intent.identity, attempt_id="attempt:later"))
+        wrong_value = ActionCancellationState.for_action(
+            wrong, state="active", actor="host:user", source_refs=("source:one",),
+            operation_id=intent.identity.operation_id,
+        )
+        encoded = canonical_json(json.loads(json.dumps(asdict(wrong_value))))
+        db.execute("UPDATE graph_atoms SET value=? WHERE token=?", (encoded, key.token))
+        db.execute("UPDATE graph_history SET value=? WHERE token=?", (encoded, key.token))
+        wrong_atom = GraphAtom(key, 1, json.loads(encoded))
+        wrong_snapshot = GraphSnapshot(snapshot.atoms[:-1] + (wrong_atom,), snapshot.epochs)
+        mismatch = read_current_d08_action_conflict_evidence(
+            db, namespace, wrong_snapshot, query, intent.action_id, p2, effect)
+        assert mismatch.action_cancellation_state == "unknown"
+        assert "action_cancellation_attempt_mismatch" in mismatch.missing_sources
     finally:
         db.close()
 

@@ -8,8 +8,10 @@ import json
 from ..authority_service.v2_contract import FencePermitV2
 from ..authority_service.v2_execution_bridge import CurrentEffectReadV2
 from ..contracts import canonical_json
-from ..domains.d08.execution import ActionIntent, ActionOutcome, Commitment, GoalExecutionProvider
-from ..graph_types import AtomKey, GraphSnapshot, GraphVersion
+from ..domains.d08.execution import (
+    ActionCancellationState, ActionIntent, ActionOutcome, Commitment, GoalExecutionProvider,
+)
+from ..graph_types import AtomKey, GraphSnapshot, GraphVersion, Owner
 from ..runtime_contracts import NamespaceId, QueryEpoch, canonical_digest
 from .d11_types import job_graph_write
 from .dispatch_action_job_binding import load_action_job_binding
@@ -46,7 +48,7 @@ class CurrentD08ActionConflictEvidenceV1:
     `effect_state=clear` means the verified Authority read found no effect at
     its pinned head. For a claimed P2 this is contradictory, so it cannot pass.
     The durable action/attempt-to-job binding and current job row are checked
-    together. Independent D08 cancellation authority remains unresolved.
+    together. D08 cancellation is independently read from its graph history.
     """
 
     action_id: str
@@ -55,7 +57,7 @@ class CurrentD08ActionConflictEvidenceV1:
     graph_query_epoch: QueryEpoch
     effect_state: str  # clear, unresolved, unknown
     job_cancellation_state: str  # clear, cancelled, unknown
-    action_cancellation_state: str  # independent D08 cancellation remains unknown
+    action_cancellation_state: str  # clear, cancelled, unknown
     job_id: str | None
     job_fence: int | None
     job_cancel_epoch: int | None
@@ -64,6 +66,115 @@ class CurrentD08ActionConflictEvidenceV1:
     missing_sources: tuple[str, ...] = ()
     action_job_binding_digest: str | None = None
     job_graph_version: GraphVersion | None = None
+    action_cancellation_graph_version: GraphVersion | None = None
+
+
+def _current_action_cancellation(
+    db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
+    intent: ActionIntent, binding,
+) -> tuple[str, GraphVersion | None, tuple[str, ...]]:
+    """Read one stable D08 head and its admission origin under the graph fence."""
+    missing = ("current_action_cancellation_read",)
+    if binding is None or "graph_history" not in {
+            row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    } or "graph_events" not in {
+            row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }:
+        return "unknown", None, missing
+    owner = Owner("activity", *namespace.as_tuple, intent.identity.activity_id)
+    action_key = AtomKey(owner, "d08.action_intent.v1", intent.action_id)
+    key = AtomKey(owner, "d08.action_cancellation.v1", intent.action_id)
+    # A full query epoch makes every competing same-name head visible. A
+    # missing initial head is never evidence that the action is uncancelled.
+    rows = db.execute(
+        "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
+        "AND type_name='d08.action_cancellation.v1'",
+        namespace.as_tuple,
+    ).fetchall()
+    relevant = tuple(row for row in rows if AtomKey.from_token(row[0]).name == intent.action_id)
+    if len(relevant) != 1 or relevant[0][0] != key.token:
+        return "unknown", None, missing
+    token, revision, encoded, valid = relevant[0]
+    matching_atoms = tuple(item for item in snapshot.atoms if item.key == key)
+    if len(matching_atoms) != 1:
+        return "unknown", None, missing
+    atom = matching_atoms[0]
+    if (not atom.valid or atom.revision != revision
+            or atom.value != json.loads(encoded) or valid != 1
+            or type(revision) is not int or revision not in {1, 2}):
+        return "unknown", None, missing
+    try:
+        state = ActionCancellationState(**{
+            **atom.value, "source_refs": tuple(atom.value["source_refs"]),
+        })
+    except (TypeError, ValueError, KeyError):
+        return "unknown", None, missing
+    expected = (intent.action_id, intent.revision, canonical_digest(intent),
+                intent.identity.activity_id, intent.identity.attempt_id,
+                intent.identity.effect_id)
+    if (state.action_id, state.action_revision, state.action_digest,
+            state.activity_id, state.attempt_id, state.effect_id) != expected:
+        return "unknown", None, ("action_cancellation_attempt_mismatch",)
+    if (binding.namespace, binding.action_id, binding.attempt_id,
+            binding.activity_id, binding.effect_id, binding.action_digest,
+            binding.action_graph_revision) != (
+                "/".join(namespace.as_tuple), intent.action_id,
+                intent.identity.attempt_id, intent.identity.activity_id,
+                intent.identity.effect_id, canonical_digest(intent), intent.revision):
+        return "unknown", None, missing
+
+    def historical(version: int):
+        row = db.execute(
+            "SELECT value,valid,event_bot,event_persona,event_session,event_id "
+            "FROM graph_history WHERE token=? AND revision=?",
+            (token, version),
+        ).fetchone()
+        if row is None or row[1:5] != (1, *namespace.as_tuple, state.activity_id):
+            return None
+        event = db.execute(
+            "SELECT reads,revisions,epoch_revision FROM graph_events WHERE bot=? "
+            "AND persona=? AND session=? AND event_id=?",
+            (*namespace.as_tuple, state.activity_id, row[5]),
+        ).fetchone()
+        if event is None or event[2] > query.revision:
+            return None
+        try:
+            reads = {tuple(item) for item in json.loads(event[0])}
+            revisions = {tuple(item) for item in json.loads(event[1])}
+        except (TypeError, ValueError):
+            return None
+        if ((token, version) not in revisions
+                or (action_key.token, intent.revision) not in reads
+                or (token, version - 1) not in reads):
+            return None
+        return row
+
+    first = historical(1)
+    if first is None or first[5] != binding.operation_id:
+        return "unknown", None, missing
+    try:
+        initial = ActionCancellationState(**{
+            **json.loads(first[0]),
+            "source_refs": tuple(json.loads(first[0])["source_refs"]),
+        })
+    except (TypeError, ValueError, KeyError):
+        return "unknown", None, missing
+    if (initial.state != "active" or initial.cancel_epoch != 0
+            or initial.operation_id != binding.operation_id
+            or (initial.action_id, initial.action_revision, initial.action_digest,
+                initial.activity_id, initial.attempt_id, initial.effect_id) != expected):
+        return "unknown", None, missing
+    if revision == 1:
+        if state != initial or encoded != first[0]:
+            return "unknown", None, missing
+        return "clear", GraphVersion(key, revision), ()
+    second = historical(2)
+    if (second is None or second[0] != encoded or second[5] != state.operation_id
+            or state.state != "cancelled" or state.cancel_epoch != 1
+            or (state.action_id, state.action_revision, state.action_digest,
+                state.activity_id, state.attempt_id, state.effect_id) != expected):
+        return "unknown", None, missing
+    return "cancelled", GraphVersion(key, revision), ("matching_action_cancelled",)
 
 
 @dataclass(frozen=True)
@@ -351,6 +462,13 @@ def read_current_d08_action_conflict_evidence(
                     canonical_digest(intent), intent.revision)):
                 blockers.append("current_action_job_binding_stale")
 
+    action_cancellation_state, action_cancellation_version, cancellation_missing = (
+        _current_action_cancellation(db, namespace, snapshot, query, intent, binding))
+    if action_cancellation_state != "unknown":
+        blockers = [item for item in blockers
+                    if item != "current_action_cancellation_read"]
+    blockers.extend(cancellation_missing)
+
     rows = db.execute(
         "SELECT job_id FROM runtime_jobs WHERE bot_id=? AND persona_id=? "
         "AND (effect_id=? OR operation_id=?) ORDER BY job_id",
@@ -407,11 +525,13 @@ def read_current_d08_action_conflict_evidence(
         blockers.append("unique_current_action_job_unproven")
     return CurrentD08ActionConflictEvidenceV1(
         action_id, identity.effect_id, identity.operation_id,
-        facts.query_epoch, effect_state, job_cancellation_state, "unknown",
+        facts.query_epoch, effect_state, job_cancellation_state,
+        action_cancellation_state,
         job_id, job_fence, job_cancel_epoch, effect,
         missing_sources=tuple(dict.fromkeys(blockers)),
         action_job_binding_digest=binding_digest,
         job_graph_version=job_graph_version,
+        action_cancellation_graph_version=action_cancellation_version,
     )
 
 
