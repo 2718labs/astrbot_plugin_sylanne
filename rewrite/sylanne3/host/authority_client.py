@@ -31,6 +31,7 @@ from ..authority_service.v2_accounting_contract import (
 from ..model_broker.broker import ModelCallRequest
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime.c02_cost_settlement import C02OriginalIntentLookupV1
 from ..runtime_contracts import InstallationGrantV2
 
 
@@ -219,6 +220,9 @@ class AuthorityTransport(Protocol):
 
     async def model_terminal_fact_v2(self, request, handshake, grant, *, namespace,
                                      holder, intent): ...
+
+    async def model_original_intent_lookup_v1(self, request, handshake, grant, *,
+                                              lookup: C02OriginalIntentLookupV1): ...
 
     async def model_result_read_v1(self, request, handshake, grant, *, namespace,
                                    read_request, owner_session_token): ...
@@ -443,6 +447,20 @@ class AuthorityClient:
         return await self._transport.model_terminal_fact_v2(
             request, handshake, grant, namespace=policy.authority_namespace,
             holder=policy.administrator_holder, intent=intent)
+
+    async def model_original_intent_lookup_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        lookup: C02OriginalIntentLookupV1,
+    ) -> ModelEgressIntentV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(lookup) is not C02OriginalIntentLookupV1
+                or (lookup.namespace, lookup.authority_id,
+                    lookup.authority_namespace, lookup.installation_id) !=
+                   (policy.namespace, grant.authority_id,
+                    policy.authority_namespace, grant.installation_id)):
+            raise RuntimeError("original intent lookup differs from installation")
+        return await self._transport.model_original_intent_lookup_v1(
+            request, handshake, grant, lookup=lookup)
 
     async def model_result_read_v1(
         self, bundle, grant: InstallationGrantV2, *,

@@ -38,6 +38,7 @@ from .host.model_egress_executor import (
 from .host.accounting_maintenance_port import InstalledAccountingMaintenancePort
 from .host.authority_client import AuthorityClient, AuthoritySelection
 from .host.model_terminal_cost_port import InstalledModelTerminalCostPort
+from .host.original_c02_cost_intent_port import InstalledOriginalC02CostIntentPort
 from .host.self_identity_current_port import InstalledCurrentSelfIdentityPort
 from .host.worker_result_read_fact_port import InstalledWorkerResultReadFactPort
 from .host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
@@ -57,6 +58,7 @@ from .model_broker.first_ingress_encoding import (
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.first_ingress_v2 import ingress_ids
 from .runtime.first_ingress_unacquired import FirstIngressUnacquiredPageV1
+from .runtime.first_ingress_recovery import FirstIngressRecoveryPageV1
 from .runtime.original_model_result_context import OriginalModelResultContextV1
 from .runtime.restore_anchor import ExecutionJournalPort
 from .runtime_contracts import (
@@ -296,6 +298,7 @@ class RuntimeContext:
             accounting_port = None
             self_identity_port = None
             worker_result_fact_port = None
+            original_c02_cost_intent_port = None
             bundle = installation.admin_bundle
             if (type(bundle) is AdminInstallationBundle
                     and type(bundle.tls_profile) is AuthorityTlsProfile):
@@ -324,12 +327,16 @@ class RuntimeContext:
                     worker_result_fact_port = InstalledWorkerResultReadFactPort(
                         client=client, bundle=bundle,
                         grant=installation_grant, owner_loop=loop)
+                    original_c02_cost_intent_port = InstalledOriginalC02CostIntentPort(
+                        client=client, bundle=bundle,
+                        grant=installation_grant, owner_loop=loop)
                 except Exception:
                     if cost_transport is not None:
                         await cost_transport.close()
                     cost_transport = None
                     terminal_cost_port = accounting_port = None
                     self_identity_port = worker_result_fact_port = None
+                    original_c02_cost_intent_port = None
             model_authority_hold = (
                 type(bundle) is AdminInstallationBundle
                 and cost_transport is None)
@@ -463,6 +470,7 @@ class RuntimeContext:
                     accounting_maintenance_port=accounting_port,
                     self_identity_port=self_identity_port,
                     worker_result_fact_port=worker_result_fact_port,
+                    original_c02_cost_intent_port=original_c02_cost_intent_port,
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(
@@ -1249,10 +1257,13 @@ class RuntimeContext:
                 return None
             return committed
 
-    async def first_ingress_c02_accounting_installed_v1(self) -> bool:
+    async def first_ingress_c02_accounting_installed_v1(
+        self, *, require_worker_result: bool = True,
+    ) -> bool:
         """Admit automatic handoff only with W01's installed cost continuation."""
         bundle = self._v2_model_bundle
-        if (self._worker is None or not self._v2_namespace_provisioned
+        if (type(require_worker_result) is not bool
+                or self._worker is None or not self._v2_namespace_provisioned
                 or self._v2_cost_transport is None
                 or type(bundle) is not AdminInstallationBundle
                 or bundle.installation_policy != self._v2_policy
@@ -1263,12 +1274,15 @@ class RuntimeContext:
         try:
             return (await self._worker.call(
                 lambda graph: graph.first_ingress_c02_accounting_installed_v1()
+                if require_worker_result else
+                graph.first_ingress_c02_accounting_installed_v1(
+                    require_worker_result=False)
             )) is True
         except Exception:
             return False
 
     async def discover_first_ingress_unacquired_v1(
-        self, *, limit: int = 8,
+        self, *, after_job_id: str | None = None, limit: int = 8,
     ) -> FirstIngressUnacquiredPageV1 | None:
         """Read one installed startup page; absence of the graph API is HOLD.
 
@@ -1276,6 +1290,8 @@ class RuntimeContext:
         This wrapper never reads private tables or upgrades a hint to a permit.
         """
         if (type(limit) is not int or not 1 <= limit <= 8
+                or after_job_id is not None and (
+                    type(after_job_id) is not str or not after_job_id)
                 or self._worker is None or self._v2_bootstrap is None
                 or not self._v2_namespace_provisioned
                 or type(self._v2_policy) is not AdminInstallationPolicy
@@ -1287,14 +1303,67 @@ class RuntimeContext:
         try:
             page = await self._worker.call(
                 lambda graph: graph.discover_first_ingress_unacquired_v1(
-                    bootstrap, namespace, limit=limit))
+                    bootstrap, namespace, after_job_id=after_job_id,
+                    limit=limit))
         except Exception:
             return None
         if (type(page) is not FirstIngressUnacquiredPageV1
                 or page.namespace != namespace
                 or page.installation_id
                    != self._v2_installation_grant.installation_id
-                or len(page.items) > limit):
+                or len(page.items) > limit
+                or any(item.job_id <= (after_job_id or "")
+                       for item in page.items)
+                or any(left.job_id >= right.job_id for left, right in zip(
+                    page.items, page.items[1:]))
+                or page.next_after_job_id is not None and (
+                    page.next_after_job_id <= (after_job_id or "")
+                    or page.items and
+                    page.next_after_job_id < page.items[-1].job_id)):
+            return None
+        return page
+
+    async def recover_committed_first_ingress_c02_unknown_cost_v1(
+        self, operation_id: str,
+    ) -> bool:
+        """Settle only a graph-proven committed C02 with the original intent."""
+        if (type(operation_id) is not str or not operation_id
+                or self._worker is None or self._v2_bootstrap is None
+                or not self._v2_namespace_provisioned
+                or self._v2_namespace is None):
+            return False
+        try:
+            await self._worker.call(
+                lambda graph: graph.recover_committed_first_ingress_c02_unknown_cost_v1(
+                    self._v2_bootstrap, self._v2_namespace, operation_id))
+        except Exception:
+            return False
+        return True
+
+    async def discover_committed_first_ingress_c02_cost_v1(
+        self, *, cursor: str | None = None, limit: int = 50,
+    ) -> FirstIngressRecoveryPageV1 | None:
+        """Read content-free V3 identities before any startup cost writes."""
+        if (type(limit) is not int or not 1 <= limit <= 50
+                or cursor is not None and (type(cursor) is not str or not cursor)
+                or self._worker is None or self._v2_bootstrap is None
+                or not self._v2_namespace_provisioned
+                or self._v2_namespace is None
+                or self._v2_installation_grant is None):
+            return None
+        try:
+            page = await self._worker.call(
+                lambda graph: graph.discover_first_ingress_recovery_v1(
+                    self._v2_bootstrap, self._v2_namespace,
+                    cursor=cursor, limit=limit))
+        except Exception:
+            return None
+        if (type(page) is not FirstIngressRecoveryPageV1
+                or page.namespace != self._v2_namespace
+                or page.installation_id
+                   != self._v2_installation_grant.installation_id
+                or len(page.items) > limit
+                or page.next_cursor == cursor):
             return None
         return page
 

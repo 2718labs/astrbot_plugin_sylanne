@@ -75,6 +75,7 @@ from ..model_broker.broker import ModelCallRequest
 from ..runtime_journal import RecoveryConstraintFootprint
 from ..runtime.activation import ActivationProof
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime.c02_cost_settlement import C02OriginalIntentLookupV1
 from ..runtime_contracts import (
     InstallationGrantV2, NamespaceBootstrapV2, NamespaceId, NamespaceRuntimeState,
     canonical_digest as runtime_canonical_digest,
@@ -694,6 +695,62 @@ class MtlsAuthorityTransport:
                     or receipt.host_incarnation != admission.host_incarnation)):
             raise RuntimeError("authority model terminal identity differs")
         return record, permit, admission, receipt
+
+    async def model_original_intent_lookup_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, lookup: C02OriginalIntentLookupV1,
+    ) -> ModelEgressIntentV1:
+        """Read only the original terminal intent from the designated observer."""
+        if (type(lookup) is not C02OriginalIntentLookupV1
+                or (lookup.authority_id, lookup.installation_id)
+                   != (grant.authority_id, grant.installation_id)):
+            raise RuntimeError("original model lookup installation differs")
+        response = await self._content_rpc(
+            request, handshake, "model_original_intent_lookup_v1", {
+                "namespace": lookup.authority_namespace,
+                "installation_id": lookup.installation_id,
+                "job_id": lookup.job_id,
+                "acquire_operation_id": lookup.acquire_operation_id,
+                "call_id": lookup.call_id,
+                "original_model_operation_id": lookup.acquire_operation_id,
+                "request_digest": lookup.model_request_digest,
+                "binding_digest": lookup.binding_digest,
+            }, protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"status", "record", "permit", "admission",
+                              "terminal", "channel_binding_sha256"}
+                or response["status"] != "terminal"
+                or response["terminal"] is None):
+            raise RuntimeError("original model terminal lookup unresolved")
+        try:
+            record = model_from_wire(response["record"], ModelEgressRecoveryV1)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("original model lookup record is invalid") from exc
+        intent = record.intent
+        self._model_response({key: response[key] for key in (
+            "record", "permit", "channel_binding_sha256")}, grant, intent,
+            "observed")
+        try:
+            admission = model_from_wire(response["admission"], ModelAdmissionV2)
+            terminal = model_from_wire(
+                response["terminal"], ModelTerminalReceiptV2)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("original model terminal lookup is invalid") from exc
+        self._model_admission_binding(
+            admission, grant, request, intent, admission.host_incarnation)
+        if ((intent.authority_id, intent.namespace, intent.job_id,
+             intent.operation_id, intent.acquire_operation_id, intent.call_id,
+             intent.binding_digest, intent.request_digest,
+             intent.budget_reservation_operation_id) !=
+            (lookup.authority_id, lookup.authority_namespace, lookup.job_id,
+             lookup.acquire_operation_id, lookup.acquire_operation_id,
+             lookup.call_id, lookup.binding_digest,
+             lookup.model_request_digest, lookup.original_operation_id)
+                or terminal.call_id != intent.call_id
+                or terminal.request_digest != intent.request_digest
+                or terminal.observation_digest != record.observation_digest
+                or terminal.installation_id != lookup.installation_id):
+            raise RuntimeError("original model terminal identity differs")
+        return intent
 
     async def model_result_read_v1(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

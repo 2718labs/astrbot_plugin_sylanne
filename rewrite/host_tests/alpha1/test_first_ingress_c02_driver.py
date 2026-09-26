@@ -1,5 +1,6 @@
 """Explicit C02 host composition uses one installed, paired model authority."""
 
+import asyncio
 import json
 from dataclasses import replace
 from types import MethodType, SimpleNamespace
@@ -8,7 +9,7 @@ import pytest
 
 from rewrite.host_tests.alpha1 import test_astrbot_model_call as model_fixture
 from rewrite.host_tests.alpha1.test_host_model_egress_executor import fixture_values
-from sylanne3.host.authority_client import AuthorityClient
+from sylanne3.host.authority_client import AuthorityClient, AuthoritySelection
 from sylanne3.host.authority_profile import (
     AdminD06FirstIngressC02Policy, AdminIngressClockPolicy,
 )
@@ -20,8 +21,10 @@ from sylanne3.host.first_ingress_c02_driver import (
 from sylanne3.host.d06_ingress import ingress_content_fingerprint
 from sylanne3.host.ingress import HostIngressEnvelope, IngressReceipt, SourceLineage
 from sylanne3.host.model_egress_executor import HostModelEgressExecutor
-from sylanne3.host.mtls_transport import AuthorityTlsProfile
+from sylanne3.host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
+from sylanne3.host.original_c02_cost_intent_port import InstalledOriginalC02CostIntentPort
 from sylanne3.host.v2_installation import V2InstallationAssembly
+from sylanne3.runtime.c02_cost_settlement import C02OriginalIntentLookupV1
 from sylanne3.runtime_context import RuntimeContext
 from sylanne3.runtime.first_ingress_unacquired import (
     FirstIngressUnacquiredItemV1, FirstIngressUnacquiredPageV1,
@@ -39,7 +42,8 @@ async def test_explicit_c02_driver_uses_paired_bundle_and_holds_without_it(
     await host.asyncSetUp()
     try:
         bundle, _, _ = host.v2_adapters()
-        _, _, _, _, grant, _ = fixture_values(host, model_fixture.call_request())
+        original_intent, _, _, _, grant, _ = fixture_values(
+            host, model_fixture.call_request())
         profile = AuthorityTlsProfile(
             "installed", "authority.example", 443, "authority.example",
             grant.authority_id, tmp_path / "ca.pem", tmp_path / "client.pem",
@@ -137,10 +141,49 @@ async def test_explicit_c02_driver_uses_paired_bundle_and_holds_without_it(
         runtime._v2_installation_grant = grant
         assert await runtime.discover_first_ingress_unacquired_v1() is None
         graph.discover_first_ingress_unacquired_v1 = (
-            lambda bootstrap, namespace, *, limit: page)
+            lambda bootstrap, namespace, *, after_job_id, limit: page)
         assert await runtime.discover_first_ingress_unacquired_v1() == page
         assert original_unacquired_handoff_v1(item, installation) == (
             model_fixture.UMO, envelope, IngressReceipt("accepted", original_op))
         assert calls == [(envelope, receipt)] and host.requests == []
+
+        authority = AuthorityClient(
+            AuthoritySelection(), package_root=tmp_path,
+            data_dir=tmp_path)
+        lookup = C02OriginalIntentLookupV1(
+            envelope.namespace, grant.authority_id,
+            bundle.installation_policy.authority_namespace,
+            grant.installation_id, original_intent.job_id,
+            original_intent.budget_reservation_operation_id,
+            original_intent.acquire_operation_id, original_intent.call_id,
+            original_intent.binding_digest, original_intent.request_digest,
+            "consumer-operation",
+        )
+        async def original_lookup(self, observed_bundle, observed_grant, *, lookup):
+            assert observed_bundle is bundle and observed_grant == grant
+            return original_intent
+
+        authority.model_original_intent_lookup_v1 = MethodType(
+            original_lookup, authority)
+        port = InstalledOriginalC02CostIntentPort(
+            client=authority, bundle=bundle, grant=grant,
+            owner_loop=asyncio.get_running_loop())
+        assert await asyncio.to_thread(port, lookup) == original_intent
+
+        transport = MtlsAuthorityTransport({profile.profile_id: profile})
+        observed_command = []
+
+        async def absent_original(*args, **kwargs):
+            observed_command.append(args[3])
+            return {"status": "absent", "channel_binding_sha256": "b" * 64}
+
+        monkeypatch.setattr(transport, "_content_rpc", absent_original)
+        with pytest.raises(RuntimeError, match="unresolved"):
+            await transport.model_original_intent_lookup_v1(
+                object(), object(), grant, lookup=lookup)
+        assert observed_command[0]["acquire_operation_id"] == (
+            original_intent.acquire_operation_id)
+        assert observed_command[0]["original_model_operation_id"] == (
+            original_intent.acquire_operation_id)
     finally:
         await host.asyncTearDown()

@@ -56,7 +56,7 @@ class FirstIngressUnacquiredPageV1:
     graph_revision: int
     graph_epoch: int
     items: tuple[FirstIngressUnacquiredItemV1, ...]
-    next_cursor: str | None
+    next_after_job_id: str | None
     schema: str = "sylanne3.runtime.first-ingress-unacquired-page.v1"
 
     def __post_init__(self) -> None:
@@ -70,8 +70,9 @@ class FirstIngressUnacquiredPageV1:
                        or item.namespace != self.namespace
                        or item.installation_id != self.installation_id
                        for item in self.items)
-                or self.next_cursor is not None and (
-                    type(self.next_cursor) is not str or not self.next_cursor)
+                or self.next_after_job_id is not None and (
+                    type(self.next_after_job_id) is not str
+                    or not self.next_after_job_id)
                 or self.schema != "sylanne3.runtime.first-ingress-unacquired-page.v1"):
             raise ValueError("unacquired ingress page identity is invalid")
 

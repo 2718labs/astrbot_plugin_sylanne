@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import tempfile
 from typing import Callable
 
 from astrbot.api import logger
@@ -109,6 +110,8 @@ class Sylanne3Plugin(Star):
         self._encoding_inflight: set[tuple[str, str, str, str]] = set()
         self._encoding_pending: asyncio.Queue = asyncio.Queue(maxsize=8)
         self._encoding_waiters: set[asyncio.Task] = set()
+        self._recovery_scan_task: asyncio.Task | None = None
+        self._cost_recovery_task: asyncio.Task | None = None
         self._encoding_stopping = False
         self._installed_namespace: NamespaceId | None = None
         self._scene_candidates = SceneCandidateCatalog()
@@ -308,7 +311,10 @@ class Sylanne3Plugin(Star):
                 logger.error("Sylanne D12 workbench pairing could not be attached")
         if health.status == "limited":
             self.runtime_health = health
-            await self._restore_unacquired_first_ingress_c02_v1()
+            self._recovery_scan_task = asyncio.create_task(
+                self._restore_unacquired_first_ingress_c02_v1())
+            self._cost_recovery_task = asyncio.create_task(
+                self._restore_committed_first_ingress_c02_cost_v1())
         else:
             self.runtime_health = RuntimeHealth(
                 "blocked", health.missing_capabilities or ("runtime_bootstrap",),
@@ -320,6 +326,14 @@ class Sylanne3Plugin(Star):
         self._workbench.close()
         self._scene_candidates.clear()
         self._installed_namespace = None
+        if self._recovery_scan_task is not None:
+            self._recovery_scan_task.cancel()
+            await asyncio.gather(self._recovery_scan_task, return_exceptions=True)
+            self._recovery_scan_task = None
+        if self._cost_recovery_task is not None:
+            self._cost_recovery_task.cancel()
+            await asyncio.gather(self._cost_recovery_task, return_exceptions=True)
+            self._cost_recovery_task = None
         for task in self._encoding_waiters:
             task.cancel()
         if self._encoding_waiters:
@@ -381,27 +395,98 @@ class Sylanne3Plugin(Star):
     async def _restore_unacquired_first_ingress_c02_v1(self) -> None:
         runtime = self._runtime
         installation = self._v2_installation
-        if (self._encoding_stopping or runtime is None or installation is None
-                or getattr(runtime, "v2_ingress_qualified", False) is not True
-                or not await runtime.first_ingress_c02_accounting_installed_v1()
-                or not await installed_first_ingress_c02_pairing_ready_v1(
-                    installation)):
-            return
-        page = await runtime.discover_first_ingress_unacquired_v1(limit=8)
-        if page is None:
-            logger.warning("Sylanne 3 unacquired first encoding discovery unavailable; HOLD")
-            return
-        for item in page.items:
-            handoff = original_unacquired_handoff_v1(item, installation)
-            if handoff is None:
-                logger.warning("Sylanne 3 unacquired first encoding identity invalid; HOLD")
-                continue
-            trusted_umo, envelope, receipt = handoff
-            await self._queue_first_ingress_c02(
-                runtime, installation, trusted_umo, envelope, receipt,
-                item.job_id)
-        if page.next_cursor is not None:
-            logger.warning("Sylanne 3 unacquired first encoding scan has further pages; HOLD")
+        try:
+            if (self._encoding_stopping or runtime is None or installation is None
+                    or getattr(runtime, "v2_ingress_qualified", False) is not True
+                    or not await runtime.first_ingress_c02_accounting_installed_v1()
+                    or not await installed_first_ingress_c02_pairing_ready_v1(
+                        installation)):
+                return
+            attempted: set[tuple[str, str]] = set()
+            # A second pass catches lower-key jobs committed during the scan.
+            # Each job is attempted at most once by this startup scan; a HOLD
+            # needs a later explicit wake or restart, never a hot retry loop.
+            for _ in range(2):
+                after_job_id = None
+                while not self._encoding_stopping:
+                    page = await runtime.discover_first_ingress_unacquired_v1(
+                        after_job_id=after_job_id, limit=8)
+                    if page is None:
+                        logger.warning(
+                            "Sylanne 3 unacquired first encoding discovery unavailable; HOLD")
+                        return
+                    for item in page.items:
+                        identity = (item.job_id, item.original_operation_id)
+                        if identity in attempted:
+                            continue
+                        attempted.add(identity)
+                        handoff = original_unacquired_handoff_v1(item, installation)
+                        if handoff is None:
+                            logger.warning(
+                                "Sylanne 3 unacquired first encoding identity invalid; HOLD")
+                            continue
+                        trusted_umo, envelope, receipt = handoff
+                        await self._queue_first_ingress_c02(
+                            runtime, installation, trusted_umo, envelope, receipt,
+                            item.job_id)
+                    after_job_id = page.next_after_job_id
+                    if after_job_id is None:
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Sylanne 3 unacquired first encoding scan failed; HOLD")
+
+    async def _restore_committed_first_ingress_c02_cost_v1(self) -> None:
+        runtime = self._runtime
+        installation = self._v2_installation
+        try:
+            if (self._encoding_stopping or runtime is None or installation is None
+                    or getattr(runtime, "v2_ingress_qualified", False) is not True
+                    or not await runtime.first_ingress_c02_accounting_installed_v1(
+                        require_worker_result=False)
+                    or not await installed_first_ingress_c02_pairing_ready_v1(
+                        installation)):
+                return
+            # Finish a content-free discovery snapshot before any cost write
+            # changes the graph stamp and invalidates its V1 cursor.
+            with tempfile.SpooledTemporaryFile(
+                    max_size=131_072, mode="w+t", encoding="ascii") as ids:
+                cursor = None
+                seen_cursors = set()
+                while not self._encoding_stopping:
+                    page = await runtime.discover_committed_first_ingress_c02_cost_v1(
+                        cursor=cursor, limit=50)
+                    if page is None:
+                        logger.warning("Sylanne 3 committed C02 cost discovery unavailable; HOLD")
+                        return
+                    for item in page.items:
+                        if item.recovery_state == "c02_committed":
+                            operation_id = item.consumer_operation_id
+                            if (type(operation_id) is not str or not operation_id
+                                    or len(operation_id) > 512
+                                    or "\n" in operation_id or "\r" in operation_id):
+                                logger.warning("Sylanne 3 C02 cost identity invalid; HOLD")
+                                return
+                            ids.write(operation_id + "\n")
+                    cursor = page.next_cursor
+                    if cursor is None:
+                        break
+                    if cursor in seen_cursors:
+                        logger.warning("Sylanne 3 C02 cost discovery cursor repeated; HOLD")
+                        return
+                    seen_cursors.add(cursor)
+                ids.seek(0)
+                for line in ids:
+                    if self._encoding_stopping:
+                        return
+                    if not await runtime.recover_committed_first_ingress_c02_unknown_cost_v1(
+                            line.rstrip("\n")):
+                        logger.warning("Sylanne 3 committed C02 cost remains HOLD")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Sylanne 3 committed C02 cost scan failed; HOLD")
 
     async def _schedule_first_ingress_c02(
         self, runtime: RuntimeContext, installation: V2InstallationAssembly,

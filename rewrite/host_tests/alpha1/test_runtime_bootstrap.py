@@ -1000,11 +1000,13 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin._encoding_inflight, set())
         self.assertEqual(event.sent, [])
 
-    async def test_startup_unacquired_scan_reuses_original_c02_queue_once(self) -> None:
+    async def test_startup_unacquired_scan_advances_past_hold_and_ninth_job(self) -> None:
         module = load_plugin_module()
-        started = asyncio.Event()
+        drained = asyncio.Event()
         calls = []
         event = Event()
+        jobs = tuple(f"original-job-{index:02}" for index in range(10))
+        scan_calls = []
 
         class ControlledRuntime:
             v2_ingress_qualified = True
@@ -1012,16 +1014,24 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             async def first_ingress_c02_accounting_installed_v1(self):
                 return True
 
-            async def discover_first_ingress_unacquired_v1(self, *, limit):
-                self_limit.append(limit)
+            async def discover_first_ingress_unacquired_v1(
+                self, *, after_job_id, limit,
+            ):
+                scan_calls.append((after_job_id, limit))
+                start = 0 if after_job_id is None else jobs.index(after_job_id) + 1
+                selected = jobs[start:start + limit]
+                next_after = selected[-1] if start + limit < len(jobs) else None
                 return types.SimpleNamespace(
-                    items=(types.SimpleNamespace(job_id="original-job"),),
-                    next_cursor=None,
+                    items=tuple(types.SimpleNamespace(
+                        job_id=job_id, original_operation_id=job_id)
+                        for job_id in selected),
+                    next_after_job_id=next_after,
                 )
 
         async def driver(*args, **kwargs):
             calls.append(kwargs["receipt"].operation_id)
-            started.set()
+            if len(calls) == 9:
+                drained.set()
             return None
 
         plugin = module.Sylanne3Plugin(
@@ -1034,20 +1044,73 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         plugin._v2_installation = object()
         plugin.runtime_health = RuntimeHealth("limited")
         envelope = await module.build_astrbot_ingress(event, plugin.context)
-        receipt = IngressReceipt("accepted", "original-operation")
-        self_limit = []
+        def handoff(item, installation):
+            if item.job_id == jobs[0]:
+                return None
+            return (event.unified_msg_origin, envelope,
+                    IngressReceipt("accepted", item.original_operation_id))
+
         with patch.object(module, "installed_first_ingress_c02_pairing_ready_v1",
                           new=AsyncMock(return_value=True)), \
                 patch.object(module, "original_unacquired_handoff_v1",
-                             return_value=(event.unified_msg_origin, envelope, receipt)), \
+                             side_effect=handoff), \
                 patch.object(module, "run_installed_first_ingress_c02_v1", new=driver):
             await plugin._restore_unacquired_first_ingress_c02_v1()
-            await asyncio.wait_for(started.wait(), 1)
+            await asyncio.wait_for(drained.wait(), 1)
             await asyncio.sleep(0)
-        self.assertEqual(self_limit, [8])
-        self.assertEqual(calls, ["original-operation"])
+        self.assertEqual(scan_calls, [
+            (None, 8), (jobs[7], 8), (None, 8), (jobs[7], 8)])
+        self.assertEqual(calls, list(jobs[1:]))
         self.assertEqual(plugin._encoding_tasks, set())
         self.assertEqual(event.sent, [])
+
+    async def test_startup_committed_c02_cost_scans_all_ids_before_settlement(self) -> None:
+        module = load_plugin_module()
+        operations = tuple(f"consumer-{index:02}" for index in range(51))
+        observed = []
+        calls = []
+
+        class ControlledRuntime:
+            v2_ingress_qualified = True
+
+            async def first_ingress_c02_accounting_installed_v1(
+                self, *, require_worker_result,
+            ):
+                assert require_worker_result is False
+                return True
+
+            async def discover_committed_first_ingress_c02_cost_v1(
+                self, *, cursor, limit,
+            ):
+                calls.append((cursor, limit, len(observed)))
+                start = 0 if cursor is None else 50
+                selected = operations[start:start + limit]
+                return types.SimpleNamespace(
+                    items=tuple(types.SimpleNamespace(
+                        recovery_state="c02_committed",
+                        consumer_operation_id=operation_id)
+                        for operation_id in selected),
+                    next_cursor="second-page" if start == 0 else None,
+                )
+
+            async def recover_committed_first_ingress_c02_unknown_cost_v1(
+                self, operation_id,
+            ):
+                observed.append(operation_id)
+                return True
+
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None,
+                    None, None, None, None, None),
+            {"enabled": True},
+        )
+        plugin._runtime = ControlledRuntime()
+        plugin._v2_installation = object()
+        with patch.object(module, "installed_first_ingress_c02_pairing_ready_v1",
+                          new=AsyncMock(return_value=True)):
+            await plugin._restore_committed_first_ingress_c02_cost_v1()
+        self.assertEqual(calls, [(None, 50, 0), ("second-page", 50, 0)])
+        self.assertEqual(observed, list(operations))
 
     async def test_limited_installed_v2_ingress_never_claims_receipt_as_reply(self) -> None:
         module = load_plugin_module()
