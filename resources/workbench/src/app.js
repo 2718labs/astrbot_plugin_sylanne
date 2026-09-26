@@ -15,6 +15,7 @@ const pages = [
   ["diagnostics", "实验与诊断", "隔离实验、真实费用与结构化诊断", "experiment"],
   ["lifecycle", "数据与生命周期", "导入、迁移、升级、停用与删除", "transfer"]
 ];
+const relationStatuses = new Set(["unknown", "available", "unavailable", "stale", "blocked_rebuild", "rebuilt", "sanitized", "reset"]);
 
 const state = initialState();
 const api = new WorkbenchApi({ baseUrl: globalThis.SYLANNE_WORKBENCH_API_BASE ?? DEFAULT_WORKBENCH_API_BASE });
@@ -33,6 +34,22 @@ let sceneCandidates = [];
 let sceneCandidatesProblem = null;
 let sceneCandidatesEpoch = 0;
 const ownerDraft = {};
+const setupReceipts = { roleInitialized: null, sceneBound: null };
+
+function clearSetupReceipts() {
+  setupReceipts.roleInitialized = null;
+  setupReceipts.sceneBound = null;
+}
+
+function rememberSetupReceipt(action, result) {
+  if (result.status !== "ready" || !result.receipt) return;
+  if (action === ACTIONS.createCharacter && result.receipt.phase === "role_initialized") {
+    setupReceipts.roleInitialized = result.receipt;
+  }
+  if (action === ACTIONS.bindScene && result.receipt.phase === "scene_bound") {
+    setupReceipts.sceneBound = result.receipt;
+  }
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]);
@@ -119,6 +136,28 @@ function memoryProjectionMarkup(projection) {
     : `<p class="creation-empty">当前授权范围内没有可显示的记忆来源。</p>`}<p class="creation-coverage" role="status">服务已确认完整覆盖，共 ${sources.length} 条来源。</p></section>`;
 }
 
+function validRelationsProjection(projection) {
+  const data = projection?.data;
+  return projection?.view_type === VIEW_TYPES.relations
+    && data?.coverage === "complete" && Array.isArray(data.relations)
+    && data.relations.every((relation) => relation && typeof relation.subject_entity_ref === "string"
+      && /^entity:[A-Za-z0-9_.:-]{1,96}$/.test(relation.subject_entity_ref)
+      && Array.isArray(relation.dimensions)
+      && relation.dimensions.every((item) => item && typeof item.dimension === "string"
+        && /^[A-Za-z0-9_.:-]{1,96}$/.test(item.dimension)
+        && relationStatuses.has(item.status)));
+}
+
+function relationsProjectionMarkup(projection) {
+  if (!validRelationsProjection(projection)) return `<section class="empty-state" role="alert"><h2>关系投影不可用</h2><p>服务未返回完整且可确认的 D05 关系摘要；请重新请求当前视图。</p></section>`;
+  const relations = projection.data.relations;
+  return `<section class="creation-view" aria-label="已授权关系与经历摘要"><h2>关系与经历</h2><p>以下是服务按当前权限返回的已提交主观关系投影，反映当前记录的理解，不证明对方行为。</p>${relations.length
+    ? `<ul class="creation-list">${relations.map((relation) => `<li><strong>${escapeHtml(relation.subject_entity_ref)}</strong><span>主观维度</span>${relation.dimensions.length
+      ? `<ul>${relation.dimensions.map((item) => `<li>${escapeHtml(item.dimension)}：${escapeHtml(item.status)}</li>`).join("")}</ul>`
+      : `<small>服务未返回主观维度。</small>`}</li>`).join("")}</ul>`
+    : `<p class="creation-empty">当前授权范围内没有已提交的关系记录。</p>`}<p class="creation-coverage" role="status">服务已确认完整覆盖，共 ${relations.length} 条关系。</p></section>`;
+}
+
 function overviewCatalogueMarkup(projection) {
   const views = projection?.views;
   const unavailable = projection?.unavailable_domains;
@@ -200,8 +239,8 @@ function setupMarkup() {
   const stage = installation ? stageNames[installation.stage] : "未取得";
   const reason = installation ? (reasonNames[installation.reason] ?? "运行能力尚未齐备")
     : (installationProblem?.message ?? "正在读取宿主安装状态");
-  const creationReceipt = state.receipt?.phase === "role_initialized" ? state.receipt : null;
-  const sceneReceipt = state.receipt?.phase === "scene_bound" ? state.receipt : null;
+  const creationReceipt = state.sessionReady ? setupReceipts.roleInitialized : null;
+  const sceneReceipt = state.sessionReady ? setupReceipts.sceneBound : null;
   const creationHold = ["role_initialization_unavailable", "role_initialization_policy_unavailable", "role_initialization_receipt_invalid", "authority_unavailable", "invalid_provider_response"].includes(state.problem?.code);
   const steps = [
     ["插件安装与运行", stage, reason],
@@ -225,6 +264,7 @@ function render() {
     ? state.view === "overview" ? overviewCatalogueMarkup(state.projection)
       : state.view === "creation" ? creationProjectionMarkup(state.projection)
       : state.view === "memory" ? memoryProjectionMarkup(state.projection)
+      : state.view === "relations" ? relationsProjectionMarkup(state.projection)
       : `<pre class="projection" aria-label="服务返回的权限过滤投影">${escapeHtml(JSON.stringify(state.projection, null, 2))}</pre>`
     : `<section class="empty-state" aria-live="polite"><div class="empty-mark" aria-hidden="true">◇</div><h2>${sessionVerified ? statusTitle : "Owner 尚未解锁"}</h2><p>${sessionVerified ? statusDetail : "Sylanne Owner 会话尚未核验。请先完成服务端登录，再刷新解锁状态。"}</p><button class="primary" data-command="refresh" ${state.role && sessionVerified ? "" : "disabled"}>重新请求投影</button></section>`;
   app.innerHTML = `
@@ -263,12 +303,14 @@ async function loadView() {
       : await api.readView({ scope: state.role, viewType: VIEW_TYPES[state.view] });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (result.status === "unauthorized") clearSetupReceipts();
     Object.assign(state, state.view === "memory" && result.status === "ready" && !validMemoryProjection(result.projection)
       ? applyProblem(state, { code: "invalid_memory_projection", message: "D06 未返回完整且可确认的来源摘要；请重新请求记忆视图。" })
       : applyResponse(state, result));
   } catch (error) {
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (!state.sessionReady) clearSetupReceipts();
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
@@ -354,6 +396,7 @@ async function ownerAction(action) {
     ownerProblem = null;
     api.clearSession();
     state.sessionReady = false;
+    clearSetupReceipts();
     Object.assign(state, applyProblem(state, { code: "owner_session_locked", message: "页面已锁定，正在等待服务端确认 Owner 退出。" }));
     render();
     try {
@@ -436,6 +479,7 @@ async function command(action) {
     ++sceneCandidatesEpoch;
     sceneCandidates = [];
     sceneCandidatesProblem = null;
+    clearSetupReceipts();
     Object.assign(state, switchRole(state, value)); render(); await loadView(); return;
   }
   if (action === "retry-session") return verifySession(true);
@@ -493,7 +537,7 @@ async function loadSceneCandidates() {
   } catch (error) {
     if (epoch !== sceneCandidatesEpoch) return;
     sceneCandidatesProblem = normalizeError(error).message;
-    if (!api.hasSession) state.sessionReady = false;
+    if (!api.hasSession) { state.sessionReady = false; clearSetupReceipts(); }
   }
   render();
 }
@@ -506,11 +550,14 @@ async function commandAction(action, input, purpose = "workbench_user_action") {
     const result = await api.command(action, { scope: state.role, purpose, input });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (result.status === "unauthorized") clearSetupReceipts();
     Object.assign(state, applyResponse(state, result));
+    rememberSetupReceipt(action, result);
     if (result.status === "ready" && needsFreshProjection(action)) return loadView();
   } catch (error) {
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
+    if (!state.sessionReady) clearSetupReceipts();
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
@@ -526,6 +573,7 @@ async function verifySession(refreshRole = false) {
     ++requestEpoch;
     api.clearSession();
     state.sessionReady = false;
+    clearSetupReceipts();
     state.projection = null;
     state.receipt = null;
     state.status = "loading";
@@ -545,6 +593,7 @@ async function verifySession(refreshRole = false) {
   } catch (error) {
     if (checkEpoch !== sessionCheckEpoch) return;
     state.sessionReady = false;
+    clearSetupReceipts();
     if (error?.code === "host_session_missing") state.dashboardAuthenticated = false;
     Object.assign(state, applyProblem(state, normalizeError(error)));
   }
