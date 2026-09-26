@@ -777,9 +777,12 @@ class D06DomainProvider:
             if len(projections) != 1 or len(recollections) != 1:
                 raise ValueError("C04 projection must accompany exactly one recollection")
             projection, recollection = projections[0], recollections[0]
+            projection_source = AtomKey.from_token(projection.value["source_ref"])
             if (projection.value["recollection_ref"] != recollection.key.token
                     or projection.value["activity_id"] != recollection.value["activity_id"]
-                    or projection.value["source_ref"] not in recollection.value["content_refs"]
+                    or projection_source.owner.subject not in recollection.value["content_refs"]
+                    or projection_source.type_name != "memory.source"
+                    or NamespaceId.from_key(projection_source) != self.namespace
                     or projection.key.owner != recollection.key.owner):
                 raise ValueError("C04 projection differs from its persisted recollection")
         trace_types = {"memory.subjective_trace.v1", "memory.subjective_trace.v2"}

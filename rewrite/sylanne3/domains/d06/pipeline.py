@@ -632,46 +632,26 @@ class D06MemoryPipeline:
         )
 
     def read_recollection_projection(
-        self, projection_ref: str, *, audience: str, purpose: str,
+        self, snapshot: GraphSnapshot, projection_ref: str,
     ) -> dict:
-        """Read a persisted subjective projection and derive literals under current access."""
+        """Expose metadata from a supplied snapshot as HOLD; no authority or literal read is implied."""
         from . import _RECOLLECTION_PROJECTION_TYPE, _validate_recollection_projection
 
+        if not isinstance(snapshot, GraphSnapshot):
+            raise TypeError("a coordinator-supplied GraphSnapshot is required")
         key = AtomKey.from_token(projection_ref)
-        if key.type_name != _RECOLLECTION_PROJECTION_TYPE:
+        if (key.type_name != _RECOLLECTION_PROJECTION_TYPE
+                or (key.owner.bot, key.owner.persona) != self.adapter.namespace.as_tuple):
             raise ValueError("projection_ref must reference a D06 recollection projection")
-        atom = self.repository.store.graph_snapshot((key,)).get(key)
+        atom = snapshot.get(key)
         if atom is None or not atom.valid:
             raise ValueError("recollection projection is unavailable")
         _validate_recollection_projection(atom.value)
         value = dict(atom.value)
-        source_key_value = AtomKey.from_token(value["source_ref"])
-        source_id = source_key_value.owner.subject
-        source, proof = self.repository.read_source_evidence(
-            source_id, audience=audience, purpose=purpose,
-        )
-        details = []
-        for detail in value["details"]:
-            item = dict(detail)
-            span = detail["source_span"]
-            if (source is not None and source_key_value in (v.key for v in proof.versions)
-                    and any(v.key == source_key_value and v.revision == value["source_revision"]
-                            for v in proof.versions)
-                    and detail["source_ref"] == value["source_ref"] and span is not None
-                    and span[1] <= len(source.text)):
-                item["literal_text"] = source.text[span[0]:span[1]]
-            else:
-                item["literal_text"] = None
-            details.append(item)
-        value["details"] = details
+        value["details"] = [dict(detail) for detail in value["details"]]
         value["projection_ref"] = key.token
-        value["source_access_status"] = "authorized" if source is not None else "unavailable"
         value["projection_revision"] = atom.revision
-        value["source_literal_status"] = (
-            "derived_from_current_authorized_source" if source is not None
-            and any(v.key == source_key_value and v.revision == value["source_revision"]
-                    for v in proof.versions) else "unavailable_or_changed"
-        )
+        value["read_status"] = "hold_unverified_access_and_d04_experience"
         return value
 
     def prepare_association(

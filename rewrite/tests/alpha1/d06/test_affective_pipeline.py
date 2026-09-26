@@ -121,27 +121,18 @@ class AffectivePipelineTests(unittest.TestCase):
                 snapshot.versions, (projection_write,), snapshot.epochs,
             ))
             reread = self.pipeline.read_recollection_projection(
-                projection_write.key.token, audience="owner", purpose="context",
+                self.store.graph_snapshot((projection_write.key,)), projection_write.key.token,
             )
             self.assertEqual(reread["state"], "committed_subjective_projection")
             self.assertEqual(reread["evidence_eligibility"], "subjective_only")
-            self.assertEqual(reread["details"][0]["literal_text"], "I waited")
+            self.assertNotIn("literal_text", reread["details"][0])
+            self.assertEqual(reread["read_status"], "hold_unverified_access_and_d04_experience")
             self.assertEqual(reread["subjective_weight"], list(reconstruction.subjective_weight))
             self.assertEqual(reread["subjective_tone"], list(reconstruction.subjective_tone))
             projections.append(reread)
         self.assertNotEqual(projections[0]["subjective_tone"], projections[1]["subjective_tone"])
         self.assertEqual(projections[0]["source_ref"], projections[1]["source_ref"])
         self.assertEqual(projections[0]["evidence_eligibility"], projections[1]["evidence_eligibility"])
-        self.repository.set_access(
-            Event(self.scope, "withdraw-projection", 21, "withdraw", {}), "message-1",
-            audiences=("owner",), purposes=("context",), status="withdrawn", recorded_at=21,
-        )
-        revoked = self.pipeline.read_recollection_projection(
-            projections[0]["projection_ref"],
-            audience="owner", purpose="context",
-        )
-        self.assertEqual(revoked["source_access_status"], "unavailable")
-        self.assertIsNone(revoked["details"][0]["literal_text"])
 
     def test_committed_then_feeling_stays_separate_from_current_mood_and_source(self):
         source_ref = source_key("bot", "persona", "message-1").token
