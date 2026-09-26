@@ -22,14 +22,17 @@ from ..domains.d09 import D09ExpressionProvider
 from ..graph_types import AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch
 from ..runtime.dispatch_candidate import DispatchCandidateEvidenceV1
 from ..runtime_contracts import CheckReceipt, NamespaceId, QueryEpoch, canonical_digest
+from .budget import BudgetError, get_budget_lease, require_budget_family_admissible
+from .dispatch_budget_check import provide_dispatch_budget_check
 from .dispatch_current_projection import (
     derive_current_domain_reads, read_current_dispatch_projection,
 )
+from .issuers import D02ResourceIssuer, D11BudgetGrantIssuer, IssuerAuthorityDenied
 
 
 _MISSING_PROVIDER_PORTS = (
     "d08.commitment_conflict.current_provider",
-    "d11.dispatch_budget.current_grant_and_journal",
+    "d11.execution_journal_current_constraints",
     "d11.command_provenance.current_provider",
     "d11.domain_context.current_provider",
     "d06.independent_deletion_authority_barrier",
@@ -51,6 +54,15 @@ class DispatchSocialInspectionV1:
     role_receipt: CheckReceipt | None
     boundary_receipt: CheckReceipt | None
     graph_epoch: int | None
+
+
+@dataclass(frozen=True)
+class DispatchBudgetInspectionV1:
+    status: str
+    missing: tuple[str, ...]
+    receipt: CheckReceipt | None
+    lease_id: str | None
+    quote_id: str | None
 
 
 class DispatchAdmissionHold(RuntimeError):
@@ -305,11 +317,127 @@ def inspect_current_d03_d05(
     )
 
 
+def inspect_current_d11_dispatch_budget(
+    db, intent: ActionIntent, *, d11_issuer: D11BudgetGrantIssuer | None,
+    d02_issuer: D02ResourceIssuer | None, now_utc: float,
+) -> DispatchBudgetInspectionV1:
+    """Recompute one scoped D11 budget check from signed and durable state.
+
+    The frozen RequiredCheckSpec uses the signed D02 quote VersionedRef as its
+    criteria_version. The existing D11 provider excludes only that criteria
+    ref while recomputing the exact lease/grant/reservation read set. This
+    seam verifies that the excluded ref really names the active signed quote
+    bound to the action and held reservation.
+    The independent execution journal is a separate, still required gate.
+    """
+    def hold(*missing: str, lease_id=None, quote_id=None):
+        return DispatchBudgetInspectionV1(
+            "hold", tuple(dict.fromkeys(missing)), None, lease_id, quote_id,
+        )
+
+    if not getattr(db, "in_transaction", False):
+        return hold("graph.current_write_transaction")
+    if type(intent) is not ActionIntent or type(now_utc) not in (int, float) or not math.isfinite(now_utc):
+        return hold("d11.typed_current_action_and_time")
+    if not isinstance(d11_issuer, D11BudgetGrantIssuer):
+        return hold("d11.installed_signed_budget_grant_issuer")
+    if not isinstance(d02_issuer, D02ResourceIssuer):
+        return hold("d11.installed_signed_d02_quote_issuer")
+    specs = tuple(spec for spec in intent.required_checks
+                  if spec.check_kind == "dispatch_budget")
+    if len(specs) != 1 or specs[0].provider_id != "d11.dispatch_budget":
+        return hold("d11.unique_frozen_dispatch_budget_spec")
+    spec = specs[0]
+    if (spec.subject_ref != "persona:" + spec.subject_ref.removeprefix("persona:")
+            or spec.action_ref != intent.action_id or spec.purpose != intent.purpose):
+        return hold("d11.frozen_budget_scope")
+    versions = spec.required_input_versions
+    by_ref = {item.ref: item.version for item in versions}
+    if len(by_ref) != len(versions):
+        return hold("d11.duplicate_frozen_budget_refs")
+    lease_refs = tuple(ref for ref in by_ref if ref.startswith("d11.budget.grant:"))
+    if len(lease_refs) != 1:
+        return hold("d11.frozen_spec_missing_signed_grant_version")
+    lease_id = lease_refs[0].removeprefix("d11.budget.grant:")
+    quote_refs = tuple(ref for ref in by_ref if ref.startswith("d02.resource_quote:"))
+    if len(quote_refs) != 1:
+        return hold("d11.frozen_spec_missing_signed_d02_quote_version", lease_id=lease_id)
+    quote_id = quote_refs[0].removeprefix("d02.resource_quote:")
+    if spec.criteria_version != quote_refs[0]:
+        return hold("d11.criteria_not_signed_d02_quote_ref", lease_id=lease_id,
+                    quote_id=quote_id)
+    try:
+        quote = d02_issuer._load_quote(db, quote_id, by_ref[quote_refs[0]])
+        grant = d11_issuer.current_budget_grant(db, lease_id)
+        lease = get_budget_lease(db, lease_id)
+        require_budget_family_admissible(db, lease_id)
+        reservation = db.execute(
+            "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
+            "WHERE lease_id=? AND operation_id=?",
+            (lease_id, intent.identity.operation_id),
+        ).fetchone()
+    except (IssuerAuthorityDenied, BudgetError, ValueError, TypeError):
+        return hold("d11.current_signed_quote_grant_or_lease_unavailable",
+                    lease_id=lease_id, quote_id=quote_id)
+    if (reservation is None or reservation[2] != "reserved"):
+        return hold("d11.current_operation_reservation_unavailable",
+                    lease_id=lease_id, quote_id=quote_id)
+    try:
+        ceiling = json.loads(reservation[1])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return hold("d11.current_reservation_ceiling_invalid",
+                    lease_id=lease_id, quote_id=quote_id)
+    if (quote.quote_id != quote_id or quote.version != by_ref[quote_refs[0]]
+            or quote.persona_id != spec.subject_ref.removeprefix("persona:")
+            or (quote.activity_id, quote.effect_id, quote.operation_id) != (
+                intent.identity.activity_id, intent.identity.effect_id,
+                intent.identity.operation_id)
+            or quote.work_kind != intent.action_kind
+            or quote.parent_budget_lease_ref != lease_id
+            or quote.valid_until_utc <= now_utc
+            or quote.deadline_utc <= now_utc
+            or dict(quote.ceiling) != ceiling
+            or (lease.bot_id, lease.persona_id, lease.currency) != (
+                quote.bot_id, quote.persona_id, grant.currency)
+            or grant.valid_until_utc <= now_utc):
+        return hold("d11.signed_quote_reservation_scope_or_ceiling_differs",
+                    lease_id=lease_id, quote_id=quote_id)
+    reservation_ref = (
+        f"d11.budget.reservation:{lease_id}:{intent.identity.operation_id}:"
+        f"{reservation[0]}"
+    )
+    if by_ref.get(reservation_ref) != 1:
+        return hold("d11.frozen_spec_reservation_digest_differs",
+                    lease_id=lease_id, quote_id=quote_id)
+    try:
+        ledger = provide_dispatch_budget_check(
+            intent, db, d11_issuer,
+            namespace=NamespaceId(quote.bot_id, quote.persona_id),
+            lease_id=lease_id,
+            reservation_operation_id=intent.identity.operation_id,
+            reservation_digest=reservation[0], required_ceiling=quote.ceiling,
+            work_kind=quote.work_kind, policy_ref=grant.policy_ref,
+            now_utc=now_utc,
+            valid_until=min(quote.valid_until_utc, grant.valid_until_utc),
+        )
+    except (TypeError, ValueError, BudgetError, IssuerAuthorityDenied):
+        return hold("d11.current_budget_provider_unavailable",
+                    lease_id=lease_id, quote_id=quote_id)
+    if ledger.result != "pass" or ledger.coverage != "full":
+        return hold("d11.current_budget_provider_not_pass",
+                    lease_id=lease_id, quote_id=quote_id)
+    return DispatchBudgetInspectionV1("check_pass", (), ledger, lease_id, quote_id)
+
+
 class InstalledDispatchAdmissionIssuer:
     """The only production integration shape; all incomplete paths HOLD."""
 
-    def __init__(self, *, context: ContextProvider | None = None):
+    def __init__(self, *, context: ContextProvider | None = None,
+                 d11_issuer: D11BudgetGrantIssuer | None = None,
+                 d02_issuer: D02ResourceIssuer | None = None):
         self._context = context
+        self._d11 = d11_issuer
+        self._d02 = d02_issuer
 
     def issue_dispatch_admission(self, bundle, snapshot, candidate, db, *,
                                  graph_incarnation: str, now_utc: float):
@@ -352,8 +480,12 @@ class InstalledDispatchAdmissionIssuer:
                 db, candidate, context=self._context, now_utc=now_utc,
             )
             social_missing = social.missing
+        budget = inspect_current_d11_dispatch_budget(
+            db, action, d11_issuer=self._d11, d02_issuer=self._d02,
+            now_utc=now_utc,
+        )
         raise DispatchAdmissionHold((
-            *inspection.missing, *social_missing,
+            *inspection.missing, *social_missing, *budget.missing,
             *_MISSING_PROVIDER_PORTS,
         ))
 
@@ -374,4 +506,6 @@ __all__ = [
     "DispatchAdmissionHold", "DispatchSourceInspectionV1",
     "InstalledDispatchAdmissionIssuer", "inspect_current_d06_source_grant",
     "DispatchSocialInspectionV1", "inspect_current_d03_d05",
+    "DispatchBudgetInspectionV1",
+    "inspect_current_d11_dispatch_budget",
 ]

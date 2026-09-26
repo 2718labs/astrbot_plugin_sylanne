@@ -16,10 +16,17 @@ from sylanne3.runtime.installed_dispatch_admission_issuer import (
     DispatchAdmissionHold, InstalledDispatchAdmissionIssuer,
     inspect_current_d06_source_grant,
     inspect_current_d03_d05,
+    inspect_current_d11_dispatch_budget,
 )
 from sylanne3.runtime_contracts import VersionedRef, canonical_digest
+from sylanne3.runtime.issuers import D02ResourceIssuer, ResourceQuote
+from sylanne3.runtime.budget import reserve_budget
 
 from test_dispatch_admission_preflight import _candidates
+from test_dispatch_budget_check import (
+    _db as _budget_db, _intent as _budget_intent,
+    CEILING, DIGEST, OPERATION,
+)
 
 
 def _social_case(*, effect="allow", rule_audience="entity:user"):
@@ -154,7 +161,7 @@ def test_d06_reads_current_rows_but_holds_without_independent_barrier():
                                             graph_incarnation="incarnation:one",
                                             now_utc=1.0)
         assert "d03.d05.installed_context_provider" in error.value.missing
-        assert "d11.dispatch_budget.current_grant_and_journal" in error.value.missing
+        assert "d11.installed_signed_budget_grant_issuer" in error.value.missing
         assert issuer.verify_required_check(spec, None, None, db) is False
     finally:
         db.close()
@@ -258,5 +265,100 @@ def test_new_boundary_rule_cannot_be_omitted_from_complete_read():
         )
         assert result.status == "hold"
         assert "d05.current_boundary_not_pass" in result.missing
+    finally:
+        db.close()
+
+
+def _signed_budget_case():
+    db, d11 = _budget_db()
+    d02 = D02ResourceIssuer(b"q" * 32)
+    original = _budget_intent()
+    quote = ResourceQuote(
+        "quote:dispatch-one", 1, "bot", "persona",
+        original.identity.activity_id, original.identity.operation_id,
+        original.identity.effect_id, "parent", "message",
+        "snapshot:dispatch-one", 20.0, "resource:dispatch-one",
+        None, (), (), CEILING, None, 100.0,
+    )
+    d02.issue_quote(db, quote)
+    reserve_budget(db, "parent", OPERATION, DIGEST, CEILING)
+    spec = original.required_checks[0]
+    quote_ref = "d02.resource_quote:" + quote.quote_id
+    versions = (VersionedRef(quote_ref, quote.version),)
+    versions += tuple(item for item in spec.required_input_versions
+                      if item.ref != spec.criteria_version)
+    intent = replace(original, required_checks=(replace(
+        spec, criteria_version=quote_ref, required_input_versions=versions,
+    ),))
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    return db, d11, d02, intent
+
+
+def test_signed_quote_is_the_budget_criteria_and_provider_passes_current_ledger():
+    db, d11, d02, intent = _signed_budget_case()
+    try:
+        result = inspect_current_d11_dispatch_budget(
+            db, intent, d11_issuer=d11, d02_issuer=d02, now_utc=10.0,
+        )
+        assert result.status == "check_pass"
+        assert result.missing == ()
+        assert (result.receipt.result, result.receipt.coverage) == ("pass", "full")
+        assert result.receipt.input_versions == intent.required_checks[0].required_input_versions
+    finally:
+        db.close()
+
+
+def test_unsigned_criteria_or_changed_signature_cannot_pass_budget():
+    db, d11, d02, intent = _signed_budget_case()
+    try:
+        spec = intent.required_checks[0]
+        changed = replace(intent, required_checks=(replace(
+            spec, criteria_version="criteria:budget-1",
+            required_input_versions=spec.required_input_versions +
+            (VersionedRef("criteria:budget-1", 1),),
+        ),))
+        assert inspect_current_d11_dispatch_budget(
+            db, changed, d11_issuer=d11, d02_issuer=d02,
+            now_utc=10.0,
+        ).missing == ("d11.criteria_not_signed_d02_quote_ref",)
+        db.execute("UPDATE runtime_resource_quotes SET signature='tampered'")
+        assert inspect_current_d11_dispatch_budget(
+            db, intent, d11_issuer=d11, d02_issuer=d02,
+            now_utc=10.0,
+        ).missing == ("d11.current_signed_quote_grant_or_lease_unavailable",)
+    finally:
+        db.close()
+
+
+def test_legacy_budget_spec_names_the_precise_missing_quote_version():
+    db, d11, d02, _ = _signed_budget_case()
+    try:
+        result = inspect_current_d11_dispatch_budget(
+            db, _budget_intent(), d11_issuer=d11, d02_issuer=d02,
+            now_utc=10.0,
+        )
+        assert result.missing == (
+            "d11.frozen_spec_missing_signed_d02_quote_version",
+        )
+        assert result.receipt is None
+    finally:
+        db.close()
+
+
+def test_budget_quote_ceiling_and_reservation_state_are_current():
+    db, d11, d02, intent = _signed_budget_case()
+    try:
+        db.execute("UPDATE runtime_budget_reservations SET ceiling_json=?",
+                   (json.dumps({"model_microusd": 1}),))
+        assert inspect_current_d11_dispatch_budget(
+            db, intent, d11_issuer=d11, d02_issuer=d02,
+            now_utc=10.0,
+        ).missing == ("d11.signed_quote_reservation_scope_or_ceiling_differs",)
+        db.execute("UPDATE runtime_budget_reservations SET state='settled'")
+        assert inspect_current_d11_dispatch_budget(
+            db, intent, d11_issuer=d11, d02_issuer=d02,
+            now_utc=10.0,
+        ).missing == ("d11.current_operation_reservation_unavailable",)
     finally:
         db.close()
