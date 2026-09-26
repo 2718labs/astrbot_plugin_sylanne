@@ -56,6 +56,7 @@ class DeletionReadCandidate:
     delete_epoch: int | None = None
     current_dependency_refs: tuple[str, ...] = ()
     storage_path_status: str = "unverified"
+    pending_c02_sources: tuple[tuple[str, str], ...] = ()
 
 
 def read_deletion_closure_candidate(
@@ -286,7 +287,9 @@ def read_deletion_closure_candidate_from_coordinator(
             missing.append("current_snapshot_drift")
             break
         snapshots.append(snapshot)
-        if snapshot.epoch != epoch or (snapshot.access_epoch, snapshot.delete_epoch) != access_delete_epochs:
+        if (snapshot.epoch != epoch
+                or (snapshot.access_epoch, snapshot.delete_epoch) != access_delete_epochs
+                or snapshot.pending_c02_sources != first.pending_c02_sources):
             missing.append("current_snapshot_drift")
             break
         for version in snapshot.read_set:
@@ -355,6 +358,7 @@ def read_deletion_closure_candidate_from_coordinator(
             )
             if (final.epoch != epoch
                     or (final.access_epoch, final.delete_epoch) != access_delete_epochs
+                    or final.pending_c02_sources != first.pending_c02_sources
                     or not final.complete):
                 missing.append("current_snapshot_drift")
         except (StaleRead, UnavailableGuard):
@@ -527,6 +531,12 @@ def read_deletion_closure_candidate_from_coordinator(
     source_descendants = {
         key for key in affected if key.type_name == "memory.source" and key not in roots
     }
+    affected_source_refs = {key.token for key in (*roots, *source_descendants)}
+    pending_c02_sources = tuple(
+        (operation_id, source_ref)
+        for operation_id, source_ref in first.pending_c02_sources
+        if source_ref in affected_source_refs
+    )
     return DeletionReadCandidate(
         request.request_id, tuple(key.token for key in roots),
         tuple(sorted(key.token for key in source_descendants)),
@@ -539,9 +549,11 @@ def read_deletion_closure_candidate_from_coordinator(
         epoch, complete, None,
         ("current_d06_values", "current_reverse_dependency_edges",
          "historical_graph_values", "historical_dependency_edges",
-         "memory_retriever_direct_graph_atom_path"),
+         "memory_retriever_direct_graph_atom_path",
+         "pending_first_ingress_c02_inventory"),
         unique_missing, "hold" if complete else "partial_hold",
         historical_versions, *access_delete_epochs,
         tuple(sorted(key.token for key in current_dependency_keys)),
-        "graph_atoms_only",
+        "graph_atoms_and_pending_c02_candidates",
+        pending_c02_sources,
     )

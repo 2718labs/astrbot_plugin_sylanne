@@ -106,6 +106,7 @@ class DeletionSnapshotCandidate:
     delete_epoch: int
     complete: bool
     pages_scanned: int
+    pending_c02_sources: tuple[tuple[str, str], ...] = ()
 
     @property
     def epoch(self) -> NamespaceEpoch:
@@ -9067,10 +9068,71 @@ class GraphCoordinator:
 
         store = self.__store
         namespace = authority.namespace
+        candidate_sql = (
+            "SELECT c.operation_id,c.schema,c.bundle_digest,c.fence_attempt_id,"
+            "c.bundle_json,c.evidence_json,i.digest,i.fence_attempt_id,"
+            "o.operation_id,r.operation_id "
+            "FROM graph_first_ingress_c02_candidates_v1 c "
+            "LEFT JOIN graph_bundle_intents_v2 i ON i.bot=c.bot "
+            "AND i.persona=c.persona AND i.operation_id=c.operation_id "
+            "LEFT JOIN graph_bundle_operations o ON o.bot=c.bot "
+            "AND o.persona=c.persona AND o.operation_id=c.operation_id "
+            "LEFT JOIN graph_bundle_rejections_v2 r ON r.bot=c.bot "
+            "AND r.persona=c.persona AND r.operation_id=c.operation_id "
+            "WHERE c.bot=? AND c.persona=? ORDER BY c.operation_id LIMIT ?"
+        )
+        candidate_args = namespace.as_tuple + (page_limit * max_pages + 1,)
+        candidate_rows_at_read = None
 
         def reader():
+            nonlocal candidate_rows_at_read
+            from .runtime.c02_bundle_codec import c02_bundle_from_wire
+
             access_epoch, delete_epoch = self._deletion_epochs_locked(
                 store._db, namespace)
+            candidate_rows = store._db.execute(
+                candidate_sql, candidate_args).fetchall()
+            candidate_rows_at_read = candidate_rows
+            if len(candidate_rows) > page_limit * max_pages:
+                raise UnavailableGuard("pending C02 inventory exceeds read bounds; HOLD")
+            pending_c02_sources = []
+            for (operation_id, schema, digest, attempt_id, bundle_json,
+                 evidence_json, intent_digest, intent_attempt, committed,
+                 rejected) in candidate_rows:
+                try:
+                    bundle = c02_bundle_from_wire(bundle_json)
+                    evidence = json.loads(evidence_json)
+                    source = AtomKey.from_token(bundle.envelope.input_refs[0])
+                    d06_writes = bundle.proposals[0].typed_writes
+                    if (type(operation_id) is not str or not operation_id
+                            or schema != "sylanne.first-ingress-c02-candidate.v1"
+                            or digest != intent_digest or digest != bundle.digest
+                            or attempt_id != intent_attempt
+                            or committed is not None or rejected is not None
+                            or bundle.envelope.identity.operation_id != operation_id
+                            or bundle.envelope.authority.namespace != namespace
+                            or len(bundle.envelope.input_refs) != 3
+                            or bundle.envelope.source_qualification.source_refs
+                            != (source.token,)
+                            or len(d06_writes) != 2
+                            or d06_writes[0].key.type_name != "memory.episode.v1"
+                            or d06_writes[1].key.type_name != "memory.subjective_trace.v2"
+                            or NamespaceId.from_key(d06_writes[0].key) != namespace
+                            or NamespaceId.from_key(d06_writes[1].key) != namespace
+                            or d06_writes[0].value.get("source_refs") != [source.token]
+                            or d06_writes[1].value.get("episode_ref")
+                            != d06_writes[0].key.token
+                            or source.type_name != "memory.source"
+                            or source.owner.kind != "event" or source.name != "record"
+                            or NamespaceId.from_key(source) != namespace
+                            or type(evidence) is not dict
+                            or type(evidence.get("source_ref")) is not str
+                            or evidence["source_ref"] != source.owner.subject
+                            or canonical_json(evidence) != evidence_json):
+                        raise ValueError("pending C02 source identity differs")
+                except (ValueError, TypeError, KeyError, IndexError) as exc:
+                    raise UnavailableGuard("pending C02 source is unreadable; HOLD") from exc
+                pending_c02_sources.append((operation_id, source.token))
             cursor = None
             epoch = None
             first = None
@@ -9099,12 +9161,14 @@ class GraphCoordinator:
             return DeletionSnapshotCandidate(
                 first.snapshot, first.read_set, first.current_reverse_edges,
                 tuple(rows.values()), tuple(edges), access_epoch, delete_epoch,
-                complete, pages_scanned)
+                complete, pages_scanned, tuple(pending_c02_sources))
 
         def final_check(candidate):
             if (candidate.access_epoch, candidate.delete_epoch) != (
                     self._deletion_epochs_locked(store._db, namespace)):
                 raise UnavailableGuard("deletion access/delete epochs changed during read")
+            if store._db.execute(candidate_sql, candidate_args).fetchall() != candidate_rows_at_read:
+                raise UnavailableGuard("pending C02 inventory changed during read; HOLD")
 
         return self._read_v2(authority, reader, final_check=final_check)
 
