@@ -39,7 +39,7 @@ from ..authority_service.v2_owner_session import (
     OwnerSessionLoginChallengeV1, OwnerSessionLoginRequestV1,
     from_wire as session_from_wire, to_wire as session_to_wire,
 )
-from ..authority_service.v2_execution_bridge import HandoffStartV2
+from ..authority_service.v2_execution_bridge import CurrentEffectReadV2, HandoffStartV2
 from ..authority_service.v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
     ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
@@ -1386,6 +1386,57 @@ class MtlsAuthorityTransport:
                 or permit.subject != handshake.installation_identity_ref):
             raise RuntimeError("authority v2 dispatch permit binding is invalid")
         return permit
+
+    async def v2_execution_read_current_effect(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, effect_id: str,
+    ) -> CurrentEffectReadV2:
+        identifier(namespace, "namespace")
+        identifier(effect_id, "effect_id")
+        response = await self._content_rpc(
+            request, handshake, "execution_read_current_effect",
+            {"namespace": namespace, "effect_id": effect_id},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        fields = set(CurrentEffectReadV2.__dataclass_fields__)
+        if (type(response) is not dict
+                or set(response) != fields | {"channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority current effect response is invalid")
+        try:
+            reading = CurrentEffectReadV2(**{
+                key: response[key] for key in fields})
+            for name in ("authority_id", "namespace", "effect_id",
+                         "execution_head_digest"):
+                identifier(getattr(reading, name), name)
+            if (type(reading.activation_generation) is not int
+                    or reading.activation_generation < 0
+                    or type(reading.execution_head_seq) is not int
+                    or reading.execution_head_seq < 0
+                    or reading.state not in {"absent", "unresolved", "observed"}
+                    or type(reading.state) is not str):
+                raise ValueError("invalid current effect state")
+            evidence = (reading.effect_seq, reading.append_id,
+                        reading.append_digest, reading.mutation_id)
+            if reading.state == "absent":
+                if any(item is not None for item in (*evidence, reading.observation_id)):
+                    raise ValueError("absent effect contains append evidence")
+            else:
+                if (type(reading.effect_seq) is not int
+                        or reading.effect_seq < 1
+                        or reading.effect_seq > reading.execution_head_seq):
+                    raise ValueError("invalid effect sequence")
+                for name in ("append_id", "append_digest", "mutation_id"):
+                    identifier(getattr(reading, name), name)
+                if reading.state == "observed":
+                    identifier(reading.observation_id, "observation_id")
+                elif reading.observation_id is not None:
+                    raise ValueError("unresolved effect contains observation")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority current effect response is invalid") from exc
+        if (reading.authority_id != handshake.installation_authority_id
+                or reading.namespace != namespace or reading.effect_id != effect_id):
+            raise RuntimeError("authority current effect binding is invalid")
+        return reading
 
     async def v2_execution_prepare(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

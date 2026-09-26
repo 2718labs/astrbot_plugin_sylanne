@@ -1484,6 +1484,14 @@ class AuthorityRpcServer:
                     expected_anchor=anchor, effect_id=command["effect_id"],
                     command_digest=command["command_digest"], footprint=footprint)
                 return {"permit": to_wire(permit)}
+            if method == "execution_read_current_effect" and set(command) == {
+                    "namespace", "effect_id"}:
+                namespace = identifier(command["namespace"], "namespace")
+                effect_id = identifier(command["effect_id"], "effect_id")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                return asdict(self._v2_execution[namespace].read_current_effect(
+                    credential=credential, subject=subject, effect_id=effect_id))
             if method == "execution_prepare" and set(command) == {
                     "permit", "mutation_id", "footprint"}:
                 permit = from_wire(command["permit"])

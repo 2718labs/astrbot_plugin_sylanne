@@ -29,7 +29,7 @@ from ..authority_service.v2_owner_proof import (
 from ..authority_service.v2_owner_session import (
     OwnerSessionLoginChallengeV1, OwnerSessionLoginRequestV1,
 )
-from ..authority_service.v2_execution_bridge import HandoffStartV2
+from ..authority_service.v2_execution_bridge import CurrentEffectReadV2, HandoffStartV2
 from ..graph_coordinator import namespace_ref
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import (
@@ -962,6 +962,31 @@ class V2FencePort:
         if permit.subject != grant.subject or permit.generation != generation:
             raise RuntimeError("v2 dispatch permit installation or generation mismatch")
         return permit
+
+    def read_current_effect(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        effect_id: str,
+    ) -> CurrentEffectReadV2:
+        """Return exact Authority evidence; an unavailable read remains unavailable."""
+        return self._submit(self._with_session_repair(
+            lambda: self._read_current_effect(
+                namespace, authority_namespace, effect_id)))
+
+    async def _read_current_effect(
+        self, namespace: NamespaceId, authority_namespace: str, effect_id: str,
+    ) -> CurrentEffectReadV2:
+        identifier(effect_id, "effect_id")
+        observed = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        reading = await self._transport.v2_execution_read_current_effect(
+            self._request, handshake, namespace=authority_namespace,
+            effect_id=effect_id)
+        if (reading.authority_id != grant.authority_id
+                or reading.namespace != authority_namespace
+                or reading.effect_id != effect_id
+                or reading.activation_generation != observed.generation):
+            raise RuntimeError("v2 current effect identity changed")
+        return reading
 
     def execution_prepare(
         self, *, namespace: NamespaceId, authority_namespace: str,
