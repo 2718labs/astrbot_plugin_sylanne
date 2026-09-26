@@ -10,9 +10,12 @@ from sylanne3.domains.d04.root import (
     AuthoredRootPreset,
     RootAssetBindings,
     RootBlockIdentity,
+    RootBlockTemplate,
     RootNumericCheckpointCandidate,
     decode_root_candidate,
+    decode_root_preset,
     encode_root_candidate,
+    encode_root_preset,
 )
 from sylanne3.domains.d04 import AffectProvider
 from sylanne3.graph_types import AtomKey, Owner, TypeRegistry
@@ -22,7 +25,7 @@ AXES = tuple(f"axis:{index:02d}" for index in range(24))
 HASH = "a" * 64
 
 
-def _candidate(persona="alice", object_id="person:one"):
+def _preset():
     assets = RootAssetBindings(
         scheme_version="scheme:1", operator_version="operator:1",
         parameter_version="parameter:1", coupling_version="coupling:1",
@@ -30,37 +33,61 @@ def _candidate(persona="alice", object_id="person:one"):
         operator_sha256="b" * 64, parameter_sha256="c" * 64,
         coupling_sha256="d" * 64, readout_sha256="e" * 64,
     )
-    blocks = (
-        RootBlockIdentity("feeling:one", "feeling", object_id, "meaning:care", "authored:one"),
-        RootBlockIdentity("feeling:two", "feeling", object_id, "meaning:boundary", "authored:two"),
-        RootBlockIdentity("mood:primary", "mood", None, None, "authored:mood"),
+    return AuthoredRootPreset(
+        preset_id="preset:1", preset_version="preset-version:1", assets=assets, axes=AXES,
+        block_templates=(
+            RootBlockTemplate("feeling:default", "feeling", "author_supplied_box"),
+            RootBlockTemplate("mood:default", "mood", "author_supplied_box"),
+        ),
     )
-    preset = AuthoredRootPreset(
-        namespace=("bot:one", persona), author_id="owner:one", draft_id="draft:1",
-        preset_id="preset:1", assets=assets, axes=AXES, blocks=blocks,
-        cursor=42.0, historical_source_refs=(),
+
+
+def _candidate(persona="alice", object_id="person:one", preset=None):
+    preset = preset or _preset()
+    namespace = ("bot:one", persona)
+    draft_id = f"draft:{persona}"
+    blocks = (
+        RootBlockIdentity("feeling:one", "feeling:default", "feeling", object_id,
+                          "meaning:care", f"authored:{persona}:one"),
+        RootBlockIdentity("feeling:two", "feeling:default", "feeling", object_id,
+                          "meaning:boundary", f"authored:{persona}:two"),
+        RootBlockIdentity("mood:primary", "mood:default", "mood", None, None,
+                          f"authored:{persona}:mood"),
     )
     checkpoints = tuple(
         RootNumericCheckpointCandidate(
-            preset_digest=preset.digest, asset_digest=assets.digest, block_id=block.block_id,
-            namespace=preset.namespace, author_id=preset.author_id, draft_id=preset.draft_id,
-            block=block, assets=assets,
+            preset_digest=preset.digest, asset_digest=preset.assets.digest, block_id=block.block_id,
+            namespace=namespace, author_id="owner:one", draft_id=draft_id,
+            block=block, assets=preset.assets,
             axes=AXES, latent_state=(2.0,) * 24, ordered_box=((1.9, 2.1),) * 24,
-            initial_error_source="author_declared_box", initial_error_ref="draft:1:bounds",
+            initial_error_source="author_declared_box", initial_error_ref=f"{draft_id}:bounds",
             cursor=42.0,
         ) for block in blocks
     )
-    return AuthoredRootCandidate(preset, preset.digest, checkpoints)
+    return AuthoredRootCandidate(
+        preset=preset, preset_digest=preset.digest, candidate_id=f"candidate:{persona}",
+        namespace=namespace, author_id="owner:one", draft_id=draft_id,
+        cursor=42.0, blocks=blocks, historical_source_refs=(), checkpoints=checkpoints,
+    )
 
 
 def test_two_roles_and_meaning_blocks_round_trip_without_shared_state_claim():
-    alice = _candidate()
-    bob = _candidate("bob", "person:two")
-    assert alice.preset.digest != bob.preset.digest
+    preset = _preset()
+    alice = _candidate(preset=preset)
+    bob = _candidate("bob", "person:two", preset)
+    assert alice.preset is bob.preset
+    assert alice.preset.digest == bob.preset.digest
+    assert alice.digest != bob.digest
+    assert decode_root_preset(json.loads(json.dumps(encode_root_preset(preset)))) == preset
+    assert "namespace" not in encode_root_preset(preset)
+    assert "author_id" not in encode_root_preset(preset)
+    assert "cursor" not in encode_root_preset(preset)
     assert len({item.block_id for item in alice.checkpoints}) == 3
     assert decode_root_candidate(json.loads(json.dumps(encode_root_candidate(alice)))) == alice
     assert all(0 <= value <= 4 for cp in alice.checkpoints for value in cp.latent_state)
-    assert alice.preset.historical_source_refs == ()
+    assert alice.historical_source_refs == ()
+    assert not set(item.block.authored_source_id for item in alice.checkpoints) & set(
+        item.block.authored_source_id for item in bob.checkpoints)
     assert alice.status == "candidate"
     assert not hasattr(alice, "numeric_certificate")
 
@@ -68,12 +95,15 @@ def test_two_roles_and_meaning_blocks_round_trip_without_shared_state_claim():
 def test_fabricated_history_and_cross_role_or_block_binding_are_rejected():
     candidate = _candidate()
     with pytest.raises(ValueError, match="historical_source_refs"):
-        replace(candidate.preset, historical_source_refs=("invented:past",))
+        replace(candidate, historical_source_refs=("invented:past",))
     with pytest.raises(ValueError, match="block"):
         replace(candidate, checkpoints=candidate.checkpoints[:-1])
     foreign = _candidate("bob").checkpoints[0]
-    with pytest.raises(ValueError, match="preset_digest"):
+    with pytest.raises(ValueError, match="namespace"):
         replace(candidate, checkpoints=(foreign, *candidate.checkpoints[1:]))
+    with pytest.raises(ValueError, match="template"):
+        replace(candidate, blocks=(replace(candidate.blocks[0], template_id="unknown"),
+                                   *candidate.blocks[1:]))
 
 
 def test_latent_box_axis_and_readout_are_not_implicitly_converted():

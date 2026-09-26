@@ -1,8 +1,9 @@
 """Versioned, candidate-only D04 authored initial root contract.
 
-These values preserve latent initial conditions. They are neither FeelingState
-readouts nor a numerical/product certificate. D11 must separately authenticate
-the author, assets, initial box and graph transaction before adoption.
+The shipped preset is reusable across roles; each candidate owns its selection
+and latent initial conditions. Candidates are neither FeelingState readouts nor
+numerical/product certificates. D11 must separately authenticate the author,
+installed assets, initial box and graph transaction before adoption.
 """
 
 from __future__ import annotations
@@ -76,8 +77,23 @@ class RootAssetBindings:
 
 
 @dataclass(frozen=True)
+class RootBlockTemplate:
+    template_id: str
+    kind: str
+    initial_rule: str
+
+    def __post_init__(self) -> None:
+        _text(self.template_id, "template_id")
+        if self.kind not in {"feeling", "mood"}:
+            raise ValueError("root block template kind must be feeling or mood")
+        if self.initial_rule != "author_supplied_box":
+            raise ValueError("unsupported authored root initial rule")
+
+
+@dataclass(frozen=True)
 class RootBlockIdentity:
     block_id: str
+    template_id: str
     kind: str
     object_ref: str | None
     meaning_ref: str | None
@@ -85,6 +101,7 @@ class RootBlockIdentity:
 
     def __post_init__(self) -> None:
         _text(self.block_id, "block_id")
+        _text(self.template_id, "template_id")
         _text(self.authored_source_id, "authored_source_id")
         if self.kind == "feeling":
             _text(self.object_ref, "object_ref")
@@ -98,22 +115,14 @@ class RootBlockIdentity:
 
 @dataclass(frozen=True)
 class AuthoredRootPreset:
-    namespace: tuple[str, str]
-    author_id: str
-    draft_id: str
     preset_id: str
+    preset_version: str
     assets: RootAssetBindings
     axes: tuple[str, ...]
-    blocks: tuple[RootBlockIdentity, ...]
-    cursor: float
-    historical_source_refs: tuple[str, ...] = ()
+    block_templates: tuple[RootBlockTemplate, ...]
 
     def __post_init__(self) -> None:
-        if type(self.namespace) is not tuple or len(self.namespace) != 2:
-            raise ValueError("namespace must bind one bot and persona")
-        for item in self.namespace:
-            _text(item, "namespace")
-        for name in ("author_id", "draft_id", "preset_id"):
+        for name in ("preset_id", "preset_version"):
             _text(getattr(self, name), name)
         if type(self.assets) is not RootAssetBindings:
             raise ValueError("assets must be exact RootAssetBindings")
@@ -121,20 +130,13 @@ class AuthoredRootPreset:
                 or any(type(axis) is not str or not axis.strip() for axis in self.axes)
                 or len(set(self.axes)) != 24):
             raise ValueError("axes must be 24 unique ordered axis IDs")
-        if (type(self.blocks) is not tuple or not self.blocks
-                or any(type(block) is not RootBlockIdentity for block in self.blocks)):
-            raise ValueError("blocks must contain root block identities")
-        if len({block.block_id for block in self.blocks}) != len(self.blocks):
-            raise ValueError("block IDs must be unique")
-        if sum(block.kind == "mood" for block in self.blocks) != 1:
-            raise ValueError("root needs exactly one role mood block")
-        signatures = [(block.kind, block.object_ref, block.meaning_ref, block.authored_source_id)
-                      for block in self.blocks]
-        if len(set(signatures)) != len(signatures):
-            raise ValueError("object, meaning and source blocks must be distinct")
-        object.__setattr__(self, "cursor", _number(self.cursor, "cursor"))
-        if self.historical_source_refs != ():
-            raise ValueError("historical_source_refs must be empty for an authored root")
+        if (type(self.block_templates) is not tuple or not self.block_templates
+                or any(type(item) is not RootBlockTemplate for item in self.block_templates)):
+            raise ValueError("block_templates must contain root block templates")
+        if len({item.template_id for item in self.block_templates}) != len(self.block_templates):
+            raise ValueError("block template IDs must be unique")
+        if sum(item.kind == "mood" for item in self.block_templates) != 1:
+            raise ValueError("preset needs exactly one role mood template")
 
     @property
     def digest(self) -> str:
@@ -206,6 +208,13 @@ class RootNumericCheckpointCandidate:
 class AuthoredRootCandidate:
     preset: AuthoredRootPreset
     preset_digest: str
+    candidate_id: str
+    namespace: tuple[str, str]
+    author_id: str
+    draft_id: str
+    cursor: float
+    blocks: tuple[RootBlockIdentity, ...]
+    historical_source_refs: tuple[str, ...]
     checkpoints: tuple[RootNumericCheckpointCandidate, ...]
     status: str = "candidate"
 
@@ -215,31 +224,61 @@ class AuthoredRootCandidate:
         _hash(self.preset_digest, "preset_digest")
         if self.preset_digest != self.preset.digest:
             raise ValueError("preset_digest differs from the exact preset")
+        _text(self.candidate_id, "candidate_id")
+        if type(self.namespace) is not tuple or len(self.namespace) != 2:
+            raise ValueError("namespace must bind one bot and persona")
+        for item in self.namespace:
+            _text(item, "namespace")
+        _text(self.author_id, "author_id")
+        _text(self.draft_id, "draft_id")
+        object.__setattr__(self, "cursor", _number(self.cursor, "cursor"))
+        if self.historical_source_refs != ():
+            raise ValueError("historical_source_refs must be empty for an authored root")
+        if (type(self.blocks) is not tuple or not self.blocks
+                or any(type(block) is not RootBlockIdentity for block in self.blocks)):
+            raise ValueError("blocks must contain root block identities")
+        if len({block.block_id for block in self.blocks}) != len(self.blocks):
+            raise ValueError("block IDs must be unique")
+        if sum(block.kind == "mood" for block in self.blocks) != 1:
+            raise ValueError("candidate needs exactly one role mood block")
+        signatures = [(block.kind, block.object_ref, block.meaning_ref, block.authored_source_id)
+                      for block in self.blocks]
+        if len(set(signatures)) != len(signatures):
+            raise ValueError("object, meaning and source blocks must be distinct")
+        templates = {item.template_id: item for item in self.preset.block_templates}
+        for block in self.blocks:
+            template = templates.get(block.template_id)
+            if template is None or template.kind != block.kind:
+                raise ValueError("block template does not match the shipped preset")
         if type(self.checkpoints) is not tuple or any(
                 type(item) is not RootNumericCheckpointCandidate for item in self.checkpoints):
             raise ValueError("checkpoints must be root numeric candidates")
         if tuple(item.block_id for item in self.checkpoints) != tuple(
-                block.block_id for block in self.preset.blocks):
-            raise ValueError("checkpoints must cover each block exactly once in preset order")
-        for item, block in zip(self.checkpoints, self.preset.blocks):
+                block.block_id for block in self.blocks):
+            raise ValueError("checkpoints must cover each block exactly once in candidate order")
+        for item, block in zip(self.checkpoints, self.blocks):
             if item.preset_digest != self.preset_digest:
                 raise ValueError("checkpoint preset_digest differs from candidate")
-            if item.namespace != self.preset.namespace:
-                raise ValueError("checkpoint namespace differs from the preset")
-            if item.author_id != self.preset.author_id or item.draft_id != self.preset.draft_id:
-                raise ValueError("checkpoint author or draft differs from the preset")
+            if item.namespace != self.namespace:
+                raise ValueError("checkpoint namespace differs from the candidate")
+            if item.author_id != self.author_id or item.draft_id != self.draft_id:
+                raise ValueError("checkpoint author or draft differs from the candidate")
             if item.block != block:
-                raise ValueError("checkpoint block identity differs from the preset")
+                raise ValueError("checkpoint block identity differs from the candidate")
             if item.assets != self.preset.assets:
                 raise ValueError("checkpoint assets differ from the preset")
             if item.asset_digest != self.preset.assets.digest:
                 raise ValueError("checkpoint asset_digest differs from candidate")
             if item.axes != self.preset.axes:
                 raise ValueError("checkpoint axes differ from the preset")
-            if item.cursor != self.preset.cursor:
+            if item.cursor != self.cursor:
                 raise ValueError("checkpoint cursor differs from the role cursor")
         if self.status != "candidate":
             raise ValueError("authored root is candidate-only")
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(encode_root_candidate(self))
 
 
 def encode_root_preset(value: AuthoredRootPreset) -> dict:
@@ -260,25 +299,27 @@ def encode_root_candidate(value: AuthoredRootCandidate) -> dict:
     return json.loads(canonical_serialize({
         "schema": "d04.authored_root_candidate.v1", "preset": encode_root_preset(value.preset),
         "preset_digest": value.preset_digest,
+        "candidate_id": value.candidate_id, "namespace": value.namespace,
+        "author_id": value.author_id, "draft_id": value.draft_id,
+        "cursor": value.cursor, "blocks": [asdict(item) for item in value.blocks],
+        "historical_source_refs": value.historical_source_refs,
         "checkpoints": [encode_root_checkpoint_candidate(item) for item in value.checkpoints],
         "status": value.status,
     }))
 
 
 def decode_root_preset(payload: object) -> AuthoredRootPreset:
-    value = _fields(payload, {"schema", "namespace", "author_id", "draft_id", "preset_id",
-                              "assets", "axes", "blocks", "cursor", "historical_source_refs"}, "preset")
+    value = _fields(payload, {"schema", "preset_id", "preset_version", "assets",
+                              "axes", "block_templates"}, "preset")
     if value["schema"] != "d04.authored_root_preset.v1":
         raise ValueError("unsupported authored root preset schema")
     assets = _fields(value["assets"], set(RootAssetBindings.__dataclass_fields__), "assets")
-    blocks = tuple(RootBlockIdentity(**_fields(item, set(RootBlockIdentity.__dataclass_fields__), "block"))
-                   for item in _list(value["blocks"], "blocks"))
+    templates = tuple(RootBlockTemplate(**_fields(item, set(RootBlockTemplate.__dataclass_fields__), "template"))
+                      for item in _list(value["block_templates"], "block_templates"))
     return AuthoredRootPreset(
-        namespace=tuple(_list(value["namespace"], "namespace")), author_id=value["author_id"],
-        draft_id=value["draft_id"], preset_id=value["preset_id"],
+        preset_id=value["preset_id"], preset_version=value["preset_version"],
         assets=RootAssetBindings(**assets), axes=tuple(_list(value["axes"], "axes")),
-        blocks=blocks, cursor=value["cursor"],
-        historical_source_refs=tuple(_list(value["historical_source_refs"], "historical_source_refs")),
+        block_templates=templates,
     )
 
 
@@ -302,11 +343,18 @@ def decode_root_checkpoint_candidate(payload: object) -> RootNumericCheckpointCa
 
 
 def decode_root_candidate(payload: object) -> AuthoredRootCandidate:
-    value = _fields(payload, {"schema", "preset", "preset_digest", "checkpoints", "status"}, "candidate")
+    value = _fields(payload, {"schema", "preset", "preset_digest", "candidate_id",
+                              "namespace", "author_id", "draft_id", "cursor", "blocks",
+                              "historical_source_refs", "checkpoints", "status"}, "candidate")
     if value["schema"] != "d04.authored_root_candidate.v1":
         raise ValueError("unsupported authored root candidate schema")
     return AuthoredRootCandidate(
         preset=decode_root_preset(value["preset"]), preset_digest=value["preset_digest"],
+        candidate_id=value["candidate_id"], namespace=tuple(_list(value["namespace"], "namespace")),
+        author_id=value["author_id"], draft_id=value["draft_id"], cursor=value["cursor"],
+        blocks=tuple(RootBlockIdentity(**_fields(item, set(RootBlockIdentity.__dataclass_fields__), "block"))
+                     for item in _list(value["blocks"], "blocks")),
+        historical_source_refs=tuple(_list(value["historical_source_refs"], "historical_source_refs")),
         checkpoints=tuple(decode_root_checkpoint_candidate(item) for item in
                           _list(value["checkpoints"], "checkpoints")),
         status=value["status"],
@@ -316,13 +364,18 @@ def decode_root_candidate(payload: object) -> AuthoredRootCandidate:
 def root_type_specs() -> tuple[TypeSpec, ...]:
     """Register graph-visible candidate records, never an adopted checkpoint."""
     definitions = (
-        ("d04.authored_root_preset.v1", decode_root_preset),
-        ("d04.authored_root_candidate.v1", decode_root_candidate),
-        ("d04.root_numeric_checkpoint_candidate.v1", decode_root_checkpoint_candidate),
+        ("d04.authored_root_preset.v1", decode_root_preset, AuthoredRootPreset),
+        ("d04.authored_root_candidate.v1", decode_root_candidate, AuthoredRootCandidate),
+        ("d04.root_numeric_checkpoint_candidate.v1", decode_root_checkpoint_candidate,
+         RootNumericCheckpointCandidate),
     )
     return tuple(TypeSpec(
         name=name, owner_kinds=("persona",), storage_role="projection", validator=decoder,
         immutable=True, writer_domain="d04", schema_hash=schema_hash({
             "type": name, "version": 1, "writer_domain": "d04", "candidate_only": True,
+            "fields": tuple(dto.__dataclass_fields__),
+            "asset_fields": tuple(RootAssetBindings.__dataclass_fields__),
+            "template_fields": tuple(RootBlockTemplate.__dataclass_fields__),
+            "block_fields": tuple(RootBlockIdentity.__dataclass_fields__),
         }),
-    ) for name, decoder in definitions)
+    ) for name, decoder, dto in definitions)
