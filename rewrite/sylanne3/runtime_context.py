@@ -467,6 +467,7 @@ class RuntimeContext:
                                               else None),
                     scene_identity_port=self._scene_identity_port,
                     scene_clock_policy=installation.ingress_clock,
+                    dispatch_clock_policy=installation.ingress_clock,
                     encoding_request_issuer=encoding_request_issuer,
                     model_terminal_cost_port=terminal_cost_port,
                     accounting_maintenance_port=accounting_port,
