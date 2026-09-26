@@ -559,6 +559,71 @@ class OwnerDispatchWitnessV1:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthorityUnresolvedEffectV1:
+    """One Authority-indexed unresolved effect and its durable footprint."""
+
+    effect_id: str
+    operation_id: str
+    mutation_id: str
+    phase: str
+    execution_seq: int
+    append_digest: str
+    footprint: RecoveryConstraintFootprint
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        for name in ("effect_id", "operation_id", "mutation_id"):
+            identifier(getattr(self, name), name)
+        if self.phase not in {"prepared", "claimed", "observed"}:
+            raise ValueError("unresolved effect phase differs")
+        _exact_int(self.execution_seq, "execution_seq", minimum=1)
+        _digest(self.append_digest, "append_digest")
+        if (type(self.footprint) is not RecoveryConstraintFootprint
+                or self.footprint.effect_id != self.effect_id):
+            raise ValueError("unresolved effect footprint differs")
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorityDispatchSnapshotV1:
+    """Complete Authority-side P2 admission state from one Core transaction."""
+
+    context_digest: str
+    authority_id: str
+    namespace: str
+    anchor: RestoreAnchor
+    owner_witness_digest: str
+    admission_epoch: int
+    authority_schema_version: int
+    active_dispatch_operation_id: str
+    pending_mutation_ids: tuple[str, ...]
+    unresolved_effects: tuple[AuthorityUnresolvedEffectV1, ...]
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        _digest(self.context_digest, "context_digest")
+        _digest(self.owner_witness_digest, "owner_witness_digest")
+        for name in ("authority_id", "namespace", "active_dispatch_operation_id"):
+            identifier(getattr(self, name), name)
+        _exact_int(self.admission_epoch, "admission_epoch")
+        _exact_int(self.authority_schema_version, "authority_schema_version")
+        _anchor(self.anchor, self.authority_id, self.namespace,
+                self.anchor.activation_generation)
+        if self.pending_mutation_ids != ():
+            raise ValueError("pending Authority mutation blocks P2 admission")
+        if (type(self.unresolved_effects) is not tuple
+                or any(type(effect) is not AuthorityUnresolvedEffectV1
+                       or effect.footprint.namespace != self.namespace
+                       for effect in self.unresolved_effects)
+                or tuple(sorted(self.unresolved_effects, key=lambda item: item.effect_id))
+                   != self.unresolved_effects
+                or len({effect.effect_id for effect in self.unresolved_effects})
+                   != len(self.unresolved_effects)):
+            raise ValueError("Authority unresolved effect set differs")
+
+
+@dataclass(frozen=True, slots=True)
 class DispatchGraphClaimReceiptV1:
     """Graph writer's committed claim identity; only a trusted callback may supply it."""
 
@@ -767,6 +832,7 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1 |
             ExecutionBindingV1 | ExecutionBindingV2 | PlatformObservationV1 |
             DispatchHandoffContextV1 | OwnerDispatchWitnessV1 |
+            AuthorityUnresolvedEffectV1 | AuthorityDispatchSnapshotV1 |
             DispatchGraphClaimReceiptV1) -> dict[str, Any]:
     """Produce a fresh, JSON-shaped dict with an explicit object kind."""
     if type(value) is FencePermitV2:
@@ -796,6 +862,25 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                 "guard": owner_to_wire(value.guard),
                 "issue_operation_id": value.issue_operation_id,
                 "grant_id": value.grant_id, "grant_digest": value.grant_digest}
+    if type(value) is AuthorityUnresolvedEffectV1:
+        return {"schema": value.schema, "kind": "authority_unresolved_effect_v1",
+                "effect_id": value.effect_id, "operation_id": value.operation_id,
+                "mutation_id": value.mutation_id, "phase": value.phase,
+                "execution_seq": value.execution_seq,
+                "append_digest": value.append_digest,
+                "footprint": _footprint_wire(value.footprint)}
+    if type(value) is AuthorityDispatchSnapshotV1:
+        return {"schema": value.schema, "kind": "authority_dispatch_snapshot_v1",
+                "context_digest": value.context_digest,
+                "authority_id": value.authority_id, "namespace": value.namespace,
+                "anchor": _anchor_wire(value.anchor),
+                "owner_witness_digest": value.owner_witness_digest,
+                "admission_epoch": value.admission_epoch,
+                "authority_schema_version": value.authority_schema_version,
+                "active_dispatch_operation_id": value.active_dispatch_operation_id,
+                "pending_mutation_ids": list(value.pending_mutation_ids),
+                "unresolved_effects": [to_wire(effect)
+                                       for effect in value.unresolved_effects]}
     if type(value) is DispatchGraphClaimReceiptV1:
         return {"schema": value.schema, "kind": "dispatch_graph_claim_receipt_v1",
                 "context_digest": value.context_digest,
@@ -936,12 +1021,40 @@ def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationRec
                                  DeletionEvidenceV1 | DeletionPendingV1 |
                                  DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                                  PlatformObservationV1 | DispatchHandoffContextV1 |
-                                 OwnerDispatchWitnessV1 |
+                                 OwnerDispatchWitnessV1 | AuthorityUnresolvedEffectV1 |
+                                 AuthorityDispatchSnapshotV1 |
                                  DispatchGraphClaimReceiptV1):
     """Reject unknown schemas, fields, kinds and nested shapes before use."""
     if type(value) is not dict or value.get("schema") != SCHEMA:
         raise ValueError("unknown authority schema")
     kind = value.get("kind")
+    if kind == "authority_unresolved_effect_v1":
+        _fields(value, frozenset({"schema", "kind", "effect_id", "operation_id",
+                                  "mutation_id", "phase", "execution_seq",
+                                  "append_digest", "footprint"}),
+                "Authority unresolved effect")
+        return AuthorityUnresolvedEffectV1(
+            footprint=_footprint_from_wire(value["footprint"]),
+            **{key: item for key, item in value.items()
+               if key not in ("kind", "footprint")})
+    if kind == "authority_dispatch_snapshot_v1":
+        _fields(value, frozenset({"schema", "kind", "context_digest",
+                                  "authority_id", "namespace", "anchor",
+                                  "owner_witness_digest", "admission_epoch",
+                                  "authority_schema_version", "active_dispatch_operation_id",
+                                  "pending_mutation_ids", "unresolved_effects"}),
+                "Authority dispatch snapshot")
+        effects = value["unresolved_effects"]
+        pending = value["pending_mutation_ids"]
+        if type(effects) is not list or type(pending) is not list:
+            raise ValueError("Authority dispatch snapshot lists differ")
+        return AuthorityDispatchSnapshotV1(
+            anchor=_anchor_from_wire(value["anchor"]),
+            unresolved_effects=tuple(from_wire(item) for item in effects),
+            pending_mutation_ids=tuple(pending),
+            **{key: item for key, item in value.items()
+               if key not in ("kind", "anchor", "unresolved_effects",
+                              "pending_mutation_ids")})
     if kind == "owner_dispatch_witness_v1":
         from .v2_owner_contract import (
             OwnerAuthorizationGuardV1, from_wire as owner_from_wire,
@@ -1150,7 +1263,8 @@ def canonical_digest(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV
                      DeletionEvidenceV1 | DeletionPendingV1 |
                      DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                      PlatformObservationV1 | DispatchHandoffContextV1 |
-                     OwnerDispatchWitnessV1 |
+                     OwnerDispatchWitnessV1 | AuthorityUnresolvedEffectV1 |
+                     AuthorityDispatchSnapshotV1 |
                      DispatchGraphClaimReceiptV1) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
 
@@ -1171,5 +1285,6 @@ __all__ = ["SCHEMA", "FencePermitV2", "PendingMutationV2", "MutationReceiptV2",
            "DeletionEvidenceV1", "DeletionPendingV1", "DeletionMutationReceiptV1",
            "deletion_scope_digest", "to_wire", "from_wire", "canonical_bytes",
            "canonical_digest", "decode_bytes", "DispatchHandoffContextV1",
-           "OwnerDispatchWitnessV1",
+           "OwnerDispatchWitnessV1", "AuthorityUnresolvedEffectV1",
+           "AuthorityDispatchSnapshotV1",
            "DispatchGraphClaimReceiptV1"]

@@ -26,8 +26,10 @@ from .v2_contract import (
     PendingMutationV2, canonical_bytes,
     canonical_digest,
     DispatchHandoffContextV1, DispatchGraphClaimReceiptV1, OwnerDispatchWitnessV1,
+    AuthorityDispatchSnapshotV1, AuthorityUnresolvedEffectV1,
     PlatformObservationV1, decode_bytes, from_wire, to_wire,
 )
+from .v2_dispatch_admission_epoch import current_admission_stamp_in_tx
 from .v2_execution_journal import AuthorityV2ExecutionJournal, VerifiedAppendV2
 from .v2_deletion_guard import AuthorityV2DeletionGuard
 from .v2_fence_store import AuthorityV2FenceStore
@@ -1078,6 +1080,105 @@ class AuthorityV2ExecutionBridge:
         if effect != ("unresolved", claimed_receipt.after_anchor.execution_seq):
             raise AuthorityUnavailable("current effect claim differs")
 
+    def _dispatch_snapshot_locked(self, db, *, context: DispatchHandoffContextV1,
+                                  owner_witness: OwnerDispatchWitnessV1,
+                                  execution_rows) -> AuthorityDispatchSnapshotV1:
+        """Read every unresolved namespace effect from the verified journal.
+
+        Any missing footprint, extra committed mutation, or pending mutation
+        fails closed; the caller cannot supply or trim this set.
+        """
+        pending_ids = tuple(row[0] for row in db.execute(
+            "SELECT mutation_id FROM authority_v2_mutations "
+            "WHERE namespace=? AND state='pending' ORDER BY mutation_id",
+            (self.namespace,)))
+        if pending_ids:
+            raise AuthorityUnavailable("pending Authority mutation blocks P2 admission")
+        active = tuple(row[0] for row in db.execute(
+            "SELECT operation_id FROM authority_v2_fences "
+            "WHERE namespace=? AND state='active' ORDER BY operation_id",
+            (self.namespace,)))
+        if active != (context.permit.operation_id,):
+            raise AuthorityUnavailable("P2 is not the only active namespace fence")
+        indexed = {}
+        for effect_id, state, keys_json, execution_seq in db.execute(
+                "SELECT effect_id,state,conflict_keys_json,execution_seq "
+                "FROM authority_effects WHERE namespace=? ORDER BY effect_id",
+                (self.namespace,)):
+            if state not in {"unresolved", "resolved"}:
+                raise AuthorityUnavailable("Authority effect state is unknown")
+            indexed[effect_id] = (state, keys_json, execution_seq)
+        by_effect = {}
+        journal_mutation_ids = set()
+        for entry in execution_rows:
+            try:
+                pending = decode_bytes(entry[4])
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise AuthorityUnavailable("execution journal append is malformed") from exc
+            if type(pending) is not PendingMutationV2 or pending.permit.effect_id is None:
+                raise AuthorityUnavailable("execution append lacks effect identity")
+            mutation_id = pending.mutation_id
+            if mutation_id in journal_mutation_ids:
+                raise AuthorityUnavailable("duplicate execution mutation append")
+            journal_mutation_ids.add(mutation_id)
+            row = self._load_mutation_locked(db, pending, pending.permit.subject)
+            completed = self._completed_result(row)
+            if (completed is None or completed[0].durable_state != "committed"
+                    or completed[0].after_anchor.execution_seq != entry[0]
+                    or completed[0].after_anchor.execution_digest != entry[6]):
+                raise AuthorityUnavailable("execution append lacks committed mutation")
+            footprint = self.fences._decode_footprint(pending, row[11])
+            by_effect.setdefault(pending.permit.effect_id, []).append(
+                (entry, pending, row, footprint))
+        committed_ids = {row[0] for row in db.execute(
+            "SELECT mutation_id FROM authority_v2_mutations WHERE namespace=? "
+            "AND mutation_kind='execution' AND state='committed'",
+            (self.namespace,))}
+        if committed_ids != journal_mutation_ids:
+            raise AuthorityUnavailable("Authority mutations and execution journal differ")
+        effects = []
+        for effect_id, entries in by_effect.items():
+            indexed_row = indexed.get(effect_id)
+            if indexed_row is None or indexed_row[0] != "unresolved":
+                raise AuthorityUnavailable("execution effect is absent or not unresolved")
+            operation_id = entries[0][1].permit.operation_id
+            footprint = entries[0][3]
+            previous_phase = None
+            for _, pending, _, saved_footprint in entries:
+                if (pending.permit.operation_id != operation_id
+                        or pending.permit.generation != context.permit.generation
+                        or saved_footprint != footprint
+                        or (previous_phase is None and pending.phase != "prepared")
+                        or (previous_phase == "prepared" and pending.phase != "claimed")
+                        or (previous_phase in {"claimed", "observed"}
+                            and pending.phase != "observed")):
+                    raise AuthorityUnavailable("unresolved effect phase or footprint differs")
+                previous_phase = pending.phase
+            entry, pending, row, _ = entries[-1]
+            if (indexed_row[1:] != (row[5], entry[0])
+                    or tuple(json.loads(row[5])) !=
+                       constraint_keys_from_footprint(footprint)):
+                raise AuthorityUnavailable("effect index and footprint differ")
+            effects.append(AuthorityUnresolvedEffectV1(
+                effect_id=effect_id, operation_id=operation_id,
+                mutation_id=pending.mutation_id, phase=pending.phase,
+                execution_seq=entry[0], append_digest=entry[6],
+                footprint=footprint))
+        if {effect_id for effect_id, row in indexed.items()
+                if row[0] == "unresolved"} != set(by_effect):
+            raise AuthorityUnavailable("unresolved effect index is incomplete")
+        stamp = current_admission_stamp_in_tx(db)
+        return AuthorityDispatchSnapshotV1(
+            context_digest=canonical_digest(context),
+            authority_id=context.permit.authority_id,
+            namespace=self.namespace, anchor=context.permit.pinned_anchor,
+            owner_witness_digest=canonical_digest(owner_witness),
+            admission_epoch=stamp.epoch,
+            authority_schema_version=stamp.schema_version,
+            active_dispatch_operation_id=context.permit.operation_id,
+            pending_mutation_ids=(),
+            unresolved_effects=tuple(sorted(effects, key=lambda item: item.effect_id)))
+
     def begin_handoff(self, *, credential, subject: str,
                       claimed_receipt: MutationReceiptV2,
                       handoff_id: str) -> HandoffStartV2:
@@ -1181,7 +1282,7 @@ class AuthorityV2ExecutionBridge:
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
                     raise AuthorityUnavailable("historical deletion closure blocks handoff")
-                execution_head = self.journal.verified_head()
+                execution_head, execution_rows = self.journal._scan_locked()
                 with self.core._tx() as db:
                     self._check_handoff_current_locked(
                         db, permit=permit, subject=subject,
@@ -1191,11 +1292,15 @@ class AuthorityV2ExecutionBridge:
                     owner_witness = self._owner_tickets.current_dispatch_witness_in_tx(
                         db, context=context, binding=binding,
                         installation_id=self._owner_installation_id)
+                    admission_snapshot = self._dispatch_snapshot_locked(
+                        db, context=context, owner_witness=owner_witness,
+                        execution_rows=execution_rows)
         # External business graph transaction MUST be atomic and idempotent by
         # handoff_id. No Core, deletion, or execution journal lock is held here.
         try:
             graph_receipt = self._final_handoff_authorizer(
-                context, binding, claimed_receipt, owner_witness)
+                context, binding, claimed_receipt, owner_witness,
+                admission_snapshot)
         except Exception as exc:
             raise AuthorityUnavailable("final business graph handoff denied") from exc
         # graph_version names an atom revision; graph_epoch is the namespace
@@ -1214,7 +1319,7 @@ class AuthorityV2ExecutionBridge:
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
                     raise AuthorityUnavailable("historical deletion closure blocks handoff")
-                execution_head = self.journal.verified_head()
+                execution_head, execution_rows = self.journal._scan_locked()
                 with self.core._tx() as db:
                     self._check_handoff_current_locked(
                         db, permit=permit, subject=subject,
@@ -1226,6 +1331,11 @@ class AuthorityV2ExecutionBridge:
                         installation_id=self._owner_installation_id)
                     if current_owner != owner_witness:
                         raise AuthorityUnavailable("Owner authorization changed during graph claim")
+                    current_snapshot = self._dispatch_snapshot_locked(
+                        db, context=context, owner_witness=current_owner,
+                        execution_rows=execution_rows)
+                    if current_snapshot != admission_snapshot:
+                        raise AuthorityUnavailable("Authority admission changed during graph claim")
                     if db.execute(
                         "SELECT 1 FROM authority_execution_handoff_starts_v1 "
                         "WHERE operation_id=? OR handoff_id=?",

@@ -193,7 +193,7 @@ def test_v2_claim_replay_preserves_original_p0_and_complete_admission(tmp_path):
 def test_v2_handoff_requires_current_owner_authorization_before_graph_claim(tmp_path):
     calls = []
 
-    def graph_claim(context, binding, claimed, _owner_witness):
+    def graph_claim(context, binding, claimed, _owner_witness, _snapshot):
         assert type(context) is DispatchHandoffContextV1
         assert type(binding) is ExecutionBindingV2
         assert binding.initial_check_evidence_digest == _digest("5")
@@ -244,7 +244,7 @@ def test_v2_handoff_requires_current_owner_authorization_before_graph_claim(tmp_
 def test_v2_owner_witness_pre_post_and_replay(tmp_path):
     observed = []
 
-    def graph_claim(context, binding, claimed, witness):
+    def graph_claim(context, binding, claimed, witness, snapshot):
         assert type(witness) is OwnerDispatchWitnessV1
         assert witness.context_digest == canonical_digest(context)
         assert witness.authority_namespace == AUTH_NS
@@ -253,6 +253,12 @@ def test_v2_owner_witness_pre_post_and_replay(tmp_path):
         assert witness.grant_id == "grant-a"
         assert witness.grant_digest == _digest("c")
         assert canonical_digest(claimed) == context.claimed_receipt_digest
+        assert snapshot.context_digest == canonical_digest(context)
+        assert snapshot.owner_witness_digest == canonical_digest(witness)
+        assert snapshot.pending_mutation_ids == ()
+        assert tuple(effect.effect_id for effect in snapshot.unresolved_effects) == ("effect-a",)
+        assert snapshot.unresolved_effects[0].footprint == binding.origin.footprint
+        assert from_wire(to_wire(snapshot)) == snapshot
         observed.append(witness)
         return DispatchGraphClaimReceiptV1(
             canonical_digest(context), binding.graph_namespace,
@@ -292,7 +298,7 @@ def test_v2_owner_witness_pre_post_and_replay(tmp_path):
 def test_v2_owner_head_change_during_graph_callback_cannot_write_start(tmp_path):
     core_ref = []
 
-    def graph_claim(context, binding, _claimed, witness):
+    def graph_claim(context, binding, _claimed, witness, _snapshot):
         assert witness.guard.authorization_revision == 1
         with core_ref[0]._tx() as db:
             db.execute(
@@ -319,6 +325,71 @@ def test_v2_owner_head_change_during_graph_callback_cannot_write_start(tmp_path)
         "SELECT COUNT(*) FROM authority_execution_handoff_starts_v1").fetchone() == (0,)
     core.close()
     journal.close()
+
+
+def test_v2_handoff_rejects_unindexed_second_unresolved_effect(tmp_path):
+    called = []
+
+    def graph_claim(*args):
+        called.append(args)
+        raise AssertionError("incomplete Authority effect set reached graph callback")
+
+    core, fences, journal, bridge = _service(
+        tmp_path, with_owner=True, final_authorizer=graph_claim,
+        final_issuer="graph-issuer-a")
+    try:
+        prepared, origin = _prepared(core, fences, bridge)
+        claimed, _ = bridge.execution_claim_v2(
+            credential="ok", subject="subject-a", prepared_receipt=prepared,
+            binding=_binding_v2(origin))
+        with core._tx() as db:
+            db.execute(
+                "INSERT INTO authority_effects(namespace,effect_id,state,"
+                "conflict_keys_json,execution_seq) VALUES(?,?,?,?,?)",
+                (AUTH_NS, "effect-b", "unresolved", '["resource-b"]', 1))
+        with pytest.raises(AuthorityUnavailable, match="unresolved effect index is incomplete"):
+            bridge.begin_handoff_v2(
+                credential="ok", subject="subject-a", claimed_receipt=claimed,
+                handoff_id="handoff-a")
+        assert not called
+        assert core._db.execute(
+            "SELECT COUNT(*) FROM authority_execution_handoff_starts_v1").fetchone() == (0,)
+    finally:
+        core.close()
+        journal.close()
+
+
+def test_v2_handoff_rejects_other_authority_write_during_graph_claim(tmp_path):
+    core_ref = []
+
+    def graph_claim(context, binding, _claimed, witness, snapshot):
+        assert snapshot.owner_witness_digest == canonical_digest(witness)
+        with core_ref[0]._tx() as db:
+            db.execute(
+                "INSERT INTO authority_meta(key,value) VALUES('admission_probe','changed')")
+        return DispatchGraphClaimReceiptV1(
+            canonical_digest(context), binding.graph_namespace,
+            binding.graph_incarnation, "graph-version-b", 4, 2, 0,
+            "graph-claim-a", _digest("8"), "graph-issuer-a")
+
+    core, fences, journal, bridge = _service(
+        tmp_path, with_owner=True, final_authorizer=graph_claim,
+        final_issuer="graph-issuer-a")
+    core_ref.append(core)
+    try:
+        prepared, origin = _prepared(core, fences, bridge)
+        claimed, _ = bridge.execution_claim_v2(
+            credential="ok", subject="subject-a", prepared_receipt=prepared,
+            binding=_binding_v2(origin))
+        with pytest.raises(AuthorityUnavailable, match="Authority admission changed"):
+            bridge.begin_handoff_v2(
+                credential="ok", subject="subject-a", claimed_receipt=claimed,
+                handoff_id="handoff-a")
+        assert core._db.execute(
+            "SELECT COUNT(*) FROM authority_execution_handoff_starts_v1").fetchone() == (0,)
+    finally:
+        core.close()
+        journal.close()
 
 
 def test_v2_wire_rejects_missing_admission_and_retyped_origin(tmp_path):

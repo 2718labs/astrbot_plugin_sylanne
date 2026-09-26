@@ -16,6 +16,7 @@ import ssl
 from .v2_contract import (
     DispatchGraphClaimReceiptV1, DispatchHandoffContextV1,
     ExecutionBindingV2, MutationReceiptV2, OwnerDispatchWitnessV1,
+    AuthorityDispatchSnapshotV1,
     canonical_digest, from_wire, to_wire,
 )
 
@@ -82,6 +83,28 @@ def require_exact_owner_witness(
         raise RuntimeError("reverse graph claim Owner witness differs")
 
 
+def require_exact_authority_snapshot(
+        context: DispatchHandoffContextV1,
+        witness: OwnerDispatchWitnessV1,
+        snapshot: AuthorityDispatchSnapshotV1) -> None:
+    """Bind the versioned full Authority admission set to this P2 callback."""
+    permit = context.permit
+    if (type(snapshot) is not AuthorityDispatchSnapshotV1
+            or snapshot.context_digest != canonical_digest(context)
+            or snapshot.owner_witness_digest != canonical_digest(witness)
+            or (snapshot.authority_id, snapshot.namespace,
+                snapshot.active_dispatch_operation_id, snapshot.anchor) !=
+               (permit.authority_id, permit.namespace,
+                permit.operation_id, permit.pinned_anchor)
+            or not any(effect.effect_id == permit.effect_id
+                       and effect.operation_id == permit.operation_id
+                       and "sha256:" + hashlib.sha256(
+                           effect.footprint._json().encode("utf-8")).hexdigest()
+                           == permit.footprint_digest
+                       for effect in snapshot.unresolved_effects)):
+        raise RuntimeError("reverse graph claim Authority snapshot differs")
+
+
 @dataclass(frozen=True, slots=True)
 class AdministratorReverseHandoffProfile:
     namespace: str
@@ -138,12 +161,14 @@ class ReverseGraphClaimClient:
     def claim(self, context: DispatchHandoffContextV1,
               binding: ExecutionBindingV2,
               claimed: MutationReceiptV2,
-              witness: OwnerDispatchWitnessV1) -> DispatchGraphClaimReceiptV1:
+              witness: OwnerDispatchWitnessV1,
+              snapshot: AuthorityDispatchSnapshotV1) -> DispatchGraphClaimReceiptV1:
         profile = self.profile
         require_exact_reverse_handoff_identity(
             profile.namespace, context, binding, claimed,
         )
         require_exact_owner_witness(profile, context, binding, witness)
+        require_exact_authority_snapshot(context, witness, snapshot)
         message = {
             "profile_id": profile.profile_id,
             "installation_id": profile.installation_id,
@@ -151,6 +176,7 @@ class ReverseGraphClaimClient:
             "context": to_wire(context), "binding": to_wire(binding),
             "claimed_receipt": to_wire(claimed),
             "owner_witness": to_wire(witness),
+            "authority_snapshot": to_wire(snapshot),
         }
         data = json.dumps(message, sort_keys=True, separators=(",", ":"),
                           allow_nan=False).encode("utf-8") + b"\n"
@@ -197,4 +223,5 @@ class ReverseGraphClaimClient:
 __all__ = (
     "AdministratorReverseHandoffProfile", "ReverseGraphClaimClient",
     "require_exact_reverse_handoff_identity", "require_exact_owner_witness",
+    "require_exact_authority_snapshot",
 )
