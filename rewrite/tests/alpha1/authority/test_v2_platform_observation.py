@@ -48,6 +48,13 @@ def _report(start, binding, *, outcome="accepted", message_id="17"):
 def test_v2_handoff_observation_is_durable_and_replay_is_exact(tmp_path):
     core, journal, bridge, claimed, start, binding = _ready(tmp_path)
     try:
+        permit, anchor, effect = bridge.read_current_dispatch_handoff(
+            credential="ok", subject="subject-a", start=start,
+            claimed_receipt=claimed)
+        assert permit == start.permit
+        assert anchor == permit.pinned_anchor
+        assert effect.state == "unresolved"
+        assert effect.execution_head_seq == anchor.execution_seq
         report = _report(start, binding)
         assert from_wire(to_wire(report)) == report
         bridge._observation_verifier = lambda namespace, receipt, value: value
@@ -63,6 +70,10 @@ def test_v2_handoff_observation_is_durable_and_replay_is_exact(tmp_path):
         assert bridge.read_current_effect(
             credential="ok", subject="subject-a", effect_id="effect-a"
         ).observation_id == report.observation_id
+        with pytest.raises(AuthorityUnavailable, match="no longer current"):
+            bridge.read_current_dispatch_handoff(
+                credential="ok", subject="subject-a", start=start,
+                claimed_receipt=claimed)
         with pytest.raises(AuthorityUnavailable, match="different evidence"):
             bridge.execution_observe_v2(
                 credential="ok", subject="subject-a",

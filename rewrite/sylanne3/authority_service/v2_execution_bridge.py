@@ -1263,9 +1263,60 @@ class AuthorityV2ExecutionBridge:
         return self._begin_handoff(credential=credential, subject=subject,
                                    claimed_receipt=claimed_receipt, handoff_id=handoff_id)
 
+    def read_current_dispatch_handoff(self, *, credential, subject: str,
+                                      start: HandoffStartV2,
+                                      claimed_receipt: MutationReceiptV2):
+        """Read the current P2/A2/Owner barrier for an existing V2 start."""
+        if (type(start) is not HandoffStartV2 or start.replay
+                or type(claimed_receipt) is not MutationReceiptV2
+                or type(claimed_receipt.pending.binding) is not ExecutionBindingV2):
+            raise AuthorityUnavailable("fresh V2 start and committed claim required")
+        replay = self._begin_handoff(
+            credential=credential, subject=subject,
+            claimed_receipt=claimed_receipt, handoff_id=start.handoff_id,
+            replay_only=True)
+        if not replay.replay or replace(replay, replay=False) != start:
+            raise AuthorityUnavailable("current handoff start identity differs")
+        binding = claimed_receipt.pending.binding
+        context = DispatchHandoffContextV1(
+            start.permit, start.claim_digest, start.binding_digest,
+            start.handoff_id)
+        if self._owner_tickets is None or self._owner_installation_id is None:
+            raise AuthorityUnavailable("current Owner authorization unavailable")
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    raise AuthorityUnavailable("historical deletion closure blocks dispatch")
+                execution_head, execution_rows = self.journal._scan_locked()
+                with self.core._tx() as db:
+                    self._check_handoff_current_locked(
+                        db, permit=start.permit, subject=subject,
+                        claimed_receipt=claimed_receipt,
+                        deletion_head=deletion_head,
+                        execution_head=execution_head)
+                    owner = self._owner_tickets.current_dispatch_witness_in_tx(
+                        db, context=context, binding=binding,
+                        installation_id=self._owner_installation_id)
+                    self._dispatch_snapshot_locked(
+                        db, context=context, owner_witness=owner,
+                        execution_rows=execution_rows)
+                    effect = CurrentEffectReadV2(
+                        authority_id=start.permit.authority_id,
+                        namespace=self.namespace, effect_id=start.effect_id,
+                        activation_generation=start.permit.generation,
+                        state="unresolved",
+                        execution_head_seq=execution_head.seq,
+                        execution_head_digest=execution_head.digest,
+                        effect_seq=claimed_receipt.after_anchor.execution_seq,
+                        append_id=claimed_receipt.pending.expected_append_id,
+                        append_digest=claimed_receipt.after_anchor.execution_digest,
+                        mutation_id=claimed_receipt.pending.mutation_id)
+                    return start.permit, start.permit.pinned_anchor, effect
+
     def _begin_handoff(self, *, credential, subject: str,
                        claimed_receipt: MutationReceiptV2,
-                       handoff_id: str) -> HandoffStartV2:
+                       handoff_id: str, replay_only: bool = False) -> HandoffStartV2:
         """Finalize business admission and durably mark one possible handoff.
 
         No platform call is made. The injected graph authority must atomically
@@ -1333,6 +1384,8 @@ class AuthorityV2ExecutionBridge:
                                       claim_digest, binding_digest,
                                       row[5], permit, replay=True,
                                       graph_claim_receipt=graph_receipt)
+        if replay_only:
+            raise AuthorityUnavailable("durable handoff start is absent")
         if type(binding) is not ExecutionBindingV2:
             raise AuthorityUnavailable("new handoff requires V2 admission binding")
         if (not callable(self._final_handoff_authorizer)

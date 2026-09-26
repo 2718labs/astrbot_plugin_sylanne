@@ -79,7 +79,7 @@ from .current_worker_model_result_graph_verifier import (
     PinnedCurrentWorkerModelResultGraphVerifier,
     PinnedTerminalRecoveryGraphVerifierV1,
 )
-from .v2_execution_bridge import AuthorityV2ExecutionBridge
+from .v2_execution_bridge import AuthorityV2ExecutionBridge, HandoffStartV2
 from .reverse_handoff import ReverseGraphClaimClient
 from .v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
@@ -1691,6 +1691,29 @@ class AuthorityRpcServer:
                     credential=credential, subject=subject,
                     claimed_receipt=claimed, observation=observation)
                 return {"receipt": to_wire(receipt), "permit": to_wire(updated)}
+            if method == "execution_read_current_dispatch_handoff" and set(command) == {
+                    "start", "claimed_receipt"}:
+                start = HandoffStartV2.from_wire(command["start"])
+                claimed = from_wire(command["claimed_receipt"])
+                if (type(claimed) is not MutationReceiptV2
+                        or type(claimed.pending.binding) is not ExecutionBindingV2
+                        or start.namespace != claimed.pending.permit.namespace
+                        or claimed.pending.permit.subject != subject):
+                    raise AuthorityUnavailable("V2 current handoff claim differs")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, start.namespace)
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                if (installed is None or installed.installation_id
+                        != self._v2_execution[start.namespace]._owner_installation_id):
+                    raise AuthorityUnavailable("current handoff installation differs")
+                permit, anchor, effect = self._v2_execution[
+                    start.namespace].read_current_dispatch_handoff(
+                        credential=credential, subject=subject,
+                        start=start, claimed_receipt=claimed)
+                return {"permit": to_wire(permit),
+                        "anchor": self._anchor_payload(anchor),
+                        "effect": asdict(effect)}
             if method == "current_anchor" and set(command) == {"namespace"}:
                 service = self._bound_v2_service(
                     credential, profile_id, manifest_digest, command["namespace"])
