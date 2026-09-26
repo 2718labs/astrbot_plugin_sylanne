@@ -102,10 +102,20 @@ def test_blocked_upgrade_survives_restart_and_preserves_prefix(tmp_path):
     other = sqlite3.connect(tmp_path / "deletion.db", isolation_level=None)
     try:
         for sql in (
-            "INSERT INTO deletion_events(seq) VALUES(2)",
+            "INSERT INTO deletion_events(seq,namespace,operation_id,roots_json,epoch,"
+            "policy_ref,phase,prev_digest,chain_digest) VALUES"
+            "(2,'ns-a','external-old','[\"root\"]',2,'policy-a','pending',"
+            "'prior','digest')",
             "UPDATE deletion_events SET phase='closed' WHERE seq=1",
             "DELETE FROM deletion_events WHERE seq=1",
-            "INSERT INTO authority_deletion_v2_tail(seq) VALUES(2)",
+            "INSERT INTO authority_deletion_v2_tail(seq,schema,kind,append_id,"
+            "mutation_id,request_digest,namespace,operation_id,phase,subject,holder,"
+            "token_digest,fence_epoch,revision,before_seq,before_digest,"
+            "evidence_digest,roots_json,epoch,policy_ref,prev_digest,chain_digest) "
+            "VALUES(2,'sylanne3.deletion-tail.v2','deletion','external-append',"
+            "'external-mutation','request','ns-a','external-delete','pending',"
+            "'subject-a','holder-a','token',1,0,1,'prior','evidence',"
+            "'[\"root\"]',2,'policy-a','prior','digest')",
         ):
             with pytest.raises(sqlite3.DatabaseError):
                 other.execute(sql)
