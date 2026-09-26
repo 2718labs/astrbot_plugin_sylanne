@@ -27,7 +27,7 @@ from ..graph_types import AtomKey
 from ..runtime_contracts import (
     CommandEnvelope, DomainBundle, canonical_digest, canonical_serialize,
 )
-from .budget import get_budget_lease
+from .budget import BudgetLease, get_budget_lease
 from .d11_types import runtime_job_key, runtime_outbox_key
 from .jobs import PersistentJob, get_job
 
@@ -2240,16 +2240,10 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         self._d02._issue_bound_stage_quote(db, quote)
         return quote
 
-    def issue_d06_source_correction_quote(
+    def _plan_d06_source_correction_quote(
             self, db, envelope: CommandEnvelope, admin_policy, request, *,
-            installation_id: str, now_utc: float | None = None) -> ResourceQuote:
-        """Bind one Owner correction to installed D02 price and existing D11 budget.
-
-        The caller verifies the Owner, original D12 command digest and graph
-        read in its business transaction. The D12 DTO lacks the original
-        command purpose and audience, so this method signs but cannot derive
-        that digest. It accepts no client quote, grant, job, or outbox identity.
-        """
+            installation_id: str, now_utc: float | None = None
+    ) -> tuple[D06SourceCorrectionQuotePolicy, ResourceQuote, BudgetLease]:
         from ..host.authority_profile import AdminD06SourceCorrectionPolicy
 
         if type(admin_policy) is not AdminD06SourceCorrectionPolicy:
@@ -2301,7 +2295,6 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
             resource_ref, policy.job_ref, (policy.outbox_ref,), (),
             dict(policy.quote_ceiling), None, envelope.deadline_utc,
         )
-        install_schema(db)
         existing = db.execute(
             "SELECT 1 FROM runtime_resource_quotes WHERE quote_id=? AND version=1",
             (quote.quote_id,),
@@ -2311,6 +2304,41 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
                 - lease.reserved.get(name, 0) - lease.unconfirmed.get(name, 0)
                 for name, amount in policy.quote_ceiling.items()):
             raise IssuerAuthorityDenied("D06 correction budget has insufficient capacity")
+        return policy, quote, lease
+
+    def plan_d06_source_correction_quote(
+            self, db, envelope: CommandEnvelope, admin_policy, request, *,
+            installation_id: str, now_utc: float | None = None
+    ) -> tuple[ResourceQuote, PersistentJob]:
+        """Read signed authority and predict the exact quote and queued job.
+
+        This read-only preflight does not install policy, sign quote, reserve
+        budget, or authorize a graph commit. The caller must reissue and
+        compare the quote inside the fenced business transaction.
+        """
+        _, quote, lease = self._plan_d06_source_correction_quote(
+            db, envelope, admin_policy, request,
+            installation_id=installation_id, now_utc=now_utc)
+        return quote, self._job_from_quote(envelope, quote, lease)
+
+    def issue_d06_source_correction_quote(
+            self, db, envelope: CommandEnvelope, admin_policy, request, *,
+            installation_id: str, now_utc: float | None = None,
+            planned_quote: ResourceQuote | None = None) -> ResourceQuote:
+        """Bind one Owner correction to installed D02 price and existing D11 budget.
+
+        The caller verifies the Owner, original D12 command digest and graph
+        read in its business transaction. The D12 DTO lacks the original
+        command purpose and audience, so this method signs but cannot derive
+        that digest. It accepts no client quote, grant, job, or outbox identity.
+        """
+        policy, quote, _ = self._plan_d06_source_correction_quote(
+            db, envelope, admin_policy, request,
+            installation_id=installation_id, now_utc=now_utc)
+        if planned_quote is not None and (
+                type(planned_quote) is not ResourceQuote or planned_quote != quote):
+            raise IssuerAuthorityDenied("D06 correction fenced quote differs from plan")
+        install_schema(db)
         self._d02._install_d06_correction_policy(db, policy)
         self._d02._issue_bound_stage_quote(db, quote)
         return quote
@@ -2443,6 +2471,16 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         quote, _, lease = self._admission_state(
             envelope, db, now_utc=_now_utc(now_utc)
         )
+        return self._job_from_quote(envelope, quote, lease)
+
+    def _job_from_quote(self, envelope: CommandEnvelope, quote: ResourceQuote,
+                        lease: BudgetLease) -> PersistentJob:
+        if ((quote.bot_id, quote.persona_id) != envelope.authority.namespace.as_tuple
+                or (quote.activity_id, quote.operation_id, quote.effect_id,
+                    quote.parent_budget_lease_ref, quote.deadline_utc) != (
+                    envelope.identity.activity_id, envelope.identity.operation_id,
+                    envelope.identity.effect_id, lease.lease_id, envelope.deadline_utc)):
+            raise IssuerAuthorityDenied("planned job differs from quote or lease")
         if quote.graph_job_ref is None:
             raise IssuerAuthorityDenied("resource quote has no scheduled graph job")
         try:

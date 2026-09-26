@@ -530,9 +530,26 @@ class ProductionIssuerTests(unittest.TestCase):
         grant = replace(self.grant(), allowed_work_kinds=(
             D06_SOURCE_CORRECTION_WORK_KIND,))
         self.d11.issue_budget_grant(self.db, grant)
-        quote = self.d11.issue_d06_source_correction_quote(
+        changes_before_plan = self.db.total_changes
+        planned_quote, planned_job = self.d11.plan_d06_source_correction_quote(
             self.db, envelope, policy, request,
             installation_id="installation-1", now_utc=now)
+        self.assertEqual(self.db.total_changes, changes_before_plan)
+        self.assertEqual(planned_job.work_kind, D06_SOURCE_CORRECTION_WORK_KIND)
+        self.assertEqual(runtime_job_key(
+            "bot", "persona", planned_job.activity_id,
+            planned_job.job_id).token, planned_quote.graph_job_ref)
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "differs from plan"):
+            self.d11.issue_d06_source_correction_quote(
+                self.db, envelope, policy, request,
+                installation_id="installation-1", now_utc=now,
+                planned_quote=replace(planned_quote, ceiling={"cpu_ms": 8}))
+        self.assertEqual(self.db.total_changes, changes_before_plan)
+        quote = self.d11.issue_d06_source_correction_quote(
+            self.db, envelope, policy, request,
+            installation_id="installation-1", now_utc=now,
+            planned_quote=planned_quote)
+        self.assertEqual(quote, planned_quote)
         self.assertEqual(quote.quote_id, d06_source_correction_quote_id(
             self.namespace, operation))
         self.assertEqual(quote.ceiling, {"cpu_ms": 7})
@@ -544,6 +561,7 @@ class ProductionIssuerTests(unittest.TestCase):
         guarded = replace(envelope, version_guard=replace(
             envelope.version_guard,
             resource_lease_versions=(VersionedRef(quote.quote_id, 1),)))
+        self.assertEqual(self.d11.job_for(guarded, self.db, now_utc=now), planned_job)
         admission = self.d11.admit_runtime(DomainBundle(
             guarded, (), (), (), (), (), ("correction-replay",),
             (quote.graph_job_ref,), quote.outbox_refs,
