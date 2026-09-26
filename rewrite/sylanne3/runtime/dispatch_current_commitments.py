@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 
 from ..authority_service.v2_contract import (
     AuthorityDispatchSnapshotV1, DispatchHandoffContextV1, FencePermitV2,
@@ -13,10 +14,13 @@ from ..authority_service.reverse_handoff import require_exact_authority_snapshot
 from ..authority_service.v2_execution_bridge import CurrentEffectReadV2
 from ..contracts import canonical_json
 from ..domains.d08.execution import (
-    ActionCancellationState, ActionIntent, ActionOutcome, Commitment, GoalExecutionProvider,
+    ActionCancellationState, ActionIntent, ActionOutcome, Commitment,
+    GoalExecutionProvider, RequiredCheckSpec,
 )
 from ..graph_types import AtomKey, GraphSnapshot, GraphVersion, Owner
-from ..runtime_contracts import NamespaceId, QueryEpoch, VersionedRef, canonical_digest
+from ..runtime_contracts import (
+    CheckReceipt, NamespaceId, QueryEpoch, VersionedRef, canonical_digest,
+)
 from .d11_types import job_graph_write
 from .dispatch_action_job_binding import load_action_job_binding
 from .dispatch_admission import load_admission
@@ -87,6 +91,123 @@ class CurrentD08ObservedVersionsV1:
     action_job_binding_digest: str
     other_unresolved_effect_ids: tuple[str, ...]
     authority_snapshot_digest: str
+
+
+def _map_current_d08_check_versions(
+    db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
+    intent: ActionIntent, spec: RequiredCheckSpec, receipt: CheckReceipt,
+    observed: CurrentD08ObservedVersionsV1, *, now_utc: float,
+) -> tuple[VersionedRef, ...]:
+    """Map only current graph/Authority observations to frozen D08 refs.
+
+    This validates versions, not semantic commitment applicability or a
+    current RequiredCheck PASS. The public reader below must create observed
+    evidence inside the same graph transaction; caller-created observations
+    are not authority. A current atom at criteria_version establishes only
+    its revision, not that D08 designated it as a criterion.
+    """
+    if (not db.in_transaction or type(namespace) is not NamespaceId
+            or type(snapshot) is not GraphSnapshot or type(query) is not QueryEpoch
+            or type(intent) is not ActionIntent or type(spec) is not RequiredCheckSpec
+            or type(receipt) is not CheckReceipt
+            or type(observed) is not CurrentD08ObservedVersionsV1
+            or type(now_utc) not in (int, float)
+            or not math.isfinite(now_utc)):
+        raise ValueError("D08 check version mapping needs current typed inputs")
+    if (len(snapshot.epochs) != 1
+            or query != QueryEpoch(namespace, "all", snapshot.epochs[0].revision)
+            or observed.query_epoch != query
+            or spec.check_kind != "commitment_conflict"
+            or spec.provider_id != "d08.commitment_conflict"
+            or (spec,) != tuple(item for item in intent.required_checks
+                                if item.check_kind == "commitment_conflict")
+            or spec.subject_ref != f"persona:{namespace.persona_id}"
+            or spec.action_ref != intent.action_id
+            or spec.purpose != intent.purpose):
+        raise ValueError("D08 frozen check scope or full query differs")
+    epoch_row = db.execute(
+        "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
+        namespace.as_tuple,
+    ).fetchone()
+    if (epoch_row[0] if epoch_row else 0) != query.revision:
+        raise ValueError("D08 graph epoch changed")
+    try:
+        criteria_key = AtomKey.from_token(spec.criteria_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("D08 criteria lacks a current graph address") from exc
+    if (criteria_key.owner.bot, criteria_key.owner.persona) != namespace.as_tuple:
+        raise ValueError("D08 criteria crosses namespace")
+    criteria = snapshot.get(criteria_key)
+    criteria_row = db.execute(
+        "SELECT revision,value,valid FROM graph_atoms WHERE token=? "
+        "AND bot=? AND persona=?",
+        (criteria_key.token, *namespace.as_tuple),
+    ).fetchone()
+    if (criteria is None or not criteria.valid or criteria_row is None
+            or criteria_row[2] != 1 or criteria.revision != criteria_row[0]
+            or criteria.value != json.loads(criteria_row[1])):
+        raise ValueError("D08 criteria is not a current graph atom")
+    if (observed.goal_version.ref != intent.goal_ref
+            or tuple(item.ref for item in observed.commitment_versions)
+            != intent.commitment_refs
+            or observed.cancellation_graph_version.key.type_name
+            != "d08.action_cancellation.v1"
+            or observed.cancellation_graph_version.key.name != intent.action_id
+            or (observed.cancellation_graph_version.key.owner.bot,
+                observed.cancellation_graph_version.key.owner.persona)
+            != namespace.as_tuple):
+        raise ValueError("D08 observed goal, commitments or cancellation differ")
+    versions = {
+        spec.criteria_version: criteria.revision,
+        observed.goal_version.ref: observed.goal_version.version,
+        **{item.ref: item.version for item in observed.commitment_versions},
+        f"commitments-query:persona:{namespace.persona_id}": query.revision,
+        f"execution-epoch:{intent.action_id}": observed.execution_head_seq,
+        f"cancellation-epoch:{intent.action_id}":
+            observed.cancellation_graph_version.revision,
+    }
+    frozen = {item.ref: item.version for item in spec.required_input_versions}
+    if (len(versions) != len(spec.required_input_versions)
+            or len(frozen) != len(spec.required_input_versions)
+            or set(versions) != set(frozen)):
+        raise ValueError("D08 check refs lack a strict current mapping")
+    if versions != frozen:
+        # P0 -> prepared -> claimed advances Authority execution_seq twice.
+        # A receipt frozen at the pre-P2 seq cannot survive this comparison.
+        raise ValueError("D08 frozen execution or graph version stale after P2")
+    if ((receipt.check_kind, receipt.issuer, receipt.subject_ref,
+         receipt.action_ref, receipt.purpose, receipt.input_versions)
+        != (spec.check_kind, spec.provider_id, spec.subject_ref,
+            spec.action_ref, spec.purpose, spec.required_input_versions)
+            or receipt.result != "pass" or receipt.coverage != "full"
+            or receipt.valid_until < now_utc):
+        raise ValueError("D08 prior receipt is incomplete or expired")
+    return tuple(VersionedRef(item.ref, versions[item.ref])
+                 for item in spec.required_input_versions)
+
+
+def read_current_d08_check_versions(
+    db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
+    intent: ActionIntent, spec: RequiredCheckSpec, receipt: CheckReceipt,
+    action_id: str, context: DispatchHandoffContextV1,
+    witness: OwnerDispatchWitnessV1,
+    authority_snapshot: AuthorityDispatchSnapshotV1,
+    effect: CurrentEffectReadV2, *, now_utc: float,
+) -> tuple[VersionedRef, ...]:
+    """Read D08 pins, then HOLD until criteria and conflict policy are issued.
+
+    The installed D08 contract has no independent criterion issuer and no
+    policy mapping all current commitments/actions to applicable conflicts.
+    Matching version numbers, including the post-P2 execution sequence, do
+    not close either authority gap.
+    """
+    observed = read_current_d08_observed_versions(
+        db, namespace, snapshot, query, action_id, context, witness,
+        authority_snapshot, effect)
+    _map_current_d08_check_versions(
+        db, namespace, snapshot, query, intent, spec, receipt, observed,
+        now_utc=now_utc)
+    raise ValueError("D08 criteria issuer and semantic conflict policy unavailable")
 
 
 def read_current_d08_observed_versions(
@@ -658,6 +779,7 @@ def read_current_d08_action_conflict_evidence(
 __all__ = [
     "CurrentD08ActionConflictEvidenceV1", "CurrentD08ConflictFactsV1",
     "CurrentD08ObservedVersionsV1", "CurrentJobCancellationReadV1",
-    "read_current_d08_action_conflict_evidence", "read_current_d08_conflict_facts",
-    "read_current_d08_observed_versions", "read_current_job_cancellation",
+    "read_current_d08_action_conflict_evidence", "read_current_d08_check_versions",
+    "read_current_d08_conflict_facts", "read_current_d08_observed_versions",
+    "read_current_job_cancellation",
 ]
