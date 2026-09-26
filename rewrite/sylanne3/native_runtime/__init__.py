@@ -58,6 +58,12 @@ from .d04_candidate import (
     run_d04_fixed_block_box_trajectory_candidate,
     require_d04_production_readout,
 )
+from .d04_snapshot_compiler import (
+    D04FixedChainSnapshotCandidate,
+    D04NumericTopologyRow,
+    D04SnapshotHold,
+    compile_d04_fixed_chain_snapshot_candidate,
+)
 
 __all__ = [
     "ArithmeticReport",
@@ -104,4 +110,8 @@ __all__ = [
     "run_d04_fixed_block_candidate",
     "run_d04_fixed_block_box_trajectory_candidate",
     "require_d04_production_readout",
+    "D04FixedChainSnapshotCandidate",
+    "D04NumericTopologyRow",
+    "D04SnapshotHold",
+    "compile_d04_fixed_chain_snapshot_candidate",
 ]
