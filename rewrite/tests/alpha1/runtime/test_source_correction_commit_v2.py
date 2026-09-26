@@ -24,7 +24,10 @@ from sylanne3.memory_types import (
 )
 from sylanne3.workbench_api.source_correction import SourceCorrectionRequestV1
 from sylanne3.workbench_api import (
-    AuthenticatedSession, GraphWorkbenchIssuer, RequestContext, WorkbenchService,
+    AsyncGraphWorkbenchService, AuthenticatedSession,
+)
+from sylanne3.workbench_api.http_transport import (
+    SYLANNE_OWNER_SESSION_COOKIE, TransportConfig, WorkbenchHttpTransport,
 )
 
 from test_graph_v2_provisioning import _owner_issue_case
@@ -214,7 +217,8 @@ def test_source_correction_commits_atomic_bundle_and_replays_exact_receipt(tmp_p
         authority_db.close()
 
 
-def test_workbench_command_reaches_owner_fenced_correction_commit(tmp_path):
+@pytest.mark.asyncio
+async def test_workbench_http_command_reaches_owner_fenced_correction_commit(tmp_path):
     case, request, kwargs, _, _, _, _ = _case(tmp_path)
     store, authority_db, coordinator, namespace = case
     scope = "/".join(namespace.as_tuple)
@@ -232,6 +236,7 @@ def test_workbench_command_reaches_owner_fenced_correction_commit(tmp_path):
         {scope: frozenset({"workbench.correct"})},
         {scope: frozenset({"owner"})},
         {scope: frozenset({"workbench_user_action"})},
+        host_username="dashboard-admin",
         owner_session_token=kwargs["owner_session_token"],
         owner_session_request=kwargs["owner_session_request"],
     )
@@ -248,17 +253,51 @@ def test_workbench_command_reaches_owner_fenced_correction_commit(tmp_path):
             "deletion_epoch": request.deletion_epoch,
         },
     }
-    issuer = GraphWorkbenchIssuer(
-        coordinator, NoReadGrants(), NoViews(),
+    class InlineWorker:
+        async def call(self, callback, *args):
+            return callback(coordinator, *args)
+
+    class Sessions:
+        def resolve(self, *, username, session_hint):
+            return session if (username == "dashboard-admin"
+                               and session_hint == kwargs["owner_session_token"]) else None
+
+    class Csrf:
+        def validate(self, *, session, token):
+            return (session.actor_id == kwargs["actor_id"]
+                    and token == "checked-csrf")
+
+    class Request:
+        username = "dashboard-admin"
+        content_type = "application/json"
+        headers = {"origin": "https://dashboard.local", "x-csrf-token": "checked-csrf"}
+
+        def __init__(self):
+            self.cookies = {SYLANNE_OWNER_SESSION_COOKIE: kwargs["owner_session_token"]}
+
+        async def body(self):
+            return json.dumps(command).encode("utf-8")
+
+    async_service = AsyncGraphWorkbenchService(
+        InlineWorker(), NoReadGrants(), NoViews(),
         correction_installation_policy=kwargs["installation_policy"],
         correction_admin_policy=kwargs["admin_policy"],
     )
+    transport = WorkbenchHttpTransport(
+        async_service, Sessions(), Csrf(),
+        TransportConfig("https://dashboard.local", tmp_path),
+    )
     try:
-        response = WorkbenchService(issuer).handle(
-            command, session=session, context=RequestContext(True, True, True))
-        assert response.status == "ready"
-        assert response.receipt["phase"] == "source_correction_committed"
-        assert response.receipt["request_digest"] == request.request_digest
+        response = await transport.command(Request())
+        assert response["status"] == "ready", response
+        receipt = response["receipt"]
+        assert receipt["phase"] == "source_correction_committed"
+        assert receipt["request_digest"] == request.request_digest
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_bundle_operations WHERE operation_id=?",
+            (request.operation_id,)).fetchone() == (1,)
+        replay = await transport.command(Request())
+        assert replay["receipt"] == receipt
         assert store._db.execute(
             "SELECT COUNT(*) FROM graph_bundle_operations WHERE operation_id=?",
             (request.operation_id,)).fetchone() == (1,)
