@@ -10,13 +10,15 @@ from rewrite.host_tests.alpha1 import test_astrbot_model_call as model_fixture
 from rewrite.tests.alpha1.authority.test_v2_model_egress_store import intent as model_intent
 from rewrite.tests.alpha1.model.test_reply_language import _inputs
 from sylanne3.authority_service.v2_model_egress_contract import (
-    ModelEgressObservationV1, ModelEgressRecoveryV1, ModelTerminalReceiptV2,
+    ModelEgressDraftV1, ModelEgressObservationV1, ModelEgressRecoveryV1,
+    ModelTerminalReceiptV2,
 )
 from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.domains.d07 import AttentionTicket
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.host.installed_reply_model_driver import (
     execute_or_recover_reply_model_v1, freeze_reply_model_preparation_v1,
+    prepare_and_run_installed_reply_model_v1,
     parse_authority_reply_observation_v1, reply_model_operation_id_v1,
 )
 from sylanne3.host.model_egress_executor import HostModelEgressExecutor
@@ -48,7 +50,7 @@ def _preparation(bundle):
         authority=replace(base.envelope.authority, actor="worker", worker_fence=7),
         causation=(c02_op,))
     anchor = RestoreAnchor(
-        "authority", "bot:persona", 1, "deletion", 0, "genesis",
+        "authority", "bot/persona", 1, "deletion", 0, "genesis",
         "execution", 0, "genesis", 0, "proof")
     frozen = bundle.model_workflows.reply
     request_digest = None
@@ -56,6 +58,7 @@ def _preparation(bundle):
     installed = freeze_installed_reply_request_v1(envelope, source, bundle=bundle)
     request_digest = installed.request.digest
     intent = model_intent(
+        namespace="bot/persona",
         operation_id=operation_id, call_id=installed.request.call_id,
         request_digest=request_digest, subject="worker", worker_fence=7,
         anchor_digest=canonical_digest(asdict(anchor)),
@@ -183,5 +186,70 @@ async def test_completed_authority_observation_yields_only_source_claim_candidat
             parse_authority_reply_observation_v1(
                 prepared, observation=observation,
                 terminal=replace(terminal, observation_digest="f" * 64))
+    finally:
+        await host.asyncTearDown()
+
+
+@pytest.mark.asyncio
+async def test_graph_draft_requires_authority_model_permit_before_reply_attempt():
+    host = model_fixture.AstrBotModelCallTests(
+        methodName="test_one_http_request_on_host_loop_with_usage")
+    await host.asyncSetUp()
+    try:
+        bundle, _, _ = host.v2_adapters()
+        prepared = _preparation(bundle)
+        intent = prepared.intent
+        draft = ModelEgressDraftV1.from_intent(intent)
+        executor = object.__new__(HostModelEgressExecutor)
+        executor._bundle = bundle
+        executor._grant = SimpleNamespace(
+            authority_id=intent.authority_id,
+            installation_id=bundle.installation_policy.installation_id)
+        executor._adapter = SimpleNamespace(_admin_model=bundle.model_workflows.reply)
+        permit = FencePermitV2(
+            intent.authority_id, intent.namespace, intent.subject, "holder", 1,
+            "model_egress", intent.operation_id, intent.fence_token,
+            intent.fence_epoch, intent.fence_revision, prepared.expected_anchor)
+        calls = []
+
+        async def prepare(_self, _bundle, _grant, *, draft, expected_anchor):
+            calls.append("prepare")
+            return ModelEgressRecoveryV1(intent, "prepared"), permit
+
+        async def recover(_self, intent):
+            calls.append("recover")
+            return None
+
+        async def recover_fence(_self, _bundle, _grant, *, intent):
+            calls.append("recover_fence")
+            return ModelEgressRecoveryV1(intent, "prepared"), permit
+
+        async def execute(_self, *, intent, expected_anchor, request):
+            calls.append("execute")
+            assert request.digest == intent.request_digest
+            return None
+
+        executor._authority = SimpleNamespace(
+            model_prepare_fenced_v1=MethodType(prepare, object()),
+            model_recover_fenced_v1=MethodType(recover_fence, object()))
+        executor.recover_original_terminal = MethodType(recover, executor)
+        executor.execute_once = MethodType(execute, executor)
+        run = await prepare_and_run_installed_reply_model_v1(
+            c02_receipt=prepared.c02_receipt,
+            envelope=prepared.envelope, source=prepared.source,
+            attention=prepared.attention, focus_revision=prepared.focus_revision,
+            draft=draft, expected_anchor=prepared.expected_anchor,
+            executor=executor)
+        assert run is not None and run.terminal.status == "unresolved"
+        assert calls == ["prepare", "recover", "recover_fence", "execute"]
+        calls.clear()
+        assert await prepare_and_run_installed_reply_model_v1(
+            c02_receipt=prepared.c02_receipt,
+            envelope=prepared.envelope, source=prepared.source,
+            attention=prepared.attention, focus_revision=prepared.focus_revision,
+            draft=replace(draft, request_digest="0" * 64),
+            expected_anchor=prepared.expected_anchor,
+            executor=executor) is None
+        assert calls == []
     finally:
         await host.asyncTearDown()

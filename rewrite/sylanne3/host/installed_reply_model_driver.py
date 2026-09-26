@@ -11,7 +11,8 @@ from dataclasses import asdict, dataclass, replace
 import json
 
 from ..authority_service.v2_model_egress_contract import (
-    ModelEgressIntentV1, ModelEgressRecoveryV1, ModelTerminalReceiptV2,
+    ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
+    ModelTerminalReceiptV2,
 )
 from ..authority_service.v2_contract import FencePermitV2
 from ..authority_service.v2_reply_worker_model_result_contract import (
@@ -123,6 +124,95 @@ class ReplyModelTerminalHoldV1:
     call_id: str
     terminal: ModelTerminalReceiptV2 | None
     status: str  # observed_pending_result_read | unresolved
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledReplyModelRunV1:
+    preparation: FrozenReplyModelPreparationV1
+    terminal: ReplyModelTerminalHoldV1
+
+
+async def prepare_and_run_installed_reply_model_v1(
+    *, c02_receipt: CommitReceipt, envelope: CommandEnvelope,
+    source: ReplySourceSnapshot, attention: AttentionTicket,
+    focus_revision: int, draft: ModelEgressDraftV1,
+    expected_anchor: RestoreAnchor, executor: HostModelEgressExecutor,
+) -> InstalledReplyModelRunV1 | None:
+    """Pair a graph-issued draft, then attempt the same Authority call once.
+
+    A lost prepare response or mismatched live result is HOLD. The graph worker
+    must keep its original D11 lease through the later result-read and C02 reply.
+    """
+    if (type(draft) is not ModelEgressDraftV1
+            or type(executor) is not HostModelEgressExecutor
+            or type(source) is not ReplySourceSnapshot
+            or type(envelope) is not CommandEnvelope):
+        return None
+    bundle = executor._bundle
+    grant = executor._grant
+    if (type(bundle) is not AdminInstallationBundle
+            or bundle.model_workflows is None
+            or executor._adapter._admin_model is not bundle.model_workflows.reply
+            or grant.authority_id != bundle.installation_policy.expected_authority_id
+            or grant.installation_id != bundle.installation_policy.installation_id):
+        return None
+    try:
+        installed = freeze_installed_reply_request_v1(
+            envelope, source, bundle=bundle)
+    except (TypeError, ValueError):
+        return None
+    request = installed.request
+    source_id = source.source.source_id
+    if (draft.authority_id != grant.authority_id
+            or draft.namespace != bundle.installation_policy.authority_namespace
+            or draft.subject != envelope.authority.actor
+            or draft.operation_id != reply_model_operation_id_v1(
+                c02_receipt.operation_id, source.source_ref)
+            or draft.acquire_operation_id != draft.operation_id
+            or draft.binding_digest is None
+            or draft.call_id != request.call_id
+            or draft.request_digest != request.digest
+            or draft.worker_fence != envelope.authority.worker_fence
+            or draft.source_refs != (source_id,)
+            or draft.source_revisions != ((source_id, source.source_revision),)
+            or draft.access_revisions != ((source_id, source.access_revision),)
+            or draft.access_epoch != envelope.version_guard.access_epoch
+            or draft.delete_epoch != envelope.version_guard.delete_epoch
+            or draft.budget_lease_id != envelope.parent_budget_lease_ref
+            or draft.provider_id != request.provider_id
+            or draft.model_id != request.model_id
+            or draft.provider_config_digest != installed.provider_config_digest
+            or draft.max_output_tokens != request.max_output_tokens
+            or any(amount > installed.quote_ceiling.get(name, 0)
+                   for name, amount in draft.budget_ceiling)):
+        return None
+    try:
+        recovery, permit = await executor._authority.model_prepare_fenced_v1(
+            bundle, grant, draft=draft, expected_anchor=expected_anchor)
+    except Exception:
+        return None
+    if (type(recovery) is not ModelEgressRecoveryV1
+            or ModelEgressDraftV1.from_intent(recovery.intent) != draft
+            or type(permit) is not FencePermitV2
+            or permit.operation != "model_egress"
+            or permit.operation_id != draft.operation_id
+            or permit.pinned_anchor != expected_anchor
+            or (permit.token, permit.fence_epoch, permit.revision) != (
+                recovery.intent.fence_token,
+                recovery.intent.fence_epoch,
+                recovery.intent.fence_revision)):
+        return None
+    try:
+        preparation = freeze_reply_model_preparation_v1(
+            c02_receipt=c02_receipt, envelope=envelope, source=source,
+            attention=attention, focus_revision=focus_revision,
+            intent=recovery.intent, expected_anchor=expected_anchor,
+            bundle=bundle)
+        terminal = await execute_or_recover_reply_model_v1(
+            preparation, executor=executor)
+    except (TypeError, ValueError):
+        return None
+    return InstalledReplyModelRunV1(preparation, terminal)
 
 
 async def execute_or_recover_reply_model_v1(
@@ -274,4 +364,5 @@ __all__ = (
     "freeze_reply_model_preparation_v1", "ReplyModelTerminalHoldV1",
     "execute_or_recover_reply_model_v1", "parse_authority_reply_observation_v1",
     "read_and_parse_installed_reply_v1",
+    "InstalledReplyModelRunV1", "prepare_and_run_installed_reply_model_v1",
 )
