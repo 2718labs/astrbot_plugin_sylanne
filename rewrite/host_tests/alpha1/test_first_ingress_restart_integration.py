@@ -15,7 +15,9 @@ from sylanne3.host.authority_profile import (
     AdminD03ArrivalPolicy, AdminD03SelfIdentityProjectionPolicy,
 )
 from sylanne3.domains.d04 import AffectAxis, AffectProvider, AffectScheme
-from sylanne3.host.first_ingress_c02_driver import original_unacquired_handoff_v1
+from sylanne3.host.first_ingress_c02_driver import (
+    original_acquired_handoff_v1, original_unacquired_handoff_v1,
+)
 from sylanne3.host.ingress import IngressReceipt
 from sylanne3.host.v2_installation import V2InstallationAssembly
 from sylanne3.host.current_scene import CurrentHostScene
@@ -210,5 +212,12 @@ async def test_sqlite_restart_rehands_only_original_queued_ingress(host_projecti
                 acquired_bootstrap, namespace, acquire_id))
         assert recovered == acquired[0]
         assert original_envelope == envelope
+        runtime._worker = _GraphWorker(acquired_graph)
+        runtime._v2_bootstrap = acquired_bootstrap
+        assert await runtime.read_first_ingress_acquired_handoff_v1(
+            acquire_id) == (recovered, envelope)
+        assert original_acquired_handoff_v1(
+            recovered, original_envelope, installation) == (
+                trusted_umo, envelope, receipt)
     finally:
         reopened.close()

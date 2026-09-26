@@ -1112,7 +1112,60 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [(None, 50, 0), ("second-page", 50, 0)])
         self.assertEqual(observed, list(operations))
 
-    async def test_startup_c02_recovery_finishes_cost_before_unacquired_scan(self) -> None:
+    async def test_startup_acquired_scan_rechecks_original_before_c02(self) -> None:
+        module = load_plugin_module()
+        attempted = []
+        calls = []
+        first = types.SimpleNamespace(
+            recovery_state="original_fence", acquire_operation_id="acquire-1")
+        second = types.SimpleNamespace(
+            recovery_state="original_fence", acquire_operation_id="acquire-2")
+        expired = types.SimpleNamespace(
+            recovery_state="expired_lease_hold", acquire_operation_id="expired")
+        envelope = object()
+
+        class ControlledRuntime:
+            v2_ingress_qualified = True
+
+            async def first_ingress_c02_accounting_installed_v1(self):
+                return True
+
+            async def discover_committed_first_ingress_c02_cost_v1(
+                    self, *, cursor, limit):
+                calls.append((cursor, limit, len(attempted)))
+                if cursor is None:
+                    return types.SimpleNamespace(
+                        items=(first, expired), next_cursor="next-page")
+                return types.SimpleNamespace(items=(second,), next_cursor=None)
+
+            async def read_first_ingress_acquired_handoff_v1(self, acquire_id):
+                attempted.append(("read", acquire_id))
+                return ((first if acquire_id == "acquire-1" else second), envelope)
+
+        async def driver(runtime, installation, trusted, observed_envelope,
+                         receipt, *, original_recovery):
+            attempted.append(("c02", original_recovery.acquire_operation_id))
+            self.assertEqual(observed_envelope, envelope)
+            self.assertEqual(receipt.status, "accepted")
+
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None,
+                    None, None, None, None, None), {"enabled": True})
+        plugin._runtime = ControlledRuntime()
+        plugin._v2_installation = object()
+        plugin._run_first_ingress_c02 = driver
+        with patch.object(module, "installed_first_ingress_c02_pairing_ready_v1",
+                          new=AsyncMock(return_value=True)), \
+                patch.object(module, "original_acquired_handoff_v1",
+                             side_effect=lambda item, original, installation: (
+                                 "trusted", original, IngressReceipt("accepted", "ingress"))):
+            await plugin._restore_acquired_first_ingress_c02_v1()
+        self.assertEqual(calls, [(None, 50, 0), ("next-page", 50, 0)])
+        self.assertEqual(attempted, [
+            ("read", "acquire-1"), ("c02", "acquire-1"),
+            ("read", "acquire-2"), ("c02", "acquire-2")])
+
+    async def test_startup_c02_recovery_orders_cost_acquired_and_unacquired(self) -> None:
         module = load_plugin_module()
         plugin = module.Sylanne3Plugin(
             Context(asyncio.Queue(), {}, None, None, None, None,
@@ -1132,14 +1185,18 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         async def unacquired():
             order.append("unacquired")
 
+        async def acquired():
+            order.append("acquired")
+
         plugin._restore_committed_first_ingress_c02_cost_v1 = cost
+        plugin._restore_acquired_first_ingress_c02_v1 = acquired
         plugin._restore_unacquired_first_ingress_c02_v1 = unacquired
         scan = asyncio.create_task(plugin._run_startup_c02_recovery_v1())
         await asyncio.wait_for(cost_started.wait(), 1)
         self.assertEqual(order, ["cost-start"])
         release_cost.set()
         await asyncio.wait_for(scan, 1)
-        self.assertEqual(order, ["cost-start", "cost-done", "unacquired"])
+        self.assertEqual(order, ["cost-start", "cost-done", "acquired", "unacquired"])
 
     async def test_limited_installed_v2_ingress_never_claims_receipt_as_reply(self) -> None:
         module = load_plugin_module()

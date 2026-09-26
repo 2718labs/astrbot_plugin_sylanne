@@ -75,8 +75,10 @@ async def test_explicit_c02_driver_uses_paired_bundle_and_holds_without_it(
         runtime = RuntimeContext(tmp_path, dependencies=None)
         calls = []
 
-        async def commit(self, observed_envelope, observed_receipt, *, executor):
+        async def commit(self, observed_envelope, observed_receipt, *,
+                         executor, original_recovery=None):
             calls.append((observed_envelope, observed_receipt))
+            assert original_recovery is None
             assert type(executor) is HostModelEgressExecutor
             assert executor._bundle is bundle and executor._grant == grant
             return committed

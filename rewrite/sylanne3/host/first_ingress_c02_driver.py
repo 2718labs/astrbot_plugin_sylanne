@@ -9,7 +9,9 @@ from astrbot.api.star import Context
 
 from ..model_broker.broker import ModelProviderDescriptor
 from ..runtime_context import RuntimeContext
+from ..runtime.first_ingress_recovery import FirstIngressRecoveryItemV1
 from ..runtime.first_ingress_unacquired import FirstIngressUnacquiredItemV1
+from ..runtime.first_ingress_v2 import ingress_ids
 from ..runtime_contracts import CommitReceipt, InstallationGrantV2
 from .astrbot_model_call import AstrBotModelProvider
 from .authority_client import AuthorityClient, AuthoritySelection
@@ -45,6 +47,35 @@ def original_unacquired_handoff_v1(
             IngressReceipt("accepted", item.original_operation_id))
 
 
+def original_acquired_handoff_v1(
+    item: FirstIngressRecoveryItemV1,
+    envelope: HostIngressEnvelope,
+    installation: V2InstallationAssembly,
+) -> tuple[str, HostIngressEnvelope, IngressReceipt] | None:
+    """Restore the original host identity for a graph-qualified V3 lease."""
+    if (type(item) is not FirstIngressRecoveryItemV1
+            or item.recovery_state != "original_fence"
+            or type(envelope) is not HostIngressEnvelope
+            or type(installation) is not V2InstallationAssembly
+            or item.installation_id != installation.installation_grant.installation_id
+            or item.namespace != installation.installation_policy.namespace
+            or envelope.namespace != item.namespace):
+        return None
+    _, _, original_id, job_id, _, _ = ingress_ids(
+        envelope.lineage.source_ref)
+    if (item.original_operation_id, item.job_id) != (original_id, job_id):
+        return None
+    try:
+        conversation = json.loads(envelope.conversation_ref)
+    except (TypeError, ValueError):
+        return None
+    if (type(conversation) is not list or len(conversation) != 2
+            or type(conversation[0]) is not str or not conversation[0]
+            or type(conversation[1]) is not str or not conversation[1]):
+        return None
+    return conversation[0], envelope, IngressReceipt("accepted", original_id)
+
+
 async def installed_first_ingress_c02_pairing_ready_v1(
     installation: V2InstallationAssembly,
 ) -> bool:
@@ -76,6 +107,7 @@ async def run_installed_first_ingress_c02_v1(
     runtime: RuntimeContext, installation: V2InstallationAssembly, *,
     context: Context, trusted_umo: str, envelope: HostIngressEnvelope,
     receipt: IngressReceipt,
+    original_recovery: FirstIngressRecoveryItemV1 | None = None,
 ) -> CommitReceipt | None:
     """Keep one live D11 lease through model, cost, read and C02 adoption."""
     if (type(runtime) is not RuntimeContext
@@ -84,7 +116,10 @@ async def run_installed_first_ingress_c02_v1(
             or type(trusted_umo) is not str or not trusted_umo
             or type(envelope) is not HostIngressEnvelope
             or type(receipt) is not IngressReceipt
-            or receipt.status != "accepted"):
+            or receipt.status != "accepted"
+            or original_recovery is not None and (
+                type(original_recovery) is not FirstIngressRecoveryItemV1
+                or original_recovery.recovery_state != "original_fence")):
         return None
     try:
         conversation = json.loads(envelope.conversation_ref)
@@ -134,7 +169,8 @@ async def run_installed_first_ingress_c02_v1(
             authority=client, bundle=bundle, grant=grant, adapter=adapter)
         try:
             return await runtime.commit_first_ingress_c02_v1(
-                envelope, receipt, executor=executor)
+                envelope, receipt, executor=executor,
+                original_recovery=original_recovery)
         except asyncio.CancelledError:
             await adapter.abort_local_dispatches()
             raise
@@ -149,5 +185,6 @@ async def run_installed_first_ingress_c02_v1(
 __all__ = (
     "run_installed_first_ingress_c02_v1",
     "original_unacquired_handoff_v1",
+    "original_acquired_handoff_v1",
     "installed_first_ingress_c02_pairing_ready_v1",
 )

@@ -29,6 +29,7 @@ from sylanne3.authority_service.v2_worker_model_result_contract import (
 from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
 from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.runtime.first_ingress_v2 import ingress_ids
+from sylanne3.runtime.first_ingress_recovery import FirstIngressRecoveryItemV1
 from sylanne3.runtime.original_model_result_context import OriginalModelResultContextV1
 from sylanne3.runtime_context import RuntimeContext
 from sylanne3.runtime_contracts import (
@@ -326,6 +327,8 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
         receipt = IngressReceipt("accepted", ingress_op)
         original_context = None
         order = []
+        expected_releases = 2
+        cost_status = "committed"
 
         class Graph:
             def grant(self, _bootstrap, **kwargs):
@@ -349,7 +352,8 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
                 assert 120 < lease_seconds <= 420
                 if not getattr(self, "baseline_committed", False):
                     raise RuntimeError("committed D03/D04 baseline unavailable")
-                return SimpleNamespace(fence=1)
+                return SimpleNamespace(
+                    fence=1, lease_expires_utc="2099-01-01T00:00:00Z")
 
             def read_first_ingress_model_egress_preparation_v2(
                 self, auth, lease, acquired_job, acquire_id,
@@ -363,7 +367,7 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
             ):
                 assert acquired_job == job_id and acquire_id == self.acquire_id
                 assert lease is self.lease and auth.worker_fence == 1
-                assert self.releases == 2
+                assert self.releases == expected_releases
                 order.append("context")
                 return original_context
 
@@ -380,7 +384,7 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
                 assert installation_policy is bundle.installation_policy
                 assert admin_policy is bundle.d06_first_ingress_c02
                 assert clock_policy is bundle.ingress_clock
-                assert self.releases == 2
+                assert self.releases == expected_releases
                 order.append("c02")
                 return self.c02_result
 
@@ -478,15 +482,15 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
 
         async def settle_cost(self, result):
             order.append("cost")
-            assert result.intent == intent and graph.releases == 2
-            return SimpleNamespace(status="committed", call_id=intent.call_id)
+            assert result.intent == intent and graph.releases == expected_releases
+            return SimpleNamespace(status=cost_status, call_id=intent.call_id)
 
         executor.execute_frozen_encoding_once = MethodType(execute_observed, executor)
         runtime.commit_first_ingress_model_cost_v1 = MethodType(settle_cost, runtime)
 
         async def read_original(self, *, read_request, intent, terminal):
             order.append("read")
-            assert graph.releases == 2
+            assert graph.releases == expected_releases
             assert intent == prepared_intent and terminal == terminal_receipt
             assert read_request == first_ingress_worker_result_request_v1(
                 original_context)
@@ -505,5 +509,35 @@ async def test_committed_ingress_acquires_original_job_then_reads_preparation(
             ["c02"] if read_mode != "wrong_consumer" else [])
         assert graph.releases == 3
         assert host.requests == []
+
+        if read_mode == "original":
+            recovery = FirstIngressRecoveryItemV1(
+                envelope.namespace, grant.installation_id, job_id,
+                original_context.acquire_operation_id, ingress_op,
+                intent.call_id, original_context.binding_digest,
+                intent.request_digest, consumer_id, "running",
+                grant.subject, 1, original_context.worker_lease_expires_utc,
+                "original_fence", None, None)
+            expected_releases = 3
+            cost_status = "duplicate"
+            order.clear()
+
+            async def forbidden_new_egress(self, *args, **kwargs):
+                pytest.fail("recovery attempted a new model egress")
+
+            async def recover_original(self, *, context, original):
+                assert context == original_context and original == recovery
+                order.append("recover")
+                return FrozenEncodingEgressResult(intent, terminal_receipt)
+
+            runtime.execute_first_ingress_encoding_v2 = MethodType(
+                forbidden_new_egress, runtime)
+            executor.recover_observed_frozen_encoding = MethodType(
+                recover_original, executor)
+            assert await runtime.commit_first_ingress_c02_v1(
+                envelope, receipt, executor=executor,
+                original_recovery=recovery) == c02_receipt
+            assert order == ["context", "recover", "cost", "context", "read", "c02"]
+            assert graph.releases == 4 and host.requests == []
     finally:
         await host.asyncTearDown()

@@ -121,6 +121,18 @@ def test_acquired_handoff_reads_original_content_only_while_live(c02_case):
             bootstrap, namespace, item.acquire_operation_id)
 
 
+def test_original_v3_acquire_replays_after_model_cost_settlement(c02_case):
+    _, coordinator, bootstrap, namespace, _, _, intent, read, _ = c02_case
+    authority, lease = _worker(
+        coordinator, bootstrap, namespace,
+        operation_id=intent.acquire_operation_id)
+    job = coordinator.acquire_first_ingress_encoding_job_v3(
+        authority, lease, read.request.job_id,
+        intent.acquire_operation_id, lease_seconds=30)
+    assert job.phase == "running"
+    assert job.fence == intent.worker_fence
+
+
 def test_recovery_two_original_v3_jobs_are_discoverable(c02_case):
     _, coordinator, bootstrap, namespace, _, _, _, _, _ = c02_case
     _, job_id, _ = _add_second_v3_job(c02_case)

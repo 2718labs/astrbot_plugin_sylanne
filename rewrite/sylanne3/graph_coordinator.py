@@ -7933,11 +7933,13 @@ class GraphCoordinator:
 
     def _qualified_first_ingress_acquire_return(
         self, namespace: NamespaceId, job_id: str, expected: PersistentJob,
-        actor: str, clock, lease_seconds: int,
+        actor: str, clock, lease_seconds: int, *,
+        original_context_verified: bool = False,
     ) -> PersistentJob:
         from datetime import datetime, timezone
 
         from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import IssuerAuthorityDenied
 
         try:
             now = trusted_upper(clock)
@@ -7945,12 +7947,16 @@ class GraphCoordinator:
                 "+00:00", "Z")
             with self.__store._lock:
                 current = self._first_ingress_encoding_job_locked(namespace, job_id)[0]
-                self.__d11_issuer.authorize_existing_encoding_job(
-                    self.__store._db, current, now_utc=now)
+                if not original_context_verified:
+                    self.__d11_issuer.authorize_existing_encoding_job(
+                        self.__store._db, current, now_utc=now)
             if (current != expected or current.lease_holder != actor
                     or plan_job_acquire(current, actor, now_utc=now_text,
                                         lease_seconds=lease_seconds) != current):
                 raise UnavailableGuard("job acquire result lost runnable eligibility; HOLD")
+        except IssuerAuthorityDenied as exc:
+            raise UnavailableGuard(
+                "job acquire lost original signed authority; HOLD") from exc
         except Exception as exc:
             raise UnavailableGuard("job acquire result lost runnable eligibility; HOLD") from exc
         return current
@@ -8496,12 +8502,6 @@ class GraphCoordinator:
                      current_access) = self._first_ingress_encoding_job_locked(
                          namespace, job_id)
                     current_stamp = self._v2_graph_stamp(namespace)
-                    try:
-                        self.__d11_issuer.authorize_existing_encoding_job(
-                            store._db, current, now_utc=replay_now)
-                    except Exception as exc:
-                        raise UnavailableGuard(
-                            "replayed job lost its signed authority; HOLD") from exc
                     if frozen_binding is not None:
                         self._validate_first_ingress_encoding_binding_context(
                             namespace, current, current_outbox,
@@ -8530,9 +8530,27 @@ class GraphCoordinator:
                         raise UnavailableGuard("job acquire permit changed")
                     port.finish_fence(scope, request_id=receipt[7],
                                       request_digest=receipt[8])
+                if frozen_binding is not None and frozen_binding.request.get(
+                        "schema") == "sylanne.first-ingress-encoding-call.v3":
+                    # Replaying V3 is not new budget admission. Its model cost
+                    # may have settled the reservation. The result context
+                    # rechecks signed provenance and current content under a
+                    # new read fence without requiring reserved state.
+                    original_context = (
+                        self.read_first_ingress_original_model_result_context_v1(
+                            replace(authority, worker_fence=historical.fence),
+                            lease, job_id, acquire_operation_id))
+                    if (original_context.original_operation_id
+                            != historical.operation_id
+                            or original_context.worker_actor != authority.actor
+                            or original_context.worker_fence != historical.fence
+                            or original_context.call_id != durable_binding.call_id):
+                        raise UnavailableGuard("replayed job original context differs; HOLD")
                 return self._qualified_first_ingress_acquire_return(
                     namespace, job_id, historical, authority.actor, clock,
-                    lease_seconds)
+                    lease_seconds, original_context_verified=(
+                        frozen_binding is not None and frozen_binding.request.get(
+                            "schema") == "sylanne.first-ingress-encoding-call.v3"))
             if (rejection[0] != "rejected_no_commit"
                     or rejection[2:4] != intent[12:14]
                     or rejection[4:6] != finish_identity(permit, rejected=True)):

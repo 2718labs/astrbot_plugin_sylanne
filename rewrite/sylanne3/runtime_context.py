@@ -58,7 +58,9 @@ from .model_broker.first_ingress_encoding import (
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.first_ingress_v2 import ingress_ids
 from .runtime.first_ingress_unacquired import FirstIngressUnacquiredPageV1
-from .runtime.first_ingress_recovery import FirstIngressRecoveryPageV1
+from .runtime.first_ingress_recovery import (
+    FirstIngressRecoveryItemV1, FirstIngressRecoveryPageV1,
+)
 from .runtime.original_model_result_context import OriginalModelResultContextV1
 from .runtime.restore_anchor import ExecutionJournalPort
 from .runtime_contracts import (
@@ -1041,6 +1043,7 @@ class RuntimeContext:
     async def acquired_first_ingress_encoding_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
         executor: HostModelEgressExecutor,
+        original_recovery: FirstIngressRecoveryItemV1 | None = None,
     ) -> AsyncIterator[AcquiredFirstIngressEncodingV2 | None]:
         """Acquire only baseline-backed V3 work and keep its D11 lease alive.
 
@@ -1064,6 +1067,19 @@ class RuntimeContext:
         _, _, ingress_operation_id, job_id, _, _ = ingress_ids(
             envelope.lineage.source_ref)
         if receipt.operation_id != ingress_operation_id:
+            yield None
+            return
+        if original_recovery is not None and (
+                type(original_recovery) is not FirstIngressRecoveryItemV1
+                or original_recovery.recovery_state != "original_fence"
+                or original_recovery.namespace != envelope.namespace
+                or original_recovery.installation_id
+                   != self._v2_installation_grant.installation_id
+                or original_recovery.job_id != job_id
+                or original_recovery.original_operation_id
+                   != ingress_operation_id
+                or original_recovery.original_worker_actor
+                   != self._v2_installation_grant.subject):
             yield None
             return
         workflow = self._v2_model_bundle.model_workflows.encode
@@ -1090,6 +1106,8 @@ class RuntimeContext:
             acquire_id = first_ingress_encoding_acquire_operation_id(
                 policy.namespace, job_id, ingress_operation_id,
                 actor, generation, attempt_nonce)
+            if original_recovery is not None:
+                acquire_id = original_recovery.acquire_operation_id
             lease, capability_ref = graph.grant(
                 bootstrap, actor=actor, issuer_domain="d11",
                 namespace=policy.namespace, domains=("d11",),
@@ -1104,6 +1122,11 @@ class RuntimeContext:
                 job = graph.acquire_first_ingress_encoding_job_v3(
                     authority, lease, job_id, acquire_id,
                     lease_seconds=lease_seconds)
+                if original_recovery is not None and (
+                        job.fence != original_recovery.original_worker_fence
+                        or job.lease_expires_utc !=
+                           original_recovery.original_worker_lease_expires_utc):
+                    raise UnavailableGuard("original worker lease differs; HOLD")
             except BaseException:
                 graph.release_authority_lease(bootstrap, lease)
                 raise
@@ -1145,6 +1168,7 @@ class RuntimeContext:
     async def prepared_first_ingress_worker_result_v1(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
         executor: HostModelEgressExecutor,
+        original_recovery: FirstIngressRecoveryItemV1 | None = None,
     ) -> AsyncIterator[PreparedFirstIngressWorkerResultV1 | None]:
         """Hold the one worker lease through egress, accounting and result read.
 
@@ -1153,19 +1177,29 @@ class RuntimeContext:
         This scope is not scheduled until the upstream D04 baseline is committed.
         """
         async with self.acquired_first_ingress_encoding_v2(
-                envelope, receipt, executor=executor) as acquired:
+                envelope, receipt, executor=executor,
+                original_recovery=original_recovery) as acquired:
             if acquired is None:
                 yield None
                 return
-            egress = await self.execute_first_ingress_encoding_v2(
-                acquired.authority, acquired.lease, acquired.job_id,
-                acquired.acquire_operation_id, executor=executor)
+            if original_recovery is None:
+                egress = await self.execute_first_ingress_encoding_v2(
+                    acquired.authority, acquired.lease, acquired.job_id,
+                    acquired.acquire_operation_id, executor=executor)
+            else:
+                original_context = (
+                    await self.read_first_ingress_original_model_result_context_v1(
+                        acquired))
+                egress = (None if original_context is None else
+                    await executor.recover_observed_frozen_encoding(
+                        context=original_context, original=original_recovery))
             if (type(egress) is not FrozenEncodingEgressResult
                     or egress.terminal is None):
                 yield None
                 return
             cost = await self.commit_first_ingress_model_cost_v1(egress)
-            if (cost is None or getattr(cost, "status", None) != "committed"
+            if (cost is None or getattr(cost, "status", None)
+                    not in {"committed", "duplicate"}
                     or getattr(cost, "call_id", None) != egress.intent.call_id):
                 yield None
                 return
@@ -1220,6 +1254,7 @@ class RuntimeContext:
     async def commit_first_ingress_c02_v1(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
         executor: HostModelEgressExecutor,
+        original_recovery: FirstIngressRecoveryItemV1 | None = None,
     ) -> CommitReceipt | None:
         """Commit C02 while the original V3 worker lease and read remain live."""
         bundle = self._v2_model_bundle
@@ -1234,7 +1269,8 @@ class RuntimeContext:
                 or self._v2_cost_transport is None):
             return None
         async with self.prepared_first_ingress_worker_result_v1(
-                envelope, receipt, executor=executor) as prepared:
+                envelope, receipt, executor=executor,
+                original_recovery=original_recovery) as prepared:
             if prepared is None:
                 return None
             try:
@@ -1366,6 +1402,35 @@ class RuntimeContext:
                 or page.next_cursor == cursor):
             return None
         return page
+
+    async def read_first_ingress_acquired_handoff_v1(
+        self, acquire_operation_id: str,
+    ) -> tuple[FirstIngressRecoveryItemV1, HostIngressEnvelope] | None:
+        """Requalify an original running V3 job before host recovery."""
+        if (type(acquire_operation_id) is not str
+                or not acquire_operation_id
+                or self._worker is None or self._v2_bootstrap is None
+                or not self._v2_namespace_provisioned
+                or self._v2_namespace is None
+                or self._v2_installation_grant is None):
+            return None
+        try:
+            item, envelope = await self._worker.call(
+                lambda graph: graph.read_first_ingress_acquired_handoff_v1(
+                    self._v2_bootstrap, self._v2_namespace,
+                    acquire_operation_id))
+        except Exception:
+            return None
+        if (type(item) is not FirstIngressRecoveryItemV1
+                or item.recovery_state != "original_fence"
+                or item.acquire_operation_id != acquire_operation_id
+                or item.namespace != self._v2_namespace
+                or item.installation_id
+                   != self._v2_installation_grant.installation_id
+                or type(envelope) is not HostIngressEnvelope
+                or envelope.namespace != item.namespace):
+            return None
+        return item, envelope
 
     async def run_committed_first_ingress_encoding_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,

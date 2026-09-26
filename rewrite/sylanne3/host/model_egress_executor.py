@@ -1,7 +1,7 @@
 """One Authority-admitted local model attempt and designated host observation.
 
-This is an independent host slice. No Broker or plugin route calls it yet.
-Only the paired Authority v2 response may supply the local start identity.
+The installed first-ingress route uses this executor. Only a paired Authority
+response may supply the local start identity; recovery reads the original fact.
 """
 
 from __future__ import annotations
@@ -31,8 +31,14 @@ from ..runtime.encoding_call_binding import (
     CommittedEncodingBaselineV1, EncodingCallBinding, EncodingCallConflict,
     binding_to_json,
 )
+from ..runtime.c02_cost_settlement import C02OriginalIntentLookupV1
+from ..runtime.first_ingress_c02_identity import (
+    first_ingress_c02_consumer_operation_id_v1,
+)
+from ..runtime.first_ingress_recovery import FirstIngressRecoveryItemV1
+from ..runtime.original_model_result_context import OriginalModelResultContextV1
 from ..runtime.restore_anchor import RestoreAnchor
-from ..runtime_contracts import InstallationGrantV2, canonical_serialize
+from ..runtime_contracts import InstallationGrantV2, canonical_digest, canonical_serialize
 from .astrbot_model_call import AstrBotModelProvider, LocalModelAdmission
 from .authority_client import AuthorityClient
 from .authority_profile import (
@@ -226,6 +232,81 @@ class HostModelEgressExecutor:
                 or record.state != "observed"):
             return None
         return receipt
+
+    async def recover_observed_frozen_encoding(
+        self, *, context: OriginalModelResultContextV1,
+        original: FirstIngressRecoveryItemV1,
+    ) -> FrozenEncodingEgressResult | None:
+        """Resume only an Authority-observed original call; never admit/send."""
+        if (type(original) is not FirstIngressRecoveryItemV1
+                or type(context) is not OriginalModelResultContextV1
+                or original.recovery_state != "original_fence"
+                or original.namespace != self._bundle.installation_policy.namespace
+                or original.installation_id != self._grant.installation_id
+                or (original.namespace, original.installation_id,
+                    original.job_id, original.acquire_operation_id,
+                    original.original_operation_id, original.call_id,
+                    original.binding_digest, original.model_request_digest,
+                    original.original_worker_actor,
+                    original.original_worker_fence,
+                    original.original_worker_lease_expires_utc) != (
+                    context.namespace, context.installation_id,
+                    context.job_id, context.acquire_operation_id,
+                    context.original_operation_id, context.call_id,
+                    context.binding_digest, context.model_request_digest,
+                    context.worker_actor, context.worker_fence,
+                    context.worker_lease_expires_utc)
+                or original.consumer_operation_id !=
+                   first_ingress_c02_consumer_operation_id_v1(
+                       namespace=context.namespace,
+                       authority_id=context.authority_id,
+                       authority_namespace=context.authority_namespace,
+                       installation_id=context.installation_id,
+                       job_id=context.job_id,
+                       acquire_operation_id=context.acquire_operation_id,
+                       original_operation_id=context.original_operation_id,
+                       call_id=context.call_id,
+                       binding_digest=context.binding_digest,
+                       model_request_digest=context.model_request_digest)):
+            return None
+        if (context.authority_id != self._grant.authority_id
+                or context.authority_namespace !=
+                   self._bundle.installation_policy.authority_namespace):
+            return None
+        lookup = C02OriginalIntentLookupV1(
+            context.namespace, context.authority_id,
+            context.authority_namespace, context.installation_id,
+            context.job_id, context.original_operation_id,
+            context.acquire_operation_id, context.call_id,
+            context.binding_digest, context.model_request_digest,
+            original.consumer_operation_id)
+        try:
+            intent = await self._authority.model_original_intent_lookup_v1(
+                self._bundle, self._grant, lookup=lookup)
+        except Exception:
+            return None
+        if (type(intent) is not ModelEgressIntentV1
+                or (intent.authority_id, intent.namespace,
+                    intent.job_id, intent.operation_id,
+                    intent.acquire_operation_id, intent.call_id,
+                    intent.binding_digest, intent.request_digest,
+                    intent.budget_reservation_operation_id,
+                    intent.subject, intent.worker_fence,
+                    intent.source_refs, intent.source_revisions,
+                    intent.access_revisions) != (
+                    context.authority_id, context.authority_namespace,
+                    context.job_id, context.acquire_operation_id,
+                    context.acquire_operation_id, context.call_id,
+                    context.binding_digest, context.model_request_digest,
+                    context.original_operation_id,
+                    context.worker_actor, context.worker_fence,
+                    (context.source_id,),
+                    ((context.source_id, context.source_revision),),
+                    ((context.source_id, context.access_revision),))
+                or intent.anchor_digest != canonical_digest(asdict(context.anchor))):
+            return None
+        return FrozenEncodingEgressResult(
+            intent, await self.recover_original_terminal(intent))
 
     async def read_original_for_owner(
         self, *, binding: EncodingCallBinding, draft: ModelEgressDraftV1,

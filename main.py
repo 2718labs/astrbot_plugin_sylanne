@@ -28,6 +28,7 @@ from .rewrite.sylanne3.host.installed_scene_identity import InstalledSceneIdenti
 from .rewrite.sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
 from .rewrite.sylanne3.host.first_ingress_c02_driver import (
     installed_first_ingress_c02_pairing_ready_v1,
+    original_acquired_handoff_v1,
     original_unacquired_handoff_v1,
     run_installed_first_ingress_c02_v1,
 )
@@ -37,6 +38,7 @@ from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
 from .rewrite.sylanne3.runtime_context import (
     FirstIngressPreEncodingStagesV1, RuntimeContext, RuntimeHealth,
 )
+from .rewrite.sylanne3.runtime.first_ingress_recovery import FirstIngressRecoveryItemV1
 from .rewrite.sylanne3.runtime_contracts import NamespaceId, canonical_digest
 from .rewrite.sylanne3.workbench_api.current_onboarding import CurrentOnboardingResolver
 from .rewrite.sylanne3.workbench_api.d01_onboarding import CurrentD01OnboardingResolver
@@ -353,11 +355,13 @@ class Sylanne3Plugin(Star):
     async def _run_first_ingress_c02(
         self, runtime: RuntimeContext, installation: V2InstallationAssembly,
         trusted_umo: str, envelope, receipt: IngressReceipt,
+        original_recovery: FirstIngressRecoveryItemV1 | None = None,
     ) -> None:
         try:
             committed = await run_installed_first_ingress_c02_v1(
                 runtime, installation, context=self.context,
                 trusted_umo=trusted_umo, envelope=envelope, receipt=receipt,
+                original_recovery=original_recovery,
             )
             if committed is None:
                 logger.warning("Sylanne 3 first encoding C02 remains HOLD")
@@ -435,7 +439,74 @@ class Sylanne3Plugin(Star):
         # before an unacquired job's V3 acquire can advance the graph stamp.
         await self._restore_committed_first_ingress_c02_cost_v1()
         if not self._encoding_stopping:
+            await self._restore_acquired_first_ingress_c02_v1()
+        if not self._encoding_stopping:
             await self._restore_unacquired_first_ingress_c02_v1()
+
+    async def _restore_acquired_first_ingress_c02_v1(self) -> None:
+        runtime = self._runtime
+        installation = self._v2_installation
+        try:
+            if (self._encoding_stopping or runtime is None or installation is None
+                    or getattr(runtime, "v2_ingress_qualified", False) is not True
+                    or not await runtime.first_ingress_c02_accounting_installed_v1()
+                    or not await installed_first_ingress_c02_pairing_ready_v1(
+                        installation)):
+                return
+            # Collect original keys before any C02 write changes the V1 cursor.
+            with tempfile.SpooledTemporaryFile(
+                    max_size=131_072, mode="w+t", encoding="ascii") as ids:
+                cursor = None
+                seen_cursors = set()
+                while not self._encoding_stopping:
+                    page = await runtime.discover_committed_first_ingress_c02_cost_v1(
+                        cursor=cursor, limit=50)
+                    if page is None:
+                        logger.warning(
+                            "Sylanne 3 acquired first encoding discovery unavailable; HOLD")
+                        return
+                    for item in page.items:
+                        if item.recovery_state == "original_fence":
+                            operation_id = item.acquire_operation_id
+                            if (len(operation_id) > 128
+                                    or "\n" in operation_id or "\r" in operation_id):
+                                logger.warning(
+                                    "Sylanne 3 acquired first encoding identity invalid; HOLD")
+                                return
+                            ids.write(operation_id + "\n")
+                    cursor = page.next_cursor
+                    if cursor is None:
+                        break
+                    if cursor in seen_cursors:
+                        logger.warning(
+                            "Sylanne 3 acquired first encoding cursor repeated; HOLD")
+                        return
+                    seen_cursors.add(cursor)
+                ids.seek(0)
+                for line in ids:
+                    if self._encoding_stopping:
+                        return
+                    handoff = await runtime.read_first_ingress_acquired_handoff_v1(
+                        line.rstrip("\n"))
+                    if handoff is None:
+                        logger.warning(
+                            "Sylanne 3 acquired first encoding recheck unavailable; HOLD")
+                        continue
+                    item, envelope = handoff
+                    original = original_acquired_handoff_v1(
+                        item, envelope, installation)
+                    if original is None:
+                        logger.warning(
+                            "Sylanne 3 acquired first encoding host identity invalid; HOLD")
+                        continue
+                    trusted_umo, envelope, receipt = original
+                    await self._run_first_ingress_c02(
+                        runtime, installation, trusted_umo, envelope, receipt,
+                        original_recovery=item)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Sylanne 3 acquired first encoding scan failed; HOLD")
 
     async def _restore_committed_first_ingress_c02_cost_v1(self) -> None:
         runtime = self._runtime
