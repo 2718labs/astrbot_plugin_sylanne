@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import warnings
 import zipfile
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "build_plugin_package.py"
@@ -927,6 +928,25 @@ class PluginPackageTests(unittest.TestCase):
                 output_dir=self.base / "bad-windows-arch",
                 allow_dirty_dev_probe=True,
             )
+
+    def test_rejects_native_library_symlink_before_resolving_it(self) -> None:
+        target = self._native()
+        link = self.base / "native-link.dll"
+        original_is_symlink = Path.is_symlink
+
+        def is_symlink(path: Path) -> bool:
+            return path == link or original_is_symlink(path)
+
+        with patch.object(Path, "is_symlink", is_symlink):
+            with self.assertRaisesRegex(FileNotFoundError, "native library is missing or unsafe"):
+                self.builder.build_package(
+                    project_root=self.project,
+                    target_os="windows",
+                    target_arch="x86_64",
+                    native_library=link,
+                    output_dir=self.base / "symlink-native",
+                    allow_dirty_dev_probe=True,
+                )
 
     def test_dev_probe_covers_each_frozen_os_architecture_target(self) -> None:
         targets = (

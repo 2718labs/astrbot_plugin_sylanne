@@ -598,7 +598,10 @@ def build_package(
     """Build a deterministic ZIP and return its absolute path."""
 
     root = Path(project_root).resolve()
-    native = Path(native_library).resolve()
+    native_input = Path(native_library)
+    if native_input.is_symlink():
+        raise FileNotFoundError(f"native library is missing or unsafe: {native_input}")
+    native = native_input.resolve()
     destination = Path(output_dir).resolve()
     if target_os not in TARGETS:
         raise ValueError(f"unsupported target OS: {target_os!r}")
