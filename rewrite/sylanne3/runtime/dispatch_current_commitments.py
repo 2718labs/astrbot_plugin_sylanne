@@ -15,6 +15,7 @@ from .d11_types import job_graph_write
 from .dispatch_action_job_binding import load_action_job_binding
 from .dispatch_admission import load_admission
 from .jobs import JobConflict, PersistentJob, get_job
+from .dispatch_source_correction_barrier import read_source_correction_barrier
 
 
 _TYPES = (
@@ -248,11 +249,24 @@ def read_current_d08_conflict_facts(
                           (intents, "action_id"), (outcomes, "outcome_id")):
         if len({getattr(value, field) for value in values}) != len(values):
             raise ValueError(f"D08 {field} repeats across graph owners")
+    missing = ["atomic_execution_effect_read", "current_action_cancellation_read"]
+    for atom in atoms:
+        if atom.key.type_name != "d08.action_intent.v1":
+            continue
+        refs = atom.value.get("source_refs")
+        if type(refs) is not list or not refs:
+            missing.append(f"action_source_refs_unavailable:{atom.key.token}")
+            continue
+        barrier = read_source_correction_barrier(
+            db, namespace, query, tuple(refs), dependent_ref=atom.key.token,
+        )
+        missing.extend(barrier.missing_sources)
     return CurrentD08ConflictFactsV1(
         namespace, QueryEpoch(namespace, "d08.conflict_graph", query.revision),
         tuple(commitments), tuple(intents), tuple(outcomes),
         tuple(GraphVersion(by_token[token].key, revision)
               for token, revision, _, _ in rows),
+        missing_sources=tuple(dict.fromkeys(missing)),
     )
 
 
@@ -287,6 +301,7 @@ def read_current_d08_action_conflict_evidence(
     blockers = ["trusted_authority_effect_read_provenance",
                 "claimed_append_identity_binding", "action_attempt_to_job_binding",
                 "current_action_cancellation_read", "authority_post_graph_p2_cas"]
+    blockers.extend(facts.missing_sources)
     anchor = p2.pinned_anchor
     effect_state = "unknown"
     if (effect.authority_id != p2.authority_id

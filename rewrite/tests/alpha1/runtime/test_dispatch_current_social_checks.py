@@ -15,6 +15,7 @@ from sylanne3.runtime_contracts import QueryEpoch, VersionedRef
 
 from test_dispatch_admission_preflight import _candidates
 from test_dispatch_current_projection import _typed_case
+from test_dispatch_source_correction_barrier import _insert_head
 
 
 def _case():
@@ -88,6 +89,22 @@ def test_current_role_and_boundary_provider_receipts_verify():
         assert _verify(case, catalogue=False).verified is False
     finally:
         case[0].close()
+
+
+def test_correction_head_turns_prior_boundary_pass_into_hold():
+    case = _case()
+    db, snapshot, prior, *_ = case
+    try:
+        _insert_head(db, prior.namespace)
+        current = read_current_dispatch_projection(
+            db, prior.namespace, snapshot,
+            QueryEpoch(prior.namespace, "all", prior.graph_epoch),
+        )
+        assert current.coverage == "partial"
+        result = _verify(case, projection=current)
+        assert (result.status, result.verified) == ("hold", False)
+    finally:
+        db.close()
 
 
 def test_empty_binding_and_changed_boundary_hold():

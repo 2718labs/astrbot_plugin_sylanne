@@ -9,6 +9,7 @@ from sylanne3.contracts import canonical_json
 from sylanne3.domains.d03.context import ContextProvider, RoleBinding, RoleBindingRequest
 from sylanne3.domains.d05.relationship import BoundaryRule
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch, Owner
+from sylanne3.memory_types import source_key
 from sylanne3.runtime.dispatch_current_projection import (
     derive_current_domain_reads, read_current_dispatch_projection,
 )
@@ -75,6 +76,11 @@ def test_missing_domain_row_or_changed_epoch_rejects_projection():
 
 def _typed_case():
     db, namespace, _, query = _case()
+    source = source_key("bot", "persona", "source-1")
+    db.execute("INSERT INTO graph_atoms VALUES(?,?,?,?,?,?,?)", (
+        source.token, "bot", "persona", "memory.source", 1,
+        canonical_json({"source_id": "source-1"}), 1,
+    ))
     binding = RoleBinding(
         "binding:one", "persona:persona", "friend", "entity:user", None,
         "scene:one", "direct", "private", (), 1, None, 1,
@@ -83,7 +89,7 @@ def _typed_case():
     rule = BoundaryRule(
         "boundary:one", "persona:persona", "entity:user", "message",
         "conversation", "scene:one", "allow", "self_internal",
-        ("source:one",), (), (), 1, None, 1, "actor", (), "active",
+        (source.token,), (), (), 1, None, 1, "actor", (), "active",
     )
     atoms = (
         GraphAtom(

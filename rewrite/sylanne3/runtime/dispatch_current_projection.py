@@ -11,6 +11,7 @@ from ..domains.d03.context import (
 from ..domains.d05.relationship import BoundaryRule, BoundaryRuleReadSet, RelationshipProvider
 from ..graph_types import AtomKey, GraphAtom, GraphSnapshot, GraphVersion
 from ..runtime_contracts import NamespaceId, QueryEpoch, VersionedRef, canonical_digest
+from .dispatch_source_correction_barrier import read_source_correction_barrier
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,8 @@ class CurrentDispatchProjectionV1:
     role_bindings: tuple[GraphAtom, ...]
     boundary_rules: tuple[GraphAtom, ...]
     digest: str
+    coverage: str = "full"
+    missing_sources: tuple[str, ...] = ()
 
 
 def read_current_dispatch_projection(
@@ -66,12 +69,23 @@ def read_current_dispatch_projection(
         raise ValueError("dispatch projection snapshot has an unbacked domain row")
     roles = tuple(typed["d03.role_binding"])
     boundaries = tuple(typed["d05.boundary_rule"])
+    missing = []
+    for atom in boundaries:
+        refs = atom.value.get("source_refs")
+        if type(refs) is not list or not refs:
+            missing.append(f"boundary_source_refs_unavailable:{atom.key.token}")
+            continue
+        barrier = read_source_correction_barrier(
+            db, namespace, query, tuple(refs), dependent_ref=atom.key.token,
+        )
+        missing.extend(barrier.missing_sources)
     return CurrentDispatchProjectionV1(
         namespace, query.revision, roles, boundaries,
         canonical_digest({
             "namespace": namespace, "graph_epoch": query.revision,
             "role_bindings": roles, "boundary_rules": boundaries,
         }),
+        "partial" if missing else "full", tuple(dict.fromkeys(missing)),
     )
 
 
@@ -173,7 +187,7 @@ def derive_current_domain_reads(
         tuple(rules),
         (VersionedRef("d05.boundary", projection.graph_epoch),)
         + tuple(VersionedRef(rule.rule_id, rule.scope_version) for rule in rules),
-        "full",
+        projection.coverage, projection.missing_sources,
     )
     return role_read, boundary_read
 
