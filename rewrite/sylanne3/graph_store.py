@@ -563,26 +563,35 @@ class GraphStore(Store):
         ).fetchall())
         expected_authority = tuple((spec.name, spec.writer_domain or "",
                                     spec.schema_hash or "") for spec in self._registry.specs)
-        new_type = "runtime.role_resources.v1"
-        catalog_addition = next((row for row in expected if row[0] == new_type), None)
-        authority_addition = next((row for row in expected_authority
-                                   if row[0] == new_type), None)
-        if (catalog_addition is not None and authority_addition is not None
-                and actual == tuple(row for row in expected if row[0] != new_type)
+        # These two additions have reviewed append-only identities.  Every
+        # previously installed row must still match exactly, including its
+        # owner, storage, writer domain and schema hash.
+        append_types = frozenset({
+            "runtime.role_resources.v1", "d06.recollection_projection.v1",
+        })
+        expected_names = {row[0] for row in expected}
+        missing = expected_names - {row[0] for row in actual}
+        authority_missing = expected_names - {row[0] for row in authority}
+        if (actual and authority and missing and missing == authority_missing
+                and missing <= append_types
+                and actual == tuple(row for row in expected if row[0] not in missing)
                 and authority == tuple(row for row in expected_authority
-                                       if row[0] != new_type)
-                and not self._db.execute(
+                                       if row[0] not in missing)
+                and all(not self._db.execute(
                     "SELECT 1 FROM graph_atoms WHERE type_name=? LIMIT 1",
-                    (new_type,),
-                ).fetchone()):
-            self._db.execute(
+                    (name,),
+                ).fetchone() for name in missing)):
+            self._db.executemany(
                 "INSERT INTO graph_type_catalog"
                 "(name,owner_kinds,storage_role,immutable,schema_version) "
-                "VALUES(?,?,?,?,?)", catalog_addition)
-            self._db.execute(
+                "VALUES(?,?,?,?,?)",
+                (row for row in expected if row[0] in missing),
+            )
+            self._db.executemany(
                 "INSERT INTO graph_type_authority"
                 "(name,writer_domain,schema_hash) VALUES(?,?,?)",
-                authority_addition)
+                (row for row in expected_authority if row[0] in missing),
+            )
             actual = expected
             authority = expected_authority
         if actual and actual != expected:
