@@ -24,6 +24,8 @@ from .rewrite.sylanne3.host.authority_profile import (
     AuthorityProfileUnavailable,
 )
 from .rewrite.sylanne3.host.v2_installation import V2InstallationAssembly
+from .rewrite.sylanne3.host.final_handoff_pairing import TrustedFinalHandoffBindingV1
+from .rewrite.sylanne3.host.reverse_handoff import HostReverseGraphClaimServer
 from .rewrite.sylanne3.host.installed_scene_identity import InstalledSceneIdentityPort
 from .rewrite.sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
 from .rewrite.sylanne3.host.first_ingress_c02_driver import (
@@ -128,6 +130,9 @@ class Sylanne3Plugin(Star):
             workbench_onboarding, workbench_origin,
         )
         self._owner_principal_resolver = owner_principal_resolver
+        self._final_handoff_server: HostReverseGraphClaimServer | None = None
+        self._final_handoff_listener: asyncio.AbstractServer | None = None
+        self._final_claim_writer: Callable | None = None
 
     def _installation_status(self) -> tuple[str, str]:
         health = self.runtime_health
@@ -277,6 +282,23 @@ class Sylanne3Plugin(Star):
                 logger.error("Sylanne 3 startup blocked: namespace provisioning failed")
                 return
             health = self._runtime.health
+        reverse_binding = installation.reverse_handoff
+        if (health.status in {"limited", "ready"}
+                and type(reverse_binding) is TrustedFinalHandoffBindingV1):
+            try:
+                verified, writer = await self._runtime.install_final_handoff_pairing_v1(
+                    installation, reverse_binding,
+                    host_context=self.context, host_loop=asyncio.get_running_loop(),
+                    candidates=self._scene_candidates)
+                server = HostReverseGraphClaimServer(verified.binding.profile)
+                listener = await server.start(
+                    verified.binding.listen_host, verified.binding.port)
+                self._final_handoff_server = server
+                self._final_handoff_listener = listener
+                self._final_claim_writer = writer
+            except Exception:
+                await self._runtime.uninstall_final_handoff_pairing_v1()
+                logger.warning("Sylanne 3 final handoff pairing unavailable; dispatch HOLD")
         pairing, grants, onboarding, origin = self._workbench_dependencies
         origin = origin or installation.workbench_origin
         if onboarding is None and pairing is None and grants is None and origin is not None:
@@ -325,6 +347,12 @@ class Sylanne3Plugin(Star):
 
     async def terminate(self) -> None:
         self._encoding_stopping = True
+        if self._final_handoff_listener is not None:
+            self._final_handoff_listener.close()
+            await self._final_handoff_listener.wait_closed()
+            self._final_handoff_listener = None
+        self._final_handoff_server = None
+        self._final_claim_writer = None
         self._workbench.close()
         self._scene_candidates.clear()
         self._installed_namespace = None

@@ -2,18 +2,21 @@
 
 from dataclasses import replace
 import hashlib
+import json
 import ssl
 from types import SimpleNamespace
 
 import pytest
 
 from rewrite.host_tests.alpha1 import test_authority_mtls_loopback as certificate_support
+from rewrite.host_tests.alpha1 import test_admin_d11_key as admin_profile_support
 from sylanne3.authority_service.final_handoff_pairing import FinalHandoffPairingV1
 from sylanne3.host.final_handoff_pairing import (
     TrustedFinalHandoffBindingV1, verify_final_handoff_pairing_v1,
 )
 from sylanne3.host.reverse_handoff import AdministratorHostReverseProfile
 from sylanne3.host.v2_installation import V2InstallationAssembly
+from sylanne3.host import authority_profile
 
 
 def _sha256(path):
@@ -72,3 +75,31 @@ def test_pairing_rejects_endpoint_and_certificate_drift(tmp_path):
     with pytest.raises(ValueError, match="configuration digest"):
         verify_final_handoff_pairing_v1(
             {**pairing.to_wire(), "issuer_id": "attacker"}, installation, binding)
+
+
+def test_schema2_admin_profile_loads_reverse_endpoint_and_real_tls_material(tmp_path):
+    profile_dir = admin_profile_support._profile(tmp_path)
+    files = certificate_support.AuthorityMtlsLoopbackTests._certificates(tmp_path)
+    (profile_dir / "reverse-cert.pem").write_bytes(files["server.pem"].read_bytes())
+    (profile_dir / "reverse-key.pem").write_bytes(files["server.key"].read_bytes())
+    (profile_dir / "reverse-trust-root.pem").write_bytes(files["ca.pem"].read_bytes())
+    payload_path = profile_dir / "profile.json"
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload["reverse_handoff"] = {
+        "profile_id": "reverse-a", "listen_host": "127.0.0.1",
+        "endpoint_host": "127.0.0.1", "port": 41234,
+        "server_name": "localhost",
+        "expected_authority_certificate_sha256": _sha256(files["client.pem"]),
+    }
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    parsed = authority_profile._read_profile_json(payload_path)
+    policy = authority_profile._policy_from_payload(parsed)
+    binding = authority_profile._reverse_handoff_from_payload(
+        parsed, profile_dir, policy, material_present=True)
+    assert binding.profile.namespace == policy.authority_namespace
+    assert binding.profile.installation_id == policy.installation_id
+    assert binding.endpoint_host == "127.0.0.1"
+    assert binding.profile.ssl_context().verify_mode == ssl.CERT_REQUIRED
+    with pytest.raises(ValueError, match="absent"):
+        authority_profile._reverse_handoff_from_payload(
+            parsed, profile_dir, policy, material_present=False)

@@ -42,6 +42,7 @@ class V2InstallationAssembly:
     ingress_model: AdminIngressModelPolicy | None = None
     admin_bundle: AdminInstallationBundle | None = None
     d03_arrival: AdminD03ArrivalPolicy | None = None
+    reverse_handoff: object | None = None
 
 
 async def assemble_v2_installation(
@@ -122,6 +123,7 @@ async def assemble_v2_installation(
         getattr(bundle, "ingress_model", None),
         bundle,
         getattr(bundle, "d03_arrival", None),
+        getattr(bundle, "reverse_handoff", None),
     )
 
 

@@ -16,6 +16,7 @@ from ..authority_service.final_handoff_pairing import FinalHandoffPairingV1
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
+    PlatformObservationV2,
     SCHEMA as AUTHORITY_V2_PROTOCOL,
 )
 from ..authority_service.v2_owner_contract import (
@@ -1005,6 +1006,74 @@ class V2FencePort:
                 or reading.activation_generation != observed.generation):
             raise RuntimeError("v2 current effect identity changed")
         return reading
+
+    def execution_read_current_dispatch_handoff(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        start: HandoffStartV2, claimed_receipt: MutationReceiptV2,
+    ) -> tuple[FencePermitV2, RestoreAnchor, CurrentEffectReadV2]:
+        return self._submit(self._with_session_repair(
+            lambda: self._execution_read_current_dispatch_handoff(
+                namespace, authority_namespace, start, claimed_receipt)))
+
+    async def _execution_read_current_dispatch_handoff(
+        self, namespace: NamespaceId, authority_namespace: str,
+        start: HandoffStartV2, claimed_receipt: MutationReceiptV2,
+    ) -> tuple[FencePermitV2, RestoreAnchor, CurrentEffectReadV2]:
+        if (type(start) is not HandoffStartV2 or start.replay
+                or type(claimed_receipt) is not MutationReceiptV2
+                or type(claimed_receipt.pending.binding) is not ExecutionBindingV2
+                or claimed_receipt.pending.permit.namespace != authority_namespace
+                or start.namespace != authority_namespace):
+            raise ValueError("current V2 handoff identity differs")
+        handshake, grant = self._identity()
+        observed = await self._transport.v2_namespace_bootstrap(
+            self._request, handshake, namespace)
+        if (observed.authority_namespace != authority_namespace
+                or observed.authority_id != grant.authority_id
+                or start.permit.subject != grant.subject
+                or start.permit.authority_id != grant.authority_id
+                or start.permit.generation != observed.generation):
+            raise RuntimeError("current V2 handoff installation differs")
+        return await self._transport.v2_execution_read_current_dispatch_handoff(
+            self._request, handshake, start=start, claimed_receipt=claimed_receipt)
+
+    def execution_observe_v2(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        claimed_receipt: MutationReceiptV2, observation: PlatformObservationV2,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        try:
+            return self._submit(self._with_session_repair(
+                lambda: self._execution_observe_v2(
+                    namespace, authority_namespace, claimed_receipt, observation)))
+        except RuntimeError as exc:
+            if isinstance(exc, V2FenceOutcomeUnknown) or str(exc) in _REPAIRABLE_ERRORS:
+                raise V2FenceOutcomeUnknown(
+                    "V2 observation outcome unknown for observation_id="
+                    + observation.observation_id
+                    + "; retry only the exact claimed receipt and observation") from exc
+            raise
+
+    async def _execution_observe_v2(
+        self, namespace: NamespaceId, authority_namespace: str,
+        claimed_receipt: MutationReceiptV2, observation: PlatformObservationV2,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        if (type(claimed_receipt) is not MutationReceiptV2
+                or type(observation) is not PlatformObservationV2
+                or type(claimed_receipt.pending.binding) is not ExecutionBindingV2
+                or observation.binding != claimed_receipt.pending.binding
+                or claimed_receipt.pending.permit.namespace != authority_namespace):
+            raise ValueError("V2 observation identity differs")
+        handshake, grant = self._identity()
+        observed = await self._transport.v2_namespace_bootstrap(
+            self._request, handshake, namespace)
+        if (observed.authority_namespace != authority_namespace
+                or observed.authority_id != grant.authority_id
+                or claimed_receipt.pending.permit.subject != grant.subject
+                or claimed_receipt.pending.permit.authority_id != grant.authority_id):
+            raise RuntimeError("V2 observation installation differs")
+        return await self._transport.v2_execution_observe_v2(
+            self._request, handshake, claimed_receipt=claimed_receipt,
+            observation=observation)
 
     def execution_prepare(
         self, *, namespace: NamespaceId, authority_namespace: str,

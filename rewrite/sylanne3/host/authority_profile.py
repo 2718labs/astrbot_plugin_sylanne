@@ -80,6 +80,11 @@ _GRANT_FIELDS = frozenset({
     "max_ceiling", "allowed_work_kinds", "valid_until_utc", "policy_ref",
 })
 _MATERIAL = ("trust-root.pem", "client-cert.pem", "client-key.pem")
+_REVERSE_MATERIAL = ("reverse-trust-root.pem", "reverse-cert.pem", "reverse-key.pem")
+_REVERSE_FIELDS = frozenset({
+    "profile_id", "listen_host", "endpoint_host", "port", "server_name",
+    "expected_authority_certificate_sha256",
+})
 _D11_SIGNING_KEY = "d11-signing.key"
 _D11_SIGNING_KEY_BYTES = 32
 _D02_SIGNING_KEY = "d02-signing.key"
@@ -529,6 +534,7 @@ class AdminInstallationBundle:
     d06_first_ingress_c02: AdminD06FirstIngressC02Policy | None = None
     d03_self_identity_projection: AdminD03SelfIdentityProjectionPolicy | None = None
     d06_source_correction: AdminD06SourceCorrectionPolicy | None = None
+    reverse_handoff: object | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -618,7 +624,8 @@ def _check_opened(fd: int, *, directory: bool, key: bool, system: str) -> None:
 
 
 @contextmanager
-def _opened_profile(profile_dir: Path, system: str, *, signing_key: bool = False
+def _opened_profile(profile_dir: Path, system: str, *, signing_key: bool = False,
+                    reverse_material: bool = False
                     ) -> Iterator[dict[str, int]]:
     """Pin every path component and consumed file before inspecting either."""
     if not profile_dir.is_absolute() or os.open not in os.supports_dir_fd:
@@ -642,13 +649,13 @@ def _opened_profile(profile_dir: Path, system: str, *, signing_key: bool = False
         files: dict[str, int] = {}
         names = ("profile.json",) + _MATERIAL + ((
             _D11_SIGNING_KEY, _D02_SIGNING_KEY,
-        ) if signing_key else ())
+        ) if signing_key else ()) + (_REVERSE_MATERIAL if reverse_material else ())
         for name in names:
             fd = os.open(name, file_flags, dir_fd=current)
             stack.callback(os.close, fd)
             _check_opened(fd, directory=False,
-                          key=name in {"client-key.pem", _D11_SIGNING_KEY,
-                                       _D02_SIGNING_KEY}, system=system)
+                          key=name in {"client-key.pem", "reverse-key.pem",
+                                       _D11_SIGNING_KEY, _D02_SIGNING_KEY}, system=system)
             files[name] = fd
         yield files
 
@@ -698,7 +705,8 @@ def _prepared_ssl_context(files: dict[str, int], system: str) -> ssl.SSLContext:
 
 
 @contextmanager
-def _opened_windows_profile(profile_dir: Path, *, signing_key: bool = False
+def _opened_windows_profile(profile_dir: Path, *, signing_key: bool = False,
+                            reverse_material: bool = False
                             ) -> Iterator[dict[Path, int]]:
     """Pin the whole path while pathname-only OpenSSL loads the same objects.
 
@@ -723,7 +731,7 @@ def _opened_windows_profile(profile_dir: Path, *, signing_key: bool = False
     directories = tuple(reversed(profile_dir.parents)) + (profile_dir,)
     names = ("profile.json",) + _MATERIAL + ((
         _D11_SIGNING_KEY, _D02_SIGNING_KEY,
-    ) if signing_key else ())
+    ) if signing_key else ()) + (_REVERSE_MATERIAL if reverse_material else ())
     paths = directories + tuple(profile_dir / name for name in names)
     with ExitStack() as stack:
         handles: dict[Path, int] = {}
@@ -776,7 +784,7 @@ def _check_windows_handles(profile_dir: Path, handles: dict[Path, int]) -> None:
         runtime_user, runtime_sids = security_gate._runtime_token_sids(win32security)
         protected_root = profile_dir.parents[2]
         key_paths = {profile_dir / name for name in (
-            "client-key.pem", _D11_SIGNING_KEY, _D02_SIGNING_KEY,
+            "client-key.pem", "reverse-key.pem", _D11_SIGNING_KEY, _D02_SIGNING_KEY,
         )}
         for path, handle in handles.items():
             security_gate._check_security_descriptor(
@@ -834,8 +842,47 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d06_first_ingress_c02", "d06_source_correction", "model_workflows"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d06_first_ingress_c02", "d06_source_correction", "model_workflows", "reverse_handoff"}
     )
+
+
+def _reverse_material_present(profile_dir: Path) -> bool:
+    return any((profile_dir / name).exists() for name in _REVERSE_MATERIAL)
+
+
+def _reverse_handoff_from_payload(
+    payload: dict[str, object], profile_dir: Path,
+    policy: AdminInstallationPolicy, *, material_present: bool,
+):
+    configured = payload.get("reverse_handoff")
+    if configured is None and "reverse_handoff" not in payload:
+        if material_present:
+            raise ValueError("unconfigured reverse TLS material is present")
+        return None
+    if not material_present:
+        raise ValueError("configured reverse TLS material is absent")
+    from .final_handoff_pairing import TrustedFinalHandoffBindingV1
+    from .reverse_handoff import AdministratorHostReverseProfile
+
+    values = _exact_object(configured, _REVERSE_FIELDS, "reverse handoff")
+    digest = values["expected_authority_certificate_sha256"]
+    if (type(digest) is not str or len(digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in digest)):
+        raise ValueError("reverse Authority certificate pin is invalid")
+    profile = AdministratorHostReverseProfile(
+        profile_id=values["profile_id"],
+        installation_id=policy.installation_id,
+        namespace=policy.authority_namespace,
+        expected_authority_certificate_sha256=digest,
+        certificate=profile_dir / "reverse-cert.pem",
+        private_key=profile_dir / "reverse-key.pem",
+        authority_trust_root=profile_dir / "reverse-trust-root.pem",
+    )
+    profile.ssl_context()  # Verify the administrator's installed cert/key now.
+    return TrustedFinalHandoffBindingV1(
+        profile=profile, listen_host=values["listen_host"],
+        endpoint_host=values["endpoint_host"], port=values["port"],
+        server_name=values["server_name"])
 
 
 def _workbench_origin_from_payload(payload: dict[str, object]) -> str | None:
@@ -1274,7 +1321,9 @@ def _load_installation_bundle_from_root(
     if system not in {"Linux", "Darwin"} or os.name != "posix":
         raise AuthorityProfileUnavailable("POSIX directory-descriptor traversal is unavailable")
     profile_dir = Path(profile_root) / profile_id
-    with _opened_profile(profile_dir, system, signing_key=True) as files:
+    reverse_material = _reverse_material_present(profile_dir)
+    with _opened_profile(profile_dir, system, signing_key=True,
+                         reverse_material=reverse_material) as files:
         payload = _read_profile_json(files["profile.json"])
         policy = _policy_from_payload(payload)
         prepared = _prepared_ssl_context(files, system)
@@ -1285,6 +1334,8 @@ def _load_installation_bundle_from_root(
         d02_key = _checked_signing_key(
             _read_fd_bounded(files[_D02_SIGNING_KEY], _D11_SIGNING_KEY_BYTES), "D02"
         )
+        reverse_handoff = _reverse_handoff_from_payload(
+            payload, profile_dir, policy, material_present=reverse_material)
     return AdminInstallationBundle(profile, policy, d11_key, d02_key,
                                    _ingress_clock_from_payload(payload),
                                    _ingress_encoding_from_payload(payload),
@@ -1295,7 +1346,8 @@ def _load_installation_bundle_from_root(
                                    _d04_baseline_from_payload(payload),
                                    _d06_c02_from_payload(payload),
                                    _d03_projection_from_payload(payload),
-                                   _d06_source_correction_from_payload(payload))
+                                   _d06_source_correction_from_payload(payload),
+                                   reverse_handoff)
 
 
 def _load_windows_installation_bundle(
@@ -1304,7 +1356,9 @@ def _load_windows_installation_bundle(
     """Keep every checked Windows handle pinned until TLS and key reads finish."""
     _check_profile_id(profile_id)
     profile_dir = Path(profile_root) / profile_id
-    with _opened_windows_profile(profile_dir, signing_key=True) as handles:
+    reverse_material = _reverse_material_present(profile_dir)
+    with _opened_windows_profile(profile_dir, signing_key=True,
+                                 reverse_material=reverse_material) as handles:
         _check_windows_handles(profile_dir, handles)
         payload = _read_profile_json(profile_dir / "profile.json")
         policy = _policy_from_payload(payload)
@@ -1316,6 +1370,8 @@ def _load_windows_installation_bundle(
         d02_key = _checked_signing_key(
             _read_windows_signing_key(handles[profile_dir / _D02_SIGNING_KEY]), "D02"
         )
+        reverse_handoff = _reverse_handoff_from_payload(
+            payload, profile_dir, policy, material_present=reverse_material)
     return AdminInstallationBundle(profile, policy, d11_key, d02_key,
                                    _ingress_clock_from_payload(payload),
                                    _ingress_encoding_from_payload(payload),
@@ -1326,7 +1382,8 @@ def _load_windows_installation_bundle(
                                    _d04_baseline_from_payload(payload),
                                    _d06_c02_from_payload(payload),
                                    _d03_projection_from_payload(payload),
-                                   _d06_source_correction_from_payload(payload))
+                                   _d06_source_correction_from_payload(payload),
+                                   reverse_handoff)
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:

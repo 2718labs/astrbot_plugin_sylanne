@@ -51,6 +51,10 @@ from .authority_service.v2_worker_model_result_contract import (
 from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from .host.v2_installation import V2InstallationAssembly
 from .host.v2_fence_port import V2FenceOutcomeUnknown, V2FencePort
+from .host.final_handoff_pairing import (
+    TrustedFinalHandoffBindingV1, VerifiedFinalHandoffPairingV1,
+    verify_final_handoff_pairing_v1,
+)
 from .installation_policy import AdminInstallationPolicy
 from .model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION, issue_first_ingress_encoding_request_v2,
@@ -223,6 +227,8 @@ class RuntimeContext:
         self._v2_coordinator: GraphCoordinator | None = None
         self._v2_bootstrap: object | None = None
         self._v2_port: V2FencePort | None = None
+        self._final_claim_lease: object | None = None
+        self._final_claim_writer: Callable | None = None
         self._v2_policy: AdminInstallationPolicy | None = None
         self._v2_installation_grant: InstallationGrantV2 | None = None
         self._v2_model_bundle: AdminInstallationBundle | None = None
@@ -555,6 +561,81 @@ class RuntimeContext:
                 "limited", ("namespace_activation",), detail,
             )
             return self.health
+
+    async def install_final_handoff_pairing_v1(
+        self, installation: V2InstallationAssembly,
+        binding: TrustedFinalHandoffBindingV1,
+        *, host_context: object, host_loop: asyncio.AbstractEventLoop,
+        candidates: object,
+    ) -> tuple[VerifiedFinalHandoffPairingV1, Callable]:
+        """Install P2 only after an authenticated Authority/local TLS comparison."""
+        from .host.installed_dispatch_route import InstalledDispatchRoutePort
+        from .host.scene_candidates import SceneCandidateCatalog
+
+        async with self._lock:
+            policy = self._v2_policy
+            grant = self._v2_installation_grant
+            port = self._v2_port
+            worker = self._worker
+            bootstrap = self._v2_bootstrap
+            if (type(installation) is not V2InstallationAssembly
+                    or type(binding) is not TrustedFinalHandoffBindingV1
+                    or type(candidates) is not SceneCandidateCatalog
+                    or not isinstance(host_loop, asyncio.AbstractEventLoop)
+                    or worker is None or bootstrap is None or port is None
+                    or policy is None or grant is None
+                    or not self._v2_namespace_provisioned
+                    or installation.installation_policy != policy
+                    or installation.installation_grant != grant
+                    or installation.reverse_handoff is not binding):
+                raise RuntimeError("installed final handoff prerequisites unavailable; HOLD")
+            if self._final_claim_writer is not None:
+                raise RuntimeError("final handoff pairing is already installed")
+
+            def install(graph):
+                authenticated = port.read_final_handoff_pairing_v1(
+                    namespace=policy.authority_namespace,
+                    installation_id=grant.installation_id)
+                verified = verify_final_handoff_pairing_v1(
+                    authenticated, installation, binding)
+                anchor = port.current_anchor(
+                    namespace=policy.namespace,
+                    authority_namespace=policy.authority_namespace)
+                lease, ref = graph.grant(
+                    bootstrap, actor=grant.administrator_holder,
+                    issuer_domain="d11", namespace=policy.namespace,
+                    domains=("d03", "d05", "d06", "d07", "d08", "d09", "d11"),
+                    activation_generation=anchor.activation_generation)
+                try:
+                    authority = AuthorityContext(
+                        grant.administrator_holder, "d11", ref, policy.namespace,
+                        ("activity",),
+                        "dispatch", ("internal",), "final-claim-route-v1",
+                        anchor.activation_generation)
+                    route = InstalledDispatchRoutePort(
+                        context=host_context, host_loop=host_loop,
+                        candidates=candidates, coordinator=graph,
+                        authority=authority, lease=lease,
+                        policy=policy, grant=grant)
+                    writer = graph.register_dispatch_final_claim_writer_v1(
+                        bootstrap, route_port=route, issuer_id=verified.issuer_id)
+                except BaseException:
+                    graph.release_authority_lease(bootstrap, lease)
+                    raise
+                return verified, lease, writer
+
+            verified, lease, writer = await worker.call(install)
+            self._final_claim_lease = lease
+            self._final_claim_writer = writer
+            return verified, writer
+
+    async def uninstall_final_handoff_pairing_v1(self) -> None:
+        async with self._lock:
+            lease, self._final_claim_lease = self._final_claim_lease, None
+            self._final_claim_writer = None
+            if lease is not None and self._worker is not None and self._v2_bootstrap is not None:
+                await self._worker.call(lambda graph: graph.release_authority_lease(
+                    self._v2_bootstrap, lease))
 
     async def provision_installed_namespace(self, operation_id: str):
         """Provision the installed administrator namespace on its graph worker."""
@@ -1716,6 +1797,14 @@ class RuntimeContext:
             if "v2_fence_recovery" in self.health.missing_capabilities:
                 return self.health
             self.health = RuntimeHealth("draining")
+            if (self._final_claim_lease is not None and self._worker is not None
+                    and self._v2_bootstrap is not None):
+                lease = self._final_claim_lease
+                bootstrap = self._v2_bootstrap
+                await self._worker.call(
+                    lambda graph: graph.release_authority_lease(bootstrap, lease))
+            self._final_claim_lease = None
+            self._final_claim_writer = None
             worker, self._worker = self._worker, None
             self._v2_provision = None
             self._v2_ingress = None

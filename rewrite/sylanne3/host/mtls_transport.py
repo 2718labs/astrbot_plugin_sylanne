@@ -22,6 +22,7 @@ from ..authority_service.final_handoff_pairing import FinalHandoffPairingV1
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
+    PlatformObservationV2,
     SCHEMA as AUTHORITY_V2_PROTOCOL,
     canonical_digest, from_wire, to_wire,
 )
@@ -1608,6 +1609,90 @@ class MtlsAuthorityTransport:
                 or reading.namespace != namespace or reading.effect_id != effect_id):
             raise RuntimeError("authority current effect binding is invalid")
         return reading
+
+    async def v2_execution_read_current_dispatch_handoff(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, start: HandoffStartV2, claimed_receipt: MutationReceiptV2,
+    ) -> tuple[FencePermitV2, RestoreAnchor, CurrentEffectReadV2]:
+        """Read the Authority's atomic P2/Owner/effect barrier for one start."""
+        if (type(start) is not HandoffStartV2 or start.replay
+                or type(claimed_receipt) is not MutationReceiptV2
+                or claimed_receipt.pending.phase != "claimed"
+                or claimed_receipt.durable_state != "committed"
+                or type(claimed_receipt.pending.binding) is not ExecutionBindingV2
+                or start.namespace != claimed_receipt.pending.permit.namespace):
+            raise ValueError("fresh V2 handoff and committed claim required")
+        response = await self._content_rpc(
+            request, handshake, "execution_read_current_dispatch_handoff",
+            {"start": start.to_wire(), "claimed_receipt": to_wire(claimed_receipt)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"permit", "anchor", "effect", "channel_binding_sha256"}:
+            raise RuntimeError("current dispatch handoff response differs")
+        try:
+            permit = from_wire(response["permit"])
+            anchor = self._restore_anchor_response({
+                **response["anchor"],
+                "channel_binding_sha256": response["channel_binding_sha256"]},
+                "current dispatch handoff anchor")
+            effect_wire = response["effect"]
+            if (type(effect_wire) is not dict
+                    or set(effect_wire) != set(CurrentEffectReadV2.__dataclass_fields__)):
+                raise ValueError("current effect wire differs")
+            effect = CurrentEffectReadV2(**effect_wire)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise RuntimeError("current dispatch handoff response differs") from exc
+        if (type(permit) is not FencePermitV2
+                or permit != start.permit or anchor != permit.pinned_anchor
+                or effect.authority_id != handshake.installation_authority_id
+                or effect.namespace != start.namespace
+                or effect.effect_id != start.effect_id
+                or effect.activation_generation != permit.generation
+                or effect.state != "unresolved"
+                or effect.mutation_id != claimed_receipt.pending.mutation_id
+                or effect.effect_seq != claimed_receipt.after_anchor.execution_seq
+                or effect.append_id != claimed_receipt.pending.expected_append_id
+                or effect.append_digest != claimed_receipt.after_anchor.execution_digest):
+            raise RuntimeError("current dispatch handoff binding differs")
+        return permit, anchor, effect
+
+    async def v2_execution_observe_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, claimed_receipt: MutationReceiptV2,
+        observation: PlatformObservationV2,
+    ) -> tuple[MutationReceiptV2, FencePermitV2]:
+        """Persist a platform observation; a lost response requires same-ID recovery."""
+        if (type(claimed_receipt) is not MutationReceiptV2
+                or claimed_receipt.pending.phase != "claimed"
+                or claimed_receipt.durable_state != "committed"
+                or type(claimed_receipt.pending.binding) is not ExecutionBindingV2
+                or type(observation) is not PlatformObservationV2
+                or observation.binding != claimed_receipt.pending.binding):
+            raise ValueError("V2 observation differs from committed claim")
+        response = await self._content_rpc(
+            request, handshake, "execution_observe_v2",
+            {"claimed_receipt": to_wire(claimed_receipt),
+             "observation": to_wire(observation)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"receipt", "permit", "channel_binding_sha256"}:
+            raise RuntimeError("V2 observation response differs")
+        try:
+            receipt = from_wire(response["receipt"])
+            permit = from_wire(response["permit"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("V2 observation response differs") from exc
+        if (type(receipt) is not MutationReceiptV2
+                or type(permit) is not FencePermitV2
+                or receipt.durable_state != "committed"
+                or receipt.pending.phase != "observed"
+                or receipt.pending.binding != observation.binding
+                or receipt.pending.platform_observation != observation
+                or permit.operation_id != observation.binding.operation_id
+                or permit.authority_id != handshake.installation_authority_id
+                or permit.subject != handshake.installation_identity_ref
+                or permit.pinned_anchor != receipt.after_anchor
+                or permit.revision != receipt.updated_revision):
+            raise RuntimeError("V2 observation binding differs")
+        return receipt, permit
 
     async def v2_execution_prepare(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
