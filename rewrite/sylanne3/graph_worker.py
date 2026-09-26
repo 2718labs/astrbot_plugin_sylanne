@@ -49,7 +49,7 @@ class _ExclusiveCallbackWindow:
         return self
 
     async def call(self, function: Callable, *args):
-        """Submit the one synchronous reverse callback inside this window."""
+        """Submit one synchronous graph transaction; it must not make Authority RPCs."""
         if not callable(function):
             raise TypeError("graph worker callback requires a callable")
         worker = self._worker
@@ -218,7 +218,11 @@ class GraphWorker:
         return await asyncio.shield(wrapped)
 
     def exclusive_callback_window(self) -> _ExclusiveCallbackWindow:
-        """Acquire before Authority handoff; release after its response or recovery."""
+        """Acquire before Authority begin_handoff, then hold through its response.
+
+        If the response is lost or cancelled, the dispatcher must retain the
+        lease until recovery for that same handoff_id has finished.
+        """
         return _ExclusiveCallbackWindow(self)
 
     async def close(self) -> None:
