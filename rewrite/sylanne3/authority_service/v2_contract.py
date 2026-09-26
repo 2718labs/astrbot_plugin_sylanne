@@ -169,7 +169,7 @@ class PendingMutationV2:
     prepared_receipt: MutationReceiptV2 | None = None
     binding: ExecutionBindingV1 | ExecutionBindingV2 | None = None
     claimed_receipt: MutationReceiptV2 | None = None
-    platform_observation: PlatformObservationV1 | None = None
+    platform_observation: PlatformObservationV1 | PlatformObservationV2 | None = None
     predecessor_mutation_id: str | None = None
     predecessor_receipt_digest: str | None = None
 
@@ -213,7 +213,7 @@ class PendingMutationV2:
             if (type(receipt) is not MutationReceiptV2
                     or receipt.pending.phase != "claimed"
                     or receipt.durable_state != "committed"
-                    or type(observation) is not PlatformObservationV1
+                    or type(observation) not in (PlatformObservationV1, PlatformObservationV2)
                     or observation.binding != receipt.pending.binding
                     or self.prepared_receipt is not None or self.binding is not None):
                 raise ValueError("observation requires original committed claim and platform evidence")
@@ -476,6 +476,57 @@ class PlatformObservationV1:
                 or self.destination_ref != self.binding.destination_ref):
             raise ValueError("platform observation destination differs from binding")
         _unique_ids(handoff_start_ref=self.handoff_start_ref,
+                    observation_id=self.observation_id)
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformObservationV2:
+    """One platform report bound to the persisted V2 handoff start."""
+
+    binding: ExecutionBindingV2
+    handoff_id: str
+    start_digest: str
+    adapter_ref: str
+    account_ref: str
+    destination_ref: str
+    observation_id: str
+    platform_request_id: str | None
+    platform_message_id: str | None
+    evidence_source_ref: str
+    outcome: str
+    observed_at_utc: str
+    time_source_ref: str
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        if type(self.binding) is not ExecutionBindingV2:
+            raise ValueError("V2 observation requires V2 binding")
+        for name in ("handoff_id", "observation_id", "evidence_source_ref",
+                     "observed_at_utc", "time_source_ref"):
+            identifier(getattr(self, name), name)
+        _digest(self.start_digest, "start_digest")
+        for name in ("platform_request_id", "platform_message_id"):
+            value = getattr(self, name)
+            if value is not None:
+                identifier(value, name)
+        if (self.adapter_ref, self.account_ref, self.destination_ref) != (
+                self.binding.origin.adapter_ref, self.binding.origin.account_ref,
+                self.binding.origin.destination_ref):
+            raise ValueError("V2 observation route differs from binding")
+        if self.outcome not in _PLATFORM_OUTCOMES:
+            raise ValueError("unknown platform observation outcome")
+        if self.outcome == "accepted" and (self.platform_message_id is None
+                or not self.platform_message_id.isdecimal()
+                or self.platform_message_id.startswith("0")):
+            raise ValueError("platform acceptance needs a positive message ID")
+        if not _UTC_TIMESTAMP.fullmatch(self.observed_at_utc):
+            raise ValueError("observed_at_utc must be a UTC second timestamp")
+        try:
+            datetime.fromisoformat(self.observed_at_utc.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("invalid observed_at_utc") from exc
+        _unique_ids(handoff_start_ref=self.handoff_id,
                     observation_id=self.observation_id)
 
 
@@ -848,6 +899,7 @@ def _footprint_from_wire(value: object) -> RecoveryConstraintFootprint:
 def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1 |
             ExecutionBindingV1 | ExecutionBindingV2 | PlatformObservationV1 |
+            PlatformObservationV2 |
             DispatchHandoffContextV1 | OwnerDispatchWitnessV1 |
             AuthorityUnresolvedEffectV1 | AuthorityDispatchSnapshotV1 |
             DispatchGraphClaimReceiptV1) -> dict[str, Any]:
@@ -987,6 +1039,23 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             "observed_at_utc": value.observed_at_utc,
             "time_source_ref": value.time_source_ref,
         }
+    if type(value) is PlatformObservationV2:
+        return {
+            "schema": value.schema, "kind": "platform_observation_v2",
+            "binding": to_wire(value.binding),
+            "handoff_id": value.handoff_id,
+            "start_digest": value.start_digest,
+            "adapter_ref": value.adapter_ref,
+            "account_ref": value.account_ref,
+            "destination_ref": value.destination_ref,
+            "observation_id": value.observation_id,
+            "platform_request_id": value.platform_request_id,
+            "platform_message_id": value.platform_message_id,
+            "evidence_source_ref": value.evidence_source_ref,
+            "outcome": value.outcome,
+            "observed_at_utc": value.observed_at_utc,
+            "time_source_ref": value.time_source_ref,
+        }
     if type(value) is MutationReceiptV2:
         return {
             "schema": value.schema, "kind": "mutation_receipt", "pending": to_wire(value.pending),
@@ -1037,7 +1106,8 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
 def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                                  DeletionEvidenceV1 | DeletionPendingV1 |
                                  DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
-                                 PlatformObservationV1 | DispatchHandoffContextV1 |
+                                 PlatformObservationV1 | PlatformObservationV2 |
+                                 DispatchHandoffContextV1 |
                                  OwnerDispatchWitnessV1 | AuthorityUnresolvedEffectV1 |
                                  AuthorityDispatchSnapshotV1 |
                                  DispatchGraphClaimReceiptV1):
@@ -1194,6 +1264,19 @@ def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationRec
         return PlatformObservationV1(
             **{key: (binding if key == "binding" else item)
                for key, item in value.items() if key != "kind"})
+    if kind == "platform_observation_v2":
+        _fields(value, frozenset({
+            "schema", "kind", "binding", "handoff_id", "start_digest",
+            "adapter_ref", "account_ref", "destination_ref", "observation_id",
+            "platform_request_id", "platform_message_id", "evidence_source_ref",
+            "outcome", "observed_at_utc", "time_source_ref",
+        }), "platform observation v2")
+        binding = from_wire(value["binding"])
+        if type(binding) is not ExecutionBindingV2:
+            raise ValueError("V2 platform observation binding kind mismatch")
+        return PlatformObservationV2(
+            **{key: (binding if key == "binding" else item)
+               for key, item in value.items() if key != "kind"})
     if kind == "mutation_receipt":
         _fields(value, frozenset({
             "schema", "kind", "pending", "after_anchor", "updated_revision",
@@ -1299,6 +1382,7 @@ def decode_bytes(data: bytes) -> (FencePermitV2 | PendingMutationV2 | MutationRe
 
 __all__ = ["SCHEMA", "FencePermitV2", "PendingMutationV2", "MutationReceiptV2",
            "ExecutionBindingV1", "ExecutionBindingV2", "PlatformObservationV1",
+           "PlatformObservationV2",
            "DeletionEvidenceV1", "DeletionPendingV1", "DeletionMutationReceiptV1",
            "deletion_scope_digest", "to_wire", "from_wire", "canonical_bytes",
            "canonical_digest", "decode_bytes", "DispatchHandoffContextV1",

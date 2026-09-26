@@ -27,7 +27,7 @@ from .v2_contract import (
     canonical_digest,
     DispatchHandoffContextV1, DispatchGraphClaimReceiptV1, OwnerDispatchWitnessV1,
     AuthorityDispatchSnapshotV1, AuthorityUnresolvedEffectV1,
-    PlatformObservationV1, decode_bytes, from_wire, to_wire,
+    PlatformObservationV1, PlatformObservationV2, decode_bytes, from_wire, to_wire,
 )
 from .v2_dispatch_admission_epoch import current_admission_stamp_in_tx
 from .v2_execution_journal import AuthorityV2ExecutionJournal, VerifiedAppendV2
@@ -154,6 +154,15 @@ class HandoffStartV2:
         if result.to_wire() != value:
             raise ValueError("handoff start wire is not canonical")
         return result
+
+
+def handoff_start_digest_v2(start: HandoffStartV2) -> str:
+    """Bind an observation to the original fresh start, never its replay view."""
+    if type(start) is not HandoffStartV2 or start.replay:
+        raise ValueError("fresh V2 handoff start required")
+    return "sha256:" + hashlib.sha256(json.dumps(
+        start.to_wire(), sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
 
 
 class AuthorityV2ExecutionBridge:
@@ -383,12 +392,12 @@ class AuthorityV2ExecutionBridge:
                        self.journal.expected_digest(draft))
 
     def _build_observed_pending(self, receipt: MutationReceiptV2,
-                                observation: PlatformObservationV1,
+                                observation: PlatformObservationV1 | PlatformObservationV2,
                                 predecessor: MutationReceiptV2) -> PendingMutationV2:
         if (type(receipt) is not MutationReceiptV2
                 or receipt.pending.phase != "claimed"
                 or receipt.durable_state != "committed"
-                or type(observation) is not PlatformObservationV1
+                or type(observation) not in (PlatformObservationV1, PlatformObservationV2)
                 or observation.binding != receipt.pending.binding
                 or type(predecessor) is not MutationReceiptV2
                 or predecessor.durable_state != "committed"
@@ -484,6 +493,9 @@ class AuthorityV2ExecutionBridge:
     def _check_observed_source_locked(self, db, pending: PendingMutationV2,
                                       subject: str):
         claimed = pending.claimed_receipt
+        if type(pending.platform_observation) is PlatformObservationV2:
+            self._check_v2_observation_start_locked(
+                db, pending.platform_observation, claimed, subject)
         claim_row = self._load_mutation_locked(db, claimed.pending, subject)
         claim_permit = replace(claimed.pending.permit,
                                revision=claimed.updated_revision,
@@ -524,6 +536,54 @@ class AuthorityV2ExecutionBridge:
                 != footprint):
             raise AuthorityUnavailable("observation predecessor footprint differs")
         return predecessor, footprint, predecessor_row
+
+    def _check_v2_observation_start_locked(
+            self, db, observation: PlatformObservationV2,
+            claimed_receipt: MutationReceiptV2, subject: str,
+    ) -> None:
+        """Authenticate the original persisted start and graph receipt in Core."""
+        binding = claimed_receipt.pending.binding
+        if type(binding) is not ExecutionBindingV2 or observation.binding != binding:
+            raise AuthorityUnavailable("V2 observation binding differs")
+        row = db.execute(
+            "SELECT operation_id,namespace,subject,claim_digest,binding_digest,"
+            "graph_claim_ref,permit FROM authority_execution_handoff_starts_v1 "
+            "WHERE handoff_id=?", (observation.handoff_id,),
+        ).fetchone()
+        if row is None:
+            raise AuthorityUnavailable("V2 observation has no durable handoff start")
+        permit = replace(claimed_receipt.pending.permit,
+                         revision=claimed_receipt.updated_revision,
+                         pinned_anchor=claimed_receipt.after_anchor)
+        if (row[:5] != (permit.operation_id, self.namespace, subject,
+                        canonical_digest(claimed_receipt), canonical_digest(binding))
+                or decode_bytes(row[6]) != permit):
+            raise AuthorityUnavailable("V2 observation start identity differs")
+        graph_row = db.execute(
+            "SELECT context_digest,receipt FROM "
+            "authority_execution_handoff_graph_receipts_v1 WHERE handoff_id=?",
+            (observation.handoff_id,),
+        ).fetchone()
+        if graph_row is None:
+            raise AuthorityUnavailable("V2 observation graph receipt absent")
+        graph_receipt = decode_bytes(graph_row[1])
+        context = DispatchHandoffContextV1(
+            permit, canonical_digest(claimed_receipt),
+            canonical_digest(binding), observation.handoff_id)
+        if (type(graph_receipt) is not DispatchGraphClaimReceiptV1
+                or graph_row[0] != canonical_digest(context)
+                or graph_receipt.context_digest != graph_row[0]
+                or graph_receipt.graph_claim_ref != row[5]
+                or graph_receipt.graph_namespace != binding.graph_namespace
+                or graph_receipt.graph_incarnation != binding.graph_incarnation
+                or graph_receipt.issuer_id != self._final_handoff_issuer_id):
+            raise AuthorityUnavailable("V2 observation graph claim differs")
+        start = HandoffStartV2(
+            observation.handoff_id, permit.operation_id, permit.effect_id,
+            self.namespace, row[3], row[4], row[5], permit,
+            graph_claim_receipt=graph_receipt)
+        if observation.start_digest != handoff_start_digest_v2(start):
+            raise AuthorityUnavailable("V2 observation original start digest differs")
 
     def prepare_pending(self, *, credential, subject: str,
                         permit: FencePermitV2, mutation_id: str,
@@ -637,7 +697,7 @@ class AuthorityV2ExecutionBridge:
     def _existing_observation_locked(self, db, mutation_id: str,
                                      original_permit: FencePermitV2,
                                      claimed_receipt: MutationReceiptV2,
-                                     observation: PlatformObservationV1,
+                                     observation: PlatformObservationV1 | PlatformObservationV2,
                                      subject: str):
         existing = self.fences.mutation_locked(db, mutation_id)
         if existing is None:
@@ -664,13 +724,13 @@ class AuthorityV2ExecutionBridge:
 
     def prepare_observation_pending(self, *, credential, subject: str,
                                     claimed_receipt: MutationReceiptV2,
-                                    observation: PlatformObservationV1) -> PendingMutationV2:
+                                    observation: PlatformObservationV1 | PlatformObservationV2) -> PendingMutationV2:
         """Persist one verifier-qualified report after the current operation tail."""
         identifier(subject, "subject")
         if (type(claimed_receipt) is not MutationReceiptV2
                 or claimed_receipt.pending.phase != "claimed"
                 or claimed_receipt.durable_state != "committed"
-                or type(observation) is not PlatformObservationV1
+                or type(observation) not in (PlatformObservationV1, PlatformObservationV2)
                 or observation.binding != claimed_receipt.pending.binding):
             raise AuthorityUnavailable("observation requires the original committed claim")
         original_permit = claimed_receipt.pending.permit
@@ -695,6 +755,9 @@ class AuthorityV2ExecutionBridge:
                     self._require_v2_mode_locked(db)
                     self.fences._check_schema(db)
                     self._check_deletion_locked(db, deletion_head)
+                    if type(observation) is PlatformObservationV2:
+                        self._check_v2_observation_start_locked(
+                            db, observation, claimed_receipt, subject)
                     existing = self._existing_observation_locked(
                         db, mutation_id, original_permit, claimed_receipt,
                         observation, subject)
@@ -709,7 +772,7 @@ class AuthorityV2ExecutionBridge:
             verified = verifier(self.namespace, claimed_receipt, observation)
         except Exception as exc:
             raise AuthorityUnavailable("platform observation verification failed") from exc
-        if type(verified) is not PlatformObservationV1 or verified != observation:
+        if type(verified) is not type(observation) or verified != observation:
             raise AuthorityUnavailable("platform observation evidence was not verified")
         with self.deletion.freeze_writes():
             with self.journal.freeze_writes():
@@ -723,6 +786,9 @@ class AuthorityV2ExecutionBridge:
                     self._require_v2_mode_locked(db)
                     self.fences._check_schema(db)
                     self._check_deletion_locked(db, deletion_head)
+                    if type(observation) is PlatformObservationV2:
+                        self._check_v2_observation_start_locked(
+                            db, observation, claimed_receipt, subject)
                     existing = self._existing_observation_locked(
                         db, mutation_id, original_permit, claimed_receipt,
                         observation, subject)
@@ -1374,6 +1440,28 @@ class AuthorityV2ExecutionBridge:
         return self.reconcile_mutation(
             credential=credential, subject=subject, pending=pending)
 
+    def execution_observe_v2(self, *, credential, subject: str,
+                             claimed_receipt: MutationReceiptV2,
+                             observation: PlatformObservationV2):
+        """Persist a verifier-qualified V2 report against its fresh handoff."""
+        if (type(observation) is not PlatformObservationV2
+                or type(claimed_receipt) is not MutationReceiptV2
+                or type(claimed_receipt.pending.binding) is not ExecutionBindingV2):
+            raise AuthorityUnavailable("V2 observation requires V2 claim and report")
+        pending = self.prepare_observation_pending(
+            credential=credential, subject=subject,
+            claimed_receipt=claimed_receipt, observation=observation)
+        with self.core._tx() as db:
+            mutation = self._load_mutation_locked(db, pending, subject)
+            completed = self._completed_result(mutation)
+        if completed is not None:
+            return self.reconcile_mutation(
+                credential=credential, subject=subject, pending=pending)
+        self.append_pending(pending, credential=credential, subject=subject)
+        return self.reconcile_mutation(
+            credential=credential, subject=subject, pending=pending)
+
 
 __all__ = ["AuthorityV2ExecutionBridge", "CurrentEffectReadV2",
-           "PreparedExecutionObservationV2", "HandoffStartV2"]
+           "PreparedExecutionObservationV2", "HandoffStartV2",
+           "handoff_start_digest_v2"]

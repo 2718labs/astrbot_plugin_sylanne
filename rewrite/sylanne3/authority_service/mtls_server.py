@@ -31,6 +31,7 @@ from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, ContentPermit, i
 from .v2_clock import AuthorityClockReadingV2, IngressClockSampleV2
 from .v2_contract import (
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
+    PlatformObservationV2,
     SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
 )
 from .v2_fence_service import AuthorityV2FenceService
@@ -257,6 +258,7 @@ class AuthorityRpcServer:
         v2_final_handoff_authorizers: Mapping[str, Callable] | None = None,
         v2_final_handoff_issuers: Mapping[str, str] | None = None,
         v2_final_handoff_reverse: Mapping[str, ReverseGraphClaimClient] | None = None,
+        v2_platform_observation_verifiers: Mapping[str, Callable] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
         clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
@@ -335,12 +337,17 @@ class AuthorityRpcServer:
                 or any(type(issuer) is not str or not issuer
                        for issuer in handoff_issuers.values())):
             raise TypeError("v2 graph claim issuers must match installed authorizers")
+        observation_verifiers = dict(v2_platform_observation_verifiers or {})
+        if any(namespace not in services or not callable(verifier)
+               for namespace, verifier in observation_verifiers.items()):
+            raise TypeError("V2 platform observation verifiers must be installed per namespace")
         self._v2_execution = {
             namespace: AuthorityV2ExecutionBridge(
                 core=core, fences=service.fences, journal=service.execution,
                 namespace=namespace, deletion=service.deletion,
                 final_handoff_authorizer=handoff_authorizers.get(namespace),
                 final_handoff_issuer_id=handoff_issuers.get(namespace),
+                observation_verifier=observation_verifiers.get(namespace),
                 owner_tickets=v2_owner_tickets,
                 owner_installation_id=(reverse_handoffs[namespace].profile.installation_id
                                        if namespace in reverse_handoffs else None),
@@ -1664,6 +1671,26 @@ class AuthorityRpcServer:
                     credential=credential, subject=subject,
                     claimed_receipt=claimed, handoff_id=handoff_id)
                 return {"start": start.to_wire()}
+            if method == "execution_observe_v2" and set(command) == {
+                    "claimed_receipt", "observation"}:
+                claimed = from_wire(command["claimed_receipt"])
+                observation = from_wire(command["observation"])
+                if (type(claimed) is not MutationReceiptV2
+                        or claimed.pending.phase != "claimed"
+                        or claimed.durable_state != "committed"
+                        or type(claimed.pending.binding) is not ExecutionBindingV2
+                        or type(observation) is not PlatformObservationV2
+                        or observation.binding != claimed.pending.binding
+                        or claimed.pending.permit.subject != subject
+                        or to_wire(observation) != command["observation"]):
+                    raise AuthorityUnavailable("V2 platform observation identity differs")
+                namespace = claimed.pending.permit.namespace
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                receipt, updated = self._v2_execution[namespace].execution_observe_v2(
+                    credential=credential, subject=subject,
+                    claimed_receipt=claimed, observation=observation)
+                return {"receipt": to_wire(receipt), "permit": to_wire(updated)}
             if method == "current_anchor" and set(command) == {"namespace"}:
                 service = self._bound_v2_service(
                     credential, profile_id, manifest_digest, command["namespace"])
