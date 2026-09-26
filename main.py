@@ -111,7 +111,6 @@ class Sylanne3Plugin(Star):
         self._encoding_pending: asyncio.Queue = asyncio.Queue(maxsize=8)
         self._encoding_waiters: set[asyncio.Task] = set()
         self._recovery_scan_task: asyncio.Task | None = None
-        self._cost_recovery_task: asyncio.Task | None = None
         self._encoding_stopping = False
         self._installed_namespace: NamespaceId | None = None
         self._scene_candidates = SceneCandidateCatalog()
@@ -312,9 +311,7 @@ class Sylanne3Plugin(Star):
         if health.status == "limited":
             self.runtime_health = health
             self._recovery_scan_task = asyncio.create_task(
-                self._restore_unacquired_first_ingress_c02_v1())
-            self._cost_recovery_task = asyncio.create_task(
-                self._restore_committed_first_ingress_c02_cost_v1())
+                self._run_startup_c02_recovery_v1())
         else:
             self.runtime_health = RuntimeHealth(
                 "blocked", health.missing_capabilities or ("runtime_bootstrap",),
@@ -330,10 +327,6 @@ class Sylanne3Plugin(Star):
             self._recovery_scan_task.cancel()
             await asyncio.gather(self._recovery_scan_task, return_exceptions=True)
             self._recovery_scan_task = None
-        if self._cost_recovery_task is not None:
-            self._cost_recovery_task.cancel()
-            await asyncio.gather(self._cost_recovery_task, return_exceptions=True)
-            self._cost_recovery_task = None
         for task in self._encoding_waiters:
             task.cancel()
         if self._encoding_waiters:
@@ -436,6 +429,13 @@ class Sylanne3Plugin(Star):
             raise
         except Exception:
             logger.exception("Sylanne 3 unacquired first encoding scan failed; HOLD")
+
+    async def _run_startup_c02_recovery_v1(self) -> None:
+        # C02 cost discovery uses graph-stamped V1 cursors. Finish that scan
+        # before an unacquired job's V3 acquire can advance the graph stamp.
+        await self._restore_committed_first_ingress_c02_cost_v1()
+        if not self._encoding_stopping:
+            await self._restore_unacquired_first_ingress_c02_v1()
 
     async def _restore_committed_first_ingress_c02_cost_v1(self) -> None:
         runtime = self._runtime

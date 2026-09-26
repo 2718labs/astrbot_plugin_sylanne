@@ -1112,6 +1112,35 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [(None, 50, 0), ("second-page", 50, 0)])
         self.assertEqual(observed, list(operations))
 
+    async def test_startup_c02_recovery_finishes_cost_before_unacquired_scan(self) -> None:
+        module = load_plugin_module()
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None,
+                    None, None, None, None, None),
+            {"enabled": True},
+        )
+        cost_started = asyncio.Event()
+        release_cost = asyncio.Event()
+        order = []
+
+        async def cost():
+            order.append("cost-start")
+            cost_started.set()
+            await release_cost.wait()
+            order.append("cost-done")
+
+        async def unacquired():
+            order.append("unacquired")
+
+        plugin._restore_committed_first_ingress_c02_cost_v1 = cost
+        plugin._restore_unacquired_first_ingress_c02_v1 = unacquired
+        scan = asyncio.create_task(plugin._run_startup_c02_recovery_v1())
+        await asyncio.wait_for(cost_started.wait(), 1)
+        self.assertEqual(order, ["cost-start"])
+        release_cost.set()
+        await asyncio.wait_for(scan, 1)
+        self.assertEqual(order, ["cost-start", "cost-done", "unacquired"])
+
     async def test_limited_installed_v2_ingress_never_claims_receipt_as_reply(self) -> None:
         module = load_plugin_module()
 
