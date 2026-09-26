@@ -281,6 +281,83 @@ class AuthoredRootCandidate:
         return canonical_digest(encode_root_candidate(self))
 
 
+@dataclass(frozen=True)
+class AuthoredRootBlockInput:
+    """One explicit authored 24D initial condition and its declared box."""
+
+    identity: RootBlockIdentity
+    axes: tuple[str, ...]
+    latent_state: tuple[float, ...]
+    ordered_box: tuple[tuple[float, float], ...]
+    initial_error_ref: str
+
+
+@dataclass(frozen=True)
+class AuthoredRootInput:
+    """Role selection of exact preset bytes and per-block authored values."""
+
+    candidate_id: str
+    namespace: tuple[str, str]
+    author_id: str
+    draft_id: str
+    cursor: float
+    preset_digest: str
+    asset_digest: str
+    blocks: tuple[AuthoredRootBlockInput, ...]
+
+
+def compile_authored_root_candidate(
+    preset: AuthoredRootPreset,
+    selection: AuthoredRootInput,
+) -> AuthoredRootCandidate:
+    """Compile a pure candidate; authentication and numeric admission remain external.
+
+    The selected digests bind the supplied preset and asset references. Each
+    block supplies a latent state and box; no readout or historical event is
+    inferred. The initial box remains an author declaration until D11 verifies
+    it with the trusted native initial-box contract.
+    """
+    if type(preset) is not AuthoredRootPreset or type(selection) is not AuthoredRootInput:
+        raise TypeError("expected an authored root preset and role input")
+    if selection.preset_digest != preset.digest:
+        raise ValueError("preset_digest differs from selected preset")
+    if selection.asset_digest != preset.assets.digest:
+        raise ValueError("asset_digest differs from selected preset assets")
+    if (type(selection.blocks) is not tuple or not selection.blocks
+            or any(type(block) is not AuthoredRootBlockInput for block in selection.blocks)):
+        raise ValueError("blocks must be explicit authored root block inputs")
+    checkpoints = tuple(
+        RootNumericCheckpointCandidate(
+            preset_digest=selection.preset_digest,
+            asset_digest=selection.asset_digest,
+            block_id=item.identity.block_id,
+            namespace=selection.namespace,
+            author_id=selection.author_id,
+            draft_id=selection.draft_id,
+            block=item.identity,
+            assets=preset.assets,
+            axes=item.axes,
+            latent_state=item.latent_state,
+            ordered_box=item.ordered_box,
+            initial_error_source="author_declared_box",
+            initial_error_ref=item.initial_error_ref,
+            cursor=selection.cursor,
+        ) for item in selection.blocks
+    )
+    return AuthoredRootCandidate(
+        preset=preset,
+        preset_digest=selection.preset_digest,
+        candidate_id=selection.candidate_id,
+        namespace=selection.namespace,
+        author_id=selection.author_id,
+        draft_id=selection.draft_id,
+        cursor=selection.cursor,
+        blocks=tuple(item.identity for item in selection.blocks),
+        historical_source_refs=(),
+        checkpoints=checkpoints,
+    )
+
+
 def encode_root_preset(value: AuthoredRootPreset) -> dict:
     if type(value) is not AuthoredRootPreset:
         raise TypeError("expected AuthoredRootPreset")
