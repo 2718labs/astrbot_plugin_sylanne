@@ -5696,12 +5696,14 @@ class GraphCoordinator:
 
     def commit_first_ingress_v2(self, bootstrap: object, host: IngressHostFacts,
                                 installation_policy, clock_policy,
-                                encoding_policy) -> CommitReceipt:
+                                encoding_policy,
+                                reply_source_policy=None) -> CommitReceipt:
         """Commit the first reported source and encoding job in one fenced write."""
         from .authority_service.v2_contract import FencePermitV2, from_wire, to_wire
         from .domains.d06 import D06DomainAdapter, SourceAdmission
         from .host.authority_profile import (
             AdminIngressClockPolicy, AdminIngressEncodingPolicy,
+            AdminD06PrivateReplySourcePolicy,
         )
         from .installation_policy import AdminInstallationPolicy
         from .runtime.d11_types import runtime_job_key, runtime_outbox_key
@@ -5728,6 +5730,12 @@ class GraphCoordinator:
                 or type(clock_policy) is not AdminIngressClockPolicy
                 or type(encoding_policy) is not AdminIngressEncodingPolicy):
             raise TypeError("typed v2 first ingress facts and policies required")
+        if reply_source_policy is not None and (
+                type(reply_source_policy) is not AdminD06PrivateReplySourcePolicy
+                or reply_source_policy.version != 1
+                or reply_source_policy.scope != "private_conversation"
+                or reply_source_policy.grant_expression is not True):
+            raise AuthorityDenied("private reply source policy differs from host scope")
         store = self.__store
         port = self.__content_fence_v2
         if (not isinstance(store, ProductionGraphStore) or port is None
@@ -5747,6 +5755,10 @@ class GraphCoordinator:
         identity_json = policy_identity(
             policy, clock_policy, encoding_policy, fingerprint,
             host.lineage.source_ref, host.conversation_ref)
+        if reply_source_policy is not None:
+            identity_data = json.loads(identity_json)
+            identity_data["d06_private_reply_source"] = asdict(reply_source_policy)
+            identity_json = canonical_json(identity_data)
         attempt_id = "first-ingress-" + canonical_digest({
             "namespace": list(namespace.as_tuple), "operation_id": operation_id,
             "identity": identity_json,
@@ -6105,7 +6117,11 @@ class GraphCoordinator:
                         host.lineage.internal_activity_actuality,
                         host.occurred_at, learned_at,
                         host.lineage.provenance_family,
-                        (host.conversation_ref,), ("context", "consolidation"))
+                        (host.conversation_ref,),
+                        (("context", "consolidation", "expression")
+                         if (reply_source_policy is not None
+                             and host.visibility == "private") else
+                         ("context", "consolidation")))
                     candidate = D06DomainAdapter(namespace).admit_source(admission)
                     command = CommandEnvelope(
                         RUNTIME_SCHEMA,
@@ -7130,6 +7146,1104 @@ class GraphCoordinator:
             authority.namespace, job, outbox, source_version, access_version,
             authority, now, acquire_operation_id, clock, binding)
         return binding, job, outbox, outbox_key
+
+    def commit_post_c02_attention_v1(
+        self, bundle: DomainBundle, lease: object, installed_bundle,
+    ) -> CommitReceipt:
+        """Sign a bounded D07 quote inside its original fenced graph write."""
+        from .host.authority_profile import (
+            AdminD07AttentionPolicy, AdminInstallationBundle,
+        )
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.reply_model_job import d07_attention_quote_id_v1
+        from .runtime_contracts import VersionedRef
+
+        if (type(bundle) is not DomainBundle
+                or type(installed_bundle) is not AdminInstallationBundle
+                or type(installed_bundle.d07_attention)
+                is not AdminD07AttentionPolicy
+                or installed_bundle.ingress_clock != self.__scene_clock_policy
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None):
+            raise UnavailableGuard("installed D07 attention issuance unavailable; HOLD")
+        envelope = bundle.envelope
+        namespace = envelope.authority.namespace
+        quote_id = d07_attention_quote_id_v1(
+            namespace, envelope.identity.operation_id)
+        if (installed_bundle.installation_policy.namespace != namespace
+                or envelope.identity.phase != "post_c02_attention"
+                or envelope.authority.purpose != "expression"
+                or len(envelope.authority.audience) != 1
+                or len(envelope.source_qualification.source_refs) != 1
+                or len(envelope.causation) != 1
+                or len(bundle.proposals) != 1
+                or bundle.proposals[0].domain != "d07"
+                or {write.key.type_name for write in
+                    bundle.proposals[0].typed_writes} != {
+                        "d07.attention_ticket.v1", "d07.focus.v1"}
+                or bundle.persistent_job_refs or bundle.outbox_refs
+                or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs
+                or envelope.version_guard.resource_lease_versions !=
+                   (VersionedRef(quote_id, 1),)):
+            raise AuthorityDenied("post-C02 attention bundle identity differs")
+        now = trusted_upper(self.__content_fence_v2.read_ingress_clock(
+            self.__scene_clock_policy))
+        self._authorize(lease, envelope.authority, frozenset({"d07"}))
+        return self._commit_domain_bundle_v2(
+            bundle, lease, attention_issuance=(installed_bundle, now))
+
+    def read_post_c02_attention_inputs_v1(
+        self, bootstrap: object, namespace: NamespaceId,
+        c02_operation_id: str, source_ref: str | None, installed_bundle,
+    ):
+        """Fenced current C02/source read for a separate D07 ticket proposal."""
+        from .host.authority_profile import AdminInstallationBundle
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.reply_model_job import (
+            read_settled_c02_reply_source_v1, source_key_from_ref,
+        )
+        from .runtime.c02_bundle_codec import c02_bundle_from_wire
+        from .memory_types import access_key, source_key
+        from .runtime_contracts import QueryEpoch, VersionGuard
+
+        self._admin(bootstrap)
+        store = self.__store
+        port = self.__content_fence_v2
+        if (not isinstance(store, ProductionGraphStore) or port is None
+                or type(namespace) is not NamespaceId
+                or type(installed_bundle) is not AdminInstallationBundle
+                or installed_bundle.ingress_clock != self.__scene_clock_policy
+                or installed_bundle.installation_policy.namespace != namespace):
+            raise UnavailableGuard("installed post-C02 attention read unavailable; HOLD")
+        reading = port.read_ingress_clock(self.__scene_clock_policy)
+        now = trusted_upper(reading)
+        with store._lock:
+            metadata, epoch = self._v2_graph_stamp(namespace)
+            provision_row = self._provision_row(store._db, namespace)
+            provision = (self._decode_provision_receipt(provision_row)
+                         if provision_row is not None else None)
+        target = metadata.requirements
+        if (provision is None or target.namespace != namespace
+                or provision.installation_id !=
+                   installed_bundle.installation_policy.installation_id
+                or provision.generation != target.activation_generation):
+            raise UnavailableGuard("post-C02 attention installation differs; HOLD")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("post-C02 attention anchor differs; HOLD")
+        operation_id = "reply-attention-read-" + secrets.token_hex(24)
+        permit = port.begin_fence(
+            namespace=namespace,
+            authority_namespace=target.authority_namespace,
+            holder=self.__holder, generation=target.activation_generation,
+            operation="read", operation_id=operation_id,
+            expected_anchor=anchor)
+        scope = FenceScope(
+            namespace, target.authority_namespace, target.activation_generation,
+            "read", operation_id, permit, anchor, epoch,
+            metadata.graph_revision)
+        try:
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("post-C02 attention read fence changed")
+            with store._lock:
+                db = store._db
+                db.execute("BEGIN")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("post-C02 attention graph changed")
+                    sealed = db.execute(
+                        "SELECT bundle_json FROM graph_first_ingress_c02_committed_seals_v2 "
+                        "WHERE bot=? AND persona=? AND operation_id=?",
+                        namespace.as_tuple + (c02_operation_id,),
+                    ).fetchone()
+                    if sealed is None:
+                        raise UnavailableGuard("original C02 seal absent; HOLD")
+                    frozen_sources = c02_bundle_from_wire(
+                        sealed[0]).envelope.source_qualification.source_refs
+                    if (len(frozen_sources) != 1 or
+                            (source_ref is not None and source_ref != frozen_sources[0])):
+                        raise UnavailableGuard("post-C02 source differs from seal; HOLD")
+                    source_ref = frozen_sources[0]
+                    source_id = source_key_from_ref(source_ref, namespace)
+                    keys = (source_key(*namespace.as_tuple, source_id),
+                            access_key(*namespace.as_tuple, source_id),
+                            AtomKey(Owner("persona", *namespace.as_tuple),
+                                    "d07.focus.v1", namespace.persona_id))
+                    atoms = []
+                    for key in keys:
+                        row = db.execute(
+                            "SELECT revision,value,valid FROM graph_atoms "
+                            "WHERE token=?", (key.token,),
+                        ).fetchone()
+                        atoms.append(GraphAtom(
+                            key, row[0], json.loads(row[1]), bool(row[2]))
+                            if row else GraphAtom(key, 0, {}, False))
+                    snapshot = GraphSnapshot(tuple(atoms), (epoch,))
+                    c02_row = db.execute(
+                        "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+                        "FROM graph_bundle_operations WHERE bot=? AND persona=? "
+                        "AND operation_id=?",
+                        namespace.as_tuple + (c02_operation_id,),
+                    ).fetchone()
+                    if c02_row is None:
+                        raise UnavailableGuard("original C02 receipt absent; HOLD")
+                    event = db.execute(
+                        "SELECT reads,revisions,epoch_revision FROM graph_events "
+                        "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+                        namespace.as_tuple + (c02_row[1], c02_operation_id),
+                    ).fetchone()
+                    if event is None:
+                        raise UnavailableGuard("original C02 graph event absent; HOLD")
+                    detail = json.loads(c02_row[4])
+                    receipt = CommitReceipt(
+                        "committed", c02_operation_id, c02_row[0], c02_row[1],
+                        c02_row[2], c02_row[3],
+                        GraphStore._version_rows(event[0]),
+                        GraphStore._version_rows(event[1]),
+                        (NamespaceEpoch(*namespace.as_tuple, event[2]),),
+                        tuple(detail["ledger_refs"]),
+                        tuple(detail["outbox_refs"]))
+                    current = read_settled_c02_reply_source_v1(
+                        db, self.__d02_issuer, namespace, receipt,
+                        source_ref, snapshot)
+                    access_epoch, delete_epoch = self._deletion_epochs_locked(
+                        db, namespace)
+                    guard = VersionGuard(
+                        snapshot.versions,
+                        (QueryEpoch(namespace, "all", epoch.revision),),
+                        access_epoch, delete_epoch,
+                        store._registry.catalogue_hash,
+                        self._version(db, namespace, "scheme", "current"),
+                        self._version(db, namespace, "operator", "current"),
+                        self._version(db, namespace, "policy", "current"),
+                        (), (), ())
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("post-C02 attention read changed; HOLD")
+            with store._lock:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise UnavailableGuard("post-C02 attention graph changed; HOLD")
+            return (receipt, snapshot, current.source_qualification,
+                    current.conversation_ref, guard, anchor, reading)
+        finally:
+            port.finish_fence(
+                scope, request_id="finish:" + operation_id,
+                request_digest="sha256:" + canonical_digest({
+                    "action": "finish_reply_attention_read",
+                    "operation_id": operation_id,
+                    "permit_token": permit.token,
+                }))
+
+    def _current_post_c02_reply_inputs_locked(
+        self, namespace: NamespaceId, c02_operation_id: str,
+        source_ref: str, now_utc: float, epoch: NamespaceEpoch,
+    ):
+        """Read original C02 and current D06/D07 atoms in this graph tx."""
+        from .domains.d07 import attention_ticket_key, read_current_focus_attention_ticket
+        from .memory_types import access_key, source_key
+        from .runtime.reply_model_job import (
+            ReplyModelJobHold, read_current_reply_model_inputs_v1,
+            source_key_from_ref,
+        )
+
+        db = self.__store._db
+        source_id = source_key_from_ref(source_ref, namespace)
+        focus_key = AtomKey(
+            Owner("persona", *namespace.as_tuple),
+            "d07.focus.v1", namespace.persona_id)
+        focus = db.execute(
+            "SELECT value,valid FROM graph_atoms WHERE token=?",
+            (focus_key.token,),
+        ).fetchone()
+        if focus is None or focus[1] != 1:
+            raise ReplyModelJobHold("current D07 focus is absent")
+        ticket_ref = json.loads(focus[0]).get("primary_ticket_ref")
+        ticket_key = AtomKey.from_token(ticket_ref)
+        if ticket_key != attention_ticket_key(namespace, ticket_key.name):
+            raise ReplyModelJobHold("current D07 ticket identity differs")
+        keys = (source_key(*namespace.as_tuple, source_id),
+                access_key(*namespace.as_tuple, source_id),
+                focus_key, ticket_key)
+        atoms = []
+        for key in keys:
+            row = db.execute(
+                "SELECT revision,value,valid FROM graph_atoms "
+                "WHERE token=?", (key.token,),
+            ).fetchone()
+            atoms.append(GraphAtom(
+                key, row[0], json.loads(row[1]), bool(row[2]))
+                if row else GraphAtom(key, 0, {}, False))
+        snapshot = GraphSnapshot(tuple(atoms), (epoch,))
+        attention = read_current_focus_attention_ticket(
+            snapshot, namespace, now=now_utc)
+        if attention is None:
+            raise ReplyModelJobHold("current D07 attention is unavailable")
+        c02_row = db.execute(
+            "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+            "FROM graph_bundle_operations WHERE bot=? AND persona=? "
+            "AND operation_id=?",
+            namespace.as_tuple + (c02_operation_id,),
+        ).fetchone()
+        if c02_row is None:
+            raise ReplyModelJobHold("original C02 receipt is absent")
+        c02_event = db.execute(
+            "SELECT reads,revisions,epoch_revision FROM graph_events "
+            "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+            namespace.as_tuple + (c02_row[1], c02_operation_id),
+        ).fetchone()
+        if c02_event is None:
+            raise ReplyModelJobHold("original C02 graph event is absent")
+        c02_detail = json.loads(c02_row[4])
+        receipt = CommitReceipt(
+            "committed", c02_operation_id, c02_row[0], c02_row[1],
+            c02_row[2], c02_row[3],
+            GraphStore._version_rows(c02_event[0]),
+            GraphStore._version_rows(c02_event[1]),
+            (NamespaceEpoch(*namespace.as_tuple, c02_event[2]),),
+            tuple(c02_detail["ledger_refs"]),
+            tuple(c02_detail["outbox_refs"]))
+        return read_current_reply_model_inputs_v1(
+            db, self.__d02_issuer, namespace, receipt,
+            source_ref, snapshot, attention)
+
+    def _finish_committed_post_c02_reply_fence_v1(
+        self, namespace: NamespaceId, metadata, epoch: NamespaceEpoch,
+        anchor, attempt_id: str, anchor_json: str,
+        prior_revision: int, prior_epoch: int, action: str,
+    ) -> None:
+        """Resolve only the original committed write after a lost finish ACK."""
+        from .authority_service.v2_contract import FencePermitV2
+
+        port = self.__content_fence_v2
+        target = metadata.requirements
+        if (port is None or anchor_json != canonical_json(asdict(anchor))
+                or action not in {"finish_reply_job", "finish_reply_acquire"}):
+            raise UnavailableGuard("reply committed write identity differs; HOLD")
+        permit, state = port.get_fence_operation(
+            namespace=namespace, authority_namespace=target.authority_namespace,
+            operation_id=attempt_id)
+        if (type(permit) is not FencePermitV2
+                or permit.operation != "write"
+                or permit.operation_id != attempt_id
+                or permit.holder != self.__holder
+                or permit.pinned_anchor != anchor
+                or state not in {"active", "finished"}
+                or metadata.graph_revision < prior_revision + 1
+                or epoch.revision < prior_epoch + 1):
+            raise UnavailableGuard("reply committed Authority write differs; HOLD")
+        if state == "active":
+            if (metadata.graph_revision, epoch.revision) != (
+                    prior_revision + 1, prior_epoch + 1):
+                raise UnavailableGuard("reply active write lost graph stamp; HOLD")
+            scope = FenceScope(
+                namespace, target.authority_namespace,
+                target.activation_generation, "write", attempt_id,
+                permit, anchor,
+                NamespaceEpoch(*namespace.as_tuple, prior_epoch),
+                prior_revision)
+            if port.validate_fence(scope) != permit:
+                raise UnavailableGuard("reply committed write permit changed; HOLD")
+            port.finish_fence(
+                scope, request_id="finish:" + attempt_id,
+                request_digest="sha256:" + canonical_digest({
+                    "action": action, "attempt_id": attempt_id,
+                    "permit_token": permit.token,
+                }))
+
+    def prepare_post_c02_reply_model_job_v1(
+        self, bootstrap: object, namespace: NamespaceId,
+        c02_operation_id: str, source_ref: str, installed_bundle,
+    ):
+        """Commit one source-qualified reply job, quote and reserve together.
+
+        The graph worker calls this synchronously. All Authority fence RPCs
+        occur outside GraphStore's lock; the current C02/source/access/D07
+        reads and all business writes occur inside one BEGIN IMMEDIATE.
+        """
+        from .authority_service.v2_contract import FencePermitV2
+        from .authority_service.contract import AuthorityUnavailable
+        from .domains.d07 import read_current_focus_attention_ticket
+        from .host.authority_profile import AdminIngressClockPolicy, AdminInstallationBundle
+        from .memory_types import access_key, source_key
+        from .runtime.d11_types import job_graph_write, runtime_job_key
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+        from .runtime.reply_model_job import (
+            ReplyModelJobHold, install_schema, issue_reply_job_in_transaction_v1,
+            read_current_reply_model_inputs_v1, read_saved_reply_job_v1,
+            reply_job_original_operation_id_v1, source_key_from_ref,
+        )
+
+        self._admin(bootstrap)
+        store = self.__store
+        port = self.__content_fence_v2
+        if (not isinstance(store, ProductionGraphStore) or port is None
+                or type(namespace) is not NamespaceId
+                or type(installed_bundle) is not AdminInstallationBundle
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy
+                or installed_bundle.ingress_clock != self.__scene_clock_policy
+                or type(self.__d02_issuer) is not D02ResourceIssuer
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or self.__d11_issuer.resource_issuer is not self.__d02_issuer
+                or installed_bundle.installation_policy.namespace != namespace):
+            raise UnavailableGuard("installed reply graph authorities are unavailable; HOLD")
+        try:
+            source_id = source_key_from_ref(source_ref, namespace)
+            now = trusted_upper(port.read_ingress_clock(self.__scene_clock_policy))
+        except Exception as exc:
+            raise UnavailableGuard("reply source or trusted clock is unavailable; HOLD") from exc
+        original_operation_id = reply_job_original_operation_id_v1(
+            c02_operation_id, source_ref)
+        input_digest = canonical_digest({
+            "schema": "sylanne.post-c02-reply-preparation.v1",
+            "namespace": list(namespace.as_tuple),
+            "c02_operation_id": c02_operation_id,
+            "source_ref": source_ref,
+            "installation_id": installed_bundle.installation_policy.installation_id,
+            "reply_workflow": ({
+                "provider_id": installed_bundle.model_workflows.reply.provider_id,
+                "model_id": installed_bundle.model_workflows.reply.model_id,
+                "provider_config_digest": installed_bundle.model_workflows.reply.provider_config_digest,
+                "template_version": installed_bundle.model_workflows.reply.template_version,
+                "quote_ceiling": dict(installed_bundle.model_workflows.reply.quote_ceiling),
+            } if installed_bundle.model_workflows is not None else None),
+        })
+        with store._lock:
+            db = store._db
+            install_schema(db)
+            saved = read_saved_reply_job_v1(
+                db, self.__d02_issuer, namespace, c02_operation_id, source_ref)
+            attempt = db.execute(
+                "SELECT input_digest,attempt_id,anchor_json,graph_revision,"
+                "graph_epoch,state FROM graph_post_c02_reply_model_attempts_v1 "
+                "WHERE bot=? AND persona=? AND original_operation_id=?",
+                namespace.as_tuple + (original_operation_id,),
+            ).fetchone()
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        target = metadata.requirements
+        provision_row = self._provision_row(store._db, namespace)
+        provision = (self._decode_provision_receipt(provision_row)
+                     if provision_row is not None else None)
+        if (target.namespace != namespace or provision is None
+                or provision.generation != target.activation_generation
+                or provision.installation_id !=
+                   installed_bundle.installation_policy.installation_id
+                or provision.authority_id != target.authority_id
+                or provision.authority_namespace != target.authority_namespace):
+            raise UnavailableGuard("reply graph activation differs; HOLD")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if not self._anchor_matches(target, anchor):
+            raise UnavailableGuard("reply Authority anchor differs; HOLD")
+        if attempt is not None and attempt[0] != input_digest:
+            raise EventConflict("reply preparation identity reused with another profile")
+        if saved is not None:
+            if attempt is None or attempt[5] != "committed":
+                raise UnavailableGuard("reply preparation lacks its write fence; HOLD")
+            self._finish_committed_post_c02_reply_fence_v1(
+                namespace, metadata, epoch, anchor, attempt[1], attempt[2],
+                attempt[3], attempt[4], "finish_reply_job")
+            return saved
+        if attempt is not None and attempt[5] == "committed":
+            raise UnavailableGuard("reply committed fence lacks job; HOLD")
+        if attempt is not None and attempt[5] == "open":
+            if (attempt[2] != canonical_json(asdict(anchor))
+                    or (attempt[3], attempt[4]) != (
+                        metadata.graph_revision, epoch.revision)):
+                raise UnavailableGuard("reply pending write anchor changed; HOLD")
+            attempt_id = attempt[1]
+            attempt_was_open = True
+        else:
+            attempt_id = "reply-job-write-" + secrets.token_hex(24)
+            attempt_was_open = False
+            with store._lock:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("reply graph changed before write intent")
+                    db.execute(
+                        "INSERT INTO graph_post_c02_reply_model_attempts_v1"
+                        "(bot,persona,original_operation_id,input_digest,attempt_id,"
+                        "anchor_json,graph_revision,graph_epoch,state) "
+                        "VALUES(?,?,?,?,?,?,?,?,'open') "
+                        "ON CONFLICT(bot,persona,original_operation_id) DO UPDATE SET "
+                        "attempt_id=excluded.attempt_id,anchor_json=excluded.anchor_json,"
+                        "graph_revision=excluded.graph_revision,"
+                        "graph_epoch=excluded.graph_epoch,state='open' "
+                        "WHERE graph_post_c02_reply_model_attempts_v1.state='closed' "
+                        "AND graph_post_c02_reply_model_attempts_v1.input_digest=excluded.input_digest",
+                        namespace.as_tuple + (original_operation_id, input_digest,
+                        attempt_id, canonical_json(asdict(anchor)),
+                        metadata.graph_revision, epoch.revision),
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+        if attempt_was_open:
+            try:
+                observed_permit, observed_state = port.get_fence_operation(
+                    namespace=namespace,
+                    authority_namespace=target.authority_namespace,
+                    operation_id=attempt_id)
+            except AuthorityUnavailable:
+                # A crash may leave the local exact attempt before begin_fence.
+                # Retry that same operation ID; Authority rejects any collision.
+                observed_permit, observed_state = None, "absent"
+        else:
+            observed_permit, observed_state = None, "absent"
+        if observed_state == "absent":
+            permit = port.begin_fence(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                holder=self.__holder, generation=target.activation_generation,
+                operation="write", operation_id=attempt_id,
+                expected_anchor=anchor)
+        elif observed_state == "active":
+            permit = observed_permit
+        else:
+            raise UnavailableGuard("reply write attempt has unresolved Authority state; HOLD")
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.operation_id != attempt_id or permit.holder != self.__holder
+                or permit.pinned_anchor != anchor):
+            raise UnavailableGuard("reply write permit differs; HOLD")
+        scope = FenceScope(
+            namespace, target.authority_namespace, target.activation_generation,
+            "write", attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("reply write fence is stale; HOLD")
+        try:
+            with store._lock:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("reply graph changed before business write")
+                    from .domains.d07 import attention_ticket_key
+                    focus_key = AtomKey(
+                        Owner("persona", *namespace.as_tuple),
+                        "d07.focus.v1", namespace.persona_id)
+                    focus = db.execute(
+                        "SELECT value,valid FROM graph_atoms WHERE token=?",
+                        (focus_key.token,),
+                    ).fetchone()
+                    if focus is None or focus[1] != 1:
+                        raise ReplyModelJobHold("current D07 focus is absent")
+                    ticket_ref = json.loads(focus[0]).get("primary_ticket_ref")
+                    ticket_key = AtomKey.from_token(ticket_ref)
+                    if ticket_key != attention_ticket_key(namespace, ticket_key.name):
+                        raise ReplyModelJobHold("current D07 ticket identity differs")
+                    source_key_value = source_key(*namespace.as_tuple, source_id)
+                    access_key_value = access_key(*namespace.as_tuple, source_id)
+                    atoms = []
+                    for key in (source_key_value, access_key_value,
+                                focus_key, ticket_key):
+                        row = db.execute(
+                            "SELECT revision,value,valid FROM graph_atoms "
+                            "WHERE token=?", (key.token,),
+                        ).fetchone()
+                        atoms.append(GraphAtom(
+                            key, row[0], json.loads(row[1]), bool(row[2]))
+                            if row else GraphAtom(key, 0, {}, False))
+                    snapshot = GraphSnapshot(tuple(atoms), (epoch,))
+                    attention = read_current_focus_attention_ticket(
+                        snapshot, namespace, now=now)
+                    if attention is None:
+                        raise ReplyModelJobHold("current D07 attention is unavailable")
+                    c02_row = db.execute(
+                        "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+                        "FROM graph_bundle_operations WHERE bot=? AND persona=? "
+                        "AND operation_id=?",
+                        namespace.as_tuple + (c02_operation_id,),
+                    ).fetchone()
+                    if c02_row is None:
+                        raise ReplyModelJobHold("original C02 receipt is absent")
+                    c02_event = db.execute(
+                        "SELECT reads,revisions,epoch_revision FROM graph_events "
+                        "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+                        namespace.as_tuple + (c02_row[1], c02_operation_id),
+                    ).fetchone()
+                    if c02_event is None:
+                        raise ReplyModelJobHold("original C02 graph event is absent")
+                    c02_detail = json.loads(c02_row[4])
+                    c02_receipt = CommitReceipt(
+                        "committed", c02_operation_id, c02_row[0], c02_row[1],
+                        c02_row[2], c02_row[3],
+                        GraphStore._version_rows(c02_event[0]),
+                        GraphStore._version_rows(c02_event[1]),
+                        (NamespaceEpoch(*namespace.as_tuple, c02_event[2]),),
+                        tuple(c02_detail["ledger_refs"]),
+                        tuple(c02_detail["outbox_refs"]))
+                    inputs = read_current_reply_model_inputs_v1(
+                        db, self.__d02_issuer, namespace, c02_receipt,
+                        source_ref, snapshot, attention)
+                    job, quote, reservation_digest = (
+                        issue_reply_job_in_transaction_v1(
+                            db, namespace=namespace, inputs=inputs,
+                            installed_bundle=installed_bundle,
+                            d02_issuer=self.__d02_issuer,
+                            d11_issuer=self.__d11_issuer, now_utc=now))
+                    write = job_graph_write(job)
+                    reconcile_runtime_write(db, write)
+                    candidate = GraphCandidate(
+                        Event(Scope(*namespace.as_tuple, job.activity_id),
+                              original_operation_id, now, "domain_bundle",
+                              {"bundle_digest": input_digest}),
+                        (GraphVersion(write.key, 0),) + snapshot.versions,
+                        (GraphWrite(write.key, write.value,
+                                    (source_key_value, access_key_value,
+                                     ticket_key, focus_key)),), (epoch,))
+                    graph_receipt = GraphStore._graph_commit_in_transaction(
+                        store, candidate, _capability=self.__graph_capability)
+                    if graph_receipt.status != "committed":
+                        raise EventConflict("reply graph job did not commit")
+                    store.cas_graph_recovery_metadata(
+                        metadata, metadata.requirements,
+                        _capability=self.__graph_capability)
+                    seq_row = db.execute(
+                        "SELECT last_seq FROM graph_bundle_sequence "
+                        "WHERE bot=? AND persona=?",
+                        namespace.as_tuple,
+                    ).fetchone()
+                    seq = (seq_row[0] if seq_row else 0) + 1
+                    db.execute(
+                        "INSERT INTO graph_bundle_sequence(bot,persona,last_seq) "
+                        "VALUES(?,?,?) ON CONFLICT(bot,persona) DO UPDATE SET "
+                        "last_seq=excluded.last_seq",
+                        namespace.as_tuple + (seq,),
+                    )
+                    db.execute(
+                        "INSERT INTO graph_bundle_operations"
+                        "(bot,persona,operation_id,digest,activity_id,effect_id,"
+                        "commit_seq,receipt_json) VALUES(?,?,?,?,?,?,?,?)",
+                        namespace.as_tuple + (original_operation_id,
+                        input_digest, job.activity_id, None, seq,
+                        canonical_json({
+                            "c02_operation_id": c02_operation_id,
+                            "source_ref": source_ref,
+                            "job_ref": write.key.token,
+                            "quote_id": quote.quote_id,
+                            "reservation_digest": reservation_digest,
+                            "ledger_refs": [write.key.token],
+                            "outbox_refs": [],
+                        })),
+                    )
+                    db.execute(
+                        "UPDATE graph_post_c02_reply_model_attempts_v1 "
+                        "SET state='committed' WHERE bot=? AND persona=? "
+                        "AND original_operation_id=? AND attempt_id=?",
+                        namespace.as_tuple + (original_operation_id, attempt_id),
+                    )
+                    saved = read_saved_reply_job_v1(
+                        db, self.__d02_issuer, namespace,
+                        c02_operation_id, source_ref)
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+        except BaseException:
+            try:
+                port.finish_fence(
+                    scope, request_id="finish:" + attempt_id,
+                    request_digest="sha256:" + canonical_digest({
+                        "action": "abort_reply_job", "attempt_id": attempt_id,
+                        "permit_token": permit.token,
+                    }))
+                with store._lock:
+                    db.execute(
+                        "UPDATE graph_post_c02_reply_model_attempts_v1 "
+                        "SET state='closed' WHERE bot=? AND persona=? "
+                        "AND original_operation_id=? AND attempt_id=? AND state='open'",
+                        namespace.as_tuple + (original_operation_id, attempt_id),
+                    )
+            except Exception:
+                pass
+            raise
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("reply committed write fence outcome unknown; HOLD")
+        port.finish_fence(
+            scope, request_id="finish:" + attempt_id,
+            request_digest="sha256:" + canonical_digest({
+                "action": "finish_reply_job", "attempt_id": attempt_id,
+                "permit_token": permit.token,
+            }))
+        return saved
+
+    def acquire_post_c02_reply_model_job_v1(
+        self, authority: AuthorityContext, lease: object,
+        c02_operation_id: str, source_ref: str, installed_bundle,
+        *, lease_seconds: int,
+    ) -> PersistentJob:
+        """Acquire the original queued reply job and freeze its exact call."""
+        from .authority_service.v2_contract import FencePermitV2
+        from .authority_service.contract import AuthorityUnavailable
+        from .host.authority_profile import AdminInstallationBundle
+        from .host.installed_reply_model_driver import reply_model_operation_id_v1
+        from .runtime.d11_types import job_graph_write
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+        from .runtime.reply_model_job import (
+            ReplyModelJobHold, freeze_acquired_reply_binding_v1,
+            install_schema, read_saved_reply_job_v1,
+        )
+
+        store = self.__store
+        port = self.__content_fence_v2
+        namespace = authority.namespace
+        acquire_operation_id = reply_model_operation_id_v1(
+            c02_operation_id, source_ref)
+        if (not isinstance(store, ProductionGraphStore) or port is None
+                or type(installed_bundle) is not AdminInstallationBundle
+                or type(self.__d02_issuer) is not D02ResourceIssuer
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer
+                or installed_bundle.ingress_clock != self.__scene_clock_policy
+                or installed_bundle.installation_policy.namespace != namespace
+                or type(lease_seconds) is not int
+                or not 1 <= lease_seconds <= 3600):
+            raise UnavailableGuard("installed reply acquire authorities are absent; HOLD")
+        self._authorize(lease, authority, frozenset({"d11"}))
+        if (authority.issuer_domain != "d11"
+                or authority.purpose != "proposal"
+                or "activity" not in authority.owner_scope
+                or authority.worker_fence is not None
+                or authority.capability_ref != _operation_capability_ref(
+                    namespace, authority.actor, "d11", frozenset({"d11"}),
+                    authority.activation_generation, acquire_operation_id)):
+            raise AuthorityDenied("reply acquire requires original D11 worker lease")
+        reading = port.read_ingress_clock(self.__scene_clock_policy)
+        now = trusted_upper(reading)
+        now_text = __import__("datetime").datetime.fromtimestamp(
+            now, __import__("datetime").timezone.utc).isoformat().replace(
+                "+00:00", "Z")
+        with store._lock:
+            db = store._db
+            install_schema(db)
+            saved = read_saved_reply_job_v1(
+                db, self.__d02_issuer, namespace, c02_operation_id, source_ref)
+            if saved is None:
+                raise ReplyModelJobHold("original queued reply job is absent")
+            row = db.execute(
+                "SELECT state,acquire_operation_id,actor,worker_fence,"
+                "model_request_digest FROM graph_post_c02_reply_model_preparations_v1 "
+                "WHERE bot=? AND persona=? AND c02_operation_id=? AND source_ref=?",
+                namespace.as_tuple + (c02_operation_id, source_ref),
+            ).fetchone()
+            committed_attempt = db.execute(
+                "SELECT attempt_id,anchor_json,graph_revision,graph_epoch,state "
+                "FROM graph_post_c02_reply_model_acquires_v1 WHERE bot=? "
+                "AND persona=? AND acquire_operation_id=?",
+                namespace.as_tuple + (acquire_operation_id,),
+            ).fetchone()
+            metadata, epoch = self._v2_graph_stamp(namespace)
+        if row[0] == "acquired":
+            if (row[1] != acquire_operation_id or row[2] != authority.actor
+                    or row[3] != saved.job.fence
+                    or not row[4] or saved.job.phase != "running"
+                    or saved.job.lease_holder != authority.actor
+                    or committed_attempt is None
+                    or committed_attempt[4] != "committed"):
+                raise ReplyModelJobHold("original reply acquire identity differs")
+            target = metadata.requirements
+            anchor = port.current_anchor(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace)
+            if not self._anchor_matches(target, anchor):
+                raise UnavailableGuard("reply acquire replay anchor differs; HOLD")
+            self._finish_committed_post_c02_reply_fence_v1(
+                namespace, metadata, epoch, anchor,
+                committed_attempt[0], committed_attempt[1],
+                committed_attempt[2], committed_attempt[3],
+                "finish_reply_acquire")
+            return saved.job
+        if row[0] != "queued" or saved.job.phase != "queued":
+            raise ReplyModelJobHold("reply job is not queued")
+        target = metadata.requirements
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=target.authority_namespace)
+        if (target.activation_generation != authority.activation_generation
+                or not self._anchor_matches(target, anchor)):
+            raise UnavailableGuard("reply acquire Authority anchor differs; HOLD")
+        request_digest = canonical_digest({
+            "schema": "sylanne.post-c02-reply-acquire.v1",
+            "original_operation_id": saved.original_operation_id,
+            "acquire_operation_id": acquire_operation_id,
+            "job_id": saved.job.job_id, "actor": authority.actor,
+            "lease_seconds": lease_seconds,
+            "expected_fence": saved.job.fence,
+        })
+        with store._lock:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                    raise StaleRead("reply graph changed before acquire intent")
+                attempt = db.execute(
+                    "SELECT request_digest,attempt_id,anchor_json,graph_revision,"
+                    "graph_epoch,state FROM graph_post_c02_reply_model_acquires_v1 "
+                    "WHERE bot=? AND persona=? AND acquire_operation_id=?",
+                    namespace.as_tuple + (acquire_operation_id,),
+                ).fetchone()
+                if attempt is not None and attempt[0] != request_digest:
+                    raise EventConflict("reply acquire identity reused with different input")
+                if attempt is None or attempt[5] == "closed":
+                    attempt_id = "reply-acquire-write-" + secrets.token_hex(24)
+                    attempt_was_open = False
+                    db.execute(
+                        "INSERT INTO graph_post_c02_reply_model_acquires_v1"
+                        "(bot,persona,acquire_operation_id,original_operation_id,"
+                        "request_digest,attempt_id,anchor_json,graph_revision,"
+                        "graph_epoch,state) VALUES(?,?,?,?,?,?,?,?,?,'open') "
+                        "ON CONFLICT(bot,persona,acquire_operation_id) DO UPDATE SET "
+                        "attempt_id=excluded.attempt_id,anchor_json=excluded.anchor_json,"
+                        "graph_revision=excluded.graph_revision,graph_epoch=excluded.graph_epoch,"
+                        "state='open' WHERE graph_post_c02_reply_model_acquires_v1.state='closed' "
+                        "AND graph_post_c02_reply_model_acquires_v1.request_digest=excluded.request_digest",
+                        namespace.as_tuple + (acquire_operation_id,
+                        saved.original_operation_id, request_digest,
+                        attempt_id, canonical_json(asdict(anchor)),
+                        metadata.graph_revision, epoch.revision),
+                    )
+                elif attempt[5] == "open" and (
+                        attempt[2] == canonical_json(asdict(anchor))
+                        and attempt[3:5] == (
+                            metadata.graph_revision, epoch.revision)):
+                    attempt_id = attempt[1]
+                    attempt_was_open = True
+                else:
+                    raise ReplyModelJobHold("reply acquire attempt is unresolved")
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        if attempt_was_open:
+            try:
+                observed, state = port.get_fence_operation(
+                    namespace=namespace,
+                    authority_namespace=target.authority_namespace,
+                    operation_id=attempt_id)
+            except AuthorityUnavailable:
+                # Keep the original durable attempt across an interrupted begin.
+                observed, state = None, "absent"
+        else:
+            observed, state = None, "absent"
+        if state == "absent":
+            permit = port.begin_fence(
+                namespace=namespace,
+                authority_namespace=target.authority_namespace,
+                holder=self.__holder, generation=target.activation_generation,
+                operation="write", operation_id=attempt_id,
+                expected_anchor=anchor)
+        elif state == "active":
+            permit = observed
+        else:
+            raise UnavailableGuard("reply acquire fence outcome unknown; HOLD")
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.operation_id != attempt_id
+                or permit.pinned_anchor != anchor or permit.holder != self.__holder):
+            raise UnavailableGuard("reply acquire write permit differs; HOLD")
+        scope = FenceScope(
+            namespace, target.authority_namespace, target.activation_generation,
+            "write", attempt_id, permit, anchor, epoch, metadata.graph_revision)
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("reply acquire write fence stale; HOLD")
+        try:
+            with store._lock:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if self._v2_graph_stamp(namespace) != (metadata, epoch):
+                        raise StaleRead("reply graph changed before acquire")
+                    inputs = self._current_post_c02_reply_inputs_locked(
+                        namespace, c02_operation_id, source_ref, now, epoch)
+                    frozen = db.execute(
+                        "SELECT source_revision,access_revision,attention_ticket_id,"
+                        "focus_revision,audience,graph_job_revision "
+                        "FROM graph_post_c02_reply_model_preparations_v1 "
+                        "WHERE bot=? AND persona=? AND c02_operation_id=? AND source_ref=?",
+                        namespace.as_tuple + (c02_operation_id, source_ref),
+                    ).fetchone()
+                    if frozen != (
+                            inputs.source.source_revision,
+                            inputs.source.access_revision,
+                            inputs.attention.ticket.ticket_id,
+                            inputs.attention.focus_version.revision,
+                            inputs.conversation_ref, saved.graph_job_revision):
+                        raise ReplyModelJobHold("queued reply source or attention changed")
+                    if authority.audience != (inputs.conversation_ref,):
+                        raise AuthorityDenied("reply worker audience differs")
+                    if (installed_bundle.installation_policy.catalogue_hash
+                            != store._registry.catalogue_hash
+                            or installed_bundle.installation_policy.scheme_version
+                            != self._version(db, namespace, "scheme", "current")
+                            or installed_bundle.installation_policy.operator_version
+                            != self._version(db, namespace, "operator", "current")
+                            or installed_bundle.installation_policy.policy_version
+                            != self._version(db, namespace, "policy", "current")):
+                        raise ReplyModelJobHold("reply installed guard versions changed")
+                    current = get_job(db, saved.job.job_id)
+                    if current != saved.job:
+                        raise ReplyModelJobHold("reply D11 job changed")
+                    planned = plan_job_acquire(
+                        current, authority.actor, now_utc=now_text,
+                        lease_seconds=lease_seconds)
+                    worker_authority = replace(authority, worker_fence=planned.fence)
+                    quote = self.__d02_issuer.original_signed_quote(
+                        db, saved.quote.quote_id, saved.quote.version)
+                    access_epoch, delete_epoch = self._deletion_epochs_locked(
+                        db, namespace)
+                    envelope, installed, binding_digest, request_json = (
+                        freeze_acquired_reply_binding_v1(
+                            db, namespace=namespace, inputs=inputs,
+                            job=planned, quote=quote, authority=worker_authority,
+                            installed_bundle=installed_bundle,
+                            graph_epoch=epoch.revision,
+                            access_epoch=access_epoch,
+                            delete_epoch=delete_epoch, now_utc=now,
+                            monotonic_now=reading.monotonic_after_seconds,
+                            acquire_operation_id=acquire_operation_id))
+                    acquired = acquire_job(
+                        db, current.job_id, authority.actor,
+                        now_utc=now_text, lease_seconds=lease_seconds)
+                    if acquired != planned:
+                        raise ReplyModelJobHold("reply job acquire CAS differed")
+                    write = job_graph_write(acquired)
+                    reconcile_runtime_write(db, write)
+                    candidate = GraphCandidate(
+                        Event(Scope(*namespace.as_tuple, current.activity_id),
+                              acquire_operation_id, now, "domain_bundle",
+                              {"bundle_digest": request_digest}),
+                        (GraphVersion(write.key, saved.graph_job_revision),)
+                        + inputs.graph_snapshot.versions,
+                        (GraphWrite(write.key, write.value,
+                                    tuple(atom.key for atom in
+                                          inputs.graph_snapshot.atoms)),),
+                        (epoch,))
+                    graph_receipt = GraphStore._graph_commit_in_transaction(
+                        store, candidate, _capability=self.__graph_capability)
+                    if graph_receipt.status != "committed":
+                        raise EventConflict("reply acquire graph event differs")
+                    store.cas_graph_recovery_metadata(
+                        metadata, metadata.requirements,
+                        _capability=self.__graph_capability)
+                    changed = db.execute(
+                        "UPDATE graph_post_c02_reply_model_preparations_v1 SET "
+                        "state='acquired',acquire_operation_id=?,actor=?,worker_fence=?,"
+                        "call_id=?,model_request_digest=?,binding_digest=?,"
+                        "envelope_json=?,request_json=?,graph_job_revision=? "
+                        "WHERE bot=? AND persona=? AND c02_operation_id=? "
+                        "AND source_ref=? AND state='queued'",
+                        (acquire_operation_id, authority.actor, acquired.fence,
+                         installed.request.call_id, installed.request.digest,
+                         binding_digest, canonical_serialize(envelope),
+                         request_json, graph_receipt.revisions[0].revision)
+                        + namespace.as_tuple + (c02_operation_id, source_ref),
+                    ).rowcount
+                    if changed != 1:
+                        raise ReplyModelJobHold("reply acquire row CAS differs")
+                    db.execute(
+                        "UPDATE graph_post_c02_reply_model_acquires_v1 "
+                        "SET state='committed' WHERE bot=? AND persona=? "
+                        "AND acquire_operation_id=? AND attempt_id=?",
+                        namespace.as_tuple + (acquire_operation_id, attempt_id),
+                    )
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+        except BaseException:
+            try:
+                port.finish_fence(
+                    scope, request_id="finish:" + attempt_id,
+                    request_digest="sha256:" + canonical_digest({
+                        "action": "abort_reply_acquire", "attempt_id": attempt_id,
+                        "permit_token": permit.token}))
+                with store._lock:
+                    db.execute(
+                        "UPDATE graph_post_c02_reply_model_acquires_v1 SET state='closed' "
+                        "WHERE bot=? AND persona=? AND acquire_operation_id=? "
+                        "AND attempt_id=? AND state='open'",
+                        namespace.as_tuple + (acquire_operation_id, attempt_id))
+            except Exception:
+                pass
+            raise
+        if port.validate_fence(scope) != permit:
+            raise UnavailableGuard("reply acquire committed but finish unknown; HOLD")
+        port.finish_fence(
+            scope, request_id="finish:" + attempt_id,
+            request_digest="sha256:" + canonical_digest({
+                "action": "finish_reply_acquire", "attempt_id": attempt_id,
+                "permit_token": permit.token}))
+        return acquired
+
+    def read_post_c02_reply_model_egress_preparation_v1(
+        self, authority: AuthorityContext, lease: object,
+        c02_operation_id: str, source_ref: str, installed_bundle,
+    ):
+        """Return a current reply draft; only Authority can issue its intent."""
+        from datetime import datetime
+
+        from .authority_service.v2_model_egress_contract import ModelEgressDraftV1
+        from .host.authority_profile import AdminInstallationBundle
+        from .host.installed_reply_model_driver import reply_model_operation_id_v1
+        from .model_broker.reply_language import freeze_installed_reply_request_v1
+        from .runtime.budget import get_budget_lease
+        from .runtime.d11_types import job_graph_write
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
+        from .runtime.reply_model_job import (
+            ReplyModelJobHold, read_saved_reply_job_v1,
+            reply_binding_digest_v1, reply_envelope_from_wire_v1,
+            reply_request_wire_v1,
+        )
+
+        store = self.__store
+        port = self.__content_fence_v2
+        namespace = authority.namespace
+        acquire_operation_id = reply_model_operation_id_v1(
+            c02_operation_id, source_ref)
+        if (not isinstance(store, ProductionGraphStore) or port is None
+                or type(installed_bundle) is not AdminInstallationBundle
+                or installed_bundle.ingress_clock != self.__scene_clock_policy
+                or installed_bundle.installation_policy.namespace != namespace
+                or type(self.__d02_issuer) is not D02ResourceIssuer
+                or type(self.__d11_issuer) is not D11BudgetJobIssuer):
+            raise UnavailableGuard("installed reply model preparation is unavailable; HOLD")
+        self._authorize(lease, authority, frozenset({"d11"}))
+        if (authority.issuer_domain != "d11"
+                or authority.purpose != "proposal"
+                or authority.worker_fence is None
+                or authority.capability_ref != _operation_capability_ref(
+                    namespace, authority.actor, "d11", frozenset({"d11"}),
+                    authority.activation_generation, acquire_operation_id)):
+            raise AuthorityDenied("reply model requires the original D11 worker")
+        reading = port.read_ingress_clock(self.__scene_clock_policy)
+        now = trusted_upper(reading)
+
+        def reader():
+            db = store._db
+            db.execute("BEGIN")
+            try:
+                metadata, epoch = self._v2_graph_stamp(namespace)
+                inputs = self._current_post_c02_reply_inputs_locked(
+                    namespace, c02_operation_id, source_ref, now, epoch)
+                saved = read_saved_reply_job_v1(
+                    db, self.__d02_issuer, namespace,
+                    c02_operation_id, source_ref)
+                row = db.execute(
+                    "SELECT c02_receipt_digest,source_id,source_revision,"
+                    "access_revision,attention_ticket_id,focus_revision,audience,"
+                    "state,acquire_operation_id,actor,worker_fence,call_id,"
+                    "model_request_digest,binding_digest,envelope_json,request_json "
+                    "FROM graph_post_c02_reply_model_preparations_v1 "
+                    "WHERE bot=? AND persona=? AND c02_operation_id=? AND source_ref=?",
+                    namespace.as_tuple + (c02_operation_id, source_ref),
+                ).fetchone()
+                if saved is None or row is None:
+                    raise ReplyModelJobHold("acquired reply preparation is absent")
+                job, quote = saved.job, saved.quote
+                deadline = datetime.fromisoformat(
+                    job.deadline_utc.replace("Z", "+00:00")).timestamp()
+                expiry = datetime.fromisoformat(
+                    job.lease_expires_utc.replace("Z", "+00:00")).timestamp()
+                lease_state = get_budget_lease(db, job.budget_ref)
+                grant = self.__d11_issuer.current_budget_grant(
+                    db, job.budget_ref)
+                reserve = db.execute(
+                    "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
+                    "WHERE lease_id=? AND operation_id=?",
+                    (job.budget_ref, job.operation_id),
+                ).fetchone()
+                reserve_op = db.execute(
+                    "SELECT digest FROM runtime_budget_operations WHERE bot_id=? "
+                    "AND persona_id=? AND operation_id=? AND phase='reserve'",
+                    namespace.as_tuple + (job.operation_id,),
+                ).fetchone()
+                acquire = db.execute(
+                    "SELECT state FROM graph_post_c02_reply_model_acquires_v1 "
+                    "WHERE bot=? AND persona=? AND acquire_operation_id=? "
+                    "AND original_operation_id=?",
+                    namespace.as_tuple + (acquire_operation_id,
+                                          job.operation_id),
+                ).fetchone()
+                if (row[0] != canonical_digest(asdict(inputs.c02_receipt))
+                        or row[1:7] != (
+                            inputs.source.source.source_id,
+                            inputs.source.source_revision,
+                            inputs.source.access_revision,
+                            inputs.attention.ticket.ticket_id,
+                            inputs.attention.focus_version.revision,
+                            inputs.conversation_ref)
+                        or row[7:11] != (
+                            "acquired", acquire_operation_id,
+                            authority.actor, authority.worker_fence)
+                        or acquire != ("committed",)
+                        or job.phase != "running"
+                        or job.lease_holder != authority.actor
+                        or job.fence != authority.worker_fence
+                        or job.cancel_epoch != 0 or job.result_ref is not None
+                        or not now < min(expiry, deadline, quote.valid_until_utc)
+                        or authority.audience != (inputs.conversation_ref,)
+                        or grant != installed_bundle.installation_policy.root_grant
+                        or lease_state.state != "active"
+                        or reserve is None or reserve_op is None
+                        or reserve != (
+                            saved.reservation_digest,
+                            canonical_json(dict(quote.ceiling)), "reserved")
+                        or reserve_op != (saved.reservation_digest,)
+                        or row[14] is None or row[15] is None):
+                    raise ReplyModelJobHold("original reply model eligibility changed")
+                envelope = reply_envelope_from_wire_v1(row[14])
+                installed = freeze_installed_reply_request_v1(
+                    envelope, inputs.source, bundle=installed_bundle)
+                request = installed.request
+                if (envelope.authority != authority
+                        or row[11] != request.call_id
+                        or row[12] != request.digest
+                        or row[13] != reply_binding_digest_v1(
+                            job, inputs, acquire_operation_id,
+                            request.call_id, request.digest)
+                        or row[15] != canonical_serialize(
+                            reply_request_wire_v1(envelope, request))
+                        or quote.ceiling != installed.quote_ceiling
+                        or job_graph_write(job).key.token !=
+                           saved.quote.graph_job_ref):
+                    raise ReplyModelJobHold("frozen reply binding differs")
+                epochs = self._deletion_epochs_locked(db, namespace)
+                result = (inputs, saved, envelope, installed,
+                          row[13], epochs, metadata, epoch)
+                db.execute("COMMIT")
+                return result
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+
+        (prepared, anchor, metadata, epoch) = self._read_v2(
+            authority, reader, return_recovery_context=True)
+        inputs, saved, envelope, installed, binding_digest, epochs, _, _ = prepared
+        target = metadata.requirements
+        job = saved.job
+        request = installed.request
+        draft = ModelEgressDraftV1(
+            target.authority_id, target.authority_namespace, authority.actor,
+            acquire_operation_id, request.call_id, request.digest,
+            job.job_id, job.fence,
+            (inputs.source.source.source_id,),
+            ((inputs.source.source.source_id, inputs.source.source_revision),),
+            ((inputs.source.source.source_id, inputs.source.access_revision),),
+            epochs[0], epochs[1], epoch.revision, metadata.graph_revision,
+            target.activation_generation, target.revocation_epoch,
+            target.deletion_seq, target.execution_seq,
+            job.budget_ref, job.operation_id, saved.reservation_digest,
+            tuple(sorted(saved.quote.ceiling.items())),
+            request.provider_id, request.model_id,
+            installed.provider_config_digest, request.max_output_tokens,
+            acquire_operation_id=acquire_operation_id,
+            binding_digest=binding_digest,
+        )
+        return (inputs.c02_receipt, envelope, inputs.source,
+                inputs.attention.ticket, inputs.attention.focus_version.revision,
+                draft, anchor)
 
     def read_first_ingress_model_egress_preparation_v2(
         self, authority: AuthorityContext, lease: object, job_id: str,
@@ -10110,6 +11224,30 @@ class GraphCoordinator:
                     or bundle.persistent_job_refs or bundle.outbox_refs
                     or bundle.d02_settlement_refs or bundle.d11_cost_settlement_refs):
                 raise AuthorityDenied("D03 arrival quote cannot authorize a mixed bundle")
+        if quote is not None and quote.work_kind == "d07.attention":
+            row = db.execute(
+                "SELECT c02_operation_id,source_ref,quote_id,bundle_digest "
+                "FROM graph_d07_attention_issuance_v1 WHERE bot=? AND persona=? "
+                "AND operation_id=?",
+                bundle.envelope.authority.namespace.as_tuple
+                + (bundle.envelope.identity.operation_id,),
+            ).fetchone() if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_d07_attention_issuance_v1'",
+            ).fetchone() else None
+            if (row != (
+                    bundle.envelope.causation[0],
+                    bundle.envelope.source_qualification.source_refs[0],
+                    quote.quote_id, bundle.digest)
+                    or len(bundle.proposals) != 1
+                    or bundle.proposals[0].domain != "d07"
+                    or {write.key.type_name for write in
+                        bundle.proposals[0].typed_writes} != {
+                            "d07.attention_ticket.v1", "d07.focus.v1"}
+                    or bundle.persistent_job_refs or bundle.outbox_refs
+                    or bundle.d02_settlement_refs
+                    or bundle.d11_cost_settlement_refs):
+                raise AuthorityDenied("D07 attention quote lacks sealed issuance")
         if quote is not None and quote.work_kind == D04_BASELINE_WORK_KIND:
             if db.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -15086,6 +16224,7 @@ class GraphCoordinator:
 
     def _commit_domain_bundle_v2(self, bundle: DomainBundle,
                                  lease: object, *, arrival_issuance=None,
+                                 attention_issuance=None,
                                  baseline_issuance=None,
                                  self_identity_issuance=None,
                                  correction_issuance=None,
@@ -15665,6 +16804,7 @@ class GraphCoordinator:
                 dispatch_admission_current_effect=dispatch_current_effect,
                 scene_owner_guard=scene_owner_guard,
                 now_utc=(arrival_issuance[2] if arrival_issuance else
+                         attention_issuance[1] if attention_issuance else
                          baseline_issuance[2] if baseline_issuance else
                          self_identity_issuance[3] if self_identity_issuance else
                          correction_issuance[2] if correction_issuance else
@@ -15673,6 +16813,7 @@ class GraphCoordinator:
                                             _C02TerminalRecovery)) else
                          c02_adoption[6] if c02_adoption is not None else None),
                 arrival_issuance=arrival_issuance,
+                attention_issuance=attention_issuance,
                 baseline_issuance=baseline_issuance,
                 self_identity_issuance=self_identity_issuance,
                 correction_issuance=correction_issuance,
@@ -15839,6 +16980,7 @@ class GraphCoordinator:
                                       ingress_deadline_check=None,
                                      scene_owner_guard=None,
                                       arrival_issuance=None,
+                                      attention_issuance=None,
                                       baseline_issuance=None,
                                       self_identity_issuance=None,
                                       correction_issuance=None,
@@ -16053,6 +17195,138 @@ class GraphCoordinator:
             elif c02_adoption is not None:
                 self._validate_first_ingress_c02_adoption_locked(
                     db, bundle, c02_adoption, v2_write)
+            if attention_issuance is not None:
+                from .runtime.reply_model_job import (
+                    d07_attention_quote_id_v1,
+                    read_settled_c02_reply_source_v1,
+                    source_key_from_ref,
+                )
+                from .runtime.issuers import ResourceQuote
+                from .runtime_contracts import VersionedRef
+
+                installed, attention_now = attention_issuance
+                admin = installed.d07_attention
+                policy = installed.installation_policy
+                source_ref = envelope.source_qualification.source_refs[0]
+                source_id = source_key_from_ref(source_ref, namespace)
+                c02_operation_id = envelope.causation[0]
+                source_atom_key = source_key(*namespace.as_tuple, source_id)
+                access_atom_key = access_key(*namespace.as_tuple, source_id)
+                source_atoms = []
+                for key in (source_atom_key, access_atom_key):
+                    row = db.execute(
+                        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                        (key.token,),
+                    ).fetchone()
+                    if row is None:
+                        raise UnavailableGuard("D07 attention source is absent; HOLD")
+                    source_atoms.append(GraphAtom(
+                        key, row[0], json.loads(row[1]), bool(row[2])))
+                c02_row = db.execute(
+                    "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+                    "FROM graph_bundle_operations WHERE bot=? AND persona=? "
+                    "AND operation_id=?",
+                    namespace.as_tuple + (c02_operation_id,),
+                ).fetchone()
+                if c02_row is None:
+                    raise UnavailableGuard("D07 attention original C02 absent; HOLD")
+                c02_event = db.execute(
+                    "SELECT reads,revisions,epoch_revision FROM graph_events "
+                    "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+                    namespace.as_tuple + (c02_row[1], c02_operation_id),
+                ).fetchone()
+                if c02_event is None:
+                    raise UnavailableGuard("D07 attention C02 event absent; HOLD")
+                c02_detail = json.loads(c02_row[4])
+                c02_receipt = CommitReceipt(
+                    "committed", c02_operation_id, c02_row[0], c02_row[1],
+                    c02_row[2], c02_row[3],
+                    GraphStore._version_rows(c02_event[0]),
+                    GraphStore._version_rows(c02_event[1]),
+                    (NamespaceEpoch(*namespace.as_tuple, c02_event[2]),),
+                    tuple(c02_detail["ledger_refs"]),
+                    tuple(c02_detail["outbox_refs"]))
+                current = read_settled_c02_reply_source_v1(
+                    db, self.__d02_issuer, namespace, c02_receipt, source_ref,
+                    GraphSnapshot(tuple(source_atoms), (v2_write[1],)))
+                ticket_write = next(
+                    (write for write in writes if
+                     write.key.type_name == "d07.attention_ticket.v1"), None)
+                focus_write = next(
+                    (write for write in writes if
+                     write.key.type_name == "d07.focus.v1"), None)
+                quote_id = d07_attention_quote_id_v1(
+                    namespace, identity.operation_id)
+                grant = self.__d11_issuer.current_budget_grant(
+                    db, policy.root_lease.lease_id)
+                budget = get_budget_lease(db, grant.lease_id)
+                provision_row = self._provision_row(db, namespace)
+                provision = (self._decode_provision_receipt(provision_row)
+                             if provision_row is not None else None)
+                if (v2_write is None or grant != policy.root_grant
+                        or provision is None
+                        or provision.installation_id != policy.installation_id
+                        or provision.root_grant_id != grant.grant_id
+                        or provision.root_lease_id != grant.lease_id
+                        or budget.state != "active"
+                        or "d07.attention" not in grant.allowed_work_kinds
+                        or identity.phase != "post_c02_attention"
+                        or identity.activity_id != c02_receipt.activity_id
+                        or current.source_qualification !=
+                           envelope.source_qualification
+                        or current.conversation_ref !=
+                           envelope.authority.audience[0]
+                        or envelope.parent_budget_lease_ref != grant.lease_id
+                        or ticket_write is None or focus_write is None
+                        or len(writes) != 2
+                        or ticket_write.value.get("causal_root") != source_ref
+                        or ticket_write.value.get("source_refs") != [source_ref]
+                        or ticket_write.value.get("category") != "interaction"
+                        or ticket_write.value.get("valid_until") !=
+                           envelope.deadline_utc
+                        or focus_write.value.get("primary_ticket_ref") !=
+                           ticket_write.key.token
+                        or not attention_now < envelope.deadline_utc
+                        or envelope.deadline_utc >
+                           attention_now + admin.deadline_after_seconds
+                        or envelope.version_guard.resource_lease_versions !=
+                           (VersionedRef(quote_id, 1),)
+                        or any(amount > grant.max_ceiling.get(name, 0)
+                               or amount > budget.available(name)
+                               for name, amount in admin.quote_ceiling.items())):
+                    raise AuthorityDenied("D07 attention signed issuance differs")
+                quote = ResourceQuote(
+                    quote_id, 1, *namespace.as_tuple, identity.activity_id,
+                    identity.operation_id, None, grant.lease_id,
+                    "d07.attention", admin.snapshot_ref,
+                    envelope.deadline_utc, admin.resource_ref, None,
+                    (), (), dict(admin.quote_ceiling), None,
+                    envelope.deadline_utc)
+                self.__d02_issuer.issue_quote(db, quote)
+                db.execute(
+                    "INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) "
+                    "VALUES(?,?,?,?,?)",
+                    namespace.as_tuple + ("resource_lease", quote_id, "1"),
+                )
+                db.execute("""CREATE TABLE IF NOT EXISTS graph_d07_attention_issuance_v1(
+                    bot TEXT NOT NULL, persona TEXT NOT NULL,
+                    operation_id TEXT NOT NULL, c02_operation_id TEXT NOT NULL,
+                    source_ref TEXT NOT NULL, quote_id TEXT NOT NULL,
+                    policy_digest TEXT NOT NULL, bundle_digest TEXT NOT NULL,
+                    PRIMARY KEY(bot,persona,operation_id))""")
+                db.execute(
+                    "INSERT INTO graph_d07_attention_issuance_v1"
+                    "(bot,persona,operation_id,c02_operation_id,source_ref,"
+                    "quote_id,policy_digest,bundle_digest) VALUES(?,?,?,?,?,?,?,?)",
+                    namespace.as_tuple + (identity.operation_id,
+                    c02_operation_id, source_ref, quote_id,
+                    canonical_digest({
+                        "deadline_after_seconds": admin.deadline_after_seconds,
+                        "quote_ceiling": dict(admin.quote_ceiling),
+                        "snapshot_ref": admin.snapshot_ref,
+                        "resource_ref": admin.resource_ref,
+                    }), digest),
+                )
             if arrival_issuance is not None:
                 admin_policy, installation_id, arrival_now, source_ref, policy_digest = (
                     arrival_issuance)
