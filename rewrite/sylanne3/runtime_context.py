@@ -1231,6 +1231,12 @@ class RuntimeContext:
                 yield None
                 return
             read_request = first_ingress_worker_result_request_v1(context)
+            if original_recovery is not None:
+                read_request = await executor.select_original_worker_read_attempt(
+                    read_request)
+                if type(read_request) is not WorkerModelResultReadRequestV1:
+                    yield None
+                    return
             result_read = await executor.read_original_for_worker(
                 read_request=read_request, intent=egress.intent,
                 terminal=egress.terminal)

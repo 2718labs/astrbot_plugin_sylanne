@@ -21,6 +21,20 @@ SCHEMA = "sylanne3.authority.worker_model_result_read.v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
+def first_ingress_read_attempt_id_v1(
+    consumer_operation_id: str, attempt: int,
+) -> str:
+    """Stable identity for one content read; this is not a read permit."""
+    identifier(consumer_operation_id, "consumer_operation_id")
+    if type(attempt) is not int or not 1 <= attempt <= 64:
+        raise ValueError("worker read attempt is outside the bounded sequence")
+    return "first-ingress-worker-read-" + canonical_digest({
+        "schema": "sylanne3.first-ingress-worker-read-attempt.v1",
+        "consumer_operation_id": consumer_operation_id,
+        "attempt": attempt,
+    })[:48]
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerModelResultReadRequestV1:
     authority_id: str
@@ -142,5 +156,7 @@ def from_wire(raw: object, kind: type):
     return value
 
 
-__all__ = ("SCHEMA", "WorkerModelResultReadRequestV1", "WorkerModelResultReadV1",
-           "from_wire", "to_wire")
+__all__ = (
+    "SCHEMA", "WorkerModelResultReadRequestV1", "WorkerModelResultReadV1",
+    "first_ingress_read_attempt_id_v1", "from_wire", "to_wire",
+)

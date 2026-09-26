@@ -6,7 +6,7 @@ transport has serialized and drained the response. It grants no C02 commit.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import threading
 
 from ..runtime_contracts import canonical_digest
@@ -20,6 +20,7 @@ from .v2_model_egress_store import AuthorityV2ModelEgressStore
 from .v2_worker_model_result_attempts import AuthorityV2WorkerModelResultAttempts
 from .v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
+    first_ingress_read_attempt_id_v1,
 )
 
 
@@ -132,6 +133,51 @@ class AuthorityV2WorkerModelResultReadService:
         if self._graph.current(request, intent, candidate) is not True:
             raise AuthorityUnavailable("current worker graph qualification unavailable")
         return anchor, intent
+
+    def select_attempt(self, *, credential,
+                       first_request: WorkerModelResultReadRequestV1,
+                       ) -> WorkerModelResultReadRequestV1:
+        """Select the original active read or the next read after a finished one.
+
+        Selection is content-free and advisory. ``prepare`` rechecks the graph
+        and binds the selected attempt under its own current Authority fence.
+        """
+        self._require(credential, first_request)
+        consumer = first_request.consumer_operation_id
+        if first_request.read_attempt_id != first_ingress_read_attempt_id_v1(
+                consumer, 1):
+            raise AuthorityUnavailable("canonical first worker read required")
+        with self._attempts._tx() as db:
+            rows = db.execute(
+                "SELECT read_attempt_id FROM authority_worker_result_read_attempts_v1 "
+                "WHERE consumer_operation_id=? LIMIT 65", (consumer,)
+            ).fetchall()
+            if len(rows) > 64:
+                raise AuthorityUnavailable("worker read attempt limit reached")
+            actual = {row[0] for row in rows}
+            latest = None
+            for attempt in range(1, len(rows) + 1):
+                expected = replace(
+                    first_request, read_attempt_id=(
+                        first_ingress_read_attempt_id_v1(consumer, attempt)))
+                record = self._attempts._read_locked(db, expected.read_attempt_id)
+                if (expected.read_attempt_id not in actual or record is None
+                        or record.request != expected
+                        or attempt < len(rows) and record.state != "finished"):
+                    raise AuthorityUnavailable("worker read sequence differs")
+                latest = record
+            if len(actual) != len(rows):
+                raise AuthorityUnavailable("worker read sequence differs")
+            if latest is not None and latest.state == "active":
+                selected = latest.request
+            else:
+                next_attempt = len(rows) + 1
+                if next_attempt > 64:
+                    raise AuthorityUnavailable("worker read attempt limit reached")
+                selected = replace(first_request, read_attempt_id=(
+                    first_ingress_read_attempt_id_v1(consumer, next_attempt)))
+        self._preflight(selected)
+        return selected
 
     def prepare(self, *, credential, request: WorkerModelResultReadRequestV1
                 ) -> WorkerResultDeliveryV1:

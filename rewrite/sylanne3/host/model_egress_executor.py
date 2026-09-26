@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 from ..authority_service.v2_model_egress_contract import (
     HostObservedModelCompletionV2, ModelEgressDraftV1, ModelEgressIntentV1,
@@ -453,6 +453,23 @@ class HostModelEgressExecutor:
                 or read.observation.cost != record.cost):
             return None
         return read
+
+    async def select_original_worker_read_attempt(
+        self, first_request: WorkerModelResultReadRequestV1,
+    ) -> WorkerModelResultReadRequestV1 | None:
+        """Choose a current read identity without admitting or sending a model call."""
+        if type(first_request) is not WorkerModelResultReadRequestV1:
+            return None
+        try:
+            selected = await self._authority.worker_model_result_select_attempt_v1(
+                self._bundle, self._grant, first_request=first_request)
+        except Exception:
+            return None
+        if (type(selected) is not WorkerModelResultReadRequestV1
+                or replace(selected, read_attempt_id=first_request.read_attempt_id)
+                   != first_request):
+            return None
+        return selected
 
     async def execute_once(
         self, *, intent: ModelEgressIntentV1, expected_anchor: RestoreAnchor,

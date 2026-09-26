@@ -7,13 +7,12 @@ They are not a read grant or evidence that the model result was released.
 from __future__ import annotations
 
 from ..authority_service.v2_worker_model_result_contract import (
-    WorkerModelResultReadRequestV1,
+    WorkerModelResultReadRequestV1, first_ingress_read_attempt_id_v1,
 )
 from ..runtime.first_ingress_c02_identity import (
     first_ingress_c02_consumer_operation_id_v1,
 )
 from ..runtime.original_model_result_context import OriginalModelResultContextV1
-from ..runtime_contracts import canonical_digest
 
 
 def first_ingress_worker_result_request_v1(
@@ -34,11 +33,7 @@ def first_ingress_worker_result_request_v1(
         binding_digest=context.binding_digest,
         model_request_digest=context.model_request_digest,
     )
-    read_id = "first-ingress-worker-read-" + canonical_digest({
-        "schema": "sylanne3.first-ingress-worker-read-attempt.v1",
-        "consumer_operation_id": consumer_id,
-        "attempt": 1,
-    })[:48]
+    read_id = first_ingress_read_attempt_id_v1(consumer_id, 1)
     return WorkerModelResultReadRequestV1(
         context.authority_id, context.authority_namespace, context.namespace,
         context.installation_id, context.job_id, context.acquire_operation_id,

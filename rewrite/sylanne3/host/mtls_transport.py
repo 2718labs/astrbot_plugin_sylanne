@@ -798,6 +798,33 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority Owner read finish is unresolved")
         return True
 
+    async def worker_model_result_select_attempt_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        first_request: WorkerModelResultReadRequestV1,
+    ) -> WorkerModelResultReadRequestV1:
+        if (type(first_request) is not WorkerModelResultReadRequestV1
+                or (first_request.authority_id, first_request.authority_namespace,
+                    first_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed worker read selection identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "worker_model_result_select_attempt_v1",
+            {"namespace": namespace,
+             "read_request": worker_result_to_wire(first_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"selected_request", "channel_binding_sha256"}:
+            raise RuntimeError("authority worker read selection response is invalid")
+        try:
+            selected = worker_result_from_wire(
+                response["selected_request"], WorkerModelResultReadRequestV1)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority worker read selection response is invalid") from exc
+        if (replace(selected, read_attempt_id=first_request.read_attempt_id)
+                != first_request):
+            raise RuntimeError("authority worker read selection identity differs")
+        return selected
+
     async def worker_model_result_read_v1(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         grant: InstallationGrantV2, *, namespace: str,

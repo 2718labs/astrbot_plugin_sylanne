@@ -120,6 +120,10 @@ async def test_installed_worker_read_and_unknown_response_close_original_attempt
 
         async def wire_rpc(self, _request, _handshake, method, command, *, protocol):
             rpc_methods.append((method, command, protocol))
+            if method == "worker_model_result_select_attempt_v1":
+                return {"selected_request": worker_result_to_wire(
+                    replace(read_request, read_attempt_id="worker-read-2")),
+                    "channel_binding_sha256": "f" * 64}
             if method == "worker_model_result_read_v1":
                 return {"result": worker_result_to_wire(read),
                         "channel_binding_sha256": "f" * 64}
@@ -127,6 +131,9 @@ async def test_installed_worker_read_and_unknown_response_close_original_attempt
 
         transport._content_rpc = MethodType(wire_rpc, transport)
         try:
+            assert (await transport.worker_model_result_select_attempt_v1(
+                object(), object(), grant, namespace=intent.namespace,
+                first_request=read_request)).read_attempt_id == "worker-read-2"
             assert await transport.worker_model_result_read_v1(
                 object(), object(), grant, namespace=intent.namespace,
                 read_request=read_request) == read
@@ -134,6 +141,7 @@ async def test_installed_worker_read_and_unknown_response_close_original_attempt
                 object(), object(), grant, namespace=intent.namespace,
                 read_request=read_request) is True
             assert [method for method, _, _ in rpc_methods] == [
+                "worker_model_result_select_attempt_v1",
                 "worker_model_result_read_v1",
                 "worker_model_result_recover_finish_v1"]
             assert all(command == {
@@ -146,7 +154,7 @@ async def test_installed_worker_read_and_unknown_response_close_original_attempt
                 await transport.worker_model_result_read_v1(
                     object(), object(), grant, namespace=intent.namespace,
                     read_request=replace(read_request, installation_id="other-install"))
-            assert len(rpc_methods) == 2
+            assert len(rpc_methods) == 3
         finally:
             await transport.close()
     finally:

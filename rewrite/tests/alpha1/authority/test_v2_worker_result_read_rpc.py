@@ -86,7 +86,8 @@ def test_worker_recover_rpc_requires_installed_namespace_bound_mtls_peer():
     observed = []
     service = SimpleNamespace(
         _read_subject="mtls:sha256:" + peer.certificate_sha256,
-        recover_finish=lambda **kwargs: observed.append(kwargs["request"]))
+        recover_finish=lambda **kwargs: observed.append(kwargs["request"]),
+        select_attempt=lambda **kwargs: kwargs["first_request"])
     server = object.__new__(AuthorityRpcServer)
     server._v2_worker_model_result_reads = {"ns-a": service}
     server._worker_result_readers_v2 = {"ns-a": (peer.certificate_sha256, "profile-a")}
@@ -105,9 +106,12 @@ def test_worker_recover_rpc_requires_installed_namespace_bound_mtls_peer():
         "worker_model_result_recover_finish_v1", peer,
         "profile-a", "f" * 64, command) == {"finished": True}
     assert observed == [request]
+    assert server._v2_command(
+        "worker_model_result_select_attempt_v1", peer,
+        "profile-a", "f" * 64, command) == {"selected_request": to_wire(request)}
     with pytest.raises(RuntimeError, match="authority unavailable"):
         server._v2_command(
-            "worker_model_result_recover_finish_v1", other,
+            "worker_model_result_select_attempt_v1", other,
             "profile-a", "f" * 64, command)
 
 

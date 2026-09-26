@@ -233,6 +233,9 @@ class AuthorityTransport(Protocol):
     async def worker_model_result_read_v1(self, request, handshake, grant,
                                            *, namespace, read_request): ...
 
+    async def worker_model_result_select_attempt_v1(
+        self, request, handshake, grant, *, namespace, first_request): ...
+
     async def worker_model_result_recover_finish_v1(self, request, handshake, grant,
                                                     *, namespace, read_request): ...
 
@@ -489,6 +492,20 @@ class AuthorityClient:
         return await self._transport.model_result_read_recover_finish_v1(
             request, handshake, grant, namespace=policy.authority_namespace,
             read_request=read_request)
+
+    async def worker_model_result_select_attempt_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        first_request: WorkerModelResultReadRequestV1,
+    ) -> WorkerModelResultReadRequestV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(first_request) is not WorkerModelResultReadRequestV1
+                or first_request.namespace != policy.namespace
+                or first_request.authority_namespace != policy.authority_namespace
+                or first_request.installation_id != grant.installation_id):
+            raise RuntimeError("worker read selection differs from installed namespace")
+        return await self._transport.worker_model_result_select_attempt_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            first_request=first_request)
 
     async def worker_model_result_read_v1(
         self, bundle, grant: InstallationGrantV2, *,

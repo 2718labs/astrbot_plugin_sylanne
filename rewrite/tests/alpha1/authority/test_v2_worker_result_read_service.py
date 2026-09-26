@@ -16,7 +16,7 @@ from sylanne3.authority_service.v2_worker_model_result_attempts import (
     AuthorityV2WorkerModelResultAttempts,
 )
 from sylanne3.authority_service.v2_worker_model_result_contract import (
-    WorkerModelResultReadRequestV1,
+    WorkerModelResultReadRequestV1, first_ingress_read_attempt_id_v1,
 )
 from sylanne3.authority_service.v2_worker_model_result_read_service import (
     AuthorityV2WorkerModelResultReadService,
@@ -39,7 +39,8 @@ def _case(tmp_path, monkeypatch):
         intent.authority_id, intent.namespace, NamespaceId("bot-a", "persona-a"),
         "original-install", intent.job_id, intent.operation_id,
         intent.budget_reservation_operation_id, intent.call_id, "a" * 64,
-        intent.request_digest, "c02-commit-1", "worker-read-1")
+        intent.request_digest, "c02-commit-1",
+        first_ingress_read_attempt_id_v1("c02-commit-1", 1))
     return service, request, core, deletion, guard, execution
 
 
@@ -62,6 +63,36 @@ def test_observed_original_stays_fenced_until_delivery_finishes(tmp_path, monkey
         service.recover_finish(credential="ok", request=request)
         with pytest.raises(AuthorityUnavailable):
             service.prepare(credential="ok", request=request)
+    finally:
+        core.close(); deletion.close(); guard.close(); execution.close()
+
+
+def test_finished_worker_read_selects_next_durable_attempt(tmp_path, monkeypatch):
+    service, first, core, deletion, guard, execution = _case(tmp_path, monkeypatch)
+    try:
+        assert service.select_attempt(
+            credential="ok", first_request=first) == first
+        initial = service.prepare(credential="ok", request=first)
+        assert service.select_attempt(
+            credential="ok", first_request=first) == first
+        service.abandon_delivery(delivery=initial)
+        assert service.select_attempt(
+            credential="ok", first_request=first) == first
+        resumed_first = service.prepare(credential="ok", request=first)
+        assert resumed_first.result == initial.result
+        service.finish_delivery(credential="ok", delivery=resumed_first)
+
+        second = service.select_attempt(credential="ok", first_request=first)
+        assert second == replace(first, read_attempt_id=(
+            first_ingress_read_attempt_id_v1(first.consumer_operation_id, 2)))
+        resumed = service.prepare(credential="ok", request=second)
+        service.finish_delivery(credential="ok", delivery=resumed)
+        third = service.select_attempt(credential="ok", first_request=first)
+        assert third.read_attempt_id == first_ingress_read_attempt_id_v1(
+            first.consumer_operation_id, 3)
+        assert resumed.result.observation == initial.result.observation
+        with pytest.raises(AuthorityUnavailable, match="canonical first"):
+            service.select_attempt(credential="ok", first_request=second)
     finally:
         core.close(); deletion.close(); guard.close(); execution.close()
 

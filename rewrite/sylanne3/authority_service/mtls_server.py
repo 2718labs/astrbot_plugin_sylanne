@@ -771,7 +771,8 @@ class AuthorityRpcServer:
                     credential=credential, subject=subject, request=request)
                 return {"current": None if current is None
                         else self_identity_to_wire(current)}
-            if method in {"worker_model_result_read_v1",
+            if method in {"worker_model_result_select_attempt_v1",
+                          "worker_model_result_read_v1",
                           "worker_model_result_recover_finish_v1"}:
                 if set(command) != {"namespace", "read_request"}:
                     raise AuthorityUnavailable("worker result command fields differ")
@@ -794,6 +795,10 @@ class AuthorityRpcServer:
                             credential.certificate_sha256, profile_id,
                             request.namespace)) != namespace):
                     raise AuthorityUnavailable("worker result installation differs")
+                if method == "worker_model_result_select_attempt_v1":
+                    selected = service.select_attempt(
+                        credential=credential, first_request=request)
+                    return {"selected_request": worker_result_to_wire(selected)}
                 if method == "worker_model_result_recover_finish_v1":
                     service.recover_finish(credential=credential, request=request)
                     return {"finished": True}
