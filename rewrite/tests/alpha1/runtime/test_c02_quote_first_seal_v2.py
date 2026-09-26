@@ -132,6 +132,14 @@ def test_first_seal_requires_transaction_and_historical_read_rejects_tampering(m
     assert d11.verify_original_d06_first_ingress_c02_quote_v2(
         db, seal=seal, bundle_json=bundle_json, quote_json=quote_json,
         trusted_now_utc=101.0) == quote
+    monkeypatch.setattr(issuers, "_d06_c02_origin", lambda *_, **__: (
+        _ for _ in ()).throw(AssertionError("expired worker must not be requalified")))
+    admission = d11.admit_terminal_d06_first_ingress_c02_v2(
+        db, bundle, seal=seal, bundle_json=bundle_json,
+        quote_json=quote_json, now_utc=101.0)
+    assert admission.budget.ceiling == {"cpu_ms": 3}
+    assert admission.budget.lease_id == "lease"
+    assert admission.jobs == ()
     with pytest.raises((ValueError, IssuerAuthorityDenied)):
         d11.verify_original_d06_first_ingress_c02_quote_v2(
             db, seal=seal, bundle_json=bundle_json,
@@ -141,4 +149,9 @@ def test_first_seal_requires_transaction_and_historical_read_rejects_tampering(m
         d11.verify_original_d06_first_ingress_c02_quote_v2(
             db, seal=seal, bundle_json=bundle_json, quote_json=quote_json,
             trusted_now_utc=120.0)
+    db.execute("UPDATE runtime_budget_grants SET status='revoked' WHERE lease_id='lease'")
+    with pytest.raises(IssuerAuthorityDenied):
+        d11.admit_terminal_d06_first_ingress_c02_v2(
+            db, bundle, seal=seal, bundle_json=bundle_json,
+            quote_json=quote_json, now_utc=101.0)
     assert db.execute("SELECT COUNT(*) FROM runtime_resource_quotes").fetchone() == (1,)

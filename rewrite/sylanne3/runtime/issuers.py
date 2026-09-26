@@ -2504,6 +2504,64 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
             raise IssuerAuthorityDenied("C02 v2 original signed policy or grant differs")
         return quote
 
+    def admit_terminal_d06_first_ingress_c02_v2(
+            self, db, bundle: DomainBundle, *, seal, bundle_json: str,
+            quote_json: str, now_utc: float) -> RuntimeAdmission:
+        """Admit the frozen C02 price after worker expiry under current D11 budget.
+
+        The caller must separately verify its current Authority read fact,
+        source/access graph, original model cost and fenced job transition.
+        This method never signs a new quote or changes a reservation.
+        """
+        from .c02_bundle_codec import c02_bundle_to_wire
+
+        now = _now_utc(now_utc)
+        if type(bundle) is not DomainBundle or c02_bundle_to_wire(bundle) != bundle_json:
+            raise IssuerAuthorityDenied("exact frozen C02 v2 bundle required")
+        quote = self.verify_original_d06_first_ingress_c02_quote_v2(
+            db, seal=seal, bundle_json=bundle_json,
+            quote_json=quote_json, trusted_now_utc=now)
+        envelope = bundle.envelope
+        if (quote.graph_job_ref is not None or quote.outbox_refs
+                or quote.d02_settlement_refs or bundle.d11_cost_settlement_refs):
+            raise IssuerAuthorityDenied("C02 v2 frozen quote has unrelated runtime refs")
+        grant = self._load_grant(db, quote.parent_budget_lease_ref)
+        lease = get_budget_lease(db, grant.lease_id)
+        policy_id = quote.snapshot_ref.split(":")[1]
+        policy = self._d02._load_d06_c02_policy(db, policy_id)
+        if (grant.version != policy.grant_version
+                or grant.grant_id != policy.grant_id
+                or grant.valid_until_utc <= now
+                or lease.state != "active"
+                or (lease.bot_id, lease.persona_id, lease.currency)
+                != (grant.bot_id, grant.persona_id, grant.currency)
+                or (quote.bot_id, quote.persona_id)
+                != (grant.bot_id, grant.persona_id)
+                or quote.work_kind not in grant.allowed_work_kinds
+                or quote.valid_until_utc > grant.valid_until_utc
+                or envelope.authority.provider_policy_ref != grant.policy_ref
+                or any(amount > grant.max_ceiling.get(name, 0)
+                       for name, amount in quote.ceiling.items())):
+            raise IssuerAuthorityDenied("C02 v2 current budget grant differs")
+        self._d02.authorize_resources(bundle, db, now_utc=now)
+        digest = budget_operation_digest(envelope, lease.lease_id,
+                                         dict(quote.ceiling))
+        reservation = db.execute(
+            "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
+            "WHERE lease_id=? AND operation_id=?",
+            (lease.lease_id, quote.operation_id),
+        ).fetchone()
+        if reservation is not None and (
+                reservation[0] != digest
+                or json.loads(reservation[1]) != dict(quote.ceiling)
+                or reservation[2] not in {"reserved", "unknown"}):
+            raise IssuerAuthorityDenied("C02 v2 reservation differs from signed quote")
+        return RuntimeAdmission(BudgetAdmission(
+            lease.lease_id, lease.version, dict(quote.ceiling),
+            pre_reserved=reservation is not None,
+            reservation_operation_id=(quote.operation_id
+                                      if reservation is not None else None)), ())
+
     def _plan_d06_source_correction_quote(
             self, db, envelope: CommandEnvelope, admin_policy, request, *,
             installation_id: str, now_utc: float | None = None
