@@ -16,6 +16,8 @@ D12 只保存经当前 Owner 会话认证的作者选择、草稿与采用请求
 
 `d11.product-advance.v2` 显式写前驱类别 `root / advance / revision` 和前驱收据。每次从**当前图 checkpoint**读取潜状态和继承误差，以完整固定耦合块、驱动分段和确切写集调用受信 ABI2，事务外计算，事务内由已安装的纯验证 numeric issuer 核对完整输入/输出、原生库与 manifest 绑定、当前图版本和区间，再原子提交下一 checkpoint、feeling/mood 及收据。当前协调器的 numeric issuer 为 `None`、前驱只查 `graph_product_advances`，因此仅有 root 类型或 ABI2 数学证书无法推进产品状态。
 
+当前 `_check_product_advance` 还按 type_name 只容纳一条 feeling 和一条 mood 写入，并拒绝同类型多写；这与按对象/意义/来源分块的 24D 根候选不一致。v2 推进必须按稳定 block ID 验证完整块集合、每块前驱及跨块耦合，不能把多块候选压成一个全角色向量或静默丢弃其余 feeling。
+
 同游标语义修订保留潜状态与误差并写新前驱，否则现有精确父图版本检查会使后续推进断链。撤销设定是新修订，不倒退游标或重置误差；参数切换须显式传播映射误差，未支持映射保持 HOLD。普通 `math.tanh` 投影没有认证误差，不能把读出坐标作为潜状态或直接作为 D04 产品证明。
 
 ## 资格生成与 C02 边界
