@@ -79,6 +79,7 @@ _D04_ASSET_PATH = "resources/catalogue/d04-affect-scheme.json"
 _D03_ASSET_PATH = "resources/catalogue/d03-neutral-context-scheme.json"
 _D03_SCHEME = {"schema": "d03.context.scheme.v1", "roles": ["scene_participant"], "norms": []}
 _D04_OPERATOR_PATH = "resources/catalogue/d04-fixed-block-operator.json"
+_D04_TANH_READOUT_PATH = "resources/catalogue/d04-tanh-readout.v1.json"
 _D04_CATALOGUE_CAPABILITY = "d04.affect.scheme.v1"
 _D04_VERSION_FIELDS = (
     "scheme_version", "operator_version", "parameter_version", "coupling_version",
@@ -165,6 +166,70 @@ def _d04_binding(payload: dict[str, bytes]) -> dict[str, object]:
         "bytes": len(content),
         "catalogue_capability": _D04_CATALOGUE_CAPABILITY,
         **versions,
+    }
+
+
+def _d04_tanh_readout_binding(payload: dict[str, bytes]) -> dict[str, object]:
+    """Bind 24 ordered monotone tanh outputs; candidate status is not G2."""
+    content = payload.get(_D04_TANH_READOUT_PATH)
+    if content is None:
+        raise RuntimeError("formal alpha1 requires a D04 tanh readout asset")
+    scheme_content = payload.get(_D04_ASSET_PATH)
+    if scheme_content is None:
+        raise ValueError("D04 tanh readout requires the affect scheme asset")
+    scheme = _strict_json_object(scheme_content, "D04 affect scheme asset")
+    readout = _strict_json_object(content, "D04 tanh readout asset")
+    if set(readout) != {"schema", "readout_id", "readout_version", "scheme_version",
+                        "axis_ids", "axis_units", "outputs"}:
+        raise ValueError("D04 tanh readout fields are invalid")
+    if readout["schema"] != "d04.tanh-readout-asset.v1":
+        raise ValueError("D04 tanh readout schema is invalid")
+    if (type(readout["readout_id"]) is not str or not readout["readout_id"]
+            or type(readout["readout_version"]) is not str or not readout["readout_version"]
+            or type(readout["scheme_version"]) is not str
+            or readout["scheme_version"] != scheme.get("scheme_version")):
+        raise ValueError("D04 tanh readout identity or scheme version differs")
+    scheme_axes = scheme.get("axes")
+    if (type(scheme_axes) is not list or len(scheme_axes) != 24
+            or any(type(axis) is not dict or type(axis.get("axis_id")) is not str
+                   or axis.get("unit") != "normalized" for axis in scheme_axes)):
+        raise ValueError("D04 tanh readout requires a normalized 24-axis scheme")
+    axis_ids = [axis["axis_id"] for axis in scheme_axes]
+    if (len(set(axis_ids)) != 24 or type(readout["axis_ids"]) is not list
+            or readout["axis_ids"] != axis_ids
+            or type(readout["axis_units"]) is not list
+            or readout["axis_units"] != ["normalized"] * 24):
+        raise ValueError("D04 tanh readout axes differ from affect scheme")
+    outputs = readout["outputs"]
+    if type(outputs) is not list or len(outputs) != 24:
+        raise ValueError("D04 tanh readout requires 24 output rows")
+    output_ids: list[str] = []
+    for index, row in enumerate(outputs):
+        if type(row) is not dict or set(row) != {
+            "output_id", "axis_id", "unit", "output_version", "transform", "coefficients"
+        }:
+            raise ValueError("D04 tanh readout row fields are invalid")
+        weights = row["coefficients"]
+        if (type(row["output_id"]) is not str or not row["output_id"]
+                or row["axis_id"] != axis_ids[index] or row["unit"] != "normalized"
+                or row["output_version"] != readout["readout_version"]
+                or row["transform"] != "p=C*tanh(z)"
+                or type(weights) is not list or len(weights) != 24
+                or any(type(weight) not in (int, float) or not math.isfinite(weight)
+                       or not 0 <= weight <= 1.0e6 for weight in weights)):
+            raise ValueError("D04 tanh readout row mapping or monotone coefficients differ")
+        output_ids.append(row["output_id"])
+    if len(set(output_ids)) != 24:
+        raise ValueError("D04 tanh readout output IDs must be unique")
+    return {
+        "path": _D04_TANH_READOUT_PATH, "sha256": _sha256(content),
+        "bytes": len(content), "schema": readout["schema"],
+        "readout_id": readout["readout_id"],
+        "readout_version": readout["readout_version"],
+        "scheme_version": readout["scheme_version"],
+        "axis_ids": axis_ids, "axis_units": ["normalized"] * 24,
+        "output_ids": output_ids, "transform": "p=C*tanh(z)",
+        "status": "candidate",
     }
 
 
@@ -546,6 +611,7 @@ def _manifest(
     context_scheme: dict[str, object] | None = None,
     affect_scheme: dict[str, object] | None = None,
     fixed_block_operator: dict[str, object] | None = None,
+    tanh_readout: dict[str, object] | None = None,
 ) -> dict[str, object]:
     files = [
         {"path": path, "sha256": _sha256(content), "bytes": len(content)}
@@ -581,6 +647,8 @@ def _manifest(
         manifest["affect_scheme"] = affect_scheme
     if fixed_block_operator is not None:
         manifest["fixed_block_operator"] = fixed_block_operator
+    if tanh_readout is not None:
+        manifest["tanh_readout"] = tanh_readout
     return manifest
 
 
@@ -645,6 +713,8 @@ def build_package(
     context_scheme = _d03_binding(payload) if formal else None
     affect_scheme = _d04_binding(payload) if formal else None
     fixed_block_operator = _d04_operator_binding(payload) if formal else None
+    tanh_readout = (_d04_tanh_readout_binding(payload)
+                    if formal or _D04_TANH_READOUT_PATH in payload else None)
     native_path = (
         f"rewrite/sylanne3/_native/{target_os}-{target_arch}/{canonical_native}"
     )
@@ -667,6 +737,7 @@ def build_package(
         context_scheme=context_scheme,
         affect_scheme=affect_scheme,
         fixed_block_operator=fixed_block_operator,
+        tanh_readout=tanh_readout,
     )
     manifest_bytes = (
         json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -776,6 +847,24 @@ def verify_package(package: Path | str) -> None:
                 version, str
             ):
                 raise ValueError("ReleaseManifest build identity is invalid")
+            if mode == "formal-alpha1" or _D04_TANH_READOUT_PATH in listed:
+                readout_resources = {
+                    member: archive.read(member)
+                    for member in (_D04_ASSET_PATH, _D04_TANH_READOUT_PATH)
+                    if member in listed
+                }
+                try:
+                    expected_readout = _d04_tanh_readout_binding(readout_resources)
+                except RuntimeError as exc:
+                    raise ValueError(str(exc)) from exc
+                readout_binding = manifest.get("tanh_readout")
+                readout_entry = listed.get(_D04_TANH_READOUT_PATH)
+                if (readout_binding != expected_readout or readout_entry is None
+                        or any(readout_binding.get(field) != readout_entry.get(field)
+                               for field in ("path", "sha256", "bytes"))):
+                    raise ValueError("D04 tanh readout manifest binding is invalid")
+            elif "tanh_readout" in manifest:
+                raise ValueError("D04 tanh readout manifest binding lacks asset")
             if mode == "formal-alpha1":
                 formal_resources_present = all(
                     any(path.startswith(root + "/") for path in listed)

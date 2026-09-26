@@ -139,15 +139,15 @@ class PluginPackageTests(unittest.TestCase):
             "parameter_version": "fixture:parameter:1",
             "coupling_version": "fixture:coupling:1",
             "axes": [{
-                "axis_id": "fixture:axis:1",
+                "axis_id": f"fixture:axis:{index:02d}",
                 "unit": "normalized",
                 "meaning": "synthetic package-builder test axis",
-            }],
+            } for index in range(24)],
             "parameter_bounds": [],
         }
-        diagonal = {"rows": 1, "cols": 1, "offsets": [0, 1],
-                    "indices": [0], "values": [1.0]}
-        zero = {"rows": 1, "cols": 1, "offsets": [0, 0],
+        diagonal = {"rows": 24, "cols": 24, "offsets": list(range(25)),
+                    "indices": list(range(24)), "values": [1.0] * 24}
+        zero = {"rows": 24, "cols": 24, "offsets": [0] * 25,
                 "indices": [], "values": []}
         operator = {
             "schema": "d04.fixed-block-operator.v1",
@@ -157,7 +157,21 @@ class PluginPackageTests(unittest.TestCase):
             "axis_ids": [axis["axis_id"] for axis in affect_scheme["axes"]],
             "parameter_bounds": affect_scheme["parameter_bounds"],
             "operator": {"k": diagonal, "r": diagonal, "j": zero,
-                         "a": diagonal, "alpha": [1.0]},
+                         "a": diagonal, "alpha": [1.0] * 24},
+        }
+        readout = {
+            "schema": "d04.tanh-readout-asset.v1",
+            "readout_id": "fixture:tanh-identity",
+            "readout_version": "fixture:readout:1",
+            "scheme_version": affect_scheme["scheme_version"],
+            "axis_ids": [axis["axis_id"] for axis in affect_scheme["axes"]],
+            "axis_units": ["normalized"] * 24,
+            "outputs": [{
+                "output_id": f"p:{axis['axis_id']}", "axis_id": axis["axis_id"],
+                "unit": "normalized", "output_version": "fixture:readout:1",
+                "transform": "p=C*tanh(z)",
+                "coefficients": [int(i == j) for j in range(24)],
+            } for i, axis in enumerate(affect_scheme["axes"])],
         }
         migrations = {
             "legacy_data_policy": "registered_migrators",
@@ -179,6 +193,7 @@ class PluginPackageTests(unittest.TestCase):
             "resources/catalogue/d03-neutral-context-scheme.json": D03_ASSET.read_bytes(),
             "resources/catalogue/d04-affect-scheme.json": json.dumps(affect_scheme).encode() + b"\n",
             "resources/catalogue/d04-fixed-block-operator.json": json.dumps(operator).encode() + b"\n",
+            "resources/catalogue/d04-tanh-readout.v1.json": json.dumps(readout).encode() + b"\n",
             "resources/migrations/v1.json": json.dumps(migrations).encode() + b"\n",
             "THIRD_PARTY_NOTICES": b"No bundled third-party runtime assets.\n",
             "SBOM.spdx.json": b'{"spdxVersion":"SPDX-2.3"}\n',
@@ -386,6 +401,14 @@ class PluginPackageTests(unittest.TestCase):
         self.assertEqual(binding["path"], "resources/catalogue/d04-affect-scheme.json")
         self.assertEqual(binding["catalogue_capability"], "d04.affect.scheme.v1")
         self.assertEqual(binding["scheme_version"], "fixture:scheme:1")
+        readout = manifest["tanh_readout"]
+        self.assertEqual(readout["status"], "candidate")
+        self.assertEqual(readout["transform"], "p=C*tanh(z)")
+        self.assertEqual(readout["scheme_version"], binding["scheme_version"])
+        self.assertEqual(len(readout["axis_ids"]), 24)
+        self.assertEqual(len(readout["output_ids"]), 24)
+        self.assertEqual(readout["sha256"], hashlib.sha256(
+            (self.project / readout["path"]).read_bytes()).hexdigest())
         paths = {entry["path"] for entry in manifest["files"]}
         self.assertTrue(
             {
@@ -393,6 +416,7 @@ class PluginPackageTests(unittest.TestCase):
                 "resources/catalogue/current.json",
                 "resources/catalogue/d03-neutral-context-scheme.json",
                 "resources/catalogue/d04-affect-scheme.json",
+                "resources/catalogue/d04-tanh-readout.v1.json",
                 "resources/migrations/v1.json",
                 "THIRD_PARTY_NOTICES",
                 "SBOM.spdx.json",
@@ -402,6 +426,54 @@ class PluginPackageTests(unittest.TestCase):
             "rewrite/sylanne3/_native/linux-aarch64/libsylanne3_kernel.so",
             paths,
         )
+
+    def test_formal_build_requires_tanh_readout_and_matching_axes(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets()
+        path = self.project / "resources/catalogue/d04-tanh-readout.v1.json"
+        original = path.read_bytes()
+        path.unlink()
+        _run_git(self.project, "add", "-A")
+        _run_git(self.project, "commit", "--quiet", "-m", "missing tanh asset")
+        with self.assertRaisesRegex(RuntimeError, "requires a D04 tanh readout asset"):
+            self.builder.build_package(
+                project_root=self.project, target_os="windows", target_arch="x86_64",
+                native_library=self._native(), output_dir=self.base / "missing-tanh",
+            )
+        value = json.loads(original)
+        value["axis_ids"][0], value["axis_ids"][1] = value["axis_ids"][1], value["axis_ids"][0]
+        path.write_text(json.dumps(value), encoding="utf-8")
+        _run_git(self.project, "add", ".")
+        _run_git(self.project, "commit", "--quiet", "-m", "wrong tanh axes")
+        with self.assertRaisesRegex(ValueError, "axes differ from affect scheme"):
+            self.builder.build_package(
+                project_root=self.project, target_os="windows", target_arch="x86_64",
+                native_library=self._native(), output_dir=self.base / "wrong-tanh-axes",
+            )
+
+    def test_dev_probe_reports_actual_tanh_binding_and_verifier_rejects_forgery(self) -> None:
+        self._add_formal_assets()
+        package = self.builder.build_package(
+            project_root=self.project, target_os="windows", target_arch="x86_64",
+            native_library=self._native(), output_dir=self.base / "tanh-probe",
+            allow_dirty_dev_probe=True,
+        )
+        with zipfile.ZipFile(package) as archive:
+            members = {name: archive.read(name) for name in archive.namelist()}
+        manifest = json.loads(members["release-manifest.json"])
+        binding = manifest["tanh_readout"]
+        assert manifest["build_mode"] == "dev-probe"
+        assert binding["status"] == "candidate"
+        assert binding["sha256"] == hashlib.sha256(members[binding["path"]]).hexdigest()
+        assert binding["bytes"] == len(members[binding["path"]])
+        manifest["tanh_readout"]["transform"] = "c*z"
+        members["release-manifest.json"] = json.dumps(manifest).encode()
+        forged = self.base / "forged-tanh-binding.zip"
+        with zipfile.ZipFile(forged, "w") as archive:
+            for name, content in members.items():
+                archive.writestr(name, content)
+        with self.assertRaisesRegex(ValueError, "D04 tanh readout manifest binding"):
+            self.builder.verify_package(forged)
 
     def test_formal_native_header_matches_each_target(self) -> None:
         targets = (
@@ -732,9 +804,8 @@ class PluginPackageTests(unittest.TestCase):
         operator_path = self.project / "resources/catalogue/d04-fixed-block-operator.json"
         scheme = json.loads(scheme_path.read_bytes())
         operator = json.loads(operator_path.read_bytes())
-        scheme["axes"].append({"axis_id": "fixture:axis:2", "unit": "normalized",
-                               "meaning": "second synthetic axis"})
-        operator["axis_ids"].append("fixture:axis:2")
+        scheme["axes"] = scheme["axes"][:2]
+        operator["axis_ids"] = [axis["axis_id"] for axis in scheme["axes"]]
         diagonal = {"rows": 2, "cols": 2, "offsets": [0, 1, 2],
                     "indices": [0, 1], "values": [1.0, 1.0]}
         skew = {"rows": 2, "cols": 2, "offsets": [0, 1, 2],
