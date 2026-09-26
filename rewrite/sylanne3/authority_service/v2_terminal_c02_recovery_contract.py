@@ -96,7 +96,7 @@ class TerminalRecoveryReadRequestV1:
 
 @dataclass(frozen=True, slots=True)
 class TerminalRecoveryReadAttemptV1:
-    """Proposed durable handoff record; no ledger or read grant exists yet."""
+    """Content-free durable attempt; this record grants no body read."""
 
     request: TerminalRecoveryReadRequestV1
     permit_digest: str
@@ -118,6 +118,35 @@ class TerminalRecoveryReadAttemptV1:
             raise ValueError("finished terminal C02 result differs from original")
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalRecoveryReadFactV1:
+    """A finished attempt record, never a C02 write or body release permit.
+
+    A future trusted transport must supply handoff_digest only after the
+    original response has been drained. The ledger cannot prove that event.
+    """
+
+    request: TerminalRecoveryReadRequestV1
+    permit_digest: str
+    result_digest: str
+    handoff_digest: str
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != SCHEMA or type(self.request) is not TerminalRecoveryReadRequestV1:
+            raise ValueError("terminal C02 read fact scope differs")
+        for name in ("permit_digest", "result_digest", "handoff_digest"):
+            value = getattr(self, name)
+            if type(value) is not str or _DIGEST.fullmatch(value) is None:
+                raise ValueError(f"invalid {name}")
+        if self.result_digest != self.request.original_key.stable_result_digest:
+            raise ValueError("terminal C02 fact differs from original result")
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(asdict(self))
+
+
 class TerminalRecoveryGraphVerifierV1(Protocol):
     """Future pinned read-only Graph check; old worker lease is historical.
 
@@ -131,16 +160,17 @@ class TerminalRecoveryGraphVerifierV1(Protocol):
                 intent: ModelEgressIntentV1, permit: FencePermitV2) -> bool: ...
 
 
-def to_wire(value: OriginalC02ResultKeyV1 | TerminalRecoveryReadRequestV1) -> dict:
+def to_wire(value: OriginalC02ResultKeyV1 | TerminalRecoveryReadRequestV1 |
+            TerminalRecoveryReadAttemptV1 | TerminalRecoveryReadFactV1) -> dict:
     if type(value) not in {OriginalC02ResultKeyV1, TerminalRecoveryReadRequestV1,
-                           TerminalRecoveryReadAttemptV1}:
+                           TerminalRecoveryReadAttemptV1, TerminalRecoveryReadFactV1}:
         raise TypeError("typed terminal C02 recovery value required")
     return json.loads(canonical_serialize(asdict(value)))
 
 
 def from_wire(raw: object, kind: type):
     if kind not in {OriginalC02ResultKeyV1, TerminalRecoveryReadRequestV1,
-                    TerminalRecoveryReadAttemptV1}:
+                    TerminalRecoveryReadAttemptV1, TerminalRecoveryReadFactV1}:
         raise TypeError("terminal C02 recovery wire type differs")
     if type(raw) is not dict or set(raw) != {field.name for field in fields(kind)}:
         raise ValueError("terminal C02 recovery wire fields differ")
@@ -162,5 +192,5 @@ def from_wire(raw: object, kind: type):
 
 
 __all__ = ("SCHEMA", "OriginalC02ResultKeyV1", "TerminalRecoveryReadRequestV1",
-           "TerminalRecoveryReadAttemptV1",
+           "TerminalRecoveryReadAttemptV1", "TerminalRecoveryReadFactV1",
            "TerminalRecoveryGraphVerifierV1", "from_wire", "to_wire")
