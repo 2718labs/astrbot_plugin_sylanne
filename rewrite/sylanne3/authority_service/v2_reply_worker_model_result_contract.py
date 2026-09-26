@@ -71,7 +71,7 @@ class ReplyWorkerModelResultReadRequestV1:
                     getattr(self, name)):
                 raise ValueError(f"invalid {name}")
         source = AtomKey.from_token(self.source_ref)
-        if (source.type_name != "memory.source"
+        if (source.type_name != "memory.source" or source.owner.kind != "event"
                 or (source.owner.bot, source.owner.persona) != self.namespace.as_tuple
                 or type(self.source_revision) is not int or self.source_revision < 1
                 or type(self.access_revision) is not int or self.access_revision < 1

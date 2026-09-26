@@ -1,6 +1,7 @@
 """Reply result read identity remains distinct from first-ingress scope."""
 
 from dataclasses import replace
+import sqlite3
 
 import pytest
 
@@ -11,6 +12,11 @@ from sylanne3.authority_service.v2_reply_worker_model_result_contract import (
 from sylanne3.memory_types import source_key
 from sylanne3.runtime_contracts import NamespaceId
 from rewrite.tests.alpha1.authority.test_v2_worker_result_read_service import _case
+from sylanne3.authority_service.contract import AuthorityUnavailable
+from sylanne3.authority_service.current_reply_worker_model_result_graph_verifier import (
+    PinnedCurrentReplyWorkerModelResultGraphVerifier,
+)
+from sylanne3.runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 
 
 def test_reply_read_identity_round_trip_and_first_ingress_scope_rejected():
@@ -59,5 +65,30 @@ def test_reply_attempt_identity_is_durable_and_conflicting_replay_denied(tmp_pat
         assert ledger.begin(request, permit=permit).request == request
         with pytest.raises(Exception, match="identity conflict"):
             ledger.read(replace(request, attention_ticket_id="ticket-b"))
+    finally:
+        core.close(); deletion.close(); guard.close(); execution.close()
+
+
+def test_reply_result_read_holds_without_durable_graph_producer(tmp_path, monkeypatch):
+    service, first, core, deletion, guard, execution = _case(tmp_path, monkeypatch)
+    graph_path = tmp_path / "reply-graph.db"
+    sqlite3.connect(graph_path).close()
+    service._reply_graph = PinnedCurrentReplyWorkerModelResultGraphVerifier(
+        graph_path, trusted_now_utc=lambda: 1.0,
+        d11_issuer=D11BudgetJobIssuer(D02ResourceIssuer(b"a" * 32), b"b" * 32))
+    request = ReplyWorkerModelResultReadRequestV1(
+        first.authority_id, first.authority_namespace, first.namespace,
+        first.installation_id, first.job_id, first.acquire_operation_id,
+        first.original_operation_id, first.call_id, first.binding_digest,
+        first.model_request_digest, "reply-consumer-a",
+        reply_worker_read_attempt_id_v1("reply-consumer-a", 1), "c02-a",
+        source_key("bot-a", "persona-a", "source-a").token,
+        2, 3, "ticket-a", 4, ("user-a",))
+    try:
+        with pytest.raises(AuthorityUnavailable, match="current worker graph"):
+            service.select_attempt(credential="ok", first_request=request)
+        with pytest.raises(AuthorityUnavailable, match="current worker graph"):
+            service.prepare(credential="ok", request=request)
+        assert service._attempts.read(request) is None
     finally:
         core.close(); deletion.close(); guard.close(); execution.close()

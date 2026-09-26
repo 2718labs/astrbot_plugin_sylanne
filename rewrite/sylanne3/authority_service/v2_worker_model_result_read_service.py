@@ -14,6 +14,9 @@ from .contract import AuthorityUnavailable, identifier
 from .current_worker_model_result_graph_verifier import (
     PinnedCurrentWorkerModelResultGraphVerifier,
 )
+from .current_reply_worker_model_result_graph_verifier import (
+    PinnedCurrentReplyWorkerModelResultGraphVerifier,
+)
 from .v2_contract import FencePermitV2
 from .v2_fence_service import AuthorityV2FenceService
 from .v2_model_egress_store import AuthorityV2ModelEgressStore
@@ -22,11 +25,15 @@ from .v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
     first_ingress_read_attempt_id_v1,
 )
+from .v2_reply_worker_model_result_contract import (
+    ReplyWorkerModelResultReadRequestV1, ReplyWorkerModelResultReadV1,
+    reply_worker_read_attempt_id_v1,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class WorkerResultDeliveryV1:
-    result: WorkerModelResultReadV1
+    result: WorkerModelResultReadV1 | ReplyWorkerModelResultReadV1
     permit: FencePermitV2
 
     @property
@@ -39,6 +46,7 @@ class AuthorityV2WorkerModelResultReadService:
                  fences: AuthorityV2FenceService,
                  attempts: AuthorityV2WorkerModelResultAttempts,
                  graph_verifier: PinnedCurrentWorkerModelResultGraphVerifier,
+                 reply_graph_verifier: PinnedCurrentReplyWorkerModelResultGraphVerifier | None = None,
                  installation_id: str, read_subject: str, holder: str):
         for value, name in ((installation_id, "installation_id"),
                             (read_subject, "read_subject"), (holder, "holder")):
@@ -47,11 +55,14 @@ class AuthorityV2WorkerModelResultReadService:
         if (type(store) is not AuthorityV2ModelEgressStore or core is None
                 or type(attempts) is not AuthorityV2WorkerModelResultAttempts
                 or type(graph_verifier) is not PinnedCurrentWorkerModelResultGraphVerifier
+                or (reply_graph_verifier is not None and type(reply_graph_verifier)
+                    is not PinnedCurrentReplyWorkerModelResultGraphVerifier)
                 or store._db is not core._db or store._lock is not core._lock
                 or attempts._db is not core._db or attempts._lock is not core._lock):
             raise AuthorityUnavailable("worker result requires one trusted Authority composition")
         self._store, self._fences, self._attempts = store, fences, attempts
         self._graph = graph_verifier
+        self._reply_graph = reply_graph_verifier
         self._installation_id = installation_id
         self._read_subject = read_subject
         self._holder = holder
@@ -61,9 +72,12 @@ class AuthorityV2WorkerModelResultReadService:
         self._inflight_deliveries: dict[str, FencePermitV2 | None] = {}
 
     def _require(self, credential, request):
-        if (type(request) is not WorkerModelResultReadRequestV1
+        if (type(request) not in {WorkerModelResultReadRequestV1,
+                                 ReplyWorkerModelResultReadRequestV1}
                 or request.authority_namespace != self._fences.namespace
-                or request.installation_id != self._installation_id):
+                or request.installation_id != self._installation_id
+                or (type(request) is ReplyWorkerModelResultReadRequestV1
+                    and self._reply_graph is None)):
             raise AuthorityUnavailable("installed typed worker read required")
         self._fences.core._require(
             credential, "read", request.authority_namespace, self._holder)
@@ -114,7 +128,9 @@ class AuthorityV2WorkerModelResultReadService:
         observation = self._store._read_observation_locked(db, intent)
         if observation.digest != receipt.observation_digest:
             raise AuthorityUnavailable("original model body differs")
-        result = WorkerModelResultReadV1(request, observation, receipt)
+        result = (ReplyWorkerModelResultReadV1(request, observation, receipt)
+                  if type(request) is ReplyWorkerModelResultReadRequestV1 else
+                  WorkerModelResultReadV1(request, observation, receipt))
         result.require_original_intent(intent)
         return intent, receipt, result
 
@@ -130,13 +146,15 @@ class AuthorityV2WorkerModelResultReadService:
             anchor.authority_id, anchor.namespace, self._read_subject,
             self._holder, anchor.activation_generation, "read",
             request.read_attempt_id, "p" * 32, 1, 0, anchor)
-        if self._graph.current(request, intent, candidate) is not True:
+        graph = (self._reply_graph if type(request) is ReplyWorkerModelResultReadRequestV1
+                 else self._graph)
+        if graph.current(request, intent, candidate) is not True:
             raise AuthorityUnavailable("current worker graph qualification unavailable")
         return anchor, intent
 
     def select_attempt(self, *, credential,
-                       first_request: WorkerModelResultReadRequestV1,
-                       ) -> WorkerModelResultReadRequestV1:
+                       first_request: WorkerModelResultReadRequestV1 |
+                                      ReplyWorkerModelResultReadRequestV1):
         """Select the original active read or the next read after a finished one.
 
         Selection is content-free and advisory. ``prepare`` rechecks the graph
@@ -144,8 +162,10 @@ class AuthorityV2WorkerModelResultReadService:
         """
         self._require(credential, first_request)
         consumer = first_request.consumer_operation_id
-        if first_request.read_attempt_id != first_ingress_read_attempt_id_v1(
-                consumer, 1):
+        attempt_id = (reply_worker_read_attempt_id_v1
+                      if type(first_request) is ReplyWorkerModelResultReadRequestV1
+                      else first_ingress_read_attempt_id_v1)
+        if first_request.read_attempt_id != attempt_id(consumer, 1):
             raise AuthorityUnavailable("canonical first worker read required")
         with self._attempts._tx() as db:
             rows = db.execute(
@@ -159,7 +179,7 @@ class AuthorityV2WorkerModelResultReadService:
             for attempt in range(1, len(rows) + 1):
                 expected = replace(
                     first_request, read_attempt_id=(
-                        first_ingress_read_attempt_id_v1(consumer, attempt)))
+                        attempt_id(consumer, attempt)))
                 record = self._attempts._read_locked(db, expected.read_attempt_id)
                 if (expected.read_attempt_id not in actual or record is None
                         or record.request != expected
@@ -175,11 +195,13 @@ class AuthorityV2WorkerModelResultReadService:
                 if next_attempt > 64:
                     raise AuthorityUnavailable("worker read attempt limit reached")
                 selected = replace(first_request, read_attempt_id=(
-                    first_ingress_read_attempt_id_v1(consumer, next_attempt)))
+                    attempt_id(consumer, next_attempt)))
         self._preflight(selected)
         return selected
 
-    def prepare(self, *, credential, request: WorkerModelResultReadRequestV1
+    def prepare(self, *, credential,
+                request: WorkerModelResultReadRequestV1 |
+                         ReplyWorkerModelResultReadRequestV1
                 ) -> WorkerResultDeliveryV1:
         """Prepare one body; caller must drain transport before finish_delivery."""
         self._require(credential, request)
@@ -218,7 +240,9 @@ class AuthorityV2WorkerModelResultReadService:
                 operation="read", current_anchor=anchor,
                 operation_id=request.read_attempt_id)
             self._attempts.begin_locked(db, request, permit=permit)
-        if self._graph.current(request, original_intent, permit) is not True:
+        graph = (self._reply_graph if type(request) is ReplyWorkerModelResultReadRequestV1
+                 else self._graph)
+        if graph.current(request, original_intent, permit) is not True:
             raise AuthorityUnavailable("current worker graph changed; read fence retained")
         with fences._frozen() as (db, deletion_head, execution_head, history):
             anchor = fences._current_locked(
@@ -231,7 +255,7 @@ class AuthorityV2WorkerModelResultReadService:
             intent, _, result = self._terminal_locked(db, request, anchor, content=True)
             if intent != original_intent:
                 raise AuthorityUnavailable("original model intent changed")
-        if self._graph.current(request, original_intent, permit) is not True:
+        if graph.current(request, original_intent, permit) is not True:
             raise AuthorityUnavailable("current worker graph changed after result copy")
         fences.validate_fence(
             credential=credential, subject=self._read_subject, permit=permit)
@@ -297,7 +321,8 @@ class AuthorityV2WorkerModelResultReadService:
             self._inflight_deliveries.pop(attempt_id, None)
 
     def recover_finish(self, *, credential,
-                       request: WorkerModelResultReadRequestV1) -> None:
+                       request: WorkerModelResultReadRequestV1 |
+                                ReplyWorkerModelResultReadRequestV1) -> None:
         """Authenticated content-free close of an uncertain original attempt."""
         self._require(credential, request)
         with self._delivery_lock:
