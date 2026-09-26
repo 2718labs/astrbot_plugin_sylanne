@@ -525,6 +525,47 @@ test("D05 relations renders only the complete public projection and distinguishe
   } finally { ui.restore(); }
 });
 
+test("D05 correction entry uses the validated D12 source_claim contract and preserves HOLD", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    await ui.nextRequest(0);
+    ui.requests[0].resolve({ status: "ready", projection: { views: [] } });
+    await opened;
+    const selected = ui.clickView("relations");
+    await ui.nextRequest(1);
+    ui.requests[1].resolve({ status: "ready", projection: { view_type: "relations", data: {
+      coverage: "complete", relations: []
+    } } });
+    await selected;
+
+    assert.match(ui.app.innerHTML, /仅支持按 D12 source_claim 合同提交来源更正申请/);
+    assert.match(ui.app.innerHTML, /解释质疑和创作调整暂不可提交/);
+    assert.match(ui.app.innerHTML, /提交来源更正申请/);
+    assert.doesNotMatch(ui.app.innerHTML, /interpretation_challenge|administrative_edit|name="correction_kind"/);
+    ui.setPageFields({ statement: "更正说明", source_refs: "source-a", target_refs: "target-a",
+      access_epoch: "3", deletion_epoch: "4", impact_preview_ref: "preview-1" });
+    const submitted = ui.clickCommand("page-action");
+    const request = await ui.nextRequest(2);
+    assert.equal(request.payload.action, "correct_or_edit");
+    assert.deepEqual(request.payload.input, {
+      schema: "d12.source_correction.v1", correction_kind: "source_claim", statement: "更正说明",
+      source_refs: ["source-a"], target_refs: ["target-a"],
+      access_epoch: 3, deletion_epoch: 4, impact_preview_ref: "preview-1"
+    });
+    request.resolve({ status: "unavailable", problem: {
+      schema: "d12.source_correction_response.v1", code: "source_correction_commit_unavailable",
+      message: "来源纠错提交尚未接入权威协调器；未修改来源或解释。", retryable: false
+    } });
+    await submitted;
+    assert.match(ui.app.innerHTML, /更正待接入（HOLD）/);
+    assert.match(ui.app.innerHTML, /未修改来源或解释/);
+    assert.doesNotMatch(ui.app.innerHTML, /更正成功|已更正|correction_committed/);
+    assert.equal(ui.requests.length, 3, "HOLD does not trigger a projection refresh");
+  } finally { ui.restore(); }
+});
+
 test("D06 memory rejects partial or malformed source coverage and clears prior summary", async () => {
   const ui = await mountWorkbench();
   try {

@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ACTIONS, D12_SCHEMA_VERSION, makeOwnerLoginRequest, makeRequest } from "../../../../resources/workbench/src/api/contract.js";
-import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "../../../../resources/workbench/src/api/client.js";
-import { applyProblem, applyResponse, initialState, switchRole, VIEW_STATES } from "../../../../resources/workbench/src/state.js";
-import { needsFreshProjection, workflowForPage } from "../../../../resources/workbench/src/workflows.js";
+import { ACTIONS, D12_SCHEMA_VERSION, makeOwnerLoginRequest, makeRequest } from "../../../../webui-src/src/api/contract.js";
+import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "../../../../webui-src/src/api/client.js";
+import { applyProblem, applyResponse, initialState, switchRole, VIEW_STATES } from "../../../../webui-src/src/state.js";
+import { needsFreshProjection, workflowForPage } from "../../../../webui-src/src/workflows.js";
 
 test("client posts to the AstrBot plugin extension route with host cookie and CSRF", async () => {
   const requested = [];
@@ -236,10 +236,20 @@ test("nine-page workflows map user inputs only to W10 action schemas", () => {
   assert.throws(() => workflowForPage("setup", { scene_ref: "scene:fake", visibility: "private" }), /conversation-v1/);
   assert.throws(() => workflowForPage("setup", { scene_ref: "scene:other:42", visibility: "private", acknowledgement: "on" }), /conversation-v1/);
   const [compile, compileInput] = workflowForPage("creation", { mode: "compile", draft_ref: "draft:1" });
-  const [correct, correction] = workflowForPage("relations", { correction_kind: "source_correction", statement: "修正", source_refs: "source:1,source:2" });
+  const [correct, correction] = workflowForPage("relations", {
+    statement: "修正", source_refs: "source:1,source:2", target_refs: "target:1",
+    access_epoch: "4", deletion_epoch: "5", impact_preview_ref: "preview:1"
+  });
   const [erase, eraseInput] = workflowForPage("lifecycle", { mode: "erase", scope_selection: "all", data_choice: "delete" });
   assert.equal(compile, ACTIONS.compileScheme); assert.deepEqual(compileInput, { draft_ref: "draft:1", intent: "user_requested_candidate" });
-  assert.equal(correct, ACTIONS.correctOrEdit); assert.deepEqual(correction.source_refs, ["source:1", "source:2"]);
+  assert.equal(correct, ACTIONS.correctOrEdit); assert.deepEqual(correction, {
+    schema: "d12.source_correction.v1", correction_kind: "source_claim", statement: "修正",
+    source_refs: ["source:1", "source:2"], target_refs: ["target:1"],
+    access_epoch: 4, deletion_epoch: 5, impact_preview_ref: "preview:1"
+  });
+  assert.throws(() => workflowForPage("relations", {
+    statement: "修正", source_refs: "source:1", target_refs: "target:1", access_epoch: "4"
+  }), /访问与删除纪元/);
   assert.equal(erase, ACTIONS.eraseOrRetire); assert.equal(eraseInput.mode, "erase");
   assert.equal(needsFreshProjection(compile), true); assert.equal(needsFreshProjection(ACTIONS.readCharacterView), false);
   const [, created] = workflowForPage("creation", { mode: "compile", draft_json: '{"fields":{},"field_sources":{}}' });
