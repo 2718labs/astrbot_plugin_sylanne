@@ -795,7 +795,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin._encoding_inflight, set())
         self.assertEqual(event.sent, [])
 
-    async def test_auto_c02_handoff_is_bounded_once_and_drains_on_terminate(self) -> None:
+    async def test_auto_c02_handoff_queues_distinct_ingress_and_drains_on_terminate(self) -> None:
         module = load_plugin_module()
         started = asyncio.Event()
         cancelled = asyncio.Event()
@@ -855,12 +855,14 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             await plugin.ingress(event)
             self.assertEqual(len(calls), 1)
             self.assertEqual(len(plugin._encoding_tasks), 1)
-            self.assertEqual(len(plugin._encoding_inflight), 1)
+            self.assertEqual(len(plugin._encoding_inflight), 2)
+            self.assertEqual(plugin._encoding_pending.qsize(), 1)
             self.assertEqual(calls[0][1]["trusted_umo"], event.unified_msg_origin)
             await plugin.terminate()
         self.assertTrue(cancelled.is_set())
         self.assertEqual(plugin._encoding_tasks, set())
         self.assertEqual(plugin._encoding_inflight, set())
+        self.assertEqual(plugin._encoding_pending.qsize(), 0)
         self.assertEqual(event.sent, [])
 
     async def test_auto_c02_handoff_retries_same_original_after_hold(self) -> None:
@@ -918,6 +920,83 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][1]["receipt"].operation_id, "ingress-1")
         self.assertEqual(calls[1][1]["receipt"].operation_id, "ingress-1")
+        self.assertEqual(plugin._encoding_inflight, set())
+        self.assertEqual(event.sent, [])
+
+    async def test_auto_c02_serializes_accepted_ingresses_with_queue_backpressure(self) -> None:
+        module = load_plugin_module()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_started = asyncio.Event()
+        third_started = asyncio.Event()
+        calls = []
+
+        class ControlledRuntime:
+            def __init__(self):
+                self.receipts = iter(("ingress-1", "ingress-2", "ingress-3", "ingress-3"))
+                self.calls = 0
+
+            async def handle_ingress(self, _envelope):
+                self.calls += 1
+                operation_id = next(self.receipts)
+                return IngressReceipt(
+                    "duplicate" if self.calls == 4
+                    else "accepted", operation_id,
+                )
+
+            async def first_ingress_c02_accounting_installed_v1(self):
+                return True
+
+            async def commit_first_ingress_pre_encoding_stages_v1(self, envelope, receipt):
+                stage_receipt = CommitReceipt(
+                    "committed", "stage-op", "a" * 64, "activity", None, 1,
+                    (), (), (), (), (),
+                )
+                return module.FirstIngressPreEncodingStagesV1(
+                    envelope.namespace, receipt.operation_id, receipt.operation_id,
+                    stage_receipt, stage_receipt,
+                )
+
+        async def driver(*args, **kwargs):
+            calls.append(kwargs["receipt"].operation_id)
+            if len(calls) == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_started.set()
+                if len(calls) == 3:
+                    third_started.set()
+            return object()
+
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None,
+                    None, None, None, None, None),
+            {"enabled": True},
+        )
+        plugin.context = _IngressContext()
+        plugin._runtime = ControlledRuntime()
+        plugin._v2_installation = object()
+        plugin._encoding_pending = asyncio.Queue(maxsize=1)
+        plugin.runtime_health = RuntimeHealth("ready")
+        event = Event()
+        plugin._installed_namespace = (
+            await module.build_astrbot_ingress(event, plugin.context)).namespace
+        with patch.object(module, "run_installed_first_ingress_c02_v1", new=driver):
+            await plugin.ingress(event)
+            await asyncio.wait_for(first_started.wait(), 1)
+            await plugin.ingress(event)
+            self.assertEqual(calls, ["ingress-1"])
+            self.assertEqual(plugin._encoding_pending.qsize(), 1)
+            third_ingress = asyncio.create_task(plugin.ingress(event))
+            await asyncio.sleep(0)
+            self.assertFalse(third_ingress.done())
+            release_first.set()
+            await asyncio.wait_for(second_started.wait(), 1)
+            await asyncio.wait_for(third_ingress, 1)
+            await asyncio.wait_for(third_started.wait(), 1)
+            await asyncio.sleep(0)
+            await plugin.ingress(event)
+        self.assertEqual(calls, ["ingress-1", "ingress-2", "ingress-3"])
         self.assertEqual(plugin._encoding_inflight, set())
         self.assertEqual(event.sent, [])
 

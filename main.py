@@ -103,6 +103,8 @@ class Sylanne3Plugin(Star):
         self._v2_installation: V2InstallationAssembly | None = None
         self._encoding_tasks: set[asyncio.Task] = set()
         self._encoding_inflight: set[tuple[str, str, str, str]] = set()
+        self._encoding_pending: asyncio.Queue = asyncio.Queue(maxsize=8)
+        self._encoding_waiters: set[asyncio.Task] = set()
         self._encoding_stopping = False
         self._installed_namespace: NamespaceId | None = None
         self._scene_candidates = SceneCandidateCatalog()
@@ -313,11 +315,22 @@ class Sylanne3Plugin(Star):
         self._workbench.close()
         self._scene_candidates.clear()
         self._installed_namespace = None
+        for task in self._encoding_waiters:
+            task.cancel()
+        if self._encoding_waiters:
+            await asyncio.gather(*self._encoding_waiters, return_exceptions=True)
         if self._encoding_tasks:
             for task in self._encoding_tasks:
                 task.cancel()
             await asyncio.gather(*self._encoding_tasks, return_exceptions=True)
             self._encoding_tasks.clear()
+        queued = self._encoding_pending.qsize()
+        while not self._encoding_pending.empty():
+            self._encoding_pending.get_nowait()
+        if queued:
+            logger.warning("Sylanne 3 first encoding interrupted with %d queued handoffs; HOLD",
+                           queued)
+        self._encoding_inflight.clear()
         self._v2_installation = None
         if self._runtime is not None:
             self.runtime_health = await self._runtime.stop()
@@ -344,7 +357,23 @@ class Sylanne3Plugin(Star):
         except Exception:
             logger.exception("Sylanne 3 first encoding C02 failed; original call HOLD")
 
-    def _schedule_first_ingress_c02(
+    async def _drive_first_ingress_c02_queue(self) -> None:
+        try:
+            while not self._encoding_pending.empty() and not self._encoding_stopping:
+                key, runtime, installation, trusted_umo, envelope, receipt = (
+                    self._encoding_pending.get_nowait())
+                try:
+                    await self._run_first_ingress_c02(
+                        runtime, installation, trusted_umo, envelope, receipt)
+                finally:
+                    self._encoding_inflight.discard(key)
+        finally:
+            self._encoding_tasks.discard(asyncio.current_task())
+            if not self._encoding_pending.empty() and not self._encoding_stopping:
+                self._encoding_tasks.add(asyncio.create_task(
+                    self._drive_first_ingress_c02_queue()))
+
+    async def _schedule_first_ingress_c02(
         self, runtime: RuntimeContext, installation: V2InstallationAssembly,
         trusted_umo: str, envelope, receipt: IngressReceipt,
         stages: FirstIngressPreEncodingStagesV1,
@@ -361,17 +390,24 @@ class Sylanne3Plugin(Star):
         key = (*envelope.namespace.as_tuple, stages.job_id, receipt.operation_id)
         if key in self._encoding_inflight:
             return
-        if len(self._encoding_tasks) >= 1:
-            logger.warning("Sylanne 3 first encoding handoff capacity reached; HOLD")
-            return
-        task = asyncio.create_task(self._run_first_ingress_c02(
-            runtime, installation, trusted_umo, envelope, receipt))
         self._encoding_inflight.add(key)
-        self._encoding_tasks.add(task)
-        def release(completed: asyncio.Task) -> None:
-            self._encoding_tasks.discard(completed)
+        current = asyncio.current_task()
+        self._encoding_waiters.add(current)
+        try:
+            await self._encoding_pending.put((
+                key, runtime, installation, trusted_umo, envelope, receipt))
+        except asyncio.CancelledError:
             self._encoding_inflight.discard(key)
-        task.add_done_callback(release)
+            logger.warning("Sylanne 3 first encoding handoff interrupted before queueing; HOLD")
+            raise
+        finally:
+            self._encoding_waiters.discard(current)
+        if self._encoding_stopping:
+            logger.warning("Sylanne 3 first encoding handoff interrupted during shutdown; HOLD")
+            return
+        if not self._encoding_tasks:
+            self._encoding_tasks.add(asyncio.create_task(
+                self._drive_first_ingress_c02_queue()))
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def ingress(self, event: AstrMessageEvent) -> None:
@@ -416,7 +452,7 @@ class Sylanne3Plugin(Star):
                 if not await runtime.first_ingress_c02_accounting_installed_v1():
                     logger.info("Sylanne 3 first encoding baseline committed; C02 accounting HOLD")
                 else:
-                    self._schedule_first_ingress_c02(
+                    await self._schedule_first_ingress_c02(
                         runtime, self._v2_installation,
                         event.unified_msg_origin, envelope, receipt, stages)
 
