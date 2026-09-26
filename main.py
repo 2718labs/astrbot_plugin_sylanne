@@ -25,7 +25,11 @@ from .rewrite.sylanne3.host.authority_profile import (
 from .rewrite.sylanne3.host.v2_installation import V2InstallationAssembly
 from .rewrite.sylanne3.host.installed_scene_identity import InstalledSceneIdentityPort
 from .rewrite.sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
-from .rewrite.sylanne3.host.first_ingress_c02_driver import run_installed_first_ingress_c02_v1
+from .rewrite.sylanne3.host.first_ingress_c02_driver import (
+    installed_first_ingress_c02_pairing_ready_v1,
+    original_unacquired_handoff_v1,
+    run_installed_first_ingress_c02_v1,
+)
 from .rewrite.sylanne3.installation_policy import AdminInstallationPolicy
 from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, SceneCandidateCatalog
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
@@ -304,6 +308,7 @@ class Sylanne3Plugin(Star):
                 logger.error("Sylanne D12 workbench pairing could not be attached")
         if health.status == "limited":
             self.runtime_health = health
+            await self._restore_unacquired_first_ingress_c02_v1()
         else:
             self.runtime_health = RuntimeHealth(
                 "blocked", health.missing_capabilities or ("runtime_bootstrap",),
@@ -373,21 +378,57 @@ class Sylanne3Plugin(Star):
                 self._encoding_tasks.add(asyncio.create_task(
                     self._drive_first_ingress_c02_queue()))
 
+    async def _restore_unacquired_first_ingress_c02_v1(self) -> None:
+        runtime = self._runtime
+        installation = self._v2_installation
+        if (self._encoding_stopping or runtime is None or installation is None
+                or getattr(runtime, "v2_ingress_qualified", False) is not True
+                or not await runtime.first_ingress_c02_accounting_installed_v1()
+                or not await installed_first_ingress_c02_pairing_ready_v1(
+                    installation)):
+            return
+        page = await runtime.discover_first_ingress_unacquired_v1(limit=8)
+        if page is None:
+            logger.warning("Sylanne 3 unacquired first encoding discovery unavailable; HOLD")
+            return
+        for item in page.items:
+            handoff = original_unacquired_handoff_v1(item, installation)
+            if handoff is None:
+                logger.warning("Sylanne 3 unacquired first encoding identity invalid; HOLD")
+                continue
+            trusted_umo, envelope, receipt = handoff
+            await self._queue_first_ingress_c02(
+                runtime, installation, trusted_umo, envelope, receipt,
+                item.job_id)
+        if page.next_cursor is not None:
+            logger.warning("Sylanne 3 unacquired first encoding scan has further pages; HOLD")
+
     async def _schedule_first_ingress_c02(
         self, runtime: RuntimeContext, installation: V2InstallationAssembly,
         trusted_umo: str, envelope, receipt: IngressReceipt,
         stages: FirstIngressPreEncodingStagesV1,
     ) -> None:
-        if (self._encoding_stopping
-                or self._runtime is not runtime
-                or self._v2_installation is not installation
-                or type(stages) is not FirstIngressPreEncodingStagesV1
+        if (type(stages) is not FirstIngressPreEncodingStagesV1
                 or stages.namespace != envelope.namespace
-                or stages.ingress_operation_id != receipt.operation_id
-                or type(trusted_umo) is not str or not trusted_umo):
+                or stages.ingress_operation_id != receipt.operation_id):
             logger.warning("Sylanne 3 first encoding handoff identity unavailable; HOLD")
             return
-        key = (*envelope.namespace.as_tuple, stages.job_id, receipt.operation_id)
+        await self._queue_first_ingress_c02(
+            runtime, installation, trusted_umo, envelope, receipt,
+            stages.job_id)
+
+    async def _queue_first_ingress_c02(
+        self, runtime: RuntimeContext, installation: V2InstallationAssembly,
+        trusted_umo: str, envelope, receipt: IngressReceipt, job_id: str,
+    ) -> None:
+        if (self._encoding_stopping or self._runtime is not runtime
+                or self._v2_installation is not installation
+                or type(trusted_umo) is not str or not trusted_umo
+                or type(job_id) is not str or not job_id
+                or receipt.status != "accepted"):
+            logger.warning("Sylanne 3 first encoding handoff identity unavailable; HOLD")
+            return
+        key = (*envelope.namespace.as_tuple, job_id, receipt.operation_id)
         if key in self._encoding_inflight:
             return
         self._encoding_inflight.add(key)

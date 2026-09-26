@@ -1000,6 +1000,55 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin._encoding_inflight, set())
         self.assertEqual(event.sent, [])
 
+    async def test_startup_unacquired_scan_reuses_original_c02_queue_once(self) -> None:
+        module = load_plugin_module()
+        started = asyncio.Event()
+        calls = []
+        event = Event()
+
+        class ControlledRuntime:
+            v2_ingress_qualified = True
+
+            async def first_ingress_c02_accounting_installed_v1(self):
+                return True
+
+            async def discover_first_ingress_unacquired_v1(self, *, limit):
+                self_limit.append(limit)
+                return types.SimpleNamespace(
+                    items=(types.SimpleNamespace(job_id="original-job"),),
+                    next_cursor=None,
+                )
+
+        async def driver(*args, **kwargs):
+            calls.append(kwargs["receipt"].operation_id)
+            started.set()
+            return None
+
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None,
+                    None, None, None, None, None),
+            {"enabled": True},
+        )
+        plugin.context = _IngressContext()
+        plugin._runtime = ControlledRuntime()
+        plugin._v2_installation = object()
+        plugin.runtime_health = RuntimeHealth("limited")
+        envelope = await module.build_astrbot_ingress(event, plugin.context)
+        receipt = IngressReceipt("accepted", "original-operation")
+        self_limit = []
+        with patch.object(module, "installed_first_ingress_c02_pairing_ready_v1",
+                          new=AsyncMock(return_value=True)), \
+                patch.object(module, "original_unacquired_handoff_v1",
+                             return_value=(event.unified_msg_origin, envelope, receipt)), \
+                patch.object(module, "run_installed_first_ingress_c02_v1", new=driver):
+            await plugin._restore_unacquired_first_ingress_c02_v1()
+            await asyncio.wait_for(started.wait(), 1)
+            await asyncio.sleep(0)
+        self.assertEqual(self_limit, [8])
+        self.assertEqual(calls, ["original-operation"])
+        self.assertEqual(plugin._encoding_tasks, set())
+        self.assertEqual(event.sent, [])
+
     async def test_limited_installed_v2_ingress_never_claims_receipt_as_reply(self) -> None:
         module = load_plugin_module()
 

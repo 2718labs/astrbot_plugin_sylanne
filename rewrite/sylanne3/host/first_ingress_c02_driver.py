@@ -9,6 +9,7 @@ from astrbot.api.star import Context
 
 from ..model_broker.broker import ModelProviderDescriptor
 from ..runtime_context import RuntimeContext
+from ..runtime.first_ingress_unacquired import FirstIngressUnacquiredItemV1
 from ..runtime_contracts import CommitReceipt, InstallationGrantV2
 from .astrbot_model_call import AstrBotModelProvider
 from .authority_client import AuthorityClient, AuthoritySelection
@@ -20,6 +21,55 @@ from .ingress import HostIngressEnvelope, IngressReceipt
 from .model_egress_executor import HostModelEgressExecutor
 from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 from .v2_installation import V2InstallationAssembly
+
+
+def original_unacquired_handoff_v1(
+    item: FirstIngressUnacquiredItemV1,
+    installation: V2InstallationAssembly,
+) -> tuple[str, HostIngressEnvelope, IngressReceipt] | None:
+    """Rehydrate only graph-attested original identity; issue no authority."""
+    if (type(item) is not FirstIngressUnacquiredItemV1
+            or type(installation) is not V2InstallationAssembly
+            or item.installation_id != installation.installation_grant.installation_id
+            or item.namespace != installation.installation_policy.namespace):
+        return None
+    try:
+        conversation = json.loads(item.envelope.conversation_ref)
+    except (TypeError, ValueError):
+        return None
+    if (type(conversation) is not list or len(conversation) != 2
+            or type(conversation[0]) is not str or not conversation[0]
+            or type(conversation[1]) is not str or not conversation[1]):
+        return None
+    return (conversation[0], item.envelope,
+            IngressReceipt("accepted", item.original_operation_id))
+
+
+async def installed_first_ingress_c02_pairing_ready_v1(
+    installation: V2InstallationAssembly,
+) -> bool:
+    """Check the current installed pairing before startup recovery discovery."""
+    if (type(installation) is not V2InstallationAssembly
+            or type(installation.admin_bundle) is not AdminInstallationBundle
+            or type(installation.installation_grant) is not InstallationGrantV2
+            or type(installation.admin_bundle.tls_profile) is not AuthorityTlsProfile
+            or installation.admin_bundle.installation_policy
+               is not installation.installation_policy):
+        return False
+    profile = installation.admin_bundle.tls_profile
+    transport = MtlsAuthorityTransport({profile.profile_id: profile})
+    try:
+        client = AuthorityClient(
+            AuthoritySelection(profile.profile_id),
+            package_root=installation.package_root,
+            data_dir=installation.data_dir, transport=transport,
+        )
+        return (await client.status_v2()).state == "paired" and (
+            await client.installation_grant_v2()) == installation.installation_grant
+    except Exception:
+        return False
+    finally:
+        await transport.close()
 
 
 async def run_installed_first_ingress_c02_v1(
@@ -96,4 +146,8 @@ async def run_installed_first_ingress_c02_v1(
         await transport.close()
 
 
-__all__ = ("run_installed_first_ingress_c02_v1",)
+__all__ = (
+    "run_installed_first_ingress_c02_v1",
+    "original_unacquired_handoff_v1",
+    "installed_first_ingress_c02_pairing_ready_v1",
+)

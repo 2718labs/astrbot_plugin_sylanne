@@ -12,12 +12,21 @@ from sylanne3.host.authority_client import AuthorityClient
 from sylanne3.host.authority_profile import (
     AdminD06FirstIngressC02Policy, AdminIngressClockPolicy,
 )
-from sylanne3.host.first_ingress_c02_driver import run_installed_first_ingress_c02_v1
+from sylanne3.host.first_ingress_c02_driver import (
+    installed_first_ingress_c02_pairing_ready_v1,
+    original_unacquired_handoff_v1,
+    run_installed_first_ingress_c02_v1,
+)
+from sylanne3.host.d06_ingress import ingress_content_fingerprint
 from sylanne3.host.ingress import HostIngressEnvelope, IngressReceipt, SourceLineage
 from sylanne3.host.model_egress_executor import HostModelEgressExecutor
 from sylanne3.host.mtls_transport import AuthorityTlsProfile
 from sylanne3.host.v2_installation import V2InstallationAssembly
 from sylanne3.runtime_context import RuntimeContext
+from sylanne3.runtime.first_ingress_unacquired import (
+    FirstIngressUnacquiredItemV1, FirstIngressUnacquiredPageV1,
+)
+from sylanne3.runtime.first_ingress_v2 import ingress_ids
 from sylanne3.runtime_contracts import CommitReceipt
 
 
@@ -99,6 +108,39 @@ async def test_explicit_c02_driver_uses_paired_bundle_and_holds_without_it(
         assert calls == [(envelope, receipt)]
         pairing["state"] = "unpaired"
         assert await run(installation) is None
+        assert calls == [(envelope, receipt)] and host.requests == []
+
+        # Startup discovery is read-only and remains HOLD until the graph
+        # supplies a verified, original queued-job page.
+        pairing["state"] = "paired"
+        assert await installed_first_ingress_c02_pairing_ready_v1(installation)
+        original_op, job_id = ingress_ids(envelope.lineage.source_ref)[2:4]
+        item = FirstIngressUnacquiredItemV1(
+            envelope.namespace, grant.installation_id, job_id, original_op,
+            envelope, ingress_content_fingerprint(envelope), "b" * 64,
+        )
+        page = FirstIngressUnacquiredPageV1(
+            envelope.namespace, grant.installation_id, "incarnation", 1, 1,
+            (item,), None,
+        )
+
+        class Worker:
+            async def call(self, operation):
+                return operation(graph)
+
+        graph = SimpleNamespace()
+        runtime._worker = Worker()
+        runtime._v2_bootstrap = object()
+        runtime._v2_namespace_provisioned = True
+        runtime._v2_policy = bundle.installation_policy
+        runtime._v2_namespace = envelope.namespace
+        runtime._v2_installation_grant = grant
+        assert await runtime.discover_first_ingress_unacquired_v1() is None
+        graph.discover_first_ingress_unacquired_v1 = (
+            lambda bootstrap, namespace, *, limit: page)
+        assert await runtime.discover_first_ingress_unacquired_v1() == page
+        assert original_unacquired_handoff_v1(item, installation) == (
+            model_fixture.UMO, envelope, IngressReceipt("accepted", original_op))
         assert calls == [(envelope, receipt)] and host.requests == []
     finally:
         await host.asyncTearDown()

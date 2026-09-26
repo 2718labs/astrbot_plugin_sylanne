@@ -56,6 +56,7 @@ from .model_broker.first_ingress_encoding import (
 )
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.first_ingress_v2 import ingress_ids
+from .runtime.first_ingress_unacquired import FirstIngressUnacquiredPageV1
 from .runtime.original_model_result_context import OriginalModelResultContextV1
 from .runtime.restore_anchor import ExecutionJournalPort
 from .runtime_contracts import (
@@ -1265,6 +1266,37 @@ class RuntimeContext:
             )) is True
         except Exception:
             return False
+
+    async def discover_first_ingress_unacquired_v1(
+        self, *, limit: int = 8,
+    ) -> FirstIngressUnacquiredPageV1 | None:
+        """Read one installed startup page; absence of the graph API is HOLD.
+
+        The graph owns content-fence, D06 access, stage, and queued-job checks.
+        This wrapper never reads private tables or upgrades a hint to a permit.
+        """
+        if (type(limit) is not int or not 1 <= limit <= 8
+                or self._worker is None or self._v2_bootstrap is None
+                or not self._v2_namespace_provisioned
+                or type(self._v2_policy) is not AdminInstallationPolicy
+                or self._v2_installation_grant is None
+                or self._v2_policy.namespace != self._v2_namespace):
+            return None
+        namespace = self._v2_namespace
+        bootstrap = self._v2_bootstrap
+        try:
+            page = await self._worker.call(
+                lambda graph: graph.discover_first_ingress_unacquired_v1(
+                    bootstrap, namespace, limit=limit))
+        except Exception:
+            return None
+        if (type(page) is not FirstIngressUnacquiredPageV1
+                or page.namespace != namespace
+                or page.installation_id
+                   != self._v2_installation_grant.installation_id
+                or len(page.items) > limit):
+            return None
+        return page
 
     async def run_committed_first_ingress_encoding_v2(
         self, envelope: HostIngressEnvelope, receipt: IngressReceipt, *,
