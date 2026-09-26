@@ -27,6 +27,7 @@ from .dispatch_current_commitments import (
 from .dispatch_current_projection import (
     CurrentDispatchProjectionV1, read_current_dispatch_projection,
 )
+from .dispatch_source_correction_barrier import read_source_correction_barrier
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,13 @@ def read_current_admission_facts(
     batch_spec = next(spec for spec in D09ExpressionProvider.register_types()
                       if spec.name == "d09.verified_segment_batch.v1")
     intent = action_spec.validator(rows["d08.action_intent.v1"])
+    correction_barrier = read_source_correction_barrier(
+        db, namespace, query, intent.source_refs,
+        dependent_ref=f"staged-action:{intent.action_id}",
+    )
+    if not correction_barrier.clear:
+        raise ValueError("staged action source correction HOLD: "
+                         + ", ".join(correction_barrier.missing_sources))
     batch = rows["d09.verified_segment_batch.v1"]
     batch_spec.validator(batch)
     if batch["valid_until"] < now_utc:

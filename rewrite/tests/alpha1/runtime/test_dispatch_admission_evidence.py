@@ -28,6 +28,7 @@ from sylanne3.runtime_contracts import (
 
 from test_dispatch_admission_preflight import _candidates
 from test_dispatch_source_qualification import _case as _source_case
+from test_dispatch_source_correction_barrier import _insert_head
 
 
 def _case():
@@ -196,13 +197,27 @@ def test_changed_graph_source_is_rejected_even_at_same_revision():
         db.close()
 
 
+def test_staged_action_with_corrected_source_holds_before_admission_facts():
+    db, bundle, snapshot, candidate = _case()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        _reserve(db, bundle)
+        _insert_head(db, bundle.envelope.authority.namespace, "child")
+        with pytest.raises(ValueError, match="staged action source correction HOLD"):
+            read_current_admission_facts(
+                db, bundle, snapshot, candidate, now_utc=2.0,
+            )
+    finally:
+        db.close()
+
+
 def test_receipt_hook_cannot_reuse_prewrite_snapshot_after_epoch_advances():
     db, bundle, snapshot, candidate = _case()
     try:
         db.execute("BEGIN IMMEDIATE")
         _reserve(db, bundle)
         db.execute("UPDATE graph_epochs SET revision=8")
-        with pytest.raises(ValueError, match="projection graph epoch changed"):
+        with pytest.raises(ValueError, match="graph epoch changed"):
             read_current_admission_facts(
                 db, bundle, snapshot, candidate, now_utc=2.0,
             )
