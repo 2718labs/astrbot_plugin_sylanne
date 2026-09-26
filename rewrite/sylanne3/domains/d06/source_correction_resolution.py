@@ -205,9 +205,8 @@ def compile_resolved_source_correction_head_v1(
         return SourceCorrectionResolutionHoldV1("reevaluation_identity_changed")
     if cost is None or type(cost) is not ActualCorrectionCostV1:
         return SourceCorrectionResolutionHoldV1("actual_d02_cost_missing")
-    if (cost.correction_operation_id != pending_head["operation_id"]
-            or now >= cost.quote_deadline_utc):
-        return SourceCorrectionResolutionHoldV1("original_quote_expired_or_changed")
+    if cost.correction_operation_id != pending_head["operation_id"]:
+        return SourceCorrectionResolutionHoldV1("original_quote_identity_changed")
     if d11 is None or type(d11) is not CorrectionJobOutboxSettlementV1:
         return SourceCorrectionResolutionHoldV1("d11_settlement_missing")
     if d11.correction_operation_id != pending_head["operation_id"]:

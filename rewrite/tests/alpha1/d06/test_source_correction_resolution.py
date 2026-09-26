@@ -122,9 +122,8 @@ def test_candidate_validator_rejects_tampered_next_value_or_stale_head_version()
     ({"reevaluations": ()}, "reevaluation_receipts_incomplete"),
     ({"cost": None}, "actual_d02_cost_missing"),
     ({"d11": None}, "d11_settlement_missing"),
-    ({"now_utc": 10.0}, "original_quote_expired_or_changed"),
 ])
-def test_missing_receipt_or_expired_original_quote_holds(change, reason):
+def test_missing_receipt_holds(change, reason):
     args = _case() | change
     result = compile_resolved_source_correction_head_v1(**args)
     assert type(result) is SourceCorrectionResolutionHoldV1
@@ -152,13 +151,33 @@ def test_stale_source_access_and_cross_operation_receipts_hold():
         **args).reason == "d11_settlement_identity_changed"
 
 
-def test_no_implicit_zero_cost_or_deadline_extension():
+def test_settled_cost_can_compile_after_original_quote_deadline():
+    args = _case()
+    args["now_utc"] = args["cost"].quote_deadline_utc + 1.0
+    candidate = compile_resolved_source_correction_head_v1(**args)
+    assert type(candidate) is ResolvedSourceCorrectionHeadCandidateV1
+    assert candidate.cost.quote_id == "original-quote-1"
+    assert candidate.cost.quote_version == 1
+    assert candidate.next_value["resolved_at_utc"] == args["now_utc"]
+    assert candidate.status == "requires_w01_atomic_receipt_verification"
+    validate_resolved_source_correction_head_candidate_v1(
+        candidate, pending_head=args["pending_head"], pending_revision=1)
+    args["cost"] = None
+    assert compile_resolved_source_correction_head_v1(
+        **args).reason == "actual_d02_cost_missing"
+    args = _case()
+    args["now_utc"] = args["cost"].quote_deadline_utc + 1.0
+    args["d11"] = None
+    assert compile_resolved_source_correction_head_v1(
+        **args).reason == "d11_settlement_missing"
+
+
+def test_no_implicit_zero_cost_or_quote_identity_change():
     args = _case()
     with pytest.raises(ValueError, match="actual D02 settlement"):
         replace(args["cost"], actual_amounts=())
     with pytest.raises(ValueError, match="SHA-256"):
         replace(args["cost"], receipt_digest="unverified")
-    expired = replace(args["cost"], quote_deadline_utc=7.0)
-    args["cost"] = expired
+    args["cost"] = replace(args["cost"], correction_operation_id="other-correction")
     assert compile_resolved_source_correction_head_v1(
-        **args).reason == "original_quote_expired_or_changed"
+        **args).reason == "original_quote_identity_changed"
