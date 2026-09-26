@@ -72,6 +72,7 @@ from .current_worker_model_result_graph_verifier import (
     PinnedCurrentWorkerModelResultGraphVerifier,
 )
 from .v2_execution_bridge import AuthorityV2ExecutionBridge
+from .reverse_handoff import ReverseGraphClaimClient
 from .v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
@@ -246,6 +247,7 @@ class AuthorityRpcServer:
         self_identity_readers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_final_handoff_authorizers: Mapping[str, Callable] | None = None,
         v2_final_handoff_issuers: Mapping[str, str] | None = None,
+        v2_final_handoff_reverse: Mapping[str, ReverseGraphClaimClient] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
         clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
@@ -308,6 +310,15 @@ class AuthorityRpcServer:
         self._v2_owner_pairings = v2_owner_pairings
         handoff_authorizers = dict(v2_final_handoff_authorizers or {})
         handoff_issuers = dict(v2_final_handoff_issuers or {})
+        reverse_handoffs = dict(v2_final_handoff_reverse or {})
+        if (set(reverse_handoffs) & set(handoff_authorizers)
+                or any(type(namespace) is not str or namespace not in services
+                       or type(client) is not ReverseGraphClaimClient
+                       or client.profile.namespace != namespace
+                       for namespace, client in reverse_handoffs.items())):
+            raise TypeError("reverse handoff must be administrator-installed per namespace")
+        handoff_authorizers.update({namespace: client.claim
+                                    for namespace, client in reverse_handoffs.items()})
         if any(namespace not in services or not callable(callback)
                for namespace, callback in handoff_authorizers.items()):
             raise TypeError("v2 final handoff authorizers must be installed per namespace")
@@ -351,6 +362,15 @@ class AuthorityRpcServer:
             namespace_to_role[namespace] = role
             role_to_namespace[role] = namespace
         self._namespace_bindings_v2 = bindings
+        if any(not any(
+                (peer, profile) in installed
+                and profile == client.profile.profile_id
+                and installed[(peer, profile)].installation_id ==
+                    client.profile.installation_id
+                and bound_namespace == namespace
+                for (peer, profile, _role), bound_namespace in bindings.items())
+               for namespace, client in reverse_handoffs.items()):
+            raise TypeError("reverse handoff installation or namespace is not bound")
         self_identity_services = dict(v2_self_identity or {})
         self_identity_readers = dict(self_identity_readers_v2 or {})
         if (set(self_identity_services) != set(self_identity_readers)
