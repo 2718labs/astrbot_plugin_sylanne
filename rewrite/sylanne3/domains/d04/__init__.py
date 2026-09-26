@@ -26,6 +26,13 @@ from .affect import (
     UnresolvedMechanism,
 )
 from .encoding_baseline import CommittedRef, EncodingBaseline
+from .numeric_coupling import (
+    NumericCoupling,
+    build_numeric_coupling_write,
+    coupling_id,
+    requires_joint_numeric_compiler,
+    validate_numeric_coupling,
+)
 from .recollection_read import (
     RecollectionExperienceSnapshotCandidate,
     RecollectionSnapshotUnavailable,
@@ -78,6 +85,11 @@ __all__ = (
     "UnresolvedMechanism",
     "CommittedRef",
     "EncodingBaseline",
+    "NumericCoupling",
+    "build_numeric_coupling_write",
+    "coupling_id",
+    "requires_joint_numeric_compiler",
+    "validate_numeric_coupling",
     "RecollectionExperienceSnapshotCandidate",
     "RecollectionSnapshotUnavailable",
     "inspect_recollection_experience_snapshot",

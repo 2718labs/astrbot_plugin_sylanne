@@ -6,7 +6,7 @@ database, retrieve memories, choose actions, or certify a numerical solve.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import math
 
 from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeSpec
@@ -20,6 +20,9 @@ from ...runtime_contracts import (
     schema_hash,
 )
 from .encoding_baseline import CommittedRef, EncodingBaseline, decode_encoding_baseline
+from .numeric_coupling import (
+    NumericCoupling, numeric_coupling_type_spec, validate_numeric_coupling,
+)
 from .root import root_type_specs
 
 
@@ -731,6 +734,7 @@ class AffectProvider:
             "d04.authored_root_candidate.v1",
             "d04.root_numeric_checkpoint_candidate.v1",
             "d04.numeric_checkpoint.v1",
+            "d04.numeric_coupling.v1",
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
@@ -755,7 +759,7 @@ class AffectProvider:
                 schema_hash=schema_hash({"type": name, "version": 1, "writer_domain": "d04"}),
             )
             for name, owner_kinds, storage_role, validator in definitions
-        ) + root_type_specs()
+        ) + root_type_specs() + (numeric_coupling_type_spec(),)
 
     def compile_scheme(self, draft: AffectScheme, snapshot: object = None) -> AffectScheme:
         if not isinstance(draft, AffectScheme):
@@ -1441,6 +1445,12 @@ class AffectProvider:
             if write.key.owner.kind not in spec.owner_kinds:
                 raise ValueError("D04 graph write uses an unsupported owner kind")
             decoded = spec.validator(write.value)
+            if isinstance(decoded, NumericCoupling):
+                if (write.key.name != decoded.edge_id
+                        or write.key.owner != AtomKey.from_token(decoded.left_ref).owner):
+                    raise ValueError("numeric coupling graph key differs from canonical edge identity")
+                if decoded.source_ref not in proposal.envelope.source_qualification.source_refs:
+                    raise ValueError("numeric coupling source lacks command qualification")
             if isinstance(decoded, RecollectionExperience) and (
                 write.key.name != decoded.experience_id
                 or write.key.owner.subject != decoded.activity_id
@@ -1499,6 +1509,8 @@ class AffectProvider:
                 raise ValueError("proposal guard versions differ from the active D04 scheme")
             registered_axes = {axis.axis_id for axis in scheme.axes}
             for decoded in decoded_writes:
+                if isinstance(decoded, NumericCoupling):
+                    validate_numeric_coupling(asdict(decoded), scheme)
                 if isinstance(decoded, (FeelingState, MoodField)):
                     if (
                         decoded.basis_version != scheme.scheme_version
