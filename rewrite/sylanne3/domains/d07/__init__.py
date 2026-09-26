@@ -16,7 +16,9 @@ import json
 import math
 
 from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeSpec
-from ...memory_types import SourceRecord, access_key, source_key, validate_access
+from ...memory_types import (
+    InterpretationRecord, SourceRecord, access_key, source_key, validate_access,
+)
 from ...runtime_contracts import (
     CommandEnvelope,
     DependencySet,
@@ -936,6 +938,119 @@ class D07DomainProvider:
             contribution_keys=contribution_keys,
             required_bundle_parts=required_bundle_parts,
         )
+
+    def source_correction_belief_proposal(
+        self,
+        envelope: CommandEnvelope,
+        snapshot: GraphSnapshot,
+        *,
+        belief_refs: tuple[str, ...],
+        correction_source_ref: str,
+        source_refs: tuple[str, ...],
+        target_refs: tuple[str, ...],
+    ) -> DomainProposal:
+        """Compile guarded belief retractions for D06's atomic correction bundle.
+
+        The correction source is a revision-zero key that D06 must write in
+        the same bundle. Each old belief key is updated in place, preserving
+        its proposition as history and making its current state false.
+        """
+        if not isinstance(envelope, CommandEnvelope) or not isinstance(snapshot, GraphSnapshot):
+            raise TypeError("correction needs an envelope and graph snapshot")
+        belief_refs = _names(belief_refs, "belief_refs", allow_empty=False)
+        source_refs = _names(source_refs, "source_refs", allow_empty=False)
+        target_refs = _names(target_refs, "target_refs", allow_empty=False)
+        correction = AtomKey.from_token(correction_source_ref)
+        sources = tuple(AtomKey.from_token(ref) for ref in source_refs)
+        targets = tuple(AtomKey.from_token(ref) for ref in target_refs)
+        beliefs = tuple(AtomKey.from_token(ref) for ref in belief_refs)
+        namespace = envelope.authority.namespace
+        accesses = tuple(access_key(namespace.bot_id, namespace.persona_id,
+                                    key.owner.subject) for key in sources)
+        keys = (*sources, *accesses, *targets, *beliefs, correction)
+        if len(set(keys)) != len(keys):
+            raise ValueError("correction closure repeats graph keys")
+        if any(key.owner.bot != namespace.bot_id or key.owner.persona != namespace.persona_id
+               for key in keys):
+            raise ValueError("correction crosses the envelope namespace")
+        if (correction.type_name != "memory.source" or correction.name != "record"
+                or correction.owner.kind != "event"
+                or any(key.type_name != "memory.source" or key.name != "record"
+                       or key.owner.kind != "event" for key in sources)
+                or any(key.type_name != "memory.interpretation" or key.name != "current"
+                       or key.owner.kind != "event" for key in targets)
+                or any(key.type_name != "d07.belief_revision.v1"
+                       or key.owner.kind != "persona" for key in beliefs)):
+            raise ValueError("correction refs have unexpected graph types")
+        guarded = {ref.key: ref for ref in envelope.version_guard.read_versions}
+        if (len(guarded) != len(envelope.version_guard.read_versions)
+                or guarded.get(correction) != GraphVersion(correction, 0)
+                or snapshot.get(correction) is not None):
+            raise ValueError("correction needs an absent, guarded new source")
+        for key in (*sources, *accesses, *targets, *beliefs):
+            atom = snapshot.get(key)
+            if (atom is None or not atom.valid or atom.revision < 1
+                    or guarded.get(key) != GraphVersion(key, atom.revision)):
+                raise ValueError("correction needs current guarded graph reads")
+        if (not set((*source_refs, *target_refs, *belief_refs)).issubset(envelope.input_refs)
+                or correction_source_ref not in envelope.input_refs):
+            raise ValueError("correction refs must be bound to envelope inputs")
+        if any(key.owner.kind not in envelope.authority.owner_scope for key in keys):
+            raise ValueError("correction refs exceed authority owner scope")
+        if not set(source_refs).issubset(envelope.source_qualification.source_refs):
+            raise ValueError("correction basis lacks source qualification")
+        source_ids = set()
+        for source, access in zip(sources, accesses):
+            record = SourceRecord.from_dict(snapshot.get(source).value)
+            access_value = snapshot.get(access).value
+            validate_access(access_value)
+            if (record.source_id != source.owner.subject
+                    or access_value["source_id"] != record.source_id
+                    or access_value["status"] != "active"
+                    or envelope.authority.purpose not in record.purposes
+                    or envelope.authority.purpose not in access_value["purposes"]
+                    or not set(envelope.authority.audience).issubset(record.audiences)
+                    or not set(envelope.authority.audience).issubset(access_value["audiences"])):
+                raise ValueError("correction basis lacks current source access")
+            source_ids.add(record.source_id)
+        for target in targets:
+            record = InterpretationRecord.from_dict(snapshot.get(target).value)
+            if (record.interpretation_id != target.owner.subject
+                    or record.status == "retracted"
+                    or not source_ids.intersection(record.source_ids)):
+                raise ValueError("correction target is not a current dependent interpretation")
+
+        writes = []
+        validator = next(spec for spec in self.type_specs()
+                         if spec.name == "d07.belief_revision.v1").validator
+        for key in beliefs:
+            old = snapshot.get(key).value
+            validator(old)
+            if (old["belief_id"] != key.name or not old["current"]
+                    or not set(old["source_refs"]).intersection((*source_refs, *target_refs))):
+                raise ValueError("belief is not a current dependent correction target")
+            edges = (*targets, correction)
+            revised = {
+                **old, "current": False,
+                "invalidation_refs": [correction_source_ref, *target_refs],
+                "invalidation_kind": "correction",
+            }
+            validator(revised)
+            writes.append(GraphWrite(key, revised, edges))
+        current_edges = tuple(dict.fromkeys(
+            dependency for write in writes for dependency in write.dependencies
+        ))
+        proposal = DomainProposal(
+            domain="d07", proposal_schema="d07.proposal.v1",
+            proposal_schema_hash=self.descriptor.request_schema_hash,
+            envelope=envelope, typed_writes=tuple(writes),
+            dependencies=DependencySet(
+                current_invalidation=tuple(guarded[key] for key in current_edges),
+                historical_provenance=tuple(guarded[key] for key in (*sources, *accesses)),
+            ),
+            contribution_keys=(), required_bundle_parts=(),
+        )
+        return self.validate(proposal, snapshot)
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):
