@@ -7077,6 +7077,133 @@ class GraphCoordinator:
 
         return self._read_v2(authority, reader)
 
+    def read_first_ingress_acquired_handoff_v1(
+        self, bootstrap: object, namespace: NamespaceId,
+        acquire_operation_id: str,
+    ):
+        """Rehydrate one live original V3 ingress under the current read fence.
+
+        Discovery supplies only an operation key. This read requalifies the
+        acquired job and the original C01 content; it grants no model send.
+        """
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .host.d06_ingress import ingress_content_fingerprint
+        from .host.ingress import HostIngressEnvelope, SourceLineage
+        from .memory_types import SourceRecord, source_key
+        from .runtime.encoding_call_binding import load_binding
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .runtime.ingress_observation import read_committed_ingress_identity
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId
+                or type(acquire_operation_id) is not str
+                or not 1 <= len(acquire_operation_id) <= 128
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__d02_issuer is None
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("installed acquired ingress handoff required")
+        try:
+            now = trusted_upper(self.__content_fence_v2.read_ingress_clock(
+                self.__scene_clock_policy))
+        except Exception as exc:
+            raise UnavailableGuard("acquired ingress clock unavailable; HOLD") from exc
+        with self.__store._lock:
+            metadata, _ = self._v2_graph_stamp(namespace)
+        authority = AuthorityContext(
+            self.__holder, "d11", "acquired-handoff", namespace,
+            ("activity",), "context", ("internal",),
+            "acquired-handoff-v1",
+            metadata.requirements.activation_generation)
+
+        def reader():
+            db = self.__store._db
+            current, epoch = self._v2_graph_stamp(namespace)
+            target = current.requirements
+            provision_row = self._provision_row(db, namespace)
+            if provision_row is None:
+                raise UnavailableGuard("acquired ingress installation absent; HOLD")
+            provision = self._decode_provision_receipt(provision_row)
+            installed = self.__content_fence_v2.installation_grant
+            if (target.namespace != namespace
+                    or provision.installation_id != installed.installation_id
+                    or provision.authority_id != installed.authority_id
+                    or provision.authority_namespace != target.authority_namespace
+                    or provision.generation != target.activation_generation):
+                raise UnavailableGuard("acquired ingress installation differs; HOLD")
+            row = db.execute(
+                "SELECT i.acquire_operation_id,i.job_id,i.original_operation_id,"
+                "i.actor,i.encoding_binding_json,i.requirements_json,"
+                "i.graph_revision,i.graph_epoch,i.request_digest,"
+                "r.request_digest,r.job_json "
+                "FROM graph_job_acquire_intents_v2 AS i "
+                "JOIN graph_job_acquire_receipts_v2 AS r "
+                "ON r.bot=i.bot AND r.persona=i.persona "
+                "AND r.acquire_operation_id=i.acquire_operation_id "
+                "WHERE i.bot=? AND i.persona=? AND i.acquire_operation_id=? "
+                "AND json_extract(json_extract(i.encoding_binding_json,"
+                "'$.request_json'),'$.schema')=?",
+                namespace.as_tuple + (acquire_operation_id,
+                    "sylanne.first-ingress-encoding-call.v3"),
+            ).fetchone()
+            if row is None or self._first_ingress_recovery_ineligible_locked_v1(
+                    namespace, epoch, row):
+                raise UnavailableGuard("original acquired ingress absent; HOLD")
+            item = self._first_ingress_recovery_item_locked_v1(
+                namespace, provision.installation_id, current, epoch, now, row)
+            if item.recovery_state != "original_fence":
+                raise UnavailableGuard("original acquired ingress is not live; HOLD")
+            binding = load_binding(db, namespace, item.job_id)
+            if binding is None:
+                raise UnavailableGuard("original acquired binding absent; HOLD")
+            receipt = read_committed_ingress_identity(
+                db, namespace, binding.source_id)
+            intent = db.execute(
+                "SELECT identity_json,requirements_json FROM "
+                "graph_first_ingress_intents_v2 WHERE bot=? AND persona=? "
+                "AND operation_id=?",
+                namespace.as_tuple + (item.original_operation_id,),
+            ).fetchone()
+            bundle = db.execute(
+                "SELECT digest,receipt_json FROM graph_bundle_operations "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (item.original_operation_id,),
+            ).fetchone()
+            if (receipt is None or intent is None or bundle is None
+                    or bundle[0] != receipt.bundle_digest
+                    or json.loads(intent[1]).get("graph_incarnation")
+                       != target.graph_incarnation
+                    or json.loads(intent[0]).get("source_ref")
+                       != binding.source_id):
+                raise UnavailableGuard("original acquired C01 receipt differs; HOLD")
+            identity = json.loads(receipt.identity_json)
+            source_row = db.execute(
+                "SELECT value FROM graph_atoms WHERE token=? AND revision=? "
+                "AND valid=1",
+                (source_key(*namespace.as_tuple, binding.source_id).token,
+                 binding.source_revision),
+            ).fetchone()
+            if source_row is None:
+                raise UnavailableGuard("original acquired source absent; HOLD")
+            source = SourceRecord.from_dict(json.loads(source_row[0]))
+            if (source.source_id != binding.source_id
+                    or source.speaker_id != identity["sender_ref"]
+                    or source.source_kind != "reported"
+                    or identity["conversation_ref"] not in source.audiences):
+                raise UnavailableGuard("original acquired source differs; HOLD")
+            envelope = HostIngressEnvelope(
+                namespace, identity["platform_ref"],
+                identity["conversation_ref"], identity["sender_ref"],
+                identity["message_id"], source.text, source.occurred_at,
+                source.recorded_at, identity["visibility"],
+                SourceLineage(**identity["lineage"]),
+            )
+            if ingress_content_fingerprint(envelope) != receipt.content_fingerprint:
+                raise UnavailableGuard("original acquired content differs; HOLD")
+            return item, envelope
+
+        return self._read_v2(authority, reader)
+
     @staticmethod
     def _parse_first_ingress_recovery_cursor_v1(cursor):
         if cursor is None:

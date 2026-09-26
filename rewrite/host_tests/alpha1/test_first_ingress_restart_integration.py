@@ -187,5 +187,28 @@ async def test_sqlite_restart_rehands_only_original_queued_ingress(host_projecti
         assert reopened._db.execute(
             "SELECT COUNT(*) FROM runtime_jobs"
         ).fetchone() == (1,)
+
+        reopened.close()
+        reopened = ProductionGraphStore(graph_path, registry)
+        port.store = reopened
+        acquired_bootstrap = object()
+        acquired_graph = GraphCoordinator(
+            reopened, acquired_bootstrap, holder="administrator",
+            content_fence_v2=port, d02_issuer=d02, d11_issuer=d11,
+        )
+        for domain, (provider, schema, schema_hash) in (
+                graph._GraphCoordinator__providers.items()):
+            acquired_graph.register_provider(
+                acquired_bootstrap, domain, provider, schema, schema_hash)
+        acquired_graph._GraphCoordinator__scene_clock_policy = clock
+        acquired = acquired_graph.discover_first_ingress_recovery_v1(
+            acquired_bootstrap, namespace).items
+        assert len(acquired) == 1
+        assert acquired[0].recovery_state == "original_fence"
+        recovered, original_envelope = (
+            acquired_graph.read_first_ingress_acquired_handoff_v1(
+                acquired_bootstrap, namespace, acquire_id))
+        assert recovered == acquired[0]
+        assert original_envelope == envelope
     finally:
         reopened.close()

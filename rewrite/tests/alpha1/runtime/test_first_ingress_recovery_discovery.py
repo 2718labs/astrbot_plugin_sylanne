@@ -101,6 +101,26 @@ def test_recovery_discovers_original_identity_and_c02_receipt(c02_case):
     assert completed.original_worker_fence == item.original_worker_fence
 
 
+def test_acquired_handoff_reads_original_content_only_while_live(c02_case):
+    store, coordinator, bootstrap, namespace, _, _, _, read, _ = c02_case
+    item = coordinator.discover_first_ingress_recovery_v1(
+        bootstrap, namespace).items[0]
+    recovered, envelope = coordinator.read_first_ingress_acquired_handoff_v1(
+        bootstrap, namespace, item.acquire_operation_id)
+    assert recovered == item
+    assert envelope.namespace == namespace
+    assert envelope.lineage.source_ref == load_binding(
+        store._db, namespace, read.request.job_id).source_id
+
+    store._db.execute(
+        "UPDATE graph_atoms SET valid=0 WHERE bot=? AND persona=? "
+        "AND type_name='memory.access'",
+        namespace.as_tuple)
+    with pytest.raises(UnavailableGuard):
+        coordinator.read_first_ingress_acquired_handoff_v1(
+            bootstrap, namespace, item.acquire_operation_id)
+
+
 def test_recovery_two_original_v3_jobs_are_discoverable(c02_case):
     _, coordinator, bootstrap, namespace, _, _, _, _, _ = c02_case
     _, job_id, _ = _add_second_v3_job(c02_case)
