@@ -352,6 +352,7 @@ def test_provider_exposes_frozen_runtime_contract_without_claiming_commit() -> N
     assert provider.descriptor.contract_version == "sylanne.runtime.v1"
     assert provider.register_types() == (
         "d07.concern.v1",
+        "d07.attention_ticket.v1",
         "d07.focus.v1",
         "d07.working_set.v1",
         "d07.belief_revision.v1",
@@ -403,7 +404,7 @@ def test_provider_builds_a_candidate_domain_proposal_only() -> None:
 
 def test_provider_supplies_d11_catalogue_specs_with_writer_and_schema_validation() -> None:
     specs = D07DomainProvider().type_specs()
-    assert len(specs) == 8
+    assert len(specs) == 9
     assert all(isinstance(spec, TypeSpec) for spec in specs)
     assert all(spec.writer_domain == "d07" for spec in specs)
     assert all(spec.schema_hash is not None and len(spec.schema_hash) == 64 for spec in specs)

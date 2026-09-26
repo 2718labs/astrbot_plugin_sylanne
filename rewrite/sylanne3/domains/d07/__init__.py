@@ -9,7 +9,7 @@ actual recollection.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from enum import Enum
 import hashlib
 import json
@@ -180,6 +180,7 @@ class AttentionTicket:
     eligible: bool
     resources_available: bool
     cancel_refs: tuple[str, ...]
+    source_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("ticket_id", "question_key", "causal_root"):
@@ -199,6 +200,7 @@ class AttentionTicket:
         if type(self.eligible) is not bool or type(self.resources_available) is not bool:
             raise TypeError("ticket gates must be bool")
         _names(self.cancel_refs, "cancel_refs")
+        _names(self.source_refs, "source_refs")
 
 
 @dataclass(frozen=True)
@@ -267,6 +269,87 @@ class FocusState:
         if len(self.auxiliary_ticket_refs) > 3:
             raise ValueError("focus may have at most three auxiliary tickets")
         _nonempty(self.switch_reason, "switch_reason")
+
+
+@dataclass(frozen=True)
+class CurrentAttentionTicketReadV1:
+    """Current graph values and revisions; the caller owns snapshot freshness."""
+
+    focus: FocusState
+    ticket: AttentionTicket
+    focus_version: GraphVersion
+    ticket_version: GraphVersion
+    source_versions: tuple[GraphVersion, ...]
+
+
+def attention_ticket_key(namespace, ticket_id: str) -> AtomKey:
+    _nonempty(ticket_id, "ticket_id")
+    return AtomKey(Owner("persona", *namespace.as_tuple),
+                   "d07.attention_ticket.v1", ticket_id)
+
+
+def read_current_focus_attention_ticket(
+    snapshot: GraphSnapshot, namespace, *, now: float,
+) -> CurrentAttentionTicketReadV1 | None:
+    """Resolve the focus's exact current ticket and current source atoms.
+
+    A caller must supply a fresh fenced graph snapshot that includes focus,
+    ticket and every source key. A partial or stale snapshot cannot qualify a
+    reply and must not be substituted with a caller-provided ticket DTO.
+    """
+    from ...runtime_contracts import NamespaceId
+
+    if (type(snapshot) is not GraphSnapshot or type(namespace) is not NamespaceId
+            or type(now) not in (int, float) or not math.isfinite(now)):
+        return None
+    focus_key = AtomKey(Owner("persona", *namespace.as_tuple),
+                        "d07.focus.v1", namespace.persona_id)
+    focus_atom = snapshot.get(focus_key)
+    if focus_atom is None or not focus_atom.valid or focus_atom.revision < 1:
+        return None
+    try:
+        focus_value = focus_atom.value
+        next(spec for spec in D07DomainProvider.type_specs()
+             if spec.name == "d07.focus.v1").validator(focus_value)
+        focus = FocusState(**{
+            **{key: value for key, value in focus_value.items() if key != "schema"},
+            "auxiliary_ticket_refs": tuple(focus_value["auxiliary_ticket_refs"]),
+        })
+        ticket_key = AtomKey.from_token(focus.primary_ticket_ref)
+        if (ticket_key != attention_ticket_key(namespace, ticket_key.name)
+                or focus.persona_id != namespace.persona_id):
+            return None
+        ticket_atom = snapshot.get(ticket_key)
+        if ticket_atom is None or not ticket_atom.valid or ticket_atom.revision < 1:
+            return None
+        value = ticket_atom.value
+        next(spec for spec in D07DomainProvider.type_specs()
+             if spec.name == "d07.attention_ticket.v1").validator(value)
+        ticket = AttentionTicket(**{
+            **{key: item for key, item in value.items() if key != "schema"},
+            "cancel_refs": tuple(value["cancel_refs"]),
+            "source_refs": tuple(value["source_refs"]),
+        })
+        if (ticket.ticket_id != ticket_key.name or ticket.valid_until <= now
+                or not ticket.eligible or not ticket.resources_available
+                or ticket.cancel_refs or not ticket.source_refs
+                or ticket.causal_root not in ticket.source_refs):
+            return None
+        versions = []
+        for ref in ticket.source_refs:
+            key = AtomKey.from_token(ref)
+            if ((key.owner.bot, key.owner.persona) != namespace.as_tuple
+                    or key.type_name != "memory.source"):
+                return None
+            atom = snapshot.get(key)
+            if atom is None or not atom.valid or atom.revision < 1:
+                return None
+            versions.append(GraphVersion(key, atom.revision))
+    except (KeyError, TypeError, ValueError, StopIteration):
+        return None
+    return CurrentAttentionTicketReadV1(
+        focus, ticket, GraphVersion(focus_key, focus_atom.revision),
+        GraphVersion(ticket_key, ticket_atom.revision), tuple(versions))
 
 
 @dataclass(frozen=True)
@@ -551,6 +634,7 @@ class D07DomainProvider:
     def register_types() -> tuple[str, ...]:
         return (
             "d07.concern.v1",
+            "d07.attention_ticket.v1",
             "d07.focus.v1",
             "d07.working_set.v1",
             "d07.belief_revision.v1",
@@ -567,6 +651,8 @@ class D07DomainProvider:
         definitions = (
             ("d07.concern.v1", ("persona",), "state", Concern,
              ("reason_refs", "wake_conditions"), False),
+            ("d07.attention_ticket.v1", ("persona",), "state", AttentionTicket,
+             ("cancel_refs", "source_refs"), True),
             ("d07.focus.v1", ("persona",), "state", FocusState,
              ("auxiliary_ticket_refs",), False),
             ("d07.working_set.v1", ("activity",), "cache", WorkingSet,
@@ -602,6 +688,82 @@ class D07DomainProvider:
             )
             for name, owners, storage_role, value_type, tuple_fields, immutable in definitions
         )
+
+    def attention_focus_proposal(
+        self, envelope: CommandEnvelope, snapshot: GraphSnapshot,
+        ticket: AttentionTicket, focus: FocusState, *, now: float,
+    ) -> DomainProposal:
+        """Write one source-bound ticket and its focus in the same graph event."""
+        if (type(envelope) is not CommandEnvelope
+                or type(snapshot) is not GraphSnapshot
+                or type(ticket) is not AttentionTicket
+                or type(focus) is not FocusState
+                or type(now) not in (int, float) or not math.isfinite(now)):
+            raise TypeError("attention focus needs typed current inputs")
+        namespace = envelope.authority.namespace
+        ticket_key = attention_ticket_key(namespace, ticket.ticket_id)
+        focus_key = AtomKey(Owner("persona", *namespace.as_tuple),
+                            "d07.focus.v1", namespace.persona_id)
+        guarded = {ref.key: ref for ref in envelope.version_guard.read_versions}
+        if (len(guarded) != len(envelope.version_guard.read_versions)
+                or "persona" not in envelope.authority.owner_scope
+                or focus.persona_id != namespace.persona_id
+                or focus.primary_ticket_ref != ticket_key.token
+                or not ticket.source_refs
+                or ticket.causal_root not in ticket.source_refs
+                or ticket.source_refs != envelope.source_qualification.source_refs
+                or ticket.valid_until <= now or not ticket.eligible
+                or not ticket.resources_available or ticket.cancel_refs
+                or (snapshot.get(ticket_key) is not None
+                    and snapshot.get(ticket_key).revision != 0)
+                or guarded.get(ticket_key, GraphVersion(ticket_key, 0))
+                   != GraphVersion(ticket_key, 0)):
+            raise ValueError("attention ticket or focus identity differs")
+        current_focus = snapshot.get(focus_key)
+        expected_focus = current_focus.revision if current_focus is not None else 0
+        if (current_focus is not None and current_focus.revision > 0
+                and not current_focus.valid
+                or guarded.get(focus_key) != GraphVersion(focus_key, expected_focus)):
+            raise ValueError("attention focus needs a guarded current graph head")
+        if current_focus is not None and current_focus.revision > 0:
+            old_focus = current_focus.value
+            next(spec for spec in self.type_specs()
+                 if spec.name == "d07.focus.v1").validator(old_focus)
+            previous_epoch = old_focus["focus_epoch"]
+        else:
+            previous_epoch = 0
+        if focus.focus_epoch != previous_epoch + 1:
+            raise ValueError("attention focus epoch must advance one current graph head")
+        sources = []
+        for ref in ticket.source_refs:
+            key = AtomKey.from_token(ref)
+            atom = snapshot.get(key)
+            if (key.type_name != "memory.source"
+                    or (key.owner.bot, key.owner.persona) != namespace.as_tuple
+                    or atom is None or not atom.valid or atom.revision < 1
+                    or guarded.get(key) != GraphVersion(key, atom.revision)):
+                raise ValueError("attention source needs a guarded current graph head")
+            sources.append(GraphVersion(key, atom.revision))
+        if ticket_key not in guarded:
+            envelope = replace(envelope, version_guard=replace(
+                envelope.version_guard,
+                read_versions=(*envelope.version_guard.read_versions,
+                               GraphVersion(ticket_key, 0))))
+        writes = (
+            GraphWrite(ticket_key, {
+                "schema": "d07.attention_ticket.v1", **asdict(ticket),
+                "cancel_refs": list(ticket.cancel_refs),
+                "source_refs": list(ticket.source_refs),
+            }),
+            GraphWrite(focus_key, {
+                "schema": "d07.focus.v1", **asdict(focus),
+                "auxiliary_ticket_refs": list(focus.auxiliary_ticket_refs),
+            }),
+        )
+        proposal = replace(self.proposal_for(envelope), typed_writes=writes,
+                           dependencies=DependencySet(
+                               historical_provenance=tuple(sources)))
+        return self.validate(proposal, snapshot)
 
     @staticmethod
     def _recollection_dependencies(
@@ -1062,6 +1224,8 @@ class D07DomainProvider:
         specs = {spec.name: spec for spec in self.type_specs()}
         selections = []
         interpretations = []
+        attention_tickets = []
+        focus_writes = []
         for write in proposal.typed_writes:
             spec = specs.get(write.key.type_name)
             if spec is None:
@@ -1083,6 +1247,59 @@ class D07DomainProvider:
                 selections.append(write)
             elif write.key.type_name == "d07.current_interpretation.v1":
                 interpretations.append(write)
+            elif write.key.type_name == "d07.attention_ticket.v1":
+                attention_tickets.append(write)
+            elif write.key.type_name == "d07.focus.v1":
+                focus_writes.append(write)
+        if attention_tickets:
+            if (type(snapshot) is not GraphSnapshot
+                    or len(attention_tickets) != 1 or len(focus_writes) != 1
+                    or len(proposal.typed_writes) != 2):
+                raise ValueError("attention ticket needs one current focus graph write")
+            ticket_write, focus_write = attention_tickets[0], focus_writes[0]
+            namespace = proposal.envelope.authority.namespace
+            ticket = ticket_write.value
+            if (ticket_write.key != attention_ticket_key(namespace, ticket["ticket_id"])
+                    or focus_write.key != AtomKey(
+                        Owner("persona", *namespace.as_tuple),
+                        "d07.focus.v1", namespace.persona_id)
+                    or focus_write.value["primary_ticket_ref"]
+                       != ticket_write.key.token
+                    or ticket["causal_root"] not in ticket["source_refs"]
+                    or tuple(ticket["source_refs"])
+                       != proposal.envelope.source_qualification.source_refs
+                    or (snapshot.get(ticket_write.key) is not None
+                        and snapshot.get(ticket_write.key).revision != 0)):
+                raise ValueError("attention ticket/focus graph identity differs")
+            guarded = {ref.key: ref for ref in proposal.envelope.version_guard.read_versions}
+            if (guarded.get(ticket_write.key) != GraphVersion(ticket_write.key, 0)
+                    or len(guarded) != len(proposal.envelope.version_guard.read_versions)):
+                raise ValueError("attention ticket needs an absent guarded graph key")
+            expected_sources = []
+            for ref in ticket["source_refs"]:
+                key = AtomKey.from_token(ref)
+                atom = snapshot.get(key)
+                if (key.type_name != "memory.source"
+                        or (key.owner.bot, key.owner.persona) != namespace.as_tuple
+                        or atom is None or not atom.valid or atom.revision < 1
+                        or guarded.get(key) != GraphVersion(key, atom.revision)):
+                    raise ValueError("attention ticket source graph read differs")
+                expected_sources.append(GraphVersion(key, atom.revision))
+            focus_atom = snapshot.get(focus_write.key)
+            revision = focus_atom.revision if focus_atom is not None else 0
+            if (focus_atom is not None and focus_atom.revision > 0
+                    and not focus_atom.valid
+                    or guarded.get(focus_write.key)
+                       != GraphVersion(focus_write.key, revision)
+                    or proposal.dependencies.historical_provenance
+                       != tuple(expected_sources)):
+                raise ValueError("attention focus/source graph read differs")
+            prior_epoch = 0
+            if focus_atom is not None and focus_atom.revision > 0:
+                specs["d07.focus.v1"].validator(focus_atom.value)
+                prior_epoch = focus_atom.value["focus_epoch"]
+            if focus_write.value["focus_epoch"] != prior_epoch + 1:
+                raise ValueError("attention focus epoch differs from current graph head")
         if selections:
             if len(selections) != 1:
                 raise ValueError("a recollection proposal must contain exactly one SelectionTicket choice")
