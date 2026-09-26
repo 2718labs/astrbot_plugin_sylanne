@@ -66,7 +66,9 @@ export function workflowForPage(page, values) {
       }];
     }
     case "relations":
-      return [ACTIONS.correctOrEdit, { correction_kind: text(values.correction_kind), statement: text(values.statement), source_refs: commaList(values.source_refs) }];
+      // D12 currently admits only the source_claim correction contract. Keep
+      // relations-page submissions on the same validated path as memory.
+      return workflowForPage("memory", values);
     case "cognition":
       return [ACTIONS.configureOrControl, { object_ref: text(values.object_ref), config_diff: { requested_view: page } }];
     case "action":
