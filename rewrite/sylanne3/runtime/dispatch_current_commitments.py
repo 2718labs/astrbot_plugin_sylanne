@@ -406,8 +406,10 @@ def read_current_d08_action_conflict_evidence(
         raise ValueError("D08 action is absent from the complete current graph read")
     intent = matches[0]
     identity = intent.identity
+    from ..graph_coordinator import namespace_ref
+
     if (p2.operation != "dispatch"
-            or p2.namespace != "/".join(namespace.as_tuple)
+            or p2.namespace != namespace_ref(namespace)
             or p2.operation_id != identity.operation_id
             or p2.effect_id != identity.effect_id):
         raise ValueError("D08 action and claimed dispatch P2 identity differ")

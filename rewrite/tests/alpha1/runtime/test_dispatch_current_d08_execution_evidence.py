@@ -11,6 +11,7 @@ from sylanne3.contracts import canonical_json
 from sylanne3.domains.d08.execution import (
     ActionCancellationState, ActionIntent, GoalPredicate, RequiredCheckSpec,
 )
+from sylanne3.graph_coordinator import namespace_ref
 from sylanne3.graph_types import (
     AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch, Owner,
 )
@@ -58,17 +59,18 @@ def _evidence_case():
         atom.revision, canonical_json(atom.value), 1,
     ))
     snapshot = GraphSnapshot(snapshot.atoms + (atom,), snapshot.epochs)
+    authority_namespace = namespace_ref(namespace)
     anchor = RestoreAnchor(
-        "authority:test", "bot/persona", 1, "deletion:test", 0, "genesis",
+        "authority:test", authority_namespace, 1, "deletion:test", 0, "genesis",
         "execution:test", 2, "sha256:" + "a" * 64, 0, "proof:test",
     )
     p2 = FencePermitV2(
-        "authority:test", "bot/persona", "subject:test", "holder:test", 1,
+        "authority:test", authority_namespace, "subject:test", "holder:test", 1,
         "dispatch", identity.operation_id, "A" * 43, 1, 3, anchor,
         identity.effect_id, "sha256:" + "b" * 64, "sha256:" + "c" * 64,
     )
     effect = CurrentEffectReadV2(
-        "authority:test", "bot/persona", identity.effect_id, 1,
+        "authority:test", authority_namespace, identity.effect_id, 1,
         "unresolved", 2, anchor.execution_digest, 2, "append:one",
         anchor.execution_digest, "mutation:one",
     )
@@ -95,16 +97,17 @@ def _bound_evidence_case():
                      json.loads(json.dumps(asdict(intent))))
     snapshot = GraphSnapshot((atom,), (NamespaceEpoch("bot", "persona", 5),))
     query = QueryEpoch(namespace, "all", 5)
+    authority_namespace = namespace_ref(namespace)
     anchor = RestoreAnchor(
-        "authority:test", "bot/persona", 1, "deletion:test", 0, "genesis",
+        "authority:test", authority_namespace, 1, "deletion:test", 0, "genesis",
         "execution:test", 2, "sha256:" + "a" * 64, 0, "proof:test")
     p2 = FencePermitV2(
-        "authority:test", "bot/persona", "subject:test", "holder:test", 1,
+        "authority:test", authority_namespace, "subject:test", "holder:test", 1,
         "dispatch", intent.identity.operation_id, "A" * 43, 1, 3, anchor,
         intent.identity.effect_id, "sha256:" + "b" * 64,
         "sha256:" + "c" * 64)
     effect = CurrentEffectReadV2(
-        "authority:test", "bot/persona", intent.identity.effect_id, 1,
+        "authority:test", authority_namespace, intent.identity.effect_id, 1,
         "unresolved", 2, anchor.execution_digest, 2, "append:one",
         anchor.execution_digest, "mutation:one")
     return db, namespace, intent, admission, bind, snapshot, query, p2, effect
@@ -326,6 +329,23 @@ def test_exact_effect_and_job_cancellation_remain_partial():
             db, namespace, snapshot, query, "action:one", p2, effect)
         assert cancelled.job_cancellation_state == "cancelled"
         assert "matching_job_cancelled" in cancelled.missing_sources
+    finally:
+        db.close()
+
+
+def test_p2_uses_opaque_authority_namespace_not_business_slash():
+    db, namespace, snapshot, query, p2, effect = _evidence_case()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        current = read_current_d08_action_conflict_evidence(
+            db, namespace, snapshot, query, "action:one", p2, effect)
+        assert p2.namespace == namespace_ref(namespace)
+        assert current.effect_state == "unresolved"
+        legacy_anchor = replace(p2.pinned_anchor, namespace="bot/persona")
+        legacy = replace(p2, namespace="bot/persona", pinned_anchor=legacy_anchor)
+        with pytest.raises(ValueError, match="P2 identity differ"):
+            read_current_d08_action_conflict_evidence(
+                db, namespace, snapshot, query, "action:one", legacy, effect)
     finally:
         db.close()
 
