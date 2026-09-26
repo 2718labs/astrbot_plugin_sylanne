@@ -48,7 +48,13 @@ from .v2_model_egress_contract import (
 from .v2_model_egress_service import AuthorityV2ModelEgressService
 from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
 from .v2_model_egress_wire import from_wire as model_from_wire, to_wire as model_to_wire
-from .v2_terminal_c02_recovery_contract import to_wire as terminal_c02_to_wire
+from .v2_terminal_c02_recovery_contract import (
+    TerminalRecoveryReadRequestV1,
+    from_wire as terminal_c02_from_wire, to_wire as terminal_c02_to_wire,
+)
+from .v2_terminal_c02_recovery_read_service import (
+    AuthorityV2TerminalC02RecoveryReadService, TerminalC02RecoveryDeliveryV1,
+)
 from .v2_model_result_read_contract import ModelResultReadRequestV1
 from .v2_model_result_read_service import AuthorityV2ModelResultReadService
 from .current_model_result_read_graph_verifier import PinnedCurrentModelResultReadGraphVerifier
@@ -70,6 +76,7 @@ from .v2_worker_result_read_fact_contract import (
 from .v2_worker_result_read_fact_service import AuthorityV2WorkerResultReadFactService
 from .current_worker_model_result_graph_verifier import (
     PinnedCurrentWorkerModelResultGraphVerifier,
+    PinnedTerminalRecoveryGraphVerifierV1,
 )
 from .v2_execution_bridge import AuthorityV2ExecutionBridge
 from .reverse_handoff import ReverseGraphClaimClient
@@ -132,9 +139,9 @@ class MtlsPeerCredential:
 @dataclass(slots=True)
 class _DeferredWorkerDelivery:
     payload: dict[str, object]
-    service: AuthorityV2WorkerModelResultReadService
+    service: AuthorityV2WorkerModelResultReadService | AuthorityV2TerminalC02RecoveryReadService
     credential: MtlsPeerCredential
-    delivery: WorkerResultDeliveryV1
+    delivery: WorkerResultDeliveryV1 | TerminalC02RecoveryDeliveryV1
 
     def finish(self) -> None:
         self.service.finish_delivery(
@@ -234,6 +241,8 @@ class AuthorityRpcServer:
         v2_model_result_reads: Mapping[str, AuthorityV2ModelResultReadService] | None = None,
         v2_worker_model_result_reads: Mapping[str, AuthorityV2WorkerModelResultReadService] | None = None,
         worker_result_readers_v2: Mapping[str, tuple[str, str]] | None = None,
+        v2_terminal_c02_recovery_reads: Mapping[str, AuthorityV2TerminalC02RecoveryReadService] | None = None,
+        terminal_c02_recovery_readers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_worker_result_read_facts: Mapping[str, AuthorityV2WorkerResultReadFactService] | None = None,
         worker_result_fact_committers_v2: Mapping[str, tuple[str, str]] | None = None,
         model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
@@ -460,6 +469,34 @@ class AuthorityRpcServer:
             raise TypeError("worker results require installed original model and reader")
         self._v2_worker_model_result_reads = worker_reads
         self._worker_result_readers_v2 = worker_readers
+        recovery_reads = dict(v2_terminal_c02_recovery_reads or {})
+        recovery_readers = dict(terminal_c02_recovery_readers_v2 or {})
+        if (set(recovery_reads) != set(recovery_readers)
+                or any(type(namespace) is not str or namespace not in model_services
+                       or type(service) is not AuthorityV2TerminalC02RecoveryReadService
+                       or service._store is not model_services[namespace]._store
+                       or service._fences is not services[namespace]
+                       or type(service._graph) is not PinnedTerminalRecoveryGraphVerifierV1
+                       or type(model_services[namespace]._graph_verifier)
+                          is not PinnedCurrentModelEgressGraphVerifier
+                       or service._graph._path != model_services[namespace]._graph_verifier._path
+                       or service._graph._issuer is not model_services[namespace]._graph_verifier._issuer
+                       or type(recovery_readers[namespace]) is not tuple
+                       or len(recovery_readers[namespace]) != 2
+                       or recovery_readers[namespace] not in installed
+                       or not any(peer == recovery_readers[namespace][0]
+                                      and profile == recovery_readers[namespace][1]
+                                      and mapped == namespace
+                                      for (peer, profile, _), mapped in bindings.items())
+                       or (service._read_subject, service._installation_id,
+                           service._holder) != (
+                               "mtls:sha256:" + recovery_readers[namespace][0],
+                               installed[recovery_readers[namespace]].installation_id,
+                               installed[recovery_readers[namespace]].administrator_holder)
+                       for namespace, service in recovery_reads.items())):
+            raise TypeError("terminal C02 recovery requires installed current graph reader")
+        self._v2_terminal_c02_recovery_reads = recovery_reads
+        self._terminal_c02_recovery_readers_v2 = recovery_readers
         fact_services = dict(v2_worker_result_read_facts or {})
         fact_committers = dict(worker_result_fact_committers_v2 or {})
         if (set(fact_services) != set(fact_committers)
@@ -800,6 +837,47 @@ class AuthorityRpcServer:
                     credential=credential, subject=subject, request=request)
                 return {"current": None if current is None
                         else self_identity_to_wire(current)}
+            if method in {"terminal_c02_recovery_read_v1",
+                          "terminal_c02_recovery_query_v1"}:
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("terminal C02 recovery command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                peer = (credential.certificate_sha256, profile_id)
+                installed = self._installations_v2[peer]
+                service = self._v2_terminal_c02_recovery_reads.get(namespace)
+                if (service is None or service._read_subject != subject
+                        or self._terminal_c02_recovery_readers_v2.get(namespace) != peer):
+                    raise AuthorityUnavailable("installed terminal C02 recovery reader unavailable")
+                request = terminal_c02_from_wire(
+                    command["read_request"], TerminalRecoveryReadRequestV1)
+                key = request.original_key
+                if (key.authority_id != self._authority_id()
+                        or key.authority_namespace != namespace
+                        or key.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            key.namespace)) != namespace):
+                    raise AuthorityUnavailable("terminal C02 recovery installation differs")
+                if method == "terminal_c02_recovery_query_v1":
+                    attempt, fact = service.query(
+                        credential=credential, request=request)
+                    return {
+                        "attempt": None if attempt is None else terminal_c02_to_wire(attempt),
+                        "read_fact": None if fact is None else terminal_c02_to_wire(fact),
+                    }
+                delivery = service.prepare(credential=credential, request=request)
+                try:
+                    result_wire = {
+                        "request": terminal_c02_to_wire(delivery.request),
+                        "observation": asdict(delivery.observation),
+                    }
+                except BaseException:
+                    service.abandon_delivery(delivery=delivery)
+                    raise
+                return _DeferredWorkerDelivery(
+                    {"result": result_wire}, service, credential, delivery)
             if method in {"worker_model_result_select_attempt_v1",
                           "worker_model_result_read_v1",
                           "worker_model_result_recover_finish_v1"}:

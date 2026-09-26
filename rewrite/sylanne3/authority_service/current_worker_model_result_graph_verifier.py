@@ -27,11 +27,12 @@ from ..runtime.encoding_call_binding import (
 from ..runtime.first_ingress_v2 import ingress_ids
 from ..runtime.jobs import get_job
 from ..runtime.issuers import D11BudgetJobIssuer
-from ..runtime_contracts import NamespaceId, SnapshotRequirementsV2, SourceQualification, canonical_serialize
+from ..runtime_contracts import NamespaceId, SnapshotRequirementsV2, SourceQualification, canonical_digest, canonical_serialize
 from .v2_contract import FencePermitV2
 from .v2_model_egress_contract import ModelEgressIntentV1
 from .current_d04_baseline_graph_proof import committed_baseline_current
 from .v2_worker_model_result_contract import WorkerModelResultReadRequestV1
+from .v2_terminal_c02_recovery_contract import TerminalRecoveryReadRequestV1
 from ..graph_coordinator import NamespaceProvisionReceiptV2
 
 
@@ -97,7 +98,7 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
 
     def _check(self, db: sqlite3.Connection, request: WorkerModelResultReadRequestV1,
                intent: ModelEgressIntentV1, permit: FencePermitV2,
-               now: float) -> bool:
+               now: float, *, recovery: bool = False) -> bool:
         ns = request.namespace.as_tuple
         meta = db.execute(
             "SELECT schema,requirements_json,graph_revision FROM graph_recovery_metadata_v2 "
@@ -143,9 +144,10 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
                 or job.result_ref is not None or job.cancel_epoch != 0
                 or job.fence != intent.worker_fence
                 or job.lease_holder != intent.subject
-                or job.lease_holder != permit.subject
+                or (not recovery and job.lease_holder != permit.subject)
                 or job.lease_expires_utc is None
-                or now >= _utc(job.lease_expires_utc)
+                or (now < _utc(job.lease_expires_utc) if recovery
+                    else now >= _utc(job.lease_expires_utc))
                 or now >= _utc(job.deadline_utc)):
             return False
         job_key = runtime_job_key(*ns, job.activity_id, job.job_id)
@@ -415,4 +417,54 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
                 and set(audience).issubset(access["audiences"]))
 
 
-__all__ = ("PinnedCurrentWorkerModelResultGraphVerifier",)
+class PinnedTerminalRecoveryGraphVerifierV1(PinnedCurrentWorkerModelResultGraphVerifier):
+    """Current graph proof for an expired original worker lease.
+
+    The original worker remains the historical actor. The read-fence subject
+    is the separately installed recovery observer and must differ from it.
+    """
+
+    def current(self, request: TerminalRecoveryReadRequestV1,
+                intent: ModelEgressIntentV1, permit: FencePermitV2) -> bool:
+        if (type(request) is not TerminalRecoveryReadRequestV1
+                or type(intent) is not ModelEgressIntentV1
+                or type(permit) is not FencePermitV2):
+            return False
+        key = request.original_key
+        if (permit.operation != "read" or permit.subject == intent.subject
+                or (permit.authority_id, permit.namespace, permit.operation_id)
+                   != (key.authority_id, key.authority_namespace,
+                       request.read_attempt_id)
+                or canonical_digest(asdict(intent)) != key.original_intent_digest
+                or (intent.authority_id, intent.namespace, intent.call_id,
+                    intent.job_id, intent.request_digest, intent.operation_id,
+                    intent.budget_reservation_operation_id)
+                   != (key.authority_id, key.authority_namespace, key.call_id,
+                       key.job_id, key.model_request_digest,
+                       key.acquire_operation_id, key.original_operation_id)):
+            return False
+        worker_request = WorkerModelResultReadRequestV1(
+            key.authority_id, key.authority_namespace, key.namespace,
+            key.installation_id, key.job_id, key.acquire_operation_id,
+            key.original_operation_id, key.call_id, key.binding_digest,
+            key.model_request_digest, request.consumer_operation_id,
+            request.read_attempt_id,
+        )
+        try:
+            now = self._clock()
+            if type(now) not in (int, float) or not math.isfinite(now):
+                return False
+            with closing(sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True)) as db:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                try:
+                    return self._check(db, worker_request, intent, permit,
+                                       float(now), recovery=True)
+                finally:
+                    db.execute("ROLLBACK")
+        except Exception:
+            return False
+
+
+__all__ = ("PinnedCurrentWorkerModelResultGraphVerifier",
+           "PinnedTerminalRecoveryGraphVerifierV1")
