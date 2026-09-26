@@ -9701,6 +9701,32 @@ class GraphCoordinator:
             raise UnavailableGuard("stored dispatch request segment differs")
         return request
 
+    def _read_dispatch_final_claim_prerequisite_locked(
+            self, namespace: NamespaceId, binding, claimed_receipt,
+            handoff_id: str, *, now_utc: float):
+        """Read durable W01/D11 facts inside the caller's business transaction.
+
+        This returns an explicit HOLD. It cannot be installed as Authority's
+        final_handoff_authorizer: no current P2 or complete domain check is
+        established here, and it does not write a graph claim or stamp.
+        """
+        from .authority_service.v2_contract import ExecutionBindingV2
+        from .runtime.dispatch_current_source_budget import CurrentDispatchHold
+        from .runtime.dispatch_final_claim import read_final_claim_prerequisite
+
+        db = self.__store._db
+        if not db.in_transaction:
+            raise CurrentDispatchHold("final claim prerequisite needs a held business transaction")
+        if type(binding) is not ExecutionBindingV2:
+            raise CurrentDispatchHold("final claim prerequisite requires a V2 binding")
+        if self._get_committed_dispatch_request_locked(
+                namespace, binding.origin.admission_ref) is None:
+            raise CurrentDispatchHold("committed graph dispatch command is absent")
+        return read_final_claim_prerequisite(
+            db, namespace, binding, claimed_receipt, handoff_id,
+            now_utc=now_utc,
+        )
+
     def get_dispatch_text_segment(self, authority: AuthorityContext,
                                   lease: object, request):
         """Read one D09 body through its committed D11 admission and graph fence.
