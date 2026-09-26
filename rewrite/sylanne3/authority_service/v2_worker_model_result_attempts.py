@@ -17,6 +17,11 @@ from .v2_contract import FencePermitV2
 from .v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, from_wire, to_wire,
 )
+from .v2_reply_worker_model_result_contract import (
+    ReplyWorkerModelResultReadRequestV1,
+    SCHEMA as REPLY_READ_SCHEMA,
+    from_wire as reply_from_wire, to_wire as reply_to_wire,
+)
 from ..runtime_contracts import canonical_digest, canonical_serialize
 
 
@@ -35,7 +40,7 @@ _DDL = """CREATE TABLE authority_worker_result_read_attempts_v1(
 
 @dataclass(frozen=True, slots=True)
 class WorkerModelResultReadAttemptV1:
-    request: WorkerModelResultReadRequestV1
+    request: WorkerModelResultReadRequestV1 | ReplyWorkerModelResultReadRequestV1
     permit_digest: str
     state: str
     result_digest: str | None
@@ -94,11 +99,19 @@ class AuthorityV2WorkerModelResultAttempts:
         if row is None:
             return None
         try:
-            request = from_wire(json.loads(row[1]), WorkerModelResultReadRequestV1)
+            raw = json.loads(row[1])
+            if type(raw) is not dict:
+                raise ValueError("worker read request is malformed")
+            if raw.get("schema") == REPLY_READ_SCHEMA:
+                request = reply_from_wire(raw, ReplyWorkerModelResultReadRequestV1)
+                encoded = reply_to_wire(request)
+            else:
+                request = from_wire(raw, WorkerModelResultReadRequestV1)
+                encoded = to_wire(request)
             if (request.read_attempt_id != attempt_id
                     or request.consumer_operation_id != row[0]
                     or request.digest != row[2]
-                    or row[1] != canonical_serialize(to_wire(request))
+                    or row[1] != canonical_serialize(encoded)
                     or type(row[3]) is not str or len(row[3]) != 64
                     or any(c not in "0123456789abcdef" for c in row[3])
                     or row[4] not in {"active", "finished"}
@@ -112,7 +125,8 @@ class AuthorityV2WorkerModelResultAttempts:
         return WorkerModelResultReadAttemptV1(request, row[3], row[4], row[5])
 
     @staticmethod
-    def _permit_digest(request: WorkerModelResultReadRequestV1,
+    def _permit_digest(request: WorkerModelResultReadRequestV1 |
+                       ReplyWorkerModelResultReadRequestV1,
                        permit: FencePermitV2) -> str:
         if (type(permit) is not FencePermitV2 or permit.operation != "read"
                 or (permit.authority_id, permit.namespace, permit.operation_id) !=
@@ -121,8 +135,10 @@ class AuthorityV2WorkerModelResultAttempts:
             raise AuthorityUnavailable("worker read attempt requires its original read fence")
         return canonical_digest(asdict(permit))
 
-    def read(self, request: WorkerModelResultReadRequestV1):
-        if type(request) is not WorkerModelResultReadRequestV1:
+    def read(self, request: WorkerModelResultReadRequestV1 |
+             ReplyWorkerModelResultReadRequestV1):
+        if type(request) not in {WorkerModelResultReadRequestV1,
+                                ReplyWorkerModelResultReadRequestV1}:
             raise TypeError("typed worker read request required")
         with self._tx() as db:
             record = self._read_locked(db, request.read_attempt_id)
@@ -130,15 +146,19 @@ class AuthorityV2WorkerModelResultAttempts:
                 raise AuthorityUnavailable("worker read attempt identity conflict")
             return record
 
-    def begin(self, request: WorkerModelResultReadRequestV1, *, permit: FencePermitV2):
+    def begin(self, request: WorkerModelResultReadRequestV1 |
+              ReplyWorkerModelResultReadRequestV1, *, permit: FencePermitV2):
         with self._tx() as db:
             return self.begin_locked(db, request, permit=permit)
 
-    def begin_locked(self, db: sqlite3.Connection, request: WorkerModelResultReadRequestV1,
+    def begin_locked(self, db: sqlite3.Connection,
+                     request: WorkerModelResultReadRequestV1 |
+                     ReplyWorkerModelResultReadRequestV1,
                      *, permit: FencePermitV2):
         """Bind an attempt; service must revalidate current eligibility first."""
         self._require_tx(db)
-        if type(request) is not WorkerModelResultReadRequestV1:
+        if type(request) not in {WorkerModelResultReadRequestV1,
+                                ReplyWorkerModelResultReadRequestV1}:
             raise TypeError("typed worker read request required")
         permit_digest = self._permit_digest(request, permit)
         record = self._read_locked(db, request.read_attempt_id)
@@ -153,21 +173,27 @@ class AuthorityV2WorkerModelResultAttempts:
             "(read_attempt_id,consumer_operation_id,request_json,request_digest,permit_digest,state,result_digest) "
             "VALUES(?,?,?,?,?,'active',NULL)",
             (request.read_attempt_id, request.consumer_operation_id,
-             canonical_serialize(to_wire(request)), request.digest, permit_digest),
+             canonical_serialize(
+                 reply_to_wire(request) if type(request) is ReplyWorkerModelResultReadRequestV1
+                 else to_wire(request)), request.digest, permit_digest),
         )
         return WorkerModelResultReadAttemptV1(request, permit_digest, "active", None)
 
-    def finish(self, request: WorkerModelResultReadRequestV1, *, permit: FencePermitV2,
+    def finish(self, request: WorkerModelResultReadRequestV1 |
+               ReplyWorkerModelResultReadRequestV1, *, permit: FencePermitV2,
                result_digest: str):
         with self._tx() as db:
             return self.finish_locked(db, request, permit=permit,
                                       result_digest=result_digest)
 
-    def finish_locked(self, db: sqlite3.Connection, request: WorkerModelResultReadRequestV1,
+    def finish_locked(self, db: sqlite3.Connection,
+                      request: WorkerModelResultReadRequestV1 |
+                      ReplyWorkerModelResultReadRequestV1,
                       *, permit: FencePermitV2, result_digest: str):
         """Close only the exact active attempt; stores a digest, never the body."""
         self._require_tx(db)
-        if type(request) is not WorkerModelResultReadRequestV1:
+        if type(request) not in {WorkerModelResultReadRequestV1,
+                                ReplyWorkerModelResultReadRequestV1}:
             raise TypeError("typed worker read request required")
         permit_digest = self._permit_digest(request, permit)
         if (type(result_digest) is not str or len(result_digest) != 64

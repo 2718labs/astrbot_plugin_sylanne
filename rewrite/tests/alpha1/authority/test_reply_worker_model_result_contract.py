@@ -10,6 +10,7 @@ from sylanne3.authority_service.v2_reply_worker_model_result_contract import (
 )
 from sylanne3.memory_types import source_key
 from sylanne3.runtime_contracts import NamespaceId
+from rewrite.tests.alpha1.authority.test_v2_worker_result_read_service import _case
 
 
 def test_reply_read_identity_round_trip_and_first_ingress_scope_rejected():
@@ -33,3 +34,30 @@ def test_reply_read_identity_round_trip_and_first_ingress_scope_rejected():
         replace(request, purpose="first_ingress_c02")
     with pytest.raises(ValueError, match="source"):
         replace(request, source_ref=source_key("other-bot", "persona-a", "source-a").token)
+
+
+def test_reply_attempt_identity_is_durable_and_conflicting_replay_denied(tmp_path, monkeypatch):
+    service, first, core, deletion, guard, execution = _case(tmp_path, monkeypatch)
+    try:
+        request = ReplyWorkerModelResultReadRequestV1(
+            first.authority_id, first.authority_namespace, first.namespace,
+            first.installation_id, first.job_id, first.acquire_operation_id,
+            first.original_operation_id, first.call_id, first.binding_digest,
+            first.model_request_digest, "reply-consumer-a",
+            reply_worker_read_attempt_id_v1("reply-consumer-a", 1), "c02-a",
+            source_key("bot-a", "persona-a", "source-a").token,
+            2, 3, "ticket-a", 4, ("user-a",))
+        fences = service._fences
+        permit = fences.begin_fence(
+            credential="ok", subject="worker-a", holder="holder-a",
+            operation="read", operation_id=request.read_attempt_id,
+            expected_anchor=fences.current_anchor(
+                credential="ok", subject="worker-a"))
+        ledger = service._attempts
+        assert ledger.begin(request, permit=permit).state == "active"
+        assert ledger.read(request).request == request
+        assert ledger.begin(request, permit=permit).request == request
+        with pytest.raises(Exception, match="identity conflict"):
+            ledger.read(replace(request, attention_ticket_id="ticket-b"))
+    finally:
+        core.close(); deletion.close(); guard.close(); execution.close()
