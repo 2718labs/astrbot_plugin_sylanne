@@ -1,4 +1,4 @@
-"""Versioned, candidate-only D04 authored initial root contract.
+"""Versioned D04 authored root candidates and committed numeric checkpoint.
 
 The shipped preset is reusable across roles; each candidate owns its selection
 and latent initial conditions. Candidates are neither FeelingState readouts nor
@@ -15,6 +15,8 @@ import re
 
 from ...graph_types import TypeSpec
 from ...runtime_contracts import canonical_digest, canonical_serialize, schema_hash
+from ...graph_types import AtomKey
+from .encoding_baseline import CommittedRef
 
 
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -205,6 +207,101 @@ class RootNumericCheckpointCandidate:
 
 
 @dataclass(frozen=True)
+class NumericCheckpoint:
+    """Graph value after D11 adoption; constructing it grants no write authority.
+
+    A root has no predecessor. Later advances/revisions bind the exact receipt
+    of the preceding committed operation. The issuer and coordinator must verify
+    all certificate, receipt, and graph claims before committing this value.
+    """
+
+    checkpoint_id: str
+    namespace: tuple[str, str]
+    block: RootBlockIdentity
+    assets: RootAssetBindings
+    asset_digest: str
+    axes: tuple[str, ...]
+    latent_state: tuple[float, ...]
+    certified_box: tuple[tuple[float, float], ...]
+    numeric_error_bound: float
+    certificate_source: str
+    certificate_digest: str
+    cursor: float
+    graph_state: CommittedRef
+    readout_proof_digest: str
+    commit_operation_id: str
+    predecessor_kind: str
+    predecessor_receipt_digest: str | None
+
+    def __post_init__(self) -> None:
+        _text(self.checkpoint_id, "checkpoint_id")
+        if type(self.namespace) is not tuple or len(self.namespace) != 2:
+            raise ValueError("namespace must bind one bot and persona")
+        for item in self.namespace:
+            _text(item, "namespace")
+        if type(self.block) is not RootBlockIdentity:
+            raise ValueError("block must be an exact RootBlockIdentity")
+        if type(self.assets) is not RootAssetBindings:
+            raise ValueError("assets must be exact RootAssetBindings")
+        _hash(self.asset_digest, "asset_digest")
+        if self.asset_digest != self.assets.digest:
+            raise ValueError("asset_digest differs from checkpoint assets")
+        if (type(self.axes) is not tuple or len(self.axes) != 24
+                or any(type(axis) is not str or not axis.strip() for axis in self.axes)
+                or len(set(self.axes)) != 24):
+            raise ValueError("axes must be 24 unique ordered axis IDs")
+        if type(self.latent_state) is not tuple or len(self.latent_state) != 24:
+            raise ValueError("latent_state must have 24 coordinates")
+        if type(self.certified_box) is not tuple or len(self.certified_box) != 24:
+            raise ValueError("certified_box must have 24 intervals")
+        state: list[float] = []
+        boxes: list[tuple[float, float]] = []
+        for index, (value, interval) in enumerate(zip(self.latent_state, self.certified_box)):
+            numeric = _number(value, f"latent_state[{index}]")
+            if not 0.0 <= numeric <= 4.0:
+                raise ValueError("latent_state must stay in [0, 4]")
+            if type(interval) is not tuple or len(interval) != 2:
+                raise ValueError("certified_box entries must be pairs")
+            low = _number(interval[0], "certified_box low")
+            high = _number(interval[1], "certified_box high")
+            if not 0.0 <= low <= numeric <= high <= 4.0:
+                raise ValueError("certified_box must contain latent_state within [0, 4]")
+            state.append(numeric)
+            boxes.append((low, high))
+        error = _number(self.numeric_error_bound, "numeric_error_bound")
+        if error < 0 or any(max(value - low, high - value) > error
+                            for value, (low, high) in zip(state, boxes)):
+            raise ValueError("numeric_error_bound must cover certified_box")
+        object.__setattr__(self, "latent_state", tuple(state))
+        object.__setattr__(self, "certified_box", tuple(boxes))
+        object.__setattr__(self, "numeric_error_bound", error)
+        if self.certificate_source not in {"trusted_initial_box", "trusted_abi2"}:
+            raise ValueError("certificate_source must identify a trusted verifier")
+        _hash(self.certificate_digest, "certificate_digest")
+        object.__setattr__(self, "cursor", _number(self.cursor, "cursor"))
+        if type(self.graph_state) is not CommittedRef:
+            raise ValueError("graph_state must be an exact CommittedRef")
+        key = AtomKey.from_token(self.graph_state.ref)
+        expected_type = ("d04.feeling_state.v1" if self.block.kind == "feeling"
+                         else "d04.mood_field.v1")
+        if (key.type_name != expected_type or key.owner.kind != "persona"
+                or (key.owner.bot, key.owner.persona) != self.namespace
+                or key.name != self.block.block_id):
+            raise ValueError("graph_state differs from checkpoint block or namespace")
+        _hash(self.readout_proof_digest, "readout_proof_digest")
+        _text(self.commit_operation_id, "commit_operation_id")
+        if self.predecessor_kind == "none":
+            if self.predecessor_receipt_digest is not None or self.certificate_source != "trusted_initial_box":
+                raise ValueError("root checkpoint must have no predecessor and an initial box")
+        elif self.predecessor_kind in {"root", "advance", "revision"}:
+            _hash(self.predecessor_receipt_digest, "predecessor_receipt_digest")
+            if self.certificate_source != "trusted_abi2":
+                raise ValueError("successor checkpoint requires trusted_abi2")
+        else:
+            raise ValueError("unsupported predecessor_kind")
+
+
+@dataclass(frozen=True)
 class AuthoredRootCandidate:
     preset: AuthoredRootPreset
     preset_digest: str
@@ -370,6 +467,12 @@ def encode_root_checkpoint_candidate(value: RootNumericCheckpointCandidate) -> d
     return json.loads(canonical_serialize({"schema": "d04.root_numeric_checkpoint_candidate.v1", **asdict(value)}))
 
 
+def encode_numeric_checkpoint(value: NumericCheckpoint) -> dict:
+    if type(value) is not NumericCheckpoint:
+        raise TypeError("expected NumericCheckpoint")
+    return json.loads(canonical_serialize({"schema": "d04.numeric_checkpoint.v1", **asdict(value)}))
+
+
 def encode_root_candidate(value: AuthoredRootCandidate) -> dict:
     if type(value) is not AuthoredRootCandidate:
         raise TypeError("expected AuthoredRootCandidate")
@@ -419,6 +522,31 @@ def decode_root_checkpoint_candidate(payload: object) -> RootNumericCheckpointCa
     )
 
 
+def decode_numeric_checkpoint(payload: object) -> NumericCheckpoint:
+    value = _fields(payload, {"schema", *NumericCheckpoint.__dataclass_fields__}, "numeric checkpoint")
+    if value["schema"] != "d04.numeric_checkpoint.v1":
+        raise ValueError("unsupported numeric checkpoint schema")
+    return NumericCheckpoint(
+        checkpoint_id=value["checkpoint_id"],
+        namespace=tuple(_list(value["namespace"], "namespace")),
+        block=RootBlockIdentity(**_fields(value["block"], set(RootBlockIdentity.__dataclass_fields__), "block")),
+        assets=RootAssetBindings(**_fields(value["assets"], set(RootAssetBindings.__dataclass_fields__), "assets")),
+        asset_digest=value["asset_digest"], axes=tuple(_list(value["axes"], "axes")),
+        latent_state=tuple(_list(value["latent_state"], "latent_state")),
+        certified_box=tuple(tuple(_list(item, "certified_box interval")) for item in
+                            _list(value["certified_box"], "certified_box")),
+        numeric_error_bound=value["numeric_error_bound"],
+        certificate_source=value["certificate_source"],
+        certificate_digest=value["certificate_digest"], cursor=value["cursor"],
+        graph_state=CommittedRef(**_fields(value["graph_state"], set(CommittedRef.__dataclass_fields__),
+                                           "graph_state")),
+        readout_proof_digest=value["readout_proof_digest"],
+        commit_operation_id=value["commit_operation_id"],
+        predecessor_kind=value["predecessor_kind"],
+        predecessor_receipt_digest=value["predecessor_receipt_digest"],
+    )
+
+
 def decode_root_candidate(payload: object) -> AuthoredRootCandidate:
     value = _fields(payload, {"schema", "preset", "preset_digest", "candidate_id",
                               "namespace", "author_id", "draft_id", "cursor", "blocks",
@@ -439,14 +567,14 @@ def decode_root_candidate(payload: object) -> AuthoredRootCandidate:
 
 
 def root_type_specs() -> tuple[TypeSpec, ...]:
-    """Register graph-visible candidate records, never an adopted checkpoint."""
+    """Register distinct candidate and committed checkpoint graph surfaces."""
     definitions = (
         ("d04.authored_root_preset.v1", decode_root_preset, AuthoredRootPreset),
         ("d04.authored_root_candidate.v1", decode_root_candidate, AuthoredRootCandidate),
         ("d04.root_numeric_checkpoint_candidate.v1", decode_root_checkpoint_candidate,
          RootNumericCheckpointCandidate),
     )
-    return tuple(TypeSpec(
+    candidates = tuple(TypeSpec(
         name=name, owner_kinds=("persona",), storage_role="projection", validator=decoder,
         immutable=True, writer_domain="d04", schema_hash=schema_hash({
             "type": name, "version": 1, "writer_domain": "d04", "candidate_only": True,
@@ -456,3 +584,14 @@ def root_type_specs() -> tuple[TypeSpec, ...]:
             "block_fields": tuple(RootBlockIdentity.__dataclass_fields__),
         }),
     ) for name, decoder, dto in definitions)
+    return candidates + (TypeSpec(
+        name="d04.numeric_checkpoint.v1", owner_kinds=("persona",), storage_role="state",
+        validator=decode_numeric_checkpoint, immutable=False, writer_domain="d04",
+        schema_hash=schema_hash({
+            "type": "d04.numeric_checkpoint.v1", "version": 1, "writer_domain": "d04",
+            "fields": tuple(NumericCheckpoint.__dataclass_fields__),
+            "asset_fields": tuple(RootAssetBindings.__dataclass_fields__),
+            "block_fields": tuple(RootBlockIdentity.__dataclass_fields__),
+            "graph_version_fields": tuple(CommittedRef.__dataclass_fields__),
+        }),
+    ),)

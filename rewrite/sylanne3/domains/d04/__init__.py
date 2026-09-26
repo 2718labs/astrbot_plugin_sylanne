@@ -35,13 +35,16 @@ from .root import (
     RootBlockIdentity,
     RootBlockTemplate,
     RootNumericCheckpointCandidate,
+    NumericCheckpoint,
     compile_authored_root_candidate,
     decode_root_candidate,
     decode_root_checkpoint_candidate,
     decode_root_preset,
+    decode_numeric_checkpoint,
     encode_root_candidate,
     encode_root_checkpoint_candidate,
     encode_root_preset,
+    encode_numeric_checkpoint,
 )
 
 __all__ = (
@@ -78,11 +81,14 @@ __all__ = (
     "RootBlockIdentity",
     "RootBlockTemplate",
     "RootNumericCheckpointCandidate",
+    "NumericCheckpoint",
     "compile_authored_root_candidate",
     "decode_root_candidate",
     "decode_root_checkpoint_candidate",
     "decode_root_preset",
+    "decode_numeric_checkpoint",
     "encode_root_candidate",
     "encode_root_checkpoint_candidate",
     "encode_root_preset",
+    "encode_numeric_checkpoint",
 )

@@ -730,6 +730,7 @@ class AffectProvider:
             "d04.authored_root_preset.v1",
             "d04.authored_root_candidate.v1",
             "d04.root_numeric_checkpoint_candidate.v1",
+            "d04.numeric_checkpoint.v1",
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
@@ -1428,6 +1429,8 @@ class AffectProvider:
             raise ValueError("proposal is not a D04 affect proposal")
         if proposal.proposal_schema_hash != self.descriptor.request_schema_hash:
             raise ValueError("D04 proposal schema hash is not recognized")
+        if any(write.key.type_name == "d04.numeric_checkpoint.v1" for write in proposal.typed_writes):
+            raise ValueError("committed numeric checkpoint requires the D11 adoption path")
         allowed = frozenset(self.register_types())
         if any(write.key.type_name not in allowed for write in proposal.typed_writes):
             raise ValueError("D04 candidates may only contain D04 graph writes")

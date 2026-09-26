@@ -146,13 +146,17 @@ def test_digest_version_and_json_schema_tamper_fail_closed():
         decode_root_candidate(payload)
 
 
-def test_graph_specs_register_only_candidate_surface():
+def test_graph_specs_keep_candidate_and_committed_checkpoint_distinct():
     provider = AffectProvider()
     specs = {item.name: item for item in provider.type_specs()}
     assert specs["d04.authored_root_preset.v1"].writer_domain == "d04"
     assert specs["d04.authored_root_candidate.v1"].storage_role == "projection"
     assert specs["d04.root_numeric_checkpoint_candidate.v1"].storage_role == "projection"
-    assert "d04.numeric_checkpoint.v1" not in specs
+    committed = specs["d04.numeric_checkpoint.v1"]
+    assert committed.storage_role == "state"
+    assert committed.writer_domain == "d04"
+    assert committed.validator is not specs["d04.root_numeric_checkpoint_candidate.v1"].validator
+    assert "d04.numeric_checkpoint.v1" in provider.register_types()
     registry = TypeRegistry()
     for name in ("d04.authored_root_preset.v1", "d04.authored_root_candidate.v1",
                  "d04.root_numeric_checkpoint_candidate.v1"):
@@ -165,3 +169,8 @@ def test_graph_specs_register_only_candidate_surface():
     invalid["status"] = "adopted"
     with pytest.raises(ValueError, match="candidate-only"):
         registry.validate(key, invalid)
+    committed_key = AtomKey(Owner("persona", "bot:one", "alice"),
+                            "d04.numeric_checkpoint.v1", "feeling:one")
+    registry.register(committed)
+    with pytest.raises(ValueError, match="fields"):
+        registry.validate(committed_key, encode_root_candidate(candidate))
