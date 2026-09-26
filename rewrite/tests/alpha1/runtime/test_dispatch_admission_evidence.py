@@ -194,3 +194,17 @@ def test_changed_graph_source_is_rejected_even_at_same_revision():
             )
     finally:
         db.close()
+
+
+def test_receipt_hook_cannot_reuse_prewrite_snapshot_after_epoch_advances():
+    db, bundle, snapshot, candidate = _case()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        _reserve(db, bundle)
+        db.execute("UPDATE graph_epochs SET revision=8")
+        with pytest.raises(ValueError, match="projection graph epoch changed"):
+            read_current_admission_facts(
+                db, bundle, snapshot, candidate, now_utc=2.0,
+            )
+    finally:
+        db.close()
