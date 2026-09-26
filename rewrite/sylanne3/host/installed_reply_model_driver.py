@@ -145,8 +145,17 @@ async def prepare_and_run_installed_reply_model_v1(
     """
     if (type(draft) is not ModelEgressDraftV1
             or type(executor) is not HostModelEgressExecutor
+            or type(c02_receipt) is not CommitReceipt
+            or c02_receipt.status not in {"committed", "duplicate"}
+            or not {"memory.episode.v1", "memory.subjective_trace.v2"}
+               <= {row.key.type_name for row in c02_receipt.write_versions}
             or type(source) is not ReplySourceSnapshot
-            or type(envelope) is not CommandEnvelope):
+            or type(envelope) is not CommandEnvelope
+            or c02_receipt.operation_id not in envelope.causation
+            or type(attention) is not AttentionTicket
+            or attention.causal_root != source.source_ref
+            or attention.category != "interaction"
+            or type(focus_revision) is not int or focus_revision < 1):
         return None
     bundle = executor._bundle
     grant = executor._grant
@@ -168,6 +177,7 @@ async def prepare_and_run_installed_reply_model_v1(
             or draft.subject != envelope.authority.actor
             or draft.operation_id != reply_model_operation_id_v1(
                 c02_receipt.operation_id, source.source_ref)
+            or envelope.identity.operation_id != draft.operation_id
             or draft.acquire_operation_id != draft.operation_id
             or draft.binding_digest is None
             or draft.call_id != request.call_id
