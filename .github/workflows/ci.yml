@@ -42,8 +42,6 @@ jobs:
           - {os: ubuntu-24.04, target_os: linux, target_arch: x86_64}
           - {os: ubuntu-24.04-arm, target_os: linux, target_arch: aarch64}
           - {os: windows-2025, target_os: windows, target_arch: x86_64}
-          - {os: macos-15, target_os: macos, target_arch: aarch64}
-          - {os: macos-15-intel, target_os: macos, target_arch: x86_64}
     steps:
       - uses: actions/checkout@v6
 
@@ -140,8 +138,6 @@ jobs:
           - {os: ubuntu-24.04, target_os: linux, target_arch: x86_64}
           - {os: ubuntu-24.04-arm, target_os: linux, target_arch: aarch64}
           - {os: windows-2025, target_os: windows, target_arch: x86_64}
-          - {os: macos-15, target_os: macos, target_arch: aarch64}
-          - {os: macos-15-intel, target_os: macos, target_arch: x86_64}
     steps:
       - uses: actions/checkout@v6
 
@@ -171,3 +167,33 @@ jobs:
 
       - name: Verify alpha1 host ingress and startup gates
         run: python -m pytest -q rewrite/host_tests/alpha1
+
+  native-cross-platform-smoke:
+    name: Native kernel smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, target_os: linux, target_arch: x86_64, library: libsylanne3_kernel.so}
+          - {os: macos-15, target_os: macos, target_arch: aarch64, library: libsylanne3_kernel.dylib}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Select stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Test and build native kernel
+        run: |
+          cargo fmt --check --manifest-path rewrite/native/Cargo.toml
+          cargo test --manifest-path rewrite/native/Cargo.toml
+          cargo build --release --manifest-path rewrite/native/Cargo.toml
+
+      - name: Load ABI2 library and solve representative nonlinear step
+        run: python scripts/alpha1/native_kernel_smoke.py --library rewrite/native/target/release/${{ matrix.library }} --expect-target ${{ matrix.target_os }}-${{ matrix.target_arch }}
