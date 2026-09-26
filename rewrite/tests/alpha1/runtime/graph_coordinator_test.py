@@ -22,8 +22,7 @@ from sylanne3.memory_types import SourceRecord, access_key, source_key, validate
 from sylanne3.runtime_contracts import (
     RUNTIME_SCHEMA, AuthorityContext, CommandEnvelope, DependencySet,
     DomainBundle, DomainProposal, NamespaceId, OperationIdentity, QueryEpoch,
-    ProductAdvanceEvidenceV1, SourceQualification, VersionGuard,
-    canonical_digest, canonical_serialize,
+    SourceQualification, VersionGuard, canonical_digest,
 )
 from sylanne3.runtime.activation import SqliteMigrationAuthority, TransferPlan
 from sylanne3.runtime.deletion import DeletionBlocked, DeletionJournal
@@ -357,25 +356,30 @@ class CoordinatorTests(unittest.TestCase):
             DependencySet(), (), ())
         return DomainBundle(envelope, (proposal,), (), (), (), (), (), (), (), evidence)
 
-    def test_d04_genesis_and_same_cursor_correction_are_distinct_from_advance(self):
-        self.assertEqual(self.coordinator.commit_domain_bundle(
-            self.d04_bundle("d04-genesis", 10.0, 1), self.d04_lease).status, "committed")
-        correction = self.d04_bundle("d04-correction", 10.0, 2,
-                                     driver_refs=["corrected-driver"])
-        self.assertEqual(self.coordinator.commit_domain_bundle(
-            correction, self.d04_lease).status, "committed")
-        with self.assertRaisesRegex(AuthorityDenied, "same-cursor"):
-            self.coordinator.commit_domain_bundle(
-                self.d04_bundle("d04-forged-correction", 10.0, 3,
-                                coordinates=[["care", 0.9]],
-                                driver_refs=["corrected-driver"]), self.d04_lease)
-        self.assertEqual(self.read((self.feeling_key,), authority=correction.envelope.authority,
-                                   lease=self.d04_lease).get(self.feeling_key).value["cursor"], 10.0)
-
-    def test_duplicate_d04_state_type_cannot_hide_an_advance(self):
+    def test_d04_genesis_requires_authored_root_and_is_atomic(self):
         genesis = self.d04_bundle("d04-genesis", 10.0, 1)
-        self.coordinator.commit_domain_bundle(genesis, self.d04_lease)
-        candidate = self.d04_bundle("d04-duplicate-feeling", 11.0, 2)
+        authority = genesis.envelope.authority
+        before = self.read((self.feeling_key, self.mood_key),
+                           authority=authority, lease=self.d04_lease)
+        with self.store._lock:
+            operations_before = self.store._db.execute(
+                "SELECT COUNT(*) FROM graph_bundle_operations").fetchone()[0]
+            budget_before = get_budget_lease(self.store._db, "parent").reserved
+        with self.assertRaisesRegex(UnavailableGuard, "authenticated authored root"):
+            self.coordinator.commit_domain_bundle(genesis, self.d04_lease)
+        self.assertEqual(self.read((self.feeling_key, self.mood_key),
+                                   authority=authority, lease=self.d04_lease), before)
+        with self.store._lock:
+            self.assertEqual(self.store._db.execute(
+                "SELECT COUNT(*) FROM graph_bundle_operations").fetchone()[0],
+                operations_before)
+            self.assertEqual(get_budget_lease(self.store._db, "parent").reserved,
+                             budget_before)
+        self.assertIsNone(self.coordinator.get_operation(
+            authority, self.d04_lease, "d04-genesis"))
+
+    def test_duplicate_d04_state_type_is_rejected_before_root(self):
+        candidate = self.d04_bundle("d04-duplicate-feeling", 11.0, 1)
         authority = candidate.envelope.authority
         new_key = AtomKey(Owner("persona", "bot", "persona"),
                           "d04.feeling_state.v1", "other-feeling")
@@ -386,7 +390,7 @@ class CoordinatorTests(unittest.TestCase):
         envelope = replace(candidate.envelope, version_guard=guard)
         feeling, mood = candidate.proposals[0].typed_writes
         hidden_feeling = GraphWrite(new_key, {
-            **feeling.value, "process_id": "other-process", "revision": 1,
+            **feeling.value, "process_id": "other-process",
         })
         unchanged_mood = GraphWrite(mood.key, {**mood.value, "cursor": 10.0})
         proposal = replace(candidate.proposals[0], envelope=envelope,
@@ -400,78 +404,20 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIsNone(self.coordinator.get_operation(authority, self.d04_lease,
                                                          "d04-duplicate-feeling"))
 
-    def test_d04_time_advance_rejects_missing_and_untrusted_evidence_atomically(self):
-        genesis = self.d04_bundle("d04-genesis", 10.0, 1)
-        legacy_payload = json.loads(canonical_serialize(genesis))
-        legacy_payload.pop("product_advance")
-        self.assertEqual(genesis.digest, canonical_digest(legacy_payload))
-        self.coordinator.commit_domain_bundle(genesis, self.d04_lease)
-        with self.store._lock:
-            db = self.store._db
-            before = (
-                db.execute("SELECT revision FROM graph_epochs WHERE bot='bot' AND persona='persona'").fetchone()[0],
-                db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone()[0],
-                db.execute("SELECT COUNT(*) FROM graph_product_advances").fetchone()[0],
-                get_budget_lease(db, "parent").reserved,
-            )
-        with self.assertRaisesRegex(UnavailableGuard, "product numeric evidence"):
-            self.coordinator.commit_domain_bundle(
-                self.d04_bundle("d04-no-proof", 11.0, 2), self.d04_lease)
-        missing_read = self.d04_bundle("d04-missing-read", 11.0, 2)
-        missing_guard = replace(missing_read.envelope.version_guard,
-                                read_versions=missing_read.envelope.version_guard.read_versions[:1])
-        missing_envelope = replace(missing_read.envelope, version_guard=missing_guard)
-        missing_read = replace(
-            missing_read, envelope=missing_envelope,
-            proposals=(replace(missing_read.proposals[0], envelope=missing_envelope),))
-        with self.assertRaisesRegex(ValueError, "all writes require read versions"):
-            self.coordinator.commit_domain_bundle(missing_read, self.d04_lease)
-        # This row is a test-only predecessor used to reach the issuer check;
-        # it never makes a candidate eligible for production adoption.
-        with self.store._lock:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute(
-                "INSERT INTO graph_product_advances VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("bot", "persona", "d04-genesis", "process", self.feeling_key.token,
-                 self.mood_key.token, "initial-seed", "seed", 10.0, 10.0,
-                 "a" * 64, "b" * 64, "c" * 64, "d" * 64, "e" * 64, 0.0, 0.0))
-            db.execute("COMMIT")
-        candidate = self.d04_bundle("d04-untrusted-proof", 11.0, 2,
-                                    phase="d11.product_advance_candidate.v1")
-        feeling, mood = (write for write in candidate.proposals[0].typed_writes)
-        digest = canonical_digest({
-            "schema": "sylanne.d04.product.advance.candidate.v1",
-            "feeling": {"ref": feeling.key.token, "value": feeling.value},
-            "mood": {"ref": mood.key.token, "value": mood.value},
-        })
-        evidence = ProductAdvanceEvidenceV1(
-            "d11.product_advance_candidate.v1", self.feeling_key.token, self.mood_key.token,
-            "d04-genesis", "replay-1", 10.0, 11.0, digest,
-            "1" * 64, "2" * 64, "3" * 64, "4" * 64, 0.0, 0.01)
-        self.assertNotEqual(candidate.digest,
-                            replace(candidate, product_advance=evidence).digest)
-        one_mood = GraphWrite(self.mood_key, {**mood.value, "cursor": 10.0})
-        one_proposal = replace(candidate.proposals[0], typed_writes=(feeling, one_mood))
-        one_candidate = replace(candidate, proposals=(one_proposal,))
-        one_digest = canonical_digest({
-            "schema": "sylanne.d04.product.advance.candidate.v1",
-            "feeling": {"ref": feeling.key.token, "value": feeling.value},
-            "mood": {"ref": one_mood.key.token, "value": one_mood.value},
-        })
-        with self.assertRaisesRegex(StaleRead, "current joint state"):
-            self.coordinator.commit_domain_bundle(replace(
-                one_candidate, product_advance=replace(evidence,
-                    candidate_digest=one_digest, replay_key="replay-one-sided")), self.d04_lease)
-        with self.assertRaisesRegex(UnavailableGuard, "trusted product numeric issuer"):
-            self.coordinator.commit_domain_bundle(
-                replace(candidate, product_advance=evidence), self.d04_lease)
-        with self.store._lock:
-            self.assertEqual(
-                db.execute("SELECT revision FROM graph_epochs WHERE bot='bot' AND persona='persona'").fetchone()[0],
-                before[0])
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone()[0], before[1])
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM graph_product_advances").fetchone()[0], before[2] + 1)
-            self.assertEqual(get_budget_lease(db, "parent").reserved, before[3])
+    def test_d04_advance_phase_cannot_bootstrap_an_unadopted_root(self):
+        candidate = self.d04_bundle(
+            "d04-unadopted-advance", 11.0, 1,
+            phase="d11.product_advance_candidate.v1")
+        before = self.read((self.feeling_key, self.mood_key),
+                           authority=candidate.envelope.authority, lease=self.d04_lease)
+        with self.assertRaisesRegex(UnavailableGuard, "authenticated authored root"):
+            self.coordinator.commit_domain_bundle(candidate, self.d04_lease)
+        self.assertEqual(self.read((self.feeling_key, self.mood_key),
+                                   authority=candidate.envelope.authority,
+                                   lease=self.d04_lease), before)
+        self.assertIsNone(self.coordinator.get_operation(
+            candidate.envelope.authority, self.d04_lease,
+            "d04-unadopted-advance"))
 
     def test_atomic_bundle_and_duplicate_after_newer_state(self):
         candidate = self.bundle(outbox=True)
