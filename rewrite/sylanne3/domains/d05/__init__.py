@@ -8,6 +8,7 @@ from .relationship import (
     RelationshipContribution,
     RelationshipProvider,
 )
+from .source_correction import D05SourceReevaluationCandidate, compile_d05_source_reevaluation
 
 __all__ = (
     "BoundaryCheck",
@@ -16,4 +17,6 @@ __all__ = (
     "InvalidationResult",
     "RelationshipContribution",
     "RelationshipProvider",
+    "D05SourceReevaluationCandidate",
+    "compile_d05_source_reevaluation",
 )

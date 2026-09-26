@@ -170,9 +170,8 @@ class RelationshipDomainTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             provider.validate_dimension("reliability:medical")
-        invalidation = provider.invalidate(("source:bad-1", "event:arrival-1"))
-        self.assertEqual(invalidation.current_status, "blocked_rebuild")
-        self.assertEqual(invalidation.historical_refs, ("event:arrival-1", "source:bad-1"))
+        with self.assertRaisesRegex(ValueError, "current correction snapshot"):
+            provider.invalidate(("source:bad-1", "event:arrival-1"))
 
     def test_provider_accepts_only_d05_typed_candidates(self):
         provider = RelationshipProvider()

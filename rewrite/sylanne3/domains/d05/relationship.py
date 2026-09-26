@@ -542,11 +542,7 @@ class RelationshipProvider:
                             spec.required_input_versions, "full", result, check_expiry, provider_id)
 
     def invalidate(self, refs: tuple[str, ...]) -> InvalidationResult:
-        if not isinstance(refs, tuple) or not refs:
-            raise ValueError("refs must be a nonempty tuple")
-        for ref in refs:
-            _id(ref, "ref")
-        return InvalidationResult("blocked_rebuild", tuple(sorted(refs)))
+        raise ValueError("D05 invalidation requires a current correction snapshot and W01 adoption")
 
     def project(self, query: dict, snapshot: tuple[BoundaryRule, ...]) -> BoundaryCheck:
         if not isinstance(query, dict):
