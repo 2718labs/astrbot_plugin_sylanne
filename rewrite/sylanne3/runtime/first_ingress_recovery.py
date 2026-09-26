@@ -54,8 +54,11 @@ class FirstIngressRecoveryItemV1:
                 or self.original_worker_fence < 1
                 or self.job_phase not in {"running", "completed"}
                 or self.recovery_state not in {
-                    "original_fence", "expired_lease_hold", "c02_committed"}):
+                    "original_fence", "expired_lease_hold", "c02_pending_hold",
+                    "c02_committed"}):
             raise ValueError("V3 recovery state is invalid")
+        if self.recovery_state == "c02_pending_hold" and self.job_phase != "running":
+            raise ValueError("pending C02 requires the original running job")
         if (self.c02_operation_digest is None) != (self.c02_commit_seq is None):
             raise ValueError("C02 receipt identity must be complete")
         if self.c02_operation_digest is not None and (

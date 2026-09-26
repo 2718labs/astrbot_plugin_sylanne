@@ -395,6 +395,17 @@ class GraphStore(Store):
                 requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
                 graph_revision INTEGER NOT NULL, graph_epoch INTEGER NOT NULL,
                 PRIMARY KEY(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_first_ingress_c02_candidates_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                schema TEXT NOT NULL CHECK(schema='sylanne.first-ingress-c02-candidate.v1'),
+                bundle_digest TEXT NOT NULL,
+                fence_attempt_id TEXT NOT NULL,
+                bundle_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                PRIMARY KEY(bot,persona,operation_id),
+                FOREIGN KEY(bot,persona,operation_id)
+                    REFERENCES graph_bundle_intents_v2(bot,persona,operation_id));
             CREATE TABLE IF NOT EXISTS graph_bundle_rejections_v2 (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 operation_id TEXT NOT NULL, digest TEXT NOT NULL,
@@ -504,6 +515,9 @@ class GraphStore(Store):
             CREATE TRIGGER IF NOT EXISTS graph_bundle_intent_no_delete_v2
                 BEFORE DELETE ON graph_bundle_intents_v2
                 BEGIN SELECT RAISE(ABORT, 'bundle intent is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS graph_first_ingress_c02_candidate_no_update_v1
+                BEFORE UPDATE ON graph_first_ingress_c02_candidates_v1
+                BEGIN SELECT RAISE(ABORT, 'C02 candidate is immutable'); END;
             CREATE TABLE IF NOT EXISTS graph_namespace_provision_intents_v2 (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 operation_id TEXT NOT NULL, digest TEXT NOT NULL,

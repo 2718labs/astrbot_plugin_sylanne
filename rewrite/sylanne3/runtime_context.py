@@ -1382,6 +1382,46 @@ class RuntimeContext:
             return False
         return True
 
+    async def recover_pending_first_ingress_c02_v1(
+        self, consumer_operation_id: str,
+    ) -> CommitReceipt | None:
+        """Resume one sealed C02 candidate without model dispatch or result read."""
+        bundle = self._v2_model_bundle
+        policy = self._v2_policy
+        grant = self._v2_installation_grant
+        if (type(consumer_operation_id) is not str or not consumer_operation_id
+                or self._worker is None or self._v2_bootstrap is None
+                or not self._v2_namespace_provisioned
+                or type(bundle) is not AdminInstallationBundle
+                or type(policy) is not AdminInstallationPolicy
+                or type(grant) is not InstallationGrantV2
+                or bundle.installation_policy != policy
+                or policy.namespace != self._v2_namespace
+                or grant.installation_id != policy.installation_id
+                or type(bundle.d06_first_ingress_c02)
+                   is not AdminD06FirstIngressC02Policy
+                or type(bundle.ingress_clock) is not AdminIngressClockPolicy
+                or self._v2_cost_transport is None):
+            return None
+        try:
+            receipt = await self._worker.call(
+                lambda graph: graph.recover_pending_first_ingress_c02_v1(
+                    self._v2_bootstrap, policy.namespace, consumer_operation_id,
+                    policy, bundle.d06_first_ingress_c02,
+                    bundle.ingress_clock))
+        except Exception:
+            return None
+        if (type(receipt) is not CommitReceipt
+                or receipt.status not in {"committed", "duplicate"}
+                or receipt.operation_id != consumer_operation_id
+                or not {"memory.episode.v1", "memory.subjective_trace.v2"}
+                       <= {version.key.type_name
+                           for version in receipt.write_versions}
+                or any(NamespaceId.from_key(version.key) != policy.namespace
+                       for version in receipt.write_versions)):
+            return None
+        return receipt
+
     async def discover_committed_first_ingress_c02_cost_v1(
         self, *, cursor: str | None = None, limit: int = 50,
     ) -> FirstIngressRecoveryPageV1 | None:

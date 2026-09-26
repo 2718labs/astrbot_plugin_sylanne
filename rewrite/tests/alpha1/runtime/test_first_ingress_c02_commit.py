@@ -2,6 +2,8 @@
 
 from dataclasses import asdict, replace
 import json
+import sqlite3
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +26,7 @@ from sylanne3.host.authority_profile import (
 )
 from sylanne3.host.worker_result_identity import first_ingress_worker_result_request_v1
 from sylanne3.runtime.encoding_call_binding import load_binding
+from sylanne3.runtime.c02_bundle_codec import c02_bundle_from_wire
 from sylanne3.runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from sylanne3.runtime_contracts import canonical_digest, canonical_serialize
 
@@ -238,6 +241,13 @@ def test_first_ingress_c02_adopts_one_original_worker_result(c02_case):
         clock)
     assert receipt.status == "committed"
     assert fact_port.calls == 1
+    candidate = store._db.execute(
+        "SELECT 1 FROM "
+        "graph_first_ingress_c02_candidates_v1 WHERE bot=? AND persona=? "
+        "AND operation_id=?",
+        read.request.namespace.as_tuple + (read.request.consumer_operation_id,),
+    ).fetchone()
+    assert candidate is None
     assert store._db.execute(
         "SELECT COUNT(*) FROM graph_atoms WHERE type_name IN "
         "('memory.episode.v1','memory.subjective_trace.v2')"
@@ -310,3 +320,228 @@ def test_first_ingress_c02_rejects_lost_adoption_proof(c02_case, mutation):
         "SELECT COUNT(*) FROM graph_atoms WHERE type_name IN "
         "('memory.episode.v1','memory.subjective_trace.v2')"
     ).fetchone() == (0,)
+
+
+def test_first_ingress_c02_candidate_survives_pre_fence_crash(
+        c02_case, tmp_path, monkeypatch):
+    store, coordinator, bootstrap, namespace, policy, clock, intent, read, _ = c02_case
+    fence_port = coordinator._GraphCoordinator__content_fence_v2
+    original_begin = fence_port.begin_fence
+
+    def crash_before_fence(**_kwargs):
+        if _kwargs["operation"] == "write":
+            raise RuntimeError("simulated crash before write fence")
+        return original_begin(**_kwargs)
+
+    monkeypatch.setattr(fence_port, "begin_fence", crash_before_fence)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        coordinator.commit_first_ingress_c02_v1(
+            bootstrap, intent, read, policy,
+            AdminD06FirstIngressC02Policy(
+                30.0, {"cpu_ms": 3}, "c02-snapshot", "c02-resource"),
+            clock)
+    operation_id = read.request.consumer_operation_id
+    page = coordinator.discover_first_ingress_recovery_v1(bootstrap, namespace)
+    item = next(item for item in page.items
+                if item.consumer_operation_id == operation_id)
+    assert item.recovery_state == "c02_pending_hold"
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_bundle_operations WHERE bot=? "
+        "AND persona=? AND operation_id=?",
+        namespace.as_tuple + (operation_id,),
+    ).fetchone() == (0,)
+    db_path = store._db.execute("PRAGMA database_list").fetchone()[2]
+    store.close()
+    with sqlite3.connect(db_path) as reopened:
+        intent_row = reopened.execute(
+            "SELECT digest,fence_attempt_id FROM graph_bundle_intents_v2 "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (operation_id,),
+        ).fetchone()
+        candidate = reopened.execute(
+            "SELECT schema,bundle_digest,fence_attempt_id,bundle_json,"
+            "evidence_json FROM graph_first_ingress_c02_candidates_v1 "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (operation_id,),
+        ).fetchone()
+    assert candidate[:3] == (
+        "sylanne.first-ingress-c02-candidate.v1", *intent_row)
+    assert c02_bundle_from_wire(candidate[3]).digest == intent_row[0]
+    evidence = json.loads(candidate[4])
+    assert evidence["read_request"]["consumer_operation_id"] == operation_id
+    assert evidence["installation_id"] == policy.installation_id
+    assert "result" not in evidence and "observation" not in evidence
+
+
+def test_first_ingress_c02_missing_candidate_and_revoked_access_hold(
+        c02_case, monkeypatch):
+    store, coordinator, bootstrap, namespace, policy, clock, intent, read, _ = c02_case
+    fence_port = coordinator._GraphCoordinator__content_fence_v2
+    original_begin = fence_port.begin_fence
+    original_commit = coordinator._commit_domain_bundle_v2
+    captured = {}
+
+    def capture_commit(bundle, lease, **kwargs):
+        if not captured:
+            captured.update(bundle=bundle, lease=lease, kwargs=kwargs)
+        return original_commit(bundle, lease, **kwargs)
+
+    def crash_before_write(**kwargs):
+        if kwargs["operation"] == "write":
+            raise RuntimeError("simulated crash before write fence")
+        return original_begin(**kwargs)
+
+    monkeypatch.setattr(coordinator, "_commit_domain_bundle_v2", capture_commit)
+    monkeypatch.setattr(fence_port, "begin_fence", crash_before_write)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        coordinator.commit_first_ingress_c02_v1(
+            bootstrap, intent, read, policy,
+            AdminD06FirstIngressC02Policy(
+                30.0, {"cpu_ms": 3}, "c02-snapshot", "c02-resource"),
+            clock)
+    operation_id = read.request.consumer_operation_id
+    store._db.execute(
+        "UPDATE graph_atoms SET valid=0 WHERE type_name='memory.access' "
+        "AND bot=? AND persona=?", namespace.as_tuple)
+    with pytest.raises(UnavailableGuard):
+        coordinator.recover_pending_first_ingress_c02_v1(
+            bootstrap, namespace, operation_id, policy,
+            AdminD06FirstIngressC02Policy(
+                30.0, {"cpu_ms": 3}, "c02-snapshot", "c02-resource"),
+            clock)
+    with pytest.raises((UnavailableGuard, ValueError, PermissionError)):
+        coordinator.commit_first_ingress_c02_v1(
+            bootstrap, intent, read, policy,
+            AdminD06FirstIngressC02Policy(
+                30.0, {"cpu_ms": 3}, "c02-snapshot", "c02-resource"),
+            clock)
+    candidate = store._db.execute(
+        "SELECT schema,bundle_digest,fence_attempt_id,bundle_json,"
+        "evidence_json FROM graph_first_ingress_c02_candidates_v1 "
+        "WHERE bot=? AND persona=? AND operation_id=?",
+        namespace.as_tuple + (operation_id,),
+    ).fetchone()
+    store._db.execute(
+        "DELETE FROM graph_first_ingress_c02_candidates_v1 WHERE bot=? "
+        "AND persona=? AND operation_id=?",
+        namespace.as_tuple + (operation_id,),
+    )
+    with pytest.raises(UnavailableGuard, match="candidate is absent"):
+        original_commit(captured["bundle"], captured["lease"],
+                        **captured["kwargs"])
+    store._db.execute(
+        "INSERT INTO graph_first_ingress_c02_candidates_v1"
+        "(bot,persona,operation_id,schema,bundle_digest,fence_attempt_id,"
+        "bundle_json,evidence_json) VALUES(?,?,?,?,?,?,?,?)",
+        namespace.as_tuple + (operation_id,) + candidate[:-1] + ("{}",),
+    )
+    with pytest.raises(EventConflict, match="candidate identity differs"):
+        original_commit(captured["bundle"], captured["lease"],
+                        **captured["kwargs"])
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_bundle_operations WHERE bot=? "
+        "AND persona=? AND operation_id=?",
+        namespace.as_tuple + (operation_id,),
+    ).fetchone() == (0,)
+
+
+def test_first_ingress_c02_resumes_sealed_candidate_without_original_body(
+        c02_case, monkeypatch):
+    store, coordinator, bootstrap, namespace, policy, clock, intent, read, fact_port = c02_case
+    fence_port = coordinator._GraphCoordinator__content_fence_v2
+    original_begin = fence_port.begin_fence
+    admin = AdminD06FirstIngressC02Policy(
+        30.0, {"cpu_ms": 3}, "c02-snapshot", "c02-resource")
+
+    def crash_before_write(**kwargs):
+        if kwargs["operation"] == "write":
+            raise RuntimeError("simulated crash before write fence")
+        return original_begin(**kwargs)
+
+    monkeypatch.setattr(fence_port, "begin_fence", crash_before_write)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        coordinator.commit_first_ingress_c02_v1(
+            bootstrap, intent, read, policy, admin, clock)
+    monkeypatch.setattr(fence_port, "begin_fence", original_begin)
+    candidate_json = store._db.execute(
+        "SELECT bundle_json FROM graph_first_ingress_c02_candidates_v1 "
+        "WHERE bot=? AND persona=? AND operation_id=?",
+        namespace.as_tuple + (read.request.consumer_operation_id,),
+    ).fetchone()[0]
+    envelope = c02_bundle_from_wire(candidate_json).envelope
+    old_deadline = envelope.monotonic_deadline
+    original_clock = fence_port.read_ingress_clock
+    with monkeypatch.context() as expired_clock:
+        expired_clock.setattr(fence_port, "read_ingress_clock", lambda _: SimpleNamespace(
+            utc_upper_bound_seconds=envelope.deadline_utc + 1.0,
+            monotonic_after_seconds=time.monotonic()))
+        with pytest.raises(UnavailableGuard, match="deadline differs"):
+            coordinator.recover_pending_first_ingress_c02_v1(
+                bootstrap, namespace, read.request.consumer_operation_id,
+                policy, admin, clock)
+    assert fence_port.read_ingress_clock == original_clock
+    assert fact_port.calls == 0
+    original_monotonic = time.monotonic
+    with monkeypatch.context() as shifted_clock:
+        shifted_clock.setattr(time, "monotonic",
+                              lambda: original_monotonic() + 1000.0)
+        assert time.monotonic() > old_deadline
+        result = coordinator.recover_pending_first_ingress_c02_v1(
+            bootstrap, namespace, read.request.consumer_operation_id,
+            policy, admin, clock)
+    assert result.status == "committed"
+    assert fact_port.calls == 1
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_atoms WHERE type_name IN "
+        "('memory.episode.v1','memory.subjective_trace.v2')"
+    ).fetchone() == (2,)
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_first_ingress_c02_candidates_v1 "
+        "WHERE bot=? AND persona=? AND operation_id=?",
+        namespace.as_tuple + (read.request.consumer_operation_id,),
+    ).fetchone() == (0,)
+
+
+def test_first_ingress_c02_recovers_same_active_write_fence(
+        c02_case, monkeypatch):
+    store, coordinator, bootstrap, namespace, policy, clock, intent, read, fact_port = c02_case
+    admin = AdminD06FirstIngressC02Policy(
+        30.0, {"cpu_ms": 3}, "c02-snapshot", "c02-resource")
+    port = coordinator._GraphCoordinator__content_fence_v2
+    original_begin = port.begin_fence
+    original_commit = coordinator._commit_domain_bundle_fenced
+    permits = []
+
+    def counted_begin(**kwargs):
+        permit = original_begin(**kwargs)
+        if kwargs["operation"] == "write":
+            permits.append(permit)
+        return permit
+
+    def crash_before_business(*_args, **_kwargs):
+        raise KeyboardInterrupt("simulated process exit before graph transaction")
+
+    monkeypatch.setattr(port, "begin_fence", counted_begin)
+    monkeypatch.setattr(coordinator, "_commit_domain_bundle_fenced",
+                        crash_before_business)
+    with pytest.raises(KeyboardInterrupt, match="simulated process exit"):
+        coordinator.commit_first_ingress_c02_v1(
+            bootstrap, intent, read, policy, admin, clock)
+    monkeypatch.setattr(coordinator, "_commit_domain_bundle_fenced", original_commit)
+    assert len(permits) == 1
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_bundle_operations WHERE bot=? "
+        "AND persona=? AND operation_id=?",
+        namespace.as_tuple + (read.request.consumer_operation_id,),
+    ).fetchone() == (0,)
+    result = coordinator.recover_pending_first_ingress_c02_v1(
+        bootstrap, namespace, read.request.consumer_operation_id,
+        policy, admin, clock)
+    assert result.status == "committed"
+    assert len(permits) == 2 and permits[1] == permits[0]
+    assert fact_port.calls == 2
+    assert store._db.execute(
+        "SELECT COUNT(*) FROM graph_bundle_operations WHERE bot=? "
+        "AND persona=? AND operation_id=?",
+        namespace.as_tuple + (read.request.consumer_operation_id,),
+    ).fetchone() == (1,)

@@ -32,6 +32,7 @@ from .rewrite.sylanne3.host.first_ingress_c02_driver import (
     original_unacquired_handoff_v1,
     run_installed_first_ingress_c02_v1,
 )
+from .rewrite.sylanne3.host.ingress import IngressReceipt
 from .rewrite.sylanne3.installation_policy import AdminInstallationPolicy
 from .rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate, SceneCandidateCatalog
 from .rewrite.sylanne3.host.workbench_mount import WorkbenchHostMount
@@ -453,9 +454,12 @@ class Sylanne3Plugin(Star):
                     or not await installed_first_ingress_c02_pairing_ready_v1(
                         installation)):
                 return
-            # Collect original keys before any C02 write changes the V1 cursor.
+            # Collect both classes before writes invalidate the V1 cursor.
+            # A sealed pending C02 must never enter the original result-read path.
             with tempfile.SpooledTemporaryFile(
-                    max_size=131_072, mode="w+t", encoding="ascii") as ids:
+                    max_size=131_072, mode="w+t", encoding="ascii") as ids, \
+                    tempfile.SpooledTemporaryFile(
+                        max_size=131_072, mode="w+t", encoding="ascii") as pending_ids:
                 cursor = None
                 seen_cursors = set()
                 while not self._encoding_stopping:
@@ -474,6 +478,15 @@ class Sylanne3Plugin(Star):
                                     "Sylanne 3 acquired first encoding identity invalid; HOLD")
                                 return
                             ids.write(operation_id + "\n")
+                        elif item.recovery_state == "c02_pending_hold":
+                            operation_id = item.consumer_operation_id
+                            if (type(operation_id) is not str or not operation_id
+                                    or len(operation_id) > 512
+                                    or "\n" in operation_id or "\r" in operation_id):
+                                logger.warning(
+                                    "Sylanne 3 pending C02 identity invalid; HOLD")
+                                return
+                            pending_ids.write(operation_id + "\n")
                     cursor = page.next_cursor
                     if cursor is None:
                         break
@@ -482,6 +495,22 @@ class Sylanne3Plugin(Star):
                             "Sylanne 3 acquired first encoding cursor repeated; HOLD")
                         return
                     seen_cursors.add(cursor)
+                pending_ids.seek(0)
+                for line in pending_ids:
+                    if self._encoding_stopping:
+                        return
+                    committed = await runtime.recover_pending_first_ingress_c02_v1(
+                        line.rstrip("\n"))
+                    if committed is None:
+                        logger.warning("Sylanne 3 pending C02 remains HOLD")
+                    else:
+                        if not await runtime.recover_committed_first_ingress_c02_unknown_cost_v1(
+                                committed.operation_id):
+                            logger.warning(
+                                "Sylanne 3 pending C02 committed but cost remains HOLD")
+                        else:
+                            logger.info(
+                                "Sylanne 3 pending C02 and cost recovered; reply HOLD")
                 ids.seek(0)
                 for line in ids:
                     if self._encoding_stopping:

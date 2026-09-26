@@ -1,16 +1,20 @@
 """A durable first-ingress baseline can be handed back to the installed host."""
 
+import asyncio
 import sys
 import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from astrbot.api.star import Context
 
 from sylanne3.graph_coordinator import GraphCoordinator
 from sylanne3.graph_store import ProductionGraphStore
 from sylanne3.host.authority_profile import AdminD04EncodingBaselinePolicy
+from sylanne3.host.authority_profile import AdminD06FirstIngressC02Policy
 from sylanne3.host.authority_profile import (
     AdminD03ArrivalPolicy, AdminD03SelfIdentityProjectionPolicy,
 )
@@ -22,6 +26,7 @@ from sylanne3.host.ingress import IngressReceipt
 from sylanne3.host.v2_installation import V2InstallationAssembly
 from sylanne3.host.current_scene import CurrentHostScene
 from sylanne3.runtime_context import RuntimeContext
+from rewrite.host_tests.alpha1.test_runtime_bootstrap import load_plugin_module
 from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
 from sylanne3.runtime_contracts import QueryEpoch
 
@@ -32,6 +37,7 @@ sys.path.insert(0, str(_RUNTIME_TESTS))
 from test_d03_self_projection_commit import FixtureCurrentSelf, _commit  # noqa: E402
 from test_first_ingress_job_acquire_v2 import _op, _worker, FixedEncodingRequestIssuer  # noqa: E402
 from test_first_ingress_v2 import _ingress_inputs  # noqa: E402
+from test_first_ingress_c02_commit import c02_case  # noqa: E402
 from test_scene_binding_v2 import _scene_case, _session  # noqa: E402
 
 
@@ -219,5 +225,180 @@ async def test_sqlite_restart_rehands_only_original_queued_ingress(host_projecti
         assert original_acquired_handoff_v1(
             recovered, original_envelope, installation) == (
                 trusted_umo, envelope, receipt)
+        pending = replace(recovered, recovery_state="c02_pending_hold")
+        assert pending.c02_operation_digest is None
+        assert pending.c02_commit_seq is None
+        assert original_acquired_handoff_v1(
+            pending, original_envelope, installation) is None
+
+        module = load_plugin_module()
+        recovered_operations = []
+
+        class PendingRuntime:
+            v2_ingress_qualified = True
+
+            async def first_ingress_c02_accounting_installed_v1(self):
+                return True
+
+            async def discover_committed_first_ingress_c02_cost_v1(
+                    self, *, cursor, limit):
+                assert (cursor, limit) == (None, 50)
+                return SimpleNamespace(items=(pending,), next_cursor=None)
+
+            async def recover_pending_first_ingress_c02_v1(self, operation_id):
+                recovered_operations.append(operation_id)
+                return None
+
+            read_first_ingress_acquired_handoff_v1 = AsyncMock(
+                side_effect=AssertionError("pending C02 must not re-enter worker read"))
+            worker_model_result_select_attempt_v1 = AsyncMock(
+                side_effect=AssertionError("pending C02 must not select a new read"))
+            commit_first_ingress_c02_v1 = AsyncMock(
+                side_effect=AssertionError("pending C02 needs dedicated recovery"))
+
+        plugin = module.Sylanne3Plugin(
+            Context(asyncio.Queue(), {}, None, None, None, None,
+                    None, None, None, None, None), {"enabled": True})
+        plugin._runtime = PendingRuntime()
+        plugin._v2_installation = installation
+        plugin._run_first_ingress_c02 = AsyncMock(
+            side_effect=AssertionError("pending C02 must not send a model"))
+        with patch.object(module, "installed_first_ingress_c02_pairing_ready_v1",
+                          new=AsyncMock(return_value=True)):
+            await plugin._restore_acquired_first_ingress_c02_v1()
+        assert recovered_operations == [pending.consumer_operation_id]
+        plugin._runtime.read_first_ingress_acquired_handoff_v1.assert_not_awaited()
+        plugin._runtime.worker_model_result_select_attempt_v1.assert_not_awaited()
+        plugin._runtime.commit_first_ingress_c02_v1.assert_not_awaited()
+        plugin._run_first_ingress_c02.assert_not_awaited()
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_fails", (False, True))
+async def test_pending_c02_sqlite_restart_uses_dedicated_recovery_once(
+        c02_case, monkeypatch, recovery_fails):
+    store, coordinator, bootstrap, namespace, policy, clock, intent, read, fact_port = (
+        c02_case)
+    fence_port = coordinator._GraphCoordinator__content_fence_v2
+    begin = fence_port.begin_fence
+
+    def crash_before_write(**kwargs):
+        if kwargs["operation"] == "write":
+            raise RuntimeError("simulated process crash before C02 write fence")
+        return begin(**kwargs)
+
+    monkeypatch.setattr(fence_port, "begin_fence", crash_before_write)
+    with pytest.raises(RuntimeError, match="simulated process crash"):
+        coordinator.commit_first_ingress_c02_v1(
+            bootstrap, intent, read, policy,
+            AdminD06FirstIngressC02Policy(
+                30.0, {"cpu_ms": 3}, "c02-snapshot", "c02-resource"), clock)
+    monkeypatch.setattr(fence_port, "begin_fence", begin)
+    graph_path = store._db.execute("PRAGMA database_list").fetchone()[2]
+    registry = store._registry
+    operation_id = read.request.consumer_operation_id
+    store.close()
+    reopened = ProductionGraphStore(graph_path, registry)
+    fence_port.store = reopened
+    fact_port.graph_store = reopened
+    accounting = coordinator._GraphCoordinator__accounting_maintenance_port
+    accounting.store = reopened
+    next_bootstrap = object()
+    graph = GraphCoordinator(
+        reopened, next_bootstrap, holder="administrator",
+        content_fence_v2=fence_port,
+        d02_issuer=coordinator._GraphCoordinator__d02_issuer,
+        d11_issuer=coordinator._GraphCoordinator__d11_issuer,
+        model_terminal_cost_port=coordinator._GraphCoordinator__model_terminal_cost_port,
+        accounting_maintenance_port=accounting,
+        worker_result_fact_port=fact_port,
+    )
+    for domain, (provider, schema, schema_hash) in (
+            coordinator._GraphCoordinator__providers.items()):
+        graph.register_provider(next_bootstrap, domain, provider, schema, schema_hash)
+    graph._GraphCoordinator__scene_clock_policy = clock
+    if recovery_fails:
+        def unavailable(*_args):
+            raise RuntimeError("Authority unavailable")
+
+        monkeypatch.setattr(
+            graph, "recover_pending_first_ingress_c02_v1", unavailable)
+
+    class PendingRuntime:
+        v2_ingress_qualified = True
+
+        async def first_ingress_c02_accounting_installed_v1(self):
+            return graph.first_ingress_c02_accounting_installed_v1()
+
+        async def discover_committed_first_ingress_c02_cost_v1(
+                self, *, cursor, limit):
+            return graph.discover_first_ingress_recovery_v1(
+                next_bootstrap, namespace, cursor=cursor, limit=limit)
+
+        async def recover_pending_first_ingress_c02_v1(self, requested):
+            try:
+                return graph.recover_pending_first_ingress_c02_v1(
+                    next_bootstrap, namespace, requested, policy,
+                    AdminD06FirstIngressC02Policy(
+                        30.0, {"cpu_ms": 3}, "c02-snapshot", "c02-resource"),
+                    clock)
+            except Exception:
+                return None
+
+        async def recover_committed_first_ingress_c02_unknown_cost_v1(
+                self, requested):
+            settled.append(requested)
+            return True
+
+        read_first_ingress_acquired_handoff_v1 = AsyncMock(
+            side_effect=AssertionError("pending C02 cannot re-enter model result read"))
+        worker_model_result_select_attempt_v1 = AsyncMock(
+            side_effect=AssertionError("pending C02 cannot select another read"))
+
+    module = load_plugin_module()
+    settled = []
+    plugin = module.Sylanne3Plugin(
+        Context(asyncio.Queue(), {}, None, None, None, None,
+                None, None, None, None, None), {"enabled": True})
+    plugin._runtime = PendingRuntime()
+    plugin._v2_installation = object()
+    plugin._run_first_ingress_c02 = AsyncMock(
+        side_effect=AssertionError("pending C02 cannot send another model call"))
+    try:
+        page = await plugin._runtime.discover_committed_first_ingress_c02_cost_v1(
+            cursor=None, limit=50)
+        assert next(item for item in page.items if
+                    item.consumer_operation_id == operation_id).recovery_state == (
+                        "c02_pending_hold")
+        with patch.object(module, "installed_first_ingress_c02_pairing_ready_v1",
+                          new=AsyncMock(return_value=True)):
+            await plugin._restore_acquired_first_ingress_c02_v1()
+        committed = reopened._db.execute(
+            "SELECT COUNT(*) FROM graph_bundle_operations WHERE bot=? "
+            "AND persona=? AND operation_id=?",
+            namespace.as_tuple + (operation_id,),
+        ).fetchone()[0]
+        assert committed == (0 if recovery_fails else 1)
+        assert settled == ([] if recovery_fails else [operation_id])
+        assert fact_port.calls == (0 if recovery_fails else 1)
+        assert reopened._db.execute(
+            "SELECT COUNT(*) FROM graph_first_ingress_c02_candidates_v1 "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            namespace.as_tuple + (operation_id,),
+        ).fetchone()[0] == (1 if recovery_fails else 0)
+        plugin._runtime.read_first_ingress_acquired_handoff_v1.assert_not_awaited()
+        plugin._runtime.worker_model_result_select_attempt_v1.assert_not_awaited()
+        plugin._run_first_ingress_c02.assert_not_awaited()
+        if not recovery_fails:
+            with patch.object(module, "installed_first_ingress_c02_pairing_ready_v1",
+                              new=AsyncMock(return_value=True)):
+                await plugin._restore_acquired_first_ingress_c02_v1()
+            assert reopened._db.execute(
+                "SELECT COUNT(*) FROM graph_bundle_operations WHERE bot=? "
+                "AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone() == (1,)
     finally:
         reopened.close()
