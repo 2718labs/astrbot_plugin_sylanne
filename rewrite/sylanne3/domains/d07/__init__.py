@@ -1445,10 +1445,14 @@ class D07DomainProvider:
         return SimulationResult(request.activity_id, tuple(branches), truncated)
 
 
+from .source_correction import D07SourceReevaluationCandidate, compile_d07_source_reevaluation
+
+
 __all__ = [
     "AffectFocusProjection", "AttentionPolicy", "AttentionTicket", "BeliefRevision", "CognitiveActivity", "Concern",
     "CurrentInterpretationCandidate", "D07DomainProvider",
     "EvidenceStatus", "FocusState", "Hypothesis", "HypothesisSet", "RankedAttention",
     "RecollectionHandoff", "ReflectionCheckpoint", "SimulationBranch", "SimulationRequest",
     "SimulationResult", "Stance", "WorkingSet", "WorkingSetItem",
+    "D07SourceReevaluationCandidate", "compile_d07_source_reevaluation",
 ]
