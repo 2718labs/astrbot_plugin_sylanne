@@ -68,6 +68,10 @@ from .runtime.post_c02_domain_commit import commit_post_c02_reply_bundle_v1
 from .host.post_c02_reply_driver import (
     PostC02ReplyCandidate, post_c02_reply_operation_id,
 )
+from .host.post_c02_attention_driver import (
+    post_c02_attention_operation_id, prepare_post_c02_attention_v1,
+)
+from .runtime.first_ingress_v2 import trusted_upper
 from .runtime.first_ingress_unacquired import FirstIngressUnacquiredPageV1
 from .runtime.first_ingress_recovery import (
     FirstIngressRecoveryItemV1, FirstIngressRecoveryPageV1,
@@ -517,6 +521,9 @@ class RuntimeContext:
                         first = graph.commit_first_ingress_v2(
                             bootstrap, host, policy,
                             installation.ingress_clock, installation.ingress_encoding,
+                            installation.admin_bundle.d06_private_reply_source
+                            if type(installation.admin_bundle) is AdminInstallationBundle
+                            else None,
                         )
                         if (first.status in {"committed", "duplicate"}
                                 and type(installation.d03_arrival) is AdminD03ArrivalPolicy):
@@ -1414,6 +1421,53 @@ class RuntimeContext:
         return await self.commit_first_ingress_c02_v2(
             envelope, receipt, executor=executor,
             original_recovery=original_recovery)
+
+    async def commit_post_c02_attention_v1(
+        self, *, c02_operation_id: str, source_ref: str | None = None,
+    ) -> CommitReceipt | None:
+        """Commit a current D07 ticket before the post-C02 model job."""
+        bundle = self._v2_model_bundle
+        policy = self._v2_policy
+        if (self._worker is None or self._v2_bootstrap is None
+                or self._v2_port is None or self._v2_installation_grant is None
+                or type(bundle) is not AdminInstallationBundle
+                or type(policy) is not AdminInstallationPolicy
+                or bundle.installation_policy != policy):
+            return None
+        bootstrap = self._v2_bootstrap
+        actor = self._v2_installation_grant.subject
+        def commit(graph: GraphCoordinator) -> CommitReceipt | None:
+            (c02, snapshot, qualification, conversation_ref, guard, anchor,
+             clock) = graph.read_post_c02_attention_inputs_v1(
+                bootstrap, policy.namespace, c02_operation_id, source_ref, bundle)
+            exact_source_ref = qualification.source_refs[0]
+            operation_id = post_c02_attention_operation_id(
+                c02_operation_id, exact_source_ref)
+            lease, capability = graph.grant(
+                bootstrap, actor=actor, issuer_domain="d11",
+                namespace=policy.namespace, domains=("d07",),
+                activation_generation=anchor.activation_generation,
+                operation_id=operation_id)
+            try:
+                authority = AuthorityContext(
+                    actor, "d11", capability, policy.namespace,
+                    ("event", "persona"), "expression", (conversation_ref,),
+                    policy.root_grant.policy_ref, anchor.activation_generation)
+                recorded = graph.get_operation(authority, lease, operation_id)
+                if recorded is not None:
+                    return recorded
+                now = trusted_upper(clock)
+                candidate = prepare_post_c02_attention_v1(
+                    c02_receipt=c02, source_ref=exact_source_ref, snapshot=snapshot,
+                    qualification=qualification, authority=authority,
+                    guard=guard, parent_budget_lease_ref=policy.root_grant.lease_id,
+                    conversation_ref=conversation_ref, now_utc=now,
+                    monotonic_deadline=clock.monotonic_after_seconds + 300.0)
+                return graph.commit_domain_bundle(candidate.bundle, lease)
+            finally:
+                graph.release_authority_lease(bootstrap, lease)
+
+        return await self._worker.call(commit)
 
     async def commit_prepared_post_c02_reply_v1(
         self, *, c02_operation_id: str, source_ref: str,

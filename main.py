@@ -44,6 +44,7 @@ from .rewrite.sylanne3.runtime_context import (
     FirstIngressPreEncodingStagesV1, RuntimeContext, RuntimeHealth,
 )
 from .rewrite.sylanne3.runtime.first_ingress_recovery import FirstIngressRecoveryItemV1
+from .rewrite.sylanne3.memory_types import source_key
 from .rewrite.sylanne3.runtime_contracts import NamespaceId, canonical_digest
 from .rewrite.sylanne3.workbench_api.current_onboarding import CurrentOnboardingResolver
 from .rewrite.sylanne3.workbench_api.d01_onboarding import CurrentD01OnboardingResolver
@@ -397,7 +398,19 @@ class Sylanne3Plugin(Star):
             if committed is None:
                 logger.warning("Sylanne 3 first encoding C02 remains HOLD")
             else:
-                logger.info("Sylanne 3 first encoding C02 committed; reply HOLD")
+                settled = await run_installed_committed_first_ingress_c02_cost_v2(
+                    runtime, installation, committed.operation_id)
+                if settled is not True:
+                    logger.warning("Sylanne 3 C02 committed but cost remains HOLD")
+                    return
+                source_ref = source_key(
+                    *envelope.namespace.as_tuple, envelope.lineage.source_ref).token
+                attention = await runtime.commit_post_c02_attention_v1(
+                    c02_operation_id=committed.operation_id, source_ref=source_ref)
+                if attention is None or attention.status not in {"committed", "duplicate"}:
+                    logger.warning("Sylanne 3 settled C02 attention remains HOLD")
+                    return
+                logger.info("Sylanne 3 C02 and D07 attention committed; reply HOLD")
         except asyncio.CancelledError:
             logger.warning("Sylanne 3 first encoding interrupted; original call HOLD")
             raise
@@ -539,8 +552,15 @@ class Sylanne3Plugin(Star):
                             logger.warning(
                                 "Sylanne 3 pending C02 committed but cost remains HOLD")
                         else:
-                            logger.info(
-                                "Sylanne 3 pending C02 and cost recovered; reply HOLD")
+                            attention = await runtime.commit_post_c02_attention_v1(
+                                c02_operation_id=committed.operation_id)
+                            if attention is None or attention.status not in {
+                                    "committed", "duplicate"}:
+                                logger.warning(
+                                    "Sylanne 3 recovered C02 attention remains HOLD")
+                            else:
+                                logger.info(
+                                    "Sylanne 3 recovered C02 and D07 attention committed; reply HOLD")
                 ids.seek(0)
                 for line in ids:
                     if self._encoding_stopping:
@@ -620,6 +640,13 @@ class Sylanne3Plugin(Star):
                         settled = terminal is True
                     if not settled:
                         logger.warning("Sylanne 3 committed C02 cost remains HOLD")
+                    else:
+                        attention = await runtime.commit_post_c02_attention_v1(
+                            c02_operation_id=operation_id)
+                        if attention is None or attention.status not in {
+                                "committed", "duplicate"}:
+                            logger.warning(
+                                "Sylanne 3 settled C02 attention remains HOLD")
         except asyncio.CancelledError:
             raise
         except Exception:

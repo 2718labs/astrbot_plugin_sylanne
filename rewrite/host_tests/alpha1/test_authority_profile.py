@@ -179,6 +179,20 @@ def test_model_workflows_are_separate_bounded_admin_authorities() -> None:
     assert authority_profile._model_workflows_from_payload(_schema2_payload()) is None
 
 
+def test_private_reply_expression_requires_explicit_schema2_workflow() -> None:
+    payload = _workflow_profile_payload()
+    payload["d06_private_reply_source"] = {
+        "version": 1, "scope": "private_conversation", "grant_expression": True,
+    }
+    authority_profile._policy_from_payload(payload)
+    assert authority_profile._d06_private_reply_source_from_payload(payload) == (
+        authority_profile.AdminD06PrivateReplySourcePolicy(
+            1, "private_conversation", True))
+    del payload["model_workflows"]
+    with pytest.raises(ValueError, match="installed reply workflow"):
+        authority_profile._policy_from_payload(payload)
+
+
 def test_legacy_ingress_model_remains_parseable_without_encoding_authority() -> None:
     payload = _schema2_payload()
     legacy = _model_workflow_payload("reply", "proposal", "reply-template-v1")

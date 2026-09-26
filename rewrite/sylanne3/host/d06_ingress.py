@@ -10,6 +10,7 @@ from ..graph_coordinator import GraphCoordinator
 from ..runtime.ingress_contracts import CommittedIngressReplay
 from ..runtime_contracts import CommitReceipt, DomainBundle, canonical_digest
 from .ingress import HostIngressEnvelope, IngressReceipt
+from .authority_profile import AdminD06PrivateReplySourcePolicy
 
 
 def ingress_source_identity(source_ref: str) -> str:
@@ -36,7 +37,10 @@ def ingress_content_fingerprint(envelope: HostIngressEnvelope) -> str:
     })
 
 
-def source_admission_from_host(envelope: HostIngressEnvelope) -> SourceAdmission:
+def source_admission_from_host(
+    envelope: HostIngressEnvelope,
+    reply_source_policy: AdminD06PrivateReplySourcePolicy | None = None,
+) -> SourceAdmission:
     """Preserve host lineage while producing a bounded D06 source candidate."""
 
     if not isinstance(envelope, HostIngressEnvelope):
@@ -44,6 +48,11 @@ def source_admission_from_host(envelope: HostIngressEnvelope) -> SourceAdmission
     reality = {"external_report": "reported"}.get(envelope.lineage.content_reality)
     if reality is None:
         raise ValueError("host lineage cannot be represented by D06")
+    if reply_source_policy is not None and type(reply_source_policy) is not AdminD06PrivateReplySourcePolicy:
+        raise TypeError("reply source policy must be administrator typed")
+    purposes = ("context", "consolidation")
+    if reply_source_policy is not None and envelope.visibility == "private":
+        purposes += ("expression",)
     return SourceAdmission(
         source_id=envelope.lineage.source_ref,
         text=envelope.text,
@@ -56,7 +65,7 @@ def source_admission_from_host(envelope: HostIngressEnvelope) -> SourceAdmission
         learned_at=envelope.learned_at,
         provenance_family=envelope.lineage.provenance_family,
         audiences=(envelope.conversation_ref,),
-        purposes=("context", "consolidation"),
+        purposes=purposes,
     )
 
 

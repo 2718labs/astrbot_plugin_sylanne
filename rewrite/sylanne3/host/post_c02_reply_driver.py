@@ -11,8 +11,8 @@ from dataclasses import asdict, dataclass, replace
 import json
 
 from ..domains.d07 import (
-    AttentionPolicy, AttentionTicket, D07DomainProvider, FocusState,
-    attention_ticket_key,
+    AttentionTicket, FocusState, attention_ticket_key,
+    read_current_focus_attention_ticket,
 )
 from ..domains.d08 import (
     ActionIntent, ActionSchema, CommunicationGrantRequest, GoalExecutionProvider,
@@ -93,22 +93,20 @@ def prepare_post_c02_private_reply_v1(
             or communication.cancellation_epoch != 0
             or len(segments) != 1 or len(communication.segment_specs) != 1):
         raise ValueError("only one ordinary passive private text reply is supported")
-    if (type(snapshot) is not GraphSnapshot
+    if type(snapshot) is not GraphSnapshot:
+        raise ValueError("current graph attention snapshot required")
+    current_attention = read_current_focus_attention_ticket(
+        snapshot, namespace, now=now)
+    if (current_attention is None or current_attention.ticket != attention
+            or current_attention.focus != current_focus
             or attention.causal_root != source_ref
             or attention.source_refs != (source_ref,)
-            or current_focus.persona_id != namespace.persona_id):
-        raise ValueError("attention must target the original C02 source and persona")
-    if attention.category != "interaction":
-        raise ValueError("passive reply requires an interaction attention ticket")
-    d07 = D07DomainProvider()
-    focus = d07.allocate_focus(
-        current_focus, (attention,), AttentionPolicy.default(), now=now)
-    if focus.primary_ticket_ref != attention.ticket_id:
-        raise ValueError("inbound message was not selected for attention")
+            or attention.category != "interaction"):
+        raise ValueError("current D07 attention must select the original C02 source")
     ticket_key = attention_ticket_key(namespace, attention.ticket_id)
-    focus = replace(focus, primary_ticket_ref=ticket_key.token)
-    if reads.get(ticket_key, 0) != 0:
-        raise ValueError("reply attention ticket must be a new graph head")
+    if (reads.get(ticket_key) != current_attention.ticket_version.revision
+            or reads.get(focus_key) != current_attention.focus_version.revision):
+        raise ValueError("reply attention and focus require current graph reads")
 
     registry = RequiredCheckRegistry()
     registry.register(schema)
@@ -134,7 +132,7 @@ def prepare_post_c02_private_reply_v1(
         activity_owner, "d09.verified_segment_batch.v1", batch["batch_id"])
     if reads.get(grant_key, 0) != 0 or reads.get(batch_key, 0) != 0:
         raise ValueError("reply grant and finite batch must be new graph heads")
-    extra = tuple(GraphVersion(key, 0) for key in (ticket_key, grant_key, batch_key)
+    extra = tuple(GraphVersion(key, 0) for key in (grant_key, batch_key)
                   if key not in reads)
     envelope = replace(envelope, version_guard=replace(
         envelope.version_guard,
@@ -158,10 +156,8 @@ def prepare_post_c02_private_reply_v1(
         "d09", "d09.proposal.v1", d09.descriptor.request_schema_hash,
         envelope, (GraphWrite(batch_key, batch),), DependencySet(), (), (),
     ))
-    d07_proposal = d07.attention_focus_proposal(
-        envelope, snapshot, attention, focus, now=now)
     return PostC02ReplyCandidate(
-        envelope, (d07_proposal, d08_proposal, d09_proposal), focus, action,
+        envelope, (d08_proposal, d09_proposal), current_focus, action,
         batch["batch_id"])
 
 

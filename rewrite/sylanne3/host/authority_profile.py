@@ -51,6 +51,9 @@ _D04_BASELINE_FIELDS = _D03_ARRIVAL_FIELDS
 _D03_SELF_PROJECTION_FIELDS = _D03_ARRIVAL_FIELDS
 _D06_FIRST_INGRESS_C02_FIELDS = _D03_ARRIVAL_FIELDS
 _D06_SOURCE_CORRECTION_FIELDS = _D03_ARRIVAL_FIELDS
+_D06_PRIVATE_REPLY_SOURCE_FIELDS = frozenset({
+    "version", "scope", "grant_expression",
+})
 _INGRESS_MODEL_FIELDS = frozenset({
     "provider_id", "model_id", "provider_config_ref", "provider_config_digest",
     "timeout_seconds", "max_output_tokens", "required_capabilities", "privacy_tier",
@@ -517,6 +520,21 @@ class AdminModelWorkflowsV2:
 
 
 @dataclass(frozen=True, slots=True)
+class AdminD06PrivateReplySourcePolicy:
+    """Explicit administrator opt-in to expression on one private ingress source."""
+
+    version: int
+    scope: str
+    grant_expression: bool
+
+    def __post_init__(self) -> None:
+        if (type(self.version) is not int or self.version != 1
+                or self.scope != "private_conversation"
+                or self.grant_expression is not True):
+            raise ValueError("private reply source policy must be version-1 private opt-in")
+
+
+@dataclass(frozen=True, slots=True)
 class AdminInstallationBundle:
     """One verified installation snapshot for Authority client assembly."""
 
@@ -535,6 +553,7 @@ class AdminInstallationBundle:
     d03_self_identity_projection: AdminD03SelfIdentityProjectionPolicy | None = None
     d06_source_correction: AdminD06SourceCorrectionPolicy | None = None
     reverse_handoff: object | None = None
+    d06_private_reply_source: AdminD06PrivateReplySourcePolicy | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -842,7 +861,7 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d06_first_ingress_c02", "d06_source_correction", "model_workflows", "reverse_handoff"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "model_workflows", "reverse_handoff"}
     )
 
 
@@ -1084,6 +1103,19 @@ def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkf
     return AdminModelWorkflowsV2(raw["version"], **workflows)
 
 
+def _d06_private_reply_source_from_payload(
+    payload: dict[str, object],
+) -> AdminD06PrivateReplySourcePolicy | None:
+    if "d06_private_reply_source" not in payload:
+        return None
+    if _model_workflows_from_payload(payload) is None:
+        raise ValueError("private reply expression requires installed reply workflow")
+    raw = _exact_object(payload["d06_private_reply_source"],
+                        _D06_PRIVATE_REPLY_SOURCE_FIELDS,
+                        "private reply source policy")
+    return AdminD06PrivateReplySourcePolicy(**raw)
+
+
 def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     """Parse schema 2 after the enclosing profile passed its trusted read gate."""
     from ..runtime.issuers import BudgetLeaseGrant
@@ -1100,6 +1132,7 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     projection = _d03_projection_from_payload(payload)
     model = _ingress_model_from_payload(payload)
     workflows = _model_workflows_from_payload(payload)
+    _d06_private_reply_source_from_payload(payload)
     _workbench_origin_from_payload(payload)
     values = _exact_object(payload["installation_policy"], _INSTALLATION_FIELDS,
                            "installation policy")
@@ -1347,7 +1380,8 @@ def _load_installation_bundle_from_root(
                                    _d06_c02_from_payload(payload),
                                    _d03_projection_from_payload(payload),
                                    _d06_source_correction_from_payload(payload),
-                                   reverse_handoff)
+                                   reverse_handoff,
+                                   _d06_private_reply_source_from_payload(payload))
 
 
 def _load_windows_installation_bundle(
@@ -1383,7 +1417,8 @@ def _load_windows_installation_bundle(
                                    _d06_c02_from_payload(payload),
                                    _d03_projection_from_payload(payload),
                                    _d06_source_correction_from_payload(payload),
-                                   reverse_handoff)
+                                   reverse_handoff,
+                                   _d06_private_reply_source_from_payload(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -1437,6 +1472,7 @@ def load_admin_d11_signing_key(profile_id: str) -> bytes:
 __all__ = (
     "AdminD03ArrivalPolicy", "AdminD03SelfIdentityProjectionPolicy", "AdminD04EncodingBaselinePolicy", "AdminD06FirstIngressC02Policy", "AdminD06SourceCorrectionPolicy", "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
     "AdminModelWorkflowV2", "AdminModelWorkflowsV2",
+    "AdminD06PrivateReplySourcePolicy",
     "AdminInstallationBundle",
     "AdminInstallationPolicy",
     "AuthorityProfileUnavailable",
