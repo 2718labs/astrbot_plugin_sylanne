@@ -295,8 +295,25 @@ class ExecutionBindingV1:
             raise ValueError("execution binding requires recovery footprint")
         for name in ("namespace", "activity_id", "effect_id", "attempt_id",
                      "operation_id", "admission_ref", "platform_capability_ref",
-                     "adapter_ref", "account_ref", "destination_ref", "content_fence"):
+                     "adapter_ref", "content_fence"):
             identifier(getattr(self, name), name)
+        for name, length in (("account_ref", 3), ("destination_ref", 2)):
+            value = getattr(self, name)
+            if type(value) is not str:
+                raise ValueError(f"invalid {name}")
+            if not value.startswith("["):
+                identifier(value, name)  # Historical opaque route identifiers.
+                continue
+            try:
+                parts = json.loads(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid {name}") from exc
+            if (type(parts) is not list or len(parts) != length
+                    or any(type(part) is not str or not part or len(part) > 256
+                           for part in parts)
+                    or json.dumps(parts, ensure_ascii=True, separators=(",", ":"))
+                    != value):
+                raise ValueError(f"invalid {name}")
         for name in ("dispatch_generation", "activation_generation", "worker_fence",
                      "cancel_epoch"):
             _exact_int(getattr(self, name), name)
