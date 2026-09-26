@@ -29,6 +29,7 @@ from .host.authority_profile import (
     AdminIngressClockPolicy, AdminIngressEncodingPolicy,
     AdminIngressModelPolicy, AdminInstallationBundle, AdminModelWorkflowsV2,
     AdminModelWorkflowV2,
+    AdminD07AttentionPolicy,
 )
 from .host.v2_ingress_adapter import ingress_host_facts
 from .host.installed_package import verify_installed_package
@@ -1431,6 +1432,7 @@ class RuntimeContext:
         if (self._worker is None or self._v2_bootstrap is None
                 or self._v2_port is None or self._v2_installation_grant is None
                 or type(bundle) is not AdminInstallationBundle
+                or type(bundle.d07_attention) is not AdminD07AttentionPolicy
                 or type(policy) is not AdminInstallationPolicy
                 or bundle.installation_policy != policy):
             return None
@@ -1451,19 +1453,26 @@ class RuntimeContext:
             try:
                 authority = AuthorityContext(
                     actor, "d11", capability, policy.namespace,
-                    ("event", "persona"), "expression", (conversation_ref,),
+                    ("persona",), "expression", (conversation_ref,),
                     policy.root_grant.policy_ref, anchor.activation_generation)
                 recorded = graph.get_operation(authority, lease, operation_id)
                 if recorded is not None:
                     return recorded
                 now = trusted_upper(clock)
+                uncertainty = (2 * bundle.ingress_clock.max_utc_error_seconds
+                               + bundle.ingress_clock.max_round_trip_seconds)
+                lifetime = bundle.d07_attention.deadline_after_seconds - uncertainty
+                if lifetime <= 0:
+                    return None
                 candidate = prepare_post_c02_attention_v1(
                     c02_receipt=c02, source_ref=exact_source_ref, snapshot=snapshot,
                     qualification=qualification, authority=authority,
                     guard=guard, parent_budget_lease_ref=policy.root_grant.lease_id,
                     conversation_ref=conversation_ref, now_utc=now,
-                    monotonic_deadline=clock.monotonic_after_seconds + 300.0)
-                return graph.commit_domain_bundle(candidate.bundle, lease)
+                    monotonic_deadline=clock.monotonic_after_seconds + lifetime,
+                    ticket_lifetime_seconds=lifetime)
+                return graph.commit_post_c02_attention_v1(
+                    candidate.bundle, lease, bundle)
             finally:
                 graph.release_authority_lease(bootstrap, lease)
 

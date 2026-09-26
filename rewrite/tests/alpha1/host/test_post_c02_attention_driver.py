@@ -12,6 +12,7 @@ from sylanne3.memory_types import access_key, source_key
 from sylanne3.host.post_c02_attention_driver import (
     post_c02_attention_operation_id, prepare_post_c02_attention_v1,
 )
+from sylanne3.runtime.reply_model_job import d07_attention_quote_id_v1
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommitReceipt, NamespaceId, QueryEpoch,
     SourceQualification, VersionGuard, canonical_digest,
@@ -69,6 +70,8 @@ def test_pre_model_attention_writes_source_bound_ticket_and_focus():
     assert result.bundle.envelope.identity.operation_id == post_c02_attention_operation_id(
         "c02-1", case["source_ref"])
     assert GraphVersion(key, 0) in result.bundle.envelope.version_guard.read_versions
+    assert result.bundle.envelope.version_guard.resource_lease_versions[0].ref == (
+        d07_attention_quote_id_v1(namespace, result.bundle.envelope.identity.operation_id))
 
 
 def test_pre_model_attention_rejects_revoked_current_access():

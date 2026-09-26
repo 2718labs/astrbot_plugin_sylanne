@@ -54,6 +54,7 @@ _D06_SOURCE_CORRECTION_FIELDS = _D03_ARRIVAL_FIELDS
 _D06_PRIVATE_REPLY_SOURCE_FIELDS = frozenset({
     "version", "scope", "grant_expression",
 })
+_D07_ATTENTION_FIELDS = _D03_ARRIVAL_FIELDS
 _INGRESS_MODEL_FIELDS = frozenset({
     "provider_id", "model_id", "provider_config_ref", "provider_config_digest",
     "timeout_seconds", "max_output_tokens", "required_capabilities", "privacy_tier",
@@ -215,6 +216,44 @@ class AdminD03ArrivalPolicy:
             value = getattr(self, name)
             if (type(value) is not str or _RESOURCE_DIMENSION.fullmatch(value) is None):
                 raise ValueError(f"D03 arrival {name} must be a canonical resource ID")
+
+    def digest_payload(self) -> dict[str, object]:
+        return {
+            "deadline_after_seconds": self.deadline_after_seconds,
+            "quote_ceiling": dict(self.quote_ceiling),
+            "snapshot_ref": self.snapshot_ref,
+            "resource_ref": self.resource_ref,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AdminD07AttentionPolicy:
+    """Administrator-bounded CPU price for one source-bound D07 selection."""
+
+    deadline_after_seconds: float
+    quote_ceiling: Mapping[str, int]
+    snapshot_ref: str
+    resource_ref: str
+
+    def __post_init__(self) -> None:
+        from ..runtime.issuers import MAX_DIMENSIONS, MAX_QUANTITY
+
+        if (type(self.deadline_after_seconds) not in (int, float)
+                or not math.isfinite(self.deadline_after_seconds)
+                or not 0 < self.deadline_after_seconds <= 300):
+            raise ValueError("D07 attention deadline must be bounded")
+        ceiling = self.quote_ceiling
+        if (not isinstance(ceiling, Mapping) or not 0 < len(ceiling) <= MAX_DIMENSIONS
+                or any(type(name) is not str
+                       or _RESOURCE_DIMENSION.fullmatch(name) is None
+                       or type(amount) is not int or not 0 < amount <= MAX_QUANTITY
+                       for name, amount in ceiling.items())):
+            raise ValueError("D07 attention quote ceiling is invalid")
+        object.__setattr__(self, "quote_ceiling", MappingProxyType(dict(ceiling)))
+        for name in ("snapshot_ref", "resource_ref"):
+            if (type(getattr(self, name)) is not str
+                    or _RESOURCE_DIMENSION.fullmatch(getattr(self, name)) is None):
+                raise ValueError(f"D07 attention {name} is invalid")
 
     def digest_payload(self) -> dict[str, object]:
         return {
@@ -554,6 +593,7 @@ class AdminInstallationBundle:
     d06_source_correction: AdminD06SourceCorrectionPolicy | None = None
     reverse_handoff: object | None = None
     d06_private_reply_source: AdminD06PrivateReplySourcePolicy | None = None
+    d07_attention: AdminD07AttentionPolicy | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -861,7 +901,7 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
 
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "model_workflows", "reverse_handoff"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "d07_attention", "model_workflows", "reverse_handoff"}
     )
 
 
@@ -1009,6 +1049,18 @@ def _d03_arrival_from_payload(payload: dict[str, object]) -> AdminD03ArrivalPoli
     return AdminD03ArrivalPolicy(**values)
 
 
+def _d07_attention_from_payload(payload: dict[str, object]) -> AdminD07AttentionPolicy | None:
+    if "d07_attention" not in payload:
+        return None
+    if payload.get("schema") != 2:
+        raise ValueError("D07 attention requires profile schema 2")
+    values = _exact_object(payload["d07_attention"], _D07_ATTENTION_FIELDS,
+                           "D07 attention")
+    if type(values["quote_ceiling"]) is not dict:
+        raise ValueError("D07 attention quote ceiling must be an object")
+    return AdminD07AttentionPolicy(**values)
+
+
 def _d04_baseline_from_payload(payload: dict[str, object]) -> AdminD04EncodingBaselinePolicy | None:
     if "d04_encoding_baseline" not in payload:
         return None
@@ -1126,6 +1178,7 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     _ingress_clock_from_payload(payload)
     encoding = _ingress_encoding_from_payload(payload)
     arrival = _d03_arrival_from_payload(payload)
+    attention = _d07_attention_from_payload(payload)
     baseline = _d04_baseline_from_payload(payload)
     c02 = _d06_c02_from_payload(payload)
     correction = _d06_source_correction_from_payload(payload)
@@ -1172,6 +1225,13 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
         if any(amount > policy.root_grant.max_ceiling.get(name, 0)
                for name, amount in arrival.quote_ceiling.items()):
             raise ValueError("D03 arrival quote exceeds the signed root grant")
+    if attention is not None:
+        if "d07.attention" not in policy.root_grant.allowed_work_kinds:
+            raise ValueError("D07 attention requires an explicit root grant work kind")
+        if any(amount > policy.root_grant.max_ceiling.get(name, 0)
+               or amount > policy.root_lease.limits.get(name, 0)
+               for name, amount in attention.quote_ceiling.items()):
+            raise ValueError("D07 attention quote exceeds the signed root budget")
     if baseline is not None:
         if "d04.encoding_baseline" not in policy.root_grant.allowed_work_kinds:
             raise ValueError("D04 baseline requires an explicit root grant work kind")
@@ -1381,7 +1441,8 @@ def _load_installation_bundle_from_root(
                                    _d03_projection_from_payload(payload),
                                    _d06_source_correction_from_payload(payload),
                                    reverse_handoff,
-                                   _d06_private_reply_source_from_payload(payload))
+                                   _d06_private_reply_source_from_payload(payload),
+                                   _d07_attention_from_payload(payload))
 
 
 def _load_windows_installation_bundle(
@@ -1418,7 +1479,8 @@ def _load_windows_installation_bundle(
                                    _d03_projection_from_payload(payload),
                                    _d06_source_correction_from_payload(payload),
                                    reverse_handoff,
-                                   _d06_private_reply_source_from_payload(payload))
+                                   _d06_private_reply_source_from_payload(payload),
+                                   _d07_attention_from_payload(payload))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -1473,6 +1535,7 @@ __all__ = (
     "AdminD03ArrivalPolicy", "AdminD03SelfIdentityProjectionPolicy", "AdminD04EncodingBaselinePolicy", "AdminD06FirstIngressC02Policy", "AdminD06SourceCorrectionPolicy", "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
     "AdminModelWorkflowV2", "AdminModelWorkflowsV2",
     "AdminD06PrivateReplySourcePolicy",
+    "AdminD07AttentionPolicy",
     "AdminInstallationBundle",
     "AdminInstallationPolicy",
     "AuthorityProfileUnavailable",

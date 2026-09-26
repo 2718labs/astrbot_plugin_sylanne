@@ -193,6 +193,23 @@ def test_private_reply_expression_requires_explicit_schema2_workflow() -> None:
         authority_profile._policy_from_payload(payload)
 
 
+def test_d07_attention_requires_its_own_bounded_root_grant() -> None:
+    payload = _workflow_profile_payload()
+    payload["d07_attention"] = {
+        "deadline_after_seconds": 30,
+        "quote_ceiling": {"output_tokens": 1},
+        "snapshot_ref": "attention-snapshot",
+        "resource_ref": "attention-resource",
+    }
+    with pytest.raises(ValueError, match="root grant work kind"):
+        authority_profile._policy_from_payload(payload)
+    payload["installation_policy"]["root_grant"]["allowed_work_kinds"].append(
+        "d07.attention")
+    authority_profile._policy_from_payload(payload)
+    attention = authority_profile._d07_attention_from_payload(payload)
+    assert attention.digest_payload() == payload["d07_attention"]
+
+
 def test_legacy_ingress_model_remains_parseable_without_encoding_authority() -> None:
     payload = _schema2_payload()
     legacy = _model_workflow_payload("reply", "proposal", "reply-template-v1")

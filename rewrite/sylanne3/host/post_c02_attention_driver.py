@@ -17,8 +17,10 @@ from ..graph_types import AtomKey, GraphSnapshot, GraphVersion, Owner
 from ..memory_types import access_key, source_key
 from ..runtime_contracts import (
     AuthorityContext, CommandEnvelope, CommitReceipt, DomainBundle,
-    OperationIdentity, SourceQualification, VersionGuard, canonical_digest,
+    OperationIdentity, SourceQualification, VersionGuard, VersionedRef,
+    canonical_digest,
 )
+from ..runtime.reply_model_job import d07_attention_quote_id_v1
 
 
 def post_c02_attention_operation_id(c02_operation_id: str, source_ref: str) -> str:
@@ -111,8 +113,12 @@ def prepare_post_c02_attention_v1(
         c02_receipt.activity_id, None, "attention-attempt", "post_c02_attention",
         operation_id, canonical_digest({"input_refs": list(inputs)}),
     )
+    if guard.resource_lease_versions:
+        raise ValueError("D07 attention quote must be issued with this operation")
+    quote_guard = replace(guard, resource_lease_versions=(
+        VersionedRef(d07_attention_quote_id_v1(namespace, operation_id), 1),))
     envelope = CommandEnvelope(
-        "sylanne.runtime.v1", identity, authority, guard, qualification,
+        "sylanne.runtime.v1", identity, authority, quote_guard, qualification,
         inputs, parent_budget_lease_ref, now_utc + ticket_lifetime_seconds,
         monotonic_deadline, "character-v1", (c02_receipt.operation_id,),
     )
