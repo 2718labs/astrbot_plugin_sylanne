@@ -22,6 +22,9 @@ from sylanne3.memory_types import (
     InterpretationRecord, SourceRecord, access_key, interpretation_key, source_key,
 )
 from sylanne3.workbench_api.source_correction import SourceCorrectionRequestV1
+from sylanne3.workbench_api import (
+    AuthenticatedSession, GraphWorkbenchIssuer, RequestContext, WorkbenchService,
+)
 
 from test_graph_v2_provisioning import _owner_issue_case
 
@@ -186,6 +189,59 @@ def test_source_correction_commits_atomic_bundle_and_replays_exact_receipt(tmp_p
             statement="Different claim")
         with pytest.raises(UnavailableGuard):
             coordinator.commit_source_correction_v1(request=changed, **kwargs)
+    finally:
+        store.close()
+        authority_db.close()
+
+
+def test_workbench_command_reaches_owner_fenced_correction_commit(tmp_path):
+    case, request, kwargs, _, _, _, _ = _case(tmp_path)
+    store, authority_db, coordinator, namespace = case
+    scope = "/".join(namespace.as_tuple)
+
+    class NoReadGrants:
+        def resolve(self, **_):
+            raise AssertionError("correction must not use a workbench read lease")
+
+    class NoViews:
+        def view_types(self, *_):
+            return {}
+
+    session = AuthenticatedSession(
+        kwargs["actor_id"], "dashboard-session",
+        {scope: frozenset({"workbench.correct"})},
+        {scope: frozenset({"owner"})},
+        {scope: frozenset({"workbench_user_action"})},
+        owner_session_token=kwargs["owner_session_token"],
+        owner_session_request=kwargs["owner_session_request"],
+    )
+    command = {
+        "schema_version": "d12.contract.v1", "action": "correct_or_edit",
+        "scope": scope, "purpose": "workbench_user_action", "audience": "owner",
+        "operation_id": request.operation_id,
+        "input": {
+            "schema": request.schema, "correction_kind": "source_claim",
+            "statement": request.statement,
+            "source_refs": list(request.source_refs),
+            "target_refs": list(request.target_refs),
+            "access_epoch": request.access_epoch,
+            "deletion_epoch": request.deletion_epoch,
+        },
+    }
+    issuer = GraphWorkbenchIssuer(
+        coordinator, NoReadGrants(), NoViews(),
+        correction_installation_policy=kwargs["installation_policy"],
+        correction_admin_policy=kwargs["admin_policy"],
+    )
+    try:
+        response = WorkbenchService(issuer).handle(
+            command, session=session, context=RequestContext(True, True, True))
+        assert response.status == "ready"
+        assert response.receipt["phase"] == "source_correction_committed"
+        assert response.receipt["request_digest"] == request.request_digest
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_bundle_operations WHERE operation_id=?",
+            (request.operation_id,)).fetchone() == (1,)
     finally:
         store.close()
         authority_db.close()
