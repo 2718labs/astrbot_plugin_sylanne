@@ -8,6 +8,7 @@ uses the returned DTO. In particular, this factory never sends platform data.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import math
 
@@ -17,14 +18,31 @@ from ..authority_service.v2_contract import (
     FencePermitV2,
 )
 from ..dispatch_runtime import DispatchRequest
+from ..graph_coordinator import namespace_ref
 from .dispatch_admission import DispatchAdmissionReceiptV1, _request_matches
-from ..runtime_contracts import canonical_digest
+from ..runtime_contracts import NamespaceId, canonical_digest
+from ..runtime_journal import RecoveryConstraintFootprint
 
 
-def _footprint_digest(request: DispatchRequest) -> str:
+def _footprint_digest(footprint: RecoveryConstraintFootprint) -> str:
     return "sha256:" + hashlib.sha256(
-        request.footprint._json().encode("utf-8")
+        footprint._json().encode("utf-8")
     ).hexdigest()
+
+
+def authority_dispatch_footprint_v2(
+        namespace: NamespaceId, request: DispatchRequest,
+) -> RecoveryConstraintFootprint:
+    """Map a trusted business namespace to P0's opaque Authority footprint."""
+    if type(namespace) is not NamespaceId or type(request) is not DispatchRequest:
+        raise TypeError("typed namespace and dispatch request are required")
+    if "/" in namespace.bot_id or "/" in namespace.persona_id:
+        raise ValueError("slash-delimited dispatch namespace is ambiguous")
+    business_namespace = "/".join(namespace.as_tuple)
+    if (request.namespace != business_namespace
+            or request.footprint.namespace != business_namespace):
+        raise ValueError("dispatch namespace differs from trusted graph namespace")
+    return replace(request.footprint, namespace=namespace_ref(namespace))
 
 
 def _authority_digest(value: str) -> str:
@@ -54,6 +72,7 @@ def _assert_budget_matches(admission, request: DispatchRequest) -> None:
 
 def build_non_authorizing_execution_binding_v2(
     *,
+    namespace: NamespaceId,
     admission_receipt: DispatchAdmissionReceiptV1,
     recovered_request: DispatchRequest,
     original_dispatch_permit: FencePermitV2,
@@ -80,8 +99,12 @@ def build_non_authorizing_execution_binding_v2(
     admission = admission_receipt.admission
     request = recovered_request
     permit = original_dispatch_permit
+    authority_footprint = authority_dispatch_footprint_v2(namespace, request)
+    opaque_namespace = authority_footprint.namespace
     admission.require_current(float(now_utc))
 
+    if admission.namespace != request.namespace:
+        raise ValueError("admission namespace differs from trusted graph namespace")
     if not _request_matches(admission, request):
         raise ValueError("recovered request differs from committed admission")
     if canonical_digest(request) != admission.request_digest:
@@ -94,12 +117,12 @@ def build_non_authorizing_execution_binding_v2(
             admission.dispatch_generation, admission.payload_digest):
         raise ValueError("admission and recovered request identity differ")
     if (permit.operation != "dispatch"
-            or permit.namespace != admission.namespace
+            or permit.namespace != opaque_namespace
             or permit.effect_id != admission.effect_id
             or permit.operation_id != admission.operation_id
             or permit.generation != request.activation_generation
             or permit.command_digest != "sha256:" + request.command_digest
-            or permit.footprint_digest != _footprint_digest(request)):
+            or permit.footprint_digest != _footprint_digest(authority_footprint)):
         raise ValueError("P0 does not bind the exact request and admission")
     if len(request.required_check_refs) != len(admission.check_receipts):
         raise ValueError("request check refs do not cover the admitted check set")
@@ -111,7 +134,7 @@ def build_non_authorizing_execution_binding_v2(
 
     origin = ExecutionBindingV1(
         permit=permit,
-        namespace=request.namespace,
+        namespace=opaque_namespace,
         activity_id=request.activity_id,
         effect_id=request.effect_id,
         attempt_id=request.attempt_id,
@@ -128,7 +151,7 @@ def build_non_authorizing_execution_binding_v2(
         worker_fence=request.worker_fence,
         content_fence=request.content_fence,
         cancel_epoch=request.cancel_epoch,
-        footprint=request.footprint,
+        footprint=authority_footprint,
         proactive_contact=request.proactive_contact,
         segment_authorization_ref=request.segment_authorization_ref,
         segment_manifest_digest=(
@@ -162,4 +185,6 @@ def build_non_authorizing_execution_binding_v2(
     )
 
 
-__all__ = ["build_non_authorizing_execution_binding_v2"]
+__all__ = [
+    "authority_dispatch_footprint_v2", "build_non_authorizing_execution_binding_v2",
+]

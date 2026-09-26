@@ -8,15 +8,16 @@ import pytest
 
 from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.dispatch_runtime import DispatchRequest
+from sylanne3.graph_coordinator import namespace_ref
 from sylanne3.runtime.dispatch_admission import (
     DispatchAdmissionReceiptV1,
     DispatchAdmissionV1,
 )
 from sylanne3.runtime.dispatch_binding_v2 import (
-    build_non_authorizing_execution_binding_v2,
+    authority_dispatch_footprint_v2, build_non_authorizing_execution_binding_v2,
 )
 from sylanne3.runtime.restore_anchor import RestoreAnchor
-from sylanne3.runtime_contracts import CheckReceipt, canonical_digest
+from sylanne3.runtime_contracts import CheckReceipt, NamespaceId, canonical_digest
 from sylanne3.runtime_journal import (
     BudgetConstraint,
     RecoveryConstraintFootprint,
@@ -24,6 +25,7 @@ from sylanne3.runtime_journal import (
 
 
 NOW = datetime(2026, 9, 26, tzinfo=timezone.utc).timestamp()
+NAMESPACE = NamespaceId("bot", "persona")
 
 
 def _fixture():
@@ -117,8 +119,10 @@ def _fixture():
         "graph_epoch": 9,
     })
     receipt = DispatchAdmissionReceiptV1(admission, 8, 9, receipt_digest)
+    opaque_namespace = namespace_ref(NAMESPACE)
+    authority_footprint = authority_dispatch_footprint_v2(NAMESPACE, request)
     anchor = RestoreAnchor(
-        authority_id="authority:one", namespace=namespace,
+        authority_id="authority:one", namespace=opaque_namespace,
         activation_generation=request.activation_generation,
         deletion_journal_id="deletion-journal:one", deletion_seq=1,
         deletion_digest="sha256:" + "5" * 64,
@@ -127,10 +131,10 @@ def _fixture():
         proof="proof:one",
     )
     footprint_digest = "sha256:" + hashlib.sha256(
-        footprint._json().encode("utf-8")
+        authority_footprint._json().encode("utf-8")
     ).hexdigest()
     permit = FencePermitV2(
-        authority_id="authority:one", namespace=namespace,
+        authority_id="authority:one", namespace=opaque_namespace,
         subject="subject:one", holder="holder:one",
         generation=request.activation_generation, operation="dispatch",
         operation_id=request.operation_id, token="T" * 32,
@@ -145,6 +149,7 @@ def test_matching_admission_request_and_original_permit_build_v2_identity():
     receipt, request, permit = _fixture()
 
     binding = build_non_authorizing_execution_binding_v2(
+        namespace=NAMESPACE,
         admission_receipt=receipt,
         recovered_request=request,
         original_dispatch_permit=permit,
@@ -160,7 +165,11 @@ def test_matching_admission_request_and_original_permit_build_v2_identity():
     assert binding.initial_check_evidence_digest == (
         "sha256:" + receipt.admission.initial_check_evidence_digest
     )
-    assert binding.origin.footprint == request.footprint
+    assert binding.origin.namespace == namespace_ref(NAMESPACE)
+    assert binding.origin.footprint == authority_dispatch_footprint_v2(
+        NAMESPACE, request)
+    assert replace(binding.origin.footprint, namespace=request.namespace) == request.footprint
+    assert binding.graph_namespace == request.namespace
 
 
 def test_stale_permit_generation_is_rejected():
@@ -175,6 +184,7 @@ def test_stale_permit_generation_is_rejected():
 
     with pytest.raises(ValueError, match="P0"):
         build_non_authorizing_execution_binding_v2(
+            namespace=NAMESPACE,
             admission_receipt=receipt,
             recovered_request=request,
             original_dispatch_permit=stale,
@@ -197,9 +207,29 @@ def test_admission_for_another_effect_is_rejected_even_with_valid_receipt_digest
 
     with pytest.raises(ValueError, match="request"):
         build_non_authorizing_execution_binding_v2(
+            namespace=NAMESPACE,
             admission_receipt=wrong_admission,
             recovered_request=request,
             original_dispatch_permit=permit,
             adapter_ref="adapter:one",
             now_utc=NOW,
         )
+
+
+def test_opaque_p0_digest_and_ambiguous_or_wrong_business_namespace_hold():
+    receipt, request, permit = _fixture()
+    slash_footprint_digest = "sha256:" + hashlib.sha256(
+        request.footprint._json().encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(ValueError, match="P0"):
+        build_non_authorizing_execution_binding_v2(
+            namespace=NAMESPACE, admission_receipt=receipt,
+            recovered_request=request,
+            original_dispatch_permit=replace(
+                permit, footprint_digest=slash_footprint_digest),
+            adapter_ref="adapter:one", now_utc=NOW,
+        )
+    with pytest.raises(ValueError, match="ambiguous"):
+        authority_dispatch_footprint_v2(NamespaceId("bot/a", "persona"), request)
+    with pytest.raises(ValueError, match="trusted graph namespace"):
+        authority_dispatch_footprint_v2(NamespaceId("other", "persona"), request)
