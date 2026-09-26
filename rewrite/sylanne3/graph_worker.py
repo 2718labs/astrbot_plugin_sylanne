@@ -13,6 +13,70 @@ from .contracts import CapacityExceeded
 
 
 _STOP = object()
+_WINDOW_READY = object()
+_WINDOW_END = object()
+
+
+class _ExclusiveCallbackWindow:
+    """A dispatcher-held lease spanning Authority handoff and its reverse call."""
+
+    def __init__(self, worker: GraphWorker) -> None:
+        self._worker = worker
+        self._ready: Future = Future()
+        self._ended: Future = Future()
+        self._entered = False
+        self._ending = False
+        self._called = False
+
+    async def __aenter__(self) -> _ExclusiveCallbackWindow:
+        worker = self._worker
+        with worker._lock:
+            if self._entered or self._ending:
+                raise RuntimeError("graph worker callback window lease already used")
+            if worker._closed:
+                raise RuntimeError("graph worker is closed")
+            if worker._callback_window is not None:
+                raise RuntimeError("graph worker callback window is active")
+            worker._callback_window = self
+            worker._queue.put_nowait((_WINDOW_READY, self._ready))
+        try:
+            await asyncio.shield(asyncio.wrap_future(self._ready))
+        except BaseException:
+            # The marker still drains accepted calls before reopening admission.
+            self._end()
+            raise
+        self._entered = True
+        return self
+
+    async def call(self, function: Callable, *args):
+        """Submit the one synchronous reverse callback inside this window."""
+        if not callable(function):
+            raise TypeError("graph worker callback requires a callable")
+        worker = self._worker
+        with worker._lock:
+            if worker._callback_window is not self or not self._entered or self._ending:
+                raise RuntimeError("graph worker callback window is not open")
+            if self._called:
+                raise RuntimeError("graph worker callback already submitted")
+            self._called = True
+            outcome: Future = Future()
+            worker._queue.put_nowait((function, args, outcome, True))
+        wrapped = asyncio.wrap_future(outcome)
+        wrapped.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        return await asyncio.shield(wrapped)
+
+    def _end(self) -> None:
+        worker = self._worker
+        with worker._lock:
+            if not self._ending:
+                if worker._callback_window is not self:
+                    raise RuntimeError("graph worker callback window is not open")
+                self._ending = True
+                worker._queue.put_nowait((_WINDOW_END, self, self._ended))
+
+    async def __aexit__(self, _exc_type, _exc, _tb) -> None:
+        self._end()
+        await asyncio.shield(asyncio.wrap_future(self._ended))
 
 
 class GraphWorker:
@@ -37,12 +101,12 @@ class GraphWorker:
         self._coordinator_factory = coordinator_factory
         self._fence_port_factory = fence_port_factory
         self._slots = BoundedSemaphore(capacity)
-        # Ordinary work uses capacity slots. The two extra cells hold at most
-        # one exclusive callback and the shutdown marker.
+        # Ordinary work uses capacity slots. Two extra cells hold lease
+        # barriers or the callback; shutdown waits for an active lease.
         self._queue: Queue = Queue(maxsize=capacity + 2)
         self._lock = Lock()
         self._closed = False
-        self._callback_active = False
+        self._callback_window: _ExclusiveCallbackWindow | None = None
         self._started: Future = Future()
         self._stopped: Future = Future()
         self._thread = Thread(target=self._run, name="sylanne-graph", daemon=True)
@@ -81,6 +145,17 @@ class GraphWorker:
                 item = self._queue.get()
                 if item is _STOP:
                     break
+                if item[0] is _WINDOW_READY:
+                    item[1].set_result(None)
+                    continue
+                if item[0] is _WINDOW_END:
+                    _, _, ended = item
+                    with self._lock:
+                        self._callback_window = None
+                        if self._closed:
+                            self._queue.put_nowait(_STOP)
+                    ended.set_result(None)
+                    continue
                 function, args, outcome, is_callback = item
                 deliver = outcome.set_running_or_notify_cancel()
                 result = None
@@ -94,10 +169,7 @@ class GraphWorker:
                 except BaseException as exc:
                     call_failure = exc
                 finally:
-                    if is_callback:
-                        with self._lock:
-                            self._callback_active = False
-                    else:
+                    if not is_callback:
                         self._slots.release()
                 if deliver:
                     if call_failure is None:
@@ -133,7 +205,7 @@ class GraphWorker:
         with self._lock:
             if self._closed:
                 raise RuntimeError("graph worker is closed")
-            if self._callback_active:
+            if self._callback_window is not None:
                 raise RuntimeError("graph worker callback window is active")
             if not self._slots.acquire(blocking=False):
                 raise CapacityExceeded("graph worker capacity exhausted")
@@ -145,34 +217,17 @@ class GraphWorker:
         wrapped.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
         return await asyncio.shield(wrapped)
 
-    async def call_exclusive_callback(self, function: Callable, *args):
-        """Drain accepted calls, then run one callback with ordinary admission closed.
-
-        The window stays closed until the worker finishes, even if this waiter
-        is cancelled or times out. Concurrent callback requests fail fast.
-        """
-        if not callable(function):
-            raise TypeError("graph worker callback requires a callable")
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("graph worker is closed")
-            if self._callback_active:
-                raise RuntimeError("graph worker callback window is active")
-            self._callback_active = True
-            outcome: Future = Future()
-            self._queue.put_nowait((function, args, outcome, True))
-        wrapped = asyncio.wrap_future(outcome)
-        # An abandoned result can still be an exception; consume it while the
-        # underlying graph operation finishes and releases its slot.
-        wrapped.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
-        return await asyncio.shield(wrapped)
+    def exclusive_callback_window(self) -> _ExclusiveCallbackWindow:
+        """Acquire before Authority handoff; release after its response or recovery."""
+        return _ExclusiveCallbackWindow(self)
 
     async def close(self) -> None:
         """Stop admission, drain accepted calls, then close the store on worker."""
         with self._lock:
             if not self._closed:
                 self._closed = True
-                self._queue.put_nowait(_STOP)
+                if self._callback_window is None:
+                    self._queue.put_nowait(_STOP)
         try:
             await asyncio.shield(asyncio.wrap_future(self._stopped))
         finally:
