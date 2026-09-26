@@ -8,12 +8,11 @@ into business authorization.
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
-from threading import Lock
-from typing import Protocol
+from typing import Awaitable, Callable, Protocol
 
 from astrbot.api.star import Context
 from astrbot.api.platform import MessageType
@@ -21,13 +20,23 @@ from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
 
 from ..dispatch_runtime import (
-    DispatchBlocked, DispatchRequest, DispatchUnavailable, HandoffStartReceipt,
-    HandoffUncertain, PlatformCapabilityDescriptor, PlatformObservation,
+    DispatchBlocked, DispatchRequest, DispatchUnavailable,
+    HandoffUncertain,
 )
 from ..domains.d09 import ClaimUse, segment_payload_digest
 from ..runtime_contracts import NamespaceId
 from .current_scene import verify_current_host_scene
 from .scene_candidates import ObservedSceneCandidate
+
+from ..authority_service.v2_contract import (
+    ExecutionBindingV2, PlatformObservationV2,
+    canonical_digest as authority_digest,
+)
+from ..authority_service.v2_execution_bridge import (
+    HandoffStartV2, handoff_start_digest_v2,
+)
+from ..host.reverse_handoff import HandoffDecisionWindow
+from .scene_candidates import SceneCandidateCatalog
 
 
 @dataclass(frozen=True)
@@ -73,190 +82,180 @@ class GraphTextPayloadResolver:
 
 
 class AstrBotTextPlatformCapability:
-    """Synchronous worker port to AstrBot's asynchronous host loop."""
+    """Retired V1 worker port; V2 handoff owns every external send."""
 
-    def __init__(
-        self, context: Context, host_loop: asyncio.AbstractEventLoop,
-        resolver: TextPayloadResolver, *, capability_ref: str,
-        namespace: str, platform_id: str, self_id: str,
-        timeout_seconds: float = 30.0,
-    ) -> None:
-        if not isinstance(context, Context) or not callable(getattr(resolver, "resolve", None)):
-            raise DispatchUnavailable("AstrBot Context and trusted payload resolver are required")
-        if not isinstance(host_loop, asyncio.AbstractEventLoop) or not host_loop.is_running():
-            raise DispatchUnavailable("a running AstrBot host loop is required")
-        if not all(isinstance(value, str) and value for value in (namespace, platform_id, self_id)):
-            raise ValueError("namespace and platform identity must be nonempty")
-        if not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds < float("inf"):
-            raise ValueError("timeout_seconds must be finite and positive")
-        self.descriptor = PlatformCapabilityDescriptor(
-            capability_ref, platform_id, True, False, True,
-        )
+    def __init__(self, *args, **kwargs) -> None:
+        raise DispatchUnavailable("V1 AstrBot handoff is retired; use fresh V2 handoff")
+
+
+class AstrBotV2TextSender:
+    """One OneBot send inside a fresh V2 handoff decision window.
+
+    A newly persisted Authority start is the cross-process one-shot gate.
+    The OneBot message_id acknowledges acceptance by the adapter;
+    it does not establish delivery or reading by the recipient.
+    """
+
+    def __init__(self, *, context: Context, candidates: SceneCandidateCatalog,
+                 resolver: TextPayloadResolver,
+                 record_observation: Callable[
+                     [HandoffStartV2, PlatformObservationV2], Awaitable[object]]) -> None:
+        if (not isinstance(context, Context)
+                or not isinstance(candidates, SceneCandidateCatalog)
+                or not callable(getattr(resolver, "resolve", None))
+                or not callable(record_observation)):
+            raise DispatchUnavailable("V2 sender requires graph resolver and Authority observation writer")
         self._context = context
-        self._loop = host_loop
+        self._candidates = candidates
         self._resolver = resolver
-        self._namespace = namespace
-        self._platform_id = platform_id
-        self._self_id = self_id
-        self._timeout_seconds = float(timeout_seconds)
-        self._lock = Lock()
-        self._attempted: set[str] = set()
-        self._pending: dict[str, Future[int | None]] = {}
+        self._record_observation = record_observation
 
-    def handoff(
-        self, request: DispatchRequest, start: HandoffStartReceipt,
-    ) -> PlatformObservation:
-        if not isinstance(request, DispatchRequest) or not isinstance(start, HandoffStartReceipt):
-            raise TypeError("handoff requires a dispatch request and start receipt")
-        if (request.namespace != self._namespace
-                or request.platform_capability_ref != self.descriptor.capability_ref
-                or start.operation_id != request.operation_id
-                or start.effect_id != request.effect_id
-                or start.platform_capability_ref != request.platform_capability_ref
-                or start.dispatch_generation != request.dispatch_generation
-                or start.activation_generation != request.activation_generation
-                or start.worker_fence != request.worker_fence
-                or start.content_fence != request.content_fence
-                or start.cancel_epoch != request.cancel_epoch
-                or start.proactive_contact != request.proactive_contact
-                or start.segment_authorization_ref != request.segment_authorization_ref
-                or start.segment_manifest_digest != request.segment_manifest_digest
-                or start.segment_index != request.segment_index
-                or start.segment_count != request.segment_count):
-            raise DispatchBlocked("handoff identity differs from the bound capability")
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is self._loop:
-            raise DispatchUnavailable("synchronous handoff cannot wait on the AstrBot host loop")
-
+    async def send(self, *, decision: HandoffDecisionWindow,
+                   binding: ExecutionBindingV2,
+                   request: DispatchRequest) -> PlatformObservationV2:
+        if (type(decision) is not HandoffDecisionWindow
+                or type(binding) is not ExecutionBindingV2
+                or type(request) is not DispatchRequest):
+            raise DispatchBlocked("typed fresh V2 handoff, binding and command required")
+        origin = binding.origin
+        if (request.namespace != binding.graph_namespace
+                or request.operation_id != binding.operation_id
+                or request.effect_id != origin.effect_id
+                or request.activity_id != origin.activity_id
+                or request.attempt_id != origin.attempt_id
+                or "sha256:" + request.payload_digest != origin.payload_digest
+                or request.platform_capability_ref != origin.platform_capability_ref
+                or request.dispatch_generation != origin.dispatch_generation
+                or request.activation_generation != origin.activation_generation
+                or request.worker_fence != origin.worker_fence
+                or request.content_fence != origin.content_fence
+                or request.cancel_epoch != origin.cancel_epoch
+                or request.segment_authorization_ref != origin.segment_authorization_ref
+                or ("sha256:" + request.segment_manifest_digest
+                    if request.segment_manifest_digest is not None else None)
+                   != origin.segment_manifest_digest
+                or request.segment_index != origin.segment_index
+                or request.segment_count != origin.segment_count):
+            raise DispatchBlocked("V2 command differs from the frozen binding")
         resolved = self._resolver.resolve(request)
-        if not isinstance(resolved, ResolvedTextPayload):
-            raise DispatchBlocked("trusted resolver returned an invalid payload")
-        if (resolved.namespace != request.namespace
-                or resolved.platform_id != self._platform_id
-                or resolved.self_id != self._self_id):
-            raise DispatchBlocked("payload routing identity differs from the bound namespace")
-        if type(resolved.payload) is not bytes or resolved.media_refs:
-            raise DispatchBlocked("dispatch route requires text without media")
-        if not isinstance(resolved.umo, str):
-            raise DispatchBlocked("AstrBot session is invalid")
+        if (type(resolved) is not ResolvedTextPayload
+                or resolved.namespace != request.namespace
+                or type(resolved.payload) is not bytes or resolved.media_refs):
+            raise DispatchBlocked("committed finite text segment is unavailable")
         try:
-            text = resolved.payload.decode("utf-8", errors="strict")
+            body = resolved.payload.decode("utf-8", errors="strict")
             session = MessageSession.from_str(resolved.umo)
-        except (UnicodeError, ValueError, TypeError, IndexError) as exc:
-            raise DispatchBlocked("payload text or AstrBot session is invalid") from exc
-        try:
-            digest = segment_payload_digest(text, resolved.media_refs, resolved.claim_uses)
-        except (ValueError, TypeError) as exc:
-            raise DispatchBlocked("resolved D09 segment metadata is invalid") from exc
-        if digest != request.payload_digest:
-            raise DispatchBlocked("dispatch payload digest differs")
-        if (not text or session.platform_id != self._platform_id
-                or session.message_type not in {MessageType.FRIEND_MESSAGE, MessageType.GROUP_MESSAGE}
-                or not session.session_id.isascii() or not session.session_id.isdigit()):
-            raise DispatchBlocked("empty text or cross-platform session")
-        namespace_parts = request.namespace.split("/", 1)
-        if len(namespace_parts) != 2 or not all(namespace_parts):
-            raise DispatchBlocked("dispatch namespace has no AstrBot bot and persona")
-        namespace = NamespaceId(*namespace_parts)
-        candidate = ObservedSceneCandidate(
-            namespace,
-            json.dumps([resolved.platform_id, resolved.platform_name, resolved.self_id],
-                       ensure_ascii=True, separators=(",", ":")),
-            json.dumps([resolved.umo, resolved.conversation_id],
-                       ensure_ascii=True, separators=(",", ":")),
-            "group" if session.message_type == MessageType.GROUP_MESSAGE else "private",
-            resolved.scene_ref,
-        )
-        # The resolver's self_id binds the UMO to the installed bot identity;
-        # AstrBot's UMO itself contains only platform id, type and session id.
-        observation_ref = "astrbot:handoff:" + hashlib.sha256(
-            f"{request.namespace}\0{request.operation_id}".encode()
-        ).hexdigest()
-        with self._lock:
-            if request.operation_id in self._attempted:
-                raise HandoffUncertain(observation_ref)
-            self._attempted.add(request.operation_id)
-            try:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._send(session, text, candidate), self._loop,
-                )
-            except Exception as exc:
-                raise HandoffUncertain(observation_ref) from exc
-            self._pending[request.operation_id] = future
-        future.add_done_callback(lambda done: self._forget_done(request.operation_id, done))
-        try:
-            matched = future.result(timeout=self._timeout_seconds)
-        except Exception as exc:
-            # Timeout/cancellation does not stop the host coroutine. The effect
-            # may still complete, so the original operation stays unknown.
-            raise HandoffUncertain(observation_ref) from exc
-        if matched is None:
-            return PlatformObservation("failed", observation_ref, None)
-        if type(matched) is not int or matched <= 0:
-            raise HandoffUncertain(observation_ref)
-        return PlatformObservation(
-            "handed_off", observation_ref, self._provider_request_ref(matched),
-        )
-
-    def _provider_request_ref(self, message_id: int) -> str:
-        scope = f"{self._platform_id}\0{self._self_id}"
-        scope_digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
-        return f"astrbot:onebot:{scope_digest}:{message_id}"
-
-    async def _send(
-        self, session: MessageSession, text: str, candidate: ObservedSceneCandidate,
-    ) -> int | None:
-        if await verify_current_host_scene(self._context, candidate) is None:
-            return None
-        # Context.send_message selects only the platform instance. OneBot may
-        # have multiple accounts on that instance, so every action specifies
-        # and revalidates the original account before the external handoff.
-        matching = [
-            platform for platform in self._context.platform_manager.platform_insts
-            if platform.meta().id == self._platform_id
-        ]
+            payload_digest = segment_payload_digest(
+                body, resolved.media_refs, resolved.claim_uses)
+            namespace = NamespaceId(*request.namespace.split("/", 1))
+        except (ValueError, TypeError, UnicodeError, IndexError) as exc:
+            raise DispatchBlocked("committed finite text segment is invalid") from exc
+        account_ref = json.dumps(
+            [resolved.platform_id, resolved.platform_name, resolved.self_id],
+            ensure_ascii=True, separators=(",", ":"))
+        destination_ref = json.dumps(
+            [resolved.umo, resolved.conversation_id],
+            ensure_ascii=True, separators=(",", ":"))
+        visibility = {
+            MessageType.FRIEND_MESSAGE: "private",
+            MessageType.GROUP_MESSAGE: "group",
+        }.get(session.message_type)
+        if (not body or payload_digest != request.payload_digest
+                or account_ref != origin.account_ref
+                or destination_ref != origin.destination_ref
+                or visibility is None or resolved.platform_name != "aiocqhttp"
+                or session.platform_id != resolved.platform_id
+                or not session.session_id.isascii()
+                or not session.session_id.isdigit()):
+            raise DispatchBlocked("committed text or route differs from binding")
+        candidate = self._candidates.get_exact(
+            namespace=namespace, platform_ref=account_ref,
+            conversation_ref=destination_ref, visibility=visibility,
+            scene_ref=resolved.scene_ref)
+        if (candidate is None
+                or await verify_current_host_scene(self._context, candidate) is None):
+            raise DispatchBlocked("current observed AstrBot scene is unavailable")
+        matching = [platform for platform in self._context.platform_manager.platform_insts
+                    if platform.meta().id == resolved.platform_id]
         if len(matching) != 1:
-            return None
-        adapter = self._context.get_platform_inst(self._platform_id)
+            raise DispatchBlocked("current AstrBot platform is ambiguous")
+        adapter = self._context.get_platform_inst(resolved.platform_id)
         if (adapter is not matching[0] or not isinstance(adapter, AiocqhttpAdapter)
-                or adapter.meta().id != self._platform_id
                 or adapter.meta().name != "aiocqhttp"):
-            return None
-        action = (
-            "send_group_msg" if session.message_type == MessageType.GROUP_MESSAGE
-            else "send_private_msg"
-        )
-        destination = (
-            "group_id" if session.message_type == MessageType.GROUP_MESSAGE
-            else "user_id"
-        )
-        receipt = await adapter.bot.call_action(
-            action, self_id=self._self_id,
-            **{destination: int(session.session_id)},
-            message=[{"type": "text", "data": {"text": text}}],
-        )
-        if (not isinstance(receipt, dict) or type(receipt.get("message_id")) is not int
-                or receipt["message_id"] <= 0):
-            # The API call may have reached OneBot. An absent or malformed
-            # receipt cannot prove failure and must keep this operation unknown.
-            raise ValueError("OneBot send receipt lacks a valid message_id")
-        return receipt["message_id"]
+            raise DispatchBlocked("current OneBot adapter differs")
 
-    def _forget_done(self, operation_id: str, future: Future[int | None]) -> None:
-        with self._lock:
-            if self._pending.get(operation_id) is future:
-                self._pending.pop(operation_id)
+        # The decision window is issued only after Authority persisted the real
+        # graph claim and start. Replays cannot take a fresh start.
+        start = decision.take_fresh_start()
+        graph_receipt = start.graph_claim_receipt
+        if (type(start) is not HandoffStartV2 or start.replay
+                or graph_receipt is None
+                or (start.namespace, start.operation_id, start.effect_id)
+                   != (binding.namespace, request.operation_id, request.effect_id)
+                or start.binding_digest != authority_digest(binding)
+                or start.graph_claim_ref != graph_receipt.graph_claim_ref
+                or graph_receipt.graph_namespace != binding.graph_namespace
+                or graph_receipt.graph_incarnation != binding.graph_incarnation):
+            raise DispatchBlocked("fresh Authority start or committed graph claim differs")
+        deadline = datetime.fromisoformat(binding.utc_deadline.replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) >= deadline:
+            raise DispatchBlocked("fresh handoff deadline expired before external send")
+        original_permit = binding.origin.permit
+        if (start.permit.authority_id != original_permit.authority_id
+                or start.permit.token != original_permit.token
+                or start.permit.fence_epoch != original_permit.fence_epoch
+                or start.permit.generation != original_permit.generation
+                or start.permit.revision != original_permit.revision + 2
+                or start.permit.operation_id != original_permit.operation_id
+                or start.permit.effect_id != original_permit.effect_id
+                or start.permit.command_digest != original_permit.command_digest
+                or start.permit.footprint_digest != original_permit.footprint_digest):
+            raise DispatchBlocked("fresh start differs from original dispatch permit")
 
-    def query_original(
-        self, request: DispatchRequest, operation: object,
-    ) -> PlatformObservation:
-        raise DispatchUnavailable("AstrBot Context has no original-send query")
+        action = ("send_group_msg" if visibility == "group"
+                  else "send_private_msg")
+        destination = "group_id" if visibility == "group" else "user_id"
+        async def call_onebot():
+            return await adapter.bot.call_action(
+                action, self_id=resolved.self_id,
+                **{destination: int(session.session_id)},
+                message=[{"type": "text", "data": {"text": body}}])
+
+        # Shield keeps cancellation from stopping an already issued call and
+        # then incorrectly claiming that no external effect was possible.
+        task = asyncio.create_task(call_onebot())
+        try:
+            receipt = await asyncio.shield(task)
+            message_id = (receipt.get("message_id")
+                          if isinstance(receipt, dict) else None)
+            accepted = type(message_id) is int and message_id > 0
+        except (Exception, asyncio.CancelledError):
+            message_id = None
+            accepted = False
+        observation = PlatformObservationV2(
+            binding=binding, handoff_id=start.handoff_id,
+            start_digest=handoff_start_digest_v2(start),
+            adapter_ref=origin.adapter_ref, account_ref=account_ref,
+            destination_ref=destination_ref,
+            observation_id="observation:" + hashlib.sha256(
+                start.handoff_id.encode()).hexdigest(),
+            platform_request_id=None,
+            platform_message_id=(str(message_id) if accepted else None),
+            evidence_source_ref="astrbot:onebot:call_action",
+            outcome="accepted" if accepted else "unknown",
+            observed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            time_source_ref="host:system_utc",
+        )
+        try:
+            await self._record_observation(start, observation)
+        except (Exception, asyncio.CancelledError) as exc:
+            # The Authority write may have committed despite a lost response.
+            # The durable start forbids another platform call either way.
+            raise HandoffUncertain(observation.observation_id) from exc
+        return observation
 
 
 __all__ = (
     "AstrBotTextPlatformCapability", "GraphTextPayloadResolver",
-    "ResolvedTextPayload", "TextPayloadResolver",
+    "ResolvedTextPayload", "TextPayloadResolver", "AstrBotV2TextSender",
 )
