@@ -11,9 +11,11 @@ from sylanne3.contracts import canonical_json
 from sylanne3.domains.d08.execution import ActionIntent, GoalPredicate, RequiredCheckSpec
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, Owner
 from sylanne3.runtime.dispatch_current_commitments import (
-    read_current_d08_action_conflict_evidence,
+    read_current_d08_action_conflict_evidence, read_current_job_cancellation,
 )
-from sylanne3.runtime.jobs import PersistentJob, cancel_job, create_job, install_schema
+from sylanne3.runtime.jobs import (
+    PersistentJob, acquire_job, cancel_job, create_job, install_schema,
+)
 from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime_contracts import OperationIdentity, VersionedRef, canonical_digest
 
@@ -129,5 +131,82 @@ def test_absent_and_stale_effects_never_clear_claimed_dispatch():
         with pytest.raises(ValueError, match="action is absent"):
             read_current_d08_action_conflict_evidence(
                 db, namespace, snapshot, query, "action:missing", p2, effect)
+    finally:
+        db.close()
+
+
+def test_current_job_cancellation_requires_row_and_exact_command_epochs():
+    db, namespace, _, _, _, _ = _evidence_case()
+    try:
+        with pytest.raises(ValueError, match="graph transaction"):
+            read_current_job_cancellation(db, namespace, "job:one")
+        db.execute("BEGIN IMMEDIATE")
+        missing = read_current_job_cancellation(
+            db, namespace, "job:one", expected_fence=0,
+            expected_cancel_epoch=0)
+        assert missing.state == "unknown"
+        assert missing.missing_sources == ("current_job_missing",)
+
+        create_job(db, _job(namespace), "job-create:one", "a" * 64)
+        clear = read_current_job_cancellation(
+            db, namespace, "job:one", expected_fence=0,
+            expected_cancel_epoch=0)
+        assert (clear.state, clear.fence_state, clear.cancel_epoch_state) == (
+            "clear", "row_match", "row_match")
+        assert (clear.phase, clear.fence, clear.cancel_epoch) == ("queued", 0, 0)
+
+        stale = read_current_job_cancellation(
+            db, namespace, "job:one", expected_fence=1,
+            expected_cancel_epoch=0)
+        assert stale.state == "unknown"
+        assert stale.fence_state == "mismatch"
+        assert "job_worker_fence_mismatch" in stale.missing_sources
+
+        db.execute("UPDATE runtime_jobs SET cancel_epoch=1 WHERE job_id='job:one'")
+        epoch_only = read_current_job_cancellation(
+            db, namespace, "job:one", expected_fence=0,
+            expected_cancel_epoch=1)
+        assert epoch_only.state == "unknown"
+        assert epoch_only.cancel_epoch_state == "row_match"
+
+        cancel_job(db, "job:one", "job-cancel:one", "b" * 64)
+        cancelled = read_current_job_cancellation(
+            db, namespace, "job:one", expected_fence=0,
+            expected_cancel_epoch=2)
+        assert cancelled.state == "cancelled"
+        assert cancelled.phase == "cancelled"
+        assert cancelled.cancel_epoch == 2
+        assert cancelled.latest_cancel_receipt_epoch == 2
+
+        db.execute(
+            "UPDATE runtime_jobs SET phase='queued',cancel_epoch=0 "
+            "WHERE job_id='job:one'")
+        contradicted = read_current_job_cancellation(
+            db, namespace, "job:one", expected_fence=0,
+            expected_cancel_epoch=0)
+        assert contradicted.state == "unknown"
+        assert "job_cancel_history_mismatch" in contradicted.missing_sources
+    finally:
+        db.close()
+
+
+def test_draining_cancellation_advances_worker_fence():
+    db, namespace, _, _, _, _ = _evidence_case()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        create_job(db, _job(namespace), "job-create:one", "a" * 64)
+        running = acquire_job(
+            db, "job:one", "worker:one", now_utc="2026-09-26T00:00:00Z",
+            lease_seconds=60)
+        assert running.fence == 1
+        cancel_job(db, "job:one", "job-cancel:one", "b" * 64)
+        current = read_current_job_cancellation(
+            db, namespace, "job:one", expected_fence=1,
+            expected_cancel_epoch=0)
+        assert (current.state, current.phase, current.fence,
+                current.cancel_epoch) == ("cancelled", "draining", 2, 1)
+        assert current.fence_state == "mismatch"
+        assert current.cancel_epoch_state == "mismatch"
+        assert current.latest_cancel_receipt_epoch == 1
     finally:
         db.close()

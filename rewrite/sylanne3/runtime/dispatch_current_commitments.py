@@ -10,7 +10,7 @@ from ..authority_service.v2_execution_bridge import CurrentEffectReadV2
 from ..domains.d08.execution import ActionIntent, ActionOutcome, Commitment, GoalExecutionProvider
 from ..graph_types import AtomKey, GraphSnapshot, GraphVersion
 from ..runtime_contracts import NamespaceId, QueryEpoch
-from .jobs import get_job
+from .jobs import JobConflict, PersistentJob, get_job
 
 
 _TYPES = (
@@ -57,6 +57,118 @@ class CurrentD08ActionConflictEvidenceV1:
     authority_effect: CurrentEffectReadV2
     status: str = "hold"
     missing_sources: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CurrentJobCancellationReadV1:
+    """One current durable job row, without an action/job ownership assertion."""
+
+    namespace: NamespaceId
+    job_id: str
+    state: str  # clear, cancelled, unknown
+    fence_state: str  # row_match, mismatch, unknown
+    cancel_epoch_state: str  # row_match, mismatch, unknown
+    phase: str | None
+    fence: int | None
+    cancel_epoch: int | None
+    lease_holder: str | None
+    lease_expires_utc: str | None
+    latest_cancel_receipt_epoch: int | None
+    missing_sources: tuple[str, ...] = ()
+
+
+def read_current_job_cancellation(
+    db, namespace: NamespaceId, job_id: str, *,
+    expected_fence: int | None = None,
+    expected_cancel_epoch: int | None = None,
+) -> CurrentJobCancellationReadV1:
+    """Read a job's recorded cancellation and fence in the graph transaction.
+
+    The caller supplies any expected fence/epoch from its authenticated command.
+    This function does not bind that command or a D08 action to the job. A
+    clear result describes only the job row and never authorizes dispatch.
+    `db.in_transaction` cannot attest that the trusted coordinator holds the
+    write fence; production must call this under its BEGIN IMMEDIATE path.
+    """
+    if not db.in_transaction:
+        raise ValueError("job cancellation read requires the graph transaction")
+    if type(namespace) is not NamespaceId:
+        raise TypeError("job cancellation read requires a namespace")
+    for name, value in (("expected_fence", expected_fence),
+                        ("expected_cancel_epoch", expected_cancel_epoch)):
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError(f"{name} must be a nonnegative exact integer")
+    try:
+        job = get_job(db, job_id)
+    except JobConflict:
+        return CurrentJobCancellationReadV1(
+            namespace, job_id, "unknown", "unknown", "unknown",
+            None, None, None, None, None, None, ("current_job_missing",),
+        )
+    if (job.bot_id, job.persona_id) != namespace.as_tuple:
+        raise ValueError("job cancellation read crosses namespace")
+    fence_state = ("unknown" if expected_fence is None else
+                   "row_match" if job.fence == expected_fence else "mismatch")
+    cancel_epoch_state = ("unknown" if expected_cancel_epoch is None else
+                          "row_match" if job.cancel_epoch == expected_cancel_epoch
+                          else "mismatch")
+    cancel_receipts = []
+    history_valid = True
+    for (encoded,) in db.execute(
+        "SELECT job_json FROM runtime_job_operations WHERE bot_id=? "
+        "AND persona_id=? AND job_id=? AND phase='cancel'",
+        namespace.as_tuple + (job_id,),
+    ):
+        try:
+            receipt = PersistentJob(**json.loads(encoded))
+        except (TypeError, ValueError):
+            history_valid = False
+            continue
+        if (receipt.job_id, receipt.operation_id, receipt.activity_id,
+                receipt.effect_id, receipt.bot_id, receipt.persona_id) != (
+                job.job_id, job.operation_id, job.activity_id, job.effect_id,
+                job.bot_id, job.persona_id):
+            history_valid = False
+        cancel_receipts.append(receipt)
+    latest_cancel_epoch = max(
+        (receipt.cancel_epoch for receipt in cancel_receipts), default=None)
+    if (job.cancel_epoch > 0 and latest_cancel_epoch != job.cancel_epoch
+            or latest_cancel_epoch is not None and latest_cancel_epoch > job.cancel_epoch
+            or job.phase in {"queued", "running", "waiting", "deferred"}
+            and latest_cancel_epoch is not None):
+        history_valid = False
+    if job.cancel_epoch > 0 and job.phase in {"draining", "cancelled"} and not any(
+            receipt.cancel_epoch == job.cancel_epoch
+            and receipt.fence == job.fence
+            and receipt.phase in {"draining", "cancelled"}
+            for receipt in cancel_receipts):
+        history_valid = False
+    if job.phase in {"draining", "cancelled"}:
+        state = "cancelled"
+    elif (job.cancel_epoch == 0 and job.phase in {
+            "queued", "running", "waiting", "deferred"}
+          and fence_state != "mismatch" and cancel_epoch_state != "mismatch"):
+        state = "clear"
+    else:
+        state = "unknown"
+    if not history_valid:
+        state = "unknown"
+    missing = []
+    if fence_state == "mismatch":
+        missing.append("job_worker_fence_mismatch")
+    if cancel_epoch_state == "mismatch":
+        missing.append("job_cancel_epoch_mismatch")
+    if not history_valid:
+        missing.append("job_cancel_history_mismatch")
+    if expected_fence is not None:
+        missing.append("current_worker_lease_unverified")
+    if state == "unknown":
+        missing.append("job_cancellation_state_unproven")
+    return CurrentJobCancellationReadV1(
+        namespace, job_id, state, fence_state, cancel_epoch_state,
+        job.phase, job.fence, job.cancel_epoch, job.lease_holder,
+        job.lease_expires_utc, latest_cancel_epoch, tuple(missing),
+    )
 
 
 def read_current_d08_conflict_facts(
@@ -214,15 +326,11 @@ def read_current_d08_action_conflict_evidence(
     job_cancellation_state = "unknown"
     if len(matching) == 1 and len(rows) == 1:
         job = matching[0]
+        job_read = read_current_job_cancellation(db, namespace, job.job_id)
         job_id, job_fence, job_cancel_epoch = (
-            job.job_id, job.fence, job.cancel_epoch)
-        if job.phase in {"draining", "cancelled"}:
-            job_cancellation_state = "cancelled"
-        elif job.cancel_epoch == 0 and job.phase in {
-                "queued", "running", "waiting", "deferred"}:
-            job_cancellation_state = "clear"
-        else:
-            job_cancellation_state = "unknown"
+            job_read.job_id, job_read.fence, job_read.cancel_epoch)
+        job_cancellation_state = job_read.state
+        blockers.extend(job_read.missing_sources)
         if job_cancellation_state == "cancelled":
             blockers.append("matching_job_cancelled")
     else:
@@ -237,5 +345,6 @@ def read_current_d08_action_conflict_evidence(
 
 __all__ = [
     "CurrentD08ActionConflictEvidenceV1", "CurrentD08ConflictFactsV1",
-    "read_current_d08_action_conflict_evidence", "read_current_d08_conflict_facts",
+    "CurrentJobCancellationReadV1", "read_current_d08_action_conflict_evidence",
+    "read_current_d08_conflict_facts", "read_current_job_cancellation",
 ]
