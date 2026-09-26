@@ -79,11 +79,11 @@ class DeletionClosureTests(unittest.TestCase):
         if True:
             registry = TypeRegistry()
             register_memory_types(registry)
-            recollection_spec = next(
-                spec for spec in D06DomainProvider.type_specs()
-                if spec.name == "d06.recollection.v1"
-            )
+            d06_specs = {spec.name: spec for spec in D06DomainProvider.type_specs()}
+            recollection_spec = d06_specs["d06.recollection.v1"]
+            projection_spec = d06_specs["d06.recollection_projection.v1"]
             registry.register(recollection_spec)
+            registry.register(projection_spec)
             registry.register(TypeSpec("d03.world_event", ("event",), "state", lambda _: None))
             store = GraphStore(Path(tmp.name) / "memory.db", registry)
             self.addCleanup(store.close)
@@ -110,6 +110,17 @@ class DeletionClosureTests(unittest.TestCase):
                 Owner("activity", "bot", "persona", "activity-1"),
                 "d06.recollection.v1", "current",
             )
+            projection = AtomKey(
+                Owner("activity", "bot", "persona", "activity-1"),
+                "d06.recollection_projection.v1", "projection-1",
+            )
+            experience_ref = AtomKey(
+                Owner("activity", "bot", "persona", "activity-1"),
+                "d04.recollection_experience.v1", "experience-1",
+            ).token
+            mood_ref = AtomKey(
+                Owner("persona", "bot", "persona"), "d04.mood_field.v1", "current",
+            ).token
             event_ref = AtomKey(Owner("event", "bot", "persona", "event-1"), "d03.world_event", "current")
             perspective = AtomKey(Owner("scene", "bot", "persona", "scene-1"), "d03.role_binding", "current")
             writes = (
@@ -137,6 +148,20 @@ class DeletionClosureTests(unittest.TestCase):
                     "provenance_eligibility": [], "focus_epoch": 1,
                     "access_epoch": 1, "delete_epoch": 1,
                 }),
+                GraphWrite(projection, {
+                    "projection_id": "projection-1", "activity_id": "activity-1",
+                    "recollection_ref": recollection.token,
+                    "experience_ref": experience_ref,
+                    "source_ref": self.root.token, "source_revision": 1,
+                    "mood_ref": mood_ref,
+                    "mood_revision": 1, "coupling_version": "coupling-1",
+                    "projection_version": "d06.affective_projection.v1",
+                    "state": "committed_subjective_projection",
+                    "evidence_eligibility": "subjective_only", "details": [],
+                    "subjective_weight": [0.4, 0.6], "subjective_tone": [-0.1, 0.1],
+                    "duration_interval": None, "encoding_trace_ref": None,
+                    "baseline_status": "not_read",
+                }),
             )
             store.graph_commit(GraphCandidate(
                 Event(scope, "derived", 5, "derived", {}),
@@ -151,7 +176,7 @@ class DeletionClosureTests(unittest.TestCase):
             self.assertEqual(result.trace_refs, (trace.token,))
             self.assertEqual(result.association_refs, (association.token,))
             self.assertEqual(result.interpretation_refs, (interpretation.token,))
-            self.assertEqual(result.recollection_refs, (recollection.token,))
+            self.assertEqual(result.recollection_refs, tuple(sorted((recollection.token, projection.token))))
             self.assertIn("current_reverse_dependency_snapshot", result.missing_facets)
             self.assertIn("historical_graph_values", result.missing_facets)
             self.assertIn("source_derived_cache_inventory_unavailable", result.missing_facets)

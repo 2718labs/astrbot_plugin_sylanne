@@ -4,7 +4,7 @@ from pathlib import Path
 
 from sylanne3.contracts import Event, Scope
 from sylanne3.domains.d04 import AffectAxis, AffectCoupling, AffectProvider, AffectScheme, FeelingState, MoodField
-from sylanne3.domains.d06 import D06DomainAdapter, RecallIntent, RecollectionContext, SelectionTicket, TriggerKind
+from sylanne3.domains.d06 import D06DomainAdapter, D06DomainProvider, RecallIntent, RecollectionContext, SelectionTicket, TriggerKind
 from sylanne3.domains.d06.pipeline import D06MemoryPipeline, SearchPlan
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import AtomKey, GraphCandidate, GraphWrite, Owner, TypeRegistry
@@ -31,6 +31,9 @@ class AffectivePipelineTests(unittest.TestCase):
         register_memory_types(registry)
         for spec in AffectProvider(active_scheme=self.scheme).type_specs():
             registry.register(spec)
+        for spec in D06DomainProvider.type_specs():
+            if spec.name in {"d06.recollection.v1", "d06.recollection_projection.v1"}:
+                registry.register(spec)
         self.store = GraphStore(Path(self.tmp.name) / "memory.db", registry)
         self.addCleanup(self.store.close)
         self.repository = MemoryRepository(self.store, "bot", "persona")
@@ -87,6 +90,58 @@ class AffectivePipelineTests(unittest.TestCase):
         self.assertNotEqual(warm.subjective_tone, guarded.subjective_tone)
         self.assertNotEqual(warm.subjective_weight, guarded.subjective_weight)
         self.assertEqual(warm.status, "candidate_hold")
+
+    def test_committed_projection_round_trips_without_copying_source_text_or_changing_evidence(self):
+        projections = []
+        for mood_value, event_id in ((0.8, "projection-warm"), (-0.8, "projection-guarded")):
+            reconstruction = self.prepare(self.mood(mood_value, event_id))
+            experience_ref = AtomKey(
+                Owner("activity", "bot", "persona", "activity"),
+                "d04.recollection_experience.v1", f"experience-{event_id}",
+            )
+            recollection_ref = AtomKey(
+                Owner("activity", "bot", "persona", "activity"),
+                "d06.recollection.v1", reconstruction.recollection_id,
+            ).token
+            experience_write = GraphWrite(experience_ref, {
+                "recollection_ref": recollection_ref,
+                "memory_ref": reconstruction.source_ref,
+                "salience_interval": list(reconstruction.subjective_weight),
+                "tone_interval": list(reconstruction.subjective_tone),
+                "evidence_weight_delta": 0.0,
+            })
+            projection_write = self.pipeline.adapter.recollection_projection_write(
+                reconstruction, experience_write,
+            )
+            self.assertNotIn("recalled_text", projection_write.value)
+            self.assertNotIn("literal_text", str(projection_write.value))
+            snapshot = self.store.graph_snapshot((projection_write.key,))
+            self.store.graph_commit(GraphCandidate(
+                Event(self.scope, f"commit-{event_id}", 20, "c04", {}),
+                snapshot.versions, (projection_write,), snapshot.epochs,
+            ))
+            reread = self.pipeline.read_recollection_projection(
+                projection_write.key.token, audience="owner", purpose="context",
+            )
+            self.assertEqual(reread["state"], "committed_subjective_projection")
+            self.assertEqual(reread["evidence_eligibility"], "subjective_only")
+            self.assertEqual(reread["details"][0]["literal_text"], "I waited")
+            self.assertEqual(reread["subjective_weight"], list(reconstruction.subjective_weight))
+            self.assertEqual(reread["subjective_tone"], list(reconstruction.subjective_tone))
+            projections.append(reread)
+        self.assertNotEqual(projections[0]["subjective_tone"], projections[1]["subjective_tone"])
+        self.assertEqual(projections[0]["source_ref"], projections[1]["source_ref"])
+        self.assertEqual(projections[0]["evidence_eligibility"], projections[1]["evidence_eligibility"])
+        self.repository.set_access(
+            Event(self.scope, "withdraw-projection", 21, "withdraw", {}), "message-1",
+            audiences=("owner",), purposes=("context",), status="withdrawn", recorded_at=21,
+        )
+        revoked = self.pipeline.read_recollection_projection(
+            projections[0]["projection_ref"],
+            audience="owner", purpose="context",
+        )
+        self.assertEqual(revoked["source_access_status"], "unavailable")
+        self.assertIsNone(revoked["details"][0]["literal_text"])
 
     def test_committed_then_feeling_stays_separate_from_current_mood_and_source(self):
         source_ref = source_key("bot", "persona", "message-1").token

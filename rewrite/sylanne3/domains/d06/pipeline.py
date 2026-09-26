@@ -603,7 +603,7 @@ class D06MemoryPipeline:
             source_versions=reconstruction.read_versions,
             dependencies=DependencySet(),
         )
-        return self.adapter.assemble_recollection_bundle(
+        bundle = self.adapter.assemble_recollection_bundle(
             envelope, ticket, candidates, context,
             supporting_proposals=(*supporting_proposals, d04),
             choice_ref=choice_ref,
@@ -612,6 +612,67 @@ class D06MemoryPipeline:
             persistent_job_ref=persistent_job_ref,
             outbox_ref=outbox_ref,
         )
+        d04_proposal = next(item for item in bundle.proposals if item.domain == "d04")
+        experience_write = next(
+            write for write in d04_proposal.typed_writes
+            if write.key.token in context.feeling_experience_refs
+        )
+        projection_write = self.adapter.recollection_projection_write(
+            reconstruction, experience_write,
+        )
+        d06_proposal = next(item for item in bundle.proposals if item.domain == "d06")
+        updated_d06 = replace(
+            d06_proposal,
+            typed_writes=(*d06_proposal.typed_writes, projection_write),
+        )
+        return replace(
+            bundle,
+            proposals=tuple(updated_d06 if item is d06_proposal else item
+                            for item in bundle.proposals),
+        )
+
+    def read_recollection_projection(
+        self, projection_ref: str, *, audience: str, purpose: str,
+    ) -> dict:
+        """Read a persisted subjective projection and derive literals under current access."""
+        from . import _RECOLLECTION_PROJECTION_TYPE, _validate_recollection_projection
+
+        key = AtomKey.from_token(projection_ref)
+        if key.type_name != _RECOLLECTION_PROJECTION_TYPE:
+            raise ValueError("projection_ref must reference a D06 recollection projection")
+        atom = self.repository.store.graph_snapshot((key,)).get(key)
+        if atom is None or not atom.valid:
+            raise ValueError("recollection projection is unavailable")
+        _validate_recollection_projection(atom.value)
+        value = dict(atom.value)
+        source_key_value = AtomKey.from_token(value["source_ref"])
+        source_id = source_key_value.owner.subject
+        source, proof = self.repository.read_source_evidence(
+            source_id, audience=audience, purpose=purpose,
+        )
+        details = []
+        for detail in value["details"]:
+            item = dict(detail)
+            span = detail["source_span"]
+            if (source is not None and source_key_value in (v.key for v in proof.versions)
+                    and any(v.key == source_key_value and v.revision == value["source_revision"]
+                            for v in proof.versions)
+                    and detail["source_ref"] == value["source_ref"] and span is not None
+                    and span[1] <= len(source.text)):
+                item["literal_text"] = source.text[span[0]:span[1]]
+            else:
+                item["literal_text"] = None
+            details.append(item)
+        value["details"] = details
+        value["projection_ref"] = key.token
+        value["source_access_status"] = "authorized" if source is not None else "unavailable"
+        value["projection_revision"] = atom.revision
+        value["source_literal_status"] = (
+            "derived_from_current_authorized_source" if source is not None
+            and any(v.key == source_key_value and v.revision == value["source_revision"]
+                    for v in proof.versions) else "unavailable_or_changed"
+        )
+        return value
 
     def prepare_association(
         self,

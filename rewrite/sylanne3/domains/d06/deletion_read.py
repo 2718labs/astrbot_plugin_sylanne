@@ -183,6 +183,12 @@ def read_deletion_closure_candidate(
             if kind in {"memory.subjective_trace.v1", "memory.subjective_trace.v2"}:
                 if value["episode_ref"] in episode_tokens:
                     traces.add(atom.key)
+            elif kind == "d06.recollection_projection.v1" and (
+                value["source_ref"] in affected_tokens
+                or value["recollection_ref"] in affected_tokens
+                or value["experience_ref"] in affected_tokens
+            ):
+                recollections.add(atom.key)
             elif kind == "d06.recollection.v1" and (
                 set(value["content_refs"]) | set(value["activity_basis_refs"])
                 | set(value["now_interpretation_refs"])
@@ -192,7 +198,7 @@ def read_deletion_closure_candidate(
                 recollections.add(atom.key)
         except (TypeError, KeyError, ValueError):
             if kind in {"memory.subjective_trace.v1", "memory.subjective_trace.v2",
-                        "d06.recollection.v1"}:
+                        "d06.recollection.v1", "d06.recollection_projection.v1"}:
                 missing.append("unreadable_memory_payload")
     return DeletionReadCandidate(
         request.request_id, tuple(key.token for key in roots),
@@ -420,7 +426,7 @@ def read_deletion_closure_candidate_from_coordinator(
             associations.add(key)
         elif key.type_name == "memory.interpretation":
             interpretations.add(key)
-        elif key.type_name == "d06.recollection.v1":
+        elif key.type_name in {"d06.recollection.v1", "d06.recollection_projection.v1"}:
             recollections.add(key)
     episode_tokens = {key.token for key in episodes}
     for atom in d06_atoms.values():
@@ -432,6 +438,10 @@ def read_deletion_closure_candidate_from_coordinator(
                     interpretations.update(AtomKey.from_token(ref)
                                            for ref in value["interpretation_refs"]
                                            if ref in by_key)
+            elif kind == "d06.recollection_projection.v1":
+                refs = {value["source_ref"], value["recollection_ref"], value["experience_ref"]}
+                if refs & (affected_tokens | episode_tokens | {key.token for key in recollections}):
+                    recollections.add(atom.key)
             elif kind == "d06.recollection.v1":
                 refs = set().union(*(set(value[name]) for name in (
                     "content_refs", "activity_basis_refs", "now_interpretation_refs",
@@ -445,7 +455,7 @@ def read_deletion_closure_candidate_from_coordinator(
                     recollections.add(atom.key)
         except (TypeError, KeyError, ValueError):
             if kind in {"memory.subjective_trace.v1", "memory.subjective_trace.v2",
-                        "d06.recollection.v1"}:
+                        "d06.recollection.v1", "d06.recollection_projection.v1"}:
                 missing.append("unreadable_memory_payload")
 
     history_by_version = {
@@ -516,7 +526,7 @@ def read_deletion_closure_candidate_from_coordinator(
             associations.add(key)
         elif key.type_name == "memory.interpretation":
             interpretations.add(key)
-        elif key.type_name == "d06.recollection.v1":
+        elif key.type_name in {"d06.recollection.v1", "d06.recollection_projection.v1"}:
             recollections.add(key)
         elif key.type_name not in d06_type_names:
             missing.append("unresolved_other_domain_historical_dependency")
@@ -545,6 +555,10 @@ def read_deletion_closure_candidate_from_coordinator(
                 if any(source_key(*namespace.as_tuple, source_id).token in affected_tokens
                        for source_id in value["source_ids"]):
                     interpretations.add(key)
+            elif kind == "d06.recollection_projection.v1":
+                refs = {value["source_ref"], value["recollection_ref"], value["experience_ref"]}
+                if refs & (affected_tokens | episode_tokens | historical_refs):
+                    recollections.add(key)
             elif kind == "d06.recollection.v1":
                 refs = set().union(*(set(value[name]) for name in (
                     "content_refs", "activity_basis_refs", "now_interpretation_refs",

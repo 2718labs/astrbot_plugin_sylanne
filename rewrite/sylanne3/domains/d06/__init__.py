@@ -64,6 +64,22 @@ _RECOLLECTION_SCHEMA_HASH = schema_hash({
     "storage_role": "source",
     "fields": sorted(_RECOLLECTION_FIELDS),
 })
+_RECOLLECTION_PROJECTION_TYPE = "d06.recollection_projection.v1"
+_RECOLLECTION_PROJECTION_FIELDS = frozenset({
+    "projection_id", "activity_id", "recollection_ref", "experience_ref",
+    "source_ref", "source_revision", "mood_ref", "mood_revision",
+    "coupling_version", "projection_version", "state",
+    "evidence_eligibility", "details", "subjective_weight",
+    "subjective_tone", "duration_interval", "encoding_trace_ref",
+    "baseline_status",
+})
+_RECOLLECTION_PROJECTION_SCHEMA_HASH = schema_hash({
+    "type": _RECOLLECTION_PROJECTION_TYPE,
+    "version": 1,
+    "owner_kinds": ("activity",),
+    "storage_role": "source",
+    "fields": sorted(_RECOLLECTION_PROJECTION_FIELDS),
+})
 _WORKBENCH_VIEW = "d06.memory_sources.v1"
 _WORKBENCH_FIELDS = frozenset({"sources", "coverage"})
 _WORKBENCH_TYPES = ("memory.source", "memory.access", "memory.interpretation")
@@ -130,6 +146,62 @@ def _validate_recollection(value: object) -> None:
     for name in ("focus_epoch", "access_epoch", "delete_epoch"):
         if type(value[name]) is not int or isinstance(value[name], bool) or value[name] < 0:
             raise ValueError(f"{name} must be a nonnegative integer")
+
+
+def _validate_recollection_projection(value: object) -> None:
+    if type(value) is not dict or frozenset(value) != _RECOLLECTION_PROJECTION_FIELDS:
+        raise ValueError("recollection projection fields must match the registered schema exactly")
+    for name in ("projection_id", "activity_id", "coupling_version", "projection_version"):
+        _nonempty(value[name], name)
+    for name in ("recollection_ref", "experience_ref", "source_ref", "mood_ref"):
+        token = _nonempty(value[name], name)
+        AtomKey.from_token(token)
+    for name in ("source_revision", "mood_revision"):
+        if type(value[name]) is not int or isinstance(value[name], bool) or value[name] <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if value["state"] != "committed_subjective_projection":
+        raise ValueError("projection state must reflect C04 adoption")
+    if value["evidence_eligibility"] != "subjective_only":
+        raise ValueError("projection cannot qualify external evidence")
+    if type(value["details"]) is not list:
+        raise TypeError("details must be a JSON array")
+    seen = set()
+    detail_fields = {"detail_id", "state", "source_ref", "source_span",
+                     "interpretation_ref", "subjective_salience", "subjective_accessibility"}
+    for detail in value["details"]:
+        if type(detail) is not dict or set(detail) != detail_fields:
+            raise ValueError("projection detail fields must match the registered schema exactly")
+        detail_id = _nonempty(detail["detail_id"], "detail_id")
+        if detail_id in seen:
+            raise ValueError("projection detail IDs must be unique")
+        seen.add(detail_id)
+        _nonempty(detail["state"], "detail state")
+        for name in ("source_ref", "interpretation_ref"):
+            ref = detail[name]
+            if ref is not None:
+                AtomKey.from_token(_nonempty(ref, name))
+        span = detail["source_span"]
+        if span is not None and (type(span) is not list or len(span) != 2
+                                 or any(type(x) is not int or x < 0 for x in span)
+                                 or span[1] <= span[0]):
+            raise ValueError("source_span must be a nonempty half-open range or null")
+        for name in ("subjective_salience", "subjective_accessibility"):
+            interval = detail[name]
+            if interval is not None and (type(interval) is not list or len(interval) != 2
+                                         or any(type(x) not in (int, float) or isinstance(x, bool)
+                                                or not math.isfinite(x) or not 0 <= x <= 1 for x in interval)
+                                         or interval[1] < interval[0]):
+                raise ValueError(f"{name} must be a bounded interval or null")
+    for name in ("subjective_weight", "subjective_tone", "duration_interval"):
+        interval = value[name]
+        if interval is not None and (type(interval) is not list or len(interval) != 2
+                                     or any(type(x) not in (int, float) or isinstance(x, bool)
+                                            or not math.isfinite(x) for x in interval)
+                                     or interval[1] < interval[0]):
+            raise ValueError(f"{name} must be a finite ordered interval or null")
+    for name in ("encoding_trace_ref", "baseline_status"):
+        if value[name] is not None:
+            _nonempty(value[name], name)
 
 
 def _canonical_graph_refs(
@@ -668,6 +740,15 @@ class D06DomainProvider:
             writer_domain="d06",
             schema_hash=_RECOLLECTION_SCHEMA_HASH,
         ))
+        specs.append(TypeSpec(
+            _RECOLLECTION_PROJECTION_TYPE,
+            ("activity",),
+            "source",
+            _validate_recollection_projection,
+            immutable=True,
+            writer_domain="d06",
+            schema_hash=_RECOLLECTION_PROJECTION_SCHEMA_HASH,
+        ))
         return tuple(sorted(specs, key=lambda item: item.name))
 
     def register_types(self) -> tuple[str, ...]:
@@ -688,6 +769,19 @@ class D06DomainProvider:
             if spec.writer_domain != "d06":
                 raise ValueError("D06 proposal contains a non-D06 graph write")
             registry.validate(write.key, write.value)
+        projections = [write for write in proposal.typed_writes
+                       if write.key.type_name == _RECOLLECTION_PROJECTION_TYPE]
+        if projections:
+            recollections = [write for write in proposal.typed_writes
+                             if write.key.type_name == _RECOLLECTION_TYPE]
+            if len(projections) != 1 or len(recollections) != 1:
+                raise ValueError("C04 projection must accompany exactly one recollection")
+            projection, recollection = projections[0], recollections[0]
+            if (projection.value["recollection_ref"] != recollection.key.token
+                    or projection.value["activity_id"] != recollection.value["activity_id"]
+                    or projection.value["source_ref"] not in recollection.value["content_refs"]
+                    or projection.key.owner != recollection.key.owner):
+                raise ValueError("C04 projection differs from its persisted recollection")
         trace_types = {"memory.subjective_trace.v1", "memory.subjective_trace.v2"}
         encoding = {write.key.type_name: write for write in proposal.typed_writes
                     if write.key.type_name in {"memory.episode.v1", *trace_types}}
@@ -1388,6 +1482,69 @@ class D06DomainAdapter:
         _validate_recollection(value)
         return GraphWrite(
             AtomKey(owner, _RECOLLECTION_TYPE, proposal.recollection_id),
+            value,
+        )
+
+    def recollection_projection_write(self, reconstruction, experience_write: GraphWrite) -> GraphWrite:
+        """Persist a source-bounded subjective projection adopted by this C04 bundle."""
+        if experience_write.key.type_name != "d04.recollection_experience.v1":
+            raise ValueError("projection requires its D04 recollection experience write")
+        experience = experience_write.value
+        if (experience.get("recollection_ref") != AtomKey(
+                Owner("activity", *self.namespace.as_tuple, reconstruction.activity_id),
+                _RECOLLECTION_TYPE, reconstruction.recollection_id).token
+                or experience.get("memory_ref") != reconstruction.source_ref
+                or tuple(experience.get("salience_interval", ())) != reconstruction.subjective_weight
+                or tuple(experience.get("tone_interval", ())) != reconstruction.subjective_tone
+                or experience.get("evidence_weight_delta") != 0.0):
+            raise ValueError("D04 official experience does not certify this subjective projection")
+        versions = {version.key: version for version in reconstruction.read_versions}
+        source_key_value = AtomKey.from_token(reconstruction.source_ref)
+        mood_key_value = AtomKey.from_token(reconstruction.mood_ref)
+        source_version, mood_version = versions.get(source_key_value), versions.get(mood_key_value)
+        if source_version is None or mood_version is None:
+            raise ValueError("projection requires guarded source and mood versions")
+        details = []
+        for detail in reconstruction.subjective_details:
+            details.append({
+                "detail_id": detail.detail_id,
+                "state": detail.state,
+                "source_ref": detail.source_ref,
+                "source_span": list(detail.source_span) if detail.source_span is not None else None,
+                "interpretation_ref": detail.interpretation_ref,
+                "subjective_salience": list(detail.subjective_salience),
+                "subjective_accessibility": (list(detail.subjective_accessibility)
+                                             if detail.subjective_accessibility is not None else None),
+            })
+        projection_id = _stable_id("projection", (
+            reconstruction.recollection_id, experience_write.key.token,
+            source_version.revision, mood_version.revision, reconstruction.coupling_version,
+        ))
+        value = {
+            "projection_id": projection_id,
+            "activity_id": reconstruction.activity_id,
+            "recollection_ref": experience["recollection_ref"],
+            "experience_ref": experience_write.key.token,
+            "source_ref": reconstruction.source_ref,
+            "source_revision": source_version.revision,
+            "mood_ref": reconstruction.mood_ref,
+            "mood_revision": mood_version.revision,
+            "coupling_version": reconstruction.coupling_version,
+            "projection_version": "d06.affective_projection.v1",
+            "state": "committed_subjective_projection",
+            "evidence_eligibility": "subjective_only",
+            "details": details,
+            "subjective_weight": list(experience["salience_interval"]),
+            "subjective_tone": list(experience["tone_interval"]),
+            "duration_interval": (list(reconstruction.subjective_duration_interval_v1)
+                                  if reconstruction.subjective_duration_interval_v1 is not None else None),
+            "encoding_trace_ref": reconstruction.encoding_trace_ref,
+            "baseline_status": reconstruction.then_feeling_status,
+        }
+        _validate_recollection_projection(value)
+        return GraphWrite(
+            AtomKey(Owner("activity", *self.namespace.as_tuple, reconstruction.activity_id),
+                    _RECOLLECTION_PROJECTION_TYPE, projection_id),
             value,
         )
 
