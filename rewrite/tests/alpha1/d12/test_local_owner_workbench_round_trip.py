@@ -47,6 +47,7 @@ from sylanne3.workbench_api.d01_onboarding import (
     VerifiedModelCapability,
 )
 from sylanne3.workbench_api.d03_onboarding import CurrentD03OnboardingResolver
+from sylanne3.workbench_api.owner_grant import GraphCurrentOwnerGrantPort
 from sylanne3.workbench_api.service import AuthenticatedSession
 
 
@@ -213,6 +214,10 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         coordinator.register_provider(
             bootstrap, "d03", d03, "d03.proposal.v1",
             d03.descriptor.request_schema_hash)
+        d01 = PersonaDomain()
+        coordinator.register_provider(
+            bootstrap, "d01", d01, "d01.proposal.v1",
+            d01.descriptor.request_schema_hash)
         scene_ref = scene_ref_for_conversation(
             owner_case.ROLE, "platform", "conversation")
         scene = CurrentHostScene(
@@ -246,10 +251,14 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
                 if (not self.current or username != "dashboard-admin"
                         or owner_session_token != login_token):
                     return None
-                if sessions.describe_current(
-                    transport_credential=owner_case.PEER, token=owner_session_token,
-                    namespace=owner_case.AUTH_NS,
-                    installation_id="installation") != login_request:
+                try:
+                    current_request = sessions.describe_current(
+                        transport_credential=owner_case.PEER, token=owner_session_token,
+                        namespace=owner_case.AUTH_NS,
+                        installation_id="installation")
+                except AuthorityUnavailable:
+                    return None
+                if current_request != login_request:
                     return None
                 anchor = service.current_anchor(
                     credential=owner_case.WORKER, subject=owner_case.SUBJECT)
@@ -335,10 +344,6 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             def resolve_bind_scene(self, **kwargs):
                 return d03_resolver.resolve_bind_scene(**kwargs)
 
-        class OwnerGrants:
-            def resolve_current_owner(self, **_):
-                return None
-
         class _Store:
             def close(self):
                 pass
@@ -355,7 +360,9 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             before = await command()
         assert before.status_code == 503
         mount.attach_transport(runtime.workbench_transport(
-            pairing=pairing, owner_grants=OwnerGrants(),
+            pairing=pairing, owner_grants=GraphCurrentOwnerGrantPort(
+                coordinator, bootstrap, namespace=owner_case.ROLE,
+                activation_generation=1, domains=("d01", "d03")),
             onboarding=Onboarding(), origin="https://dashboard.local"))
         session_route, _ = _match_registered_web_api(
             context.registered_web_apis, SESSION_ROUTE, "GET")
@@ -377,6 +384,18 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         assert receipt["operation_id"] == operation_id
         assert receipt["phase"] == "role_initialized"
         assert receipt["owner_grant_revision"] == 1
+        view_body = json.dumps({
+            "schema_version": "d12.contract.v1", "action": "read_character_view",
+            "scope": "bot/persona", "purpose": "workbench_view",
+            "audience": "owner", "operation_id": str(uuid4()),
+            "input": {"view_type": "creation"},
+        }).encode()
+        with bind_request_context(_Request(
+                view_body, token=token, owner_token=login_token)):
+            viewed = await command()
+        assert viewed.status_code == 200, viewed.body
+        candidates = json.loads(viewed.body)["projection"]["data"]["candidates"]
+        assert candidates[0]["plan_id"] == receipt["plan_id"]
         assert resources[0]._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_receipts_v1").fetchone() == (1,)
         resources[0]._db.execute(
@@ -433,6 +452,11 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         sessions.logout(
             transport_credential=owner_case.PEER, token=login_token,
             request=login_request)
+        with bind_request_context(_Request(
+                view_body, token=token, owner_token=login_token)):
+            revoked_view = await command()
+        assert revoked_view.status_code == 401
+        assert "projection" not in json.loads(revoked_view.body)
         with pytest.raises(AuthorityUnavailable, match="Owner session is not current"):
             coordinator.replay_committed_scene_binding_v2(
                 namespace=owner_case.ROLE, operation_id=scene_operation_id,
