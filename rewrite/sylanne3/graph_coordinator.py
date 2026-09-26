@@ -11169,6 +11169,238 @@ class GraphCoordinator:
             _capability=self.__graph_capability)
         return receipt.revisions[0], receipt.epoch.revision, True
 
+    def register_dispatch_final_claim_writer_v1(self, bootstrap: object):
+        """Give trusted host composition one synchronous GraphWorker callback.
+
+        The reverse mTLS listener registers this callback in its exclusive
+        window. Merely receiving the five Authority DTOs never grants a claim.
+        """
+        self._admin(bootstrap)
+        from .host.authority_profile import AdminIngressClockPolicy
+
+        port = self.__content_fence_v2
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or port is None
+                or type(self.__dispatch_clock_policy) is not AdminIngressClockPolicy
+                or not callable(getattr(port, "read_current_effect", None))
+                or not callable(getattr(port, "current_anchor", None))
+                or not callable(getattr(port, "read_ingress_clock", None))):
+            raise UnavailableGuard("installed final dispatch authorities unavailable; HOLD")
+
+        def claim_writer(graph, context, binding, claimed, witness, snapshot):
+            if graph is not self:
+                raise UnavailableGuard("final dispatch GraphWorker identity differs; HOLD")
+            return self._commit_dispatch_final_claim_v1(
+                context, binding, claimed, witness, snapshot)
+
+        return claim_writer
+
+    def _commit_dispatch_final_claim_v1(
+            self, context, binding, claimed, witness, authority_snapshot):
+        """Recheck the exact P2 and current graph in one write transaction.
+
+        All Authority reads precede the GraphStore lock. Incomplete domain
+        checks explicitly HOLD before the private claim atom can be written.
+        """
+        from .authority_service.reverse_handoff import (
+            require_exact_authority_snapshot,
+            require_exact_reverse_handoff_identity,
+        )
+        from .authority_service.v2_contract import (
+            AuthorityDispatchSnapshotV1, DispatchHandoffContextV1,
+            ExecutionBindingV2, MutationReceiptV2, OwnerDispatchWitnessV1,
+            canonical_digest as authority_digest,
+        )
+        from .authority_service.v2_execution_bridge import CurrentEffectReadV2
+        from .runtime.dispatch_budget_check import (
+            evaluate_dispatch_budget_authority_snapshot,
+        )
+        from .runtime.dispatch_current_commitments import (
+            read_current_d08_action_conflict_evidence,
+            read_current_d08_conflict_facts,
+        )
+        from .runtime.dispatch_current_commitment_check import (
+            read_current_commitment_criteria_v1,
+        )
+        from .runtime.dispatch_current_projection import (
+            read_current_dispatch_projection,
+        )
+        from .runtime.dispatch_current_social_checks import (
+            verify_current_social_checks,
+        )
+        from .runtime.dispatch_current_segment import read_current_dispatch_segment
+        from .domains.d08 import GoalExecutionProvider
+        from .domains.d03.context import ContextProvider
+        from .domains.d05.relationship import RelationshipProvider
+        from .runtime.first_ingress_v2 import trusted_upper
+        from .host.authority_profile import AdminIngressClockPolicy
+
+        if (type(context) is not DispatchHandoffContextV1
+                or type(binding) is not ExecutionBindingV2
+                or type(claimed) is not MutationReceiptV2
+                or type(witness) is not OwnerDispatchWitnessV1
+                or type(authority_snapshot) is not AuthorityDispatchSnapshotV1):
+            raise UnavailableGuard("typed final dispatch P2 evidence required; HOLD")
+        try:
+            namespace = NamespaceId(*binding.graph_namespace.split("/"))
+            require_exact_reverse_handoff_identity(
+                namespace_ref(namespace), context, binding, claimed)
+            require_exact_authority_snapshot(context, witness, authority_snapshot)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise UnavailableGuard("final dispatch P2 chain differs; HOLD") from exc
+        permit = context.permit
+        if (witness.context_digest != authority_digest(context)
+                or witness.authority_namespace != permit.namespace
+                or witness.graph_namespace != binding.graph_namespace
+                or witness.guard.authority_id != permit.authority_id
+                or witness.guard.namespace != namespace):
+            raise UnavailableGuard("final dispatch Owner witness differs; HOLD")
+
+        # The installed port reads live Authority state. No GraphStore lock is
+        # held while these synchronous RPCs run on the GraphWorker thread.
+        port = self.__content_fence_v2
+        if (port is None or not callable(getattr(port, "read_current_effect", None))
+                or type(self.__dispatch_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("installed final dispatch readers unavailable; HOLD")
+        anchor = port.current_anchor(
+            namespace=namespace, authority_namespace=permit.namespace)
+        effect = port.read_current_effect(
+            namespace=namespace, authority_namespace=permit.namespace,
+            effect_id=permit.effect_id)
+        now_utc = trusted_upper(port.read_ingress_clock(
+            self.__dispatch_clock_policy))
+        own = tuple(item for item in authority_snapshot.unresolved_effects
+                    if item.effect_id == permit.effect_id)
+        if (anchor != authority_snapshot.anchor or type(effect) is not CurrentEffectReadV2
+                or len(own) != 1 or own[0].phase != "claimed"
+                or own[0].mutation_id != effect.mutation_id
+                or own[0].execution_seq != effect.effect_seq
+                or own[0].append_digest != effect.append_digest
+                or effect.state != "unresolved"
+                or (effect.execution_head_seq, effect.execution_head_digest)
+                != (anchor.execution_seq, anchor.execution_digest)):
+            raise UnavailableGuard("current Authority P2 effect differs; HOLD")
+
+        store = self.__store
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                metadata, _ = self._v2_graph_stamp(namespace)
+                requirements = metadata.requirements
+                if (requirements.namespace != namespace
+                        or requirements.graph_incarnation != binding.graph_incarnation
+                        or requirements.authority_namespace != permit.namespace
+                        or requirements.deletion_seq != anchor.deletion_seq
+                        or requirements.revocation_epoch != anchor.revocation_epoch
+                        or not self._accounting_anchor_covers(requirements, anchor)):
+                    raise UnavailableGuard("final dispatch graph/Authority stamp differs; HOLD")
+                provision_row = self._provision_row(db, namespace)
+                if (provision_row is None or
+                        self._decode_provision_receipt(provision_row).installation_id
+                        != witness.guard.installation_id):
+                    raise UnavailableGuard("final dispatch Owner installation differs; HOLD")
+                prerequisite = self._read_dispatch_final_claim_prerequisite_locked(
+                    namespace, binding, claimed, context.handoff_id,
+                    now_utc=now_utc)
+                from .runtime.dispatch_admission import load_admission
+                admission_receipt = load_admission(
+                    db, namespace, prerequisite.admission_ref)
+                if (admission_receipt is None
+                        or admission_receipt.admission.clock_policy_ref
+                        != self.__dispatch_clock_policy.source_id
+                        or admission_receipt.admission.clock_policy_digest
+                        != canonical_digest(asdict(self.__dispatch_clock_policy))):
+                    raise UnavailableGuard("final dispatch installed clock differs; HOLD")
+                graph, query = self._dispatch_full_graph_snapshot_locked(namespace)
+                segment = read_current_dispatch_segment(
+                    db, namespace, prerequisite.admission_ref, now_utc=now_utc)
+                projection = read_current_dispatch_projection(
+                    db, namespace, graph, query)
+                blockers = evaluate_dispatch_budget_authority_snapshot(
+                    context, witness, authority_snapshot, namespace=namespace,
+                    proposed_footprint=binding.origin.footprint)
+                if blockers:
+                    raise UnavailableGuard(
+                        "final dispatch Authority budget conflicts: "
+                        + ",".join(blockers) + "; HOLD")
+                facts = read_current_d08_conflict_facts(
+                    db, namespace, graph, query)
+                actions = tuple(item for item in facts.action_intents
+                                if item.identity.operation_id == binding.operation_id
+                                and item.identity.effect_id == binding.origin.effect_id)
+                if len(actions) != 1:
+                    raise UnavailableGuard("current D08 action is absent or ambiguous; HOLD")
+                action = read_current_d08_action_conflict_evidence(
+                    db, namespace, graph, query, actions[0].action_id,
+                    permit, effect)
+                if (action.effect_state != "unresolved"
+                        or action.action_cancellation_state != "clear"
+                        or action.job_cancellation_state != "clear"
+                        or projection.coverage != "full"
+                        or projection.missing_sources):
+                    raise UnavailableGuard("current D08/graph checks incomplete; HOLD")
+                candidate = self._get_dispatch_candidate_evidence_locked(
+                    namespace, binding.operation_id)
+                if candidate is None:
+                    raise UnavailableGuard("current D08 schema candidate absent; HOLD")
+                schema_ref, schema_revision = candidate.write_versions[1]
+                schema_atom = graph.get(AtomKey.from_token(schema_ref))
+                if (schema_atom is None or not schema_atom.valid
+                        or schema_atom.revision != schema_revision):
+                    raise UnavailableGuard("current D08 action schema differs; HOLD")
+                schema = next(spec for spec in GoalExecutionProvider().register_types()
+                              if spec.name == "d08.action_schema.v1").validator(
+                                  schema_atom.value)
+                read_current_commitment_criteria_v1(
+                    db, namespace, graph, query, actions[0], schema,
+                    claimed, context, witness, authority_snapshot, effect,
+                    now_utc=now_utc)
+                d03 = self.__providers.get("d03")
+                d05 = self.__providers.get("d05")
+                if (d03 is None or d05 is None
+                        or type(d03[0]) is not ContextProvider
+                        or type(d05[0]) is not RelationshipProvider
+                        or len(admission_receipt.admission.audience) != 1):
+                    raise UnavailableGuard("current D03/D05 provider or scope absent; HOLD")
+                try:
+                    catalogue_current = all(
+                        store._registry.spec(spec.name) == spec
+                        for provider in (d03[0], d05[0])
+                        for spec in provider.type_specs())
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    catalogue_current = False
+                receipts = {
+                    item.check_kind: item
+                    for item in admission_receipt.admission.check_receipts}
+                if set(receipts) != {item.check_kind for item in schema.required_checks}:
+                    raise UnavailableGuard("current RequiredCheck set is incomplete; HOLD")
+                role = receipts.get("role_binding")
+                boundary = receipts.get("boundary")
+                if role is None or boundary is None:
+                    raise UnavailableGuard("current D03/D05 receipts absent; HOLD")
+                social = verify_current_social_checks(
+                    db, graph, projection, actions[0], schema, role, boundary,
+                    context=d03[0], scene_ref=admission_receipt.admission.scene_ref,
+                    audience_scope=admission_receipt.admission.audience[0],
+                    now_utc=now_utc,
+                    current_catalogue_confirmed=catalogue_current)
+                if social.status != "verified" or social.verified is not True:
+                    raise UnavailableGuard(
+                        "current D03/D05 check incomplete: " + social.reason + "; HOLD")
+                if segment.missing_sources:
+                    raise UnavailableGuard(
+                        "current D09 host route and scene unavailable; HOLD")
+                # No trusted live route, Owner role/scene, D10 issuer or full
+                # RequiredCheck recomputation is installed here yet. Do not
+                # turn historical receipt fields into current PASS evidence.
+                raise UnavailableGuard(
+                    "current Owner route, D03/D05, D10 and RequiredCheck "
+                    "providers unavailable; HOLD")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+
     def get_dispatch_text_segment(self, authority: AuthorityContext,
                                   lease: object, request):
         """Read one D09 body through its committed D11 admission and graph fence.
