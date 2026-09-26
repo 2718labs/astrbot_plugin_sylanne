@@ -3,6 +3,7 @@
 from dataclasses import replace
 import hashlib
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -14,6 +15,13 @@ from sylanne3.authority_service.v2_execution_bridge import (
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
+from sylanne3.authority_service.v2_owner_contract import (
+    OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
+    OwnerClaimTicketV1, OwnerGraphCommitProofV1, OwnerPrincipalV1,
+)
+from sylanne3.authority_service.v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from sylanne3.graph_coordinator import namespace_ref
+from sylanne3.runtime_contracts import NamespaceId
 from sylanne3.authority_service.v2_contract import (
     DispatchGraphClaimReceiptV1, ExecutionBindingV1, ExecutionBindingV2,
     PendingMutationV2, PlatformObservationV1,
@@ -26,6 +34,14 @@ from sylanne3.runtime_journal import (
 )
 
 
+GRAPH_NS = NamespaceId("bot", "persona")
+AUTH_NS = namespace_ref(GRAPH_NS)
+
+
+def _digest(character):
+    return "sha256:" + character * 64
+
+
 def setup_service(tmp_path, *, create=True, observation_verifier=None,
                   final_handoff_authorizer=None):
     deletion_journal = DeletionJournal(tmp_path / "deletion.db", create=create)
@@ -34,7 +50,7 @@ def setup_service(tmp_path, *, create=True, observation_verifier=None,
     deletion_anchor = JournalHead(deletion_head.journal_id, deletion_head.seq,
                                   deletion_head.chain_digest)
     journal = AuthorityV2ExecutionJournal(
-        tmp_path / "execution.db", namespace="ns-a", journal_id="execution-a",
+        tmp_path / "execution.db", namespace=AUTH_NS, journal_id="execution-a",
         create=create)
     calls = []
     refs = {}
@@ -57,32 +73,64 @@ def setup_service(tmp_path, *, create=True, observation_verifier=None,
     )
     refs["core"] = core
     if create:
-        core.register_namespace("ok", "ns-a", "holder-a",
+        core.register_namespace("ok", AUTH_NS, "holder-a",
                                 deletion_anchor,
                                 JournalHead("execution-a", 0, "genesis"))
         core.seal_v2_only("ok")
     fences = AuthorityV2FenceStore(core._db, create=create, lock=core._lock)
+    owner_tickets = AuthorityV2OwnerTicketStore(
+        core, create=create,
+        utc_clock=lambda: datetime(2029, 1, 1, tzinfo=timezone.utc),
+        first_claim_verifier=lambda *_: True,
+        claimant_verifier=lambda *_: True,
+        graph_commit_verifier=lambda *_: True)
+    if create:
+        with core._tx() as db:
+            authority_id = core._id(db)
+        principal = OwnerPrincipalV1("identity", "account", "incarnation")
+        ticket = OwnerClaimTicketV1(
+            authority_id, "install-a", GRAPH_NS, principal, "ticket-a",
+            "create-a", _digest("a"), _digest("b"), "C" * 43,
+            "2030-01-01T00:00:00Z")
+        operation = OwnerAuthorizationOperationV1(
+            "issue", "owner-issue-a", authority_id, "install-a", GRAPH_NS,
+            principal, "grant-a", _digest("c"), 0,
+            OwnerAuthorizationGuardV1(authority_id, "install-a", GRAPH_NS,
+                                      0, "genesis", 0, 0), ticket)
+        proof = OwnerGraphCommitProofV1(
+            GRAPH_NS, operation.operation_id, operation.request_digest,
+            operation.grant_id, operation.grant_digest,
+            "incarnation-a", 1, 0, 1, _digest("d"))
+        owner_tickets.register_ticket(
+            credential="ok", authority_namespace=AUTH_NS, ticket=ticket)
+        owner_tickets.reserve_issue(
+            credential="ok", authority_namespace=AUTH_NS, operation=operation)
+        owner_tickets.finalize_issue(
+            credential="ok", authority_namespace=AUTH_NS,
+            operation=operation, proof=proof)
     bridge = AuthorityV2ExecutionBridge(core=core, fences=fences,
-                                        journal=journal, namespace="ns-a",
+                                        journal=journal, namespace=AUTH_NS,
                                         deletion=deletion,
                                         observation_verifier=observation_verifier,
                                         final_handoff_authorizer=final_handoff_authorizer,
                                         final_handoff_issuer_id=("graph-writer-a" if
-                                            final_handoff_authorizer is not None else None))
+                                            final_handoff_authorizer is not None else None),
+                                        owner_tickets=owner_tickets,
+                                        owner_installation_id="install-a")
     bridge._test_deletion_journal = deletion_journal
     return core, fences, journal, bridge, calls
 
 
 def footprint():
     return RecoveryConstraintFootprint(
-        namespace="ns-a", activity_id="activity-a", effect_id="effect-a",
+        namespace=AUTH_NS, activity_id="activity-a", effect_id="effect-a",
         conflict_keys=("resource-a",),
     )
 
 
 def rich_footprint():
     return RecoveryConstraintFootprint(
-        namespace="ns-a", activity_id="activity-a", effect_id="effect-a",
+        namespace=AUTH_NS, activity_id="activity-a", effect_id="effect-a",
         external_idempotency_ref="idem-a", external_query_ref="query-a",
         conflict_keys=("resource-a",), communication_action="send",
         contact_id="contact-a", segment_id="segment-a",
@@ -106,12 +154,12 @@ def begin(core, fences, item):
 
 def authority_anchor(core):
     with core._tx() as db:
-        return core._anchor(db, "ns-a", core._row(db, "ns-a"))
+        return core._anchor(db, AUTH_NS, core._row(db, AUTH_NS))
 
 
 def execution_binding(permit, item, **changes):
     fields = dict(
-        permit=permit, namespace="ns-a", activity_id=item.activity_id,
+        permit=permit, namespace=AUTH_NS, activity_id=item.activity_id,
         effect_id=item.effect_id, attempt_id="attempt-a",
         operation_id=permit.operation_id, dispatch_generation=1,
         activation_generation=permit.generation, admission_ref="admission-a",
@@ -127,7 +175,7 @@ def execution_binding(permit, item, **changes):
 
 def execution_binding_v2(permit, item):
     return ExecutionBindingV2(
-        execution_binding(permit, item), "ns-a", "incarnation-a",
+        execution_binding(permit, item), "/".join(GRAPH_NS.as_tuple), "incarnation-a",
         "sha256:" + "a" * 64, "graph-version-a", 1, 0, 0,
         "sha256:" + "b" * 64, "intent-schema-a",
         "sha256:" + "c" * 64, "action-schema-a",
@@ -139,7 +187,8 @@ def execution_binding_v2(permit, item):
 
 def graph_receipt(context, **changes):
     fields = dict(
-        context_digest=canonical_digest(context), graph_namespace="ns-a",
+        context_digest=canonical_digest(context),
+        graph_namespace="/".join(GRAPH_NS.as_tuple),
         graph_incarnation="incarnation-a", graph_version="graph-version-b",
         graph_epoch=2, graph_access_epoch=0, graph_deletion_epoch=0,
         graph_claim_ref="graph-final-claim-a",
@@ -167,7 +216,7 @@ def test_handoff_start_requires_final_graph_authority_and_durable_current_claim(
     calls = []
     refs = {}
 
-    def authorize(context, binding, claimed):
+    def authorize(context, binding, claimed, _owner_witness):
         core = refs["core"]
         journal = refs["journal"]
         assert not core._db.in_transaction
@@ -283,7 +332,7 @@ def test_handoff_rejects_receipt_identity_tampering(tmp_path, receipt_changes):
 def test_handoff_context_binds_exact_p2_a2_and_rejects_misbound_echo(tmp_path):
     seen = []
 
-    def authorize(context, binding, claimed):
+    def authorize(context, binding, claimed, _owner_witness):
         assert context.permit.revision == claimed.updated_revision
         assert context.permit.pinned_anchor == claimed.after_anchor
         assert context.permit.effect_id == binding.origin.effect_id
@@ -314,11 +363,11 @@ def test_handoff_context_binds_exact_p2_a2_and_rejects_misbound_echo(tmp_path):
 def test_handoff_rechecks_exact_a2_after_graph_callback(tmp_path):
     refs = {}
 
-    def change_head(context, _binding, _claimed):
+    def change_head(context, _binding, _claimed, _owner_witness):
         with refs["core"]._tx() as db:
             db.execute("UPDATE authority_namespaces SET anchor_nonce=? "
                        "WHERE namespace=?",
-                       (refs["core"]._new_nonce(), "ns-a"))
+                       (refs["core"]._new_nonce(), AUTH_NS))
         return graph_receipt(context)
 
     core, fences, journal, bridge, _ = setup_service(
@@ -395,7 +444,7 @@ def test_stale_fence_is_rejected_before_graph_handoff_claim(tmp_path):
 def test_fence_change_during_graph_handoff_claim_blocks_authority_start(tmp_path):
     refs = {}
 
-    def claim_then_finish(context, _binding, _claimed):
+    def claim_then_finish(context, _binding, _claimed, _owner_witness):
         core, fences, updated = refs["core"], refs["fences"], refs["permit"]
         assert not core._db.in_transaction
         fences.finish_fence(
@@ -442,7 +491,7 @@ def test_observation_requires_installed_verifier_and_keeps_unknown_unresolved(tm
             credential="ok", subject="subject-a",
             claimed_receipt=claimed, observation=report)
     mismatched = AuthorityV2ExecutionBridge(
-        core=core, fences=fences, journal=journal, namespace="ns-a",
+        core=core, fences=fences, journal=journal, namespace=AUTH_NS,
         deletion=bridge.deletion,
         observation_verifier=lambda ns, receipt, evidence:
             replace(evidence, outcome="accepted"))
@@ -460,7 +509,7 @@ def test_observation_requires_installed_verifier_and_keeps_unknown_unresolved(tm
     verified_calls = []
 
     def verify(namespace, receipt, observation):
-        assert namespace == "ns-a" and receipt == claimed
+        assert namespace == AUTH_NS and receipt == claimed
         assert type(observation) is PlatformObservationV1
         assert not core._db.in_transaction
         assert journal._guard_owner is None
@@ -497,7 +546,7 @@ def test_observation_requires_installed_verifier_and_keeps_unknown_unresolved(tm
 
 def test_observed_handoff_is_not_delivery_and_append_recovers(tmp_path):
     def verify(namespace, receipt, observation):
-        assert namespace == "ns-a" and receipt.pending.phase == "claimed"
+        assert namespace == AUTH_NS and receipt.pending.phase == "claimed"
         return observation
 
     core, fences, journal, bridge, _ = setup_service(
@@ -734,7 +783,7 @@ def test_claim_advances_same_operation_and_replays_after_restart(tmp_path):
     assert journal.verified_head().seq == 2
     assert core._db.execute(
         "SELECT state,execution_seq FROM authority_effects WHERE namespace=? AND effect_id=?",
-        ("ns-a", "effect-a")).fetchone() == ("unresolved", 2)
+        (AUTH_NS, "effect-a")).fetchone() == ("unresolved", 2)
     core.close()
     journal.close()
 
@@ -836,7 +885,7 @@ def test_claim_pending_recovers_one_append_without_platform_handoff(tmp_path):
         prepared_receipt=prepared, binding=binding)
     assert decode_bytes(canonical_bytes(pending)) == pending
     assert journal.verified_head().seq == 1
-    assert fences.get_operation("operation-a", subject="subject-a", namespace="ns-a")[2] == pending
+    assert fences.get_operation("operation-a", subject="subject-a", namespace=AUTH_NS)[2] == pending
     with pytest.raises(AuthorityUnavailable, match="claimed pending requires"):
         bridge.reconcile_mutation(
             credential="ok", subject="subject-a", pending=pending,
@@ -874,7 +923,7 @@ def test_prepared_commit_updates_head_effect_fence_and_receipt(tmp_path):
     assert journal.verified_head().seq == receipt.after_anchor.execution_seq == 1
     assert authority_anchor(core) == receipt.after_anchor
     assert core._db.execute("SELECT state,execution_seq FROM authority_effects WHERE effect_id='effect-a'").fetchone() == ("unresolved", 1)
-    assert fences.get_operation("operation-a", subject="subject-a", namespace="ns-a") == (updated, "active", None)
+    assert fences.get_operation("operation-a", subject="subject-a", namespace=AUTH_NS) == (updated, "active", None)
     with pytest.raises(AuthorityUnavailable):
         fences.validate_fence(permit, subject="subject-a",
                               current_anchor=receipt.after_anchor)
@@ -920,7 +969,7 @@ def test_locked_observation_rejects_authority_effect_drift(tmp_path):
         credential="ok", subject="subject-a", permit=permit,
         mutation_id="mutation-a", footprint=item)
     core._db.execute("UPDATE authority_effects SET conflict_keys_json='[]' "
-                     "WHERE namespace='ns-a' AND effect_id='effect-a'")
+                     "WHERE namespace=? AND effect_id='effect-a'", (AUTH_NS,))
     with pytest.raises(AuthorityUnavailable, match="Authority effect"):
         bridge.observe_prepared(credential="ok", subject="subject-a",
                                 pending=receipt.pending)
@@ -936,7 +985,7 @@ def test_deletion_head_drift_blocks_append_and_keeps_pending(tmp_path):
                                      permit=permit, mutation_id="mutation-a",
                                      footprint=item)
     bridge._test_deletion_journal.append_intent(
-        namespace="ns-a", operation_id="delete-a", closure_roots=("item-a",),
+        namespace=AUTH_NS, operation_id="delete-a", closure_roots=("item-a",),
         epoch=1, policy_ref="policy-a")
     with pytest.raises(AuthorityUnavailable, match="historical deletion closure"):
         bridge.append_pending(pending, credential="ok", subject="subject-a")
@@ -948,7 +997,7 @@ def test_deletion_head_drift_blocks_append_and_keeps_pending(tmp_path):
                                 pending=pending)
     assert journal.verified_head().seq == 0
     assert fences.get_operation("operation-a", subject="subject-a",
-                                namespace="ns-a")[2] == pending
+                                namespace=AUTH_NS)[2] == pending
     core.close()
     bridge._test_deletion_journal.close()
     bridge.deletion.close()
@@ -974,8 +1023,10 @@ def test_fsync_then_authority_commit_failure_recovers_after_reopen(tmp_path, mon
         bridge.reconcile_mutation(credential="ok", subject="subject-a",
                                   pending=pending)
     assert journal.verified_head().seq == 1
-    assert core._db.execute("SELECT execution_seq FROM authority_namespaces WHERE namespace='ns-a'").fetchone() == (0,)
-    assert fences.get_operation("operation-a", subject="subject-a", namespace="ns-a")[2] == pending
+    assert core._db.execute(
+        "SELECT execution_seq FROM authority_namespaces WHERE namespace=?",
+        (AUTH_NS,)).fetchone() == (0,)
+    assert fences.get_operation("operation-a", subject="subject-a", namespace=AUTH_NS)[2] == pending
     core.close()
     journal.close()
 
@@ -1002,7 +1053,7 @@ def test_crash_after_authority_pending_before_append_retains_full_limits(tmp_pat
 
     core, fences, journal, bridge, _ = setup_service(tmp_path, create=False)
     assert fences.get_recovery_footprint(
-        "mutation-a", subject="subject-a", namespace="ns-a") == item
+        "mutation-a", subject="subject-a", namespace=AUTH_NS) == item
     assert bridge.observe_prepared(
         credential="ok", subject="subject-a", pending=pending).append is None
     bridge.append_pending(pending, credential="ok", subject="subject-a")
@@ -1010,7 +1061,7 @@ def test_crash_after_authority_pending_before_append_retains_full_limits(tmp_pat
         credential="ok", subject="subject-a", pending=pending)
     assert receipt.durable_state == "committed"
     assert fences.get_recovery_footprint(
-        "mutation-a", subject="subject-a", namespace="ns-a") == item
+        "mutation-a", subject="subject-a", namespace=AUTH_NS) == item
     core.close()
     journal.close()
 
@@ -1085,8 +1136,10 @@ def test_zero_append_cancel_and_extra_append_quarantine(tmp_path):
     with pytest.raises(AuthorityUnavailable, match="extra execution append"):
         bridge.observe_prepared(credential="ok", subject="subject-a",
                                 pending=pending)
-    assert fences.get_operation("operation-a", subject="subject-a", namespace="ns-a")[2] == pending
-    assert core._db.execute("SELECT execution_seq FROM authority_namespaces WHERE namespace='ns-a'").fetchone() == (0,)
+    assert fences.get_operation("operation-a", subject="subject-a", namespace=AUTH_NS)[2] == pending
+    assert core._db.execute(
+        "SELECT execution_seq FROM authority_namespaces WHERE namespace=?",
+        (AUTH_NS,)).fetchone() == (0,)
     core.close()
     journal.close()
 

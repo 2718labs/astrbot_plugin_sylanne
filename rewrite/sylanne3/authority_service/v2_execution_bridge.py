@@ -25,12 +25,13 @@ from .v2_contract import (
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
     PendingMutationV2, canonical_bytes,
     canonical_digest,
-    DispatchHandoffContextV1, DispatchGraphClaimReceiptV1,
+    DispatchHandoffContextV1, DispatchGraphClaimReceiptV1, OwnerDispatchWitnessV1,
     PlatformObservationV1, decode_bytes, from_wire, to_wire,
 )
 from .v2_execution_journal import AuthorityV2ExecutionJournal, VerifiedAppendV2
 from .v2_deletion_guard import AuthorityV2DeletionGuard
 from .v2_fence_store import AuthorityV2FenceStore
+from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
 
 
 _HANDOFF_DDL = """CREATE TABLE authority_execution_handoff_starts_v1 (
@@ -106,7 +107,6 @@ class HandoffStartV2:
         if self.graph_claim_receipt is not None and (
                 type(self.graph_claim_receipt) is not DispatchGraphClaimReceiptV1
                 or self.graph_claim_receipt.graph_claim_ref != self.graph_claim_ref
-                or self.graph_claim_receipt.graph_namespace != self.namespace
                 or self.graph_claim_receipt.context_digest != canonical_digest(
                     DispatchHandoffContextV1(
                         permit=self.permit,
@@ -162,7 +162,9 @@ class AuthorityV2ExecutionBridge:
                  journal: AuthorityV2ExecutionJournal, namespace: str,
                  deletion: AuthorityV2DeletionGuard | None = None,
                  observation_verifier=None, final_handoff_authorizer=None,
-                 final_handoff_issuer_id: str | None = None):
+                 final_handoff_issuer_id: str | None = None,
+                 owner_tickets: AuthorityV2OwnerTicketStore | None = None,
+                 owner_installation_id: str | None = None):
         identifier(namespace, "namespace")
         if (type(core) is not AuthorityServiceCore
                 or type(fences) is not AuthorityV2FenceStore
@@ -194,6 +196,13 @@ class AuthorityV2ExecutionBridge:
         # this Authority bridge. Missing callback keeps handoff closed.
         self._final_handoff_authorizer = final_handoff_authorizer
         self._final_handoff_issuer_id = final_handoff_issuer_id
+        if owner_tickets is not None and (type(owner_tickets) is not AuthorityV2OwnerTicketStore
+                                          or owner_tickets._core is not core):
+            raise AuthorityUnavailable("Owner dispatch witness requires this Authority core")
+        if owner_installation_id is not None:
+            identifier(owner_installation_id, "owner_installation_id")
+        self._owner_tickets = owner_tickets
+        self._owner_installation_id = owner_installation_id
         with core._tx() as db:
             stored = db.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' "
@@ -1162,6 +1171,8 @@ class AuthorityV2ExecutionBridge:
         if (not callable(self._final_handoff_authorizer)
                 or self._final_handoff_issuer_id is None):
             raise AuthorityUnavailable("trusted final handoff authorizer is unavailable")
+        if self._owner_tickets is None or self._owner_installation_id is None:
+            raise AuthorityUnavailable("current Owner dispatch authorization is unavailable")
         # Check the P2 head, live fence, unresolved effect and exact claim
         # before leaving any durable graph reservation. Release all freezes
         # before the graph callback to avoid GraphWorker/Authority deadlock.
@@ -1177,11 +1188,14 @@ class AuthorityV2ExecutionBridge:
                         claimed_receipt=claimed_receipt,
                         deletion_head=deletion_head,
                         execution_head=execution_head)
+                    owner_witness = self._owner_tickets.current_dispatch_witness_in_tx(
+                        db, context=context, binding=binding,
+                        installation_id=self._owner_installation_id)
         # External business graph transaction MUST be atomic and idempotent by
         # handoff_id. No Core, deletion, or execution journal lock is held here.
         try:
             graph_receipt = self._final_handoff_authorizer(
-                context, binding, claimed_receipt)
+                context, binding, claimed_receipt, owner_witness)
         except Exception as exc:
             raise AuthorityUnavailable("final business graph handoff denied") from exc
         # graph_version names an atom revision; graph_epoch is the namespace
@@ -1207,6 +1221,11 @@ class AuthorityV2ExecutionBridge:
                         claimed_receipt=claimed_receipt,
                         deletion_head=deletion_head,
                         execution_head=execution_head)
+                    current_owner = self._owner_tickets.current_dispatch_witness_in_tx(
+                        db, context=context, binding=binding,
+                        installation_id=self._owner_installation_id)
+                    if current_owner != owner_witness:
+                        raise AuthorityUnavailable("Owner authorization changed during graph claim")
                     if db.execute(
                         "SELECT 1 FROM authority_execution_handoff_starts_v1 "
                         "WHERE operation_id=? OR handoff_id=?",

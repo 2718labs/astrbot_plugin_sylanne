@@ -3,6 +3,7 @@
 from dataclasses import replace
 import asyncio
 import hashlib
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -11,17 +12,29 @@ from sylanne3.authority_service.contract import AuthorityUnavailable, JournalHea
 from sylanne3.authority_service.core import AuthorityServiceCore
 from sylanne3.authority_service.v2_contract import (
     DispatchGraphClaimReceiptV1, DispatchHandoffContextV1,
-    ExecutionBindingV1, ExecutionBindingV2, canonical_digest,
+    ExecutionBindingV1, ExecutionBindingV2, OwnerDispatchWitnessV1,
+    canonical_digest,
     from_wire, to_wire,
 )
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_execution_bridge import AuthorityV2ExecutionBridge
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_fence_store import AuthorityV2FenceStore
+from sylanne3.authority_service.v2_owner_contract import (
+    OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
+    OwnerClaimTicketV1, OwnerGraphCommitProofV1, OwnerPrincipalV1,
+)
+from sylanne3.authority_service.v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from sylanne3.graph_coordinator import namespace_ref
+from sylanne3.runtime_contracts import NamespaceId
 from sylanne3.authority_service.mtls_server import AuthorityRpcServer
 from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime_journal import RecoveryConstraintFootprint
 from sylanne3.host.mtls_transport import MtlsAuthorityTransport
+
+
+GRAPH_NS = NamespaceId("bot", "persona")
+AUTH_NS = namespace_ref(GRAPH_NS)
 
 
 def _digest(character: str) -> str:
@@ -30,7 +43,7 @@ def _digest(character: str) -> str:
 
 def _binding_v2(origin: ExecutionBindingV1, **changes: object) -> ExecutionBindingV2:
     fields = dict(
-        origin=origin, graph_namespace=origin.namespace,
+        origin=origin, graph_namespace="/".join(GRAPH_NS.as_tuple),
         graph_incarnation="graph-incarnation-a",
         admission_receipt_digest=_digest("1"),
         admission_graph_version="graph-version-a",
@@ -50,13 +63,14 @@ def _binding_v2(origin: ExecutionBindingV1, **changes: object) -> ExecutionBindi
     return ExecutionBindingV2(**fields)
 
 
-def _service(tmp_path, *, create=True, final_authorizer=None, final_issuer=None):
+def _service(tmp_path, *, create=True, final_authorizer=None, final_issuer=None,
+             with_owner=False):
     deletion_journal = DeletionJournal(tmp_path / "deletion.db", create=create)
     deletion = AuthorityV2DeletionGuard(tmp_path / "deletion.db")
     head = deletion_journal.latest_head()
     deletion_head = JournalHead(head.journal_id, head.seq, head.chain_digest)
     journal = AuthorityV2ExecutionJournal(
-        tmp_path / "execution.db", namespace="ns-a", journal_id="execution-a",
+        tmp_path / "execution.db", namespace=AUTH_NS, journal_id="execution-a",
         create=create)
     core = AuthorityServiceCore(
         tmp_path / "authority.db", create=create,
@@ -69,23 +83,56 @@ def _service(tmp_path, *, create=True, final_authorizer=None, final_issuer=None)
         dispatch_verifier=lambda *args: True,
     )
     if create:
-        core.register_namespace("ok", "ns-a", "holder-a", deletion_head,
+        core.register_namespace("ok", AUTH_NS, "holder-a", deletion_head,
                                 JournalHead("execution-a", 0, "genesis"))
         core.seal_v2_only("ok")
     fences = AuthorityV2FenceStore(core._db, create=create, lock=core._lock)
+    owner_tickets = None
+    if with_owner:
+        owner_tickets = AuthorityV2OwnerTicketStore(
+            core, create=create,
+            utc_clock=lambda: datetime(2029, 1, 1, tzinfo=timezone.utc),
+            first_claim_verifier=lambda *_: True,
+            claimant_verifier=lambda *_: True,
+            graph_commit_verifier=lambda *_: True)
+        if create:
+            with core._tx() as db:
+                authority_id = core._id(db)
+            principal = OwnerPrincipalV1("identity", "account", "incarnation")
+            ticket = OwnerClaimTicketV1(
+                authority_id, "install-a", GRAPH_NS, principal, "ticket-a",
+                "create-a", _digest("a"), _digest("b"), "C" * 43,
+                "2030-01-01T00:00:00Z")
+            operation = OwnerAuthorizationOperationV1(
+                "issue", "owner-issue-a", authority_id, "install-a", GRAPH_NS,
+                principal, "grant-a", _digest("c"), 0,
+                OwnerAuthorizationGuardV1(authority_id, "install-a", GRAPH_NS,
+                                          0, "genesis", 0, 0), ticket)
+            proof = OwnerGraphCommitProofV1(
+                GRAPH_NS, operation.operation_id, operation.request_digest,
+                operation.grant_id, operation.grant_digest,
+                "graph-incarnation-a", 1, 1, 2, _digest("d"))
+            owner_tickets.register_ticket(
+                credential="ok", authority_namespace=AUTH_NS, ticket=ticket)
+            owner_tickets.reserve_issue(
+                credential="ok", authority_namespace=AUTH_NS, operation=operation)
+            owner_tickets.finalize_issue(
+                credential="ok", authority_namespace=AUTH_NS,
+                operation=operation, proof=proof)
     bridge = AuthorityV2ExecutionBridge(
-        core=core, fences=fences, journal=journal, namespace="ns-a",
+        core=core, fences=fences, journal=journal, namespace=AUTH_NS,
         deletion=deletion, final_handoff_authorizer=final_authorizer,
-        final_handoff_issuer_id=final_issuer)
+        final_handoff_issuer_id=final_issuer, owner_tickets=owner_tickets,
+        owner_installation_id="install-a" if with_owner else None)
     return core, fences, journal, bridge
 
 
 def _prepared(core, fences, bridge):
     footprint = RecoveryConstraintFootprint(
-        namespace="ns-a", activity_id="activity-a", effect_id="effect-a",
+        namespace=AUTH_NS, activity_id="activity-a", effect_id="effect-a",
         conflict_keys=("resource-a",))
     with core._tx() as db:
-        anchor = core._anchor(db, "ns-a", core._row(db, "ns-a"))
+        anchor = core._anchor(db, AUTH_NS, core._row(db, AUTH_NS))
     footprint_digest = "sha256:" + hashlib.sha256(footprint._json().encode()).hexdigest()
     permit = fences.begin_fence(
         subject="subject-a", holder="holder-a", operation="dispatch",
@@ -95,7 +142,7 @@ def _prepared(core, fences, bridge):
         credential="ok", subject="subject-a", permit=permit,
         mutation_id="mutation-a", footprint=footprint)
     origin = ExecutionBindingV1(
-        permit=permit, namespace="ns-a", activity_id="activity-a",
+        permit=permit, namespace=AUTH_NS, activity_id="activity-a",
         effect_id="effect-a", attempt_id="attempt-a", operation_id="operation-a",
         dispatch_generation=1, activation_generation=permit.generation,
         admission_ref="admission-a", verified_check_refs=("check-a",),
@@ -143,10 +190,10 @@ def test_v2_claim_replay_preserves_original_p0_and_complete_admission(tmp_path):
     journal.close()
 
 
-def test_v2_handoff_requires_graph_claim_and_replay_cannot_send(tmp_path):
+def test_v2_handoff_requires_current_owner_authorization_before_graph_claim(tmp_path):
     calls = []
 
-    def graph_claim(context, binding, claimed):
+    def graph_claim(context, binding, claimed, _owner_witness):
         assert type(context) is DispatchHandoffContextV1
         assert type(binding) is ExecutionBindingV2
         assert binding.initial_check_evidence_digest == _digest("5")
@@ -182,32 +229,94 @@ def test_v2_handoff_requires_graph_claim_and_replay_cannot_send(tmp_path):
             credential="ok", subject="subject-a",
             claimed_receipt=claimed, handoff_id="handoff-a")
     bridge._final_handoff_issuer_id = "graph-issuer-a"
-    bridge._final_handoff_authorizer = lambda *_: "graph-claim-a"
-    with pytest.raises(AuthorityUnavailable, match="graph claim receipt identity"):
+    bridge._final_handoff_authorizer = graph_claim
+    with pytest.raises(AuthorityUnavailable, match="Owner dispatch authorization"):
         bridge.begin_handoff_v2(
             credential="ok", subject="subject-a",
             claimed_receipt=claimed, handoff_id="handoff-a")
-    bridge._final_handoff_authorizer = lambda *args: replace(
-        graph_claim(*args), issuer_id="wrong-issuer")
-    with pytest.raises(AuthorityUnavailable, match="graph claim receipt identity"):
-        bridge.begin_handoff_v2(
-            credential="ok", subject="subject-a",
-            claimed_receipt=claimed, handoff_id="handoff-a")
+    assert not calls
     assert core._db.execute(
         "SELECT COUNT(*) FROM authority_execution_handoff_starts_v1").fetchone() == (0,)
-    calls.clear()
-    bridge._final_handoff_authorizer = graph_claim
+    core.close()
+    journal.close()
+
+
+def test_v2_owner_witness_pre_post_and_replay(tmp_path):
+    observed = []
+
+    def graph_claim(context, binding, claimed, witness):
+        assert type(witness) is OwnerDispatchWitnessV1
+        assert witness.context_digest == canonical_digest(context)
+        assert witness.authority_namespace == AUTH_NS
+        assert witness.graph_namespace == "/".join(GRAPH_NS.as_tuple)
+        assert witness.guard.installation_id == "install-a"
+        assert witness.grant_id == "grant-a"
+        assert witness.grant_digest == _digest("c")
+        assert canonical_digest(claimed) == context.claimed_receipt_digest
+        observed.append(witness)
+        return DispatchGraphClaimReceiptV1(
+            canonical_digest(context), binding.graph_namespace,
+            binding.graph_incarnation, "graph-version-b", 4, 2, 0,
+            "graph-claim-a", _digest("8"), "graph-issuer-a")
+
+    core, fences, journal, bridge = _service(
+        tmp_path, with_owner=True, final_authorizer=graph_claim,
+        final_issuer="graph-issuer-a")
+    prepared, origin = _prepared(core, fences, bridge)
+    claimed, _ = bridge.execution_claim_v2(
+        credential="ok", subject="subject-a", prepared_receipt=prepared,
+        binding=_binding_v2(origin))
+    bridge._owner_installation_id = "other-installation"
+    with pytest.raises(AuthorityUnavailable, match="Owner authorization"):
+        bridge.begin_handoff_v2(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            handoff_id="handoff-a")
+    assert not observed
+    bridge._owner_installation_id = "install-a"
     start = bridge.begin_handoff_v2(
-        credential="ok", subject="subject-a",
-        claimed_receipt=claimed, handoff_id="handoff-a")
+        credential="ok", subject="subject-a", claimed_receipt=claimed,
+        handoff_id="handoff-a")
     assert start.replay is False
-    assert start.binding_digest == canonical_digest(claimed.pending.binding)
-    assert start.graph_claim_receipt is not None
-    assert start.graph_claim_receipt.issuer_id == "graph-issuer-a"
     assert bridge.begin_handoff_v2(
-        credential="ok", subject="subject-a",
-        claimed_receipt=claimed, handoff_id="handoff-a").replay is True
-    assert len(calls) == 1
+        credential="ok", subject="subject-a", claimed_receipt=claimed,
+        handoff_id="handoff-a").replay is True
+    assert len(observed) == 1
+    assert from_wire(to_wire(observed[0])) == observed[0]
+    with pytest.raises(ValueError, match="active grant"):
+        replace(observed[0], guard=replace(
+            observed[0].guard, namespace=NamespaceId("bot/other", "persona")))
+    core.close()
+    journal.close()
+
+
+def test_v2_owner_head_change_during_graph_callback_cannot_write_start(tmp_path):
+    core_ref = []
+
+    def graph_claim(context, binding, _claimed, witness):
+        assert witness.guard.authorization_revision == 1
+        with core_ref[0]._tx() as db:
+            db.execute(
+                "UPDATE authority_owner_authorization_heads_v1 SET state='revoked' "
+                "WHERE authority_namespace=?", (AUTH_NS,))
+        return DispatchGraphClaimReceiptV1(
+            canonical_digest(context), binding.graph_namespace,
+            binding.graph_incarnation, "graph-version-b", 4, 2, 0,
+            "graph-claim-a", _digest("8"), "graph-issuer-a")
+
+    core, fences, journal, bridge = _service(
+        tmp_path, with_owner=True, final_authorizer=graph_claim,
+        final_issuer="graph-issuer-a")
+    core_ref.append(core)
+    prepared, origin = _prepared(core, fences, bridge)
+    claimed, _ = bridge.execution_claim_v2(
+        credential="ok", subject="subject-a", prepared_receipt=prepared,
+        binding=_binding_v2(origin))
+    with pytest.raises(AuthorityUnavailable, match="owner current head differs"):
+        bridge.begin_handoff_v2(
+            credential="ok", subject="subject-a", claimed_receipt=claimed,
+            handoff_id="handoff-a")
+    assert core._db.execute(
+        "SELECT COUNT(*) FROM authority_execution_handoff_starts_v1").fetchone() == (0,)
     core.close()
     journal.close()
 

@@ -18,10 +18,13 @@ from typing import Awaitable, Callable
 
 from ..authority_service.v2_contract import (
     DispatchGraphClaimReceiptV1, DispatchHandoffContextV1,
-    ExecutionBindingV2, MutationReceiptV2, canonical_digest, from_wire, to_wire,
+    ExecutionBindingV2, MutationReceiptV2, OwnerDispatchWitnessV1,
+    canonical_digest, from_wire, to_wire,
 )
 from ..authority_service.v2_execution_bridge import HandoffStartV2
-from ..authority_service.reverse_handoff import require_exact_reverse_handoff_identity
+from ..authority_service.reverse_handoff import (
+    require_exact_owner_witness, require_exact_reverse_handoff_identity,
+)
 from ..graph_worker import GraphWorker
 
 
@@ -72,6 +75,7 @@ class _Registration:
     claimed: MutationReceiptV2
     window: object
     claim_writer: Callable
+    witness: OwnerDispatchWitnessV1 | None = None
     task: asyncio.Task | None = None
     receipt: DispatchGraphClaimReceiptV1 | None = None
 
@@ -159,7 +163,7 @@ class HostReverseGraphClaimServer:
         profile = self.profile
         if (type(message) is not dict or set(message) != {
                 "profile_id", "installation_id", "namespace", "context",
-                "binding", "claimed_receipt"}
+                "binding", "claimed_receipt", "owner_witness"}
                 or (message["profile_id"], message["installation_id"],
                     message["namespace"]) !=
                    (profile.profile_id, profile.installation_id, profile.namespace)):
@@ -167,27 +171,34 @@ class HostReverseGraphClaimServer:
         context = from_wire(message["context"])
         binding = from_wire(message["binding"])
         claimed = from_wire(message["claimed_receipt"])
+        witness = from_wire(message["owner_witness"])
         if (type(context) is not DispatchHandoffContextV1
                 or type(binding) is not ExecutionBindingV2
                 or type(claimed) is not MutationReceiptV2
+                or type(witness) is not OwnerDispatchWitnessV1
                 or to_wire(context) != message["context"]
                 or to_wire(binding) != message["binding"]
-                or to_wire(claimed) != message["claimed_receipt"]):
+                or to_wire(claimed) != message["claimed_receipt"]
+                or to_wire(witness) != message["owner_witness"]):
             raise RuntimeError("reverse graph claim wire identity differs")
         require_exact_reverse_handoff_identity(
             profile.namespace, context, binding, claimed,
         )
+        require_exact_owner_witness(profile, context, binding, witness)
         async with self._lock:
             registration = self._registration
             if (registration is None or registration.context != context
                     or registration.binding != binding
                     or registration.claimed != claimed):
                 raise RuntimeError("reverse graph claim handoff is not registered")
+            if registration.witness is not None and registration.witness != witness:
+                raise RuntimeError("reverse graph claim Owner witness changed")
             if registration.receipt is not None:
                 return registration.receipt
             if registration.task is None:
+                registration.witness = witness
                 registration.task = asyncio.create_task(registration.window.call(
-                    registration.claim_writer, context, binding, claimed))
+                    registration.claim_writer, context, binding, claimed, witness))
             task = registration.task
         receipt = await asyncio.shield(task)
         if (type(receipt) is not DispatchGraphClaimReceiptV1

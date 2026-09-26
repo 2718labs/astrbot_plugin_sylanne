@@ -15,7 +15,8 @@ import ssl
 
 from .v2_contract import (
     DispatchGraphClaimReceiptV1, DispatchHandoffContextV1,
-    ExecutionBindingV2, MutationReceiptV2, canonical_digest, from_wire, to_wire,
+    ExecutionBindingV2, MutationReceiptV2, OwnerDispatchWitnessV1,
+    canonical_digest, from_wire, to_wire,
 )
 
 
@@ -64,6 +65,21 @@ def require_exact_reverse_handoff_identity(
            or getattr(p0, field) != getattr(p2, field)
            for field in exact_fields):
         raise RuntimeError("reverse graph claim subject, holder or fence differs")
+
+
+def require_exact_owner_witness(
+        profile: AdministratorReverseHandoffProfile,
+        context: DispatchHandoffContextV1,
+        binding: ExecutionBindingV2,
+        witness: OwnerDispatchWitnessV1) -> None:
+    """Bind Authority's current grant snapshot to this pinned callback."""
+    if (type(witness) is not OwnerDispatchWitnessV1
+            or witness.context_digest != canonical_digest(context)
+            or witness.authority_namespace != profile.namespace
+            or witness.graph_namespace != binding.graph_namespace
+            or witness.guard.authority_id != context.permit.authority_id
+            or witness.guard.installation_id != profile.installation_id):
+        raise RuntimeError("reverse graph claim Owner witness differs")
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,17 +137,20 @@ class ReverseGraphClaimClient:
 
     def claim(self, context: DispatchHandoffContextV1,
               binding: ExecutionBindingV2,
-              claimed: MutationReceiptV2) -> DispatchGraphClaimReceiptV1:
+              claimed: MutationReceiptV2,
+              witness: OwnerDispatchWitnessV1) -> DispatchGraphClaimReceiptV1:
         profile = self.profile
         require_exact_reverse_handoff_identity(
             profile.namespace, context, binding, claimed,
         )
+        require_exact_owner_witness(profile, context, binding, witness)
         message = {
             "profile_id": profile.profile_id,
             "installation_id": profile.installation_id,
             "namespace": profile.namespace,
             "context": to_wire(context), "binding": to_wire(binding),
             "claimed_receipt": to_wire(claimed),
+            "owner_witness": to_wire(witness),
         }
         data = json.dumps(message, sort_keys=True, separators=(",", ":"),
                           allow_nan=False).encode("utf-8") + b"\n"
@@ -177,5 +196,5 @@ class ReverseGraphClaimClient:
 
 __all__ = (
     "AdministratorReverseHandoffProfile", "ReverseGraphClaimClient",
-    "require_exact_reverse_handoff_identity",
+    "require_exact_reverse_handoff_identity", "require_exact_owner_witness",
 )

@@ -12,7 +12,10 @@ from datetime import datetime
 import hashlib
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .v2_owner_contract import OwnerAuthorizationGuardV1
 
 from .contract import CONTENT_OPERATIONS, identifier
 from ..runtime.restore_anchor import RestoreAnchor
@@ -380,8 +383,6 @@ class ExecutionBindingV2:
                      "action_schema_version", "required_checks_schema_version",
                      "clock_policy_ref"):
             identifier(getattr(self, name), name)
-        if self.graph_namespace != self.origin.namespace:
-            raise ValueError("admission graph namespace differs from dispatch fence")
         for name in ("admission_graph_epoch", "admission_access_epoch",
                      "admission_deletion_epoch"):
             _exact_int(getattr(self, name), name)
@@ -515,6 +516,46 @@ class DispatchHandoffContextV1:
         identifier(self.handoff_id, "handoff_id")
         _digest(self.claimed_receipt_digest, "claimed_receipt_digest")
         _digest(self.binding_digest, "binding_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerDispatchWitnessV1:
+    """Authority's current Owner grant snapshot for one exact P2 callback.
+
+    This is a control-plane fact, not a graph role/scene check or send permit.
+    """
+
+    context_digest: str
+    authority_namespace: str
+    graph_namespace: str
+    guard: OwnerAuthorizationGuardV1
+    issue_operation_id: str
+    grant_id: str
+    grant_digest: str
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        from .v2_owner_contract import OwnerAuthorizationGuardV1
+        from ..graph_coordinator import namespace_ref
+
+        _schema(self.schema)
+        _digest(self.context_digest, "context_digest")
+        identifier(self.authority_namespace, "authority_namespace")
+        identifier(self.graph_namespace, "graph_namespace")
+        identifier(self.issue_operation_id, "issue_operation_id")
+        identifier(self.grant_id, "grant_id")
+        _digest(self.grant_digest, "grant_digest")
+        guard = self.guard
+        if (type(guard) is not OwnerAuthorizationGuardV1
+                or guard.authorization_revision < 1
+                or guard.pending_revoke_operation_id is not None
+                or guard.minimum_revocation_revision >= guard.authorization_revision
+                or guard.minimum_revocation_epoch > 0
+                or "/" in guard.namespace.bot_id
+                or "/" in guard.namespace.persona_id
+                or self.authority_namespace != namespace_ref(guard.namespace)
+                or self.graph_namespace != "/".join(guard.namespace.as_tuple)):
+            raise ValueError("Owner dispatch witness requires an active grant")
 
 
 @dataclass(frozen=True, slots=True)
@@ -725,7 +766,8 @@ def _footprint_from_wire(value: object) -> RecoveryConstraintFootprint:
 def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1 |
             ExecutionBindingV1 | ExecutionBindingV2 | PlatformObservationV1 |
-            DispatchHandoffContextV1 | DispatchGraphClaimReceiptV1) -> dict[str, Any]:
+            DispatchHandoffContextV1 | OwnerDispatchWitnessV1 |
+            DispatchGraphClaimReceiptV1) -> dict[str, Any]:
     """Produce a fresh, JSON-shaped dict with an explicit object kind."""
     if type(value) is FencePermitV2:
         return {
@@ -744,6 +786,16 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                 "claimed_receipt_digest": value.claimed_receipt_digest,
                 "binding_digest": value.binding_digest,
                 "handoff_id": value.handoff_id}
+    if type(value) is OwnerDispatchWitnessV1:
+        from .v2_owner_contract import to_wire as owner_to_wire
+
+        return {"schema": value.schema, "kind": "owner_dispatch_witness_v1",
+                "context_digest": value.context_digest,
+                "authority_namespace": value.authority_namespace,
+                "graph_namespace": value.graph_namespace,
+                "guard": owner_to_wire(value.guard),
+                "issue_operation_id": value.issue_operation_id,
+                "grant_id": value.grant_id, "grant_digest": value.grant_digest}
     if type(value) is DispatchGraphClaimReceiptV1:
         return {"schema": value.schema, "kind": "dispatch_graph_claim_receipt_v1",
                 "context_digest": value.context_digest,
@@ -884,11 +936,27 @@ def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationRec
                                  DeletionEvidenceV1 | DeletionPendingV1 |
                                  DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                                  PlatformObservationV1 | DispatchHandoffContextV1 |
+                                 OwnerDispatchWitnessV1 |
                                  DispatchGraphClaimReceiptV1):
     """Reject unknown schemas, fields, kinds and nested shapes before use."""
     if type(value) is not dict or value.get("schema") != SCHEMA:
         raise ValueError("unknown authority schema")
     kind = value.get("kind")
+    if kind == "owner_dispatch_witness_v1":
+        from .v2_owner_contract import (
+            OwnerAuthorizationGuardV1, from_wire as owner_from_wire,
+        )
+
+        _fields(value, frozenset({"schema", "kind", "context_digest",
+                                  "authority_namespace", "graph_namespace", "guard",
+                                  "issue_operation_id", "grant_id", "grant_digest"}),
+                "Owner dispatch witness")
+        guard = owner_from_wire(value["guard"])
+        if type(guard) is not OwnerAuthorizationGuardV1:
+            raise ValueError("Owner dispatch witness guard kind differs")
+        return OwnerDispatchWitnessV1(
+            guard=guard, **{key: item for key, item in value.items()
+                            if key not in ("kind", "guard")})
     if kind == "dispatch_handoff_context_v1":
         _fields(value, frozenset({"schema", "kind", "permit",
                                   "claimed_receipt_digest", "binding_digest",
@@ -1071,8 +1139,9 @@ def _reject_constant(value: str) -> None:
 def canonical_bytes(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                     DeletionEvidenceV1 | DeletionPendingV1 |
                     DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
-                    PlatformObservationV1 | DispatchHandoffContextV1 |
-                    DispatchGraphClaimReceiptV1) -> bytes:
+                     PlatformObservationV1 | DispatchHandoffContextV1 |
+                     OwnerDispatchWitnessV1 |
+                     DispatchGraphClaimReceiptV1) -> bytes:
     return json.dumps(to_wire(value), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
@@ -1081,6 +1150,7 @@ def canonical_digest(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV
                      DeletionEvidenceV1 | DeletionPendingV1 |
                      DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                      PlatformObservationV1 | DispatchHandoffContextV1 |
+                     OwnerDispatchWitnessV1 |
                      DispatchGraphClaimReceiptV1) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
 
@@ -1088,7 +1158,7 @@ def canonical_digest(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV
 def decode_bytes(data: bytes) -> (FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                                   DeletionEvidenceV1 | DeletionPendingV1 |
                                   DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
-                                  PlatformObservationV1):
+                                  PlatformObservationV1 | OwnerDispatchWitnessV1):
     if type(data) is not bytes:
         raise TypeError("authority wire data must be bytes")
     value = json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs,
@@ -1101,4 +1171,5 @@ __all__ = ["SCHEMA", "FencePermitV2", "PendingMutationV2", "MutationReceiptV2",
            "DeletionEvidenceV1", "DeletionPendingV1", "DeletionMutationReceiptV1",
            "deletion_scope_digest", "to_wire", "from_wire", "canonical_bytes",
            "canonical_digest", "decode_bytes", "DispatchHandoffContextV1",
+           "OwnerDispatchWitnessV1",
            "DispatchGraphClaimReceiptV1"]

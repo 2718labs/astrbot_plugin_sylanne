@@ -341,6 +341,9 @@ class AuthorityRpcServer:
                 namespace=namespace, deletion=service.deletion,
                 final_handoff_authorizer=handoff_authorizers.get(namespace),
                 final_handoff_issuer_id=handoff_issuers.get(namespace),
+                owner_tickets=v2_owner_tickets,
+                owner_installation_id=(reverse_handoffs[namespace].profile.installation_id
+                                       if namespace in reverse_handoffs else None),
             ) for namespace, service in services.items()
         }
         installed = dict(installations_v2 or {})
@@ -1647,6 +1650,13 @@ class AuthorityRpcServer:
                 namespace = claimed.pending.permit.namespace
                 self._bound_v2_service(
                     credential, profile_id, manifest_digest, namespace)
+                if method == "execution_begin_handoff_v2":
+                    installed = self._installations_v2.get(
+                        (credential.certificate_sha256, profile_id))
+                    if (installed is None or installed.installation_id
+                            != self._v2_execution[namespace]._owner_installation_id):
+                        raise AuthorityUnavailable(
+                            "handoff installation differs from pinned Owner authority")
                 begin = (self._v2_execution[namespace].begin_handoff_v2
                          if method == "execution_begin_handoff_v2"
                          else self._v2_execution[namespace].begin_handoff)

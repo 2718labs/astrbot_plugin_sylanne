@@ -22,15 +22,22 @@ from sylanne3.authority_service.v2_execution_bridge import HandoffStartV2
 from sylanne3.authority_service.v2_contract import (
     DispatchGraphClaimReceiptV1, DispatchHandoffContextV1,
     ExecutionBindingV1, ExecutionBindingV2, FencePermitV2,
-    MutationReceiptV2, PendingMutationV2, canonical_digest,
+    MutationReceiptV2, OwnerDispatchWitnessV1, PendingMutationV2, canonical_digest,
 )
+from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
 from sylanne3.graph_worker import GraphWorker
+from sylanne3.graph_coordinator import namespace_ref
 from sylanne3.host.reverse_handoff import (
     AdministratorHostReverseProfile, HostReverseGraphClaimServer,
     begin_handoff_with_reverse_claim,
 )
 from sylanne3.runtime.restore_anchor import RestoreAnchor
+from sylanne3.runtime_contracts import NamespaceId
 from sylanne3.runtime_journal import RecoveryConstraintFootprint
+
+
+NS = NamespaceId("bot", "persona")
+AUTH_NS = namespace_ref(NS)
 
 
 def _digest(character: str) -> str:
@@ -39,18 +46,18 @@ def _digest(character: str) -> str:
 
 def _claim() -> tuple[ExecutionBindingV2, MutationReceiptV2, DispatchHandoffContextV1]:
     anchor = RestoreAnchor(
-        "authority:test", "ns-a", 1, "deletion:test", 0, "genesis",
+        "authority:test", AUTH_NS, 1, "deletion:test", 0, "genesis",
         "execution:test", 0, "genesis", 0, "proof:test")
     footprint = RecoveryConstraintFootprint(
-        namespace="ns-a", activity_id="activity-a", effect_id="effect-a",
+        namespace=AUTH_NS, activity_id="activity-a", effect_id="effect-a",
         conflict_keys=("resource-a",))
     permit = FencePermitV2(
-        "authority:test", "ns-a", "subject-a", "holder-a", 1,
+        "authority:test", AUTH_NS, "subject-a", "holder-a", 1,
         "dispatch", "operation-a", "A" * 43, 1, 1, anchor,
         "effect-a", _digest("a"),
         "sha256:" + hashlib.sha256(footprint._json().encode()).hexdigest())
     origin = ExecutionBindingV1(
-        permit=permit, namespace="ns-a", activity_id="activity-a",
+        permit=permit, namespace=AUTH_NS, activity_id="activity-a",
         effect_id="effect-a", attempt_id="attempt-a",
         operation_id="operation-a", dispatch_generation=1,
         activation_generation=1, admission_ref="admission-a",
@@ -60,7 +67,7 @@ def _claim() -> tuple[ExecutionBindingV2, MutationReceiptV2, DispatchHandoffCont
         worker_fence=1, content_fence="content-a", cancel_epoch=0,
         footprint=footprint)
     binding = ExecutionBindingV2(
-        origin, "ns-a", "graph-incarnation-a", _digest("d"),
+        origin, "bot/persona", "graph-incarnation-a", _digest("d"),
         "graph-version-a", 3, 2, 0, _digest("e"), "d08.intent.v1",
         _digest("f"), "d08.action.v1", _digest("0"), "d08.checks.v1",
         _digest("1"), "2029-01-01T00:00:00Z", "clock-policy-a", _digest("2"))
@@ -82,6 +89,16 @@ def _claim() -> tuple[ExecutionBindingV2, MutationReceiptV2, DispatchHandoffCont
     return binding, claimed, context
 
 
+def _witness(context: DispatchHandoffContextV1,
+             binding: ExecutionBindingV2) -> OwnerDispatchWitnessV1:
+    guard = OwnerAuthorizationGuardV1(
+        context.permit.authority_id, "install-a", NamespaceId("bot", "persona"),
+        1, _digest("9"), 0, 0)
+    return OwnerDispatchWitnessV1(
+        canonical_digest(context), context.permit.namespace,
+        binding.graph_namespace, guard, "owner-issue-a", "grant-a", _digest("8"))
+
+
 class _Store:
     def close(self) -> None:
         pass
@@ -95,14 +112,14 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
             server_der = ssl.PEM_cert_to_DER_cert(files["server.pem"].read_text())
             client_der = ssl.PEM_cert_to_DER_cert(files["client.pem"].read_text())
             host_profile = AdministratorHostReverseProfile(
-                "profile-a", "install-a", "ns-a",
+                "profile-a", "install-a", AUTH_NS,
                 hashlib.sha256(client_der).hexdigest(), files["server.pem"],
                 files["server.key"], files["ca.pem"], timeout_seconds=2)
             server = HostReverseGraphClaimServer(host_profile)
             listener = await server.start("127.0.0.1", 0)
             port = listener.sockets[0].getsockname()[1]
             client_profile = AdministratorReverseHandoffProfile(
-                "ns-a", "profile-a", "install-a", "127.0.0.1", port,
+                AUTH_NS, "profile-a", "install-a", "127.0.0.1", port,
                 "localhost", hashlib.sha256(server_der).hexdigest(),
                 files["ca.pem"], files["client.pem"], files["client.key"],
                 timeout_seconds=2)
@@ -115,9 +132,12 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
             worker = await GraphWorker.start(lambda: _Store(), lambda _store: object(),
                                              capacity=1)
             binding, claimed, context = _claim()
+            witness = _witness(context, binding)
             calls = []
 
-            def graph_claim(_coordinator, callback_context, callback_binding, _claimed):
+            def graph_claim(_coordinator, callback_context, callback_binding,
+                            _claimed, callback_witness):
+                self.assertEqual(callback_witness, witness)
                 calls.append(callback_context.handoff_id)
                 return DispatchGraphClaimReceiptV1(
                     canonical_digest(callback_context), callback_binding.graph_namespace,
@@ -137,29 +157,38 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                                                    claimed=claimed, window=window,
                                                    claim_writer=graph_claim):
                             receipt = await asyncio.wait_for(
-                                call_authority(client.claim, context, binding, claimed), 3)
+                                call_authority(client.claim, context, binding, claimed,
+                                               witness), 3)
                             self.assertEqual(receipt.graph_claim_ref, "claim-a")
                             self.assertEqual(calls, ["handoff-a"])
                             # Exact replay observes the one graph transaction.
                             self.assertEqual(await call_authority(
-                                client.claim, context, binding, claimed), receipt)
+                                client.claim, context, binding, claimed, witness), receipt)
                             self.assertEqual(calls, ["handoff-a"])
                             concurrent = await asyncio.gather(*(
-                                asyncio.to_thread(client.claim, context, binding, claimed)
+                                asyncio.to_thread(client.claim, context, binding, claimed,
+                                                  witness)
                                 for _ in range(2)
                             ))
                             self.assertEqual(concurrent, [receipt, receipt])
                             self.assertEqual(calls, ["handoff-a"])
                             with self.assertRaises(RuntimeError):
+                                await call_authority(
+                                    client.claim, context, binding, claimed,
+                                    replace(witness, grant_id="other-grant"))
+                            self.assertEqual(calls, ["handoff-a"])
+                            with self.assertRaises(RuntimeError):
                                 await call_authority(client.claim,
                                     replace(context, handoff_id="wrong-handoff"),
-                                    binding, claimed)
+                                    binding, claimed, witness)
                             with self.assertRaises(RuntimeError):
                                 await call_authority(
-                                    wrong_peer_client.claim, context, binding, claimed)
+                                    wrong_peer_client.claim, context, binding, claimed,
+                                    witness)
                             with self.assertRaises(RuntimeError):
                                 await call_authority(
-                                    wrong_install_client.claim, context, binding, claimed)
+                                    wrong_install_client.claim, context, binding, claimed,
+                                    witness)
                             with self.assertRaises(RuntimeError):
                                 await worker.call(lambda _coordinator: None)
                         # GraphWorker is drained before ordinary work resumes.
@@ -167,11 +196,11 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                 wrong_namespace = replace(client_profile, namespace="ns-other")
                 with self.assertRaises(RuntimeError):
                     await asyncio.to_thread(ReverseGraphClaimClient(
-                        wrong_namespace).claim, context, binding, claimed)
+                        wrong_namespace).claim, context, binding, claimed, witness)
 
                 async def begin(_claimed, _handoff_id):
                     receipt = await asyncio.to_thread(
-                        client.claim, context, binding, claimed)
+                        client.claim, context, binding, claimed, witness)
                     return HandoffStartV2(
                         context.handoff_id, context.permit.operation_id,
                         context.permit.effect_id, context.permit.namespace,
@@ -227,23 +256,25 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
             server_der = ssl.PEM_cert_to_DER_cert(files["server.pem"].read_text())
             client_der = ssl.PEM_cert_to_DER_cert(files["client.pem"].read_text())
             server = HostReverseGraphClaimServer(AdministratorHostReverseProfile(
-                "profile-a", "install-a", "ns-a",
+                "profile-a", "install-a", AUTH_NS,
                 hashlib.sha256(client_der).hexdigest(), files["server.pem"],
                 files["server.key"], files["ca.pem"], timeout_seconds=3))
             listener = await server.start("127.0.0.1", 0)
             port = listener.sockets[0].getsockname()[1]
             client = ReverseGraphClaimClient(AdministratorReverseHandoffProfile(
-                "ns-a", "profile-a", "install-a", "127.0.0.1", port,
+                AUTH_NS, "profile-a", "install-a", "127.0.0.1", port,
                 "localhost", hashlib.sha256(server_der).hexdigest(),
                 files["ca.pem"], files["client.pem"], files["client.key"],
                 timeout_seconds=0.6))
             worker = await GraphWorker.start(lambda: _Store(), lambda _store: object(),
                                              capacity=1)
             binding, claimed, context = _claim()
+            witness = _witness(context, binding)
             entered = threading.Event()
             release = threading.Event()
 
-            def slow_claim(_coordinator, callback_context, callback_binding, _claimed):
+            def slow_claim(_coordinator, callback_context, callback_binding,
+                           _claimed, _witness_value):
                 entered.set()
                 if not release.wait(3):
                     raise RuntimeError("test graph writer was not released")
@@ -258,7 +289,7 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                                                claimed=claimed, window=window,
                                                claim_writer=slow_claim):
                         task = asyncio.create_task(asyncio.to_thread(
-                            client.claim, context, binding, claimed))
+                            client.claim, context, binding, claimed, witness))
                         self.assertTrue(await asyncio.to_thread(entered.wait, 2))
                         with self.assertRaises(RuntimeError):
                             await worker.call(lambda _coordinator: None)
@@ -279,7 +310,7 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
             files = tls_fixtures.AuthorityMtlsLoopbackTests._certificates(root)
             client_der = ssl.PEM_cert_to_DER_cert(files["client.pem"].read_text())
             profile = AdministratorHostReverseProfile(
-                "profile-a", "install-a", "ns-a",
+                "profile-a", "install-a", AUTH_NS,
                 hashlib.sha256(client_der).hexdigest(), files["server.pem"],
                 files["server.key"], files["ca.pem"])
             server = HostReverseGraphClaimServer(profile)
@@ -316,7 +347,7 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_exact_p2_subject_holder_generation_token_and_epoch(self) -> None:
         binding, claimed, context = _claim()
-        require_exact_reverse_handoff_identity("ns-a", context, binding, claimed)
+        require_exact_reverse_handoff_identity(AUTH_NS, context, binding, claimed)
         for field, value in (
             ("subject", "other-subject"), ("holder", "other-holder"),
             ("generation", 2), ("token", "B" * 43), ("fence_epoch", 2),
@@ -331,7 +362,7 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                 continue
             with self.subTest(field=field), self.assertRaises(RuntimeError):
                 require_exact_reverse_handoff_identity(
-                    "ns-a", altered, binding, claimed,
+                    AUTH_NS, altered, binding, claimed,
                 )
 
 

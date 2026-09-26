@@ -15,7 +15,11 @@ from typing import Callable
 from .contract import AuthorityUnavailable, identifier
 from .core import AuthorityServiceCore
 from .v2_fence_store import AuthorityV2FenceStore
-from .v2_contract import FencePermitV2, canonical_bytes as fence_canonical_bytes
+from .v2_contract import (
+    DispatchHandoffContextV1, ExecutionBindingV2, FencePermitV2,
+    OwnerDispatchWitnessV1, canonical_bytes as fence_canonical_bytes,
+    canonical_digest as fence_canonical_digest,
+)
 from .v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
@@ -234,6 +238,56 @@ class AuthorityV2OwnerTicketStore:
                 or guard.pending_revoke_operation_id is not None):
             raise AuthorityUnavailable("owner current head differs")
         return guard
+
+    def current_dispatch_witness_in_tx(
+            self, db: sqlite3.Connection, *, context: DispatchHandoffContextV1,
+            binding: ExecutionBindingV2, installation_id: str,
+    ) -> OwnerDispatchWitnessV1:
+        """Snapshot the committed, active Owner grant in the caller's Core tx."""
+        if db is not self._core._db or not db.in_transaction:
+            raise AuthorityUnavailable("Owner dispatch witness needs Authority transaction")
+        if (type(context) is not DispatchHandoffContextV1
+                or type(binding) is not ExecutionBindingV2):
+            raise TypeError("Owner dispatch witness requires exact P2 identity")
+        identifier(installation_id, "installation_id")
+        self._require_mode(db)
+        authority_namespace = context.permit.namespace
+        guard = self._checked_current_head(db, authority_namespace)
+        if (guard is None or guard.authority_id != context.permit.authority_id
+                or guard.installation_id != installation_id
+                or namespace_ref(guard.namespace) != authority_namespace
+                or binding.graph_namespace != "/".join(guard.namespace.as_tuple)
+                or guard.pending_revoke_operation_id is not None
+                or guard.minimum_revocation_revision >= guard.authorization_revision
+                or guard.minimum_revocation_epoch > 0
+                or "/" in guard.namespace.bot_id
+                or "/" in guard.namespace.persona_id):
+            raise AuthorityUnavailable("current Owner authorization is unavailable")
+        head = db.execute(
+            "SELECT issue_operation_id FROM authority_owner_authorization_heads_v1 "
+            "WHERE authority_namespace=?", (authority_namespace,),
+        ).fetchone()
+        if head is None:
+            raise AuthorityUnavailable("current Owner grant origin is unavailable")
+        pending = self._checked_pending(db, authority_namespace, head[0])
+        committed = self._checked_committed(db, authority_namespace, head[0])
+        if pending is None or committed is None:
+            raise AuthorityUnavailable("current Owner grant is not committed")
+        operation = pending[0]
+        proof = committed[0]
+        if (operation.action != "issue" or operation.authority_id != guard.authority_id
+                or operation.installation_id != installation_id
+                or operation.namespace != guard.namespace
+                or proof.graph_incarnation != binding.graph_incarnation
+                or proof.graph_epoch > binding.admission_graph_epoch
+                or proof.graph_access_epoch > binding.admission_access_epoch):
+            raise AuthorityUnavailable("current Owner grant differs from dispatch graph")
+        return OwnerDispatchWitnessV1(
+            context_digest=fence_canonical_digest(context),
+            authority_namespace=authority_namespace,
+            graph_namespace=binding.graph_namespace, guard=guard,
+            issue_operation_id=operation.operation_id,
+            grant_id=operation.grant_id, grant_digest=operation.grant_digest)
 
     @staticmethod
     def _checked_pending(db: sqlite3.Connection, authority_namespace: str,
