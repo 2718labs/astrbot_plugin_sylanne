@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+import sqlite3
 
 from ..domains.d06 import SourceGrantRead, provide_source_grant_check
 from ..domains.d03 import ContextProvider, RoleBindingRequest
@@ -27,11 +28,11 @@ from .dispatch_budget_check import provide_dispatch_budget_check
 from .dispatch_current_projection import (
     derive_current_domain_reads, read_current_dispatch_projection,
 )
+from .dispatch_current_commitments import read_current_d08_conflict_facts
 from .issuers import D02ResourceIssuer, D11BudgetGrantIssuer, IssuerAuthorityDenied
 
 
 _MISSING_PROVIDER_PORTS = (
-    "d08.commitment_conflict.current_provider",
     "d11.execution_journal_current_constraints",
     "d11.command_provenance.current_provider",
     "d11.domain_context.current_provider",
@@ -63,6 +64,15 @@ class DispatchBudgetInspectionV1:
     receipt: CheckReceipt | None
     lease_id: str | None
     quote_id: str | None
+
+
+@dataclass(frozen=True)
+class DispatchCommitmentInspectionV1:
+    status: str
+    missing: tuple[str, ...]
+    graph_epoch: int | None
+    commitment_refs: tuple[str, ...]
+    action_refs: tuple[str, ...]
 
 
 class DispatchAdmissionHold(RuntimeError):
@@ -429,6 +439,86 @@ def inspect_current_d11_dispatch_budget(
     return DispatchBudgetInspectionV1("check_pass", (), ledger, lease_id, quote_id)
 
 
+def inspect_current_d08_commitments(
+    db, candidate: DispatchCandidateEvidenceV1,
+) -> DispatchCommitmentInspectionV1:
+    """Inventory all current D08 conflict rows under the graph transaction.
+
+    This can veto stale identity or shared effects. It cannot issue D08 PASS:
+    the criteria issuer, semantic conflict policy and authenticated P2 effect
+    and cancellation reads are not installed at this admission seam.
+    """
+    def hold(*missing: str, epoch=None, commitments=(), actions=()):
+        return DispatchCommitmentInspectionV1(
+            "hold", tuple(dict.fromkeys(missing)), epoch,
+            tuple(commitments), tuple(actions),
+        )
+
+    if not getattr(db, "in_transaction", False):
+        return hold("graph.current_write_transaction")
+    if type(candidate) is not DispatchCandidateEvidenceV1:
+        return hold("d08.typed_dispatch_candidate")
+    try:
+        action_key = AtomKey.from_token(candidate.action_ref)
+        namespace = NamespaceId(action_key.owner.bot, action_key.owner.persona)
+        epoch_row = db.execute(
+            "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()
+        if epoch_row is None or epoch_row[0] != candidate.query_epoch:
+            return hold("d08.current_graph_epoch_differs")
+        epoch = epoch_row[0]
+        rows = db.execute(
+            "SELECT token,revision,value,type_name FROM graph_atoms "
+            "WHERE bot=? AND persona=? AND type_name IN "
+            "('d08.commitment.v1','d08.action_intent.v1',"
+            "'d08.action_outcome.v1') AND valid=1 ORDER BY token",
+            namespace.as_tuple,
+        ).fetchall()
+        atoms = tuple(GraphAtom(
+            AtomKey.from_token(token), revision, json.loads(raw), True,
+        ) for token, revision, raw, _ in rows)
+        snapshot = GraphSnapshot(
+            atoms, (NamespaceEpoch(*namespace.as_tuple, epoch),),
+        )
+        facts = read_current_d08_conflict_facts(
+            db, namespace, snapshot, QueryEpoch(namespace, "all", epoch),
+        )
+    except sqlite3.OperationalError:
+        return hold("d08.current_graph_schema_unavailable")
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return hold("d08.current_complete_graph_inventory_unavailable")
+    actions = tuple(item.action_id for item in facts.action_intents)
+    commitments = tuple(item.commitment_id for item in facts.commitments)
+    current = tuple(item for item in facts.action_intents
+                    if item.action_id == action_key.name
+                    and item.identity.operation_id == candidate.operation_id)
+    missing = list(facts.missing_sources)
+    if (len(current) != 1 or action_key.type_name != "d08.action_intent.v1"
+            or candidate.action_digest != canonical_digest(current[0])):
+        missing.append("d08.current_action_identity_differs")
+    else:
+        intent = current[0]
+        specs = tuple(item for item in intent.required_checks
+                      if item.check_kind == "commitment_conflict")
+        if len(specs) != 1 or specs[0].provider_id != "d08.commitment_conflict":
+            missing.append("d08.frozen_commitment_check_missing")
+        elif specs[0].criteria_version.startswith("criteria:"):
+            missing.append("d08.criteria_ref_has_no_authoritative_issuer")
+        if any(other.action_id != intent.action_id
+               and other.identity.effect_id == intent.identity.effect_id
+               for other in facts.action_intents):
+            missing.append("d08.current_effect_shared_by_actions")
+    missing.extend((
+        "d08.criteria_issuer_unavailable",
+        "d08.semantic_conflict_policy_unavailable",
+        "d08.authenticated_p2_effect_and_post_graph_cas_unavailable",
+    ))
+    return DispatchCommitmentInspectionV1(
+        "hold", tuple(dict.fromkeys(missing)), epoch, commitments, actions,
+    )
+
+
 class InstalledDispatchAdmissionIssuer:
     """The only production integration shape; all incomplete paths HOLD."""
 
@@ -484,8 +574,10 @@ class InstalledDispatchAdmissionIssuer:
             db, action, d11_issuer=self._d11, d02_issuer=self._d02,
             now_utc=now_utc,
         )
+        commitments = inspect_current_d08_commitments(db, candidate)
         raise DispatchAdmissionHold((
             *inspection.missing, *social_missing, *budget.missing,
+            *commitments.missing,
             *_MISSING_PROVIDER_PORTS,
         ))
 
@@ -508,4 +600,5 @@ __all__ = [
     "DispatchSocialInspectionV1", "inspect_current_d03_d05",
     "DispatchBudgetInspectionV1",
     "inspect_current_d11_dispatch_budget",
+    "DispatchCommitmentInspectionV1", "inspect_current_d08_commitments",
 ]

@@ -17,6 +17,7 @@ from sylanne3.runtime.installed_dispatch_admission_issuer import (
     inspect_current_d06_source_grant,
     inspect_current_d03_d05,
     inspect_current_d11_dispatch_budget,
+    inspect_current_d08_commitments,
 )
 from sylanne3.runtime_contracts import VersionedRef, canonical_digest
 from sylanne3.runtime.issuers import D02ResourceIssuer, ResourceQuote
@@ -360,5 +361,44 @@ def test_budget_quote_ceiling_and_reservation_state_are_current():
             db, intent, d11_issuer=d11, d02_issuer=d02,
             now_utc=10.0,
         ).missing == ("d11.current_operation_reservation_unavailable",)
+    finally:
+        db.close()
+
+
+def test_d08_complete_graph_inventory_identifies_unissued_authority_gates():
+    db, candidate, _context, _key = _social_case()
+    try:
+        result = inspect_current_d08_commitments(db, candidate)
+        assert result.status == "hold"
+        assert result.graph_epoch == 5
+        assert result.action_refs == ("action:one",)
+        assert "d08.criteria_ref_has_no_authoritative_issuer" in result.missing
+        assert "d08.semantic_conflict_policy_unavailable" in result.missing
+        db.execute("UPDATE graph_epochs SET revision=6")
+        assert inspect_current_d08_commitments(
+            db, candidate,
+        ).missing == ("d08.current_graph_epoch_differs",)
+    finally:
+        db.close()
+
+
+def test_d08_new_same_effect_action_is_visible_and_holds():
+    db, candidate, _context, _key = _social_case()
+    try:
+        row = db.execute("SELECT value FROM graph_atoms WHERE token=?",
+                         (candidate.action_ref,)).fetchone()
+        action = json.loads(row[0])
+        action["action_id"] = "action:other"
+        action["identity"]["operation_id"] = "operation:other"
+        original = AtomKey.from_token(candidate.action_ref)
+        other = AtomKey(original.owner, original.type_name, "action:other")
+        db.execute("INSERT INTO graph_atoms VALUES(?,?,?,?,?,?,?)", (
+            other.token, "bot", "persona", other.type_name, 1,
+            json.dumps(action), 1,
+        ))
+        result = inspect_current_d08_commitments(db, candidate)
+        assert result.status == "hold"
+        assert result.action_refs == ("action:one", "action:other")
+        assert "d08.current_effect_shared_by_actions" in result.missing
     finally:
         db.close()
