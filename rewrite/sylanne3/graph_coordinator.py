@@ -680,6 +680,33 @@ class CurrentRecollectionExperienceV1:
     encoding_baseline_certified: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class CurrentRecollectionProjectionV1:
+    """Current subjective C04/D06 projection without a source literal."""
+
+    namespace: NamespaceId
+    operation_id: str
+    projection_ref: str
+    recollection_ref: str
+    experience_ref: str
+    experience: object
+    mood: object
+    source_ref: str
+    source_kind: str
+    assertion_status: str
+    provenance_eligibility: str
+    subjective_weight: tuple[float, float]
+    subjective_tone: tuple[float, float]
+    duration_interval: tuple[float, float] | None
+    read_versions: tuple[GraphVersion, ...]
+    epoch: NamespaceEpoch
+    access_epoch: int
+    deletion_epoch: int
+    status: str = "current_authorized_projection_read"
+    read_status: str = "hold_uncertified_c02_baseline"
+    encoding_baseline_certified: bool = False
+
+
 class GraphCoordinator:
     """One in-process authority over a GraphStore's business SQLite connection.
 
@@ -4617,16 +4644,47 @@ class GraphCoordinator:
             owner_session_token: str,
             owner_session_request: OwnerSessionLoginRequestV1,
     ) -> CurrentRecollectionExperienceV1:
+        return self._read_current_recollection_v1(
+            namespace=namespace, operation_id=operation_id,
+            experience_ref=experience_ref, projection_ref=None,
+            actor_id=actor_id, principal=principal,
+            owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
+
+    def read_current_recollection_projection_v1(
+            self, *, namespace: NamespaceId, operation_id: str,
+            projection_ref: str, actor_id: str, principal: OwnerPrincipalV1,
+            owner_session_token: str,
+            owner_session_request: OwnerSessionLoginRequestV1,
+    ) -> CurrentRecollectionProjectionV1:
+        return self._read_current_recollection_v1(
+            namespace=namespace, operation_id=operation_id,
+            experience_ref=None, projection_ref=projection_ref,
+            actor_id=actor_id, principal=principal,
+            owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
+
+    def _read_current_recollection_v1(
+            self, *, namespace: NamespaceId, operation_id: str,
+            experience_ref: str | None, projection_ref: str | None,
+            actor_id: str, principal: OwnerPrincipalV1,
+            owner_session_token: str,
+            owner_session_request: OwnerSessionLoginRequestV1,
+    ) -> CurrentRecollectionExperienceV1 | CurrentRecollectionProjectionV1:
         """Recheck a committed C04 experience and all source ancestors now.
 
-        The D04 inspector sees one business snapshot while the Authority read
-        fence is active. Only its content-free projection escapes this method.
+        D04 and D06 inspectors share one business snapshot under one read fence.
+        Only content-free subjective values escape this method.
         """
         from .authority_service.contract import identifier
         from .domains.d04.affect import AffectProvider, AffectScheme
         from .domains.d04.recollection_read import (
             RecollectionSnapshotUnavailable,
             inspect_recollection_experience_snapshot,
+        )
+        from .domains.d06 import (
+            RecollectionProjectionUnavailable,
+            inspect_recollection_projection_snapshot,
         )
 
         if (not isinstance(self.__store, ProductionGraphStore)
@@ -4636,10 +4694,20 @@ class GraphCoordinator:
             raise TypeError("typed recollection Owner identity is required")
         identifier(operation_id, "operation_id")
         identifier(actor_id, "actor_id")
-        experience_key = self._parse_ref(experience_ref, namespace)
-        if (experience_key.type_name != "d04.recollection_experience.v1"
-                or experience_key.owner.kind != "activity"):
+        if (experience_ref is None) == (projection_ref is None):
+            raise ValueError("exactly one recollection read ref is required")
+        experience_key = (self._parse_ref(experience_ref, namespace)
+                          if experience_ref is not None else None)
+        projection_key = (self._parse_ref(projection_ref, namespace)
+                          if projection_ref is not None else None)
+        if (experience_key is not None and
+                (experience_key.type_name != "d04.recollection_experience.v1"
+                 or experience_key.owner.kind != "activity")):
             raise AuthorityDenied("recollection experience ref differs")
+        if (projection_key is not None and
+                (projection_key.type_name != "d06.recollection_projection.v1"
+                 or projection_key.owner.kind != "activity")):
+            raise AuthorityDenied("recollection projection ref differs")
         registration = self.__providers.get("d04")
         if registration is None or not isinstance(registration[0], AffectProvider):
             raise UnavailableGuard("registered D04 affect provider is unavailable")
@@ -4661,7 +4729,7 @@ class GraphCoordinator:
         mood_key = AtomKey(Owner("persona", *namespace.as_tuple),
                            "d04.mood_field.v1", "current")
 
-        def reader() -> CurrentRecollectionExperienceV1:
+        def reader() -> CurrentRecollectionExperienceV1 | CurrentRecollectionProjectionV1:
             db = store._db
             if db.in_transaction:
                 raise UnavailableGuard("recollection read requires an idle graph connection")
@@ -4685,7 +4753,8 @@ class GraphCoordinator:
                     authority, operation_id, v2=True)
                 if (receipt is None or receipt.status != "committed"
                         or receipt.operation_id != operation_id
-                        or receipt.activity_id != experience_key.owner.subject
+                        or receipt.activity_id != (
+                            experience_key or projection_key).owner.subject
                         or len(receipt.invalidated_epochs) != 1
                         or receipt.invalidated_epochs[0].revision > epoch.revision):
                     raise UnavailableGuard("committed C04 operation is unavailable")
@@ -4708,7 +4777,27 @@ class GraphCoordinator:
                                       GraphAtom(key, 0, {}, False))
                     return atoms[key]
 
-                experience_atom = load(experience_key)
+                selected_experience_key = experience_key
+                if projection_key is not None:
+                    projection_atom = load(projection_key)
+                    if not projection_atom.valid:
+                        raise UnavailableGuard("current D06 projection is absent")
+                    try:
+                        selected_experience_key = self._parse_ref(
+                            projection_atom.value["experience_ref"], namespace)
+                        projection_mood_key = self._parse_ref(
+                            projection_atom.value["mood_ref"], namespace)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise UnavailableGuard(
+                            "current D06 projection refs are invalid") from exc
+                    if (selected_experience_key.type_name
+                            != "d04.recollection_experience.v1"
+                            or selected_experience_key.owner.subject
+                            != projection_key.owner.subject
+                            or projection_mood_key != mood_key):
+                        raise UnavailableGuard(
+                            "current D06 projection experience or mood differs")
+                experience_atom = load(selected_experience_key)
                 mood_atom = load(mood_key)
                 if not experience_atom.valid or not mood_atom.valid:
                     raise UnavailableGuard("current C04 experience or mood is absent")
@@ -4754,18 +4843,36 @@ class GraphCoordinator:
                                    for parent in record.parent_source_ids)
                 snapshot = GraphSnapshot(tuple(atoms.values()), (epoch,))
                 try:
-                    candidate = inspect_recollection_experience_snapshot(
-                        snapshot, namespace=namespace, audience=("owner",),
-                        purpose="context", experience_ref=experience_ref,
-                        mood_key=mood_key, receipt=receipt, scheme=scheme)
-                except RecollectionSnapshotUnavailable as exc:
+                    if projection_key is None:
+                        candidate = inspect_recollection_experience_snapshot(
+                            snapshot, namespace=namespace, audience=("owner",),
+                            purpose="context", experience_ref=experience_ref,
+                            mood_key=mood_key, receipt=receipt, scheme=scheme)
+                    else:
+                        candidate = inspect_recollection_projection_snapshot(
+                            snapshot, namespace=namespace, audience=("owner",),
+                            purpose="context", projection_ref=projection_ref,
+                            receipt=receipt, scheme=scheme)
+                except (RecollectionSnapshotUnavailable,
+                        RecollectionProjectionUnavailable) as exc:
                     raise UnavailableGuard("current recollection source is unavailable") from exc
-                result = CurrentRecollectionExperienceV1(
-                    namespace, operation_id, candidate.experience, candidate.mood,
-                    candidate.source_ref, candidate.source_kind,
-                    candidate.assertion_status, candidate.provenance_eligibility,
-                    candidate.read_versions, candidate.epoch,
-                    epoch_row[0], epoch_row[1])
+                if projection_key is None:
+                    result = CurrentRecollectionExperienceV1(
+                        namespace, operation_id, candidate.experience, candidate.mood,
+                        candidate.source_ref, candidate.source_kind,
+                        candidate.assertion_status, candidate.provenance_eligibility,
+                        candidate.read_versions, candidate.epoch,
+                        epoch_row[0], epoch_row[1])
+                else:
+                    result = CurrentRecollectionProjectionV1(
+                        namespace, operation_id, candidate.projection_ref,
+                        candidate.recollection_ref, candidate.experience_ref,
+                        candidate.experience, candidate.mood,
+                        candidate.source_ref, candidate.source_kind,
+                        candidate.assertion_status, candidate.provenance_eligibility,
+                        candidate.subjective_weight, candidate.subjective_tone,
+                        candidate.duration_interval, candidate.read_versions,
+                        candidate.epoch, epoch_row[0], epoch_row[1])
                 db.execute("COMMIT")
                 return result
             except BaseException:
