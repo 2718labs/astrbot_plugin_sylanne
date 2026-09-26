@@ -7,7 +7,9 @@ import pytest
 
 from sylanne3.contracts import Event, Scope
 from sylanne3.domains.d06 import D06DomainProvider
-from sylanne3.domains.d08 import ActionSchema, ActionSchemaRecord, GoalExecutionProvider
+from sylanne3.domains.d08 import (
+    ActionCancellationState, ActionSchema, ActionSchemaRecord, GoalExecutionProvider,
+)
 from sylanne3.domains.d09 import D09ExpressionProvider
 from sylanne3.graph_coordinator import (
     BudgetAdmission, GraphCoordinator, IngressHostFacts, IngressLineage,
@@ -97,9 +99,14 @@ def _bundle(coordinator, authority, lease, providers, *, tamper=False,
                              schema.proactive, schema.required_checks),
     )
     owner = Owner("activity", "bot", "persona", identity.activity_id)
+    initial = ActionCancellationState.for_action(
+        intent, state="active", actor=authority.actor,
+        source_refs=(source.token,), operation_id=identity.operation_id,
+    )
     values = (
         ("d08.action_intent.v1", intent.action_id, intent),
         ("d08.action_schema.v1", schema.schema_ref, schema),
+        ("d08.action_cancellation.v1", intent.action_id, initial),
         ("d08.communication_intent_grant.v1", grant.grant_id, grant),
         ("d09.verified_segment_batch.v1", batch["batch_id"], batch),
     )
@@ -133,11 +140,11 @@ def _bundle(coordinator, authority, lease, providers, *, tamper=False,
         writes = writes[:-1] + (GraphWrite(writes[-1].key, invalid),)
     d08 = DomainProposal(
         "d08", "d08.proposal.v1", providers[1].descriptor.request_schema_hash,
-        envelope, writes[:3], DependencySet(), (), (),
+        envelope, writes[:4], DependencySet(), (), (),
     )
     d09 = DomainProposal(
         "d09", "d09.proposal.v1", providers[2].descriptor.request_schema_hash,
-        envelope, writes[3:], DependencySet(), (), (),
+        envelope, writes[4:], DependencySet(), (), (),
     )
     return DomainBundle(envelope, (d08, d09), (), (), (), (), (), (), ())
 

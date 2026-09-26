@@ -15101,7 +15101,7 @@ class GraphCoordinator:
                         if v2_write is not None else None),
                 }
                 if self.__dispatch_admission_issuer is not None:
-                    from .domains.d08 import GoalExecutionProvider
+                    from .domains.d08 import ActionCancellationState, GoalExecutionProvider
                     from .runtime.dispatch_action_job_binding import bind_action_job
 
                     admission_jobs = runtime_admissions[0].jobs
@@ -15171,6 +15171,43 @@ class GraphCoordinator:
                     except ValueError as exc:
                         raise UnavailableGuard(
                             "dispatch action/attempt lacks an exact D11 job binding") from exc
+                    cancel_writes = tuple(
+                        (proposal.domain, write)
+                        for proposal in bundle.proposals
+                        for write in proposal.typed_writes
+                        if write.key.type_name == "d08.action_cancellation.v1"
+                    )
+                    expected_cancel = ActionCancellationState.for_action(
+                        action, state="active", actor=envelope.authority.actor,
+                        source_refs=envelope.source_qualification.source_refs,
+                        operation_id=identity.operation_id,
+                    )
+                    cancel_key = AtomKey(
+                        Owner("activity", *namespace.as_tuple, identity.activity_id),
+                        "d08.action_cancellation.v1", action.action_id,
+                    )
+                    if (len(cancel_writes) != 1
+                            or cancel_writes[0][0] != "d08"
+                            or cancel_writes[0][1].key != cancel_key
+                            or cancel_writes[0][1].value != json.loads(
+                                canonical_serialize(asdict(expected_cancel)))
+                            or tuple(ref.revision for ref in
+                                     envelope.version_guard.read_versions
+                                     if ref.key == cancel_key) != (0,)
+                            or tuple(ref.revision for ref in graph_receipt.revisions
+                                     if ref.key == cancel_key) != (1,)
+                            or (admission_receipt.admission.action_ref,
+                                admission_receipt.admission.attempt_id,
+                                admission_receipt.admission.operation_id) != (
+                                    action.action_id, identity.attempt_id,
+                                    identity.operation_id)
+                            or (action_job_binding.action_id,
+                                action_job_binding.attempt_id,
+                                action_job_binding.operation_id) != (
+                                    action.action_id, identity.attempt_id,
+                                    identity.operation_id)):
+                        raise UnavailableGuard(
+                            "dispatch admission lacks same-commit D08 active cancellation head")
                     data["dispatch_admission"] = {
                         "schema": admission_receipt.admission.schema,
                         "ref": admission_receipt.admission.admission_ref,

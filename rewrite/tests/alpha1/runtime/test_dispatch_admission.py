@@ -12,7 +12,7 @@ from sylanne3.domains.d03 import ContextProvider, RoleBinding
 from sylanne3.domains.d05 import BoundaryRule, RelationshipProvider
 from sylanne3.dispatch_runtime import DispatchRequest
 from sylanne3.domains.d06 import D06DomainProvider, SourceGrantRead
-from sylanne3.domains.d08 import ActionSchema, ActionSchemaRecord
+from sylanne3.domains.d08 import ActionCancellationState, ActionSchema, ActionSchemaRecord
 from sylanne3.domains.d09 import (
     ClaimKind, ClaimUse, D09ExpressionProvider, ExpressionClaim, SegmentCandidate,
 )
@@ -101,9 +101,14 @@ def _qualified_bundle(coordinator, authority, lease, providers, *,
                           ("answer",), (), 0.0),), now=1.0,
     )
     owner = Owner("activity", bot, persona, identity.activity_id)
+    initial = ActionCancellationState.for_action(
+        intent, state="active", actor=authority.actor,
+        source_refs=(source.token,), operation_id=identity.operation_id,
+    )
     values = (
         ("d08.action_intent.v1", intent.action_id, intent),
         ("d08.action_schema.v1", schema.schema_ref, schema),
+        ("d08.action_cancellation.v1", intent.action_id, initial),
         ("d08.communication_intent_grant.v1", grant.grant_id, grant),
         ("d09.verified_segment_batch.v1", batch["batch_id"], batch),
     )
@@ -123,7 +128,7 @@ def _qualified_bundle(coordinator, authority, lease, providers, *,
         outbox = RuntimeOutboxValue(
             bot, persona, identity.activity_id, identity.operation_id,
             identity.effect_id, "outbox:dispatch-one", job.job_id,
-            job_write.key.token, dispatch_segment_payload_ref(writes[3].key.token, 0),
+            job_write.key.token, dispatch_segment_payload_ref(writes[4].key.token, 0),
             "idempotency:dispatch-one", "pending", 1,
         )
         outbox_write = outbox_graph_write(outbox, job_write.key)
@@ -147,15 +152,15 @@ def _qualified_bundle(coordinator, authority, lease, providers, *,
     proposals = (
         DomainProposal("d08", "d08.proposal.v1",
                        providers[1].descriptor.request_schema_hash,
-                       envelope, writes[:3], DependencySet(), (), ()),
+                       envelope, writes[:4], DependencySet(), (), ()),
         DomainProposal("d09", "d09.proposal.v1",
                        providers[2].descriptor.request_schema_hash,
-                       envelope, writes[3:4], DependencySet(), (), ()),
+                       envelope, writes[4:5], DependencySet(), (), ()),
     )
     if job is not None:
         proposals += (DomainProposal(
             "d11", D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH,
-            envelope, writes[4:], DependencySet(
+            envelope, writes[5:], DependencySet(
                 current_invalidation=(GraphVersion(job_write.key, 0),),
             ), (), (),
         ),)
