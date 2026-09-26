@@ -10,13 +10,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import json
 
-from ..domains.d07 import AttentionPolicy, AttentionTicket, D07DomainProvider, FocusState
+from ..domains.d07 import (
+    AttentionPolicy, AttentionTicket, D07DomainProvider, FocusState,
+    attention_ticket_key,
+)
 from ..domains.d08 import (
     ActionIntent, ActionSchema, CommunicationGrantRequest, GoalExecutionProvider,
     RequiredCheckRegistry,
 )
 from ..domains.d09 import D09ExpressionProvider, ExpressionClaim, SegmentCandidate
-from ..graph_types import AtomKey, GraphVersion, GraphWrite, Owner
+from ..graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner
 from ..memory_types import access_key
 from ..runtime_contracts import (
     CheckReceipt, CommandEnvelope, CommitReceipt, DependencySet, DomainProposal,
@@ -45,7 +48,8 @@ def post_c02_reply_operation_id(c02_operation_id: str, source_ref: str) -> str:
 
 def prepare_post_c02_private_reply_v1(
     *, c02_receipt: CommitReceipt, envelope: CommandEnvelope,
-    source_ref: str, current_focus: FocusState, attention: AttentionTicket,
+    source_ref: str, snapshot: GraphSnapshot,
+    current_focus: FocusState, attention: AttentionTicket,
     action: ActionIntent, schema: ActionSchema,
     checks: tuple[CheckReceipt, ...], communication: CommunicationGrantRequest,
     claims: tuple[ExpressionClaim, ...], segments: tuple[SegmentCandidate, ...],
@@ -89,7 +93,10 @@ def prepare_post_c02_private_reply_v1(
             or communication.cancellation_epoch != 0
             or len(segments) != 1 or len(communication.segment_specs) != 1):
         raise ValueError("only one ordinary passive private text reply is supported")
-    if attention.causal_root != source_ref or current_focus.persona_id != namespace.persona_id:
+    if (type(snapshot) is not GraphSnapshot
+            or attention.causal_root != source_ref
+            or attention.source_refs != (source_ref,)
+            or current_focus.persona_id != namespace.persona_id):
         raise ValueError("attention must target the original C02 source and persona")
     if attention.category != "interaction":
         raise ValueError("passive reply requires an interaction attention ticket")
@@ -98,6 +105,10 @@ def prepare_post_c02_private_reply_v1(
         current_focus, (attention,), AttentionPolicy.default(), now=now)
     if focus.primary_ticket_ref != attention.ticket_id:
         raise ValueError("inbound message was not selected for attention")
+    ticket_key = attention_ticket_key(namespace, attention.ticket_id)
+    focus = replace(focus, primary_ticket_ref=ticket_key.token)
+    if reads.get(ticket_key, 0) != 0:
+        raise ValueError("reply attention ticket must be a new graph head")
 
     registry = RequiredCheckRegistry()
     registry.register(schema)
@@ -123,7 +134,7 @@ def prepare_post_c02_private_reply_v1(
         activity_owner, "d09.verified_segment_batch.v1", batch["batch_id"])
     if reads.get(grant_key, 0) != 0 or reads.get(batch_key, 0) != 0:
         raise ValueError("reply grant and finite batch must be new graph heads")
-    extra = tuple(GraphVersion(key, 0) for key in (grant_key, batch_key)
+    extra = tuple(GraphVersion(key, 0) for key in (ticket_key, grant_key, batch_key)
                   if key not in reads)
     envelope = replace(envelope, version_guard=replace(
         envelope.version_guard,
@@ -147,12 +158,8 @@ def prepare_post_c02_private_reply_v1(
         "d09", "d09.proposal.v1", d09.descriptor.request_schema_hash,
         envelope, (GraphWrite(batch_key, batch),), DependencySet(), (), (),
     ))
-    focus_write = GraphWrite(
-        focus_key,
-        {"schema": "d07.focus.v1", **json.loads(canonical_serialize(asdict(focus)))},
-    )
-    d07_proposal = d07.validate(replace(
-        d07.proposal_for(envelope), typed_writes=(focus_write,)))
+    d07_proposal = d07.attention_focus_proposal(
+        envelope, snapshot, attention, focus, now=now)
     return PostC02ReplyCandidate(
         envelope, (d07_proposal, d08_proposal, d09_proposal), focus, action,
         batch["batch_id"])
