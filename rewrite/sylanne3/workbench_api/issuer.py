@@ -68,7 +68,9 @@ class GraphWorkbenchIssuer:
 
     def __init__(self, coordinator: object, grants: GrantResolver,
                  view_registry: DomainViewRegistry,
-                 onboarding: OnboardingPolicyResolver | None = None) -> None:
+                 onboarding: OnboardingPolicyResolver | None = None,
+                 correction_installation_policy: object | None = None,
+                 correction_admin_policy: object | None = None) -> None:
         if not callable(getattr(coordinator, "query", None)):
             raise TypeError("coordinator must expose query")
         if not callable(getattr(grants, "resolve", None)):
@@ -79,6 +81,8 @@ class GraphWorkbenchIssuer:
         self._grants = grants
         self._view_registry = view_registry
         self._onboarding = onboarding
+        self._correction_installation_policy = correction_installation_policy
+        self._correction_admin_policy = correction_admin_policy
 
     def read_projection(self, *, session: AuthenticatedSession, scope: str, view_type: str,
                         purpose: str, audience: str, cursor: str | None = None,
@@ -312,6 +316,8 @@ class GraphWorkbenchIssuer:
                 request=request, actor_id=session.actor_id,
                 principal=login.principal,
                 purpose=purpose, audience=audience,
+                installation_policy=self._correction_installation_policy,
+                admin_policy=self._correction_admin_policy,
                 owner_session_token=session.owner_session_token,
                 owner_session_request=login,
             )

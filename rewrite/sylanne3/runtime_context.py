@@ -738,9 +738,12 @@ class RuntimeContext:
                 or not callable(getattr(onboarding, "resolve_bind_scene", None))):
             raise TypeError("trusted onboarding policy resolver is required")
         sessions = CurrentOwnerDashboardSessions(pairing)
+        bundle = self._v2_model_bundle
         service = AsyncGraphWorkbenchService(
             self._worker, DurableOwnerGrantResolver(owner_grants),
-            CurrentDomainViewRegistry(lambda: self._domains), onboarding)
+            CurrentDomainViewRegistry(lambda: self._domains), onboarding,
+            self._v2_policy,
+            bundle.d06_source_correction if bundle is not None else None)
         transport = WorkbenchHttpTransport(
             service, sessions, BoundCsrfTokens(),
             TransportConfig(origin, self._package_root / "resources" / "workbench"))

@@ -76,7 +76,13 @@ def test_dedicated_port_receives_typed_request_but_rejects_nonreceipt():
             return {"status": "ready", "phase": "source_correction_committed"}
 
     port = UntrustedPort()
-    issuer = GraphWorkbenchIssuer(port, NoReadGrant(), NoViews())
+    installation_policy = object()
+    admin_policy = object()
+    issuer = GraphWorkbenchIssuer(
+        port, NoReadGrant(), NoViews(),
+        correction_installation_policy=installation_policy,
+        correction_admin_policy=admin_policy,
+    )
     request = command()
     answer = WorkbenchService(issuer).handle(request, session=SESSION, context=CONTEXT)
     assert answer.status == "unavailable" and answer.receipt is None
@@ -90,6 +96,8 @@ def test_dedicated_port_receives_typed_request_but_rejects_nonreceipt():
     assert submitted["owner_session_request"] == LOGIN
     assert submitted["purpose"] == "workbench_user_action"
     assert submitted["audience"] == "owner"
+    assert submitted["installation_policy"] is installation_policy
+    assert submitted["admin_policy"] is admin_policy
 
 
 def test_dedicated_port_rejects_statement_changed_after_command_digest():

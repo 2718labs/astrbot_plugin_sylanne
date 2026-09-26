@@ -16,11 +16,15 @@ class AsyncGraphWorkbenchService:
 
     def __init__(self, worker: GraphWorker, grants: GrantResolver,
                  view_registry: DomainViewRegistry,
-                 onboarding: OnboardingPolicyResolver | None = None) -> None:
+                 onboarding: OnboardingPolicyResolver | None = None,
+                 correction_installation_policy: object | None = None,
+                 correction_admin_policy: object | None = None) -> None:
         self._worker = worker
         self._grants = grants
         self._view_registry = view_registry
         self._onboarding = onboarding
+        self._correction_installation_policy = correction_installation_policy
+        self._correction_admin_policy = correction_admin_policy
 
     async def handle(self, payload: Any, *, session: AuthenticatedSession | None,
                      context: RequestContext) -> ApiResponse:
@@ -30,7 +34,9 @@ class AsyncGraphWorkbenchService:
                           session: AuthenticatedSession | None,
                           context: RequestContext) -> ApiResponse:
         issuer = GraphWorkbenchIssuer(coordinator, self._grants, self._view_registry,
-                                      self._onboarding)
+                                      self._onboarding,
+                                      self._correction_installation_policy,
+                                      self._correction_admin_policy)
         scope = getattr(self._grants, "request_scope", None)
         with scope() if callable(scope) else nullcontext():
             return WorkbenchService(issuer).handle(
