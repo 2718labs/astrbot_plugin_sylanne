@@ -53,6 +53,24 @@ class PreparedExecutionObservationV2:
 
 
 @dataclass(frozen=True, slots=True)
+class CurrentEffectReadV2:
+    """Content-free Authority evidence, never a platform delivery assertion."""
+
+    authority_id: str
+    namespace: str
+    effect_id: str
+    activation_generation: int
+    state: str  # absent, unresolved, or observed
+    execution_head_seq: int
+    execution_head_digest: str
+    effect_seq: int | None = None
+    append_id: str | None = None
+    append_digest: str | None = None
+    mutation_id: str | None = None
+    observation_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class HandoffStartV2:
     """One durable Authority start bound to a current dispatch fence.
 
@@ -166,6 +184,94 @@ class AuthorityV2ExecutionBridge:
         row = self.core._row(db, self.namespace)
         if row[10:13] != (head.journal_id, head.seq, head.digest):
             raise AuthorityUnavailable("execution journal differs from Authority head")
+
+    def read_current_effect(self, *, credential, subject: str,
+                            effect_id: str) -> CurrentEffectReadV2:
+        """Read one exact effect under the same frozen-head order as v2 writes.
+
+        A missing index row is absent only when the verified execution chain has
+        no matching append. Any pending, missing, or contradictory evidence is
+        unavailable rather than a synthetic clear or settlement.
+        """
+        identifier(subject, "subject")
+        identifier(effect_id, "effect_id")
+        self.core._require(credential, "current", self.namespace)
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    raise AuthorityUnavailable("deletion history blocks current effect read")
+                execution_head, rows = self.journal._scan_locked()
+                with self.core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    self.fences._check_schema(db)
+                    self._check_deletion_locked(db, deletion_head)
+                    self._check_execution_head_locked(db, execution_head)
+                    owner = self.core._row(db, self.namespace)
+                    if (owner[2] != "active" or owner[0] is None
+                            or owner[3] is not None or owner[4] is not None):
+                        raise AuthorityUnavailable("activation is not current")
+                    if db.execute(
+                            "SELECT 1 FROM authority_v2_mutations "
+                            "WHERE namespace=? AND state='pending' LIMIT 1",
+                            (self.namespace,)).fetchone():
+                        raise AuthorityUnavailable("pending execution mutation blocks effect read")
+                    matching = []
+                    for row in rows:
+                        pending = decode_bytes(row[4])
+                        if pending.permit.effect_id == effect_id:
+                            matching.append((row, pending))
+                    effect = db.execute(
+                        "SELECT state,conflict_keys_json,execution_seq "
+                        "FROM authority_effects WHERE namespace=? AND effect_id=?",
+                        (self.namespace, effect_id)).fetchone()
+                    common = dict(authority_id=self.core._id(db),
+                                  namespace=self.namespace, effect_id=effect_id,
+                                  activation_generation=owner[1],
+                                  execution_head_seq=execution_head.seq,
+                                  execution_head_digest=execution_head.digest)
+                    if effect is None and not matching:
+                        return CurrentEffectReadV2(state="absent", **common)
+                    if effect is None or not matching:
+                        raise AuthorityUnavailable("effect index and append history differ")
+                    if (effect[0] != "unresolved" or type(effect[2]) is not int
+                            or effect[2] != matching[-1][0][0]
+                            or matching[0][1].phase != "prepared"):
+                        raise AuthorityUnavailable("effect index or phase history differs")
+                    operation_id = matching[0][1].permit.operation_id
+                    allowed_next = {"prepared": {"claimed"},
+                                    "claimed": {"observed"},
+                                    "observed": {"observed"}}
+                    previous_phase = None
+                    for entry, pending in matching:
+                        permit = pending.permit
+                        if (permit.authority_id != common["authority_id"]
+                                or permit.namespace != self.namespace
+                                or permit.generation != owner[1]
+                                or permit.operation_id != operation_id
+                                or (previous_phase is not None and pending.phase
+                                    not in allowed_next[previous_phase])):
+                            raise AuthorityUnavailable("effect activation or phase chain differs")
+                        mutation = self._load_mutation_locked(
+                            db, pending, permit.subject)
+                        completed = self._completed_result(mutation)
+                        if (completed is None or completed[0].durable_state != "committed"
+                                or completed[0].after_anchor.execution_seq != entry[0]
+                                or completed[0].after_anchor.execution_digest != entry[6]):
+                            raise AuthorityUnavailable("effect append lacks committed Authority evidence")
+                        previous_phase = pending.phase
+                    entry, pending = matching[-1]
+                    mutation = self._load_mutation_locked(
+                        db, pending, pending.permit.subject)
+                    if effect[1] != mutation[5]:
+                        raise AuthorityUnavailable("effect conflict evidence differs")
+                    return CurrentEffectReadV2(
+                        state="observed" if pending.phase == "observed" else "unresolved",
+                        effect_seq=entry[0], append_id=entry[3],
+                        append_digest=entry[6], mutation_id=entry[1],
+                        observation_id=(pending.platform_observation.observation_id
+                                        if pending.phase == "observed" else None),
+                        **common)
 
     @staticmethod
     def _require_v2_mode_locked(db) -> None:
@@ -1054,5 +1160,5 @@ class AuthorityV2ExecutionBridge:
             credential=credential, subject=subject, pending=pending)
 
 
-__all__ = ["AuthorityV2ExecutionBridge", "PreparedExecutionObservationV2",
-           "HandoffStartV2"]
+__all__ = ["AuthorityV2ExecutionBridge", "CurrentEffectReadV2",
+           "PreparedExecutionObservationV2", "HandoffStartV2"]
