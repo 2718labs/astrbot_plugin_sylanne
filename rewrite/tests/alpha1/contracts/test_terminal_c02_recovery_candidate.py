@@ -6,6 +6,9 @@ import json
 import pytest
 
 from sylanne3.authority_service.v2_terminal_c02_recovery_contract import OriginalC02ResultKeyV1
+from sylanne3.authority_service.v2_terminal_c02_recovery_contract import (
+    TerminalRecoveryReadFactV1, TerminalRecoveryReadRequestV1,
+)
 from sylanne3.authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, to_wire,
 )
@@ -120,6 +123,28 @@ def test_frozen_candidate_binds_original_terminal_identity_without_grant():
     assert candidate.original_read_request.read_attempt_id == "read-attempt-a"
     assert not hasattr(candidate, "read_fact")
     assert not hasattr(candidate, "commit_permit")
+
+
+def test_expired_frozen_deadline_cannot_be_extended_by_recovery_read_fact():
+    args, _ = fixture()
+    frozen = inspect_frozen_terminal_c02_candidate_v1(**args)
+    assert frozen.bundle.envelope.deadline_utc == 100.0
+    recovery_request = TerminalRecoveryReadRequestV1(
+        args["original_key"], args["consumer_operation_id"], "recovery-attempt-a")
+    fact = TerminalRecoveryReadFactV1(
+        recovery_request, "4" * 64,
+        args["original_key"].stable_result_digest, "5" * 64)
+    assert fact.request != frozen.original_read_request
+    assert not hasattr(fact, "read_request")  # cannot impersonate the worker fact port
+    extended = replace(
+        frozen.bundle.envelope, deadline_utc=101.0)
+    changed = replace(
+        frozen.bundle, envelope=extended,
+        proposals=tuple(replace(proposal, envelope=extended)
+                        for proposal in frozen.bundle.proposals))
+    changed_args = dict(args, bundle_json=c02_bundle_to_wire(changed))
+    with pytest.raises(ValueError, match="candidate unavailable"):
+        inspect_frozen_terminal_c02_candidate_v1(**changed_args)
 
 
 @pytest.mark.parametrize("field,replacement", [
