@@ -6,3 +6,5 @@ webui-src/**/*.css text eol=lf
 webui-src/*.html text eol=lf
 webui-src/*.json text eol=lf
 webui-src/pnpm-lock.yaml text eol=lf
+webui-src/src/** text eol=lf
+resources/workbench/** text eol=lf
