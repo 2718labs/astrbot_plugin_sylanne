@@ -29,6 +29,9 @@ from ..model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
 )
+from ..model_broker.reply_language import (
+    REPLY_TEMPLATE_VERSION, reply_request_shape_valid,
+)
 from .authority_profile import (
     AdminIngressEncodingPolicy, AdminIngressModelPolicy, AdminModelWorkflowV2,
     AdminInstallationBundle, installed_model_config_ref,
@@ -181,8 +184,9 @@ class AstrBotModelProvider:
                         == FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
                         and request.prompt_template_digest
                         == FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST)
-            # No trusted D09 reply template registry is installed in this slice.
-            return False
+            return (model is workflows.reply
+                    and model.template_version == REPLY_TEMPLATE_VERSION
+                    and reply_request_shape_valid(request))
         if (model is not bundle.ingress_model
                 or type(policy) is not AdminInstallationPolicy
                 or type(encoding) is not AdminIngressEncodingPolicy

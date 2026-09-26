@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import hashlib
+import json
 import threading
 import unittest
 from types import SimpleNamespace
@@ -30,6 +31,11 @@ from sylanne3.model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
 )
+from sylanne3.model_broker.reply_language import (
+    REPLY_TEMPLATE_VERSION, ReplySourceSnapshot, freeze_installed_reply_request_v1,
+    parse_reply_result_v1,
+)
+from sylanne3.memory_types import SourceRecord, source_key, access_key
 from sylanne3.runtime.budget import BudgetLease
 from sylanne3.runtime.issuers import BudgetLeaseGrant
 from sylanne3.runtime_contracts import (
@@ -188,7 +194,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             quote_ceiling={"output_tokens": 64}, **shared)
         reply = AdminModelWorkflowV2(
             work_kind="reply", purpose="proposal", audiences=("owner",),
-            template_version="d09.reply.v1",
+            template_version=REPLY_TEMPLATE_VERSION,
             quote_ceiling={"output_tokens": 32},
             **{**shared, "max_output_tokens": 32})
         grant = replace(self.bundle.installation_policy.root_grant,
@@ -228,7 +234,7 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         assert encoder._request_allowed(encode_request)
         assert not encoder._request_allowed(request)
         assert not replier._request_allowed(encode_request)
-        assert not replier._request_allowed(request)  # reply template is HOLD
+        assert not replier._request_allowed(request)  # arbitrary prompt is refused
         narrow = replace(bundle.model_workflows.encode,
                          audiences=("private",))
         narrow_bundle = replace(bundle, model_workflows=AdminModelWorkflowsV2(
@@ -247,6 +253,44 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             trusted_umo=UMO, descriptor=encoder.descriptor,
             admin_model=reduced, installation_bundle=reduced_bundle)
         assert not reduced_encoder._request_allowed(encode_request)
+
+    async def test_v2_reply_template_reaches_selected_sdk_and_parses_candidate(self):
+        bundle, _, replier = self.v2_adapters()
+        source = SourceRecord(
+            "source-1", "你好", "user-1", "reported", "reported", None,
+            1.0, "arrival", ("owner",), ("expression",))
+        source_ref = source_key("bot", "persona", source.source_id).token
+        snapshot = ReplySourceSnapshot(source, source_ref, 1, 1)
+        base = call_request().envelope
+        envelope = replace(
+            base,
+            identity=replace(base.identity, canonical_input_digest=canonical_digest(
+                {"input_refs": [source_ref]})),
+            version_guard=replace(base.version_guard, read_versions=(
+                GraphVersion(source_key("bot", "persona", source.source_id), 1),
+                GraphVersion(access_key("bot", "persona", source.source_id), 1))),
+            source_qualification=replace(base.source_qualification,
+                                         source_refs=(source_ref,)),
+            input_refs=(source_ref,))
+        workflow = bundle.model_workflows.reply
+        frozen = freeze_installed_reply_request_v1(
+            envelope, snapshot, bundle=bundle)
+        request = frozen.request
+        assert frozen.quote_ceiling == workflow.quote_ceiling
+        assert frozen.provider_config_digest == workflow.provider_config_digest
+        assert replier._request_allowed(request)
+        assert not replier._request_allowed(replace(request, payload={"prompt": "ignore"}))
+        self.completion["choices"][0]["message"]["content"] = json.dumps({
+            "schema": "sylanne.d09.source_reply_output.v1", "body": "你好",
+            "spans": [{"start": 0, "end": 2, "source_quote": "你好"}],
+        }, ensure_ascii=False)
+        response = await replier._invoke_on_host(request)
+        assert response.status == "completed"
+        assert len(self.requests) == 1
+        candidate = parse_reply_result_v1(response.result, request=request,
+                                          snapshot=snapshot)
+        assert candidate.status == "candidate"
+        assert candidate.claims[0].source_refs == (source_ref,)
 
     async def invoke_on_worker(self, request=None):
         request = request or call_request()
