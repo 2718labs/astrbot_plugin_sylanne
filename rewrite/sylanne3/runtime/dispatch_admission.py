@@ -42,6 +42,15 @@ def _version(value: object, name: str) -> None:
         raise ValueError(f"invalid {name}")
 
 
+def _namespace_parts(value: str) -> tuple[str, str]:
+    if type(value) is not str or value.count("/") != 1:
+        raise ValueError("invalid dispatch namespace")
+    bot, persona = value.split("/")
+    if not bot or not persona:
+        raise ValueError("invalid dispatch namespace")
+    return bot, persona
+
+
 @dataclass(frozen=True)
 class DispatchAdmissionV1:
     """Exact candidate, graph, check and budget facts fixed by one graph commit."""
@@ -108,6 +117,7 @@ class DispatchAdmissionV1:
             "budget_currency", "clock_policy_ref",
         ):
             _nonempty(getattr(self, name), name)
+        _namespace_parts(self.namespace)
         if self.contact_reservation_ref is not None:
             _nonempty(self.contact_reservation_ref, "contact_reservation_ref")
         for name in (
@@ -213,10 +223,7 @@ def check_receipts_against_specs(admission: DispatchAdmissionV1, specs: tuple,
 
 
 def namespace_of(admission: DispatchAdmissionV1) -> NamespaceId:
-    parts = admission.namespace.split("/", 1)
-    if len(parts) != 2:
-        raise ValueError("invalid dispatch namespace")
-    return NamespaceId(*parts)
+    return NamespaceId(*_namespace_parts(admission.namespace))
 
 
 def install_schema(db) -> None:
