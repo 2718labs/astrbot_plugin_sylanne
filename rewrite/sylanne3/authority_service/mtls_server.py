@@ -66,6 +66,11 @@ from .v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, to_wire as worker_result_to_wire,
     from_wire as worker_result_from_wire,
 )
+from .v2_reply_worker_model_result_contract import (
+    ReplyWorkerModelResultReadRequestV1,
+    to_wire as reply_worker_result_to_wire,
+    from_wire as reply_worker_result_from_wire,
+)
 from .v2_worker_model_result_read_service import (
     AuthorityV2WorkerModelResultReadService, WorkerResultDeliveryV1,
 )
@@ -78,6 +83,9 @@ from .v2_worker_result_read_fact_service import AuthorityV2WorkerResultReadFactS
 from .current_worker_model_result_graph_verifier import (
     PinnedCurrentWorkerModelResultGraphVerifier,
     PinnedTerminalRecoveryGraphVerifierV1,
+)
+from .current_reply_worker_model_result_graph_verifier import (
+    PinnedCurrentReplyWorkerModelResultGraphVerifier,
 )
 from .v2_execution_bridge import AuthorityV2ExecutionBridge, HandoffStartV2
 from .reverse_handoff import ReverseGraphClaimClient
@@ -457,11 +465,14 @@ class AuthorityRpcServer:
         worker_reads = dict(v2_worker_model_result_reads or {})
         worker_readers = dict(worker_result_readers_v2 or {})
         if (set(worker_reads) != set(worker_readers)
-                or any(type(namespace) is not str or namespace not in model_services
+                  or any(type(namespace) is not str or namespace not in model_services
                        or type(service) is not AuthorityV2WorkerModelResultReadService
                        or service._store is not model_services[namespace]._store
                        or service._fences is not services[namespace]
-                       or type(service._graph) is not PinnedCurrentWorkerModelResultGraphVerifier
+                         or type(service._graph) is not PinnedCurrentWorkerModelResultGraphVerifier
+                         or (service._reply_graph is not None and
+                             type(service._reply_graph) is not
+                             PinnedCurrentReplyWorkerModelResultGraphVerifier)
                        or type(model_services[namespace]._graph_verifier)
                           is not PinnedCurrentModelEgressGraphVerifier
                        or service._graph._path != model_services[namespace]._graph_verifier._path
@@ -930,7 +941,10 @@ class AuthorityRpcServer:
                     {"result": result_wire}, service, credential, delivery)
             if method in {"worker_model_result_select_attempt_v1",
                           "worker_model_result_read_v1",
-                          "worker_model_result_recover_finish_v1"}:
+                          "worker_model_result_recover_finish_v1",
+                          "reply_worker_model_result_select_attempt_v1",
+                          "reply_worker_model_result_read_v1",
+                          "reply_worker_model_result_recover_finish_v1"}:
                 if set(command) != {"namespace", "read_request"}:
                     raise AuthorityUnavailable("worker result command fields differ")
                 namespace = identifier(command["namespace"], "namespace")
@@ -943,8 +957,18 @@ class AuthorityRpcServer:
                         or self._worker_result_readers_v2.get(namespace) !=
                         (credential.certificate_sha256, profile_id)):
                     raise AuthorityUnavailable("installed worker reader unavailable")
-                request = worker_result_from_wire(
-                    command["read_request"], WorkerModelResultReadRequestV1)
+                reply = method.startswith("reply_")
+                if reply and type(service._reply_graph) is not (
+                        PinnedCurrentReplyWorkerModelResultGraphVerifier):
+                    raise AuthorityUnavailable("installed reply graph reader unavailable")
+                wire_from = (reply_worker_result_from_wire if reply
+                             else worker_result_from_wire)
+                wire_to = (reply_worker_result_to_wire if reply
+                           else worker_result_to_wire)
+                request = wire_from(
+                    command["read_request"],
+                    ReplyWorkerModelResultReadRequestV1 if reply
+                    else WorkerModelResultReadRequestV1)
                 if (request.authority_id != self._authority_id()
                         or request.authority_namespace != namespace
                         or request.installation_id != installed.installation_id
@@ -952,16 +976,16 @@ class AuthorityRpcServer:
                             credential.certificate_sha256, profile_id,
                             request.namespace)) != namespace):
                     raise AuthorityUnavailable("worker result installation differs")
-                if method == "worker_model_result_select_attempt_v1":
+                if method.endswith("select_attempt_v1"):
                     selected = service.select_attempt(
                         credential=credential, first_request=request)
-                    return {"selected_request": worker_result_to_wire(selected)}
-                if method == "worker_model_result_recover_finish_v1":
+                    return {"selected_request": wire_to(selected)}
+                if method.endswith("recover_finish_v1"):
                     service.recover_finish(credential=credential, request=request)
                     return {"finished": True}
                 delivery = service.prepare(credential=credential, request=request)
                 try:
-                    result_wire = worker_result_to_wire(delivery.result)
+                    result_wire = wire_to(delivery.result)
                 except BaseException:
                     service.abandon_delivery(delivery=delivery)
                     raise

@@ -1,9 +1,4 @@
-"""Pinned current graph check for post-C02 reply model result release.
-
-The reply preparation producer has a dedicated durable row. Until its exact
-schema is installed and the row can be authenticated, this verifier holds the
-result body. It never delegates to the first-ingress C02 verifier.
-"""
+"""Pinned current graph check for post-C02 reply model result release."""
 
 from __future__ import annotations
 
@@ -19,11 +14,16 @@ from typing import Callable
 from ..contracts import canonical_json
 from ..domains.d07 import AttentionTicket, D07DomainProvider, FocusState
 from ..graph_types import AtomKey, Owner
+from ..graph_store import GraphStore
 from ..memory_types import SourceRecord, access_key, validate_access
 from ..runtime.d11_types import job_graph_write, runtime_job_key
+from ..runtime.budget import get_budget_lease
 from ..runtime.jobs import get_job
-from ..runtime.issuers import D11BudgetJobIssuer
-from ..runtime_contracts import NamespaceId, SnapshotRequirementsV2, canonical_digest
+from ..runtime.issuers import D11BudgetJobIssuer, d06_first_ingress_c02_quote_id
+from ..runtime_contracts import (
+    CommitReceipt, NamespaceEpoch, NamespaceId, SnapshotRequirementsV2,
+    canonical_digest,
+)
 from .v2_contract import FencePermitV2
 from .v2_model_egress_contract import ModelEgressIntentV1
 from .v2_reply_worker_model_result_contract import ReplyWorkerModelResultReadRequestV1
@@ -221,47 +221,97 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
                 or ticket.ticket_id != request.attention_ticket_id
                 or ticket.category != "interaction"
                 or ticket.causal_root != request.source_ref
-                or request.source_ref not in ticket.source_refs
+                or ticket.source_refs != (request.source_ref,)
                 or ticket.valid_until <= now or not ticket.eligible
                 or not ticket.resources_available or ticket.cancel_refs):
             return False
         original = db.execute(
-            "SELECT activity_id,receipt_json FROM graph_bundle_operations "
+            "SELECT digest,activity_id,effect_id,commit_seq,receipt_json "
+            "FROM graph_bundle_operations "
             "WHERE bot=? AND persona=? AND operation_id=?",
             ns + (request.c02_operation_id,)).fetchone()
         if original is None:
             return False
-        c02_receipt = _canonical(original[1])
-        if (c02_receipt.get("status") not in {"committed", "duplicate"}
-                or c02_receipt.get("operation_id") != request.c02_operation_id
-                or c02_receipt.get("activity_id") != original[0]
-                or type(c02_receipt.get("write_versions")) is not list):
+        event = db.execute(
+            "SELECT reads,revisions,epoch_revision FROM graph_events "
+            "WHERE bot=? AND persona=? AND session=? AND event_id=?",
+            ns + (original[1], request.c02_operation_id),).fetchone()
+        if event is None:
             return False
+        detail = _canonical(original[4])
+        c02_receipt = CommitReceipt(
+            "committed", request.c02_operation_id, original[0], original[1],
+            original[2], original[3], GraphStore._version_rows(event[0]),
+            GraphStore._version_rows(event[1]),
+            (NamespaceEpoch(*ns, event[2]),), tuple(detail["ledger_refs"]),
+            tuple(detail["outbox_refs"]))
         writes = {}
-        for item in c02_receipt["write_versions"]:
-            if (type(item) is not dict or set(item) != {"key", "revision"}
-                    or type(item["key"]) is not dict
-                    or set(item["key"]) != {"owner", "type_name", "name"}
-                    or type(item["key"]["owner"]) is not dict):
-                return False
-            key = AtomKey(Owner(**item["key"]["owner"]),
-                          item["key"]["type_name"], item["key"]["name"])
+        for item in c02_receipt.write_versions:
+            key = item.key
             if key.type_name in {"memory.episode.v1", "memory.subjective_trace.v2"}:
                 if key.type_name in writes:
                     return False
-                writes[key.type_name] = (key, item["revision"])
+                writes[key.type_name] = (key, item.revision)
         if set(writes) != {"memory.episode.v1", "memory.subjective_trace.v2"}:
             return False
         episode_key, episode_revision = writes["memory.episode.v1"]
         episode = db.execute(
             "SELECT revision,value,valid FROM graph_history WHERE token=? "
             "AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
-            (episode_key.token, *ns, original[0], request.c02_operation_id),
+            (episode_key.token, *ns, original[1], request.c02_operation_id),
         ).fetchall()
         if (len(episode) != 1 or episode[0][0] != episode_revision
                 or episode[0][2] != 1
                 or request.source_ref not in _canonical(episode[0][1]).get(
                     "source_refs", ())):
+            return False
+        archive = db.execute(
+            "SELECT schema,bundle_digest,evidence_json,quote_json FROM "
+            "graph_first_ingress_c02_committed_seals_v2 WHERE bot=? AND persona=? "
+            "AND operation_id=?", ns + (request.c02_operation_id,),
+        ).fetchone()
+        cost_attempt = db.execute(
+            "SELECT state FROM graph_c02_cost_attempts_v1 WHERE bot=? "
+            "AND persona=? AND operation_id=?",
+            ns + (request.c02_operation_id,),
+        ).fetchone()
+        cost_operation_id = "c02-cost-" + canonical_digest({
+            "namespace": list(ns), "operation_id": request.c02_operation_id,
+        })[:48]
+        cost = db.execute(
+            "SELECT receipt_json FROM graph_bundle_operations WHERE bot=? "
+            "AND persona=? AND operation_id=?",
+            ns + (cost_operation_id,),
+        ).fetchone()
+        c02_quote = self._issuer.resource_issuer.original_signed_quote(
+            db, d06_first_ingress_c02_quote_id(
+                request.namespace, request.c02_operation_id), 1)
+        c02_reservation = db.execute(
+            "SELECT state FROM runtime_budget_reservations WHERE lease_id=? "
+            "AND operation_id=?",
+            (c02_quote.parent_budget_lease_ref, request.c02_operation_id),
+        ).fetchone()
+        c02_settled = db.execute(
+            "SELECT 1 FROM runtime_budget_operations WHERE bot_id=? "
+            "AND persona_id=? AND operation_id=? AND phase='settle'",
+            ns + (request.c02_operation_id,),
+        ).fetchone()
+        if (archive is None or archive[0] != "sylanne.first-ingress-c02-candidate.v2"
+                or archive[1] != original[0]
+                or _canonical(archive[2]).get("source_ref") != request.source_ref
+                or archive[3] != canonical_json(asdict(c02_quote))
+                or cost_attempt != ("committed",) or cost is None
+                or c02_reservation is None
+                or c02_reservation[0] not in {"unknown", "settled", "overrun"}
+                or c02_settled is None):
+            return False
+        cost_detail = _canonical(cost[0])
+        if (cost_detail.get("original_operation_id") != request.c02_operation_id
+                or not cost_detail.get("cost_ref")
+                or db.execute(
+                    "SELECT 1 FROM graph_atoms WHERE token=? AND valid=1",
+                    (cost_detail["cost_ref"],),
+                ).fetchone() is None):
             return False
         preparation = db.execute(
             "SELECT original_operation_id,job_id,activity_id,c02_receipt_digest,"
@@ -283,10 +333,7 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
          acquire_operation_id, actor, worker_fence, call_id,
          model_request_digest, binding_digest, envelope_json,
          request_json) = preparation
-        c02_fields = {key: c02_receipt[key] for key in (
-            "status", "operation_id", "operation_digest", "activity_id",
-            "effect_id", "commit_seq", "read_versions", "write_versions",
-            "invalidated_epochs", "ledger_refs", "outbox_refs")}
+        c02_fields = asdict(c02_receipt)
         if ((original_operation_id, job_id, activity_id, c02_digest,
              row_source_id, source_revision, access_revision, ticket_id,
              focus_revision, audience, graph_job_ref, graph_job_revision,
@@ -304,9 +351,27 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
                 or job.operator_versions.get("resource_quote")
                    != f"{quote_id}:{quote_version}"):
             return False
+        acquired_history = db.execute(
+            "SELECT revision,value,valid FROM graph_history WHERE token=? "
+            "AND event_bot=? AND event_persona=? AND event_session=? "
+            "AND event_id=?",
+            (job_key.token, *ns, job.activity_id, acquire_operation_id),
+        ).fetchall()
+        queued_history = db.execute(
+            "SELECT value,valid FROM graph_history WHERE token=? "
+            "AND event_bot=? AND event_persona=? AND event_session=? "
+            "AND event_id=?",
+            (job_key.token, *ns, job.activity_id, original_operation_id),
+        ).fetchall()
+        if (len(acquired_history) != 1
+                or acquired_history[0] != (job_row[0], job_row[1], 1)
+                or len(queued_history) != 1 or queued_history[0][1] != 1
+                or _canonical(queued_history[0][0]).get("phase") != "queued"):
+            return False
         quote = self._issuer.resource_issuer.original_signed_quote(
             db, quote_id, quote_version)
         grant = self._issuer.current_budget_grant(db, job.budget_ref)
+        lease = get_budget_lease(db, job.budget_ref)
         reservation = db.execute(
             "SELECT digest,ceiling_json,state FROM runtime_budget_reservations "
             "WHERE lease_id=? AND operation_id=?",
@@ -319,12 +384,20 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
              quote.operation_id, quote.effect_id,
              quote.parent_budget_lease_ref, quote.work_kind,
              quote.snapshot_ref, quote.resource_ref, quote.graph_job_ref,
-             quote.outbox_refs, quote.required_worker_fence,
-             quote.deadline_utc) !=
+             quote.outbox_refs, quote.d02_settlement_refs,
+             quote.required_worker_fence, quote.deadline_utc,
+             quote.valid_until_utc) !=
             (*ns, job.activity_id, original_operation_id, None,
              job.budget_ref, "reply", job.snapshot_ref, job.resource_ref,
-             job_key.token, (), None, deadline_utc)
+             job_key.token, (), (), None, deadline_utc, deadline_utc)
                 or quote.version != quote_version or quote.ceiling != dict(intent.budget_ceiling)
+                or lease.state != "active"
+                or (lease.bot_id, lease.persona_id) != ns
+                or (grant.bot_id, grant.persona_id, grant.lease_id)
+                   != (*ns, job.budget_ref)
+                or grant.valid_until_utc <= now
+                or any(lease.reserved.get(name, 0) < amount
+                       for name, amount in quote.ceiling.items())
                 or "reply" not in grant.allowed_work_kinds
                 or any(amount > grant.max_ceiling.get(name, 0)
                        for name, amount in quote.ceiling.items())
@@ -354,10 +427,34 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
                 or frozen["provider_id"] != intent.provider_id
                 or frozen["model_id"] != intent.model_id):
             return False
-        # The producer's acquired binding must still be verified against its
-        # own frozen digest before result release. Until that graph write and
-        # test fixture are committed, do not authorize body access.
-        return False
+        computed_request_digest = canonical_digest({
+            "envelope": frozen["envelope"], "call_id": frozen["call_id"],
+            "provider_id": frozen["provider_id"],
+            "model_id": frozen["model_id"],
+            "purpose": authority["purpose"],
+            "required_capabilities": frozen["required_capabilities"],
+            "privacy_tier": frozen["privacy_tier"],
+            "template": frozen["prompt_template_digest"],
+            "payload": frozen["payload"],
+            "timeout_seconds": float(frozen["timeout_seconds"]),
+            "max_output_tokens": frozen["max_output_tokens"],
+        })
+        computed_binding_digest = canonical_digest({
+            "schema": "sylanne.post-c02-reply-model-binding.v1",
+            "job_id": job.job_id,
+            "original_operation_id": job.operation_id,
+            "acquire_operation_id": acquire_operation_id,
+            "worker_fence": job.fence,
+            "source_ref": request.source_ref,
+            "source_revision": source_revision,
+            "access_revision": access_revision,
+            "attention_ticket_id": ticket_id,
+            "focus_revision": focus_revision,
+            "call_id": call_id,
+            "request_digest": computed_request_digest,
+        })
+        return (computed_request_digest == request.model_request_digest
+                and computed_binding_digest == request.binding_digest)
 
 
 __all__ = ["PinnedCurrentReplyWorkerModelResultGraphVerifier"]
