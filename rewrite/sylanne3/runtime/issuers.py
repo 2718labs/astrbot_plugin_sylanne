@@ -2240,6 +2240,145 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         self._d02._issue_bound_stage_quote(db, quote)
         return quote
 
+    def issue_d06_first_ingress_c02_quote_at_first_seal_v2(
+            self, db, bundle: DomainBundle, admin_policy, *,
+            original_key, sealed_at_utc: float):
+        """Sign the original C02 price while its worker is live.
+
+        The caller owns the transaction and must store the returned seal and
+        exact bundle bytes in that transaction. This does not admit the bundle.
+        """
+        from ..authority_service.v2_terminal_c02_recovery_contract import OriginalC02ResultKeyV1
+        from .terminal_c02_recovery_candidate_v2 import FrozenTerminalC02CandidateV2
+
+        if not db.in_transaction:
+            raise IssuerAuthorityDenied("C02 v2 first seal requires caller transaction")
+        if type(bundle) is not DomainBundle or type(original_key) is not OriginalC02ResultKeyV1:
+            raise TypeError("typed C02 bundle and original result key required")
+        from .c02_bundle_codec import c02_bundle_to_wire
+        c02_bundle_to_wire(bundle)
+        now = _now_utc(sealed_at_utc)
+        envelope = bundle.envelope
+        namespace = envelope.authority.namespace
+        operation_id = envelope.identity.operation_id
+        if (namespace != original_key.namespace
+                or envelope.identity.phase != "first_ingress_c02"
+                or envelope.identity.activity_id == ""
+                or envelope.deadline_utc <= now
+                or len(envelope.version_guard.resource_lease_versions) != 1
+                or (envelope.version_guard.resource_lease_versions[0].ref,
+                    envelope.version_guard.resource_lease_versions[0].version)
+                != (d06_first_ingress_c02_quote_id(namespace, operation_id), 1)):
+            raise IssuerAuthorityDenied("C02 v2 first seal bundle identity differs")
+        pre_quote = replace(envelope, version_guard=replace(
+            envelope.version_guard, resource_lease_versions=()))
+        origin = _d06_c02_origin(
+            db, pre_quote, original_key.job_id, self._d02, now_utc=now)
+        job = get_job(db, original_key.job_id)
+        try:
+            lease_expires = datetime.fromisoformat(
+                job.lease_expires_utc.replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise IssuerAuthorityDenied("C02 v2 original worker lease is invalid") from exc
+        if ((origin.installation_id, origin.job_id, origin.operation_id,
+             origin.acquire_operation_id, origin.call_id, origin.binding_digest,
+             origin.model_request_digest, origin.consumer_operation_id)
+            != (original_key.installation_id, original_key.job_id,
+                original_key.original_operation_id,
+                original_key.acquire_operation_id, original_key.call_id,
+                original_key.binding_digest, original_key.model_request_digest,
+                operation_id)
+                or not now < lease_expires < envelope.deadline_utc):
+            raise IssuerAuthorityDenied("C02 v2 original result or deadline differs")
+        quote = self.issue_d06_first_ingress_c02_quote(
+            db, pre_quote, admin_policy,
+            installation_id=original_key.installation_id,
+            job_id=original_key.job_id, now_utc=now)
+        grant = self._load_grant(db, quote.parent_budget_lease_ref)
+        if (quote.deadline_utc != envelope.deadline_utc
+                or quote.valid_until_utc != envelope.deadline_utc
+                or quote.required_worker_fence != envelope.authority.worker_fence):
+            raise IssuerAuthorityDenied("C02 v2 first-seal quote differs from bundle")
+        seal = FrozenTerminalC02CandidateV2(
+            original_key=original_key, bundle_digest=bundle.digest,
+            quote_id=quote.quote_id, quote_version=quote.version,
+            quote_digest=canonical_digest(_payload(quote)), sealed_at_utc=now,
+            original_worker_lease_expires_utc=lease_expires,
+            business_deadline_utc=envelope.deadline_utc,
+            admin_deadline_after_seconds=admin_policy.deadline_after_seconds,
+            root_grant_valid_until_utc=grant.valid_until_utc)
+        return quote, seal
+
+    def verify_original_d06_first_ingress_c02_quote_v2(
+            self, db, *, seal, bundle_json: str, quote_json: str,
+            trusted_now_utc: float) -> ResourceQuote:
+        """Read historical signatures after lease expiry; grant no execution.
+
+        Current Authority, source/access, graph and budget admission remain
+        separate production checks. No quote or deadline is issued here.
+        """
+        from .terminal_c02_recovery_candidate_v2 import (
+            FrozenTerminalC02CandidateV2,
+            inspect_frozen_terminal_c02_candidate_v2,
+        )
+
+        if type(seal) is not FrozenTerminalC02CandidateV2:
+            raise TypeError("typed C02 v2 seal required")
+        now = _now_utc(trusted_now_utc)
+        if not (seal.original_worker_lease_expires_utc <= now
+                < seal.business_deadline_utc):
+            raise IssuerAuthorityDenied("C02 v2 historical verification is outside recovery window")
+        inspection = inspect_frozen_terminal_c02_candidate_v2(
+            namespace=seal.original_key.namespace,
+            operation_id=seal.consumer_operation_id, seal=seal,
+            bundle_json=bundle_json, quote_json=quote_json)
+        quote = self._d02.original_signed_quote(db, seal.quote_id, seal.quote_version)
+        if canonical_serialize(_payload(quote)) != quote_json:
+            raise IssuerAuthorityDenied("C02 v2 frozen quote differs from signed original")
+        parts = quote.snapshot_ref.split(":")
+        if len(parts) != 3 or parts[0] != "d06c02snap":
+            raise IssuerAuthorityDenied("C02 v2 signed policy binding is absent")
+        row = db.execute(
+            "SELECT policy_json,signature FROM runtime_d06_c02_quote_policies "
+            "WHERE policy_id=?", (parts[1],)).fetchone()
+        if row is None:
+            raise IssuerAuthorityDenied("C02 v2 original policy is absent")
+        self._d02._signer.verify("d06-first-ingress-c02-policy.v1", row[0], row[1])
+        try:
+            policy = _decode_d06_c02_policy(row[0])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("C02 v2 original policy is invalid") from exc
+        grant, _ = self.signed_budget_grant_at_version(
+            db, quote.parent_budget_lease_ref, policy.grant_version)
+        key = seal.original_key
+        if (policy.policy_id != parts[1]
+                or policy.policy_id != _d06_c02_policy_id(
+                    key.installation_id, grant, seal.consumer_operation_id)
+                or (policy.bot_id, policy.persona_id) != key.namespace.as_tuple
+                or (policy.grant_id, policy.grant_version, policy.lease_id,
+                    policy.provider_policy_ref)
+                != (grant.grant_id, grant.version, grant.lease_id, grant.policy_ref)
+                or (policy.installation_id, policy.job_id,
+                    policy.original_operation_id, policy.acquire_operation_id,
+                    policy.original_call_id, policy.binding_digest,
+                    policy.model_request_digest, policy.consumer_operation_id)
+                != (key.installation_id, key.job_id,
+                    key.original_operation_id, key.acquire_operation_id,
+                    key.call_id, key.binding_digest, key.model_request_digest,
+                    seal.consumer_operation_id)
+                or (quote.snapshot_ref, quote.resource_ref)
+                != _d06_c02_quote_refs(policy, inspection.bundle.envelope)
+                or dict(quote.ceiling) != dict(policy.quote_ceiling)
+                or quote.parent_budget_lease_ref != grant.lease_id
+                or quote.work_kind not in grant.allowed_work_kinds
+                or quote.deadline_utc > grant.valid_until_utc
+                or seal.root_grant_valid_until_utc != grant.valid_until_utc
+                or seal.admin_deadline_after_seconds != policy.deadline_after_seconds
+                or any(amount > grant.max_ceiling.get(name, 0)
+                       for name, amount in quote.ceiling.items())):
+            raise IssuerAuthorityDenied("C02 v2 original signed policy or grant differs")
+        return quote
+
     def _plan_d06_source_correction_quote(
             self, db, envelope: CommandEnvelope, admin_policy, request, *,
             installation_id: str, now_utc: float | None = None
