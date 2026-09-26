@@ -6791,6 +6791,186 @@ class GraphCoordinator:
             binding.source_revision, binding.access_revision,
             authority.actor, job.fence, job.lease_expires_utc, anchor)
 
+    def discover_first_ingress_unacquired_v1(
+        self, bootstrap: object, namespace: NamespaceId,
+        after_job_id: str | None = None, limit: int = 8,
+    ):
+        """Find original queued C01 work under a fresh paired read fence.
+
+        The keyset is only a traversal hint. Every returned row is requalified
+        against the current graph, D06 grant, D11 job, and committed D03/D04
+        baseline; the page carries no worker or model authority.
+        """
+        from datetime import datetime
+
+        from .host.authority_profile import AdminIngressClockPolicy
+        from .host.d06_ingress import ingress_content_fingerprint
+        from .host.ingress import HostIngressEnvelope, SourceLineage
+        from .memory_types import SourceRecord, validate_access
+        from .runtime.first_ingress_unacquired import (
+            FirstIngressUnacquiredItemV1, FirstIngressUnacquiredPageV1,
+        )
+        from .runtime.first_ingress_v2 import ingress_ids, trusted_upper
+        from .runtime.ingress_observation import read_committed_ingress_identity
+
+        self._admin(bootstrap)
+        if (type(namespace) is not NamespaceId or type(limit) is not int
+                or not 1 <= limit <= 8
+                or after_job_id is not None and (
+                    type(after_job_id) is not str or not after_job_id
+                    or len(after_job_id) > 128)
+                or not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None
+                or self.__d11_issuer is None
+                or type(self.__scene_clock_policy) is not AdminIngressClockPolicy):
+            raise UnavailableGuard("installed bounded ingress discovery required")
+        try:
+            now = trusted_upper(self.__content_fence_v2.read_ingress_clock(
+                self.__scene_clock_policy))
+        except Exception as exc:
+            raise UnavailableGuard("ingress discovery clock unavailable; HOLD") from exc
+        with self.__store._lock:
+            metadata, _ = self._v2_graph_stamp(namespace)
+        authority = AuthorityContext(
+            self.__holder, "d11", "unacquired-discovery", namespace,
+            ("activity",), "context", ("internal",),
+            "unacquired-discovery-v1",
+            metadata.requirements.activation_generation)
+
+        def reader():
+            db = self.__store._db
+            current, epoch = self._v2_graph_stamp(namespace)
+            target = current.requirements
+            provision_row = self._provision_row(db, namespace)
+            if provision_row is None:
+                raise UnavailableGuard("ingress discovery provisioning absent; HOLD")
+            provision = self._decode_provision_receipt(provision_row)
+            installed = self.__content_fence_v2.installation_grant
+            if (target.namespace != namespace
+                    or provision.installation_id != installed.installation_id
+                    or provision.authority_id != installed.authority_id
+                    or provision.authority_namespace != target.authority_namespace
+                    or provision.generation != target.activation_generation):
+                raise UnavailableGuard("ingress discovery installation differs; HOLD")
+            last = after_job_id or ""
+            items = []
+            while True:
+                rows = db.execute(
+                    "SELECT job_id FROM runtime_jobs WHERE bot_id=? AND "
+                    "persona_id=? AND job_id>? AND work_kind='d06.encode_source' "
+                    "ORDER BY job_id LIMIT ?",
+                    namespace.as_tuple + (last, limit + 1),
+                ).fetchall()
+                if not rows:
+                    break
+                for (job_id,) in rows[:limit]:
+                    last = job_id
+                    try:
+                        job, job_key, _, outbox, _, _, source_version, access_version = (
+                            self._first_ingress_encoding_job_locked(namespace, job_id))
+                        if (job.phase != "queued" or job.fence != 0
+                                or job.lease_holder is not None
+                                or job.lease_expires_utc is not None
+                                or job.cancel_epoch != 0 or job.result_ref is not None
+                                or now >= datetime.fromisoformat(
+                                    job.deadline_utc.replace("Z", "+00:00")
+                                ).timestamp()):
+                            continue
+                        self.__d11_issuer.authorize_existing_encoding_job(
+                            db, job, now_utc=now)
+                        source_id = outbox.payload_ref
+                        if (job.operation_id != ingress_ids(source_id)[2]
+                                or job_id != ingress_ids(source_id)[3]
+                                or db.execute(
+                                    "SELECT 1 FROM graph_job_acquire_intents_v2 "
+                                    "WHERE bot=? AND persona=? AND job_id=? LIMIT 1",
+                                    namespace.as_tuple + (job_id,),
+                                ).fetchone() is not None):
+                            continue
+                        receipt = read_committed_ingress_identity(
+                            db, namespace, source_id)
+                        if receipt is None:
+                            continue
+                        identity = json.loads(receipt.identity_json)
+                        intent = db.execute(
+                            "SELECT identity_json,requirements_json FROM "
+                            "graph_first_ingress_intents_v2 WHERE bot=? AND "
+                            "persona=? AND operation_id=?",
+                            namespace.as_tuple + (job.operation_id,),
+                        ).fetchone()
+                        bundle = db.execute(
+                            "SELECT digest,receipt_json FROM graph_bundle_operations "
+                            "WHERE bot=? AND persona=? AND operation_id=?",
+                            namespace.as_tuple + (job.operation_id,),
+                        ).fetchone()
+                        if (intent is None or bundle is None
+                                or bundle[0] != receipt.bundle_digest
+                                or json.loads(intent[1]).get("graph_incarnation")
+                                   != target.graph_incarnation
+                                or job_key.token not in json.loads(bundle[1]).get(
+                                    "ledger_refs", ())
+                                or json.loads(intent[0]).get("source_ref")
+                                   != source_id):
+                            continue
+                        source_row = db.execute(
+                            "SELECT value FROM graph_atoms WHERE token=? AND "
+                            "revision=? AND valid=1",
+                            (source_version.key.token, source_version.revision),
+                        ).fetchone()
+                        access_row = db.execute(
+                            "SELECT value FROM graph_atoms WHERE token=? AND "
+                            "revision=? AND valid=1",
+                            (access_version.key.token, access_version.revision),
+                        ).fetchone()
+                        if source_row is None or access_row is None:
+                            continue
+                        source = SourceRecord.from_dict(json.loads(source_row[0]))
+                        access = json.loads(access_row[0])
+                        validate_access(access)
+                        if (source.source_id != source_id
+                                or source.speaker_id != identity["sender_ref"]
+                                or source.source_kind != "reported"
+                                or "context" not in source.purposes
+                                or "consolidation" not in source.purposes
+                                or identity["conversation_ref"] not in source.audiences
+                                or access["status"] != "active"
+                                or access["source_id"] != source_id
+                                or "context" not in access["purposes"]
+                                or "consolidation" not in access["purposes"]
+                                or identity["conversation_ref"] not in access["audiences"]):
+                            continue
+                        envelope = HostIngressEnvelope(
+                            namespace, identity["platform_ref"],
+                            identity["conversation_ref"], identity["sender_ref"],
+                            identity["message_id"], source.text,
+                            source.occurred_at, source.recorded_at,
+                            identity["visibility"], SourceLineage(**identity["lineage"]),
+                        )
+                        if ingress_content_fingerprint(envelope) != receipt.content_fingerprint:
+                            continue
+                        self._committed_first_ingress_baseline_locked(
+                            namespace, source_id, current, epoch)
+                        item = FirstIngressUnacquiredItemV1(
+                            namespace, provision.installation_id, job_id,
+                            job.operation_id, envelope, receipt.content_fingerprint,
+                            receipt.bundle_digest)
+                    except (AuthorityDenied, UnavailableGuard, EventConflict,
+                            KeyError, TypeError, ValueError):
+                        continue
+                    items.append(item)
+                if len(rows) > limit:
+                    return FirstIngressUnacquiredPageV1(
+                        namespace, provision.installation_id,
+                        target.graph_incarnation, current.graph_revision,
+                        epoch.revision, tuple(items), last)
+                break
+            return FirstIngressUnacquiredPageV1(
+                namespace, provision.installation_id,
+                target.graph_incarnation, current.graph_revision,
+                epoch.revision, tuple(items), None)
+
+        return self._read_v2(authority, reader)
+
     def discover_first_ingress_recovery_v1(
         self, bootstrap: object, namespace: NamespaceId,
         cursor: str | None = None, limit: int = 20,
