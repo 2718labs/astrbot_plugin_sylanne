@@ -6,7 +6,7 @@ import asyncio
 from concurrent.futures import TimeoutError as FutureTimeout
 
 from ..authority_service.v2_worker_result_read_fact_contract import (
-    WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+    WorkerResultReadFactRequestV2, WorkerResultReadFactV2,
 )
 from ..runtime_contracts import InstallationGrantV2
 from .authority_client import AuthorityClient
@@ -39,9 +39,9 @@ class InstalledWorkerResultReadFactPort:
         self._timeout = max(5.0, 3 * bundle.tls_profile.timeout_seconds)
 
     def current_worker_result_read_fact(
-        self, request: WorkerResultReadFactRequestV1,
-    ) -> WorkerResultReadFactV1:
-        if type(request) is not WorkerResultReadFactRequestV1:
+        self, request: WorkerResultReadFactRequestV2,
+    ) -> WorkerResultReadFactV2:
+        if type(request) is not WorkerResultReadFactRequestV2:
             raise TypeError("typed original worker read fact request required")
         if not self._loop.is_running():
             raise RuntimeError("installed Authority event loop is unavailable")
@@ -52,7 +52,7 @@ class InstalledWorkerResultReadFactPort:
         if running is self._loop:
             raise RuntimeError("worker result fact read must run on the graph worker")
         future = asyncio.run_coroutine_threadsafe(
-            self._client.worker_result_read_fact_v1(
+            self._client.worker_result_read_fact_v2(
                 self._bundle, self._grant, fact_request=request),
             self._loop,
         )

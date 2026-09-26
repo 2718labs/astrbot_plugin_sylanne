@@ -20,6 +20,7 @@ import time
 from typing import TYPE_CHECKING, Callable
 
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from ..runtime_journal import (
     BudgetConstraint, QuotaOccupancy, RecoveryConstraintFootprint,
     ReservationConstraint,
@@ -62,7 +63,8 @@ from .v2_worker_model_result_read_service import (
     AuthorityV2WorkerModelResultReadService, WorkerResultDeliveryV1,
 )
 from .v2_worker_result_read_fact_contract import (
-    WorkerResultReadFactRequestV1, from_wire as worker_fact_from_wire,
+    WorkerResultReadFactRequestV1, WorkerResultReadFactRequestV2,
+    from_wire as worker_fact_from_wire,
     to_wire as worker_fact_to_wire,
 )
 from .v2_worker_result_read_fact_service import AuthorityV2WorkerResultReadFactService
@@ -811,7 +813,7 @@ class AuthorityRpcServer:
                 return _DeferredWorkerDelivery(
                     {"result": result_wire},
                     service, credential, delivery)
-            if method == "worker_result_read_fact_v1":
+            if method in {"worker_result_read_fact_v1", "worker_result_read_fact_v2"}:
                 if set(command) != {"namespace", "fact_request"}:
                     raise AuthorityUnavailable("worker read fact command fields differ")
                 namespace = identifier(command["namespace"], "namespace")
@@ -824,14 +826,24 @@ class AuthorityRpcServer:
                         or service._committer_subject != subject):
                     raise AuthorityUnavailable("designated C02 committer unavailable")
                 request = worker_fact_from_wire(
-                    command["fact_request"], WorkerResultReadFactRequestV1)
+                    command["fact_request"],
+                    (WorkerResultReadFactRequestV2 if method == "worker_result_read_fact_v2"
+                     else WorkerResultReadFactRequestV1))
                 if (request.read_request.authority_id != self._authority_id()
                         or request.read_request.authority_namespace != namespace
                         or self._namespace_bindings_v2.get((
                             credential.certificate_sha256, profile_id,
                             request.read_request.namespace)) != namespace):
                     raise AuthorityUnavailable("C02 committer installation differs")
-                fact = service.current(credential=credential, request=request)
+                if method == "worker_result_read_fact_v2":
+                    if request.write_permit.operation_id != domain_bundle_write_attempt_id_v1(
+                            request.read_request.namespace,
+                            request.read_request.consumer_operation_id,
+                            request.bundle_digest):
+                        raise AuthorityUnavailable("C02 bundle write fence differs")
+                    fact = service.current_v2(credential=credential, request=request)
+                else:
+                    fact = service.current(credential=credential, request=request)
                 return {"fact": worker_fact_to_wire(fact)}
             if method in {"accounting_begin_v1", "accounting_validate_v1",
                           "accounting_finish_v1", "accounting_recover_finish_v1"}:

@@ -11,7 +11,9 @@ from sylanne3.authority_service.v2_model_egress_contract import (
     ModelEgressRecoveryV1, ModelTerminalReceiptV2,
 )
 from sylanne3.authority_service.v2_worker_model_result_contract import WorkerModelResultReadV1
-from sylanne3.authority_service.v2_worker_result_read_fact_contract import WorkerResultReadFactV1
+from sylanne3.authority_service.v2_worker_result_read_fact_contract import (
+    WorkerResultReadFactRequestV2, WorkerResultReadFactV2,
+)
 from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.domains.d04 import AffectAxis, AffectProvider, AffectScheme
 from sylanne3.graph_coordinator import UnavailableGuard
@@ -22,6 +24,7 @@ from sylanne3.host.authority_profile import (
 )
 from sylanne3.host.worker_result_identity import first_ingress_worker_result_request_v1
 from sylanne3.runtime.encoding_call_binding import load_binding
+from sylanne3.runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from sylanne3.runtime_contracts import canonical_digest, canonical_serialize
 
 import test_graph_v2_provisioning
@@ -44,7 +47,20 @@ class FinishedReadFactPort:
     def current_worker_result_read_fact(self, request):
         assert not self.graph_store._lock._is_owned()
         self.calls += 1
+        assert type(request) is WorkerResultReadFactRequestV2
         assert request.read_request == self.read.request
+        namespace = self.read.request.namespace
+        operation_id = request.write_permit.operation_id
+        row = self.graph_store._db.execute(
+            "SELECT operation_id,digest FROM graph_bundle_intents_v2 "
+            "WHERE bot=? AND persona=? AND fence_attempt_id=?",
+            namespace.as_tuple + (operation_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == self.read.request.consumer_operation_id
+        assert request.bundle_digest == row[1]
+        assert request.write_permit.operation_id == domain_bundle_write_attempt_id_v1(
+            namespace, row[0], row[1])
         anchor = self.port.anchors[self.read.request.namespace]
         assert self.port.fences.validate_fence(
             request.write_permit, subject="subject", current_anchor=anchor)
@@ -58,12 +74,19 @@ class FinishedReadFactPort:
             "action": "finish_worker_result_read",
             "request": asdict(self.read.request),
             "permit": asdict(self.read_permit)})
-        return WorkerResultReadFactV1(
-            self.read.request, self.read.request.digest, self.read_permit,
-            canonical_digest(asdict(self.read_permit)), finish_id, finish_digest,
-            canonical_digest(asdict(self.read)),
-            canonical_digest(asdict(self.intent)), self.read.terminal_receipt,
-            request.write_permit, canonical_digest(asdict(request.write_permit)))
+        return WorkerResultReadFactV2(
+            read_request=self.read.request,
+            read_request_digest=self.read.request.digest,
+            read_permit=self.read_permit,
+            read_permit_digest=canonical_digest(asdict(self.read_permit)),
+            read_finish_request_id=finish_id,
+            read_finish_request_digest=finish_digest,
+            result_digest=canonical_digest(asdict(self.read)),
+            original_intent_digest=canonical_digest(asdict(self.intent)),
+            terminal_receipt=self.read.terminal_receipt,
+            write_permit=request.write_permit,
+            write_permit_digest=canonical_digest(asdict(request.write_permit)),
+            bundle_digest=request.bundle_digest)
 
 
 @pytest.fixture
@@ -255,7 +278,8 @@ def test_first_ingress_c02_adopts_one_original_worker_result(c02_case):
     ).fetchone() == (2,)
 
 
-@pytest.mark.parametrize("mutation", ("cancel", "revoke_access", "tamper_fact"))
+@pytest.mark.parametrize("mutation", (
+    "cancel", "revoke_access", "tamper_fact", "tamper_bundle_fact"))
 def test_first_ingress_c02_rejects_lost_adoption_proof(c02_case, mutation):
     store, coordinator, bootstrap, namespace, policy, clock, intent, read, fact_port = c02_case
     if mutation == "cancel":
@@ -270,7 +294,10 @@ def test_first_ingress_c02_rejects_lost_adoption_proof(c02_case, mutation):
         current = fact_port.current_worker_result_read_fact
 
         def tampered(request):
-            return replace(current(request), result_digest="0" * 64)
+            fact = current(request)
+            if mutation == "tamper_bundle_fact":
+                return replace(fact, bundle_digest="0" * 64)
+            return replace(fact, result_digest="0" * 64)
 
         fact_port.current_worker_result_read_fact = tampered
     with pytest.raises((UnavailableGuard, ValueError, PermissionError)):

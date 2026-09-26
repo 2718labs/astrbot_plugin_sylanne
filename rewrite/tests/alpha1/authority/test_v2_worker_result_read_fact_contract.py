@@ -5,9 +5,12 @@ from dataclasses import asdict, replace
 import pytest
 
 from rewrite.tests.alpha1.authority.test_v2_worker_result_read_service import _case
+from rewrite.tests.alpha1.authority.test_v2_worker_result_read_fact_service import _finished
 from sylanne3.authority_service.v2_worker_result_read_fact_contract import (
-    WorkerResultReadFactRequestV1, WorkerResultReadFactV1, from_wire, to_wire,
+    WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+    WorkerResultReadFactRequestV2, WorkerResultReadFactV2, from_wire, to_wire,
 )
+from sylanne3.runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from sylanne3.runtime_contracts import canonical_digest
 
 
@@ -41,5 +44,33 @@ def test_fact_contract_is_content_free_and_binds_both_fences(tmp_path, monkeypat
         with pytest.raises(ValueError, match="identities"):
             replace(fact, terminal_receipt=replace(
                 fact.terminal_receipt, call_id="other-call"))
+    finally:
+        core.close(); deletion.close(); guard.close(); execution.close()
+
+
+def test_v2_fact_wire_roundtrip_and_graph_attempt_identity(tmp_path, monkeypatch):
+    bundle_digest = "a" * 64
+    service, legacy, reads, core, deletion, guard, execution = _finished(
+        tmp_path, monkeypatch, bundle_digest)
+    try:
+        request = WorkerResultReadFactRequestV2(
+            legacy.read_request, legacy.write_permit, bundle_digest)
+        assert from_wire(to_wire(request), WorkerResultReadFactRequestV2) == request
+        fact = service.current_v2(credential="ok", request=request)
+        assert from_wire(to_wire(fact), WorkerResultReadFactV2) == fact
+        assert fact.bundle_digest == bundle_digest
+        assert fact.schema.endswith(".v2")
+        assert fact.write_permit.operation_id == "graph-write-" + canonical_digest({
+            "namespace": list(request.read_request.namespace.as_tuple),
+            "operation_id": request.read_request.consumer_operation_id,
+            "bundle_digest": bundle_digest,
+        })[:48]
+        assert fact.write_permit.operation_id == domain_bundle_write_attempt_id_v1(
+            request.read_request.namespace,
+            request.read_request.consumer_operation_id, bundle_digest)
+        with pytest.raises(ValueError, match="bundle_digest"):
+            replace(request, bundle_digest="A" * 64)
+        with pytest.raises(ValueError, match="attempt differs"):
+            replace(fact, bundle_digest="b" * 64)
     finally:
         core.close(); deletion.close(); guard.close(); execution.close()

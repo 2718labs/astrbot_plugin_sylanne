@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import asdict
 
 from ..runtime_contracts import canonical_digest
+from ..runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from .contract import AuthorityUnavailable, identifier
 from .v2_worker_model_result_read_service import AuthorityV2WorkerModelResultReadService
 from .v2_worker_result_read_fact_contract import (
     WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+    WorkerResultReadFactRequestV2, WorkerResultReadFactV2,
 )
 
 
@@ -30,21 +32,26 @@ class AuthorityV2WorkerResultReadFactService:
         self._committer_subject = committer_subject
         self._committer_holder = committer_holder
 
-    def _require(self, credential, request: WorkerResultReadFactRequestV1):
-        if type(request) is not WorkerResultReadFactRequestV1:
+    def _require(self, credential, request):
+        if type(request) not in {WorkerResultReadFactRequestV1,
+                                 WorkerResultReadFactRequestV2}:
             raise AuthorityUnavailable("typed worker result fact request required")
         read = request.read_request
         write = request.write_permit
+        expected_operation_id = (
+            read.consumer_operation_id if type(request) is WorkerResultReadFactRequestV1
+            else domain_bundle_write_attempt_id_v1(
+                read.namespace, read.consumer_operation_id, request.bundle_digest))
         if (read.authority_namespace != self._reads._fences.namespace
                 or read.installation_id != self._reads._installation_id
                 or (write.subject, write.holder) !=
                    (self._committer_subject, self._committer_holder)
-                or write.operation_id != read.consumer_operation_id):
+                or write.operation_id != expected_operation_id):
             raise AuthorityUnavailable("C02 committer or operation differs")
         self._reads._fences.core._require(
             credential, "write", read.authority_namespace, self._committer_holder)
 
-    def _snapshot(self, request: WorkerResultReadFactRequestV1):
+    def _snapshot(self, request):
         reads = self._reads
         fences = reads._fences
         original = request.read_request
@@ -83,16 +90,31 @@ class AuthorityV2WorkerResultReadFactService:
                 raise AuthorityUnavailable("worker result handoff is not finished")
             intent, receipt, _ = reads._terminal_locked(
                 db, original, anchor, content=False)
-            fact = WorkerResultReadFactV1(
+            fact_fields = (
                 original, original.digest, read_permit, attempt.permit_digest,
                 finish_id, finish_digest, attempt.result_digest,
                 canonical_digest(asdict(intent)), receipt, write,
                 canonical_digest(asdict(write)))
+            fact = (WorkerResultReadFactV1(*fact_fields)
+                    if type(request) is WorkerResultReadFactRequestV1
+                    else WorkerResultReadFactV2(*fact_fields, request.bundle_digest))
             return intent, fact
 
     def current(self, *, credential,
                 request: WorkerResultReadFactRequestV1) -> WorkerResultReadFactV1:
         """Fail closed unless both Authority snapshots and the graph agree."""
+        if type(request) is not WorkerResultReadFactRequestV1:
+            raise AuthorityUnavailable("typed V1 worker result fact request required")
+        return self._current(credential=credential, request=request)
+
+    def current_v2(self, *, credential,
+                   request: WorkerResultReadFactRequestV2) -> WorkerResultReadFactV2:
+        """Issue a bundle-bound fact only for the active Graph write attempt."""
+        if type(request) is not WorkerResultReadFactRequestV2:
+            raise AuthorityUnavailable("typed V2 worker result fact request required")
+        return self._current(credential=credential, request=request)
+
+    def _current(self, *, credential, request):
         self._require(credential, request)
         intent, fact = self._snapshot(request)
         if self._reads._graph.current(

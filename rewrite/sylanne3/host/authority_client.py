@@ -24,6 +24,7 @@ from ..authority_service.v2_self_identity_contract import (
 )
 from ..authority_service.v2_worker_result_read_fact_contract import (
     WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+    WorkerResultReadFactRequestV2, WorkerResultReadFactV2,
 )
 from ..authority_service.v2_accounting_contract import (
     AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
@@ -32,6 +33,7 @@ from ..model_broker.broker import ModelCallRequest
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime.c02_cost_settlement import C02OriginalIntentLookupV1
+from ..runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from ..runtime_contracts import InstallationGrantV2
 
 
@@ -243,6 +245,9 @@ class AuthorityTransport(Protocol):
                                        *, namespace, current_request): ...
 
     async def worker_result_read_fact_v1(self, request, handshake, grant,
+                                         *, namespace, fact_request): ...
+
+    async def worker_result_read_fact_v2(self, request, handshake, grant,
                                          *, namespace, fact_request): ...
 
 
@@ -575,6 +580,32 @@ class AuthorityClient:
                     fact_request.read_request.consumer_operation_id)):
             raise RuntimeError("worker result fact differs from installed C02 fence")
         return await self._transport.worker_result_read_fact_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            fact_request=fact_request)
+
+    async def worker_result_read_fact_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        fact_request: WorkerResultReadFactRequestV2,
+    ) -> WorkerResultReadFactV2:
+        """Read the bundled C02 handoff fact under its exact graph write fence."""
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(fact_request) is not WorkerResultReadFactRequestV2
+                or (fact_request.read_request.authority_id,
+                    fact_request.read_request.authority_namespace,
+                    fact_request.read_request.namespace,
+                    fact_request.read_request.installation_id,
+                    fact_request.write_permit.subject,
+                    fact_request.write_permit.holder,
+                    fact_request.write_permit.operation_id) !=
+                   (grant.authority_id, policy.authority_namespace,
+                    policy.namespace, grant.installation_id,
+                    grant.subject, grant.administrator_holder,
+                    domain_bundle_write_attempt_id_v1(
+                        policy.namespace,
+                        fact_request.read_request.consumer_operation_id,
+                        fact_request.bundle_digest))):
+            raise RuntimeError("worker result fact differs from installed C02 fence")
+        return await self._transport.worker_result_read_fact_v2(
             request, handshake, grant, namespace=policy.authority_namespace,
             fact_request=fact_request)
 

@@ -43,6 +43,7 @@ from .runtime.jobs import (
     PersistentJob, acquire_job, cancel_job, create_job, get_job, plan_job_acquire,
 )
 from .runtime.d11_types import reconcile_runtime_write
+from .runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from .runtime.dispatch_admission import (
     DispatchAdmissionV1, DispatchAdmissionReceiptV1,
     check_receipts_against_specs, insert_admission, load_admission, load_request,
@@ -62,7 +63,7 @@ if TYPE_CHECKING:
     from .authority_service.v2_model_egress_contract import ModelEgressDraftV1
     from .authority_service.v2_owner_session import OwnerSessionLoginRequestV1
     from .authority_service.v2_worker_result_read_fact_contract import (
-        WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+        WorkerResultReadFactRequestV2, WorkerResultReadFactV2,
     )
     from .runtime.encoding_call_binding import EncodingCallBinding
     from .runtime.encoding_call_binding import CommittedEncodingBaselineV1
@@ -74,8 +75,8 @@ class WorkerResultReadFactPort(Protocol):
     """Installed Authority committer for a finished original worker read."""
 
     def current_worker_result_read_fact(
-        self, request: WorkerResultReadFactRequestV1,
-    ) -> WorkerResultReadFactV1: ...
+        self, request: WorkerResultReadFactRequestV2,
+    ) -> WorkerResultReadFactV2: ...
 
 
 @dataclass(frozen=True)
@@ -10052,11 +10053,8 @@ class GraphCoordinator:
                     or saved[4] != saved[2] + 1
                     or saved[5] != prior.invalidated_epochs[0].revision):
                 raise UnavailableGuard("D03 arrival replay receipt differs")
-            attempt_id = "graph-write-" + canonical_digest({
-                "namespace": list(namespace.as_tuple),
-                "operation_id": operation_id,
-                "bundle_digest": prior.operation_digest,
-            })[:48]
+            attempt_id = domain_bundle_write_attempt_id_v1(
+                namespace, operation_id, prior.operation_digest)
             permit = from_wire(json.loads(saved[1]))
             if (type(permit) is not FencePermitV2
                     or permit.operation_id != attempt_id
@@ -10362,10 +10360,8 @@ class GraphCoordinator:
         """Finish the frozen no-commit attempt before pricing a new operation."""
         store, port = self.__store, self.__content_fence_v2
         target = metadata.requirements
-        attempt_id = "graph-write-" + canonical_digest({
-            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
-            "bundle_digest": intent[0],
-        })[:48]
+        attempt_id = domain_bundle_write_attempt_id_v1(
+            namespace, operation_id, intent[0])
         if (intent[1] != attempt_id
                 or intent[2] != canonical_json(asdict(target))
                 or intent[3] != canonical_json(asdict(anchor))
@@ -11873,10 +11869,8 @@ class GraphCoordinator:
             permit = from_wire(json.loads(fence[1]))
         except (TypeError, ValueError) as exc:
             raise UnavailableGuard("C02 replay write permit is invalid") from exc
-        attempt_id = "graph-write-" + canonical_digest({
-            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
-            "bundle_digest": row[0],
-        })[:48]
+        attempt_id = domain_bundle_write_attempt_id_v1(
+            namespace, operation_id, row[0])
         if (type(permit) is not FencePermitV2 or permit.operation != "write"
                 or permit.operation_id != attempt_id
                 or permit.pinned_anchor != anchor or permit.holder != self.__holder
@@ -12168,10 +12162,8 @@ class GraphCoordinator:
         if (bundle.envelope.identity.phase == "first_ingress_c02") != (
                 c02_adoption is not None):
             raise UnavailableGuard("C02 requires its installed result adoption; HOLD")
-        attempt_id = "graph-write-" + canonical_digest({
-            "namespace": list(namespace.as_tuple), "operation_id": operation_id,
-            "bundle_digest": digest,
-        })[:48]
+        attempt_id = domain_bundle_write_attempt_id_v1(
+            namespace, operation_id, digest)
         with store._lock:
             metadata, epoch = self._v2_graph_stamp(namespace)
             prior = store._db.execute(
@@ -12388,15 +12380,18 @@ class GraphCoordinator:
         c02_fact = None
         if c02_adoption is not None:
             from .authority_service.v2_worker_result_read_fact_contract import (
-                WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+                WorkerResultReadFactRequestV2, WorkerResultReadFactV2,
             )
 
             read = c02_adoption[1]
             c02_fact = self.__worker_result_fact_port.current_worker_result_read_fact(
-                WorkerResultReadFactRequestV1(read.request, permit))
-            if (type(c02_fact) is not WorkerResultReadFactV1
+                WorkerResultReadFactRequestV2(
+                    read_request=read.request, write_permit=permit,
+                    bundle_digest=digest))
+            if (type(c02_fact) is not WorkerResultReadFactV2
                     or c02_fact.read_request != read.request
                     or c02_fact.write_permit != permit
+                    or c02_fact.bundle_digest != digest
                     or c02_fact.result_digest != canonical_digest(asdict(read))):
                 raise UnavailableGuard("original Authority worker result fact differs; HOLD")
         transaction_state = {"phase": "before_transaction"}

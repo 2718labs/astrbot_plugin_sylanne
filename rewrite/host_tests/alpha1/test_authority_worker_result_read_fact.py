@@ -14,9 +14,10 @@ from sylanne3.authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1,
 )
 from sylanne3.authority_service.v2_worker_result_read_fact_contract import (
-    WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+    WorkerResultReadFactRequestV2, WorkerResultReadFactV2,
     to_wire as worker_fact_to_wire,
 )
+from sylanne3.runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from sylanne3.host.mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 from sylanne3.host.worker_result_read_fact_port import InstalledWorkerResultReadFactPort
 from sylanne3.runtime_contracts import canonical_digest
@@ -44,17 +45,22 @@ async def test_worker_fact_uses_original_handoff_and_installed_write_fence(tmp_p
             grant.installation_id, "job-1", "acquire-1", "reserve-1",
             "call-1", "a" * 64, "b" * 64, "consumer-1", "read-1",
         )
+        bundle_digest = "9" * 64
+        write_attempt_id = domain_bundle_write_attempt_id_v1(
+            policy.namespace, read_request.consumer_operation_id, bundle_digest)
         write = FencePermitV2(
             grant.authority_id, policy.authority_namespace, grant.subject,
             grant.administrator_holder, 1, "write",
-            read_request.consumer_operation_id, "c" * 64, 1, 1, anchor,
+            write_attempt_id, "c" * 64, 1, 1, anchor,
         )
         read = FencePermitV2(
             grant.authority_id, policy.authority_namespace, grant.subject,
             grant.administrator_holder, 1, "read",
             read_request.read_attempt_id, "d" * 64, 1, 1, anchor,
         )
-        fact_request = WorkerResultReadFactRequestV1(read_request, write)
+        fact_request = WorkerResultReadFactRequestV2(
+            read_request=read_request, write_permit=write,
+            bundle_digest=bundle_digest)
         finish_key = canonical_digest({
             "request": asdict(read_request), "permit": asdict(read),
         })
@@ -63,16 +69,18 @@ async def test_worker_fact_uses_original_handoff_and_installed_write_fence(tmp_p
             read_request.model_request_digest, "e" * 64, "f" * 64,
             "sha256:" + "a" * 64, grant.installation_id, "d" * 64,
         )
-        fact = WorkerResultReadFactV1(
-            read_request, read_request.digest, read,
-            canonical_digest(asdict(read)),
-            "worker-result-finish:" + finish_key,
-            "sha256:" + canonical_digest({
+        fact = WorkerResultReadFactV2(
+            read_request=read_request, read_request_digest=read_request.digest,
+            read_permit=read, read_permit_digest=canonical_digest(asdict(read)),
+            read_finish_request_id="worker-result-finish:" + finish_key,
+            read_finish_request_digest="sha256:" + canonical_digest({
                 "action": "finish_worker_result_read",
                 "request": asdict(read_request), "permit": asdict(read),
             }),
-            "b" * 64, "c" * 64, terminal, write,
-            canonical_digest(asdict(write)),
+            result_digest="b" * 64, original_intent_digest="c" * 64,
+            terminal_receipt=terminal, write_permit=write,
+            write_permit_digest=canonical_digest(asdict(write)),
+            bundle_digest=bundle_digest,
         )
         transport = MtlsAuthorityTransport({profile.profile_id: profile})
         sent = []
@@ -98,15 +106,17 @@ async def test_worker_fact_uses_original_handoff_and_installed_write_fence(tmp_p
             port.current_worker_result_read_fact, fact_request,
         ) == fact
         assert sent == [(
-            "worker_result_read_fact_v1",
+            "worker_result_read_fact_v2",
             {"namespace": policy.authority_namespace,
              "fact_request": worker_fact_to_wire(fact_request)},
             "sylanne3.authority.v2",
         )]
         with pytest.raises(RuntimeError, match="installed C02 fence"):
-            await client.worker_result_read_fact_v1(
-                bundle, grant, fact_request=WorkerResultReadFactRequestV1(
-                    read_request, replace(write, subject="other")),
+            await client.worker_result_read_fact_v2(
+                bundle, grant, fact_request=WorkerResultReadFactRequestV2(
+                    read_request=read_request,
+                    write_permit=replace(write, subject="other"),
+                    bundle_digest=bundle_digest),
             )
         assert len(sent) == 1 and host.requests == []
     finally:

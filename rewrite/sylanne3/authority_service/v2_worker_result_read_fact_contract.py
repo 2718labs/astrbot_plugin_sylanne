@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, fields
 import re
 
 from ..runtime_contracts import canonical_digest
+from ..runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from .v2_contract import FencePermitV2, from_wire as fence_from_wire, to_wire as fence_to_wire
 from .v2_model_egress_contract import ModelTerminalReceiptV2
 from .v2_worker_model_result_contract import (
@@ -20,6 +21,7 @@ from .v2_worker_model_result_contract import (
 
 
 SCHEMA = "sylanne3.authority.worker-result-read-fact.v1"
+SCHEMA_V2 = "sylanne3.authority.worker-result-read-fact.v2"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -108,19 +110,75 @@ class WorkerResultReadFactV1:
             raise ValueError("worker read fact digest or finish identity differs")
 
 
-def to_wire(value: WorkerResultReadFactRequestV1 | WorkerResultReadFactV1) -> dict:
-    if type(value) not in {WorkerResultReadFactRequestV1, WorkerResultReadFactV1}:
+@dataclass(frozen=True, slots=True)
+class WorkerResultReadFactRequestV2:
+    """Bind an original handoff to one specific domain bundle graph write."""
+
+    read_request: WorkerModelResultReadRequestV1
+    write_permit: FencePermitV2
+    bundle_digest: str
+    schema: str = SCHEMA_V2
+
+    def __post_init__(self) -> None:
+        if self.schema != SCHEMA_V2:
+            raise ValueError("unknown worker read fact schema")
+        _digest(self.bundle_digest, "bundle_digest")
+        # Retain every V1 identity check, then bind the Graph attempt.
+        WorkerResultReadFactRequestV1(self.read_request, self.write_permit)
+        if self.write_permit.operation_id != domain_bundle_write_attempt_id_v1(
+                self.read_request.namespace,
+                self.read_request.consumer_operation_id, self.bundle_digest):
+            raise ValueError("C02 graph write attempt differs")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerResultReadFactV2:
+    read_request: WorkerModelResultReadRequestV1
+    read_request_digest: str
+    read_permit: FencePermitV2
+    read_permit_digest: str
+    read_finish_request_id: str
+    read_finish_request_digest: str
+    result_digest: str
+    original_intent_digest: str
+    terminal_receipt: ModelTerminalReceiptV2
+    write_permit: FencePermitV2
+    write_permit_digest: str
+    bundle_digest: str
+    schema: str = SCHEMA_V2
+
+    def __post_init__(self) -> None:
+        if self.schema != SCHEMA_V2:
+            raise ValueError("unknown worker read fact schema")
+        _digest(self.bundle_digest, "bundle_digest")
+        WorkerResultReadFactV1(
+            self.read_request, self.read_request_digest,
+            self.read_permit, self.read_permit_digest,
+            self.read_finish_request_id, self.read_finish_request_digest,
+            self.result_digest, self.original_intent_digest,
+            self.terminal_receipt, self.write_permit, self.write_permit_digest)
+        if self.write_permit.operation_id != domain_bundle_write_attempt_id_v1(
+                self.read_request.namespace,
+                self.read_request.consumer_operation_id, self.bundle_digest):
+            raise ValueError("C02 graph write attempt differs")
+
+
+def to_wire(value: WorkerResultReadFactRequestV1 | WorkerResultReadFactV1 |
+            WorkerResultReadFactRequestV2 | WorkerResultReadFactV2) -> dict:
+    if type(value) not in {WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+                           WorkerResultReadFactRequestV2, WorkerResultReadFactV2}:
         raise TypeError("typed worker read fact required")
     result = asdict(value)
     result["read_request"] = read_to_wire(value.read_request)
     result["write_permit"] = fence_to_wire(value.write_permit)
-    if type(value) is WorkerResultReadFactV1:
+    if type(value) in {WorkerResultReadFactV1, WorkerResultReadFactV2}:
         result["read_permit"] = fence_to_wire(value.read_permit)
     return result
 
 
 def from_wire(raw: object, kind: type):
-    if kind not in {WorkerResultReadFactRequestV1, WorkerResultReadFactV1}:
+    if kind not in {WorkerResultReadFactRequestV1, WorkerResultReadFactV1,
+                    WorkerResultReadFactRequestV2, WorkerResultReadFactV2}:
         raise TypeError("typed worker read fact kind required")
     if type(raw) is not dict or set(raw) != {field.name for field in fields(kind)}:
         raise ValueError("worker read fact wire fields differ")
@@ -128,7 +186,7 @@ def from_wire(raw: object, kind: type):
     data["read_request"] = read_from_wire(
         data["read_request"], WorkerModelResultReadRequestV1)
     data["write_permit"] = fence_from_wire(data["write_permit"])
-    if kind is WorkerResultReadFactV1:
+    if kind in {WorkerResultReadFactV1, WorkerResultReadFactV2}:
         data["read_permit"] = fence_from_wire(data["read_permit"])
         receipt = data["terminal_receipt"]
         if (type(receipt) is not dict
@@ -142,6 +200,8 @@ def from_wire(raw: object, kind: type):
 
 
 __all__ = (
-    "SCHEMA", "WorkerResultReadFactRequestV1", "WorkerResultReadFactV1",
+    "SCHEMA", "SCHEMA_V2", "WorkerResultReadFactRequestV1",
+    "WorkerResultReadFactV1", "WorkerResultReadFactRequestV2",
+    "WorkerResultReadFactV2",
     "to_wire", "from_wire",
 )

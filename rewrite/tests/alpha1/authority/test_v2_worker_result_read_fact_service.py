@@ -7,14 +7,15 @@ import pytest
 from rewrite.tests.alpha1.authority.test_v2_worker_result_read_service import _case
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.v2_worker_result_read_fact_contract import (
-    WorkerResultReadFactRequestV1,
+    WorkerResultReadFactRequestV1, WorkerResultReadFactRequestV2,
 )
 from sylanne3.authority_service.v2_worker_result_read_fact_service import (
     AuthorityV2WorkerResultReadFactService,
 )
+from sylanne3.runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 
 
-def _finished(tmp_path, monkeypatch):
+def _finished(tmp_path, monkeypatch, bundle_digest=None):
     reads, read_request, core, deletion, guard, execution = _case(
         tmp_path, monkeypatch)
     delivery = reads.prepare(credential="ok", request=read_request)
@@ -22,13 +23,62 @@ def _finished(tmp_path, monkeypatch):
     anchor = reads._fences.current_anchor(credential="ok", subject="worker-a")
     write = reads._fences.begin_fence(
         credential="ok", subject="committer-a", holder="holder-a",
-        operation="write", operation_id=read_request.consumer_operation_id,
+        operation="write", operation_id=(
+            domain_bundle_write_attempt_id_v1(
+                read_request.namespace, read_request.consumer_operation_id,
+                bundle_digest) if bundle_digest is not None
+            else read_request.consumer_operation_id),
         expected_anchor=anchor)
     service = AuthorityV2WorkerResultReadFactService(
         worker_reads=reads, committer_subject="committer-a",
         committer_holder="holder-a")
     return (service, WorkerResultReadFactRequestV1(read_request, write),
             reads, core, deletion, guard, execution)
+
+
+def test_v2_fact_binds_live_graph_write_to_bundle(tmp_path, monkeypatch):
+    digest = "a" * 64
+    service, legacy, reads, core, deletion, guard, execution = _finished(
+        tmp_path, monkeypatch, digest)
+    request = WorkerResultReadFactRequestV2(
+        legacy.read_request, legacy.write_permit, digest)
+    try:
+        fact = service.current_v2(credential="ok", request=request)
+        assert fact.bundle_digest == digest
+        assert fact.write_permit.operation_id == domain_bundle_write_attempt_id_v1(
+            request.read_request.namespace,
+            request.read_request.consumer_operation_id, digest)
+    finally:
+        core.close(); deletion.close(); guard.close(); execution.close()
+
+
+def test_v2_fact_rejects_rebound_digest_consumer_namespace_and_committer(
+        tmp_path, monkeypatch):
+    digest = "a" * 64
+    service, legacy, reads, core, deletion, guard, execution = _finished(
+        tmp_path, monkeypatch, digest)
+    request = WorkerResultReadFactRequestV2(
+        legacy.read_request, legacy.write_permit, digest)
+    try:
+        for changed in (
+            {"bundle_digest": "b" * 64},
+            {"read_request": replace(
+                request.read_request, consumer_operation_id="other-consumer")},
+            {"read_request": replace(
+                request.read_request,
+                namespace=type(request.read_request.namespace)("other-bot", "persona-a"))},
+        ):
+            with pytest.raises(ValueError, match="attempt differs"):
+                replace(request, **changed)
+        for changed in (
+            {"subject": "other-committer"}, {"holder": "other-holder"},
+        ):
+            bad = replace(request, write_permit=replace(
+                request.write_permit, **changed))
+            with pytest.raises(AuthorityUnavailable):
+                service.current_v2(credential="ok", request=bad)
+    finally:
+        core.close(); deletion.close(); guard.close(); execution.close()
 
 
 def test_fact_from_finished_attempt_and_original_terminal(tmp_path, monkeypatch):
