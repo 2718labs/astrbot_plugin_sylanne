@@ -8,10 +8,11 @@ into business authorization.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from typing import Awaitable, Callable, Protocol
 
 from astrbot.api.star import Context
@@ -29,13 +30,19 @@ from .current_scene import verify_current_host_scene
 from .scene_candidates import ObservedSceneCandidate
 
 from ..authority_service.v2_contract import (
-    ExecutionBindingV2, PlatformObservationV2,
+    ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
+    PlatformObservationV2,
     canonical_digest as authority_digest,
 )
 from ..authority_service.v2_execution_bridge import (
-    HandoffStartV2, handoff_start_digest_v2,
+    CurrentEffectReadV2, HandoffStartV2, handoff_start_digest_v2,
 )
 from ..host.reverse_handoff import HandoffDecisionWindow
+from ..host.authority_profile import AdminIngressClockPolicy
+from ..host.v2_fence_port import VerifiedIngressClockV2
+from ..runtime.first_ingress_v2 import trusted_upper
+from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime_contracts import canonical_digest
 from .scene_candidates import SceneCandidateCatalog
 
 
@@ -88,6 +95,25 @@ class AstrBotTextPlatformCapability:
         raise DispatchUnavailable("V1 AstrBot handoff is retired; use fresh V2 handoff")
 
 
+@dataclass(frozen=True, slots=True)
+class CurrentDispatchHandoffReadV1:
+    """One Authority transaction's current P2, anchor and effect snapshot."""
+
+    permit: FencePermitV2
+    anchor: RestoreAnchor
+    effect: CurrentEffectReadV2
+
+
+class CurrentDispatchHandoffPort(Protocol):
+    def read_current_dispatch_handoff(
+        self, start: HandoffStartV2, claimed_receipt: MutationReceiptV2,
+    ) -> CurrentDispatchHandoffReadV1: ...
+
+    def read_ingress_clock(
+        self, policy: AdminIngressClockPolicy,
+    ) -> VerifiedIngressClockV2: ...
+
+
 class AstrBotV2TextSender:
     """One OneBot send inside a fresh V2 handoff decision window.
 
@@ -98,23 +124,37 @@ class AstrBotV2TextSender:
 
     def __init__(self, *, context: Context, candidates: SceneCandidateCatalog,
                  resolver: TextPayloadResolver,
+                 authority: CurrentDispatchHandoffPort,
+                 clock_policy: AdminIngressClockPolicy,
                  record_observation: Callable[
-                     [HandoffStartV2, PlatformObservationV2], Awaitable[object]]) -> None:
+                     [HandoffStartV2, PlatformObservationV2], Awaitable[object]],
+                 send_timeout_seconds: float = 30.0) -> None:
         if (not isinstance(context, Context)
                 or not isinstance(candidates, SceneCandidateCatalog)
                 or not callable(getattr(resolver, "resolve", None))
+                or not callable(getattr(authority, "read_current_dispatch_handoff", None))
+                or not callable(getattr(authority, "read_ingress_clock", None))
+                or type(clock_policy) is not AdminIngressClockPolicy
+                or type(send_timeout_seconds) not in (int, float)
+                or not math.isfinite(send_timeout_seconds)
+                or not 0 < send_timeout_seconds <= 120
                 or not callable(record_observation)):
-            raise DispatchUnavailable("V2 sender requires graph resolver and Authority observation writer")
+            raise DispatchUnavailable("V2 sender requires current Authority, clock and observation ports")
         self._context = context
         self._candidates = candidates
         self._resolver = resolver
+        self._authority = authority
+        self._clock_policy = clock_policy
         self._record_observation = record_observation
+        self._send_timeout_seconds = float(send_timeout_seconds)
 
     async def send(self, *, decision: HandoffDecisionWindow,
                    binding: ExecutionBindingV2,
+                   claimed_receipt: MutationReceiptV2,
                    request: DispatchRequest) -> PlatformObservationV2:
         if (type(decision) is not HandoffDecisionWindow
                 or type(binding) is not ExecutionBindingV2
+                or type(claimed_receipt) is not MutationReceiptV2
                 or type(request) is not DispatchRequest):
             raise DispatchBlocked("typed fresh V2 handoff, binding and command required")
         origin = binding.origin
@@ -193,13 +233,18 @@ class AstrBotV2TextSender:
                 or (start.namespace, start.operation_id, start.effect_id)
                    != (binding.namespace, request.operation_id, request.effect_id)
                 or start.binding_digest != authority_digest(binding)
+                or start.claim_digest != authority_digest(claimed_receipt)
+                or claimed_receipt.pending.binding != binding
+                or claimed_receipt.pending.phase != "claimed"
+                or claimed_receipt.durable_state != "committed"
                 or start.graph_claim_ref != graph_receipt.graph_claim_ref
                 or graph_receipt.graph_namespace != binding.graph_namespace
                 or graph_receipt.graph_incarnation != binding.graph_incarnation):
             raise DispatchBlocked("fresh Authority start or committed graph claim differs")
-        deadline = datetime.fromisoformat(binding.utc_deadline.replace("Z", "+00:00"))
-        if datetime.now(timezone.utc) >= deadline:
-            raise DispatchBlocked("fresh handoff deadline expired before external send")
+        if (binding.clock_policy_ref != self._clock_policy.source_id
+                or binding.clock_policy_digest != "sha256:" + canonical_digest(
+                    asdict(self._clock_policy))):
+            raise DispatchBlocked("installed Authority clock policy differs")
         original_permit = binding.origin.permit
         if (start.permit.authority_id != original_permit.authority_id
                 or start.permit.token != original_permit.token
@@ -212,6 +257,43 @@ class AstrBotV2TextSender:
                 or start.permit.footprint_digest != original_permit.footprint_digest):
             raise DispatchBlocked("fresh start differs from original dispatch permit")
 
+        # This read must be one Authority transaction, not three independently
+        # sampled heads. No send occurs if the installed port is missing.
+        current = await asyncio.to_thread(
+            self._authority.read_current_dispatch_handoff, start, claimed_receipt)
+        if (type(current) is not CurrentDispatchHandoffReadV1
+                or current.permit != start.permit
+                or current.anchor != start.permit.pinned_anchor
+                or type(current.effect) is not CurrentEffectReadV2
+                or current.effect.authority_id != start.permit.authority_id
+                or current.effect.namespace != start.namespace
+                or current.effect.effect_id != start.effect_id
+                or current.effect.activation_generation != start.permit.generation
+                or current.effect.state != "unresolved"
+                or current.effect.mutation_id != claimed_receipt.pending.mutation_id
+                or current.effect.effect_seq != current.anchor.execution_seq
+                or current.effect.append_digest != current.anchor.execution_digest
+                or (current.effect.execution_head_seq,
+                    current.effect.execution_head_digest) != (
+                    current.anchor.execution_seq,
+                    current.anchor.execution_digest)):
+            raise DispatchBlocked("current P2, Owner or effect state differs")
+        clock = await asyncio.to_thread(
+            self._authority.read_ingress_clock, self._clock_policy)
+        if (type(clock) is not VerifiedIngressClockV2
+                or clock.sample.source_id != self._clock_policy.source_id
+                or clock.sample.authority_id != start.permit.authority_id
+                or clock.sample.utc_error_seconds
+                   > self._clock_policy.max_utc_error_seconds
+                or clock.monotonic_after_seconds < clock.monotonic_before_seconds
+                or clock.monotonic_after_seconds - clock.monotonic_before_seconds
+                   > self._clock_policy.max_round_trip_seconds):
+            raise DispatchBlocked("current Authority clock sample is unqualified")
+        deadline = datetime.fromisoformat(
+            binding.utc_deadline.replace("Z", "+00:00")).timestamp()
+        if trusted_upper(clock) >= deadline:
+            raise DispatchBlocked("fresh handoff deadline expired before external send")
+
         action = ("send_group_msg" if visibility == "group"
                   else "send_private_msg")
         destination = "group_id" if visibility == "group" else "user_id"
@@ -221,11 +303,12 @@ class AstrBotV2TextSender:
                 **{destination: int(session.session_id)},
                 message=[{"type": "text", "data": {"text": body}}])
 
-        # Shield keeps cancellation from stopping an already issued call and
-        # then incorrectly claiming that no external effect was possible.
-        task = asyncio.create_task(call_onebot())
+        # Run in this task so cancellation cannot leave our own send task
+        # running after the decision window closes. asyncio.timeout cancels
+        # and awaits this coroutine's termination before returning.
         try:
-            receipt = await asyncio.shield(task)
+            async with asyncio.timeout(self._send_timeout_seconds):
+                receipt = await call_onebot()
             message_id = (receipt.get("message_id")
                           if isinstance(receipt, dict) else None)
             accepted = type(message_id) is int and message_id > 0
@@ -243,8 +326,9 @@ class AstrBotV2TextSender:
             platform_message_id=(str(message_id) if accepted else None),
             evidence_source_ref="astrbot:onebot:call_action",
             outcome="accepted" if accepted else "unknown",
-            observed_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            time_source_ref="host:system_utc",
+            observed_at_utc=datetime.fromtimestamp(
+                trusted_upper(clock), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            time_source_ref=self._clock_policy.source_id,
         )
         try:
             await self._record_observation(start, observation)
@@ -258,4 +342,5 @@ class AstrBotV2TextSender:
 __all__ = (
     "AstrBotTextPlatformCapability", "GraphTextPayloadResolver",
     "ResolvedTextPayload", "TextPayloadResolver", "AstrBotV2TextSender",
+    "CurrentDispatchHandoffReadV1", "CurrentDispatchHandoffPort",
 )
