@@ -82,10 +82,15 @@ def test_candidate_assembles_one_atomic_bundle_without_admission():
     assert candidate.evidence.status == "source_hold"
     assert tuple(item.domain for item in candidate.bundle.proposals) == ("d08", "d09")
     assert "d08.current_execution_and_cancellation" in candidate.missing_for_admission
-    assert len(candidate.bundle.proposals[0].typed_writes) == 3
+    assert len(candidate.bundle.proposals[0].typed_writes) == 4
     assert len(candidate.bundle.proposals[1].typed_writes) == 1
-    assert candidate.bundle.proposals[0].envelope is envelope
-    assert candidate.bundle.proposals[1].envelope is envelope
+    current = candidate.bundle.envelope
+    assert candidate.bundle.proposals[0].envelope is current
+    assert candidate.bundle.proposals[1].envelope is current
+    state = candidate.bundle.proposals[0].typed_writes[2]
+    assert state.key.type_name == "d08.action_cancellation.v1"
+    assert (state.value["state"], state.value["cancel_epoch"]) == ("active", 0)
+    assert GraphVersion(state.key, 0) in current.version_guard.read_versions
 
 
 def test_reactive_assembly_rejects_missing_source_and_changed_segment():

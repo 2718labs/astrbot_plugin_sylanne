@@ -140,9 +140,11 @@ def _install_action_cancel_head(db, namespace, snapshot, intent, *, cancelled=Fa
                               operation_id="operation:cancel-action"))
     for revision, state in enumerate(values, 1):
         encoded = canonical_json(json.loads(json.dumps(asdict(state))))
-        reads = canonical_json([[action_key.token, intent.revision],
+        reads = canonical_json([[action_key.token, 0 if revision == 1 else intent.revision],
                                 [key.token, revision - 1]])
-        revisions = canonical_json([[key.token, revision]])
+        revisions = canonical_json(([[action_key.token, intent.revision]]
+                                    if revision == 1 else [])
+                                   + [[key.token, revision]])
         db.execute("INSERT INTO graph_events VALUES(?,?,?,?,?,?,?)", (
             *namespace.as_tuple, intent.identity.activity_id, state.operation_id,
             reads, revisions, 5,

@@ -143,8 +143,14 @@ def _current_action_cancellation(
             revisions = {tuple(item) for item in json.loads(event[1])}
         except (TypeError, ValueError):
             return None
+        action_binding = (
+            (action_key.token, 0) in reads
+            and (action_key.token, intent.revision) in revisions
+            if version == 1 else
+            (action_key.token, intent.revision) in reads
+        )
         if ((token, version) not in revisions
-                or (action_key.token, intent.revision) not in reads
+                or not action_binding
                 or (token, version - 1) not in reads):
             return None
         return row

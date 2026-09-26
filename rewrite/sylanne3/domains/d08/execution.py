@@ -1350,9 +1350,13 @@ class GoalExecutionProvider:
                               if item.key.type_name == "d08.action_intent.v1")
         schema_writes = tuple(item for item in proposal.typed_writes
                               if item.key.type_name == "d08.action_schema.v1")
+        cancellation_writes = tuple(item for item in proposal.typed_writes
+                                    if item.key.type_name == "d08.action_cancellation.v1")
         if action_writes or schema_writes:
             if len(action_writes) != 1 or len(schema_writes) != 1:
                 raise ValueError("an action proposal requires exactly one intent and one frozen schema")
+            if len(cancellation_writes) != 1:
+                raise ValueError("an action proposal requires its initial cancellation state")
             intent = _decode_intent(action_writes[0].value)
             binding = _decode_action_schema(schema_writes[0].value)
             schema = ActionSchema(
@@ -1372,11 +1376,9 @@ class GoalExecutionProvider:
                 or action_writes[0].key.owner != schema_writes[0].key.owner
             ):
                 raise ValueError("action intent and frozen schema are not bound to this exact operation")
-        cancellation_writes = tuple(item for item in proposal.typed_writes
-                                    if item.key.type_name == "d08.action_cancellation.v1")
         if cancellation_writes:
-            if len(cancellation_writes) != 1 or not isinstance(snapshot, GraphSnapshot):
-                raise ValueError("cancellation requires one write and a current graph snapshot")
+            if len(cancellation_writes) != 1:
+                raise ValueError("cancellation requires exactly one state write")
             write = cancellation_writes[0]
             state = _decode("d08.action_cancellation.v1", write.value)
             namespace = proposal.envelope.authority.namespace
@@ -1385,11 +1387,17 @@ class GoalExecutionProvider:
                 "d08.action_intent.v1", state.action_id,
             )
             state_key = AtomKey(action_key.owner, "d08.action_cancellation.v1", state.action_id)
-            action_atom = snapshot.get(action_key)
-            previous_atom = snapshot.get(state_key)
+            action_atom = snapshot.get(action_key) if isinstance(snapshot, GraphSnapshot) else None
+            previous_atom = snapshot.get(state_key) if isinstance(snapshot, GraphSnapshot) else None
+            if action_atom is not None and not action_atom.valid and action_atom.revision == 0:
+                action_atom = None
+            if previous_atom is not None and not previous_atom.valid and previous_atom.revision == 0:
+                previous_atom = None
             guards = {item.key: item.revision for item in proposal.envelope.version_guard.read_versions}
-            if (write.key != state_key or action_atom is None or not action_atom.valid
-                    or guards.get(action_key) != action_atom.revision
+            same_bundle = bool(action_writes)
+            if (write.key != state_key
+                    or (not same_bundle and (action_atom is None or not action_atom.valid))
+                    or guards.get(action_key) != (0 if same_bundle else action_atom.revision)
                     or guards.get(state_key) != (previous_atom.revision if previous_atom else 0)
                     or len(guards) != len(proposal.envelope.version_guard.read_versions)
                     or proposal.envelope.identity.activity_id != state.activity_id
@@ -1398,17 +1406,28 @@ class GoalExecutionProvider:
                     or proposal.envelope.identity.operation_id != state.operation_id
                     or proposal.envelope.source_qualification.source_refs != state.source_refs):
                 raise ValueError("cancellation is not bound to guarded action and source identity")
-            action = _decode_intent(action_atom.value)
-            if (action_atom.revision != state.action_revision
+            if same_bundle:
+                if (state.state != "active" or state.cancel_epoch != 0
+                        or previous_atom is not None
+                        or (action_atom is not None and action_atom.valid)
+                        or action_writes[0].key != action_key):
+                    raise ValueError("same-bundle cancellation must initialize an absent action")
+                action = _decode_intent(action_writes[0].value)
+            else:
+                if not isinstance(snapshot, GraphSnapshot):
+                    raise ValueError("cancellation transition requires a current graph snapshot")
+                action = _decode_intent(action_atom.value)
+            if ((not same_bundle and action_atom.revision != state.action_revision)
                     or action.revision != state.action_revision
                     or canonical_digest(action) != state.action_digest
                     or action.identity.activity_id != state.activity_id
                     or action.identity.attempt_id != state.attempt_id
-                    or action.identity.effect_id != state.effect_id):
+                    or action.identity.effect_id != state.effect_id
+                    or action.source_refs != state.source_refs):
                 raise ValueError("cancellation targets a stale action attempt")
             if previous_atom is None:
-                if state.state != "active" or state.cancel_epoch != 0:
-                    raise ValueError("initial cancellation state must be active@0")
+                if not same_bundle:
+                    raise ValueError("initial cancellation state requires the action bundle")
             else:
                 if not previous_atom.valid:
                     raise ValueError("invalid cancellation state cannot be replaced")
@@ -1429,8 +1448,8 @@ class GoalExecutionProvider:
         *, state: str,
     ) -> DomainProposal:
         """Construct a guarded candidate; W01 must authorize and atomically commit it."""
-        if state not in {"active", "cancelled"}:
-            raise ValueError("unsupported cancellation transition")
+        if state != "cancelled":
+            raise ValueError("initial active state requires the action candidate")
         namespace = proposal.envelope.authority.namespace
         owner = Owner("activity", namespace.bot_id, namespace.persona_id,
                       action.identity.activity_id)
@@ -1446,17 +1465,18 @@ class GoalExecutionProvider:
     def prepare_action_candidate(
         self, proposal: DomainProposal, intent: ActionIntent, schema: ActionSchema,
     ) -> DomainProposal:
-        """Add the immutable per-action schema beside its intent candidate.
+        """Add the immutable schema and initial cancellation state beside an action.
 
-        This is pure proposal assembly. The graph writer must commit both
-        writes in the same operation and repeat the same checks at commit time.
+        This is pure proposal assembly. W01 must bind all three graph writes
+        to the admission and job in one transaction before dispatch.
         """
         if not isinstance(proposal, DomainProposal):
             raise TypeError("proposal must be DomainProposal")
         _validate_action_schema(intent, schema)
         if proposal.envelope.identity != intent.identity:
             raise ValueError("proposal and action intent must share one exact operation identity")
-        if any(write.key.type_name in {"d08.action_intent.v1", "d08.action_schema.v1"}
+        if any(write.key.type_name in {"d08.action_intent.v1", "d08.action_schema.v1",
+                                       "d08.action_cancellation.v1"}
                for write in proposal.typed_writes):
             raise ValueError("proposal already contains an action intent or schema")
 
@@ -1465,11 +1485,26 @@ class GoalExecutionProvider:
         binding = ActionSchemaRecord.bind(intent, schema)
         action_key = AtomKey(owner, "d08.action_intent.v1", intent.action_id)
         schema_key = AtomKey(owner, "d08.action_schema.v1", binding.schema_ref)
+        state_key = AtomKey(owner, "d08.action_cancellation.v1", intent.action_id)
+        initial = ActionCancellationState.for_action(
+            intent, state="active", actor=proposal.envelope.authority.actor,
+            source_refs=proposal.envelope.source_qualification.source_refs,
+            operation_id=proposal.envelope.identity.operation_id,
+        )
         writes = proposal.typed_writes + (
             GraphWrite(action_key, json.loads(canonical_serialize(asdict(intent)))),
             GraphWrite(schema_key, json.loads(canonical_serialize(asdict(binding)))),
+            GraphWrite(state_key, json.loads(canonical_serialize(asdict(initial)))),
         )
-        return self.validate(replace(proposal, typed_writes=writes))
+        guard = proposal.envelope.version_guard
+        reads = {item.key: item.revision for item in guard.read_versions}
+        if any(reads.get(key, 0) != 0 for key in (action_key, schema_key, state_key)):
+            raise ValueError("new action, schema and cancellation heads require absent reads")
+        extra = tuple(GraphVersion(key, 0) for key in (action_key, schema_key, state_key)
+                      if key not in reads)
+        envelope = replace(proposal.envelope, version_guard=replace(
+            guard, read_versions=guard.read_versions + extra))
+        return self.validate(replace(proposal, envelope=envelope, typed_writes=writes))
 
     def provide_required_check(
         self, intent: ActionIntent, schema: ActionSchema, snapshot: CommitmentConflictSnapshot,

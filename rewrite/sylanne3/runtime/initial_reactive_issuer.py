@@ -6,17 +6,17 @@ dispatch admission or interprets a caller supplied check receipt as authority.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import math
 
 from ..domains.d08 import (
-    ActionIntent, ActionSchema, ActionSchemaRecord, CommunicationIntentGrant,
+    ActionCancellationState, ActionIntent, ActionSchema, ActionSchemaRecord, CommunicationIntentGrant,
     GoalExecutionProvider,
 )
 from ..domains.d09 import (
     D09ExpressionProvider, ExpressionBlueprint, SegmentCandidate,
 )
-from ..graph_types import AtomKey, GraphWrite, Owner
+from ..graph_types import AtomKey, GraphVersion, GraphWrite, Owner
 from ..runtime_contracts import (
     CommandEnvelope, DependencySet, DomainBundle, DomainProposal, QueryEpoch,
 )
@@ -99,9 +99,23 @@ def assemble_initial_reactive_candidate(
         grant, blueprint, segments, now=now_utc,
     )
     owner = Owner("activity", *namespace.as_tuple, intent.identity.activity_id)
+    initial = ActionCancellationState.for_action(
+        intent, state="active", actor=envelope.authority.actor,
+        source_refs=envelope.source_qualification.source_refs,
+        operation_id=intent.identity.operation_id,
+    )
+    state_key = AtomKey(owner, "d08.action_cancellation.v1", intent.action_id)
+    state_reads = tuple(item.revision for item in guard.read_versions
+                        if item.key == state_key)
+    if state_reads not in {(), (0,)}:
+        raise ValueError("initial action cancellation requires an absent graph head")
+    if not state_reads:
+        guard = replace(guard, read_versions=guard.read_versions + (GraphVersion(state_key, 0),))
+        envelope = replace(envelope, version_guard=guard)
     values = (
         ("d08.action_intent.v1", intent.action_id, intent),
         ("d08.action_schema.v1", schema.schema_ref, schema),
+        ("d08.action_cancellation.v1", intent.action_id, initial),
         ("d08.communication_intent_grant.v1", grant.grant_id, grant),
         ("d09.verified_segment_batch.v1", batch["batch_id"], batch),
     )
@@ -113,17 +127,17 @@ def assemble_initial_reactive_candidate(
     d09_provider = D09ExpressionProvider()
     d08 = DomainProposal(
         "d08", "d08.proposal.v1", d08_provider.descriptor.request_schema_hash,
-        envelope, writes[:3], DependencySet(), (), (),
+        envelope, writes[:4], DependencySet(), (), (),
     )
     d09 = DomainProposal(
         "d09", "d09.proposal.v1", d09_provider.descriptor.request_schema_hash,
-        envelope, writes[3:], DependencySet(), (), (),
+        envelope, writes[4:], DependencySet(), (), (),
     )
     d08_provider.validate(d08)
     d09_provider.validate(d09)
     evidence = validate_dispatch_candidate_writes(
         (("d08", writes[0]), ("d08", writes[1]), ("d08", writes[2]),
-         ("d09", writes[3])),
+         ("d08", writes[3]), ("d09", writes[4])),
         namespace=namespace, identity=envelope.identity,
         read_versions=guard.read_versions,
         source_refs=envelope.source_qualification.source_refs,
