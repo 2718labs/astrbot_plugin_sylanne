@@ -11,25 +11,54 @@ from dataclasses import dataclass
 import json
 import math
 import sqlite3
+from typing import TYPE_CHECKING
 
 from ..domains.d06 import SourceGrantRead, provide_source_grant_check
 from ..domains.d03 import ContextProvider, RoleBindingRequest
 from ..domains.d05 import RelationshipProvider
 from ..domains.d08 import (
-    ActionIntent, ActionSchema, ActionSchemaRecord, GoalExecutionProvider,
-    RequiredCheckSpec,
+    ActionIntent, ActionSchema, ActionSchemaRecord, CommitmentConflictSnapshot,
+    GoalExecutionProvider, RequiredCheckSpec,
 )
 from ..domains.d09 import D09ExpressionProvider
-from ..graph_types import AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch
+from ..graph_types import AtomKey, GraphAtom, GraphReceipt, GraphSnapshot, NamespaceEpoch
 from ..runtime.dispatch_candidate import DispatchCandidateEvidenceV1
-from ..runtime_contracts import CheckReceipt, NamespaceId, QueryEpoch, canonical_digest
+from ..runtime_contracts import (
+    CheckReceipt, FenceScope, NamespaceId, QueryEpoch, VersionedRef,
+    canonical_digest,
+)
 from .budget import BudgetError, get_budget_lease, require_budget_family_admissible
 from .dispatch_budget_check import provide_dispatch_budget_check
 from .dispatch_current_projection import (
-    derive_current_domain_reads, read_current_dispatch_projection,
+    CurrentDispatchProjectionV1, derive_current_domain_reads,
+    read_current_dispatch_projection,
 )
 from .dispatch_current_commitments import read_current_d08_conflict_facts
+from .dispatch_current_commitment_check import CRITERIA_REF, CRITERIA_VERSION
 from .issuers import D02ResourceIssuer, D11BudgetGrantIssuer, IssuerAuthorityDenied
+
+if TYPE_CHECKING:
+    from ..authority_service.v2_execution_bridge import CurrentEffectReadV2
+    from ..authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
+    from ..host.authority_profile import AdminIngressClockPolicy
+    from ..host.v2_fence_port import VerifiedIngressClockV2
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedDispatchAdmissionContextV1:
+    """Coordinator-held service observations paired with one graph write.
+
+    Construction alone is not Authority proof. The coordinator validates the
+    installed V2 write fence before this transaction and finishes it after.
+    """
+
+    scope: FenceScope
+    clock_reading: VerifiedIngressClockV2
+    clock_policy: AdminIngressClockPolicy
+    projection: CurrentDispatchProjectionV1
+    graph_receipt: GraphReceipt
+    owner_guard: OwnerAuthorizationGuardV1 | None
+    current_effect: CurrentEffectReadV2 | None
 
 
 _MISSING_PROVIDER_PORTS = (
@@ -46,6 +75,7 @@ class DispatchSourceInspectionV1:
     missing: tuple[str, ...]
     observed_versions: tuple[tuple[str, int], ...]
     provider_result: str | None
+    receipt: CheckReceipt | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +103,169 @@ class DispatchCommitmentInspectionV1:
     graph_epoch: int | None
     commitment_refs: tuple[str, ...]
     action_refs: tuple[str, ...]
+    receipt: CheckReceipt | None = None
+
+
+@dataclass(frozen=True)
+class DispatchPrivateRouteInspectionV1:
+    status: str
+    missing: tuple[str, ...]
+    account_ref: str | None = None
+    destination_ref: str | None = None
+    scene_ref: str | None = None
+
+
+@dataclass(frozen=True)
+class DispatchOwnerInspectionV1:
+    status: str
+    missing: tuple[str, ...]
+    grant_id: str | None = None
+
+
+def inspect_current_owner_grant(
+    db, namespace: NamespaceId, audience: tuple[str, ...], purpose: str,
+    *, trusted_context: TrustedDispatchAdmissionContextV1 | None,
+    graph_incarnation: str,
+) -> DispatchOwnerInspectionV1:
+    """Join current graph Owner grant/proof to the V2 current guard."""
+    def hold(reason: str) -> DispatchOwnerInspectionV1:
+        return DispatchOwnerInspectionV1("hold", (reason,))
+
+    if not getattr(db, "in_transaction", False):
+        return hold("graph.current_write_transaction")
+    if (type(namespace) is not NamespaceId
+            or type(trusted_context) is not TrustedDispatchAdmissionContextV1
+            or trusted_context.owner_guard is None):
+        return hold("d01.current_authority_owner_guard")
+    try:
+        from dataclasses import asdict
+        from ..authority_service.v2_owner_contract import (
+            OwnerGraphCommitProofV1, canonical_digest as owner_digest,
+        )
+        from ..contracts import canonical_json
+        from ..graph_coordinator import owner_grant_key
+        from ..graph_types import validate_owner_grant_v1
+
+        guard = trusted_context.owner_guard
+        anchor = trusted_context.scope.pinned_anchor
+        grant_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (owner_grant_key(*namespace.as_tuple).token,),
+        ).fetchone()
+        proof_row = db.execute(
+            "SELECT operation_id,request_digest,grant_id,grant_digest,"
+            "graph_incarnation,graph_access_epoch,graph_epoch,"
+            "graph_receipt_digest,proof_json FROM "
+            "graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()
+        if grant_row is None or proof_row is None:
+            return hold("d01.current_owner_graph_grant_or_proof_missing")
+        grant = json.loads(grant_row[1])
+        validate_owner_grant_v1(grant)
+        proof = OwnerGraphCommitProofV1(
+            namespace, proof_row[0], proof_row[1], proof_row[2],
+            proof_row[3], proof_row[4], grant["grant_revision"],
+            proof_row[5], proof_row[6], proof_row[7],
+        )
+        epochs = db.execute(
+            "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        if (grant_row != (1, canonical_json(grant), 1)
+                or proof_row[8] != canonical_json(asdict(proof))
+                or "sha256:" + canonical_digest(grant) != proof.grant_digest
+                or grant["grant_id"] != proof.grant_id
+                or grant["issue_operation_id"] != proof.operation_id
+                or grant["graph_incarnation"] != graph_incarnation
+                or proof.graph_incarnation != graph_incarnation
+                or epochs is None
+                or proof.graph_access_epoch > epochs[0]
+                or proof.graph_epoch > trusted_context.scope.graph_epoch.revision
+                or purpose not in grant["purposes"]
+                or not set(audience).issubset(grant["audiences"])
+                or guard.namespace != namespace
+                or guard.authority_id != anchor.authority_id
+                or guard.authority_id != grant["authority_id"]
+                or guard.installation_id != grant["installation_id"]
+                or guard.authorization_revision != grant["grant_revision"]
+                or guard.authorization_head != owner_digest(proof)
+                or guard.minimum_revocation_revision != 0
+                or guard.minimum_revocation_epoch != 0
+                or guard.pending_revoke_operation_id is not None
+                or anchor.revocation_epoch != 0):
+            return hold("d01.current_owner_authorization_differs")
+    except (ImportError, sqlite3.OperationalError, TypeError, ValueError,
+            KeyError, json.JSONDecodeError):
+        return hold("d01.current_owner_graph_proof_unavailable")
+    return DispatchOwnerInspectionV1("owner_verified", (), grant["grant_id"])
+
+
+def inspect_current_private_route(
+    db, candidate: DispatchCandidateEvidenceV1, *, now_utc: float,
+) -> DispatchPrivateRouteInspectionV1:
+    """Bind one D09 text segment to a durable host ingress route in this tx."""
+    def hold(*missing: str) -> DispatchPrivateRouteInspectionV1:
+        return DispatchPrivateRouteInspectionV1(
+            "hold", tuple(dict.fromkeys(missing)),
+        )
+
+    if not getattr(db, "in_transaction", False):
+        return hold("graph.current_write_transaction")
+    if (type(candidate) is not DispatchCandidateEvidenceV1
+            or type(now_utc) not in (int, float) or not math.isfinite(now_utc)
+            or len(candidate.source_refs) != 1
+            or len(candidate.source_audience) != 1):
+        return hold("d09.narrow_single_source_private_route")
+    try:
+        from ..runtime.first_ingress_v2 import scene_ref_for_conversation
+        from ..host.identity import astrbot_namespace
+
+        key = AtomKey.from_token(candidate.batch_ref)
+        namespace = NamespaceId(key.owner.bot, key.owner.persona)
+        batch = _current_atom(db, namespace, candidate.batch_ref,
+                              "d09.verified_segment_batch.v1").value
+        next(item for item in D09ExpressionProvider.register_types()
+             if item.name == "d09.verified_segment_batch.v1").validator(batch)
+        rows = db.execute(
+            "SELECT platform_ref,conversation_ref,visibility FROM "
+            "graph_first_ingress_identity_v1 WHERE bot=? AND persona=? "
+            "AND source_ref=?",
+            (*namespace.as_tuple, candidate.source_refs[0]),
+        ).fetchall()
+        if len(rows) != 1:
+            return hold("d09.unique_committed_host_ingress_route")
+        account_ref, destination_ref, visibility = rows[0]
+        account = json.loads(account_ref)
+        destination = json.loads(destination_ref)
+        if (visibility != "private" or type(account) is not list
+                or len(account) != 3 or type(destination) is not list
+                or len(destination) != 2
+                or any(type(item) is not str or not item
+                       for item in (*account, *destination))
+                or json.dumps(account, ensure_ascii=True, separators=(",", ":"))
+                != account_ref
+                or json.dumps(destination, ensure_ascii=True, separators=(",", ":"))
+                != destination_ref
+                or astrbot_namespace(account[0], account[2], "route-check").bot_id
+                != namespace.bot_id):
+            return hold("d09.private_astrbot_ingress_identity")
+        expected_scene = scene_ref_for_conversation(
+            namespace, account_ref, destination_ref,
+        )
+        if (tuple(batch["audiences"]) != (destination_ref,)
+                or candidate.source_audience != (destination_ref,)
+                or batch["scene_ref"] != expected_scene
+                or len(batch["segments"]) != 1
+                or batch["segments"][0]["media_refs"]
+                or float(batch["valid_until"]) <= now_utc):
+            return hold("d09.current_private_batch_route_or_segment_differs")
+    except (sqlite3.OperationalError, TypeError, ValueError, KeyError,
+            StopIteration, json.JSONDecodeError):
+        return hold("d09.current_host_ingress_route_unavailable")
+    return DispatchPrivateRouteInspectionV1(
+        "route_verified", (), account_ref, destination_ref, expected_scene,
+    )
 
 
 class DispatchAdmissionHold(RuntimeError):
@@ -84,12 +277,14 @@ class DispatchAdmissionHold(RuntimeError):
 def inspect_current_d06_source_grant(
     db, intent: ActionIntent, spec: RequiredCheckSpec,
     candidate: DispatchCandidateEvidenceV1, *, audience: tuple[str, ...],
+    trusted_context: TrustedDispatchAdmissionContextV1 | None = None,
+    now_utc: float | None = None,
 ) -> DispatchSourceInspectionV1:
-    """Read D06 inputs from the caller-held graph transaction; never issue PASS.
+    """Read D06 inputs from the caller-held graph transaction.
 
-    The graph rows and namespace epoch are read afresh. The independent
-    deletion/Authority barrier is not derivable from this SQLite snapshot, so
-    D06 receives an unconfirmed barrier and cannot issue a passing receipt.
+    A scoped PASS requires the coordinator's prevalidated V2 write fence. Its
+    Authority validation rejects historical deletion closures and pins the
+    independent deletion/execution heads. SQLite rows alone cannot prove it.
     """
     if not getattr(db, "in_transaction", False):
         raise DispatchAdmissionHold(("graph.current_write_transaction",))
@@ -159,15 +354,34 @@ def inspect_current_d06_source_grant(
     snapshot = GraphSnapshot(tuple(atoms), (
         NamespaceEpoch(*namespace.as_tuple, candidate.query_epoch),
     ))
+    barrier = False
+    if trusted_context is not None:
+        if type(trusted_context) is not TrustedDispatchAdmissionContextV1:
+            raise DispatchAdmissionHold(("d06.trusted_admission_context",))
+        scope = trusted_context.scope
+        if (type(scope) is not FenceScope or scope.operation != "write"
+                or scope.namespace != namespace
+                or scope.graph_epoch.revision != candidate.query_epoch
+                or scope.pinned_anchor != scope.permit.pinned_anchor):
+            raise DispatchAdmissionHold(("d06.current_authority_write_scope",))
+        barrier = True
+    if barrier and (type(now_utc) not in (int, float)
+                    or not math.isfinite(now_utc)):
+        raise DispatchAdmissionHold(("d06.trusted_admission_time",))
     try:
         receipt = provide_source_grant_check(
-            intent, SourceGrantRead(snapshot, audience, "expression", True, False),
-            valid_until=0.0,
+            intent, SourceGrantRead(snapshot, audience, "expression", True, barrier),
+            valid_until=now_utc + 1.0 if barrier else 0.0,
         )
     except (TypeError, ValueError) as exc:
         raise DispatchAdmissionHold(("d06.provider_recomputation",)) from exc
+    if barrier and receipt.result == "pass" and receipt.coverage == "full":
+        return DispatchSourceInspectionV1(
+            "check_pass", (), required, receipt.result, receipt,
+        )
     return DispatchSourceInspectionV1(
-        "hold", ("d06.independent_deletion_authority_barrier",),
+        "hold", (("d06.current_source_grant_not_pass",) if barrier else
+                 ("d06.independent_deletion_authority_barrier",)),
         required, receipt.result,
     )
 
@@ -441,12 +655,15 @@ def inspect_current_d11_dispatch_budget(
 
 def inspect_current_d08_commitments(
     db, candidate: DispatchCandidateEvidenceV1,
+    *, trusted_context: TrustedDispatchAdmissionContextV1 | None = None,
+    now_utc: float | None = None,
 ) -> DispatchCommitmentInspectionV1:
     """Inventory all current D08 conflict rows under the graph transaction.
 
-    This can veto stale identity or shared effects. It cannot issue D08 PASS:
-    the criteria issuer, semantic conflict policy and authenticated P2 effect
-    and cancellation reads are not installed at this admission seam.
+    The narrow v1 PASS covers a current active goal with no own commitments,
+    no other unfinished commitment or same-target action, an active same-commit
+    cancellation head, and an authenticated *pre-P2* absent effect read. The
+    final P2/effect and revocation recheck remains at handoff.
     """
     def hold(*missing: str, epoch=None, commitments=(), actions=()):
         return DispatchCommitmentInspectionV1(
@@ -493,7 +710,10 @@ def inspect_current_d08_commitments(
     current = tuple(item for item in facts.action_intents
                     if item.action_id == action_key.name
                     and item.identity.operation_id == candidate.operation_id)
-    missing = list(facts.missing_sources)
+    missing = [source for source in facts.missing_sources
+               if trusted_context is None or source not in {
+                   "atomic_execution_effect_read", "current_action_cancellation_read",
+               }]
     if (len(current) != 1 or action_key.type_name != "d08.action_intent.v1"
             or candidate.action_digest != canonical_digest(current[0])):
         missing.append("d08.current_action_identity_differs")
@@ -509,13 +729,130 @@ def inspect_current_d08_commitments(
                and other.identity.effect_id == intent.identity.effect_id
                for other in facts.action_intents):
             missing.append("d08.current_effect_shared_by_actions")
-    missing.extend((
-        "d08.criteria_issuer_unavailable",
-        "d08.semantic_conflict_policy_unavailable",
-        "d08.authenticated_p2_effect_and_post_graph_cas_unavailable",
-    ))
+    if missing or trusted_context is None:
+        missing.append("d08.current_pre_p2_authority_effect")
+        return DispatchCommitmentInspectionV1(
+            "hold", tuple(dict.fromkeys(missing)), epoch, commitments, actions,
+        )
+    if (type(trusted_context) is not TrustedDispatchAdmissionContextV1
+            or type(now_utc) not in (int, float) or not math.isfinite(now_utc)):
+        missing.append("d08.typed_trusted_context_and_time")
+        return DispatchCommitmentInspectionV1(
+            "hold", tuple(dict.fromkeys(missing)), epoch, commitments, actions,
+        )
+    effect = trusted_context.current_effect
+    anchor = trusted_context.scope.pinned_anchor
+    intent = current[0]
+    spec = tuple(item for item in intent.required_checks
+                 if item.check_kind == "commitment_conflict")[0]
+    if (effect is None or effect.effect_id != intent.identity.effect_id
+            or effect.state != "absent"
+            or (effect.authority_id, effect.namespace,
+                effect.activation_generation, effect.execution_head_seq,
+                effect.execution_head_digest) != (
+                anchor.authority_id, anchor.namespace,
+                anchor.activation_generation, anchor.execution_seq,
+                anchor.execution_digest)):
+        missing.append("d08.current_effect_not_absent_at_pinned_execution_head")
+    if intent.commitment_refs:
+        missing.append("d08.narrow_zero_commitment_policy")
+    if any(item.fulfillment_state not in {"fulfilled", "withdrawn"}
+           for item in facts.commitments):
+        missing.append("d08.other_unfinished_commitment")
+    for other in facts.action_intents:
+        if other.action_id == intent.action_id:
+            continue
+        if other.identity.effect_id == intent.identity.effect_id:
+            missing.append("d08.current_effect_shared_by_actions")
+        if other.target_ref == intent.target_ref and not any(
+            outcome.action_id == other.action_id
+            and outcome.effect_id == other.identity.effect_id
+            and outcome.attempt_id == other.identity.attempt_id
+            and outcome.result_level == "completed_verified"
+            and not outcome.unknown_effects
+            for outcome in facts.action_outcomes
+        ):
+            missing.append("d08.other_same_target_action_unfinished")
+    try:
+        if spec.criteria_version != CRITERIA_REF:
+            missing.append("d08.fixed_criteria_ref_required")
+        schema_atom = _current_atom(
+            db, namespace, candidate.schema_ref, "d08.action_schema.v1",
+        )
+        d08 = {item.name: item for item in GoalExecutionProvider().register_types()}
+        schema_record = d08["d08.action_schema.v1"].validator(schema_atom.value)
+        frozen_schema = ActionSchema(
+            schema_record.schema_id, schema_record.action_kind,
+            schema_record.proactive, schema_record.required_checks,
+        )
+        if (schema_record.proactive
+                or schema_record != ActionSchemaRecord.bind(intent, frozen_schema)):
+            missing.append("d08.narrow_passive_schema_required")
+        goal_rows = db.execute(
+            "SELECT revision,value FROM graph_atoms WHERE bot=? AND persona=? "
+            "AND type_name='d08.goal.v1' AND name=? AND valid=1",
+            (*namespace.as_tuple, intent.goal_ref),
+        ).fetchall()
+        cancel_rows = db.execute(
+            "SELECT revision,value FROM graph_atoms WHERE bot=? AND persona=? "
+            "AND type_name='d08.action_cancellation.v1' AND name=? AND valid=1",
+            (*namespace.as_tuple, intent.action_id),
+        ).fetchall()
+        if len(goal_rows) != 1 or len(cancel_rows) != 1:
+            missing.append("d08.current_goal_or_cancellation_head_missing")
+        else:
+            goal = d08["d08.goal.v1"].validator(json.loads(goal_rows[0][1]))
+            cancellation = d08["d08.action_cancellation.v1"].validator(
+                json.loads(cancel_rows[0][1]))
+            if goal.goal_id != intent.goal_ref or goal.state != "active":
+                missing.append("d08.current_goal_not_active")
+            if (cancellation.action_id != intent.action_id
+                    or cancellation.action_revision != intent.revision
+                    or cancellation.action_digest != canonical_digest(intent)
+                    or cancellation.effect_id != intent.identity.effect_id
+                    or cancellation.attempt_id != intent.identity.attempt_id
+                    or cancellation.state != "active"
+                    or cancellation.cancel_epoch != 0):
+                missing.append("d08.current_action_cancelled_or_identity_differs")
+            expected = {
+                CRITERIA_REF: CRITERIA_VERSION,
+                intent.goal_ref: goal_rows[0][0],
+                f"commitments-query:persona:{namespace.persona_id}": epoch,
+                f"execution-epoch:{intent.action_id}": anchor.execution_seq,
+                f"cancellation-epoch:{intent.action_id}": cancel_rows[0][0],
+            }
+            frozen = {item.ref: item.version for item in spec.required_input_versions}
+            if len(frozen) != len(spec.required_input_versions) or frozen != expected:
+                missing.append("d08.current_fixed_criteria_read_set_differs")
+    except (sqlite3.OperationalError, KeyError, TypeError, ValueError,
+            json.JSONDecodeError):
+        missing.append("d08.current_goal_cancellation_provider_unavailable")
+    if missing:
+        return DispatchCommitmentInspectionV1(
+            "hold", tuple(dict.fromkeys(missing)), epoch, commitments, actions,
+        )
+    read = CommitmentConflictSnapshot(
+        spec.required_input_versions, "full", (), (), (),
+        action_ref=intent.action_id, action_revision=intent.revision,
+        intent_digest=canonical_digest(intent), schema_id=intent.schema_id,
+        goal_ref=intent.goal_ref, target_ref=intent.target_ref,
+        action_kind=intent.action_kind, purpose=intent.purpose,
+        commitment_query_epoch_ref=f"commitments-query:persona:{namespace.persona_id}",
+        commitment_query_epoch=epoch,
+        execution_epoch_ref=f"execution-epoch:{intent.action_id}",
+        execution_epoch=anchor.execution_seq,
+        cancellation_epoch_ref=f"cancellation-epoch:{intent.action_id}",
+        cancellation_epoch=cancel_rows[0][0], current_read_confirmed=True,
+    )
+    receipt = GoalExecutionProvider().provide_required_check(
+        intent, frozen_schema, read, valid_until=now_utc + 1.0,
+    )
+    if receipt.result != "pass" or receipt.coverage != "full":
+        return DispatchCommitmentInspectionV1(
+            "hold", ("d08.current_provider_not_pass",), epoch, commitments, actions,
+        )
     return DispatchCommitmentInspectionV1(
-        "hold", tuple(dict.fromkeys(missing)), epoch, commitments, actions,
+        "check_pass", (), epoch, commitments, actions, receipt,
     )
 
 
@@ -530,7 +867,8 @@ class InstalledDispatchAdmissionIssuer:
         self._d02 = d02_issuer
 
     def issue_dispatch_admission(self, bundle, snapshot, candidate, db, *,
-                                 graph_incarnation: str, now_utc: float):
+                                 graph_incarnation: str, now_utc: float,
+                                 trusted_context: TrustedDispatchAdmissionContextV1 | None = None):
         if not getattr(db, "in_transaction", False):
             raise DispatchAdmissionHold(("graph.current_write_transaction",))
         if type(candidate) is not DispatchCandidateEvidenceV1:
@@ -563,6 +901,7 @@ class InstalledDispatchAdmissionIssuer:
             raise DispatchAdmissionHold(("d06.unique_source_grant_spec",))
         inspection = inspect_current_d06_source_grant(
             db, action, specs[0], candidate, audience=candidate.source_audience,
+            trusted_context=trusted_context, now_utc=now_utc,
         )
         social_missing = ("d03.d05.installed_context_provider",)
         if self._context is not None:
@@ -574,10 +913,19 @@ class InstalledDispatchAdmissionIssuer:
             db, action, d11_issuer=self._d11, d02_issuer=self._d02,
             now_utc=now_utc,
         )
-        commitments = inspect_current_d08_commitments(db, candidate)
+        commitments = inspect_current_d08_commitments(
+            db, candidate, trusted_context=trusted_context, now_utc=now_utc,
+        )
+        route = inspect_current_private_route(db, candidate, now_utc=now_utc)
+        owner = inspect_current_owner_grant(
+            db, NamespaceId(action_key.owner.bot, action_key.owner.persona),
+            candidate.source_audience, action.purpose,
+            trusted_context=trusted_context,
+            graph_incarnation=graph_incarnation,
+        )
         raise DispatchAdmissionHold((
             *inspection.missing, *social_missing, *budget.missing,
-            *commitments.missing,
+            *commitments.missing, *route.missing, *owner.missing,
             *_MISSING_PROVIDER_PORTS,
         ))
 
@@ -601,4 +949,7 @@ __all__ = [
     "DispatchBudgetInspectionV1",
     "inspect_current_d11_dispatch_budget",
     "DispatchCommitmentInspectionV1", "inspect_current_d08_commitments",
+    "DispatchPrivateRouteInspectionV1", "inspect_current_private_route",
+    "DispatchOwnerInspectionV1", "inspect_current_owner_grant",
+    "TrustedDispatchAdmissionContextV1",
 ]

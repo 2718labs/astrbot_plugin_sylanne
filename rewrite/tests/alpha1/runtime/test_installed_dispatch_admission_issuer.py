@@ -7,9 +7,15 @@ import sqlite3
 import pytest
 
 from sylanne3.graph_types import AtomKey, Owner
+from sylanne3.graph_types import NamespaceEpoch
+from sylanne3.authority_service.v2_contract import FencePermitV2
+from sylanne3.authority_service.v2_execution_bridge import CurrentEffectReadV2
 from sylanne3.domains.d03 import ContextProvider, RoleBinding
 from sylanne3.domains.d05 import BoundaryRule
-from sylanne3.domains.d08 import ActionSchema, ActionSchemaRecord
+from sylanne3.domains.d08 import (
+    ActionCancellationState, ActionSchema, ActionSchemaRecord, Goal,
+    GoalExecutionProvider,
+)
 from sylanne3.memory_types import access_key, source_key
 from sylanne3.runtime.dispatch_candidate import DispatchCandidateEvidenceV1
 from sylanne3.runtime.installed_dispatch_admission_issuer import (
@@ -18,8 +24,15 @@ from sylanne3.runtime.installed_dispatch_admission_issuer import (
     inspect_current_d03_d05,
     inspect_current_d11_dispatch_budget,
     inspect_current_d08_commitments,
+    TrustedDispatchAdmissionContextV1,
 )
-from sylanne3.runtime_contracts import VersionedRef, canonical_digest
+from sylanne3.runtime_contracts import (
+    FenceScope, NamespaceId, VersionedRef, canonical_digest,
+)
+from sylanne3.runtime.restore_anchor import RestoreAnchor
+from sylanne3.runtime.dispatch_current_commitment_check import (
+    CRITERIA_REF, CRITERIA_VERSION,
+)
 from sylanne3.runtime.issuers import D02ResourceIssuer, ResourceQuote
 from sylanne3.runtime.budget import reserve_budget
 
@@ -373,11 +386,87 @@ def test_d08_complete_graph_inventory_identifies_unissued_authority_gates():
         assert result.graph_epoch == 5
         assert result.action_refs == ("action:one",)
         assert "d08.criteria_ref_has_no_authoritative_issuer" in result.missing
-        assert "d08.semantic_conflict_policy_unavailable" in result.missing
+        assert "d08.current_pre_p2_authority_effect" in result.missing
         db.execute("UPDATE graph_epochs SET revision=6")
         assert inspect_current_d08_commitments(
             db, candidate,
         ).missing == ("d08.current_graph_epoch_differs",)
+    finally:
+        db.close()
+
+
+def test_d08_fixed_pre_p2_policy_recomputes_current_goal_and_effect():
+    # The typed scope/effect here exercise mapping only. Production obtains
+    # them from the installed V2 port before entering the graph transaction.
+    db, candidate, _context, _key = _social_case()
+    try:
+        db.execute("ALTER TABLE graph_atoms ADD COLUMN name TEXT")
+        for ref, in db.execute("SELECT token FROM graph_atoms").fetchall():
+            db.execute("UPDATE graph_atoms SET name=? WHERE token=?",
+                       (AtomKey.from_token(ref).name, ref))
+        d08 = {item.name: item for item in GoalExecutionProvider().register_types()}
+        row = db.execute("SELECT value FROM graph_atoms WHERE token=?",
+                         (candidate.action_ref,)).fetchone()
+        intent = d08["d08.action_intent.v1"].validator(json.loads(row[0]))
+        checks = tuple(replace(item, criteria_version=CRITERIA_REF,
+                               required_input_versions=(
+                                   VersionedRef(CRITERIA_REF, CRITERIA_VERSION),
+                                   VersionedRef(intent.goal_ref, 1),
+                                   VersionedRef("commitments-query:persona:persona", 5),
+                                   VersionedRef("execution-epoch:action:one", 0),
+                                   VersionedRef("cancellation-epoch:action:one", 1),
+                               )) if item.check_kind == "commitment_conflict" else item
+                       for item in intent.required_checks)
+        intent = replace(intent, required_checks=checks)
+        schema = ActionSchemaRecord.bind(
+            intent, ActionSchema(intent.schema_id, intent.action_kind, False, checks),
+        )
+        db.execute("UPDATE graph_atoms SET value=? WHERE token=?",
+                   (json.dumps(asdict(intent)), candidate.action_ref))
+        db.execute("UPDATE graph_atoms SET value=? WHERE token=?",
+                   (json.dumps(asdict(schema)), candidate.schema_ref))
+        goal = Goal(intent.goal_ref, 1, "active", intent.success_predicate,
+                    (), (), None, (), ())
+        cancellation = ActionCancellationState.for_action(
+            intent, state="active", actor="host", source_refs=intent.source_refs,
+            operation_id=intent.identity.operation_id,
+        )
+        for type_name, name, value in (
+            ("d08.goal.v1", intent.goal_ref, goal),
+            ("d08.action_cancellation.v1", intent.action_id, cancellation),
+        ):
+            key = AtomKey(Owner("activity", "bot", "persona",
+                                intent.identity.activity_id), type_name, name)
+            db.execute("INSERT INTO graph_atoms VALUES(?,?,?,?,?,?,?,?)", (
+                key.token, "bot", "persona", type_name, 1,
+                json.dumps(asdict(value)), 1, name,
+            ))
+        candidate = replace(candidate, action_digest=canonical_digest(intent),
+                            schema_digest=canonical_digest(schema))
+        anchor = RestoreAnchor("authority", "ns", 1, "deletion", 0,
+                               "genesis", "execution", 0, "genesis", 0,
+                               "service-proof")
+        permit = FencePermitV2("authority", "ns", "subject", "holder", 1,
+                                "write", "attempt:one", "t" * 32, 1, 1, anchor)
+        scope = FenceScope(NamespaceId("bot", "persona"), "ns", 1, "write",
+                           "attempt:one", permit, anchor,
+                           NamespaceEpoch("bot", "persona", 5), 1)
+        effect = CurrentEffectReadV2("authority", "ns", "effect:one", 1,
+                                     "absent", 0, "genesis")
+        trusted = TrustedDispatchAdmissionContextV1(
+            scope, None, None, None, None, None, effect,
+        )
+        passed = inspect_current_d08_commitments(
+            db, candidate, trusted_context=trusted, now_utc=2.0,
+        )
+        assert passed.status == "check_pass"
+        assert passed.receipt.result == "pass"
+        db.execute("UPDATE graph_atoms SET value=? WHERE type_name='d08.goal.v1'",
+                   (json.dumps({**asdict(goal), "state": "abandoned"}),))
+        blocked = inspect_current_d08_commitments(
+            db, candidate, trusted_context=trusted, now_utc=2.0,
+        )
+        assert "d08.current_goal_not_active" in blocked.missing
     finally:
         db.close()
 
