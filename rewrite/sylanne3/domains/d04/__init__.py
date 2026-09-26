@@ -26,6 +26,11 @@ from .affect import (
     UnresolvedMechanism,
 )
 from .encoding_baseline import CommittedRef, EncodingBaseline
+from .recollection_read import (
+    RecollectionExperienceSnapshotCandidate,
+    RecollectionSnapshotUnavailable,
+    inspect_recollection_experience_snapshot,
+)
 from .root import (
     AuthoredRootBlockInput,
     AuthoredRootCandidate,
@@ -73,6 +78,9 @@ __all__ = (
     "UnresolvedMechanism",
     "CommittedRef",
     "EncodingBaseline",
+    "RecollectionExperienceSnapshotCandidate",
+    "RecollectionSnapshotUnavailable",
+    "inspect_recollection_experience_snapshot",
     "AuthoredRootBlockInput",
     "AuthoredRootCandidate",
     "AuthoredRootInput",
