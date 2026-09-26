@@ -19,6 +19,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], sce
   let statusRequests = 0;
   let pageFields = {};
   let createFields = {};
+  let sourceFocusCount = 0;
   const pageForm = { id: "page-form", elements: { namedItem(name) { return {
     set value(value) { pageFields[name] = value; },
     set checked(value) { pageFields[name] = value ? "on" : ""; }
@@ -30,6 +31,10 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], sce
       if (selector === "#role-input") return { value: roleInput };
       if (selector === "#owner-login-form") return { id: "owner-login-form" };
       if (selector === "#page-form") return pageForm;
+      if (selector === '#page-form [name="source_refs"]') return {
+        set value(value) { pageFields.source_refs = value; },
+        focus() { sourceFocusCount++; }
+      };
       if (selector === "#create-character-form") return { id: "create-character-form" };
       if (selector === "#owner-signature") return { value: ownerSignature };
       return null;
@@ -81,6 +86,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], sce
   return {
     app, requests, candidateRequests, nextRequest,
     get workspaceFocusCount() { return workspace.focusCount; },
+    get sourceFocusCount() { return sourceFocusCount; },
     get sessionRequests() { return sessionRequests; },
     get statusRequests() { return statusRequests; },
     setRole(value) { roleInput = value; },
@@ -91,6 +97,7 @@ async function mountWorkbench({ sessionResponses = [], statusResponses = [], sce
     clickCommand(command) { return app.click({ target: { closest(selector) { return selector === "[data-command]" ? { dataset: { command } } : null; } } }); },
     clickView(view) { return app.click({ target: { closest(selector) { return selector === "[data-view]" ? { dataset: { view } } : null; } } }); },
     clickCandidate(index) { return app.click({ target: { closest(selector) { return selector === "[data-scene-candidate]" ? { dataset: { sceneCandidate: String(index) } } : null; } } }); },
+    clickSource(index) { return app.click({ target: { closest(selector) { return selector === "[data-source-index]" ? { dataset: { sourceIndex: String(index) } } : null; } } }); },
     restore() {
       globalThis.document = previousDocument;
       globalThis.fetch = previousFetch;
@@ -658,6 +665,52 @@ test("D06 correction permission denial clears the projection and locks Owner", a
     assert.match(ui.app.innerHTML, /当前会话无权更正/);
     assert.match(ui.app.innerHTML, /Sylanne Owner 锁定/);
     assert.doesNotMatch(ui.app.innerHTML, /private-source/);
+  } finally { ui.restore(); }
+});
+
+test("Owner selects a live source, retains correction draft on HOLD, and sees only a committed receipt", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    (await ui.nextRequest(0)).resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await opened;
+    const memory = ui.clickView("memory");
+    (await ui.nextRequest(1)).resolve({ status: "ready", projection: { view_type: "d06.memory_sources.v1", data: {
+      sources: [{ source_id: "source-from-server", source_kind: "reported", assertion_status: "asserted", recorded_at: 2, qualification: "not_recorded" }],
+      coverage: "complete"
+    } } });
+    await memory;
+    assert.match(ui.app.innerHTML, /选择此来源/);
+    await ui.clickSource(0);
+    assert.equal(ui.getPageFields().source_refs, "source-from-server");
+    assert.equal(ui.sourceFocusCount, 1);
+
+    ui.setPageFields({ statement: "来源有误", source_refs: "source-from-server", target_refs: "target-a", access_epoch: "3", deletion_epoch: "4" });
+    const held = ui.clickCommand("memory-correction");
+    const heldRequest = await ui.nextRequest(2);
+    assert.deepEqual(heldRequest.payload.input.source_refs, ["source-from-server"]);
+    heldRequest.resolve({ status: "unavailable", problem: { code: "source_correction_commit_unavailable", message: "未修改来源或解释。", retryable: false } });
+    await held;
+    assert.match(ui.app.innerHTML, /更正待接入（HOLD）/);
+    assert.match(ui.app.innerHTML, /value="source-from-server"/);
+    assert.match(ui.app.innerHTML, /来源有误<\/textarea>/);
+    assert.doesNotMatch(ui.app.innerHTML, /服务端已提交来源更正/);
+
+    const committed = ui.clickCommand("memory-correction");
+    const committedRequest = await ui.nextRequest(3);
+    assert.equal(committedRequest.payload.operation_id, heldRequest.payload.operation_id,
+      "retrying unchanged correction keeps its idempotency identity");
+    committedRequest.resolve({ status: "ready", receipt: {
+      schema: "d12.source_correction_receipt.v1", phase: "source_correction_committed",
+      operation_id: committedRequest.payload.operation_id, graph_revision: 7
+    } });
+    (await ui.nextRequest(4)).resolve({ status: "ready", projection: { view_type: "d06.memory_sources.v1", data: {
+      sources: [], coverage: "complete"
+    } } });
+    await committed;
+    assert.match(ui.app.innerHTML, /服务端已提交来源更正，图版本 7/);
+    assert.match(ui.app.innerHTML, new RegExp(committedRequest.payload.operation_id));
   } finally { ui.restore(); }
 });
 
