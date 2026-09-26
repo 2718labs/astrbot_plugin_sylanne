@@ -351,11 +351,17 @@ def inspect_current_private_route(
                               "d09.verified_segment_batch.v1").value
         next(item for item in D09ExpressionProvider.register_types()
              if item.name == "d09.verified_segment_batch.v1").validator(batch)
+        source_key = AtomKey.from_token(candidate.source_refs[0])
+        if (source_key.type_name != "memory.source"
+                or source_key.name != "record"
+                or (source_key.owner.bot, source_key.owner.persona)
+                != namespace.as_tuple):
+            return hold("d09.canonical_host_ingress_source")
         rows = db.execute(
             "SELECT platform_ref,conversation_ref,visibility FROM "
             "graph_first_ingress_identity_v1 WHERE bot=? AND persona=? "
             "AND source_ref=?",
-            (*namespace.as_tuple, candidate.source_refs[0]),
+            (*namespace.as_tuple, source_key.owner.subject),
         ).fetchall()
         if len(rows) != 1:
             return hold("d09.unique_committed_host_ingress_route")

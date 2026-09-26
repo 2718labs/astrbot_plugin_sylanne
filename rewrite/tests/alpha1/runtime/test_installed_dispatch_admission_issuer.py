@@ -8,6 +8,8 @@ import pytest
 
 from sylanne3.graph_types import AtomKey, Owner
 from sylanne3.graph_types import GraphReceipt, NamespaceEpoch
+from sylanne3.graph_types import TypeRegistry
+from sylanne3.graph_store import ProductionGraphStore
 from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.authority_service.v2_execution_bridge import CurrentEffectReadV2
 from sylanne3.domains.d03 import ContextProvider, RoleBinding
@@ -16,6 +18,12 @@ from sylanne3.domains.d08 import (
     ActionCancellationState, ActionSchema, ActionSchemaRecord, Goal,
     GoalExecutionProvider,
 )
+from sylanne3.domains.d09 import (
+    ClaimKind, ClaimUse, D09ExpressionProvider, ExpressionClaim,
+    SegmentCandidate,
+)
+from sylanne3.host.identity import astrbot_namespace
+from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
 from sylanne3.memory_types import access_key, source_key
 from sylanne3.runtime.dispatch_candidate import DispatchCandidateEvidenceV1
 from sylanne3.runtime.installed_dispatch_admission_issuer import (
@@ -24,6 +32,7 @@ from sylanne3.runtime.installed_dispatch_admission_issuer import (
     inspect_current_d03_d05,
     inspect_current_d11_dispatch_budget,
     inspect_current_d08_commitments,
+    inspect_current_private_route,
     TrustedDispatchAdmissionContextV1,
 )
 from sylanne3.runtime_contracts import (
@@ -395,7 +404,76 @@ def test_d08_complete_graph_inventory_identifies_unissued_authority_gates():
         db.close()
 
 
-def test_d08_fixed_pre_p2_policy_recomputes_current_goal_and_effect():
+def test_private_route_uses_committed_ingress_source_not_graph_token():
+    account = json.dumps(["platform-1", "aiocqhttp", "bot-1"],
+                         separators=(",", ":"))
+    destination = json.dumps(["platform-1:FriendMessage:123", "123"],
+                             separators=(",", ":"))
+    namespace = NamespaceId(
+        astrbot_namespace("platform-1", "bot-1", "route-check").bot_id,
+        "persona",
+    )
+    source = source_key(*namespace.as_tuple, "source-one")
+    _schema, intent, _batch, _request, _receipts, grant = _candidates(
+        source_ref=source.token, include_grant=True,
+    )
+    grant = replace(grant, audiences=(destination,))
+    scene = scene_ref_for_conversation(namespace, account, destination)
+    use = ClaimUse("claim:one", 0, 5, ClaimKind.EXTERNAL_FACT)
+    claim = ExpressionClaim("claim:one", "Hello", ClaimKind.EXTERNAL_FACT,
+                            (source.token,), (destination,), ("expression",),
+                            "disclosure:one")
+    provider = D09ExpressionProvider()
+    blueprint = provider.prepare_blueprint(grant, scene, 1, (claim,), now=1.0).blueprint
+    batch = provider.build_verified_batch_v1(
+        grant, blueprint,
+        (SegmentCandidate("segment:one", intent.identity.effect_id,
+                          "Hello", (use,), ("answer",), (), 0.0),),
+        now=1.0,
+    )
+    batch_key = AtomKey(
+        Owner("activity", *namespace.as_tuple, intent.identity.activity_id),
+        "d09.verified_segment_batch.v1", batch["batch_id"],
+    )
+    candidate = DispatchCandidateEvidenceV1(
+        intent.identity.operation_id, "action:unused", "schema:unused",
+        "grant:unused", batch_key.token, "0" * 64, "1" * 64,
+        "2" * 64, batch["batch_digest"], (source.token,), (), (),
+        0, 0, 1, "source_qualified", (destination,), (), None,
+    )
+    db = sqlite3.connect(":memory:")
+    db.executescript("""
+        CREATE TABLE graph_atoms(token TEXT,bot TEXT,persona TEXT,
+            type_name TEXT,revision INTEGER,value TEXT,valid INTEGER);
+        CREATE TABLE graph_first_ingress_identity_v1(
+            bot TEXT,persona TEXT,source_ref TEXT,platform_ref TEXT,
+            conversation_ref TEXT,visibility TEXT);
+    """)
+    db.execute("INSERT INTO graph_atoms VALUES(?,?,?,?,?,?,?)", (
+        batch_key.token, *namespace.as_tuple, batch_key.type_name, 1,
+        json.dumps(batch), 1,
+    ))
+    db.execute("INSERT INTO graph_first_ingress_identity_v1 VALUES(?,?,?,?,?,?)", (
+        *namespace.as_tuple, "source-one", account, destination, "private",
+    ))
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        verified = inspect_current_private_route(db, candidate, now_utc=2.0)
+        assert (verified.status, verified.account_ref,
+                verified.destination_ref, verified.scene_ref) == (
+            "route_verified", account, destination, scene,
+        )
+        db.execute("UPDATE graph_first_ingress_identity_v1 "
+                   "SET conversation_ref='wrong'")
+        assert inspect_current_private_route(
+            db, candidate, now_utc=2.0,
+        ).status == "hold"
+    finally:
+        db.close()
+
+
+def _d08_fixed_pre_p2_case():
     # The typed scope/effect here exercise mapping only. Production obtains
     # them from the installed V2 port before entering the graph transaction.
     db, candidate, _context, _key = _social_case()
@@ -458,6 +536,15 @@ def test_d08_fixed_pre_p2_policy_recomputes_current_goal_and_effect():
             GraphReceipt("committed", (), (), NamespaceEpoch("bot", "persona", 5)),
             None, effect,
         )
+        return db, candidate, trusted, goal
+    except BaseException:
+        db.close()
+        raise
+
+
+def test_d08_fixed_pre_p2_policy_recomputes_current_goal_and_effect():
+    db, candidate, trusted, goal = _d08_fixed_pre_p2_case()
+    try:
         passed = inspect_current_d08_commitments(
             db, candidate, trusted_context=trusted, now_utc=2.0,
         )
@@ -471,6 +558,78 @@ def test_d08_fixed_pre_p2_policy_recomputes_current_goal_and_effect():
         assert "d08.current_goal_not_active" in blocked.missing
     finally:
         db.close()
+
+
+def test_production_store_transaction_d08_pre_p2_logic_only(tmp_path):
+    # These graph rows are seeded directly; the Authority context is synthetic.
+    # This verifies the installed reader against the production SQL schema and
+    # transaction, not the V2 fence service or complete dispatch admission.
+    fixture_db, candidate, trusted, _goal = _d08_fixed_pre_p2_case()
+    store = ProductionGraphStore(tmp_path / "admission-logic.db", TypeRegistry())
+    try:
+        with store._lock:
+            store._db.execute("BEGIN IMMEDIATE")
+            store._db.execute(
+                "INSERT INTO graph_epochs(bot,persona,revision) VALUES(?,?,?)",
+                ("bot", "persona", 5),
+            )
+            for token, bot, persona, type_name, revision, value, valid, name in (
+                fixture_db.execute(
+                    "SELECT token,bot,persona,type_name,revision,value,valid,name "
+                    "FROM graph_atoms"
+                ).fetchall()
+            ):
+                key = AtomKey.from_token(token)
+                store._db.execute(
+                    "INSERT INTO graph_atoms("
+                    "token,bot,persona,owner_kind,subject,type_name,name,"
+                    "revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (token, bot, persona, key.owner.kind, key.owner.subject,
+                     type_name, name, revision, value, valid),
+                )
+            passed = inspect_current_d08_commitments(
+                store._db, candidate, trusted_context=trusted, now_utc=2.0,
+            )
+            assert passed.status == "check_pass"
+            assert passed.receipt.result == "pass"
+            revoked = replace(
+                trusted,
+                current_effect=CurrentEffectReadV2(
+                    "authority", "ns", "effect:one", 1,
+                    "executed", 1, "changed",
+                ),
+            )
+            assert "d08.current_effect_not_absent_at_pinned_execution_head" in (
+                inspect_current_d08_commitments(
+                    store._db, candidate, trusted_context=revoked, now_utc=2.0,
+                ).missing
+            )
+            original = AtomKey.from_token(candidate.action_ref)
+            other = AtomKey(original.owner, original.type_name, "action:other")
+            row = store._db.execute(
+                "SELECT value FROM graph_atoms WHERE token=?",
+                (candidate.action_ref,),
+            ).fetchone()
+            other_action = json.loads(row[0])
+            other_action["action_id"] = "action:other"
+            other_action["identity"]["operation_id"] = "operation:other"
+            store._db.execute(
+                "INSERT INTO graph_atoms("
+                "token,bot,persona,owner_kind,subject,type_name,name,"
+                "revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (other.token, "bot", "persona", other.owner.kind,
+                 other.owner.subject, other.type_name, other.name, 1,
+                 json.dumps(other_action), 1),
+            )
+            assert "d08.current_effect_shared_by_actions" in (
+                inspect_current_d08_commitments(
+                    store._db, candidate, trusted_context=trusted, now_utc=2.0,
+                ).missing
+            )
+            store._db.execute("ROLLBACK")
+    finally:
+        fixture_db.close()
+        store.close()
 
 
 def test_d08_new_same_effect_action_is_visible_and_holds():
