@@ -57,6 +57,10 @@ from .model_broker.first_ingress_encoding import (
 )
 from .runtime.issuers import D02ResourceIssuer, D11BudgetJobIssuer
 from .runtime.first_ingress_v2 import ingress_ids
+from .runtime.post_c02_domain_commit import commit_post_c02_reply_bundle_v1
+from .host.post_c02_reply_driver import (
+    PostC02ReplyCandidate, post_c02_reply_operation_id,
+)
 from .runtime.first_ingress_unacquired import FirstIngressUnacquiredPageV1
 from .runtime.first_ingress_recovery import (
     FirstIngressRecoveryItemV1, FirstIngressRecoveryPageV1,
@@ -64,7 +68,7 @@ from .runtime.first_ingress_recovery import (
 from .runtime.original_model_result_context import OriginalModelResultContextV1
 from .runtime.restore_anchor import ExecutionJournalPort
 from .runtime_contracts import (
-    AuthorityContext, CommitReceipt, InstallationGrantV2, NamespaceId,
+    AuthorityContext, CommitReceipt, DomainBundle, InstallationGrantV2, NamespaceId,
     canonical_digest,
 )
 from .workbench_api.async_service import AsyncGraphWorkbenchService
@@ -1312,6 +1316,65 @@ class RuntimeContext:
         return await self.commit_first_ingress_c02_v2(
             envelope, receipt, executor=executor,
             original_recovery=original_recovery)
+
+    async def commit_prepared_post_c02_reply_v1(
+        self, *, c02_operation_id: str, source_ref: str,
+        audience: tuple[str, ...],
+        prepare: Callable[[GraphCoordinator, AuthorityContext, object, CommitReceipt],
+                          tuple[PostC02ReplyCandidate, DomainBundle]],
+    ) -> CommitReceipt | None:
+        """Commit a graph-read, finite reply candidate under one installed lease.
+
+        ``prepare`` runs on the graph worker after a durable duplicate check.
+        It must use current graph/domain reads and an already settled reply
+        result; no model call is made by this method.  A missing result or
+        provider is a HOLD at the caller's orchestration boundary.
+        """
+        if (self._worker is None or self._v2_bootstrap is None
+                or self._v2_port is None or self._v2_policy is None
+                or self._v2_installation_grant is None
+                or not callable(prepare) or not audience):
+            return None
+        policy = self._v2_policy
+        port = self._v2_port
+        bootstrap = self._v2_bootstrap
+        actor = self._v2_installation_grant.subject
+        operation_id = post_c02_reply_operation_id(c02_operation_id, source_ref)
+
+        def commit(graph: GraphCoordinator) -> CommitReceipt | None:
+            anchor = port.current_anchor(
+                namespace=policy.namespace,
+                authority_namespace=policy.authority_namespace)
+            lease, capability = graph.grant(
+                bootstrap, actor=actor, issuer_domain="d11",
+                namespace=policy.namespace,
+                domains=("d03", "d05", "d06", "d07", "d08", "d09", "d11"),
+                activation_generation=anchor.activation_generation,
+                operation_id=operation_id)
+            try:
+                authority = AuthorityContext(
+                    actor, "d11", capability, policy.namespace,
+                    ("event", "persona", "relation", "scene", "activity"),
+                    "expression", audience,
+                    policy.root_grant.policy_ref,
+                    anchor.activation_generation)
+                c02 = graph.get_operation(authority, lease, c02_operation_id)
+                if (c02 is None or c02.status not in {"committed", "duplicate"}
+                        or not {"memory.episode.v1", "memory.subjective_trace.v2"}
+                           <= {item.key.type_name for item in c02.write_versions}):
+                    return None
+                recorded = graph.get_operation(authority, lease, operation_id)
+                if recorded is not None:
+                    return recorded
+                candidate, bundle = prepare(graph, authority, lease, c02)
+                return commit_post_c02_reply_bundle_v1(
+                    graph, authority, lease,
+                    c02_operation_id=c02_operation_id, source_ref=source_ref,
+                    candidate=candidate, bundle=bundle)
+            finally:
+                graph.release_authority_lease(bootstrap, lease)
+
+        return await self._worker.call(commit)
 
     async def first_ingress_c02_accounting_installed_v1(
         self, *, require_worker_result: bool = True,
