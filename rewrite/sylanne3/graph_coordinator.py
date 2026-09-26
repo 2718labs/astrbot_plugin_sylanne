@@ -660,6 +660,26 @@ class CurrentOwnerViewV1:
     graph_binding: OwnerLeaseBindingV1
 
 
+@dataclass(frozen=True, slots=True)
+class CurrentRecollectionExperienceV1:
+    """One fenced C04 read; source literals never leave W01."""
+
+    namespace: NamespaceId
+    operation_id: str
+    experience: object
+    mood: object
+    source_ref: str
+    source_kind: str
+    assertion_status: str
+    provenance_eligibility: str
+    read_versions: tuple[GraphVersion, ...]
+    epoch: NamespaceEpoch
+    access_epoch: int
+    deletion_epoch: int
+    status: str = "current_authorized_read"
+    encoding_baseline_certified: bool = False
+
+
 class GraphCoordinator:
     """One in-process authority over a GraphStore's business SQLite connection.
 
@@ -4218,6 +4238,181 @@ class GraphCoordinator:
         return self._read_v2(
             authority, lambda: None, owner_principal=expected_principal,
             owner_view=True, owner_session_proof=proof)
+
+    def read_current_recollection_experience_v1(
+            self, *, namespace: NamespaceId, operation_id: str,
+            experience_ref: str, actor_id: str, principal: OwnerPrincipalV1,
+            owner_session_token: str,
+            owner_session_request: OwnerSessionLoginRequestV1,
+    ) -> CurrentRecollectionExperienceV1:
+        """Recheck a committed C04 experience and all source ancestors now.
+
+        The D04 inspector sees one business snapshot while the Authority read
+        fence is active. Only its content-free projection escapes this method.
+        """
+        from .authority_service.contract import identifier
+        from .domains.d04.affect import AffectProvider, AffectScheme
+        from .domains.d04.recollection_read import (
+            RecollectionSnapshotUnavailable,
+            inspect_recollection_experience_snapshot,
+        )
+
+        if (not isinstance(self.__store, ProductionGraphStore)
+                or self.__content_fence_v2 is None):
+            raise UnavailableGuard("current recollection requires production v2")
+        if type(namespace) is not NamespaceId or type(principal) is not OwnerPrincipalV1:
+            raise TypeError("typed recollection Owner identity is required")
+        identifier(operation_id, "operation_id")
+        identifier(actor_id, "actor_id")
+        experience_key = self._parse_ref(experience_ref, namespace)
+        if (experience_key.type_name != "d04.recollection_experience.v1"
+                or experience_key.owner.kind != "activity"):
+            raise AuthorityDenied("recollection experience ref differs")
+        registration = self.__providers.get("d04")
+        if registration is None or not isinstance(registration[0], AffectProvider):
+            raise UnavailableGuard("registered D04 affect provider is unavailable")
+        scheme = registration[0]._active_scheme
+        if type(scheme) is not AffectScheme:
+            raise UnavailableGuard("active D04 affect scheme is unavailable")
+        store = self.__store
+        with store._lock:
+            metadata, _ = self._v2_graph_stamp(namespace)
+        self._check_owner_session_v2(
+            namespace=namespace, principal=principal, actor_id=actor_id,
+            token=owner_session_token, request=owner_session_request,
+            target=metadata.requirements)
+        authority = AuthorityContext(
+            actor_id, "d12", "recollection-read:" + secrets.token_hex(16),
+            namespace, ("persona", "activity", "event"), "workbench_view",
+            ("owner",), "owner-grant-v1",
+            metadata.requirements.activation_generation)
+        mood_key = AtomKey(Owner("persona", *namespace.as_tuple),
+                           "d04.mood_field.v1", "current")
+
+        def reader() -> CurrentRecollectionExperienceV1:
+            db = store._db
+            if db.in_transaction:
+                raise UnavailableGuard("recollection read requires an idle graph connection")
+            db.execute("BEGIN")
+            try:
+                epoch = GraphStore.graph_epoch(
+                    store, *namespace.as_tuple,
+                    _capability=self.__graph_capability)
+                epoch_row = db.execute(
+                    "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                    "WHERE bot=? AND persona=?", namespace.as_tuple,
+                ).fetchone()
+                if epoch_row is None:
+                    raise UnavailableGuard("recollection access epochs are unavailable")
+                if (self._version(db, namespace, "scheme", "current")
+                        != scheme.scheme_version
+                        or self._version(db, namespace, "operator", "current")
+                        != scheme.operator_version):
+                    raise UnavailableGuard("current D04 affect scheme changed")
+                receipt = self._get_operation_fenced(
+                    authority, operation_id, v2=True)
+                if (receipt is None or receipt.status != "committed"
+                        or receipt.operation_id != operation_id
+                        or receipt.activity_id != experience_key.owner.subject
+                        or len(receipt.invalidated_epochs) != 1
+                        or receipt.invalidated_epochs[0].revision > epoch.revision):
+                    raise UnavailableGuard("committed C04 operation is unavailable")
+
+                atoms: dict[AtomKey, GraphAtom] = {}
+
+                def load(key: AtomKey) -> GraphAtom:
+                    if NamespaceId.from_key(key) != namespace:
+                        raise AuthorityDenied("recollection source crosses namespace")
+                    if key not in atoms:
+                        if len(atoms) >= 512:
+                            raise UnavailableGuard("recollection source closure exceeds read bound")
+                        store._validate_key(key)
+                        row = db.execute(
+                            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                            (key.token,),
+                        ).fetchone()
+                        atoms[key] = (GraphAtom(key, row[0], json.loads(row[1]),
+                                                bool(row[2])) if row else
+                                      GraphAtom(key, 0, {}, False))
+                    return atoms[key]
+
+                experience_atom = load(experience_key)
+                mood_atom = load(mood_key)
+                if not experience_atom.valid or not mood_atom.valid:
+                    raise UnavailableGuard("current C04 experience or mood is absent")
+                try:
+                    recollection_key = self._parse_ref(
+                        experience_atom.value["recollection_ref"], namespace)
+                    source = self._parse_ref(
+                        experience_atom.value["memory_ref"], namespace)
+                    basis = tuple(mood_atom.value["source_refs"])
+                    if not basis or len(basis) > 256:
+                        raise ValueError("mood source set is unbounded")
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise UnavailableGuard("current C04 source identities are invalid") from exc
+                load(recollection_key)
+                if (recollection_key.token not in receipt.ledger_refs
+                        or db.execute(
+                            "SELECT 1 FROM graph_bundle_refs WHERE bot=? AND persona=? "
+                            "AND operation_id=? AND ref_kind='experience' AND ref=?",
+                            namespace.as_tuple + (operation_id, recollection_key.token),
+                        ).fetchone() is None):
+                    raise UnavailableGuard("C04 operation does not own the recollection")
+                pending = [source.token, *basis]
+                seen: set[str] = set()
+                while pending:
+                    ref = pending.pop()
+                    if ref in seen:
+                        continue
+                    seen.add(ref)
+                    if len(seen) > 256:
+                        raise UnavailableGuard("recollection source ancestry exceeds read bound")
+                    key = self._parse_ref(ref, namespace)
+                    if key != source_key(*namespace.as_tuple, key.owner.subject or ""):
+                        raise UnavailableGuard("recollection source ref is not canonical")
+                    source_atom = load(key)
+                    load(access_key(*namespace.as_tuple, key.owner.subject))
+                    if not source_atom.valid:
+                        raise UnavailableGuard("current recollection ancestor is absent")
+                    try:
+                        record = SourceRecord.from_dict(source_atom.value)
+                    except (TypeError, ValueError) as exc:
+                        raise UnavailableGuard("current recollection ancestor is invalid") from exc
+                    pending.extend(source_key(*namespace.as_tuple, parent).token
+                                   for parent in record.parent_source_ids)
+                snapshot = GraphSnapshot(tuple(atoms.values()), (epoch,))
+                try:
+                    candidate = inspect_recollection_experience_snapshot(
+                        snapshot, namespace=namespace, audience=("owner",),
+                        purpose="context", experience_ref=experience_ref,
+                        mood_key=mood_key, receipt=receipt, scheme=scheme)
+                except RecollectionSnapshotUnavailable as exc:
+                    raise UnavailableGuard("current recollection source is unavailable") from exc
+                result = CurrentRecollectionExperienceV1(
+                    namespace, operation_id, candidate.experience, candidate.mood,
+                    candidate.source_ref, candidate.source_kind,
+                    candidate.assertion_status, candidate.provenance_eligibility,
+                    candidate.read_versions, candidate.epoch,
+                    epoch_row[0], epoch_row[1])
+                db.execute("COMMIT")
+                return result
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+
+        def final_check(result: CurrentRecollectionExperienceV1) -> None:
+            current = store._db.execute(
+                "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+                "WHERE bot=? AND persona=?", namespace.as_tuple,
+            ).fetchone()
+            if current != (result.access_epoch, result.deletion_epoch):
+                raise UnavailableGuard("recollection access or deletion epoch changed")
+
+        return self._read_v2(
+            authority, reader, owner_principal=principal,
+            owner_session_proof=(owner_session_token, owner_session_request),
+            final_check=final_check)
 
     @staticmethod
     def _owner_session_proof(actor: str, token: str | None,
