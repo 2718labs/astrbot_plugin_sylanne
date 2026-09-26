@@ -12,6 +12,7 @@ from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequest
 from sylanne3.contracts import canonical_json
 from sylanne3.domains.d04 import AffectAxis, AffectProvider, AffectScheme, MoodField
 from sylanne3.domains.d04.affect import RecollectionExperience
+from sylanne3.domains.d06 import source_correction_head_key
 from sylanne3.graph_coordinator import UnavailableGuard
 from sylanne3.graph_store import GraphStore, ProductionGraphStore
 from sylanne3.graph_types import AtomKey, Owner
@@ -174,6 +175,39 @@ def _read(case, experience):
     )
 
 
+def test_current_experience_holds_on_pending_ancestor_correction(tmp_path):
+    case, experience, _ = _fixture(tmp_path)
+    store, authority_db, _, _, namespace, _ = case
+    try:
+        assert _read(case, experience).status == "current_authorized_read"
+        head = source_correction_head_key(namespace, "ancestor-1")
+        source = source_key(*namespace.as_tuple, "ancestor-1")
+        correction = source_key(*namespace.as_tuple, "correction-1")
+        target = AtomKey(Owner("event", *namespace.as_tuple, "meaning-1"),
+                         "memory.interpretation", "current")
+        store._db.execute(
+            "INSERT INTO graph_atoms(token,bot,persona,owner_kind,subject,"
+            "type_name,name,revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,1)",
+            (head.token, *namespace.as_tuple, head.owner.kind,
+             head.owner.subject, head.type_name, head.name, 1,
+             canonical_json({
+                 "source_ref": source.token, "source_revision": 1,
+                 "correction_source_ref": correction.token,
+                 "target_refs": [target.token], "operation_id": "correction-1",
+                 "state": "pending_reevaluation", "access_epoch": 0,
+                 "deletion_epoch": 0,
+             })),
+        )
+        assert store._db.execute(
+            "SELECT revision FROM graph_atoms WHERE token=?",
+            (source.token,)).fetchone() == (1,)
+        with pytest.raises(UnavailableGuard, match="awaits reevaluation"):
+            _read(case, experience)
+    finally:
+        store.close()
+        authority_db.close()
+
+
 def test_current_recollection_rechecks_receipt_and_revoked_source(tmp_path):
     case, experience, ancestor_access = _fixture(tmp_path)
     store, authority_db = case[:2]
@@ -183,6 +217,9 @@ def test_current_recollection_rechecks_receipt_and_revoked_source(tmp_path):
         assert result.encoding_baseline_certified is False
         assert result.experience.experience_id == "experience-1"
         assert result.source_kind == result.provenance_eligibility == "observed"
+        assert any(item.key == source_correction_head_key(
+            case[4], "ancestor-1") and item.revision == 0
+            for item in result.read_versions)
         assert "text" not in {field.name for field in fields(result)}
         assert "private source literal" not in repr(result)
         assert "private ancestor literal" not in repr(result)

@@ -13,6 +13,7 @@ from sylanne3.authority_service.v2_owner_contract import (
 from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.contracts import canonical_json
 from sylanne3.domains.d07 import D07DomainProvider
+from sylanne3.domains.d06 import source_correction_head_key
 from sylanne3.graph_coordinator import AuthorityDenied, UnavailableGuard
 from sylanne3.graph_types import AtomKey, Owner
 from sylanne3.host.authority_profile import (
@@ -171,6 +172,25 @@ def test_source_correction_commits_atomic_bundle_and_replays_exact_receipt(tmp_p
             "SELECT value FROM graph_atoms WHERE token=?",
             (receipt.correction_source_ref,)).fetchone()
         assert json.loads(correction[0])["source_kind"] == "reported"
+        head = source_correction_head_key(namespace, source.owner.subject)
+        head_row = db.execute(
+            "SELECT revision,value FROM graph_atoms WHERE token=?",
+            (head.token,)).fetchone()
+        assert head_row[0] == 1
+        assert json.loads(head_row[1]) == {
+            "source_ref": source.token, "source_revision": 1,
+            "correction_source_ref": receipt.correction_source_ref,
+            "target_refs": [target.token], "operation_id": request.operation_id,
+            "state": "pending_reevaluation", "access_epoch": request.access_epoch,
+            "deletion_epoch": request.deletion_epoch,
+        }
+        assert db.execute(
+            "SELECT revision FROM graph_atoms WHERE token=?",
+            (source.token,)).fetchone() == (1,)
+        detail = json.loads(db.execute(
+            "SELECT receipt_json FROM graph_bundle_operations WHERE operation_id=?",
+            (request.operation_id,)).fetchone()[0])["source_correction"]
+        assert detail["correction_head_refs"] == [head.token]
         assert json.loads(db.execute(
             "SELECT value FROM graph_atoms WHERE token=?",
             (target.token,)).fetchone()[0])["status"] == "retracted"

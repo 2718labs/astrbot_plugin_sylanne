@@ -8,7 +8,8 @@ import pytest
 
 from sylanne3.domains.d06 import (
     CorrectionRequest, D06DomainAdapter, D06DomainProvider, SourceAdmission,
-    SourceCorrectionReadSetV1,
+    SourceCorrectionReadSetV1, source_correction_head_key,
+    validate_source_correction_head,
 )
 from sylanne3.contracts import Event, Scope
 from sylanne3.graph_store import GraphStore
@@ -29,6 +30,7 @@ SOURCE = source_key("bot", "persona", "source-1")
 ACCESS = access_key("bot", "persona", "source-1")
 TARGET = interpretation_key("bot", "persona", "meaning-1")
 D07 = AtomKey(Owner("persona", "bot", "persona"), "d07.belief_revision.v1", "belief-1")
+HEAD = source_correction_head_key(NAMESPACE, "source-1")
 
 
 def setup():
@@ -64,6 +66,7 @@ def setup():
         VersionGuard((
             GraphVersion(new_source, 0), GraphVersion(new_access, 0),
             GraphVersion(SOURCE, 1), GraphVersion(ACCESS, 1),
+            GraphVersion(HEAD, 0),
             GraphVersion(TARGET, 1), GraphVersion(D07, 1),
         ), (), 3, 2, "catalogue", "scheme", "operator", "policy", (), (), ()),
         qualification, input_refs, "budget", 100.0, 10.0, "interval", ("correction",),
@@ -75,7 +78,7 @@ def test_correction_compiles_reported_source_and_retraction_without_claiming_com
     request, reads, envelope = setup()
     candidate = ADAPTER.compile_source_correction(envelope, request, reads, recorded_at=5.0)
     proposal = candidate.proposal
-    new_source, new_access, invalidation = proposal.typed_writes
+    new_source, new_access, head, invalidation = proposal.typed_writes
     assert candidate.status == "proposal_requires_w01_atomic_bundle"
     assert candidate.correction_source_ref == new_source.key.token
     assert candidate.invalidated_target_refs == (TARGET.token,)
@@ -89,6 +92,11 @@ def test_correction_compiles_reported_source_and_retraction_without_claiming_com
     assert new_source.value["audiences"] == ["owner"]
     assert new_source.value["purposes"] == ["context"]
     assert new_access.value["status"] == "active"
+    assert head.key == HEAD
+    assert head.value["source_ref"] == SOURCE.token
+    assert head.value["source_revision"] == 1
+    assert head.value["target_refs"] == [TARGET.token]
+    assert head.value["state"] == "pending_reevaluation"
     assert invalidation.key == TARGET
     assert invalidation.value["status"] == "retracted"
     assert invalidation.value["valid_to"] == 5.0
@@ -102,6 +110,7 @@ def test_correction_compiles_reported_source_and_retraction_without_claiming_com
     classified_current = {version.key for version in proposal.dependencies.current_invalidation}
     assert actual_current == classified_current == {new_source.key}
     assert new_access.dependencies == (new_source.key,)
+    assert head.dependencies == (new_source.key,)
     assert invalidation.dependencies == (new_source.key,)
 
 
@@ -136,6 +145,7 @@ def test_correction_writes_commit_without_self_dependency_cycle():
             assert GraphVersion(TARGET, 2) in receipt.revisions
             corrected = store.graph_snapshot((TARGET,))
             assert corrected.atoms[0].value["status"] == "retracted"
+            assert store.graph_snapshot((HEAD,)).atoms[0].value["state"] == "pending_reevaluation"
         finally:
             store.close()
 
@@ -172,3 +182,21 @@ def test_correction_rejects_wrong_target_cross_namespace_and_unrelated_claim():
         reads.interpretations[0], status="retracted", valid_to=3.0),))
     with pytest.raises(ValueError, match="current dependent interpretation"):
         ADAPTER.compile_source_correction(envelope, request, old, recorded_at=5.0)
+
+
+def test_correction_head_rejects_cross_namespace_and_missing_absence_read():
+    request, reads, envelope = setup()
+    candidate = ADAPTER.compile_source_correction(
+        envelope, request, reads, recorded_at=5.0)
+    head = candidate.proposal.typed_writes[2]
+    other = source_key("other-bot", "persona", "other-source")
+    with pytest.raises(ValueError, match="correction ref differs"):
+        validate_source_correction_head(
+            head.key, {**head.value, "correction_source_ref": other.token})
+    missing = replace(envelope.version_guard, read_versions=tuple(
+        version for version in envelope.version_guard.read_versions
+        if version.key != HEAD))
+    with pytest.raises(ValueError, match="complete CAS"):
+        ADAPTER.compile_source_correction(
+            replace(envelope, version_guard=missing), request, reads,
+            recorded_at=5.0)

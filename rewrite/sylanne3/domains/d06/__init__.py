@@ -80,6 +80,18 @@ _RECOLLECTION_PROJECTION_SCHEMA_HASH = schema_hash({
     "storage_role": "source",
     "fields": sorted(_RECOLLECTION_PROJECTION_FIELDS),
 })
+SOURCE_CORRECTION_HEAD_TYPE = "d06.source_correction_head.v1"
+_SOURCE_CORRECTION_HEAD_FIELDS = frozenset({
+    "source_ref", "source_revision", "correction_source_ref", "target_refs",
+    "operation_id", "state", "access_epoch", "deletion_epoch",
+})
+_SOURCE_CORRECTION_HEAD_SCHEMA_HASH = schema_hash({
+    "type": SOURCE_CORRECTION_HEAD_TYPE,
+    "version": 1,
+    "owner_kinds": ("event",),
+    "storage_role": "state",
+    "fields": sorted(_SOURCE_CORRECTION_HEAD_FIELDS),
+})
 _WORKBENCH_VIEW = "d06.memory_sources.v1"
 _WORKBENCH_FIELDS = frozenset({"sources", "coverage"})
 _WORKBENCH_TYPES = ("memory.source", "memory.access", "memory.interpretation")
@@ -218,6 +230,61 @@ def _canonical_graph_refs(
             raise ValueError(f"{label} item would cross namespace")
         keys.append(key.token)
     return tuple(sorted(keys))
+
+
+def source_correction_head_key(namespace: NamespaceId, source_id: str) -> AtomKey:
+    """Stable current-correction address for an old D06 source."""
+    if type(namespace) is not NamespaceId:
+        raise TypeError("source correction head requires a namespace")
+    return AtomKey(Owner("event", *namespace.as_tuple, _nonempty(source_id, "source_id")),
+                   SOURCE_CORRECTION_HEAD_TYPE, "current")
+
+
+def validate_source_correction_head(key: AtomKey, value: object) -> None:
+    """Validate the D06 current-interpretation barrier, including its address."""
+    if (type(key) is not AtomKey or key.type_name != SOURCE_CORRECTION_HEAD_TYPE
+            or key.name != "current" or key.owner.kind != "event"):
+        raise ValueError("source correction head key is not canonical")
+    if type(value) is not dict or frozenset(value) != _SOURCE_CORRECTION_HEAD_FIELDS:
+        raise ValueError("source correction head fields differ")
+    namespace = NamespaceId.from_key(key)
+    source = source_key(*namespace.as_tuple, key.owner.subject)
+    if value["source_ref"] != source.token:
+        raise ValueError("source correction head source differs from its address")
+    if type(value["source_revision"]) is not int or value["source_revision"] <= 0:
+        raise ValueError("source correction head revision must be positive")
+    correction = AtomKey.from_token(_nonempty(
+        value["correction_source_ref"], "correction_source_ref"))
+    if (NamespaceId.from_key(correction) != namespace
+            or correction.type_name != "memory.source" or correction.name != "record"
+            or correction.owner.kind != "event" or correction == source):
+        raise ValueError("source correction head correction ref differs")
+    targets = value["target_refs"]
+    if type(targets) is not list or not targets or len(set(targets)) != len(targets):
+        raise ValueError("source correction head targets must be distinct")
+    for ref in targets:
+        target = AtomKey.from_token(_nonempty(ref, "target_ref"))
+        if (NamespaceId.from_key(target) != namespace
+                or target.type_name != "memory.interpretation"
+                or target.name != "current" or target.owner.kind != "event"):
+            raise ValueError("source correction head target crosses contract")
+    _nonempty(value["operation_id"], "operation_id")
+    if value["state"] != "pending_reevaluation":
+        raise ValueError("source correction head requires pending reevaluation")
+    for name in ("access_epoch", "deletion_epoch"):
+        if type(value[name]) is not int or value[name] < 0:
+            raise ValueError(f"source correction head {name} must be nonnegative")
+
+
+def _validate_source_correction_head_value(value: object) -> None:
+    if type(value) is not dict or "source_ref" not in value:
+        raise ValueError("source correction head source is absent")
+    source = AtomKey.from_token(value["source_ref"])
+    if source.owner.kind != "event" or source.type_name != "memory.source":
+        raise ValueError("source correction head source ref differs")
+    validate_source_correction_head(
+        source_correction_head_key(NamespaceId.from_key(source), source.owner.subject),
+        value)
 
 
 class TriggerKind(Enum):
@@ -749,6 +816,15 @@ class D06DomainProvider:
             writer_domain="d06",
             schema_hash=_RECOLLECTION_PROJECTION_SCHEMA_HASH,
         ))
+        specs.append(TypeSpec(
+            SOURCE_CORRECTION_HEAD_TYPE,
+            ("event",),
+            "state",
+            _validate_source_correction_head_value,
+            immutable=False,
+            writer_domain="d06",
+            schema_hash=_SOURCE_CORRECTION_HEAD_SCHEMA_HASH,
+        ))
         return tuple(sorted(specs, key=lambda item: item.name))
 
     def register_types(self) -> tuple[str, ...]:
@@ -769,6 +845,27 @@ class D06DomainProvider:
             if spec.writer_domain != "d06":
                 raise ValueError("D06 proposal contains a non-D06 graph write")
             registry.validate(write.key, write.value)
+            if write.key.type_name == SOURCE_CORRECTION_HEAD_TYPE:
+                validate_source_correction_head(write.key, write.value)
+        heads = [write for write in proposal.typed_writes
+                 if write.key.type_name == SOURCE_CORRECTION_HEAD_TYPE]
+        if heads:
+            reads = {item.key: item for item in proposal.envelope.version_guard.read_versions}
+            writes = {write.key: write for write in proposal.typed_writes}
+            for head in heads:
+                source = AtomKey.from_token(head.value["source_ref"])
+                correction = AtomKey.from_token(head.value["correction_source_ref"])
+                targets = tuple(AtomKey.from_token(ref)
+                                for ref in head.value["target_refs"])
+                if (reads.get(head.key) != GraphVersion(head.key, 0)
+                        or reads.get(source) != GraphVersion(
+                            source, head.value["source_revision"])
+                        or correction not in writes
+                        or not set(targets).issubset(writes)
+                        or head.dependencies != (correction,)
+                        or source.owner.subject not in
+                        writes[correction].value.get("parent_source_ids", [])):
+                    raise ValueError("source correction head lacks bound read and writes")
         projections = [write for write in proposal.typed_writes
                        if write.key.type_name == _RECOLLECTION_PROJECTION_TYPE]
         if projections:
@@ -1761,6 +1858,8 @@ class D06DomainAdapter:
         targets = _canonical_graph_refs(request.target_refs, "target_refs",
                                         self.namespace, allow_empty=False)
         basis_keys = tuple(AtomKey.from_token(ref) for ref in basis)
+        head_keys = tuple(source_correction_head_key(
+            self.namespace, key.owner.subject) for key in basis_keys)
         target_keys = tuple(AtomKey.from_token(ref) for ref in targets)
         if (any(key.type_name != "memory.source" or key.name != "record"
                 or key.owner.kind != "event" for key in basis_keys)
@@ -1812,6 +1911,8 @@ class D06DomainAdapter:
         )))
         if (guarded.get(correction_key) != GraphVersion(correction_key, 0)
                 or guarded.get(correction_access) != GraphVersion(correction_access, 0)
+                or any(guarded.get(key) != GraphVersion(key, 0)
+                       for key in head_keys)
                 or any(guarded.get(key) is None or guarded[key].revision <= 0
                        for key in positive)):
             raise ValueError("correction lacks complete CAS reads and absence proofs")
@@ -1849,6 +1950,18 @@ class D06DomainAdapter:
             GraphWrite(correction_key, admitted.source.to_dict()),
             GraphWrite(correction_access, access_value, (correction_key,)),
         ]
+        for source_ref, head_key in zip(basis, head_keys):
+            source_version = guarded[AtomKey.from_token(source_ref)].revision
+            writes.append(GraphWrite(head_key, {
+                "source_ref": source_ref,
+                "source_revision": source_version,
+                "correction_source_ref": correction_key.token,
+                "target_refs": list(targets),
+                "operation_id": request.request_id,
+                "state": "pending_reevaluation",
+                "access_epoch": request.access_epoch,
+                "deletion_epoch": request.deletion_epoch,
+            }, (correction_key,)))
         for key, old in zip(target_keys, reads.interpretations):
             retracted = replace(old, status="retracted", valid_to=recorded_at)
             writes.append(GraphWrite(key, retracted.to_dict(), (correction_key,)))

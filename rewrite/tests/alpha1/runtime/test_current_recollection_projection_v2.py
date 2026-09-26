@@ -7,6 +7,7 @@ import pytest
 
 from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.contracts import canonical_json
+from sylanne3.domains.d06 import source_correction_head_key
 from sylanne3.graph_coordinator import UnavailableGuard
 from sylanne3.graph_types import AtomKey, Owner
 from sylanne3.memory_types import source_key
@@ -104,6 +105,33 @@ def test_current_d06_projection_uses_same_fenced_source_and_c04_receipt(tmp_path
              ancestor_access.token),
         )
         with pytest.raises(UnavailableGuard, match="current recollection source"):
+            _read(case, projection)
+        store._db.execute(
+            "UPDATE graph_atoms SET value=?,revision=revision-1 WHERE token=?",
+            (row[0], ancestor_access.token),
+        )
+        head = source_correction_head_key(namespace, "ancestor-1")
+        correction = source_key(*namespace.as_tuple, "correction-1")
+        store._db.execute(
+            "INSERT INTO graph_atoms(token,bot,persona,owner_kind,subject,"
+            "type_name,name,revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,1)",
+            (head.token, *namespace.as_tuple, head.owner.kind,
+             head.owner.subject, head.type_name, head.name, 1,
+             canonical_json({
+                 "source_ref": source_key(*namespace.as_tuple, "ancestor-1").token,
+                 "source_revision": 1,
+                 "correction_source_ref": correction.token,
+                 "target_refs": [AtomKey(
+                     Owner("event", *namespace.as_tuple, "meaning-1"),
+                     "memory.interpretation", "current").token],
+                 "operation_id": "correction-1", "state": "pending_reevaluation",
+                 "access_epoch": 0, "deletion_epoch": 0,
+             })),
+        )
+        assert store._db.execute(
+            "SELECT revision FROM graph_atoms WHERE token=?",
+            (source.token,)).fetchone() == (1,)
+        with pytest.raises(UnavailableGuard, match="awaits reevaluation"):
             _read(case, projection)
     finally:
         store.close()

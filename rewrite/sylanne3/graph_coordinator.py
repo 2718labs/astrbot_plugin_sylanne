@@ -4277,6 +4277,7 @@ class GraphCoordinator:
         from .domains.d04.source_head import D04SourceHeadRead, _qualified_head
         from .domains.d06 import (
             CorrectionRequest, D06DomainAdapter, SourceCorrectionReadSetV1,
+            source_correction_head_key,
         )
         from .domains.d07 import D07DomainProvider
         from .host.authority_profile import (
@@ -4360,6 +4361,9 @@ class GraphCoordinator:
             request.statement, request.access_epoch, request.deletion_epoch)
         adapter = D06DomainAdapter(namespace)
         correction_key = adapter.correction_source_key(correction)
+        head_refs = tuple(source_correction_head_key(
+            namespace, self._parse_ref(ref, namespace).owner.subject).token
+            for ref in request.source_refs)
 
         def prior_or_pending():
             db = store._db
@@ -4382,10 +4386,11 @@ class GraphCoordinator:
                         or fence is None or fence[0] != committed.operation_digest
                         or not {item.key.token for item in committed.write_versions}
                         .issuperset({correction_key.token, *request.target_refs,
-                                    detail.get("reevaluation_outbox_ref")})
+                                    *head_refs, detail.get("reevaluation_outbox_ref")})
                         or detail.get("request_digest") != request.request_digest
                         or detail.get("correction_source_ref") != correction_key.token
                         or detail.get("source_refs") != list(request.source_refs)
+                        or detail.get("correction_head_refs") != list(head_refs)
                         or detail.get("invalidated_target_refs")
                         != list(request.target_refs)
                         or detail.get("reevaluation_status") != "pending"):
@@ -4482,8 +4487,13 @@ class GraphCoordinator:
                         source = load(key)
                         access = load(access_key(
                             *namespace.as_tuple, key.owner.subject))
+                        head = load(source_correction_head_key(
+                            namespace, key.owner.subject))
                         if not source.valid or not access.valid:
                             raise UnavailableGuard("correction source or ancestor unavailable")
+                        if head.revision != 0:
+                            raise UnavailableGuard(
+                                "correction source or ancestor has pending reevaluation")
                         record = SourceRecord.from_dict(source.value)
                         validate_access(access.value)
                         pending.extend(source_key(*namespace.as_tuple, parent).token
@@ -4685,6 +4695,7 @@ class GraphCoordinator:
         from .domains.d06 import (
             RecollectionProjectionUnavailable,
             inspect_recollection_projection_snapshot,
+            source_correction_head_key, validate_source_correction_head,
         )
 
         if (not isinstance(self.__store, ProductionGraphStore)
@@ -4833,8 +4844,21 @@ class GraphCoordinator:
                         raise UnavailableGuard("recollection source ref is not canonical")
                     source_atom = load(key)
                     load(access_key(*namespace.as_tuple, key.owner.subject))
+                    correction_head = load(source_correction_head_key(
+                        namespace, key.owner.subject))
                     if not source_atom.valid:
                         raise UnavailableGuard("current recollection ancestor is absent")
+                    if correction_head.revision:
+                        try:
+                            if not correction_head.valid:
+                                raise ValueError("inactive correction head")
+                            validate_source_correction_head(
+                                correction_head.key, correction_head.value)
+                        except (TypeError, ValueError) as exc:
+                            raise UnavailableGuard(
+                                "current recollection correction head is invalid") from exc
+                        raise UnavailableGuard(
+                            "current recollection interpretation awaits reevaluation")
                     try:
                         record = SourceRecord.from_dict(source_atom.value)
                     except (TypeError, ValueError) as exc:
@@ -14493,9 +14517,13 @@ class GraphCoordinator:
             if correction_issuance is not None:
                 request = correction_issuance[3]
                 correction_ref = bundle.proposals[0].typed_writes[0].key.token
+                from .domains.d06 import source_correction_head_key
+                head_refs = tuple(source_correction_head_key(
+                    namespace, AtomKey.from_token(ref).owner.subject).token
+                    for ref in request.source_refs)
                 expected_writes = {
                     correction_ref, *request.target_refs,
-                    bundle.persistent_job_refs[0], bundle.outbox_refs[0],
+                    *head_refs, bundle.persistent_job_refs[0], bundle.outbox_refs[0],
                 }
                 written = {item.key.token for item in graph_receipt.revisions}
                 if (not expected_writes.issubset(written)
@@ -14505,6 +14533,7 @@ class GraphCoordinator:
                     "request_digest": request.request_digest,
                     "correction_source_ref": correction_ref,
                     "source_refs": list(request.source_refs),
+                    "correction_head_refs": list(head_refs),
                     "invalidated_target_refs": list(request.target_refs),
                     "reevaluation_outbox_ref": bundle.outbox_refs[0],
                     "audit_event_ref": identity.operation_id,
