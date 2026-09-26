@@ -222,6 +222,7 @@ class RecollectionBundleTests(unittest.TestCase):
                 "memory.episode.v1", "memory.subjective_trace.v1",
                 "memory.subjective_trace.v2",
                 "memory.association.v1", "d06.recollection.v1",
+                "d06.recollection_projection.v1",
             },
         )
         registry = TypeRegistry()

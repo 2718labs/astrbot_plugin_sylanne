@@ -8,6 +8,7 @@ from sylanne3.domains.d06 import (
     CandidateItem, CandidateSet, D06DomainAdapter, D06DomainProvider,
     RecollectionContext, SelectionTicket,
 )
+from sylanne3.domains.d06.pipeline import D06MemoryPipeline
 from sylanne3.graph_coordinator import BudgetAdmission, GraphCoordinator, RuntimeAdmission
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import AtomKey, GraphWrite, Owner, TypeRegistry
@@ -103,12 +104,16 @@ class RecollectionCoordinatorCommitTests(unittest.TestCase):
                 Owner("activity", "bot", "persona", "activity-1"),
                 "d06.recollection.v1", recollection.recollection_id,
             )
+            projection_key = AtomKey(
+                Owner("activity", "bot", "persona", "activity-1"),
+                "d06.recollection_projection.v1", "projection-1",
+            )
             authority = AuthorityContext(
                 "host", "d06", capability, namespace, ("event", "activity"), "context",
                 ("owner",), "policy-1", 1,
             )
             snapshot = coordinator.read_snapshot(
-                authority, lease, (source, access, recollection_key),
+                authority, lease, (source, access, recollection_key, projection_key),
             )
             input_refs = (ticket.ticket_id, candidates.candidate_set_id)
             envelope = CommandEnvelope(
@@ -196,6 +201,32 @@ class RecollectionCoordinatorCommitTests(unittest.TestCase):
             )
             proposal = next(item for item in candidate_bundle.proposals if item.domain == "d06")
             write = proposal.typed_writes[0]
+            projection_value = {
+                "projection_id": "projection-1", "activity_id": "activity-1",
+                "recollection_ref": write.key.token, "experience_ref": feeling.token,
+                "source_ref": source.token, "source_revision": 1,
+                "mood_ref": AtomKey(
+                    Owner("persona", "bot", "persona"), "d04.mood_field.v1", "mood-1",
+                ).token,
+                "mood_revision": 1, "coupling_version": "coupling-1",
+                "projection_version": "d06.affective_projection.v1",
+                "state": "committed_subjective_projection",
+                "evidence_eligibility": "subjective_only", "details": [],
+                "subjective_weight": [0.4, 0.6], "subjective_tone": [-0.1, 0.1],
+                "duration_interval": None, "encoding_trace_ref": None,
+                "baseline_status": "not_read",
+            }
+            projection_write = GraphWrite(projection_key, projection_value)
+            proposal = replace(proposal, typed_writes=(*proposal.typed_writes, projection_write))
+            provider.validate(proposal)
+            invalid_value = {**projection_value,
+                             "source_ref": source_key("bot", "persona", "other-source").token}
+            invalid_proposal = replace(
+                proposal,
+                typed_writes=(*proposal.typed_writes[:-1], GraphWrite(projection_key, invalid_value)),
+            )
+            with self.assertRaisesRegex(ValueError, "differs from its persisted recollection"):
+                provider.validate(invalid_proposal)
             self.assertEqual(write.dependencies, ())
             self.assertEqual(proposal.dependencies.current_invalidation, ())
             self.assertEqual(proposal.dependencies.historical_provenance, proofs)
@@ -208,7 +239,16 @@ class RecollectionCoordinatorCommitTests(unittest.TestCase):
             receipt = coordinator.commit_domain_bundle(bundle, lease)
 
             self.assertEqual(receipt.status, "committed")
-            self.assertEqual({item.key for item in receipt.write_versions}, {write.key})
+            self.assertEqual({item.key for item in receipt.write_versions},
+                             {write.key, projection_write.key})
+            reread = D06MemoryPipeline(adapter, repository).read_recollection_projection(
+                store.graph_snapshot((projection_key,)), projection_key.token,
+            )
+            self.assertEqual(reread["read_status"],
+                             "hold_unverified_access_and_d04_experience")
+            self.assertEqual(reread["evidence_eligibility"], "subjective_only")
+            self.assertNotIn("literal_text", str(reread))
+            self.assertNotIn("recalled_text", str(reread))
         finally:
             store.close()
 

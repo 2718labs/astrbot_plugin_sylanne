@@ -782,7 +782,8 @@ class D06DomainProvider:
                     or projection.value["activity_id"] != recollection.value["activity_id"]
                     or projection_source.owner.subject not in recollection.value["content_refs"]
                     or projection_source.type_name != "memory.source"
-                    or NamespaceId.from_key(projection_source) != self.namespace
+                    or NamespaceId.from_key(projection_source)
+                    != proposal.envelope.authority.namespace
                     or projection.key.owner != recollection.key.owner):
                 raise ValueError("C04 projection differs from its persisted recollection")
         trace_types = {"memory.subjective_trace.v1", "memory.subjective_trace.v2"}
@@ -1851,12 +1852,13 @@ class D06DomainAdapter:
         for key, old in zip(target_keys, reads.interpretations):
             retracted = replace(old, status="retracted", valid_to=recorded_at)
             writes.append(GraphWrite(key, retracted.to_dict(), (correction_key,)))
+        current_edges = tuple(dict.fromkeys(
+            dependency for write in writes for dependency in write.dependencies
+        ))
         proposal = self.wrap_runtime_proposal(
             envelope, typed_writes=tuple(writes),
             dependencies=DependencySet(
-                current_invalidation=(guarded[correction_key], guarded[correction_access],
-                                      *(guarded[key] for key in target_keys),
-                                      *(guarded[key] for key in d07_keys)),
+                current_invalidation=tuple(guarded[key] for key in current_edges),
                 historical_provenance=tuple(guarded[key] for key in positive),
             ),
             contribution_keys=(f"source-correction:{correction_key.token}",),

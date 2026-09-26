@@ -1,14 +1,19 @@
 """D06 source corrections remain graph candidates until W01 adopts a full bundle."""
 
 from dataclasses import replace
+from pathlib import Path
+import tempfile
 
 import pytest
 
 from sylanne3.domains.d06 import (
-    CorrectionRequest, D06DomainAdapter, SourceAdmission,
+    CorrectionRequest, D06DomainAdapter, D06DomainProvider, SourceAdmission,
     SourceCorrectionReadSetV1,
 )
-from sylanne3.graph_types import AtomKey, GraphVersion, Owner
+from sylanne3.contracts import Event, Scope
+from sylanne3.graph_store import GraphStore
+from sylanne3.graph_types import AtomKey, GraphCandidate, GraphVersion, GraphWrite, Owner, TypeRegistry
+from sylanne3.memory_repository import MemoryRepository
 from sylanne3.memory_types import (
     InterpretationRecord, SourceRecord, access_key, interpretation_key, source_key,
 )
@@ -88,8 +93,51 @@ def test_correction_compiles_reported_source_and_retraction_without_claiming_com
     assert invalidation.value["status"] == "retracted"
     assert invalidation.value["valid_to"] == 5.0
     assert invalidation.value["claim"] == reads.interpretations[0].claim
-    assert GraphVersion(TARGET, 1) in proposal.dependencies.current_invalidation
-    assert GraphVersion(D07, 1) in proposal.dependencies.current_invalidation
+    assert GraphVersion(TARGET, 1) not in proposal.dependencies.current_invalidation
+    assert GraphVersion(TARGET, 1) in proposal.dependencies.historical_provenance
+    assert GraphVersion(D07, 1) not in proposal.dependencies.current_invalidation
+    assert GraphVersion(D07, 1) in proposal.dependencies.historical_provenance
+    actual_current = {dependency for write in proposal.typed_writes
+                      for dependency in write.dependencies}
+    classified_current = {version.key for version in proposal.dependencies.current_invalidation}
+    assert actual_current == classified_current == {new_source.key}
+    assert new_access.dependencies == (new_source.key,)
+    assert invalidation.dependencies == (new_source.key,)
+
+
+def test_correction_writes_commit_without_self_dependency_cycle():
+    request, reads, envelope = setup()
+    registry = TypeRegistry()
+    for spec in D06DomainProvider.type_specs():
+        registry.register(spec)
+    with tempfile.TemporaryDirectory() as directory:
+        store = GraphStore(Path(directory) / "correction.db", registry)
+        try:
+            repository = MemoryRepository(store, "bot", "persona")
+            scope = Scope("bot", "persona", "session")
+            repository.ingest(Event(scope, "source-ingress", 1.0, "ingress", {}),
+                              reads.sources[0])
+            initial = store.graph_snapshot((TARGET, SOURCE))
+            store.graph_commit(GraphCandidate(
+                Event(scope, "interpretation-ingress", 2.0, "ingress", {}),
+                initial.versions,
+                (GraphWrite(TARGET, reads.interpretations[0].to_dict(), (SOURCE,)),),
+                initial.epochs,
+            ))
+            candidate = ADAPTER.compile_source_correction(
+                envelope, request, reads, recorded_at=5.0,
+            )
+            write_keys = tuple(write.key for write in candidate.proposal.typed_writes)
+            snapshot = store.graph_snapshot(write_keys)
+            receipt = store.graph_commit(GraphCandidate(
+                Event(scope, "correction-ingress", 5.0, "correction", {}),
+                snapshot.versions, candidate.proposal.typed_writes, snapshot.epochs,
+            ))
+            assert GraphVersion(TARGET, 2) in receipt.revisions
+            corrected = store.graph_snapshot((TARGET,))
+            assert corrected.atoms[0].value["status"] == "retracted"
+        finally:
+            store.close()
 
 
 def test_correction_rejects_revocation_missing_proof_and_stale_epochs():
