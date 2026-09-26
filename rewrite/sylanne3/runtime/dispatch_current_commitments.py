@@ -5,14 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 
-from ..authority_service.v2_contract import FencePermitV2
+from ..authority_service.v2_contract import (
+    AuthorityDispatchSnapshotV1, DispatchHandoffContextV1, FencePermitV2,
+    OwnerDispatchWitnessV1,
+)
+from ..authority_service.reverse_handoff import require_exact_authority_snapshot
 from ..authority_service.v2_execution_bridge import CurrentEffectReadV2
 from ..contracts import canonical_json
 from ..domains.d08.execution import (
     ActionCancellationState, ActionIntent, ActionOutcome, Commitment, GoalExecutionProvider,
 )
 from ..graph_types import AtomKey, GraphSnapshot, GraphVersion, Owner
-from ..runtime_contracts import NamespaceId, QueryEpoch, canonical_digest
+from ..runtime_contracts import NamespaceId, QueryEpoch, VersionedRef, canonical_digest
 from .d11_types import job_graph_write
 from .dispatch_action_job_binding import load_action_job_binding
 from .dispatch_admission import load_admission
@@ -67,6 +71,114 @@ class CurrentD08ActionConflictEvidenceV1:
     action_job_binding_digest: str | None = None
     job_graph_version: GraphVersion | None = None
     action_cancellation_graph_version: GraphVersion | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentD08ObservedVersionsV1:
+    """Direct observations only; no synthetic RequiredCheck epoch is asserted."""
+
+    query_epoch: QueryEpoch
+    goal_version: VersionedRef
+    commitment_versions: tuple[VersionedRef, ...]
+    execution_head_seq: int
+    execution_head_digest: str
+    cancellation_graph_version: GraphVersion
+    job_graph_version: GraphVersion
+    action_job_binding_digest: str
+    other_unresolved_effect_ids: tuple[str, ...]
+    authority_snapshot_digest: str
+
+
+def read_current_d08_observed_versions(
+    db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
+    action_id: str, context: DispatchHandoffContextV1,
+    witness: OwnerDispatchWitnessV1,
+    authority_snapshot: AuthorityDispatchSnapshotV1,
+    effect: CurrentEffectReadV2,
+) -> CurrentD08ObservedVersionsV1:
+    """Correlate graph goal/action/job heads with the complete P2 effect set.
+
+    The installed reverse callback must supply ``authority_snapshot`` and the
+    installed V2 port must supply ``effect``. Equality checks here cannot
+    authenticate arbitrary caller-created DTOs. This result deliberately has
+    no ``current_read_confirmed`` or CheckReceipt field: the mapping of D08's
+    synthetic cancellation/query epoch refs still needs a shared contract.
+    """
+    if (not db.in_transaction or type(namespace) is not NamespaceId
+            or type(snapshot) is not GraphSnapshot or type(query) is not QueryEpoch
+            or type(context) is not DispatchHandoffContextV1
+            or type(witness) is not OwnerDispatchWitnessV1
+            or type(authority_snapshot) is not AuthorityDispatchSnapshotV1
+            or type(effect) is not CurrentEffectReadV2):
+        raise ValueError("current D08 observation requires typed graph transaction inputs")
+    require_exact_authority_snapshot(context, witness, authority_snapshot)
+    from ..graph_coordinator import namespace_ref
+
+    if (len(snapshot.epochs) != 1
+            or context.permit.namespace != namespace_ref(namespace)
+            or query != QueryEpoch(namespace, "all", snapshot.epochs[0].revision)):
+        raise ValueError("D08 observation P2 or graph query differs")
+    own = tuple(item for item in authority_snapshot.unresolved_effects
+                if item.effect_id == context.permit.effect_id)
+    if (len(own) != 1 or own[0].phase != "claimed"
+            or own[0].operation_id != context.permit.operation_id
+            or own[0].mutation_id != effect.mutation_id
+            or own[0].execution_seq != effect.effect_seq
+            or own[0].append_digest != effect.append_digest
+            or effect.state != "unresolved"
+            or (effect.execution_head_seq, effect.execution_head_digest)
+            != (authority_snapshot.anchor.execution_seq,
+                authority_snapshot.anchor.execution_digest)):
+        raise ValueError("D08 observation does not match claimed P2 effect")
+    facts = read_current_d08_conflict_facts(db, namespace, snapshot, query)
+    action = read_current_d08_action_conflict_evidence(
+        db, namespace, snapshot, query, action_id, context.permit, effect)
+    if (action.effect_state != "unresolved"
+            or action.action_cancellation_state != "clear"
+            or action.job_cancellation_state != "clear"
+            or action.action_cancellation_graph_version is None
+            or action.job_graph_version is None
+            or action.action_job_binding_digest is None):
+        raise ValueError("D08 action cancellation or bound job is unproven")
+    intents = tuple(item for item in facts.action_intents
+                    if item.action_id == action_id)
+    if len(intents) != 1:
+        raise ValueError("D08 current action is not unique")
+    intent = intents[0]
+    goal_rows = db.execute(
+        "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
+        "AND type_name='d08.goal.v1' AND name=?",
+        namespace.as_tuple + (intent.goal_ref,),
+    ).fetchall()
+    if len(goal_rows) != 1:
+        raise ValueError("D08 current goal is absent or ambiguous")
+    token, revision, encoded, valid = goal_rows[0]
+    goal_key = AtomKey.from_token(token)
+    goal_atom = snapshot.get(goal_key)
+    goal_spec = next(spec for spec in GoalExecutionProvider().register_types()
+                     if spec.name == "d08.goal.v1")
+    goal = goal_spec.validator(json.loads(encoded))
+    if (valid != 1 or goal_atom is None or not goal_atom.valid
+            or goal_atom.revision != revision or goal_atom.value != json.loads(encoded)
+            or goal.goal_id != intent.goal_ref or goal.revision != revision):
+        raise ValueError("D08 current goal changed")
+    by_id = {item.commitment_id: item for item in facts.commitments}
+    commitment_versions = []
+    for ref in intent.commitment_refs:
+        item = by_id.get(ref)
+        if item is None:
+            raise ValueError("D08 pinned commitment is absent")
+        commitment_versions.append(VersionedRef(ref, item.revision))
+    return CurrentD08ObservedVersionsV1(
+        query, VersionedRef(intent.goal_ref, revision),
+        tuple(commitment_versions), authority_snapshot.anchor.execution_seq,
+        authority_snapshot.anchor.execution_digest,
+        action.action_cancellation_graph_version,
+        action.job_graph_version, action.action_job_binding_digest,
+        tuple(item.effect_id for item in authority_snapshot.unresolved_effects
+              if item.effect_id != context.permit.effect_id),
+        canonical_digest(authority_snapshot),
+    )
 
 
 def _current_action_cancellation(
@@ -545,6 +657,7 @@ def read_current_d08_action_conflict_evidence(
 
 __all__ = [
     "CurrentD08ActionConflictEvidenceV1", "CurrentD08ConflictFactsV1",
-    "CurrentJobCancellationReadV1", "read_current_d08_action_conflict_evidence",
-    "read_current_d08_conflict_facts", "read_current_job_cancellation",
+    "CurrentD08ObservedVersionsV1", "CurrentJobCancellationReadV1",
+    "read_current_d08_action_conflict_evidence", "read_current_d08_conflict_facts",
+    "read_current_d08_observed_versions", "read_current_job_cancellation",
 ]

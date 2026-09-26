@@ -11,6 +11,11 @@ import json
 import math
 from typing import Mapping
 
+from ..authority_service.v2_contract import (
+    AuthorityDispatchSnapshotV1, DispatchHandoffContextV1,
+    OwnerDispatchWitnessV1,
+)
+from ..authority_service.reverse_handoff import require_exact_authority_snapshot
 from ..domains.d08.execution import ActionIntent
 from ..runtime_contracts import CheckReceipt, NamespaceId, VersionedRef
 from ..runtime_journal import (
@@ -214,6 +219,75 @@ def _check_dispatch_journal_constraints(
     return candidate
 
 
+def evaluate_dispatch_budget_authority_snapshot(
+    context: DispatchHandoffContextV1,
+    witness: OwnerDispatchWitnessV1,
+    snapshot: AuthorityDispatchSnapshotV1, *,
+    namespace: NamespaceId,
+    proposed_footprint: RecoveryConstraintFootprint,
+) -> tuple[str, ...]:
+    """Check every Authority unresolved footprint against this one P2 effect.
+
+    The reverse mTLS callback must supply the snapshot; this pure comparison
+    cannot authenticate a caller-supplied DTO or issue a budget receipt.
+    Empty blockers mean only that this conflict set is clear. The graph
+    transaction still has to re-read the D11 grant, lease and reservation.
+    """
+    if (type(context) is not DispatchHandoffContextV1
+            or type(witness) is not OwnerDispatchWitnessV1
+            or type(snapshot) is not AuthorityDispatchSnapshotV1
+            or type(namespace) is not NamespaceId
+            or type(proposed_footprint) is not RecoveryConstraintFootprint):
+        raise TypeError("typed Authority dispatch budget evidence is required")
+    require_exact_authority_snapshot(context, witness, snapshot)
+    permit = context.permit
+    from ..graph_coordinator import namespace_ref
+
+    if (snapshot.namespace != namespace_ref(namespace)
+            or proposed_footprint.namespace != snapshot.namespace
+            or proposed_footprint.effect_id != permit.effect_id
+            or not any(item.upper_bound is not None
+                       for item in proposed_footprint.budgets)):
+        return ("own_budget_footprint_or_namespace_unproven",)
+    own = tuple(item for item in snapshot.unresolved_effects
+                if item.effect_id == permit.effect_id)
+    if (len(own) != 1 or own[0].operation_id != permit.operation_id
+            or own[0].phase != "claimed"
+            or own[0].execution_seq != snapshot.anchor.execution_seq
+            or own[0].append_digest != snapshot.anchor.execution_digest
+            or own[0].footprint != proposed_footprint):
+        return ("claimed_p2_footprint_or_append_unproven",)
+    quotas = {(item.bucket_key, item.window_key)
+              for item in proposed_footprint.quota_occupancies}
+    gates = set(proposed_footprint.object_gate_keys)
+    conflicts = set(proposed_footprint.conflict_keys)
+    missing = []
+    for item in snapshot.unresolved_effects:
+        if item.effect_id == permit.effect_id:
+            continue
+        footprint = item.footprint
+        # AuthorityDispatchSnapshotV1 requires every item to be in its opaque
+        # namespace and to carry a decoded durable footprint.
+        if not footprint.budgets:
+            missing.append("other_unresolved_effect_budget_unknown")
+        else:
+            # No untrusted list of parent lease refs may narrow the overlap
+            # set. Until the current ledger ancestry is joined by the graph
+            # coordinator, every other namespace budget is a conflict.
+            missing.append("other_unresolved_effect_budget_overlap")
+        if (proposed_footprint.contact_id is not None
+                and proposed_footprint.contact_id == footprint.contact_id):
+            missing.append("other_unresolved_effect_contact_overlap")
+        if gates.intersection(footprint.object_gate_keys):
+            missing.append("other_unresolved_effect_gate_overlap")
+        if quotas.intersection((q.bucket_key, q.window_key)
+                               for q in footprint.quota_occupancies):
+            missing.append("other_unresolved_effect_quota_overlap")
+        if conflicts.intersection(footprint.conflict_keys):
+            missing.append("other_unresolved_effect_conflict_key_overlap")
+    return tuple(dict.fromkeys(missing))
+
+
 def provide_dispatch_budget_check_with_journal(
     intent: ActionIntent, db, issuer: D11BudgetGrantIssuer, *,
     namespace: NamespaceId, lease_id: str, reservation_operation_id: str,
@@ -245,4 +319,7 @@ def provide_dispatch_budget_check_with_journal(
     )
 
 
-__all__ = ["provide_dispatch_budget_check", "provide_dispatch_budget_check_with_journal"]
+__all__ = [
+    "evaluate_dispatch_budget_authority_snapshot",
+    "provide_dispatch_budget_check", "provide_dispatch_budget_check_with_journal",
+]
