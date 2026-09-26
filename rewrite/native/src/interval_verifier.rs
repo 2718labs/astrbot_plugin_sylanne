@@ -681,6 +681,68 @@ pub(crate) fn linear_readout(
     })
 }
 
+/// Enclose c^T z + sum beta_l log(cosh(b_l^T z)) over an inherited Euclidean
+/// state-error ball. The coefficients are part of the checked mathematical
+/// input. No external source or semantic meaning is established here.
+pub(crate) fn nonlinear_readout(
+    nominal: &[f64],
+    linear: &[f64],
+    b: SparseMatrix<'_>,
+    beta: &[f64],
+    error: Interval,
+    threshold: f64,
+) -> Result<LinearReadout, VerifierError> {
+    let n = nominal.len();
+    if n == 0 || n > MAX_VERIFIED_N || linear.len() != n || b.rows > MAX_VERIFIED_A_ROWS {
+        return Err(VerifierError::InvalidDimension);
+    }
+    validate_state(nominal)?;
+    validate_state(linear)?;
+    if !threshold.is_finite() || threshold.abs() > MAX_ABS_INPUT {
+        return Err(VerifierError::InvalidState);
+    }
+    if !error.lower().is_finite() || !error.upper().is_finite() || error.lower() < 0.0 {
+        return Err(VerifierError::InvalidInheritedError);
+    }
+    if beta.len() != b.rows
+        || beta
+            .iter()
+            .any(|v| !v.is_finite() || v.abs() > MAX_ABS_INPUT)
+    {
+        return Err(VerifierError::InvalidAlpha);
+    }
+    validate_csr(b, MatrixRole::A, b.rows, n)?;
+    let nominal_state = point_vector(nominal)?;
+    let ball = state_error_ball(nominal, error)?;
+    let linear_state = point_vector(linear)?;
+    let mut point = interval_dot(&linear_state, &nominal_state)?;
+    let mut enclosure = interval_dot(&linear_state, &ball)?;
+    let nominal_arguments = matvec(b, &nominal_state)?;
+    let ball_arguments = matvec(b, &ball)?;
+    for row in 0..b.rows {
+        for argument in [nominal_arguments[row], ball_arguments[row]] {
+            if argument.lower() < -17.0 / 4.0 || argument.upper() > 17.0 / 4.0 {
+                return Err(VerifierError::NonlinearArgumentOutOfRange);
+            }
+        }
+        let weight = Interval::point(beta[row])?;
+        point = finite_interval(point.add(weight.mul(nominal_arguments[row].log_cosh()?)?)?)?;
+        enclosure = finite_interval(enclosure.add(weight.mul(ball_arguments[row].log_cosh()?)?)?)?;
+    }
+    let threshold_relation = if enclosure.upper() < threshold {
+        -1
+    } else if enclosure.lower() > threshold {
+        1
+    } else {
+        0
+    };
+    Ok(LinearReadout {
+        point,
+        enclosure,
+        threshold_relation,
+    })
+}
+
 /// Derive error bounds from the verified operators, not caller-provided norms.
 ///
 /// `inherited_error` must already be a trusted enclosure of the preceding

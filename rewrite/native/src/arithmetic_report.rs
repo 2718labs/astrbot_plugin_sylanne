@@ -3,7 +3,7 @@
 //! entire synchronous call and must not mutate them or overlap the output.
 use crate::interval::Interval;
 use crate::interval_verifier::{
-    linear_readout, verify_affine_switched_trajectory,
+    linear_readout, nonlinear_readout, verify_affine_switched_trajectory,
     verify_affine_switched_trajectory_with_energy_jump, verify_fixed_trajectory,
     verify_fixed_trajectory_from_error, verify_joint_error_bounds, verify_joint_step,
     JointVerificationInput, SparseMatrix,
@@ -119,6 +119,24 @@ pub struct TrajectoryMathReport {
     final_time_error: ReportInterval,
     max_endpoint_error: ReportInterval,
     max_reconstruction_defect: ReportInterval,
+}
+
+/// A mathematical nonlinear readout of a linked fixed-model trajectory.
+/// The caller supplies the source premise for initial_error_upper; the native
+/// verifier derives all later errors and checks the complete readout function.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NonlinearReadoutMathReport {
+    struct_size: u32,
+    version: u32,
+    status: i32,
+    product_certificate_flags: u32,
+    steps_verified: u32,
+    input_sha256: [u8; 32],
+    final_time_error: ReportInterval,
+    readout_point: ReportInterval,
+    readout_enclosure: ReportInterval,
+    threshold_relation: i32,
 }
 
 #[repr(C)]
@@ -513,6 +531,89 @@ unsafe fn parse_trajectory_steps<'a>(
         });
     }
     Some(numerical_steps)
+}
+
+/// Verify a linked trajectory and enclose
+/// `c^T z + sum beta_l log(cosh(b_l^T z))` at its final time. A threshold is
+/// decisive only when outside the entire returned interval. This proves
+/// fixed-block mathematics conditional on the initial error and source; it
+/// never grants a product certificate.
+///
+/// # Safety
+/// All pointers and CSR buffers must be aligned, live and immutable through
+/// the call, and disjoint from the exclusive writable output.
+#[no_mangle]
+pub unsafe extern "C" fn sylanne3_v2_trajectory_nonlinear_readout_math_v1(
+    steps: *const TrajectoryMathStep,
+    step_count: u32,
+    initial_error_upper: f64,
+    linear: *const f64,
+    b: ReportCsr,
+    beta: *const f64,
+    threshold: f64,
+    output: *mut NonlinearReadoutMathReport,
+    output_size: u32,
+) -> i32 {
+    if !aligned(output) || output_size as usize != mem::size_of::<NonlinearReadoutMathReport>() {
+        return -1;
+    }
+    let mut report = NonlinearReadoutMathReport {
+        struct_size: mem::size_of::<NonlinearReadoutMathReport>() as u32,
+        version: VERSION,
+        status: -1,
+        ..NonlinearReadoutMathReport::default()
+    };
+    ptr::write(output, report);
+    let Some(numerical_steps) = parse_trajectory_steps(steps, step_count) else {
+        return -1;
+    };
+    let n = numerical_steps.last().unwrap().y.len();
+    if b.rows as usize > MAX_N {
+        return -1;
+    }
+    let (Some(linear), Some(b_matrix), Some(beta)) = (
+        vector(linear, n),
+        matrix(b, b.rows as usize, n),
+        vector(beta, b.rows as usize),
+    ) else {
+        return -1;
+    };
+    let computed = Interval::new(0.0, initial_error_upper)
+        .ok()
+        .and_then(|initial| {
+            let verified = verify_fixed_trajectory_from_error(&numerical_steps, initial).ok()?;
+            let readout = nonlinear_readout(
+                numerical_steps.last()?.y,
+                linear,
+                b_matrix,
+                beta,
+                verified.final_time_error,
+                threshold,
+            )
+            .ok()?;
+            Some((verified, readout))
+        });
+    let Some((verified, readout)) = computed else {
+        report.status = -2;
+        ptr::write(output, report);
+        return -2;
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"sylanne3-trajectory-nonlinear-readout-math-v1\0");
+    hash.update(verified.input_sha256);
+    hash_vector(&mut hash, linear);
+    hash_matrix(&mut hash, b, b_matrix);
+    hash_vector(&mut hash, beta);
+    hash_f64(&mut hash, threshold);
+    report.input_sha256.copy_from_slice(&hash.finalize());
+    report.steps_verified = step_count;
+    report.final_time_error = verified.final_time_error.into();
+    report.readout_point = readout.point.into();
+    report.readout_enclosure = readout.enclosure.into();
+    report.threshold_relation = readout.threshold_relation;
+    report.status = 0;
+    ptr::write(output, report);
+    0
 }
 
 /// Mathematical continuation across one explicit affine parameter switch.
