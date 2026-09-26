@@ -32,6 +32,8 @@ pub(crate) enum VerifierError {
     InvalidState,
     InvalidStep,
     InvalidInheritedError,
+    InvalidInitialBox,
+    InitialBoxDigestMismatch,
     TrajectorySourceMismatch,
     ContractionNotProven,
     TemporalBoundUnavailable,
@@ -353,6 +355,73 @@ pub(crate) fn verify_fixed_trajectory_from_error(
     initial_error: Interval,
 ) -> Result<FixedTrajectoryBounds, VerifierError> {
     verify_fixed_trajectory_impl(steps, initial_error, true)
+}
+
+/// Derive the Euclidean initial error from the complete coordinate box. Every
+/// square and sum is outward-rounded; the box must contain the first nominal
+/// state. The caller remains responsible for authenticating the box's origin.
+pub(crate) fn initial_error_from_box(
+    nominal: &[f64],
+    lower: &[f64],
+    upper: &[f64],
+) -> Result<Interval, VerifierError> {
+    if nominal.is_empty()
+        || nominal.len() > MAX_VERIFIED_N
+        || nominal.len() != lower.len()
+        || nominal.len() != upper.len()
+    {
+        return Err(VerifierError::InvalidDimension);
+    }
+    validate_state(nominal)?;
+    validate_state(lower)?;
+    validate_state(upper)?;
+    let mut squared = Interval::point(0.0)?;
+    for ((center, lo), hi) in nominal.iter().zip(lower).zip(upper) {
+        if lo > center || center > hi {
+            return Err(VerifierError::InvalidInitialBox);
+        }
+        let difference = finite_interval(Interval::new(*lo, *hi)?.sub(Interval::point(*center)?)?)?;
+        let square = finite_interval(difference.mul(difference)?)?;
+        squared = finite_interval(squared.add(Interval::new(0.0, square.upper())?)?)?;
+        squared = Interval::new(squared.lower().max(0.0), squared.upper())?;
+    }
+    let radius = finite_interval(squared.sqrt()?)?;
+    Interval::new(0.0, radius.upper()).map_err(VerifierError::from)
+}
+
+/// Canonical digest of the nominal first state and its coordinate box. The
+/// expected digest must come from an independently trusted upstream record;
+/// this function authenticates no such record by itself.
+pub(crate) fn initial_box_digest(nominal: &[f64], lower: &[f64], upper: &[f64]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"sylanne3-initial-box-math-v1\0");
+    hash_f64_values(&mut digest, nominal);
+    hash_f64_values(&mut digest, lower);
+    hash_f64_values(&mut digest, upper);
+    digest.finalize().into()
+}
+
+/// Recompute and bind the initial coordinate box and the complete linked
+/// fixed-model trajectory. No caller-supplied scalar error can shrink this box.
+pub(crate) fn verify_fixed_trajectory_from_box(
+    steps: &[JointVerificationInput<'_>],
+    lower: &[f64],
+    upper: &[f64],
+    expected_box_digest: &[u8; 32],
+) -> Result<(FixedTrajectoryBounds, Interval), VerifierError> {
+    let first = steps.first().ok_or(VerifierError::InvalidDimension)?;
+    let initial = initial_error_from_box(first.x, lower, upper)?;
+    let box_digest = initial_box_digest(first.x, lower, upper);
+    if &box_digest != expected_box_digest {
+        return Err(VerifierError::InitialBoxDigestMismatch);
+    }
+    let mut verified = verify_fixed_trajectory_from_error(steps, initial)?;
+    let mut digest = Sha256::new();
+    digest.update(b"sylanne3-fixed-trajectory-initial-box-math-v1\0");
+    digest.update(box_digest);
+    digest.update(verified.input_sha256);
+    verified.input_sha256 = digest.finalize().into();
+    Ok((verified, initial))
 }
 
 fn verify_fixed_trajectory_impl(
@@ -1153,6 +1222,26 @@ fn finite_interval(value: Interval) -> Result<Interval, VerifierError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_box_radius_uses_all_coordinates_and_digest_binds_exact_bits() {
+        let nominal = [0.0, 0.0];
+        let lower = [-3.0, -4.0];
+        let upper = [3.0, 4.0];
+        let radius = initial_error_from_box(&nominal, &lower, &upper).unwrap();
+        assert_eq!(radius.lower(), 0.0);
+        assert!(radius.upper() >= 5.0);
+        let digest = initial_box_digest(&nominal, &lower, &upper);
+        let next_four = f64::from_bits(4.0_f64.to_bits() + 1);
+        assert_ne!(
+            digest,
+            initial_box_digest(&nominal, &lower, &[3.0, next_four])
+        );
+        assert_eq!(
+            initial_error_from_box(&nominal, &lower, &[-0.1, 4.0]),
+            Err(VerifierError::InvalidInitialBox)
+        );
+    }
 
     fn contains(interval: Interval, value: f64) {
         assert!(

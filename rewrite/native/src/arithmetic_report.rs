@@ -5,8 +5,8 @@ use crate::interval::Interval;
 use crate::interval_verifier::{
     linear_readout, nonlinear_readout, verify_affine_switched_trajectory,
     verify_affine_switched_trajectory_with_energy_jump, verify_fixed_trajectory,
-    verify_fixed_trajectory_from_error, verify_joint_error_bounds, verify_joint_step,
-    JointVerificationInput, SparseMatrix,
+    verify_fixed_trajectory_from_box, verify_fixed_trajectory_from_error,
+    verify_joint_error_bounds, verify_joint_step, JointVerificationInput, SparseMatrix,
 };
 use sha2::{Digest, Sha256};
 use std::{mem, ptr, slice};
@@ -133,6 +133,22 @@ pub struct NonlinearReadoutMathReport {
     product_certificate_flags: u32,
     steps_verified: u32,
     input_sha256: [u8; 32],
+    final_time_error: ReportInterval,
+    readout_point: ReportInterval,
+    readout_enclosure: ReportInterval,
+    threshold_relation: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct NonlinearReadoutBoxMathReport {
+    struct_size: u32,
+    version: u32,
+    status: i32,
+    product_certificate_flags: u32,
+    steps_verified: u32,
+    input_sha256: [u8; 32],
+    initial_error: ReportInterval,
     final_time_error: ReportInterval,
     readout_point: ReportInterval,
     readout_enclosure: ReportInterval,
@@ -426,6 +442,78 @@ pub unsafe extern "C" fn sylanne3_v2_trajectory_math_report_from_error_v1(
     )
 }
 
+/// Verify the complete linked trajectory from a coordinate box rather than a
+/// caller-supplied scalar radius. The exact box bytes are included in the
+/// digest. A mandatory expected digest must match the box and first nominal
+/// state. Its trusted source and whole-graph closure remain caller premises.
+///
+/// # Safety
+/// `lower` and `upper` must be aligned live arrays matching the first step's
+/// dimension; all other pointers follow the trajectory report contract.
+#[no_mangle]
+pub unsafe extern "C" fn sylanne3_v2_trajectory_math_report_from_box_v1(
+    steps: *const TrajectoryMathStep,
+    step_count: u32,
+    lower: *const f64,
+    upper: *const f64,
+    expected_box_digest: *const u8,
+    output: *mut TrajectoryMathReport,
+    output_size: u32,
+) -> i32 {
+    if !aligned(output) || output_size as usize != mem::size_of::<TrajectoryMathReport>() {
+        return -1;
+    }
+    let mut report = TrajectoryMathReport {
+        struct_size: mem::size_of::<TrajectoryMathReport>() as u32,
+        version: VERSION,
+        status: -1,
+        ..TrajectoryMathReport::default()
+    };
+    ptr::write(output, report);
+    let Some(numerical_steps) = parse_trajectory_steps(steps, step_count) else {
+        return -1;
+    };
+    let n = numerical_steps[0].x.len();
+    let (Some(lower), Some(upper)) = (vector(lower, n), vector(upper, n)) else {
+        return -1;
+    };
+    if expected_box_digest.is_null() {
+        return -1;
+    }
+    let expected = &*(expected_box_digest as *const [u8; 32]);
+    let Ok((verified, _initial)) =
+        verify_fixed_trajectory_from_box(&numerical_steps, lower, upper, expected)
+    else {
+        report.status = -2;
+        ptr::write(output, report);
+        return -2;
+    };
+    let max_endpoint = verified
+        .steps
+        .iter()
+        .map(|step| step.endpoint_error.upper())
+        .fold(0.0_f64, f64::max);
+    let max_defect = verified
+        .steps
+        .iter()
+        .map(|step| step.reconstruction_defect.upper())
+        .fold(0.0_f64, f64::max);
+    report.steps_verified = step_count;
+    report.input_sha256 = verified.input_sha256;
+    report.final_time_error = verified.final_time_error.into();
+    report.max_endpoint_error = ReportInterval {
+        lower: 0.0,
+        upper: max_endpoint,
+    };
+    report.max_reconstruction_defect = ReportInterval {
+        lower: 0.0,
+        upper: max_defect,
+    };
+    report.status = 0;
+    ptr::write(output, report);
+    0
+}
+
 unsafe fn trajectory_math_report_impl(
     steps: *const TrajectoryMathStep,
     step_count: u32,
@@ -607,6 +695,95 @@ pub unsafe extern "C" fn sylanne3_v2_trajectory_nonlinear_readout_math_v1(
     hash_f64(&mut hash, threshold);
     report.input_sha256.copy_from_slice(&hash.finalize());
     report.steps_verified = step_count;
+    report.final_time_error = verified.final_time_error.into();
+    report.readout_point = readout.point.into();
+    report.readout_enclosure = readout.enclosure.into();
+    report.threshold_relation = readout.threshold_relation;
+    report.status = 0;
+    ptr::write(output, report);
+    0
+}
+
+/// The box-bound counterpart of the nonlinear readout report. The native
+/// verifier derives its outward initial radius, checks the first nominal state
+/// lies in every coordinate interval, checks a mandatory expected digest, and hashes the exact box with the
+/// trajectory and readout. Product capability remains zero.
+///
+/// # Safety
+/// All buffers must be aligned, live, immutable and disjoint from the output.
+#[no_mangle]
+pub unsafe extern "C" fn sylanne3_v2_trajectory_nonlinear_readout_from_box_math_v1(
+    steps: *const TrajectoryMathStep,
+    step_count: u32,
+    lower: *const f64,
+    upper: *const f64,
+    expected_box_digest: *const u8,
+    linear: *const f64,
+    b: ReportCsr,
+    beta: *const f64,
+    threshold: f64,
+    output: *mut NonlinearReadoutBoxMathReport,
+    output_size: u32,
+) -> i32 {
+    if !aligned(output) || output_size as usize != mem::size_of::<NonlinearReadoutBoxMathReport>() {
+        return -1;
+    }
+    let mut report = NonlinearReadoutBoxMathReport {
+        struct_size: mem::size_of::<NonlinearReadoutBoxMathReport>() as u32,
+        version: VERSION,
+        status: -1,
+        ..NonlinearReadoutBoxMathReport::default()
+    };
+    ptr::write(output, report);
+    let Some(numerical_steps) = parse_trajectory_steps(steps, step_count) else {
+        return -1;
+    };
+    let n = numerical_steps[0].x.len();
+    if b.rows as usize > MAX_N {
+        return -1;
+    }
+    let (Some(lower), Some(upper), Some(linear), Some(b_matrix), Some(beta)) = (
+        vector(lower, n),
+        vector(upper, n),
+        vector(linear, n),
+        matrix(b, b.rows as usize, n),
+        vector(beta, b.rows as usize),
+    ) else {
+        return -1;
+    };
+    if expected_box_digest.is_null() {
+        return -1;
+    }
+    let expected = &*(expected_box_digest as *const [u8; 32]);
+    let computed = verify_fixed_trajectory_from_box(&numerical_steps, lower, upper, expected)
+        .ok()
+        .and_then(|(verified, initial)| {
+            let readout = nonlinear_readout(
+                numerical_steps.last()?.y,
+                linear,
+                b_matrix,
+                beta,
+                verified.final_time_error,
+                threshold,
+            )
+            .ok()?;
+            Some((verified, initial, readout))
+        });
+    let Some((verified, initial, readout)) = computed else {
+        report.status = -2;
+        ptr::write(output, report);
+        return -2;
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"sylanne3-trajectory-nonlinear-readout-initial-box-math-v1\0");
+    hash.update(verified.input_sha256);
+    hash_vector(&mut hash, linear);
+    hash_matrix(&mut hash, b, b_matrix);
+    hash_vector(&mut hash, beta);
+    hash_f64(&mut hash, threshold);
+    report.input_sha256.copy_from_slice(&hash.finalize());
+    report.steps_verified = step_count;
+    report.initial_error = initial.into();
     report.final_time_error = verified.final_time_error.into();
     report.readout_point = readout.point.into();
     report.readout_enclosure = readout.enclosure.into();
