@@ -254,6 +254,12 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
                 writes[key.type_name] = (key, item.revision)
         if set(writes) != {"memory.episode.v1", "memory.subjective_trace.v2"}:
             return False
+        if any(db.execute(
+                "SELECT revision,valid FROM graph_atoms WHERE token=?",
+                (key.token,),
+            ).fetchone() != (revision, 1)
+            for key, revision in writes.values()):
+            return False
         episode_key, episode_revision = writes["memory.episode.v1"]
         episode = db.execute(
             "SELECT revision,value,valid FROM graph_history WHERE token=? "
@@ -367,6 +373,14 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
                 or acquired_history[0] != (job_row[0], job_row[1], 1)
                 or len(queued_history) != 1 or queued_history[0][1] != 1
                 or _canonical(queued_history[0][0]).get("phase") != "queued"):
+            return False
+        acquire = db.execute(
+            "SELECT state FROM graph_post_c02_reply_model_acquires_v1 "
+            "WHERE bot=? AND persona=? AND acquire_operation_id=? "
+            "AND original_operation_id=?",
+            ns + (acquire_operation_id, original_operation_id),
+        ).fetchone()
+        if acquire != ("committed",):
             return False
         quote = self._issuer.resource_issuer.original_signed_quote(
             db, quote_id, quote_version)
