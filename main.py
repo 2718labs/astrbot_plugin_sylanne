@@ -308,7 +308,7 @@ class Sylanne3Plugin(Star):
                 self._workbench.attach_transport(transport)
             except Exception:
                 logger.error("Sylanne D12 workbench pairing could not be attached")
-        if health.status == "limited":
+        if health.status in {"limited", "ready"}:
             self.runtime_health = health
             self._recovery_scan_task = asyncio.create_task(
                 self._run_startup_c02_recovery_v1())

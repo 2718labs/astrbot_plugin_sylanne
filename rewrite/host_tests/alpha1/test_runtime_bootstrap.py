@@ -1363,6 +1363,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_verified_v2_startup_orders_installation_scheme_and_worker(self) -> None:
         module = load_plugin_module()
         order = []
+        ready_mode = False
         registry = _mock_context_registry()
         policy = types.SimpleNamespace(
             manifest_digest="a" * 64,
@@ -1401,7 +1402,9 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             async def start_v2(self, assembled):
                 order.append("start_v2")
                 self_outer.assertIs(assembled, installation)
-                return RuntimeHealth("limited", ("namespace_activation",), "internal path")
+                return (RuntimeHealth("ready") if ready_mode else
+                        RuntimeHealth("limited", ("namespace_activation",),
+                                      "internal path"))
 
             async def provision_installed_namespace(self, operation_id):
                 order.append(("provision", operation_id))
@@ -1447,6 +1450,22 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             await plugin.ingress(event)
             self.assertFalse(event.is_stopped())
             self.assertFalse((Path(directory) / "sylanne3.sqlite3").exists())
+
+            ready_mode = True
+            with patch.object(StarTools, "get_data_dir", return_value=Path(directory)), \
+                    patch.object(module, "assemble_v2_installation", side_effect=assemble), \
+                    patch.object(module, "load_verified_affect_scheme", side_effect=load_scheme), \
+                    patch.object(module, "load_verified_context_scheme",
+                                 return_value=_neutral_context_scheme()), \
+                    patch.object(module, "RuntimeContext", ControlledRuntime):
+                ready_plugin = module.Sylanne3Plugin(
+                    Context(asyncio.Queue(), {}, None, None, None, None,
+                            None, None, None, None, None),
+                    {"enabled": True, "authority_profile": "installed"},
+                )
+                await ready_plugin.initialize()
+            self.assertEqual(ready_plugin.runtime_health.status, "ready")
+            self.assertIsNotNone(ready_plugin._recovery_scan_task)
 
     async def test_installed_v2_port_composes_owner_workbench_without_explicit_resolvers(self) -> None:
         module = load_plugin_module()
