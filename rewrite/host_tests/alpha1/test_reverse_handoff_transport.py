@@ -16,6 +16,7 @@ import test_authority_mtls_loopback as tls_fixtures
 
 from sylanne3.authority_service.reverse_handoff import (
     AdministratorReverseHandoffProfile, ReverseGraphClaimClient,
+    require_exact_reverse_handoff_identity,
 )
 from sylanne3.authority_service.v2_execution_bridge import HandoffStartV2
 from sylanne3.authority_service.v2_contract import (
@@ -143,6 +144,12 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(await call_authority(
                                 client.claim, context, binding, claimed), receipt)
                             self.assertEqual(calls, ["handoff-a"])
+                            concurrent = await asyncio.gather(*(
+                                asyncio.to_thread(client.claim, context, binding, claimed)
+                                for _ in range(2)
+                            ))
+                            self.assertEqual(concurrent, [receipt, receipt])
+                            self.assertEqual(calls, ["handoff-a"])
                             with self.assertRaises(RuntimeError):
                                 await call_authority(client.claim,
                                     replace(context, handoff_id="wrong-handoff"),
@@ -172,11 +179,41 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                         receipt.graph_claim_ref, context.permit,
                         graph_claim_receipt=receipt)
 
-                start = await begin_handoff_with_reverse_claim(
+                async with begin_handoff_with_reverse_claim(
                     worker=worker, server=server, claimed=claimed,
                     handoff_id=context.handoff_id, claim_writer=graph_claim,
-                    begin=begin)
-                self.assertFalse(start.replay)
+                    begin=begin) as decision:
+                    self.assertFalse(decision.replay)
+                    with self.assertRaises(RuntimeError):
+                        await worker.call(lambda _coordinator: None)
+                    start = decision.take_fresh_start()
+                    with self.assertRaises(RuntimeError):
+                        decision.take_fresh_start()
+                with self.assertRaises(RuntimeError):
+                    decision.take_fresh_start()
+                self.assertEqual(calls, ["handoff-a", "handoff-a"])
+
+                async def replay(_claimed, _handoff_id):
+                    return replace(start, replay=True)
+
+                async with begin_handoff_with_reverse_claim(
+                    worker=worker, server=server, claimed=claimed,
+                    handoff_id=context.handoff_id, claim_writer=graph_claim,
+                    begin=replay) as replay_decision:
+                    self.assertTrue(replay_decision.replay)
+                    with self.assertRaises(RuntimeError):
+                        replay_decision.take_fresh_start()
+                self.assertEqual(calls, ["handoff-a", "handoff-a"])
+
+                async def fake_fresh(_claimed, _handoff_id):
+                    return start
+
+                with self.assertRaisesRegex(RuntimeError, "registered graph callback"):
+                    async with begin_handoff_with_reverse_claim(
+                        worker=worker, server=server, claimed=claimed,
+                        handoff_id=context.handoff_id, claim_writer=graph_claim,
+                        begin=fake_fresh):
+                        self.fail("fresh start without callback must not enter")
                 self.assertEqual(calls, ["handoff-a", "handoff-a"])
             finally:
                 await worker.close()
@@ -257,10 +294,14 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("Authority result unknown")
 
             try:
-                task = asyncio.create_task(begin_handoff_with_reverse_claim(
-                    worker=worker, server=server, claimed=claimed,
-                    handoff_id="handoff-a", claim_writer=lambda *_: None,
-                    begin=begin))
+                async def drive():
+                    async with begin_handoff_with_reverse_claim(
+                        worker=worker, server=server, claimed=claimed,
+                        handoff_id="handoff-a", claim_writer=lambda *_: None,
+                        begin=begin):
+                        self.fail("cancelled handoff must not enter decision window")
+
+                task = asyncio.create_task(drive())
                 await asyncio.wait_for(started.wait(), 2)
                 task.cancel()
                 await asyncio.sleep(0)
@@ -272,6 +313,26 @@ class ReverseHandoffTlsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(await worker.call(lambda _coordinator: None))
             finally:
                 await worker.close()
+
+    async def test_exact_p2_subject_holder_generation_token_and_epoch(self) -> None:
+        binding, claimed, context = _claim()
+        require_exact_reverse_handoff_identity("ns-a", context, binding, claimed)
+        for field, value in (
+            ("subject", "other-subject"), ("holder", "other-holder"),
+            ("generation", 2), ("token", "B" * 43), ("fence_epoch", 2),
+        ):
+            try:
+                altered = replace(
+                    context, permit=replace(context.permit, **{field: value}),
+                )
+            except ValueError:
+                # The typed P2 contract can reject some cross-anchor changes
+                # before the transport identity check is reached.
+                continue
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                require_exact_reverse_handoff_identity(
+                    "ns-a", altered, binding, claimed,
+                )
 
 
 if __name__ == "__main__":

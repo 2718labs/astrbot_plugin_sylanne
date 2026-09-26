@@ -19,6 +19,53 @@ from .v2_contract import (
 )
 
 
+def require_exact_reverse_handoff_identity(
+    namespace: str, context: DispatchHandoffContextV1,
+    binding: ExecutionBindingV2, claimed: MutationReceiptV2,
+) -> None:
+    """Reject a callback that is not the exact prepared-to-claimed P2 chain.
+
+    The bridge still supplies Authority provenance and the live CAS. This
+    transport check binds the registered P0/P1/P2 identities.
+    """
+    if (type(namespace) is not str or not namespace
+            or type(context) is not DispatchHandoffContextV1
+            or type(binding) is not ExecutionBindingV2
+            or type(claimed) is not MutationReceiptV2):
+        raise RuntimeError("reverse graph claim requires typed P2 identity")
+    pending = claimed.pending
+    prepared = pending.prepared_receipt
+    p0 = binding.permit
+    p1 = pending.permit
+    p2 = context.permit
+    if (claimed.durable_state != "committed" or pending.phase != "claimed"
+            or pending.binding != binding or prepared is None
+            or prepared.durable_state != "committed"
+            or prepared.pending.phase != "prepared"
+            or prepared.pending.permit != p0
+            or binding.namespace != namespace or p0.namespace != namespace
+            or p0.operation != "dispatch" or p1.operation != "dispatch"
+            or p2.operation != "dispatch"
+            or p1.revision != p0.revision + 1
+            or claimed.updated_revision != p1.revision + 1
+            or p1.pinned_anchor != prepared.after_anchor
+            or pending.before_anchor != prepared.after_anchor
+            or p2 != replace(p1, revision=claimed.updated_revision,
+                             pinned_anchor=claimed.after_anchor)
+            or context.claimed_receipt_digest != canonical_digest(claimed)
+            or context.binding_digest != canonical_digest(binding)):
+        raise RuntimeError("reverse graph claim P2 chain differs")
+    exact_fields = (
+        "authority_id", "namespace", "subject", "holder", "generation",
+        "operation_id", "effect_id", "token", "fence_epoch",
+        "command_digest", "footprint_digest",
+    )
+    if any(getattr(p0, field) != getattr(p1, field)
+           or getattr(p0, field) != getattr(p2, field)
+           for field in exact_fields):
+        raise RuntimeError("reverse graph claim subject, holder or fence differs")
+
+
 @dataclass(frozen=True, slots=True)
 class AdministratorReverseHandoffProfile:
     namespace: str
@@ -76,19 +123,9 @@ class ReverseGraphClaimClient:
               binding: ExecutionBindingV2,
               claimed: MutationReceiptV2) -> DispatchGraphClaimReceiptV1:
         profile = self.profile
-        if (type(context) is not DispatchHandoffContextV1
-                or type(binding) is not ExecutionBindingV2
-                or type(claimed) is not MutationReceiptV2
-                or context.permit.namespace != profile.namespace
-                or claimed.pending.binding != binding
-                or claimed.pending.prepared_receipt is None
-                or claimed.pending.prepared_receipt.pending.permit != binding.permit
-                or context.permit != replace(
-                    claimed.pending.permit, revision=claimed.updated_revision,
-                    pinned_anchor=claimed.after_anchor)
-                or context.claimed_receipt_digest != canonical_digest(claimed)
-                or context.binding_digest != canonical_digest(binding)):
-            raise RuntimeError("reverse graph claim identity differs")
+        require_exact_reverse_handoff_identity(
+            profile.namespace, context, binding, claimed,
+        )
         message = {
             "profile_id": profile.profile_id,
             "installation_id": profile.installation_id,
@@ -138,4 +175,7 @@ class ReverseGraphClaimClient:
             raise RuntimeError("reverse graph claim response is invalid") from exc
 
 
-__all__ = ("AdministratorReverseHandoffProfile", "ReverseGraphClaimClient")
+__all__ = (
+    "AdministratorReverseHandoffProfile", "ReverseGraphClaimClient",
+    "require_exact_reverse_handoff_identity",
+)

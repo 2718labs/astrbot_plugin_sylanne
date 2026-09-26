@@ -21,6 +21,7 @@ from ..authority_service.v2_contract import (
     ExecutionBindingV2, MutationReceiptV2, canonical_digest, from_wire, to_wire,
 )
 from ..authority_service.v2_execution_bridge import HandoffStartV2
+from ..authority_service.reverse_handoff import require_exact_reverse_handoff_identity
 from ..graph_worker import GraphWorker
 
 
@@ -75,6 +76,37 @@ class _Registration:
     receipt: DispatchGraphClaimReceiptV1 | None = None
 
 
+class HandoffDecisionWindow:
+    """One fresh-start decision capability while GraphWorker remains drained.
+
+    A replay or a duplicate take cannot supply a new sender with a fresh start.
+    The future dispatcher must make its single send/no-send decision before the
+    surrounding async context exits. This class does not send anything.
+    """
+
+    def __init__(self, start: HandoffStartV2, registration: _Registration) -> None:
+        self._start = start
+        self._registration = registration
+        self._open = True
+        self._taken = False
+
+    @property
+    def replay(self) -> bool:
+        return self._start.replay
+
+    def take_fresh_start(self) -> HandoffStartV2:
+        if not self._open or self._taken or self._start.replay:
+            raise RuntimeError("no fresh handoff decision remains")
+        if (self._registration.task is None
+                or self._registration.receipt != self._start.graph_claim_receipt):
+            raise RuntimeError("fresh handoff lacks its registered graph callback")
+        self._taken = True
+        return self._start
+
+    def _close(self) -> None:
+        self._open = False
+
+
 class HostReverseGraphClaimServer:
     """A content-free callback listener; caller owns its network exposure."""
 
@@ -95,19 +127,10 @@ class HostReverseGraphClaimServer:
         The caller must hold the window through the Authority response and any
         recovery for the same handoff. This port does not supply a claim writer.
         """
-        if (type(context) is not DispatchHandoffContextV1
-                or type(binding) is not ExecutionBindingV2
-                or type(claimed) is not MutationReceiptV2
-                or not callable(claim_writer)
-                or context.permit.namespace != self.profile.namespace
-                or claimed.pending.binding != binding
-                or claimed.pending.prepared_receipt is None
-                or claimed.pending.prepared_receipt.pending.permit != binding.permit
-                or context.permit != replace(
-                    claimed.pending.permit, revision=claimed.updated_revision,
-                    pinned_anchor=claimed.after_anchor)
-                or context.claimed_receipt_digest != canonical_digest(claimed)
-                or context.binding_digest != canonical_digest(binding)
+        require_exact_reverse_handoff_identity(
+            self.profile.namespace, context, binding, claimed,
+        )
+        if (not callable(claim_writer)
                 or not callable(getattr(window, "call", None))):
             raise ValueError("reverse handoff registration identity differs")
         async with self._lock:
@@ -151,6 +174,9 @@ class HostReverseGraphClaimServer:
                 or to_wire(binding) != message["binding"]
                 or to_wire(claimed) != message["claimed_receipt"]):
             raise RuntimeError("reverse graph claim wire identity differs")
+        require_exact_reverse_handoff_identity(
+            profile.namespace, context, binding, claimed,
+        )
         async with self._lock:
             registration = self._registration
             if (registration is None or registration.context != context
@@ -209,17 +235,20 @@ class HostReverseGraphClaimServer:
             limit=self.profile.max_message_bytes)
 
 
+@asynccontextmanager
 async def begin_handoff_with_reverse_claim(
     *, worker: GraphWorker, server: HostReverseGraphClaimServer,
     claimed: MutationReceiptV2, handoff_id: str,
     claim_writer: Callable,
     begin: Callable[[MutationReceiptV2, str], Awaitable[object]],
     recover: Callable[[MutationReceiptV2, str], Awaitable[object]] | None = None,
-) -> HandoffStartV2:
-    """Drain GraphWorker, register callback, then call Authority off worker.
+) -> HandoffDecisionWindow:
+    """Keep GraphWorker drained through the caller's one send/no-send decision.
 
     A failed or lost RPC stays HOLD. A caller-supplied recovery may query the
-    same handoff while the lease is held; this helper never authorizes a send.
+    same handoff while the lease is held. Never make an Authority RPC from the
+    graph callback or while holding the graph store lock. This helper never
+    sends or turns a GraphCoordinator HOLD into a claim.
     """
     if (type(worker) is not GraphWorker or type(server) is not HostReverseGraphClaimServer
             or type(claimed) is not MutationReceiptV2
@@ -237,6 +266,9 @@ async def begin_handoff_with_reverse_claim(
                        pinned_anchor=claimed.after_anchor),
         claimed_receipt_digest=canonical_digest(claimed),
         binding_digest=canonical_digest(binding), handoff_id=handoff_id)
+    require_exact_reverse_handoff_identity(
+        server.profile.namespace, context, binding, claimed,
+    )
 
     def require_exact_start(start: object) -> HandoffStartV2:
         if (type(start) is not HandoffStartV2
@@ -246,16 +278,20 @@ async def begin_handoff_with_reverse_claim(
                 or start.effect_id != context.permit.effect_id
                 or start.claim_digest != context.claimed_receipt_digest
                 or start.binding_digest != context.binding_digest
-                or start.permit != context.permit):
+                or start.permit != context.permit
+                or (not start.replay and (
+                    start.graph_claim_receipt is None
+                    or start.graph_claim_ref
+                    != start.graph_claim_receipt.graph_claim_ref))):
             raise RuntimeError("Authority handoff response identity differs")
         return start
 
     async with worker.exclusive_callback_window() as window:
         async with server.register(context=context, binding=binding, claimed=claimed,
-                                   window=window, claim_writer=claim_writer):
+                                   window=window, claim_writer=claim_writer) as registration:
             task = asyncio.create_task(begin(claimed, handoff_id))
             try:
-                return require_exact_start(await asyncio.shield(task))
+                start = require_exact_start(await asyncio.shield(task))
             except asyncio.CancelledError:
                 # The remote worker may still be in the graph callback. Keep
                 # the lease until this local RPC and any started graph call end.
@@ -268,8 +304,17 @@ async def begin_handoff_with_reverse_claim(
             except Exception:
                 if recover is None:
                     raise
-                return require_exact_start(await recover(claimed, handoff_id))
+                start = require_exact_start(await recover(claimed, handoff_id))
+            if (not start.replay
+                    and (registration.task is None
+                         or registration.receipt != start.graph_claim_receipt)):
+                raise RuntimeError("fresh handoff did not use registered graph callback")
+            decision = HandoffDecisionWindow(start, registration)
+            try:
+                yield decision
+            finally:
+                decision._close()
 
 
 __all__ = ("AdministratorHostReverseProfile", "HostReverseGraphClaimServer",
-           "begin_handoff_with_reverse_claim")
+           "HandoffDecisionWindow", "begin_handoff_with_reverse_claim")
