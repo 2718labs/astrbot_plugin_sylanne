@@ -89,6 +89,24 @@ def pin_finished_terminal_read(
     return _PinnedTerminalRead(fact, _WITNESS_KEY)
 
 
+async def pin_finished_terminal_read_from_host(adapter: object) -> _PinnedTerminalRead:
+    """Resolve the exact installed mTLS query before taking the graph lock."""
+    # Import at the host boundary to keep the core job module independent of
+    # host initialization and to reject generic fact-producing callables.
+    from ..host.terminal_c02_recovery_query import PinnedTerminalC02RecoveryQueryV1
+
+    if type(adapter) is not PinnedTerminalC02RecoveryQueryV1:
+        raise TypeError("installed pinned terminal C02 query adapter required")
+    request = adapter.request
+    fact = await adapter.query_finished()
+    if (type(request) is not TerminalRecoveryReadRequestV1
+            or type(fact) is not TerminalRecoveryReadFactV1
+            or fact.request != request
+            or fact.result_digest != request.original_key.stable_result_digest):
+        raise TerminalC02JobHold("installed terminal C02 query result differs")
+    return _PinnedTerminalRead(fact, _WITNESS_KEY)
+
+
 def complete_original_c02_job_in_transaction(
     db: sqlite3.Connection, *, original: OriginalC02JobLeaseV1,
     seal: FrozenTerminalC02CandidateV2, pinned_read: _PinnedTerminalRead,
@@ -215,4 +233,5 @@ def complete_original_c02_job_in_transaction(
 
 
 __all__ = ("OriginalC02JobLeaseV1", "TerminalC02JobHold",
-           "pin_finished_terminal_read", "complete_original_c02_job_in_transaction")
+           "pin_finished_terminal_read", "pin_finished_terminal_read_from_host",
+           "complete_original_c02_job_in_transaction")

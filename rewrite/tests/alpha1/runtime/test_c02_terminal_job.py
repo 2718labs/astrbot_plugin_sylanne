@@ -1,10 +1,11 @@
 """Original C02 terminal recovery changes only the old durable worker job."""
 
-from dataclasses import asdict
+import asyncio
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import json
 import sqlite3
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -18,6 +19,10 @@ from sylanne3.authority_service.v2_terminal_c02_recovery_read_service import (
 from sylanne3.runtime.c02_terminal_job import (
     OriginalC02JobLeaseV1, TerminalC02JobHold,
     complete_original_c02_job_in_transaction, pin_finished_terminal_read,
+    pin_finished_terminal_read_from_host,
+)
+from sylanne3.host.terminal_c02_recovery_query import (
+    PinnedTerminalC02RecoveryQueryV1,
 )
 from sylanne3.runtime.first_ingress_c02_identity import (
     first_ingress_c02_consumer_operation_id_v1,
@@ -166,5 +171,26 @@ def test_terminal_c02_requires_pinned_authority_query_not_fact_dto():
         with pytest.raises(TypeError):
             _complete(db, lease, seal, pinned.fact, consumer)
         db.execute("ROLLBACK")
+    finally:
+        db.close()
+
+
+def test_host_pin_only_accepts_exact_installed_adapter_and_original_fact():
+    db, _, _, pinned, _ = _case()
+    try:
+        adapter = object.__new__(PinnedTerminalC02RecoveryQueryV1)
+        adapter._request = pinned.fact.request
+        with patch.object(PinnedTerminalC02RecoveryQueryV1, "query_finished",
+                          AsyncMock(return_value=pinned.fact)):
+            witnessed = asyncio.run(pin_finished_terminal_read_from_host(adapter))
+        assert witnessed.fact == pinned.fact
+        with pytest.raises(TypeError):
+            asyncio.run(pin_finished_terminal_read_from_host(pinned.fact))
+        changed = replace(pinned.fact.request, read_attempt_id="other-read")
+        wrong_fact = replace(pinned.fact, request=changed)
+        with patch.object(PinnedTerminalC02RecoveryQueryV1, "query_finished",
+                          AsyncMock(return_value=wrong_fact)):
+            with pytest.raises(TerminalC02JobHold):
+                asyncio.run(pin_finished_terminal_read_from_host(adapter))
     finally:
         db.close()
