@@ -157,6 +157,9 @@ class ReverseGraphClaimClient:
         context.load_cert_chain(str(profile.client_certificate),
                                 str(profile.client_private_key))
         self._ssl = context
+        self.client_certificate_sha256 = hashlib.sha256(
+            ssl.PEM_cert_to_DER_cert(
+                profile.client_certificate.read_text(encoding="ascii"))).hexdigest()
 
     def claim(self, context: DispatchHandoffContextV1,
               binding: ExecutionBindingV2,

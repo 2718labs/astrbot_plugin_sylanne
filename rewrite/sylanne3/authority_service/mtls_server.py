@@ -81,6 +81,7 @@ from .current_worker_model_result_graph_verifier import (
 )
 from .v2_execution_bridge import AuthorityV2ExecutionBridge, HandoffStartV2
 from .reverse_handoff import ReverseGraphClaimClient
+from .final_handoff_pairing import FinalHandoffPairingV1
 from .v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
@@ -381,6 +382,8 @@ class AuthorityRpcServer:
             namespace_to_role[namespace] = role
             role_to_namespace[role] = namespace
         self._namespace_bindings_v2 = bindings
+        self._final_handoff_reverse_v2 = reverse_handoffs
+        self._final_handoff_issuers_v2 = handoff_issuers
         if any(not any(
                 (peer, profile) in installed
                 and profile == client.profile.profile_id
@@ -808,6 +811,43 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            if method == "read_final_handoff_pairing_v1":
+                if set(command) != {"namespace", "installation_id"}:
+                    raise AuthorityUnavailable("final handoff pairing fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                installation_id = identifier(
+                    command["installation_id"], "installation_id")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                reverse = self._final_handoff_reverse_v2.get(namespace)
+                issuer_id = self._final_handoff_issuers_v2.get(namespace)
+                if (reverse is None or issuer_id is None
+                        or installed.installation_id != installation_id
+                        or reverse.profile.installation_id != installation_id
+                        or reverse.profile.profile_id != profile_id):
+                    raise AuthorityUnavailable("final handoff pairing unavailable")
+                profile = reverse.profile
+                fields = {
+                    "authority_id": self._authority_id(),
+                    "namespace": namespace,
+                    "installation_id": installation_id,
+                    "issuer_id": issuer_id,
+                    "reverse_profile_id": profile.profile_id,
+                    "reverse_host": profile.host,
+                    "reverse_port": profile.port,
+                    "reverse_server_name": profile.server_name,
+                    "reverse_expected_host_certificate_sha256":
+                        profile.expected_host_certificate_sha256,
+                    "reverse_client_certificate_sha256":
+                        reverse.client_certificate_sha256,
+                    "installation_manifest_digest": installed.manifest_digest,
+                }
+                return FinalHandoffPairingV1(
+                    **fields,
+                    configuration_digest=FinalHandoffPairingV1.digest_public_fields(fields),
+                ).to_wire()
             if method in {"self_identity_mutate_v1", "self_identity_current_v1"}:
                 expected = ({"namespace", "mutation"}
                             if method == "self_identity_mutate_v1" else
