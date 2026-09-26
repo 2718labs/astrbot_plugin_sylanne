@@ -14,7 +14,7 @@ from sylanne3.domains.d03.self_perspective import (
 )
 from sylanne3.host.authority_profile import (
     AdminD03SelfIdentityProjectionPolicy, AdminD04EncodingBaselinePolicy,
-    AdminD06FirstIngressC02Policy,
+    AdminD06FirstIngressC02Policy, AdminD06SourceCorrectionPolicy,
     _d03_projection_from_payload, _d04_baseline_from_payload,
     _policy_from_payload,
 )
@@ -32,6 +32,8 @@ from sylanne3.runtime.issuers import (
     D04_BASELINE_WORK_KIND,
     D03_SELF_IDENTITY_PROJECTION_WORK_KIND,
     D06_FIRST_INGRESS_C02_WORK_KIND,
+    D06_SOURCE_CORRECTION_WORK_KIND,
+    d06_source_correction_quote_id,
     d04_baseline_quote_id,
     d03_self_identity_projection_quote_id,
     build_runtime_issuers,
@@ -43,6 +45,8 @@ from sylanne3.runtime.d03_self_identity_projection_identity import (
     d03_self_identity_projection_retry_operation_id_v2,
 )
 from sylanne3.memory_types import access_key
+from sylanne3.domains.d06 import CorrectionRequest, D06DomainAdapter
+from sylanne3.workbench_api.source_correction import SourceCorrectionRequestV1
 from sylanne3.authority_service.v2_contract import FencePermitV2, to_wire
 from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime.jobs import create_job
@@ -486,6 +490,96 @@ class ProductionIssuerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already-settled model"):
             AdminD06FirstIngressC02Policy(
                 60.0, {"output_tokens": 5}, "c02-snapshot", "c02-resource")
+
+    def test_d06_correction_uses_installed_price_existing_grant_and_one_job(self):
+        operation = "a980d36b-1c02-4d21-94a5-0304f46b3091"
+        source = AtomKey(Owner("event", "bot", "persona", "source-1"),
+                         "memory.source", "record")
+        target = AtomKey(Owner("event", "bot", "persona", "target-1"),
+                         "memory.interpretation", "current")
+        request = SourceCorrectionRequestV1(
+            self.namespace, operation, "sha256:" + "a" * 64,
+            "我当时在忙", (source.token,), (target.token,), 3, 2,
+        )
+        correction = D06DomainAdapter(self.namespace).correction_source_key(
+            CorrectionRequest(operation, request.target_refs, request.source_refs,
+                              request.statement, 3, 2))
+        input_refs = (correction.token, source.token, target.token)
+        envelope = replace(
+            self.envelope,
+            identity=OperationIdentity(
+                "activity-1", None, "attempt-1", "source-correction", operation,
+                canonical_digest({"input_refs": list(input_refs)})),
+            authority=replace(self.envelope.authority, actor="owner-actor",
+                              issuer_domain="d06", owner_scope=("event",),
+                              purpose="context", audience=("owner",)),
+            version_guard=replace(self.envelope.version_guard,
+                                  access_epoch=3, delete_epoch=2,
+                                  resource_lease_versions=()),
+            source_qualification=replace(self.envelope.source_qualification,
+                                         source_refs=(source.token,)),
+            input_refs=input_refs,
+        )
+        policy = AdminD06SourceCorrectionPolicy(
+            60.0, {"cpu_ms": 7}, "correction-snapshot", "correction-resource")
+        now = envelope.deadline_utc - 30.0
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "grant is absent"):
+            self.d11.issue_d06_source_correction_quote(
+                self.db, envelope, policy, request,
+                installation_id="installation-1", now_utc=now)
+        grant = replace(self.grant(), allowed_work_kinds=(
+            D06_SOURCE_CORRECTION_WORK_KIND,))
+        self.d11.issue_budget_grant(self.db, grant)
+        quote = self.d11.issue_d06_source_correction_quote(
+            self.db, envelope, policy, request,
+            installation_id="installation-1", now_utc=now)
+        self.assertEqual(quote.quote_id, d06_source_correction_quote_id(
+            self.namespace, operation))
+        self.assertEqual(quote.ceiling, {"cpu_ms": 7})
+        self.assertEqual(len(quote.outbox_refs), 1)
+        self.assertIsNotNone(quote.graph_job_ref)
+        self.assertEqual(self.d11.issue_d06_source_correction_quote(
+            self.db, envelope, policy, request,
+            installation_id="installation-1", now_utc=now), quote)
+        guarded = replace(envelope, version_guard=replace(
+            envelope.version_guard,
+            resource_lease_versions=(VersionedRef(quote.quote_id, 1),)))
+        admission = self.d11.admit_runtime(DomainBundle(
+            guarded, (), (), (), (), (), ("correction-replay",),
+            (quote.graph_job_ref,), quote.outbox_refs,
+        ), self.db, now_utc=now)
+        self.assertEqual(admission.budget.ceiling, {"cpu_ms": 7})
+        self.assertEqual(len(admission.jobs), 1)
+        self.assertEqual(admission.jobs[0].outbox_refs, quote.outbox_refs)
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "request differs"):
+            self.d11.issue_d06_source_correction_quote(
+                self.db, envelope, policy, replace(
+                    request, operation_id="66d3b8e3-8941-4e53-b25c-300d1fc70ea7"),
+                installation_id="installation-1", now_utc=now)
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "bound to this command"):
+            self.d11._admission_state(replace(
+                guarded, identity=replace(guarded.identity, activity_id="other-activity")),
+                self.db, now_utc=now)
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "bound to this command"):
+            self.d11._admission_state(replace(
+                guarded, deadline_utc=guarded.deadline_utc - 1),
+                self.db, now_utc=now)
+        self.db.execute("UPDATE runtime_budget_leases SET currency='EUR' WHERE lease_id='parent'")
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "signed budget grant"):
+            self.d11._admission_state(guarded, self.db, now_utc=now)
+        self.db.execute("UPDATE runtime_budget_leases SET currency='USD' WHERE lease_id='parent'")
+        changed_request = replace(request, statement="不同纠错文字")
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "replay differs"):
+            self.d11.issue_d06_source_correction_quote(
+                self.db, envelope, policy, changed_request,
+                installation_id="installation-1", now_utc=now)
+        self.db.execute("UPDATE runtime_d06_correction_quote_policies "
+                        "SET policy_json=replace(policy_json,'\"cpu_ms\":7','\"cpu_ms\":8')")
+        with self.assertRaisesRegex(IssuerAuthorityDenied, "signature is invalid"):
+            self.d11.admit_runtime(DomainBundle(
+                guarded, (), (), (), (), (), ("correction-replay",),
+                (quote.graph_job_ref,), quote.outbox_refs,
+            ), self.db, now_utc=now)
 
     def test_d03_self_projection_uses_distinct_signed_quote_and_mapping(self):
         source = AtomKey(Owner("event", "bot", "persona", "source-event"),

@@ -28,7 +28,7 @@ from ..runtime_contracts import (
     CommandEnvelope, DomainBundle, canonical_digest, canonical_serialize,
 )
 from .budget import get_budget_lease
-from .d11_types import runtime_job_key
+from .d11_types import runtime_job_key, runtime_outbox_key
 from .jobs import PersistentJob, get_job
 
 
@@ -185,6 +185,7 @@ D03_ARRIVAL_WORK_KIND = "d03.message_received"
 D03_SELF_IDENTITY_PROJECTION_WORK_KIND = "d03.self_identity_projection"
 D04_BASELINE_WORK_KIND = "d04.encoding_baseline"
 D06_FIRST_INGRESS_C02_WORK_KIND = "d06.first_ingress_c02"
+D06_SOURCE_CORRECTION_WORK_KIND = "d06.source_correction"
 _MODEL_COST_DIMENSIONS = frozenset({
     "input_tokens", "output_tokens", "model_tokens", "model_microusd",
 })
@@ -356,6 +357,60 @@ class D06FirstIngressC02QuotePolicy:
             raise ValueError("D06 C02 cannot price the original model call again")
         object.__setattr__(self, "deadline_after_seconds", deadline)
         object.__setattr__(self, "quote_ceiling", ceiling)
+
+
+@dataclass(frozen=True)
+class D06SourceCorrectionQuotePolicy:
+    """Signed D02 price and immutable request identity for one correction."""
+
+    policy_id: str
+    bot_id: str
+    persona_id: str
+    installation_id: str
+    grant_id: str
+    grant_version: int
+    lease_id: str
+    provider_policy_ref: str
+    quote_ceiling: Mapping[str, int]
+    deadline_after_seconds: float
+    snapshot_ref: str
+    resource_ref: str
+    request_digest: str
+    statement: str
+    impact_preview_ref: str | None
+    envelope_digest: str
+    operation_id: str
+    activity_id: str
+    correction_source_ref: str
+    source_refs: tuple[str, ...]
+    target_refs: tuple[str, ...]
+    job_ref: str
+    outbox_ref: str
+
+    def __post_init__(self) -> None:
+        for name in ("policy_id", "bot_id", "persona_id", "installation_id",
+                     "grant_id", "lease_id", "provider_policy_ref",
+                     "snapshot_ref", "resource_ref", "operation_id", "activity_id"):
+            _id(getattr(self, name), name)
+        if type(self.grant_version) is not int or self.grant_version < 1:
+            raise ValueError("D06 correction grant version is invalid")
+        for name in ("request_digest", "envelope_digest"):
+            digest = getattr(self, name)
+            if type(digest) is not str or not re.fullmatch(
+                    r"(?:sha256:)?[0-9a-f]{64}", digest):
+                raise ValueError(f"D06 correction {name} must be SHA-256")
+        for name in ("correction_source_ref", "job_ref", "outbox_ref"):
+            _ref(getattr(self, name), name)
+        if not isinstance(self.statement, str) or not 1 <= len(self.statement.strip()) <= 4096:
+            raise ValueError("D06 correction statement is invalid")
+        _ref(self.impact_preview_ref, "impact_preview_ref", optional=True)
+        object.__setattr__(self, "source_refs", _tuple_refs(self.source_refs, "source_refs"))
+        object.__setattr__(self, "target_refs", _tuple_refs(self.target_refs, "target_refs"))
+        deadline = _finite(self.deadline_after_seconds, "deadline_after_seconds")
+        if deadline <= 0:
+            raise ValueError("D06 correction deadline bound must be positive")
+        object.__setattr__(self, "deadline_after_seconds", deadline)
+        object.__setattr__(self, "quote_ceiling", _amounts(self.quote_ceiling))
 
 
 def _d03_policy_id(installation_id: str, grant: BudgetLeaseGrant) -> str:
@@ -719,6 +774,98 @@ def _d06_c02_input_keys(envelope: CommandEnvelope) -> tuple[AtomKey, AtomKey, At
     return source, event, baseline
 
 
+def _d06_correction_policy_id(installation_id: str, grant: BudgetLeaseGrant,
+                              operation_id: str) -> str:
+    return "d06-correction-policy-" + canonical_digest({
+        "installation_id": installation_id,
+        "namespace": [grant.bot_id, grant.persona_id],
+        "grant_id": grant.grant_id, "grant_version": grant.version,
+        "operation_id": operation_id,
+    })[:40]
+
+
+def d06_source_correction_quote_id(namespace, operation_id: str) -> str:
+    return "d06-correction-q-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+    })[:40]
+
+
+def d06_source_correction_job_ref(namespace, activity_id: str,
+                                  operation_id: str) -> str:
+    job_id = "d06-correction-job-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+    })[:40]
+    return runtime_job_key(*namespace.as_tuple, activity_id, job_id).token
+
+
+def d06_source_correction_outbox_ref(namespace, activity_id: str,
+                                     operation_id: str) -> str:
+    outbox_id = "d06-correction-outbox-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+    })[:40]
+    return runtime_outbox_key(*namespace.as_tuple, activity_id, outbox_id).token
+
+
+def _d06_correction_envelope_digest(envelope: CommandEnvelope) -> str:
+    return canonical_digest(replace(
+        envelope, version_guard=replace(
+            envelope.version_guard, resource_lease_versions=())))
+
+
+def _d06_correction_quote_refs(policy: D06SourceCorrectionQuotePolicy,
+                               envelope: CommandEnvelope) -> tuple[str, str]:
+    snapshot = "d06correctionsnap:" + policy.policy_id + ":" + canonical_digest({
+        "policy": _payload(policy), "envelope": _d06_correction_envelope_digest(envelope),
+    })[:32]
+    resource = "d06correctionresource:" + canonical_digest({
+        "policy_id": policy.policy_id, "resource_ref": policy.resource_ref,
+        "operation_id": policy.operation_id,
+    })[:48]
+    return snapshot, resource
+
+
+def _d06_correction_request_binding(envelope: CommandEnvelope, request) -> str:
+    from ..domains.d06 import CorrectionRequest, D06DomainAdapter
+    from ..workbench_api.source_correction import SourceCorrectionRequestV1
+
+    if type(request) is not SourceCorrectionRequestV1:
+        raise IssuerAuthorityDenied("typed D12 correction identity is required")
+    namespace = envelope.authority.namespace
+    identity = envelope.identity
+    if (request.namespace != namespace or request.operation_id != identity.operation_id
+            or identity.phase != "source-correction" or identity.effect_id is not None
+            or envelope.authority.issuer_domain != "d06"
+            or "event" not in envelope.authority.owner_scope
+            or envelope.authority.worker_fence is not None
+            or envelope.version_guard.access_epoch != request.access_epoch
+            or envelope.version_guard.delete_epoch != request.deletion_epoch
+            or identity.canonical_input_digest != canonical_digest({
+                "input_refs": list(envelope.input_refs),
+            })):
+        raise IssuerAuthorityDenied("D06 correction request differs from trusted envelope")
+    source = D06DomainAdapter(namespace).correction_source_key(CorrectionRequest(
+        request.operation_id, request.target_refs, request.source_refs,
+        request.statement, request.access_epoch, request.deletion_epoch))
+    expected = (source.token, *request.source_refs, *request.target_refs)
+    if envelope.input_refs[:len(expected)] != expected:
+        raise IssuerAuthorityDenied("D06 correction input refs differ from request")
+    try:
+        extras = tuple(AtomKey.from_token(ref) for ref in envelope.input_refs[len(expected):])
+        sources = tuple(AtomKey.from_token(ref) for ref in request.source_refs)
+        targets = tuple(AtomKey.from_token(ref) for ref in request.target_refs)
+    except (TypeError, ValueError) as exc:
+        raise IssuerAuthorityDenied("D06 correction graph refs are invalid") from exc
+    if (any(key.type_name != "memory.source" or key.owner.kind != "event"
+            or key.name != "record" for key in sources)
+            or any(key.type_name != "memory.interpretation" or key.owner.kind != "event"
+                   or key.name != "current" for key in targets)
+            or any(key.type_name != "d07.belief_revision.v1" for key in extras)
+            or any((key.owner.bot, key.owner.persona) != namespace.as_tuple
+                   for key in (source, *sources, *targets, *extras))):
+        raise IssuerAuthorityDenied("D06 correction refs cross type or namespace")
+    return source.token
+
+
 @dataclass(frozen=True)
 class _D06C02Origin:
     job_id: str
@@ -975,6 +1122,13 @@ def _decode_d06_c02_policy(payload: str) -> D06FirstIngressC02QuotePolicy:
     return D06FirstIngressC02QuotePolicy(**json.loads(payload))
 
 
+def _decode_d06_correction_policy(payload: str) -> D06SourceCorrectionQuotePolicy:
+    value = json.loads(payload)
+    value["source_refs"] = tuple(value["source_refs"])
+    value["target_refs"] = tuple(value["target_refs"])
+    return D06SourceCorrectionQuotePolicy(**value)
+
+
 def _decode_outcome(payload: str) -> ResourceOutcome:
     return ResourceOutcome(**json.loads(payload))
 
@@ -1051,6 +1205,14 @@ def install_schema(db) -> None:
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS runtime_d06_c02_quote_policies(
+            policy_id TEXT PRIMARY KEY,
+            policy_json TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            status TEXT NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_d06_correction_quote_policies(
             policy_id TEXT PRIMARY KEY,
             policy_json TEXT NOT NULL,
             signature TEXT NOT NULL,
@@ -1361,6 +1523,78 @@ class D02ResourceIssuer:
                 or quote.d02_settlement_refs
                 or dict(quote.ceiling) != dict(policy.quote_ceiling)):
             raise IssuerAuthorityDenied("D06 C02 quote differs from signed policy")
+        return policy
+
+    def _install_d06_correction_policy(
+            self, db, policy: D06SourceCorrectionQuotePolicy) -> str:
+        payload = canonical_serialize(_payload(policy))
+        signature = self._signer.sign("d06-source-correction-policy.v1", payload)
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM runtime_d06_correction_quote_policies "
+            "WHERE policy_id=?", (policy.policy_id,),
+        ).fetchone()
+        if row is not None:
+            self._signer.verify("d06-source-correction-policy.v1", row[0], row[1])
+            if row != (payload, signature, "active"):
+                raise IssuerAuthorityDenied("D06 correction policy replay differs")
+            return signature
+        db.execute(
+            "INSERT INTO runtime_d06_correction_quote_policies"
+            "(policy_id,policy_json,signature,status) VALUES(?,?,?,'active')",
+            (policy.policy_id, payload, signature),
+        )
+        return signature
+
+    def _load_d06_correction_policy(
+            self, db, policy_id: str) -> D06SourceCorrectionQuotePolicy:
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM runtime_d06_correction_quote_policies "
+            "WHERE policy_id=?", (policy_id,),
+        ).fetchone()
+        if row is None or row[2] != "active":
+            raise IssuerAuthorityDenied("active signed D06 correction policy is absent")
+        self._signer.verify("d06-source-correction-policy.v1", row[0], row[1])
+        try:
+            policy = _decode_d06_correction_policy(row[0])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("signed D06 correction policy is invalid") from exc
+        if policy.policy_id != policy_id:
+            raise IssuerAuthorityDenied("signed D06 correction policy identity differs")
+        return policy
+
+    def _qualified_d06_correction_policy(
+            self, db, envelope: CommandEnvelope, quote: ResourceQuote,
+            grant: BudgetLeaseGrant) -> D06SourceCorrectionQuotePolicy:
+        parts = quote.snapshot_ref.split(":")
+        if len(parts) != 3 or parts[0] != "d06correctionsnap":
+            raise IssuerAuthorityDenied("D06 correction quote lacks policy binding")
+        policy = self._load_d06_correction_policy(db, parts[1])
+        namespace = envelope.authority.namespace
+        snapshot_ref, resource_ref = _d06_correction_quote_refs(policy, envelope)
+        expected_input = (policy.correction_source_ref,
+                          *policy.source_refs, *policy.target_refs)
+        if (policy.policy_id != _d06_correction_policy_id(
+                    policy.installation_id, grant, envelope.identity.operation_id)
+                or (policy.bot_id, policy.persona_id) != namespace.as_tuple
+                or (policy.grant_id, policy.grant_version, policy.lease_id,
+                    policy.provider_policy_ref) != (
+                    grant.grant_id, grant.version, grant.lease_id, grant.policy_ref)
+                or policy.envelope_digest != _d06_correction_envelope_digest(envelope)
+                or (policy.operation_id, policy.activity_id) != (
+                    envelope.identity.operation_id, envelope.identity.activity_id)
+                or envelope.identity.phase != "source-correction"
+                or envelope.authority.issuer_domain != "d06"
+                or envelope.input_refs[:len(expected_input)] != expected_input
+                or quote.snapshot_ref != snapshot_ref or quote.resource_ref != resource_ref
+                or quote.quote_id != d06_source_correction_quote_id(
+                    namespace, envelope.identity.operation_id)
+                or quote.graph_job_ref != policy.job_ref
+                or quote.outbox_refs != (policy.outbox_ref,)
+                or quote.d02_settlement_refs
+                or quote.activity_id != policy.activity_id
+                or quote.operation_id != policy.operation_id
+                or dict(quote.ceiling) != dict(policy.quote_ceiling)):
+            raise IssuerAuthorityDenied("D06 correction quote differs from signed policy")
         return policy
 
     def issue_outcome(self, db, outcome: ResourceOutcome) -> str:
@@ -2006,6 +2240,81 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         self._d02._issue_bound_stage_quote(db, quote)
         return quote
 
+    def issue_d06_source_correction_quote(
+            self, db, envelope: CommandEnvelope, admin_policy, request, *,
+            installation_id: str, now_utc: float | None = None) -> ResourceQuote:
+        """Bind one Owner correction to installed D02 price and existing D11 budget.
+
+        The caller verifies the Owner, original D12 command digest and graph
+        read in its business transaction. The D12 DTO lacks the original
+        command purpose and audience, so this method signs but cannot derive
+        that digest. It accepts no client quote, grant, job, or outbox identity.
+        """
+        from ..host.authority_profile import AdminD06SourceCorrectionPolicy
+
+        if type(admin_policy) is not AdminD06SourceCorrectionPolicy:
+            raise IssuerAuthorityDenied("installed D06 correction policy is required")
+        if type(envelope) is not CommandEnvelope:
+            raise TypeError("envelope must be CommandEnvelope")
+        _id(installation_id, "installation_id")
+        if envelope.version_guard.resource_lease_versions:
+            raise IssuerAuthorityDenied("D06 correction quote request has prior resource refs")
+        correction_source_ref = _d06_correction_request_binding(envelope, request)
+        now = _now_utc(now_utc)
+        grant = self._load_grant(db, envelope.parent_budget_lease_ref)
+        lease = get_budget_lease(db, grant.lease_id)
+        namespace = envelope.authority.namespace
+        if (D06_SOURCE_CORRECTION_WORK_KIND not in grant.allowed_work_kinds
+                or (grant.bot_id, grant.persona_id) != namespace.as_tuple
+                or (lease.bot_id, lease.persona_id, lease.currency)
+                != (grant.bot_id, grant.persona_id, grant.currency)
+                or lease.state != "active"
+                or grant.policy_ref != envelope.authority.provider_policy_ref
+                or grant.valid_until_utc <= now
+                or not now < envelope.deadline_utc <= min(
+                    now + admin_policy.deadline_after_seconds,
+                    grant.valid_until_utc)):
+            raise IssuerAuthorityDenied("D06 correction lacks current signed grant or deadline")
+        if any(amount > grant.max_ceiling.get(name, 0)
+               for name, amount in admin_policy.quote_ceiling.items()):
+            raise IssuerAuthorityDenied("D06 correction quote exceeds signed grant")
+        operation_id = envelope.identity.operation_id
+        activity_id = envelope.identity.activity_id
+        policy = D06SourceCorrectionQuotePolicy(
+            _d06_correction_policy_id(installation_id, grant, operation_id),
+            *namespace.as_tuple, installation_id, grant.grant_id, grant.version,
+            grant.lease_id, grant.policy_ref, dict(admin_policy.quote_ceiling),
+            admin_policy.deadline_after_seconds, admin_policy.snapshot_ref,
+            admin_policy.resource_ref, request.request_digest,
+            request.statement, request.impact_preview_ref,
+            _d06_correction_envelope_digest(envelope), operation_id, activity_id,
+            correction_source_ref, request.source_refs, request.target_refs,
+            d06_source_correction_job_ref(namespace, activity_id, operation_id),
+            d06_source_correction_outbox_ref(namespace, activity_id, operation_id),
+        )
+        snapshot_ref, resource_ref = _d06_correction_quote_refs(policy, envelope)
+        quote = ResourceQuote(
+            d06_source_correction_quote_id(namespace, operation_id), 1,
+            *namespace.as_tuple, activity_id, operation_id,
+            envelope.identity.effect_id, grant.lease_id,
+            D06_SOURCE_CORRECTION_WORK_KIND, snapshot_ref, envelope.deadline_utc,
+            resource_ref, policy.job_ref, (policy.outbox_ref,), (),
+            dict(policy.quote_ceiling), None, envelope.deadline_utc,
+        )
+        install_schema(db)
+        existing = db.execute(
+            "SELECT 1 FROM runtime_resource_quotes WHERE quote_id=? AND version=1",
+            (quote.quote_id,),
+        ).fetchone()
+        if existing is None and any(
+                amount > lease.limits.get(name, 0) - lease.used.get(name, 0)
+                - lease.reserved.get(name, 0) - lease.unconfirmed.get(name, 0)
+                for name, amount in policy.quote_ceiling.items()):
+            raise IssuerAuthorityDenied("D06 correction budget has insufficient capacity")
+        self._d02._install_d06_correction_policy(db, policy)
+        self._d02._issue_bound_stage_quote(db, quote)
+        return quote
+
     def authorize_existing_encoding_job(self, db, job: PersistentJob, *,
                                         now_utc: float) -> bool:
         """Recheck the original signed grant and quote without reserving again."""
@@ -2116,6 +2425,8 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
                         origin.source_ref, baseline.token, baseline_revision,
                         origin.consumer_operation_id)):
                 raise IssuerAuthorityDenied("D06 C02 original signed binding changed")
+        if quote.work_kind == D06_SOURCE_CORRECTION_WORK_KIND:
+            self._d02._qualified_d06_correction_policy(db, envelope, quote, grant)
         return quote, grant, lease
 
     @staticmethod
@@ -2230,7 +2541,7 @@ def build_runtime_issuers(signing_key: bytes, *,
 
 
 __all__ = [
-    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D03SelfIdentityProjectionQuotePolicy", "D03_SELF_IDENTITY_PROJECTION_WORK_KIND", "D04BaselineQuotePolicy", "D04_BASELINE_WORK_KIND", "D06FirstIngressC02QuotePolicy", "D06_FIRST_INGRESS_C02_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id", "d03_self_identity_projection_quote_id", "d04_baseline_quote_id", "d06_first_ingress_c02_quote_id",
+    "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D03SelfIdentityProjectionQuotePolicy", "D03_SELF_IDENTITY_PROJECTION_WORK_KIND", "D04BaselineQuotePolicy", "D04_BASELINE_WORK_KIND", "D06FirstIngressC02QuotePolicy", "D06_FIRST_INGRESS_C02_WORK_KIND", "D06SourceCorrectionQuotePolicy", "D06_SOURCE_CORRECTION_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id", "d03_self_identity_projection_quote_id", "d04_baseline_quote_id", "d06_first_ingress_c02_quote_id", "d06_source_correction_quote_id", "d06_source_correction_job_ref", "d06_source_correction_outbox_ref",
     "IssuerAuthorityDenied", "ResourceOutcome", "ResourceQuote",
     "build_runtime_issuers", "install_schema",
 ]
