@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, replace
 import json
 import math
 
-from ...graph_types import AtomKey, GraphWrite, Owner, TypeSpec
+from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeSpec
 from ...runtime_contracts import (
     CheckReceipt,
     DomainProposal,
@@ -517,6 +517,46 @@ class ActionIntent:
             raise ValueError("retry cannot change activity_id")
         if self.identity.effect_id != other.identity.effect_id:
             raise ValueError("retry cannot change effect_id")
+
+
+@dataclass(frozen=True)
+class ActionCancellationState:
+    """Current graph head for one action attempt; never a dispatch permit."""
+
+    action_id: str
+    action_revision: int
+    action_digest: str
+    activity_id: str
+    attempt_id: str
+    effect_id: str
+    cancel_epoch: int
+    state: str
+    actor: str
+    source_refs: tuple[str, ...]
+    operation_id: str
+
+    def __post_init__(self) -> None:
+        _text(self.action_id, "action_id", "action:")
+        _positive(self.action_revision, "action_revision")
+        _sha256(self.action_digest, "action_digest")
+        for name in ("activity_id", "attempt_id", "effect_id", "actor", "operation_id"):
+            _text(getattr(self, name), name)
+        if type(self.cancel_epoch) is not int or self.cancel_epoch < 0:
+            raise ValueError("cancel_epoch must be a nonnegative exact integer")
+        if (self.state, self.cancel_epoch) not in {("active", 0), ("cancelled", 1)}:
+            raise ValueError("action cancellation permits only active@0 then cancelled@1")
+        object.__setattr__(self, "source_refs", _strings(
+            self.source_refs, "source_refs", allow_empty=False))
+
+    @classmethod
+    def for_action(cls, action: ActionIntent, *, state: str, actor: str,
+                   source_refs: tuple[str, ...], operation_id: str) -> "ActionCancellationState":
+        if not isinstance(action, ActionIntent):
+            raise TypeError("action must be ActionIntent")
+        return cls(action.action_id, action.revision, canonical_digest(action),
+                   action.identity.activity_id, action.identity.attempt_id,
+                   action.identity.effect_id or "", 0 if state == "active" else 1,
+                   state, actor, source_refs, operation_id)
 
 
 @dataclass(frozen=True)
@@ -1221,6 +1261,8 @@ def _decode(type_name: str, payload: dict) -> object:
         return _decode_joint_plan(payload)
     if type_name == "d08.action_intent.v1":
         return _decode_intent(payload)
+    if type_name == "d08.action_cancellation.v1":
+        return ActionCancellationState(**_tuple_fields(payload, "source_refs"))
     if type_name == "d08.action_schema.v1":
         return _decode_action_schema(payload)
     if type_name == "d08.communication_intent_grant.v1":
@@ -1243,6 +1285,7 @@ class GoalExecutionProvider:
         "d08.commitment.v1": ("persona", "relation", "activity"),
         "d08.joint_plan.v1": ("activity",),
         "d08.action_intent.v1": ("activity",),
+        "d08.action_cancellation.v1": ("activity",),
         "d08.action_schema.v1": ("activity",),
         "d08.communication_intent_grant.v1": ("activity",),
         "d08.action_outcome.v1": ("activity",),
@@ -1329,7 +1372,76 @@ class GoalExecutionProvider:
                 or action_writes[0].key.owner != schema_writes[0].key.owner
             ):
                 raise ValueError("action intent and frozen schema are not bound to this exact operation")
+        cancellation_writes = tuple(item for item in proposal.typed_writes
+                                    if item.key.type_name == "d08.action_cancellation.v1")
+        if cancellation_writes:
+            if len(cancellation_writes) != 1 or not isinstance(snapshot, GraphSnapshot):
+                raise ValueError("cancellation requires one write and a current graph snapshot")
+            write = cancellation_writes[0]
+            state = _decode("d08.action_cancellation.v1", write.value)
+            namespace = proposal.envelope.authority.namespace
+            action_key = AtomKey(
+                Owner("activity", namespace.bot_id, namespace.persona_id, state.activity_id),
+                "d08.action_intent.v1", state.action_id,
+            )
+            state_key = AtomKey(action_key.owner, "d08.action_cancellation.v1", state.action_id)
+            action_atom = snapshot.get(action_key)
+            previous_atom = snapshot.get(state_key)
+            guards = {item.key: item.revision for item in proposal.envelope.version_guard.read_versions}
+            if (write.key != state_key or action_atom is None or not action_atom.valid
+                    or guards.get(action_key) != action_atom.revision
+                    or guards.get(state_key) != (previous_atom.revision if previous_atom else 0)
+                    or len(guards) != len(proposal.envelope.version_guard.read_versions)
+                    or proposal.envelope.identity.activity_id != state.activity_id
+                    or proposal.envelope.identity.attempt_id != state.attempt_id
+                    or proposal.envelope.authority.actor != state.actor
+                    or proposal.envelope.identity.operation_id != state.operation_id
+                    or proposal.envelope.source_qualification.source_refs != state.source_refs):
+                raise ValueError("cancellation is not bound to guarded action and source identity")
+            action = _decode_intent(action_atom.value)
+            if (action_atom.revision != state.action_revision
+                    or action.revision != state.action_revision
+                    or canonical_digest(action) != state.action_digest
+                    or action.identity.activity_id != state.activity_id
+                    or action.identity.attempt_id != state.attempt_id
+                    or action.identity.effect_id != state.effect_id):
+                raise ValueError("cancellation targets a stale action attempt")
+            if previous_atom is None:
+                if state.state != "active" or state.cancel_epoch != 0:
+                    raise ValueError("initial cancellation state must be active@0")
+            else:
+                if not previous_atom.valid:
+                    raise ValueError("invalid cancellation state cannot be replaced")
+                previous = _decode("d08.action_cancellation.v1", previous_atom.value)
+                if (previous.action_id != state.action_id
+                        or previous.action_revision != state.action_revision
+                        or previous.action_digest != state.action_digest
+                        or previous.activity_id != state.activity_id
+                        or previous.attempt_id != state.attempt_id
+                        or previous.effect_id != state.effect_id
+                        or previous.state != "active" or previous.cancel_epoch != 0
+                        or state.state != "cancelled" or state.cancel_epoch != 1):
+                    raise ValueError("cancellation transition is stale or already terminal")
         return proposal
+
+    def prepare_action_cancellation(
+        self, proposal: DomainProposal, action: ActionIntent, snapshot: GraphSnapshot,
+        *, state: str,
+    ) -> DomainProposal:
+        """Construct a guarded candidate; W01 must authorize and atomically commit it."""
+        if state not in {"active", "cancelled"}:
+            raise ValueError("unsupported cancellation transition")
+        namespace = proposal.envelope.authority.namespace
+        owner = Owner("activity", namespace.bot_id, namespace.persona_id,
+                      action.identity.activity_id)
+        key = AtomKey(owner, "d08.action_cancellation.v1", action.action_id)
+        value = ActionCancellationState.for_action(
+            action, state=state, actor=proposal.envelope.authority.actor,
+            source_refs=proposal.envelope.source_qualification.source_refs,
+            operation_id=proposal.envelope.identity.operation_id,
+        )
+        write = GraphWrite(key, json.loads(canonical_serialize(asdict(value))))
+        return self.validate(replace(proposal, typed_writes=proposal.typed_writes + (write,)), snapshot)
 
     def prepare_action_candidate(
         self, proposal: DomainProposal, intent: ActionIntent, schema: ActionSchema,
@@ -1458,7 +1570,7 @@ class GoalExecutionProvider:
 
 
 __all__ = (
-    "BASE_REQUIRED_PROVIDERS", "PROACTIVE_REQUIRED_PROVIDER", "ActionIntent", "ActionOutcome",
+    "BASE_REQUIRED_PROVIDERS", "PROACTIVE_REQUIRED_PROVIDER", "ActionCancellationState", "ActionIntent", "ActionOutcome",
     "ActionSchema", "ActionSchemaRecord", "Aspiration", "Commitment", "CommitmentConflictSnapshot",
     "CommunicationGrantRequest", "CommunicationIntentGrant", "CommunicationSegmentSpec", "SegmentGrant",
     "DecisionRecord", "Goal", "GoalExecutionProvider",

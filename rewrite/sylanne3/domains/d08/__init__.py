@@ -3,6 +3,7 @@
 from .execution import (
     BASE_REQUIRED_PROVIDERS,
     PROACTIVE_REQUIRED_PROVIDER,
+    ActionCancellationState,
     ActionIntent,
     ActionOutcome,
     ActionSchema,
@@ -32,6 +33,7 @@ from .expression import CommunicationPlanResult, prepare_expression_plan
 __all__ = (
     "BASE_REQUIRED_PROVIDERS",
     "PROACTIVE_REQUIRED_PROVIDER",
+    "ActionCancellationState",
     "ActionIntent",
     "ActionOutcome",
     "ActionSchema",
