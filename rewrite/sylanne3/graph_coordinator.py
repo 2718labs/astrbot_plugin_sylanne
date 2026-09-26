@@ -665,9 +665,10 @@ class GraphCoordinator:
                  owner_principal_resolver=None,
                  dispatch_admission_issuer=None, dispatch_clock_policy=None,
                  scene_identity_port=None, scene_clock_policy=None,
-                 encoding_request_issuer=None, model_terminal_cost_port=None,
-                 accounting_maintenance_port=None, self_identity_port=None,
-                 worker_result_fact_port: WorkerResultReadFactPort | None = None):
+                   encoding_request_issuer=None, model_terminal_cost_port=None,
+                   accounting_maintenance_port=None, self_identity_port=None,
+                   worker_result_fact_port: WorkerResultReadFactPort | None = None,
+                   original_c02_cost_intent_port=None):
         if not isinstance(store, GraphStore):
             raise TypeError("store must be GraphStore")
         if bootstrap is None or isinstance(bootstrap, (str, bytes, int, float)):
@@ -703,6 +704,10 @@ class GraphCoordinator:
         if model_terminal_cost_port is not None and not callable(model_terminal_cost_port):
             raise TypeError("model_terminal_cost_port must be callable")
         self.__model_terminal_cost_port = model_terminal_cost_port
+        if (original_c02_cost_intent_port is not None
+                and not callable(original_c02_cost_intent_port)):
+            raise TypeError("original_c02_cost_intent_port must be callable")
+        self.__original_c02_cost_intent_port = original_c02_cost_intent_port
         if (accounting_maintenance_port is not None
                 and any(not callable(getattr(accounting_maintenance_port, name, None))
                         for name in ("begin", "validate", "finish", "recover_finish"))):
@@ -10799,11 +10804,14 @@ class GraphCoordinator:
         finally:
             self.release_authority_lease(bootstrap, lease)
 
-    def first_ingress_c02_accounting_installed_v1(self) -> bool:
+    def first_ingress_c02_accounting_installed_v1(
+        self, *, require_worker_result: bool = True,
+    ) -> bool:
         """Whether the mandatory C02 unknown-cost continuation has its ports."""
         return (isinstance(self.__store, ProductionGraphStore)
                 and self.__content_fence_v2 is not None
-                and self.__worker_result_fact_port is not None
+                and (not require_worker_result
+                     or self.__worker_result_fact_port is not None)
                 and self.__model_terminal_cost_port is not None
                 and self.__accounting_maintenance_port is not None
                 and callable(getattr(self.__d02_issuer,
@@ -10811,6 +10819,175 @@ class GraphCoordinator:
                 and callable(getattr(self.__d02_issuer,
                                      "original_c02_unknown_outcome", None))
                 and self.__d11_issuer is not None)
+
+    def recover_committed_first_ingress_c02_unknown_cost_v1(
+        self, bootstrap: object, namespace: NamespaceId, operation_id: str,
+    ) -> None:
+        """Settle a durable C02 completion without re-reading its model body.
+
+        The Authority terminal authenticates the observation digest. A
+        historical read/result digest has no independent post-finish seal, so
+        this path never treats it as measured CPU use or body revalidation.
+        """
+        from .authority_service.v2_model_egress_contract import ModelEgressIntentV1
+        from .runtime.c02_cost_settlement import (
+            C02CommittedCostProofV1, C02OriginalIntentLookupV1,
+        )
+        from .runtime.encoding_call_binding import binding_from_json, load_binding
+        from .runtime.first_ingress_c02_identity import (
+            first_ingress_c02_consumer_operation_id_v1,
+        )
+        from .runtime.model_cost_settlement import read_original_model_cost
+
+        self._admin(bootstrap)
+        lookup = self.__original_c02_cost_intent_port
+        if (type(namespace) is not NamespaceId or type(operation_id) is not str
+                or not operation_id or not callable(lookup)
+                or not self.first_ingress_c02_accounting_installed_v1(
+                    require_worker_result=False)):
+            raise UnavailableGuard("installed committed C02 recovery authorities required")
+        store = self.__store
+        with store._lock:
+            metadata, _ = self._v2_graph_stamp(namespace)
+            db = store._db
+            row = db.execute(
+                "SELECT activity_id,receipt_json FROM graph_bundle_operations "
+                "WHERE bot=? AND persona=? AND operation_id=?",
+                namespace.as_tuple + (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise UnavailableGuard("committed C02 receipt is absent; HOLD")
+            detail = json.loads(row[1]).get("first_ingress_c02")
+            event = db.execute(
+                "SELECT revisions FROM graph_events WHERE bot=? AND persona=? "
+                "AND session=? AND event_id=?",
+                namespace.as_tuple + (row[0], operation_id),
+            ).fetchone()
+            job_writes = (() if event is None else tuple(
+                version for version in GraphStore._version_rows(event[0])
+                if version.key.type_name == "runtime.job"
+                and version.key.owner == Owner(
+                    "activity", *namespace.as_tuple, row[0])))
+            if type(detail) is not dict or len(job_writes) != 1:
+                raise UnavailableGuard("committed C02 job receipt differs; HOLD")
+            job_id = job_writes[0].key.name
+            job = db.execute(
+                "SELECT operation_id,phase,lease_holder,fence "
+                "FROM runtime_jobs WHERE bot_id=? AND persona_id=? "
+                "AND activity_id=? AND job_id=?",
+                namespace.as_tuple + (row[0], job_id),
+            ).fetchone()
+            if job is None or job[1:3] != ("completed", None):
+                raise UnavailableGuard("committed C02 job receipt differs; HOLD")
+            original_id, _, _, worker_fence = job
+            acquired = db.execute(
+                "SELECT i.acquire_operation_id,i.actor,i.encoding_binding_json,"
+                "i.requirements_json,i.request_digest,r.request_digest,r.job_json "
+                "FROM graph_job_acquire_intents_v2 AS i "
+                "JOIN graph_job_acquire_receipts_v2 AS r "
+                "ON r.bot=i.bot AND r.persona=i.persona "
+                "AND r.acquire_operation_id=i.acquire_operation_id "
+                "WHERE i.bot=? AND i.persona=? AND i.job_id=? "
+                "AND i.original_operation_id=?",
+                namespace.as_tuple + (job_id, original_id),
+            ).fetchall()
+            provision_row = self._provision_row(db, namespace)
+            if provision_row is None:
+                raise UnavailableGuard("C02 original installation is absent; HOLD")
+            provision = self._decode_provision_receipt(provision_row)
+            installed = self.__content_fence_v2.installation_grant
+            if (provision.installation_id != installed.installation_id
+                    or provision.authority_id != metadata.requirements.authority_id
+                    or provision.authority_namespace !=
+                    metadata.requirements.authority_namespace
+                    or provision.generation !=
+                    metadata.requirements.activation_generation):
+                raise UnavailableGuard("C02 original installation differs; HOLD")
+            matches = []
+            for (acquire_id, actor, binding_json, requirements_json,
+                 intent_digest, receipt_digest, original_job_json) in acquired:
+                binding = binding_from_json(binding_json)
+                frozen = binding.request
+                historic = json.loads(requirements_json)
+                original_job = PersistentJob(**json.loads(original_job_json))
+                derived = first_ingress_c02_consumer_operation_id_v1(
+                    namespace=namespace,
+                    authority_id=metadata.requirements.authority_id,
+                    authority_namespace=metadata.requirements.authority_namespace,
+                    installation_id=provision.installation_id, job_id=job_id,
+                    acquire_operation_id=acquire_id,
+                    original_operation_id=original_id, call_id=binding.call_id,
+                    binding_digest=binding.binding_digest,
+                    model_request_digest=binding.model_request_digest)
+                if derived != operation_id:
+                    continue
+                current = load_binding(db, namespace, job_id)
+                if (binding.namespace != namespace or current != binding
+                        or intent_digest != receipt_digest
+                        or (original_job.job_id, original_job.operation_id,
+                            original_job.activity_id, original_job.phase,
+                            original_job.lease_holder, original_job.fence,
+                            original_job.cancel_epoch) != (
+                                job_id, original_id, row[0], "running",
+                                actor, worker_fence, 0)
+                        or frozen.get("schema") !=
+                        "sylanne.first-ingress-encoding-call.v3"
+                        or frozen.get("acquire_operation_id") != acquire_id
+                        or frozen.get("original_operation_id") != original_id
+                        or frozen.get("worker_fence") != worker_fence
+                        or historic.get("graph_incarnation") !=
+                        metadata.requirements.graph_incarnation
+                        or historic.get("authority_id") !=
+                        metadata.requirements.authority_id
+                        or historic.get("authority_namespace") !=
+                        metadata.requirements.authority_namespace):
+                    raise UnavailableGuard("C02 original V3 identity differs; HOLD")
+                matches.append((C02OriginalIntentLookupV1(
+                    namespace, metadata.requirements.authority_id,
+                    metadata.requirements.authority_namespace,
+                    provision.installation_id, job_id, original_id, acquire_id,
+                    binding.call_id, binding.binding_digest,
+                    binding.model_request_digest, operation_id), actor))
+            if len(matches) != 1:
+                raise UnavailableGuard("C02 original V3 identity is ambiguous; HOLD")
+            request, actor = matches[0]
+            proof = C02CommittedCostProofV1(
+                job_id, original_id, operation_id,
+                *(detail.get(key) for key in (
+                    "read_request_digest", "read_result_digest",
+                    "original_intent_digest", "terminal_receipt_digest",
+                    "observation_digest", "result_digest")))
+        # Both Authority calls are made outside GraphStore's lock. The lookup
+        # port holds the designated observer credential and returns its ledger intent.
+        original_intent = lookup(request)
+        if (type(original_intent) is not ModelEgressIntentV1
+                or (original_intent.authority_id, original_intent.namespace,
+                    original_intent.job_id, original_intent.operation_id,
+                    original_intent.acquire_operation_id, original_intent.call_id,
+                    original_intent.binding_digest, original_intent.request_digest,
+                    original_intent.budget_reservation_operation_id,
+                    original_intent.subject, original_intent.worker_fence) != (
+                        request.authority_id, request.authority_namespace,
+                        request.job_id, request.acquire_operation_id,
+                        request.acquire_operation_id, request.call_id,
+                        request.binding_digest, request.model_request_digest,
+                    request.original_operation_id, actor, worker_fence)):
+            raise UnavailableGuard("Authority original C02 intent differs; HOLD")
+        if proof.original_intent_digest != canonical_digest(asdict(original_intent)):
+            raise UnavailableGuard("Authority original C02 intent digest differs; HOLD")
+        fact = read_original_model_cost(self.__model_terminal_cost_port, original_intent)
+        if (fact.recovery.state != "observed"
+                or proof.terminal_receipt_digest != canonical_digest(
+                    asdict(fact.receipt))
+                or proof.observation_digest != fact.recovery.observation_digest):
+            raise UnavailableGuard("Authority original C02 terminal differs; HOLD")
+        verified = self._first_ingress_c02_duplicate_v1(
+            namespace, operation_id, original_intent,
+            terminal_receipt_digest=proof.terminal_receipt_digest)
+        if verified is None:
+            raise UnavailableGuard("committed C02 fence receipt is absent; HOLD")
+        self._commit_first_ingress_c02_unknown_cost_v1(
+            namespace, original_intent, proof, verified)
 
     def _commit_first_ingress_c02_unknown_cost_v1(
         self, namespace: NamespaceId, original_intent, read, verified_completion,
@@ -10820,17 +10997,21 @@ class GraphCoordinator:
             AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
         )
         from .runtime.c02_cost_settlement import (
+            C02CommittedCostProofV1,
             apply_c02_unknown_budget_in_transaction,
             prepare_c02_unknown_cost_plan,
         )
         from .runtime.d11_types import validate_d11_writes
         from .runtime.model_cost_settlement import read_original_model_cost
 
-        if not self.first_ingress_c02_accounting_installed_v1():
+        if not self.first_ingress_c02_accounting_installed_v1(
+                require_worker_result=type(read) is not C02CommittedCostProofV1):
             raise UnavailableGuard("C02 local accounting authority unavailable; HOLD")
         store = self.__store
         port = self.__accounting_maintenance_port
-        operation_id = read.request.consumer_operation_id
+        operation_id = (read.consumer_operation_id
+                        if type(read) is C02CommittedCostProofV1 else
+                        read.request.consumer_operation_id)
         intent_digest = canonical_digest(asdict(original_intent))
         completion_digest = canonical_digest(asdict(verified_completion))
 
@@ -10916,6 +11097,11 @@ class GraphCoordinator:
             self.__model_terminal_cost_port, original_intent)
         if original_model_fact.recovery.state != "observed":
             raise UnavailableGuard("C02 original model terminal is unavailable")
+        if (type(read) is C02CommittedCostProofV1
+                and (read.original_intent_digest != intent_digest
+                     or read.terminal_receipt_digest != canonical_digest(
+                         asdict(original_model_fact.receipt)))):
+            raise UnavailableGuard("C02 original terminal proof differs")
         anchor = self.__content_fence_v2.current_anchor(
             namespace=namespace, authority_namespace=target.authority_namespace)
         if not self._accounting_anchor_covers(target, anchor):
@@ -11292,9 +11478,10 @@ class GraphCoordinator:
             self.release_authority_lease(bootstrap, lease)
 
     def _first_ingress_c02_duplicate_v1(
-        self, namespace: NamespaceId, operation_id: str, original_intent, read,
+        self, namespace: NamespaceId, operation_id: str, original_intent, read=None,
+        *, terminal_receipt_digest: str | None = None,
     ) -> CommitReceipt | None:
-        """Replay a committed C02 from its immutable result and graph receipts."""
+        """Replay a committed C02 from its result or terminal and graph receipts."""
         from .authority_service.v2_contract import FencePermitV2, from_wire
 
         store = self.__store
@@ -11309,16 +11496,27 @@ class GraphCoordinator:
                 return None
             data = json.loads(row[4])
             c02 = data.get("first_ingress_c02")
+            expected_c02 = (
+                {"read_request_digest": read.request.digest,
+                 "read_result_digest": canonical_digest(asdict(read)),
+                 "original_intent_digest": canonical_digest(asdict(original_intent)),
+                 "terminal_receipt_digest": canonical_digest(
+                     asdict(read.terminal_receipt)),
+                 "observation_digest": read.observation.digest,
+                 "result_digest": canonical_digest(read.observation.result)}
+                if read is not None else None)
             if (not isinstance(c02, dict)
-                    or c02.get("read_request_digest") != read.request.digest
-                    or c02.get("read_result_digest") != canonical_digest(asdict(read))
-                    or c02.get("original_intent_digest") != canonical_digest(
-                        asdict(original_intent))
-                    or c02.get("terminal_receipt_digest") != canonical_digest(
-                        asdict(read.terminal_receipt))
-                    or c02.get("observation_digest") != read.observation.digest
-                    or c02.get("result_digest") != canonical_digest(
-                        read.observation.result)):
+                    or set(c02) != {
+                        "read_request_digest", "read_result_digest",
+                        "original_intent_digest", "terminal_receipt_digest",
+                        "observation_digest", "result_digest"}
+                    or (c02 != expected_c02 if read is not None else
+                        c02["original_intent_digest"] != canonical_digest(
+                            asdict(original_intent))
+                        or c02["terminal_receipt_digest"] != terminal_receipt_digest
+                        or any(type(value) is not str or len(value) != 64
+                               or any(char not in "0123456789abcdef" for char in value)
+                               for value in c02.values()))):
                 raise EventConflict("C02 operation ID reused with different original result")
             graph = store._db.execute(
                 "SELECT reads,revisions,epoch_revision FROM graph_events "

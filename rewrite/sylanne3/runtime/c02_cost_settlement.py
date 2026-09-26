@@ -44,6 +44,43 @@ class C02UnknownCostApplicationV1:
     cost_write: GraphWrite
 
 
+@dataclass(frozen=True, slots=True)
+class C02CommittedCostProofV1:
+    """Content-free fields from an already committed C02 business receipt.
+
+    Historical read/result digests have no independent Authority seal after
+    the write fence finishes. They are local receipt consistency fields, not
+    the basis for the conservative CPU accounting decision.
+    """
+
+    job_id: str
+    original_operation_id: str
+    consumer_operation_id: str
+    read_request_digest: str
+    read_result_digest: str
+    original_intent_digest: str
+    terminal_receipt_digest: str
+    observation_digest: str
+    result_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class C02OriginalIntentLookupV1:
+    """Exact persisted V3 identity for the installed Authority lookup port."""
+
+    namespace: NamespaceId
+    authority_id: str
+    authority_namespace: str
+    installation_id: str
+    job_id: str
+    original_operation_id: str
+    acquire_operation_id: str
+    call_id: str
+    binding_digest: str
+    model_request_digest: str
+    consumer_operation_id: str
+
+
 def prepare_c02_unknown_cost_plan(
     db, issuer, namespace: NamespaceId, original_intent, read,
     verified_completion: CommitReceipt,
@@ -61,21 +98,33 @@ def prepare_c02_unknown_cost_plan(
 
     if (type(namespace) is not NamespaceId
             or type(original_intent) is not ModelEgressIntentV1
-            or type(read) is not WorkerModelResultReadV1
+            or type(read) not in (WorkerModelResultReadV1, C02CommittedCostProofV1)
             or type(verified_completion) is not CommitReceipt
             or verified_completion.status != "duplicate"):
         raise C02CostUnavailable("verified finished C02 completion required")
-    read.require_original_intent(original_intent)
-    request = read.request
-    operation_id = request.consumer_operation_id
-    if namespace != request.namespace or verified_completion.operation_id != operation_id:
+    if type(read) is WorkerModelResultReadV1:
+        read.require_original_intent(original_intent)
+        request = read.request
+        proof = C02CommittedCostProofV1(
+            request.job_id, request.original_operation_id,
+            request.consumer_operation_id, request.digest,
+            canonical_digest(asdict(read)), canonical_digest(asdict(original_intent)),
+            canonical_digest(asdict(read.terminal_receipt)),
+            read.observation.digest, canonical_digest(read.observation.result))
+        if namespace != request.namespace:
+            raise C02CostUnavailable("C02 read namespace differs")
+    else:
+        proof = read
+    operation_id = proof.consumer_operation_id
+    if verified_completion.operation_id != operation_id:
         raise C02CostUnavailable("C02 completion identity differs")
     quote = issuer.original_signed_quote(
         db, d06_first_ingress_c02_quote_id(namespace, operation_id), 1)
     if ((quote.bot_id, quote.persona_id) != namespace.as_tuple
             or quote.operation_id != operation_id
             or quote.work_kind != D06_FIRST_INGRESS_C02_WORK_KIND
-            or quote.activity_id != verified_completion.activity_id):
+            or quote.activity_id != verified_completion.activity_id
+            or quote.effect_id != verified_completion.effect_id):
         raise C02CostUnavailable("signed C02 quote differs from completion")
     row = db.execute(
         "SELECT digest,activity_id,receipt_json FROM graph_bundle_operations "
@@ -87,11 +136,14 @@ def prepare_c02_unknown_cost_plan(
         raise C02CostUnavailable("C02 business receipt differs")
     detail = json.loads(row[2]).get("first_ingress_c02")
     if (type(detail) is not dict
-            or detail.get("read_request_digest") != request.digest
-            or detail.get("read_result_digest") != canonical_digest(asdict(read))
-            or detail.get("original_intent_digest") != canonical_digest(asdict(original_intent))
-            or detail.get("terminal_receipt_digest") != canonical_digest(
-                asdict(read.terminal_receipt))):
+            or detail != {key: getattr(proof, key) for key in (
+                "read_request_digest", "read_result_digest",
+                "original_intent_digest", "terminal_receipt_digest",
+                "observation_digest", "result_digest")}
+            or proof.original_intent_digest != canonical_digest(asdict(original_intent))
+            or (type(read) is WorkerModelResultReadV1 and
+                proof.terminal_receipt_digest != canonical_digest(
+                    asdict(read.terminal_receipt)))):
         raise C02CostUnavailable("C02 result receipt differs")
     event = db.execute(
         "SELECT 1 FROM graph_events WHERE bot=? AND persona=? AND session=? "
@@ -103,19 +155,23 @@ def prepare_c02_unknown_cost_plan(
         namespace.as_tuple + (operation_id,),
     ).fetchone()
     job = db.execute(
-        "SELECT activity_id,operation_id,phase,lease_holder,lease_expires_utc "
+        "SELECT activity_id,operation_id,phase,lease_holder,lease_expires_utc,"
+        "fence,budget_ref "
         "FROM runtime_jobs WHERE job_id=? AND bot_id=? AND persona_id=?",
-        (request.job_id, *namespace.as_tuple),
+        (proof.job_id, *namespace.as_tuple),
     ).fetchone()
     projection = db.execute(
         "SELECT valid,value FROM graph_atoms WHERE token=?",
         (runtime_job_key(*namespace.as_tuple, quote.activity_id,
-                         request.job_id).token,),
+                         proof.job_id).token,),
     ).fetchone()
     if (event is None or fence is None or fence[0] != row[0]
             or not fence[1].startswith("finish:graph-write-")
-            or job != (quote.activity_id, request.original_operation_id,
-                       "completed", None, None)
+            or job is None or job[:5] != (
+                quote.activity_id, proof.original_operation_id,
+                "completed", None, None)
+            or quote.required_worker_fence != job[5]
+            or quote.parent_budget_lease_ref != job[6]
             or projection is None or projection[0] != 1
             or json.loads(projection[1]).get("phase") != "completed"):
         raise C02CostUnavailable("C02 graph, job, or write-fence receipt is incomplete")
@@ -187,7 +243,8 @@ def apply_c02_unknown_budget_in_transaction(
 
 
 __all__ = (
-    "C02CostUnavailable", "C02UnknownCostPlanV1",
+    "C02CostUnavailable", "C02CommittedCostProofV1",
+    "C02OriginalIntentLookupV1", "C02UnknownCostPlanV1",
     "C02UnknownCostApplicationV1", "prepare_c02_unknown_cost_plan",
     "apply_c02_unknown_budget_in_transaction",
 )
