@@ -1664,6 +1664,37 @@ class D02ResourceIssuer:
         )
         return signature
 
+    def issue_c02_terminal_unknown_outcome(
+            self, db, plan, namespace, original_intent, seal, pinned_read,
+            verified_completion) -> str:
+        """Sign unknown use for an archived, Authority-pinned v2 C02 terminal.
+
+        The v1 result-read verifier remains exact-type and unchanged. This
+        path independently replays the v2 archive and original reservation
+        check in the caller's fenced accounting transaction.
+        """
+        from .c02_cost_settlement import (
+            C02UnknownCostPlanV1, prepare_c02_terminal_unknown_cost_plan,
+        )
+
+        if type(plan) is not C02UnknownCostPlanV1 or not db.in_transaction:
+            raise IssuerAuthorityDenied("caller-owned v2 C02 accounting transaction required")
+        current = prepare_c02_terminal_unknown_cost_plan(
+            db, self, namespace, original_intent, seal, pinned_read,
+            verified_completion)
+        if current != plan or plan.outcome.actual is not None:
+            raise IssuerAuthorityDenied("v2 C02 terminal completion proof differs")
+        outcome = plan.outcome
+        payload = canonical_serialize(_payload(outcome))
+        signature = self._signer.sign("resource-outcome.v1", payload)
+        _insert_signed(
+            db, "runtime_resource_outcomes",
+            ("quote_id", "operation_id", "version"),
+            (outcome.quote_id, outcome.operation_id, outcome.version),
+            "outcome_json", payload, signature,
+        )
+        return signature
+
     def original_c02_unknown_outcome(
             self, db, quote: ResourceQuote) -> ResourceOutcome:
         """Read the signed historical local completion, without granting work."""
