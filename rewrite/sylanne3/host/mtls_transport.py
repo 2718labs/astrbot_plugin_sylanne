@@ -65,6 +65,10 @@ from ..authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
     from_wire as worker_result_from_wire, to_wire as worker_result_to_wire,
 )
+from ..authority_service.v2_reply_worker_model_result_contract import (
+    ReplyWorkerModelResultReadRequestV1, ReplyWorkerModelResultReadV1,
+    from_wire as reply_result_from_wire, to_wire as reply_result_to_wire,
+)
 from ..authority_service.v2_self_identity_contract import (
     AuthorityCurrentSelfIdentityV1, SelfIdentityCurrentRequestV1,
     from_wire as self_identity_from_wire, to_wire as self_identity_to_wire,
@@ -982,6 +986,78 @@ class MtlsAuthorityTransport:
         if (set(response) != {"finished", "channel_binding_sha256"}
                 or response["finished"] is not True):
             raise RuntimeError("authority worker read finish is unresolved")
+        return True
+
+    async def reply_worker_model_result_select_attempt_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        first_request: ReplyWorkerModelResultReadRequestV1,
+    ) -> ReplyWorkerModelResultReadRequestV1:
+        if (type(first_request) is not ReplyWorkerModelResultReadRequestV1
+                or (first_request.authority_id, first_request.authority_namespace,
+                    first_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed reply read selection identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "reply_worker_model_result_select_attempt_v1",
+            {"namespace": namespace,
+             "read_request": reply_result_to_wire(first_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"selected_request", "channel_binding_sha256"}:
+            raise RuntimeError("authority reply read selection response is invalid")
+        try:
+            selected = reply_result_from_wire(
+                response["selected_request"], ReplyWorkerModelResultReadRequestV1)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority reply read selection response is invalid") from exc
+        if replace(selected, read_attempt_id=first_request.read_attempt_id) != first_request:
+            raise RuntimeError("authority reply read selection identity differs")
+        return selected
+
+    async def reply_worker_model_result_read_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: ReplyWorkerModelResultReadRequestV1,
+    ) -> ReplyWorkerModelResultReadV1:
+        if (type(read_request) is not ReplyWorkerModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed reply result read identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "reply_worker_model_result_read_v1",
+            {"namespace": namespace,
+             "read_request": reply_result_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("authority reply result response is invalid")
+        try:
+            result = reply_result_from_wire(
+                response["result"], ReplyWorkerModelResultReadV1)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority reply result response is invalid") from exc
+        if result.request != read_request:
+            raise RuntimeError("authority reply result attempt identity differs")
+        return result
+
+    async def reply_worker_model_result_recover_finish_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: ReplyWorkerModelResultReadRequestV1,
+    ) -> bool:
+        if (type(read_request) is not ReplyWorkerModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed reply result read identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "reply_worker_model_result_recover_finish_v1",
+            {"namespace": namespace,
+             "read_request": reply_result_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"finished", "channel_binding_sha256"}
+                or response["finished"] is not True):
+            raise RuntimeError("authority reply read finish is unresolved")
         return True
 
     async def self_identity_current_v1(

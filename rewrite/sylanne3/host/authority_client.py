@@ -19,6 +19,9 @@ from ..authority_service.v2_model_result_read_contract import (
 from ..authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
 )
+from ..authority_service.v2_reply_worker_model_result_contract import (
+    ReplyWorkerModelResultReadRequestV1, ReplyWorkerModelResultReadV1,
+)
 from ..authority_service.v2_self_identity_contract import (
     AuthorityCurrentSelfIdentityV1, SelfIdentityCurrentRequestV1,
 )
@@ -240,6 +243,15 @@ class AuthorityTransport(Protocol):
 
     async def worker_model_result_recover_finish_v1(self, request, handshake, grant,
                                                     *, namespace, read_request): ...
+
+    async def reply_worker_model_result_select_attempt_v1(
+        self, request, handshake, grant, *, namespace, first_request): ...
+
+    async def reply_worker_model_result_read_v1(
+        self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def reply_worker_model_result_recover_finish_v1(
+        self, request, handshake, grant, *, namespace, read_request): ...
 
     async def self_identity_current_v1(self, request, handshake, grant,
                                        *, namespace, current_request): ...
@@ -537,6 +549,51 @@ class AuthorityClient:
                 or read_request.installation_id != grant.installation_id):
             raise RuntimeError("worker result read differs from installed namespace")
         return await self._transport.worker_model_result_recover_finish_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def reply_worker_model_result_select_attempt_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        first_request: ReplyWorkerModelResultReadRequestV1,
+    ) -> ReplyWorkerModelResultReadRequestV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(first_request) is not ReplyWorkerModelResultReadRequestV1
+                or first_request.namespace != policy.namespace
+                or first_request.authority_namespace != policy.authority_namespace
+                or first_request.installation_id != grant.installation_id
+                or first_request.authority_id != grant.authority_id):
+            raise RuntimeError("reply worker read selection differs from installation")
+        return await self._transport.reply_worker_model_result_select_attempt_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            first_request=first_request)
+
+    async def reply_worker_model_result_read_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: ReplyWorkerModelResultReadRequestV1,
+    ) -> ReplyWorkerModelResultReadV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ReplyWorkerModelResultReadRequestV1
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id
+                or read_request.authority_id != grant.authority_id):
+            raise RuntimeError("reply worker result read differs from installation")
+        return await self._transport.reply_worker_model_result_read_v1(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def reply_worker_model_result_recover_finish_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: ReplyWorkerModelResultReadRequestV1,
+    ) -> bool:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ReplyWorkerModelResultReadRequestV1
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id
+                or read_request.authority_id != grant.authority_id):
+            raise RuntimeError("reply worker result read differs from installation")
+        return await self._transport.reply_worker_model_result_recover_finish_v1(
             request, handshake, grant, namespace=policy.authority_namespace,
             read_request=read_request)
 
