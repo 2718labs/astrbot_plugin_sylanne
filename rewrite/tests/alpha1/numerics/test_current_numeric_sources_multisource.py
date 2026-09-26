@@ -11,8 +11,10 @@ from sylanne3.memory_types import SourceRecord, access_key, source_key
 from sylanne3.runtime.authoritative_coupling_snapshot import CouplingSnapshotHold
 from sylanne3.runtime.current_numeric_sources import read_current_d04_numeric_sources_v2
 
-from test_authoritative_coupling_snapshot import _fixture, _insert, _read
-from test_current_numeric_sources import _drive
+from rewrite.tests.alpha1.runtime.test_authoritative_coupling_snapshot import (
+    _fixture, _insert, _read,
+)
+from rewrite.tests.alpha1.runtime.test_current_numeric_sources import _drive
 
 
 def _second(store, namespace, root, *, provenance_root="family-2", interval=(1.0, 2.0)):

@@ -7,8 +7,10 @@ from sylanne3.domains.d04.numeric_drive import sourced_numeric_drive_write
 from sylanne3.runtime.joint_numeric_component import JointNumericHold, read_joint_numeric_component
 from sylanne3.runtime_contracts import QueryEpoch
 
-from test_authoritative_coupling_snapshot import _add_checkpoint, _fixture, _insert
-from test_current_numeric_sources import _drive
+from rewrite.tests.alpha1.runtime.test_authoritative_coupling_snapshot import (
+    _add_checkpoint, _fixture, _insert,
+)
+from rewrite.tests.alpha1.runtime.test_current_numeric_sources import _drive
 
 
 def _component(tmp_path, *, edge_interval=(1.0, 2.0), include_second_drive=True):

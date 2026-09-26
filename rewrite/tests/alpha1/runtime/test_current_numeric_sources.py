@@ -19,7 +19,9 @@ from sylanne3.runtime_contracts import (
     VersionGuard, canonical_digest,
 )
 
-from test_authoritative_coupling_snapshot import _fixture, _insert, _read
+from rewrite.tests.alpha1.runtime.test_authoritative_coupling_snapshot import (
+    _fixture, _insert, _read,
+)
 
 
 def _drive(root, source):
