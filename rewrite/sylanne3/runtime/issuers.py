@@ -8,7 +8,7 @@ No function in this module opens, commits, or rolls back a database.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -25,7 +25,8 @@ from ..graph_coordinator import (
 )
 from ..graph_types import AtomKey
 from ..runtime_contracts import (
-    CommandEnvelope, DomainBundle, canonical_digest, canonical_serialize,
+    CommandEnvelope, DomainBundle, FenceScope, NamespaceId,
+    canonical_digest, canonical_serialize,
 )
 from .budget import BudgetLease, get_budget_lease
 from .d11_types import runtime_job_key, runtime_outbox_key
@@ -1219,6 +1220,17 @@ def install_schema(db) -> None:
             status TEXT NOT NULL
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_d04_coupling_graph_evidence_v1(
+            bot TEXT NOT NULL,
+            persona TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            candidate_digest TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            PRIMARY KEY(bot,persona,operation_id)
+        )
+    """)
 
 
 def _insert_signed(db, table: str, key_columns: tuple[str, ...],
@@ -1858,6 +1870,119 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
     def resource_issuer(self) -> D02ResourceIssuer:
         """Return the D02 authority this budget issuer actually verifies."""
         return self._d02
+
+    def _verify_d04_coupling_graph_evidence_v1(
+            self, db: sqlite3.Connection, *, namespace: NamespaceId,
+            operation_id: str) -> tuple[str, str, str]:
+        """Verify stored graph evidence, not a numeric certificate or live read."""
+        row = db.execute(
+            "SELECT candidate_digest,evidence_json,signature FROM "
+            "runtime_d04_coupling_graph_evidence_v1 WHERE bot=? AND persona=? "
+            "AND operation_id=?", namespace.as_tuple + (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise IssuerAuthorityDenied("D04 coupling graph evidence is absent")
+        digest, payload, signature = row
+        self._signer.verify("d04-coupling-graph-evidence.v1", payload, signature)
+        try:
+            evidence = json.loads(payload)
+            if (canonical_serialize(evidence) != payload
+                    or type(evidence) is not dict
+                    or evidence.get("schema") != "d11.d04-coupling-graph-evidence.v1"
+                    or evidence.get("namespace") != list(namespace.as_tuple)
+                    or evidence.get("operation_id") != operation_id
+                    or evidence.get("candidate_digest") != digest
+                    or type(evidence.get("candidate")) is not dict
+                    or canonical_digest(evidence.get("candidate")) != digest
+                    or type(evidence.get("write_scope")) is not dict
+                    or evidence["write_scope"].get("operation") != "write"
+                    or evidence["write_scope"].get("graph_revision")
+                    != evidence["candidate"].get("graph_revision")
+                    or evidence["write_scope"].get("graph_epoch")
+                    != evidence["candidate"].get("query_epoch", {}).get("revision")):
+                raise ValueError("D04 coupling evidence binding differs")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("D04 coupling graph evidence is invalid") from exc
+        return digest, payload, signature
+
+    def _issue_d04_coupling_graph_evidence_v1(
+            self, db: sqlite3.Connection, *, candidate, write_scope: FenceScope,
+            registry, scheme, audience: tuple[str, ...], purpose: str,
+            operation_id: str) -> tuple[str, str]:
+        """Sign a re-read graph candidate in the caller's fenced write tx.
+
+        The private GraphCoordinator caller must validate the live Authority V2
+        write permit before and after its graph transaction. A FenceScope is a
+        comparison target, not an independently verifiable permit here.
+        """
+        from .authoritative_coupling_snapshot import (
+            D04UnsignedCouplingSnapshotCandidateV1,
+            read_unsigned_d04_coupling_snapshot_candidate,
+        )
+
+        if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+            raise IssuerAuthorityDenied("D04 coupling evidence needs write transaction")
+        if (type(candidate) is not D04UnsignedCouplingSnapshotCandidateV1
+                or type(write_scope) is not FenceScope
+                or write_scope.operation != "write"
+                or write_scope.namespace != candidate.namespace
+                or write_scope.graph_epoch.revision != candidate.query_epoch.revision
+                or write_scope.graph_revision != candidate.graph_revision):
+            raise IssuerAuthorityDenied("D04 coupling write scope or graph stamp differs")
+        _id(operation_id, "operation_id")
+        evidence = {
+            "schema": "d11.d04-coupling-graph-evidence.v1",
+            "namespace": candidate.namespace.as_tuple,
+            "operation_id": operation_id,
+            "candidate_digest": canonical_digest(asdict(candidate)),
+            "candidate": asdict(candidate),
+            "write_scope": {
+                "operation": "write",
+                "authority_id": write_scope.permit.authority_id,
+                "authority_namespace": write_scope.authority_namespace,
+                "generation": write_scope.generation,
+                "attempt_id": write_scope.operation_id,
+                "fence_epoch": write_scope.permit.fence_epoch,
+                "permit_revision": write_scope.permit.revision,
+                "anchor_digest": canonical_digest(asdict(write_scope.pinned_anchor)),
+                "graph_epoch": write_scope.graph_epoch.revision,
+                "graph_revision": write_scope.graph_revision,
+            },
+        }
+        payload = canonical_serialize(evidence)
+        row = db.execute(
+            "SELECT 1 FROM runtime_d04_coupling_graph_evidence_v1 "
+            "WHERE bot=? AND persona=? AND operation_id=?",
+            candidate.namespace.as_tuple + (operation_id,),
+        ).fetchone()
+        if row is not None:
+            digest, _saved_payload, signature = self._verify_d04_coupling_graph_evidence_v1(
+                db, namespace=candidate.namespace, operation_id=operation_id)
+            if digest != evidence["candidate_digest"]:
+                raise IssuerAuthorityDenied("D04 coupling operation identity conflicts")
+            return digest, signature
+        observed = read_unsigned_d04_coupling_snapshot_candidate(
+            db, namespace=candidate.namespace, registry=registry, scheme=scheme,
+            checkpoint_ref=candidate.checkpoint_ref,
+            expected_query_epoch=candidate.query_epoch,
+            expected_graph_incarnation=candidate.graph_incarnation,
+            expected_graph_revision=candidate.graph_revision,
+            expected_access_epoch=candidate.access_epoch,
+            expected_delete_epoch=candidate.delete_epoch,
+            expected_asset_digest=candidate.fixed_template_asset_digest,
+            audience=audience, purpose=purpose,
+        )
+        if observed != candidate:
+            raise IssuerAuthorityDenied("D04 coupling graph candidate is not current")
+        signature = self._signer.sign("d04-coupling-graph-evidence.v1", payload)
+        db.execute(
+            "INSERT INTO runtime_d04_coupling_graph_evidence_v1"
+            "(bot,persona,operation_id,candidate_digest,evidence_json,signature) "
+            "VALUES(?,?,?,?,?,?)",
+            candidate.namespace.as_tuple + (
+                operation_id, evidence["candidate_digest"], payload, signature),
+        )
+        return evidence["candidate_digest"], signature
 
     def issue_d03_arrival_quote(self, db, envelope: CommandEnvelope,
                                 admin_policy, *, installation_id: str,
