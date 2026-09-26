@@ -1,5 +1,6 @@
 import { ACTIONS, VIEW_TYPES, makeOwnerLoginRequest } from "./api/contract.js";
 import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "./api/client.js";
+import { PendingOperationIds } from "./api/pending_operations.js";
 import { applyProblem, applyResponse, initialState, switchRole } from "./state.js";
 import { needsFreshProjection, workflowForPage } from "./workflows.js";
 
@@ -35,10 +36,12 @@ let sceneCandidatesProblem = null;
 let sceneCandidatesEpoch = 0;
 const ownerDraft = {};
 const setupReceipts = { roleInitialized: null, sceneBound: null };
+const pendingOperationIds = new PendingOperationIds();
 
 function clearSetupReceipts() {
   setupReceipts.roleInitialized = null;
   setupReceipts.sceneBound = null;
+  pendingOperationIds.clear();
 }
 
 function rememberSetupReceipt(action, result) {
@@ -545,12 +548,18 @@ async function loadSceneCandidates() {
 async function commandAction(action, input, purpose = "workbench_user_action") {
   if (!state.role) return loadView();
   const epoch = ++requestEpoch;
+  const operationKeyValue = needsFreshProjection(action)
+    ? pendingOperationIds.key(action, state.role, purpose, input) : null;
   state.status = "loading"; state.problem = null; render();
   try {
-    const result = await api.command(action, { scope: state.role, purpose, input });
+    const result = await api.command(action, {
+      scope: state.role, purpose, input,
+      ...(operationKeyValue ? { operationId: pendingOperationIds.get(operationKeyValue) } : {})
+    });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
     if (result.status === "unauthorized") clearSetupReceipts();
+    else if (result.status === "ready" && operationKeyValue) pendingOperationIds.complete(operationKeyValue);
     Object.assign(state, applyResponse(state, result));
     rememberSetupReceipt(action, result);
     if (result.status === "ready" && needsFreshProjection(action)) return loadView();
