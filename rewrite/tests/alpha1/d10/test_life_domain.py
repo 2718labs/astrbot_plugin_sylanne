@@ -6,12 +6,16 @@ from sylanne3.domains.d10 import (
     ActivityRecipe,
     CharacterClockMappingProposal,
     ContactPolicy,
+    ContactPolicyReadSet,
+    ContactClaim,
     LifeDomain,
     LifeProject,
     ProactiveOpportunity,
 )
 from sylanne3.domains.d08 import ActionIntent, GoalPredicate, RequiredCheckSpec
-from sylanne3.runtime_contracts import NamespaceId, OperationIdentity, VersionedRef, canonical_digest
+from sylanne3.runtime_contracts import (
+    NamespaceId, OperationIdentity, QueryEpoch, VersionedRef, canonical_digest,
+)
 
 
 class LifeDomainTests(unittest.TestCase):
@@ -26,8 +30,9 @@ class LifeDomainTests(unittest.TestCase):
 
     def _proactive_intent(self):
         versions = (VersionedRef("criteria:contact", 1), VersionedRef("policy:one", 1),
-                    VersionedRef("opportunity:one", 1))
-        spec = RequiredCheckSpec("contact_policy", "d10.contact_policy", "persona:one",
+                    VersionedRef("opportunity:one", 1),
+                    VersionedRef("d10.contact_policy:user:one:private:ordinary", 5))
+        spec = RequiredCheckSpec("contact_policy", "d10.contact_policy", "persona:persona",
                                  "action:one", "proactive_contact", "criteria:contact", versions)
         return ActionIntent(
             action_id="action:one", revision=1, goal_ref="goal:one", commitment_refs=(),
@@ -38,6 +43,14 @@ class LifeDomainTests(unittest.TestCase):
             schema_id="schema:one", required_checks=(spec,),
             success_predicate=GoalPredicate("communicated", "d11.observer", (), 0.0, None),
             effect_scope=("effect:one",), compensation_ref=None, source_refs=("source:one",),
+        )
+
+    def _read_set(self, opportunity, claims=(), *, coverage="full", versions=None):
+        versions = versions or self._proactive_intent().required_checks[0].required_input_versions
+        return ContactPolicyReadSet(
+            self.namespace,
+            QueryEpoch(self.namespace, "d10.contact_policy:user:one:private:ordinary", 5),
+            self.policy, opportunity, claims, versions, coverage,
         )
 
     def test_life_project_cannot_adopt_planned_or_unknown_work_as_progress(self):
@@ -71,20 +84,37 @@ class LifeDomainTests(unittest.TestCase):
         versions = intent.required_checks[0].required_input_versions
         opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone", "user:one",
                                            "private", "ordinary", 0.0, 10.0)
-        receipt = self.domain.contact_policy_required_check(
-            intent, self.policy, opportunity, (), coverage="full", input_versions=versions, now=1.0
+        read_set = self._read_set(opportunity)
+        trusted = LifeDomain(contact_read_verifier=lambda candidate: candidate is read_set)
+        receipt = trusted.contact_policy_required_check(
+            intent, self.policy, opportunity, (), coverage="full", input_versions=versions,
+            now=1.0, read_set=read_set,
         )
         self.assertEqual((receipt.result, receipt.coverage, receipt.issuer),
                          ("pass", "full", "d10.contact_policy"))
-        partial = self.domain.contact_policy_required_check(
-            intent, self.policy, opportunity, (), coverage="partial", input_versions=versions, now=1.0
+        forged = self.domain.contact_policy_required_check(
+            intent, self.policy, opportunity, (), coverage="full", input_versions=versions,
+            now=1.0, read_set=read_set,
+        )
+        self.assertEqual(forged.result, "unknown")
+        partial = trusted.contact_policy_required_check(
+            intent, self.policy, opportunity, (), coverage="partial", input_versions=versions,
+            now=1.0, read_set=replace(read_set, coverage="partial"),
         )
         self.assertEqual((partial.result, partial.coverage), ("unknown", "partial"))
-        stale = self.domain.contact_policy_required_check(
+        stale = trusted.contact_policy_required_check(
             intent, self.policy, opportunity, (), coverage="full",
-            input_versions=(VersionedRef("policy:one", 2),), now=1.0
+            input_versions=(VersionedRef("policy:one", 2),), now=1.0,
+            read_set=replace(read_set, input_versions=(VersionedRef("policy:one", 2),)),
         )
         self.assertEqual(stale.result, "unknown")
+
+        old_epoch = replace(read_set, query_epoch=replace(read_set.query_epoch, revision=4))
+        old = trusted.contact_policy_required_check(
+            intent, self.policy, opportunity, (), coverage="full", input_versions=versions,
+            now=1.0, read_set=old_epoch,
+        )
+        self.assertEqual(old.result, "unknown")
 
     def test_required_contact_check_fails_closed_for_policy_gates(self):
         intent = self._proactive_intent()
@@ -92,10 +122,62 @@ class LifeDomainTests(unittest.TestCase):
         opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone", "user:one",
                                            "private", "ordinary", 0.0, 10.0)
         policy = replace(self.policy, consent=False)
-        receipt = self.domain.contact_policy_required_check(
-            intent, policy, opportunity, (), coverage="full", input_versions=versions, now=1.0
+        read_set = replace(self._read_set(opportunity), policy=policy)
+        trusted = LifeDomain(contact_read_verifier=lambda candidate: candidate is read_set)
+        receipt = trusted.contact_policy_required_check(
+            intent, policy, opportunity, (), coverage="full", input_versions=versions,
+            now=1.0, read_set=read_set,
         )
         self.assertEqual((receipt.result, receipt.coverage), ("fail", "full"))
+
+    def test_current_no_response_claim_blocks_a_forged_empty_read(self):
+        opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone",
+                                           "user:one", "private", "ordinary", 0.0, 10.0)
+        claim = ContactClaim("contact:one", "action:old", "user:one", "private", "ordinary",
+                             ("effect:old",), (("effect:old", "unknown"),),
+                             "pending_confirmation", "policy:one", 1)
+        base = self._proactive_intent()
+        versions = (*base.required_checks[0].required_input_versions, VersionedRef("contact:one", 1))
+        spec = replace(base.required_checks[0], required_input_versions=versions)
+        intent = replace(base, required_checks=(spec,))
+        current = self._read_set(opportunity, (claim,), versions=versions)
+        trusted = LifeDomain(contact_read_verifier=lambda candidate: candidate is current)
+        receipt = trusted.contact_policy_required_check(
+            intent, self.policy, opportunity, (claim,), coverage="full",
+            input_versions=versions, now=1.0, read_set=current,
+        )
+        self.assertEqual(receipt.result, "fail")
+        forged_empty = replace(current, claims=())
+        unknown = trusted.contact_policy_required_check(
+            intent, self.policy, opportunity, (), coverage="full", input_versions=versions,
+            now=1.0, read_set=forged_empty,
+        )
+        self.assertEqual(unknown.result, "unknown")
+
+    def test_withdrawn_consent_cannot_be_overridden_by_old_policy_value(self):
+        intent = self._proactive_intent()
+        versions = intent.required_checks[0].required_input_versions
+        opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone",
+                                           "user:one", "private", "ordinary", 0.0, 10.0)
+        current_policy = replace(self.policy, version=2, consent=False)
+        current_versions = tuple(VersionedRef(item.ref, 2) if item.ref == "policy:one" else item
+                                 for item in versions)
+        current = replace(self._read_set(opportunity), policy=current_policy,
+                          input_versions=current_versions)
+        trusted = LifeDomain(contact_read_verifier=lambda candidate: candidate is current)
+        old = trusted.contact_policy_required_check(
+            intent, self.policy, opportunity, (), coverage="full", input_versions=versions,
+            now=1.0, read_set=self._read_set(opportunity),
+        )
+        self.assertEqual(old.result, "unknown")
+        current_intent = replace(intent, required_checks=(replace(
+            intent.required_checks[0], required_input_versions=current_versions,
+        ),))
+        denied = trusted.contact_policy_required_check(
+            current_intent, current_policy, opportunity, (), coverage="full",
+            input_versions=current_versions, now=1.0, read_set=current,
+        )
+        self.assertEqual(denied.result, "fail")
 
     def test_unknown_segment_holds_contact_occupancy_and_new_contact_id_cannot_bypass_no_response_gate(self):
         opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone", "user:one", "private", "ordinary", 0.0, 10.0)

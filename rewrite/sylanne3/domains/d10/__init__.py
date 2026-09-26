@@ -5,8 +5,11 @@ contact policy; it cannot execute a step, send a platform message, or claim a
 D08/D11 admission.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 import math
+from typing import Callable
 
 from ...runtime_contracts import (
     CommandEnvelope,
@@ -14,6 +17,7 @@ from ...runtime_contracts import (
     DomainProposal,
     NamespaceId,
     ProviderDescriptor,
+    QueryEpoch,
     RUNTIME_SCHEMA,
     schema_hash,
 )
@@ -226,6 +230,44 @@ class ContactPolicyCheck:
 
 
 @dataclass(frozen=True)
+class ContactPolicyReadSet:
+    """Graph read including the scoped negative query for contact occupancy.
+
+    The trusted graph integration must verify this read set is complete and
+    current. Its fields alone cannot authorize a passing check.
+    """
+
+    namespace: NamespaceId
+    query_epoch: QueryEpoch | None
+    policy: ContactPolicy
+    opportunity: ProactiveOpportunity
+    claims: tuple[ContactClaim, ...]
+    input_versions: tuple[VersionedRef, ...]
+    coverage: str
+    missing_items: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.namespace, NamespaceId):
+            raise TypeError("namespace must be NamespaceId")
+        if self.query_epoch is not None and not isinstance(self.query_epoch, QueryEpoch):
+            raise TypeError("query_epoch must be QueryEpoch or None")
+        if not isinstance(self.policy, ContactPolicy) or not isinstance(self.opportunity, ProactiveOpportunity):
+            raise TypeError("policy and opportunity must be D10 values")
+        if type(self.claims) is not tuple or any(not isinstance(item, ContactClaim) for item in self.claims):
+            raise TypeError("claims must be a tuple of ContactClaim values")
+        if type(self.input_versions) is not tuple or any(type(item) is not VersionedRef
+                                                       for item in self.input_versions):
+            raise TypeError("input_versions must be a tuple of VersionedRef values")
+        if len({item.ref for item in self.input_versions}) != len(self.input_versions):
+            raise ValueError("input_versions cannot repeat a ref")
+        if self.coverage not in {"full", "partial", "none"}:
+            raise ValueError("coverage must be full, partial, or none")
+        if type(self.missing_items) is not tuple or any(type(item) is not str or not item
+                                                        for item in self.missing_items):
+            raise TypeError("missing_items must be a tuple of nonempty strings")
+
+
+@dataclass(frozen=True)
 class ContactClaim:
     contact_id: str
     communication_action_id: str
@@ -268,6 +310,11 @@ class ContactClaim:
 
 
 class LifeDomain:
+    def __init__(self, *, contact_read_verifier: Callable[[ContactPolicyReadSet], bool] | None = None) -> None:
+        if contact_read_verifier is not None and not callable(contact_read_verifier):
+            raise TypeError("contact_read_verifier must be callable")
+        self._contact_read_verifier = contact_read_verifier
+
     @property
     def descriptor(self) -> ProviderDescriptor:
         return ProviderDescriptor(
@@ -376,13 +423,13 @@ class LifeDomain:
         coverage: str,
         input_versions: tuple[VersionedRef, ...],
         now: float,
+        read_set: ContactPolicyReadSet | None = None,
     ) -> CheckReceipt:
         """Adapt a complete, current graph read into D08's proactive check.
 
-        ``coverage`` and ``input_versions`` must come from the same trusted
-        graph read as policy, opportunity, and claims. D10 cannot establish
-        graph currency itself; a partial read or version mismatch therefore
-        produces an unknown receipt and can never qualify the action.
+        A trusted graph integration verifies the complete read set and its
+        scoped negative query at this decision point. Caller coverage and
+        versions alone cannot qualify a proactive action.
         """
         if not isinstance(intent, ActionIntent):
             raise TypeError("intent must be ActionIntent")
@@ -403,7 +450,42 @@ class LifeDomain:
         if spec.action_ref != intent.action_id:
             raise ValueError("contact_policy check must bind to this ActionIntent")
 
-        complete_current_read = coverage == "full" and input_versions == spec.required_input_versions
+        epoch = read_set.query_epoch if read_set is not None else None
+        scope_ref = (f"d10.contact_policy:{opportunity.subject_ref}:"
+                     f"{opportunity.channel}:{opportunity.category}")
+        expected_refs = {spec.criteria_version, policy.policy_id, opportunity.opportunity_id,
+                         scope_ref, *(claim.contact_id for claim in claims)}
+        versions = {item.ref: item.version for item in input_versions}
+        exact_versions = (
+            len(versions) == len(input_versions)
+            and set(versions) == expected_refs
+            and set(input_versions) == set(spec.required_input_versions)
+            and versions.get(policy.policy_id) == policy.version
+            and epoch is not None and versions.get(scope_ref) == epoch.revision
+        )
+        scope_matches = (
+            policy.namespace == opportunity.namespace
+            and read_set is not None and read_set.namespace == policy.namespace
+            and epoch is not None and epoch.namespace == policy.namespace
+            and epoch.scope_ref == scope_ref
+            and policy.subject_ref == intent.target_ref == opportunity.subject_ref
+            and spec.subject_ref == f"persona:{policy.namespace.persona_id}"
+            and spec.purpose == intent.purpose
+            and read_set.policy == policy and read_set.opportunity == opportunity
+            and read_set.claims == claims
+            and read_set.input_versions == input_versions
+            and read_set.coverage == coverage
+        )
+        trusted_current = False
+        if self._contact_read_verifier is not None and read_set is not None:
+            try:
+                trusted_current = self._contact_read_verifier(read_set) is True
+            except Exception:
+                trusted_current = False
+        complete_current_read = (
+            trusted_current and scope_matches and coverage == "full"
+            and not read_set.missing_items and exact_versions
+        )
         if not complete_current_read:
             return CheckReceipt(spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
                                 input_versions, coverage, "unknown", _finite(now, "now"), spec.provider_id)
