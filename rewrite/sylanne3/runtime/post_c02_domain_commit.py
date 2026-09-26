@@ -51,6 +51,16 @@ def commit_post_c02_reply_bundle_v1(
             or not {"memory.episode.v1", "memory.subjective_trace.v2"}
                <= {item.key.type_name for item in c02.write_versions}):
         raise ValueError("original C02 graph operation is not committed")
+    episode_versions = tuple(item for item in c02.write_versions
+                             if item.key.type_name == "memory.episode.v1")
+    if len(episode_versions) != 1:
+        raise ValueError("original C02 episode identity is ambiguous")
+    episode = graph.read_snapshot(
+        authority, lease, (episode_versions[0].key,)).get(episode_versions[0].key)
+    if (episode is None or not episode.valid
+            or episode.revision != episode_versions[0].revision
+            or source_ref not in episode.value.get("source_refs", ())):
+        raise ValueError("original C02 episode no longer contains this source")
     return commit_prepared_domain_bundle_v1(graph, authority, lease, bundle)
 
 

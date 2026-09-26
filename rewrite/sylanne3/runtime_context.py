@@ -1366,6 +1366,16 @@ class RuntimeContext:
                 recorded = graph.get_operation(authority, lease, operation_id)
                 if recorded is not None:
                     return recorded
+                episodes = tuple(item for item in c02.write_versions
+                                 if item.key.type_name == "memory.episode.v1")
+                if len(episodes) != 1:
+                    return None
+                episode = graph.read_snapshot(
+                    authority, lease, (episodes[0].key,)).get(episodes[0].key)
+                if (episode is None or not episode.valid
+                        or episode.revision != episodes[0].revision
+                        or source_ref not in episode.value.get("source_refs", ())):
+                    return None
                 candidate, bundle = prepare(graph, authority, lease, c02)
                 return commit_post_c02_reply_bundle_v1(
                     graph, authority, lease,
