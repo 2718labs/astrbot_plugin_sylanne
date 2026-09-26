@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import uuid4
 
 from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
 from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
+from sylanne3.runtime_contracts import NamespaceId
 from sylanne3.workbench_api import (
     AuthenticatedSession, GraphWorkbenchIssuer, RequestContext, WorkbenchService,
 )
@@ -86,6 +88,37 @@ def test_dedicated_port_receives_typed_request_but_rejects_nonreceipt():
     assert submitted["request"].target_refs == ("interpretation:old",)
     assert submitted["principal"] == LOGIN.principal
     assert submitted["owner_session_request"] == LOGIN
+    assert submitted["purpose"] == "workbench_user_action"
+    assert submitted["audience"] == "owner"
+
+
+def test_dedicated_port_rejects_statement_changed_after_command_digest():
+    class ShouldNotCommit(NoCorrectionPort):
+        def commit_source_correction_v1(self, **_):
+            raise AssertionError("mismatched statement reached W01")
+
+    issuer = GraphWorkbenchIssuer(ShouldNotCommit(), NoReadGrant(), NoViews())
+    request = command()
+    from sylanne3.workbench_api.service import request_digest
+
+    digest = "sha256:" + request_digest({
+        "action": request["action"], "scope": request["scope"],
+        "purpose": request["purpose"], "audience": request["audience"],
+        "operation_id": request["operation_id"], "input": request["input"],
+    })
+    typed = SourceCorrectionRequestV1(
+        namespace=NamespaceId("bot", "persona"),
+        operation_id=request["operation_id"], request_digest=digest,
+        statement=request["input"]["statement"], source_refs=("source:original",),
+        target_refs=("interpretation:old",), access_epoch=3, deletion_epoch=2,
+        impact_preview_ref="preview:untrusted",
+    )
+    changed = replace(typed, statement="当时不在忙")
+    result = issuer.correct_source_claim(
+        session=SESSION, scope=SCOPE, purpose="workbench_user_action",
+        audience="owner", request=changed,
+    )
+    assert result["problem"]["code"] == "source_correction_request_digest_mismatch"
 
 
 def test_dedicated_port_is_not_called_without_signed_owner_session():

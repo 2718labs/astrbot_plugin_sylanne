@@ -273,12 +273,31 @@ class GraphWorkbenchIssuer:
 
         The W01 method must recheck the signed Owner session, durable graph
         grant, source access and deletion epochs in its commit transaction.
-        Until that method exists, this route remains explicitly unavailable.
+        The full Workbench command digest is checked here before W01 receives
+        it; W01 checks it again against its own current graph transaction.
         """
         if (type(request) is not SourceCorrectionRequestV1
                 or scope != f"{request.namespace.bot_id}/{request.namespace.persona_id}"
                 or not session.allows(scope, "workbench.correct", purpose, audience)):
             return _unavailable("source_correction_policy_unavailable")
+        correction_input = {
+            "schema": request.schema,
+            "correction_kind": "source_claim",
+            "statement": request.statement,
+            "source_refs": list(request.source_refs),
+            "target_refs": list(request.target_refs),
+            "access_epoch": request.access_epoch,
+            "deletion_epoch": request.deletion_epoch,
+        }
+        if request.impact_preview_ref is not None:
+            correction_input["impact_preview_ref"] = request.impact_preview_ref
+        expected_digest = "sha256:" + request_digest({
+            "action": "correct_or_edit", "scope": scope,
+            "purpose": purpose, "audience": audience,
+            "operation_id": request.operation_id, "input": correction_input,
+        })
+        if request.request_digest != expected_digest:
+            return _unavailable("source_correction_request_digest_mismatch")
         login = session.owner_session_request
         if (type(session.owner_session_token) is not str
                 or not session.owner_session_token
@@ -292,6 +311,7 @@ class GraphWorkbenchIssuer:
             result = commit(
                 request=request, actor_id=session.actor_id,
                 principal=login.principal,
+                purpose=purpose, audience=audience,
                 owner_session_token=session.owner_session_token,
                 owner_session_request=login,
             )
