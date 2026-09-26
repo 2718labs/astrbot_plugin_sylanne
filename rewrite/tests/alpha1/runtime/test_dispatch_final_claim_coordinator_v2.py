@@ -51,6 +51,9 @@ def test_final_writer_rejects_uninstalled_or_caller_supplied_p2(tmp_path):
     try:
         with pytest.raises(UnavailableGuard, match="installed final dispatch"):
             graph.register_dispatch_final_claim_writer_v1(bootstrap)
+        with pytest.raises(UnavailableGuard, match="installed final dispatch"):
+            graph.register_dispatch_final_claim_writer_v1(
+                bootstrap, route_port=object(), issuer_id="issuer:test")
         with pytest.raises(UnavailableGuard, match="typed final dispatch"):
             graph._commit_dispatch_final_claim_v1(None, None, None, None, None)
         assert store._db.execute(

@@ -11073,6 +11073,79 @@ class GraphCoordinator:
         return GraphSnapshot(tuple(atoms), (epoch,)), QueryEpoch(
             namespace, "all", epoch.revision)
 
+    def _verify_dispatch_owner_graph_locked(
+            self, namespace, witness, admission, graph_epoch):
+        """Join the current Owner head to its durable graph issue proof."""
+        from .authority_service.v2_owner_contract import (
+            OwnerGraphCommitProofV1, canonical_digest as owner_digest,
+        )
+
+        db = self.__store._db
+        metadata, epoch = self._v2_graph_stamp(namespace)
+        grant_row = db.execute(
+            "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+            (owner_grant_key(*namespace.as_tuple).token,),
+        ).fetchone()
+        proof_row = db.execute(
+            "SELECT operation_id,request_digest,grant_id,grant_digest,"
+            "graph_incarnation,graph_access_epoch,graph_epoch,"
+            "graph_receipt_digest,proof_json "
+            "FROM graph_owner_issue_operations_v1 WHERE bot=? AND persona=?",
+            namespace.as_tuple,
+        ).fetchone()
+        epochs = db.execute(
+            "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
+            "WHERE bot=? AND persona=?", namespace.as_tuple,
+        ).fetchone()
+        if (grant_row is None or proof_row is None or epochs is None
+                or epoch.revision != graph_epoch):
+            raise UnavailableGuard("current dispatch Owner graph proof absent; HOLD")
+        try:
+            grant = json.loads(grant_row[1])
+            validate_owner_grant_v1(grant)
+            proof = OwnerGraphCommitProofV1(
+                namespace, proof_row[0], proof_row[1], proof_row[2],
+                proof_row[3], proof_row[4], grant["grant_revision"],
+                proof_row[5], proof_row[6], proof_row[7])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise UnavailableGuard("current dispatch Owner graph proof invalid; HOLD") from exc
+        guard = witness.guard
+        if (grant_row != (1, canonical_json(grant), 1)
+                or proof_row[8] != canonical_json(asdict(proof))
+                or "sha256:" + canonical_digest(grant) != proof.grant_digest
+                or (witness.issue_operation_id, witness.grant_id,
+                    witness.grant_digest) != (
+                        proof.operation_id, proof.grant_id, proof.grant_digest)
+                or (grant["issue_operation_id"], grant["grant_id"]) != (
+                    proof.operation_id, proof.grant_id)
+                or (grant["graph_incarnation"], proof.graph_incarnation,
+                    admission.graph_incarnation) != (
+                        metadata.requirements.graph_incarnation,) * 3
+                or grant["activation_generation"]
+                != metadata.requirements.activation_generation
+                or grant["scope"] != "bot/persona"
+                or proof.graph_access_epoch > epochs[0]
+                or proof.graph_epoch > epoch.revision
+                or (admission.access_epoch, admission.delete_epoch)
+                != epochs
+                or admission.owner_head_ref != grant["grant_id"]
+                or admission.purpose not in grant["purposes"]
+                or not set(admission.audience).issubset(grant["audiences"])
+                or guard.namespace != namespace
+                or guard.authority_id != metadata.requirements.authority_id
+                or guard.authority_id != grant["authority_id"]
+                or guard.installation_id != grant["installation_id"]
+                or guard.installation_id
+                != self.__content_fence_v2.installation_grant.installation_id
+                or guard.authorization_revision != grant["grant_revision"]
+                or guard.authorization_head != owner_digest(proof)
+                or guard.minimum_revocation_revision != 0
+                or guard.minimum_revocation_epoch != 0
+                or guard.pending_revoke_operation_id is not None
+                or metadata.requirements.revocation_epoch != 0):
+            raise UnavailableGuard("current dispatch Owner authorization differs; HOLD")
+        return epochs
+
     def _commit_dispatch_claim_atom_in_transaction(
             self, namespace: NamespaceId, value, claimed_receipt):
         """Persist an already verified final claim and recovery stamp atomically.
@@ -11169,7 +11242,8 @@ class GraphCoordinator:
             _capability=self.__graph_capability)
         return receipt.revisions[0], receipt.epoch.revision, True
 
-    def register_dispatch_final_claim_writer_v1(self, bootstrap: object):
+    def register_dispatch_final_claim_writer_v1(
+            self, bootstrap: object, *, route_port=None, issuer_id=None):
         """Give trusted host composition one synchronous GraphWorker callback.
 
         The reverse mTLS listener registers this callback in its exclusive
@@ -11177,10 +11251,13 @@ class GraphCoordinator:
         """
         self._admin(bootstrap)
         from .host.authority_profile import AdminIngressClockPolicy
+        from .host.installed_dispatch_route import InstalledDispatchRoutePort
 
         port = self.__content_fence_v2
         if (not isinstance(self.__store, ProductionGraphStore)
                 or port is None
+                or type(route_port) is not InstalledDispatchRoutePort
+                or type(issuer_id) is not str or not issuer_id
                 or type(self.__dispatch_clock_policy) is not AdminIngressClockPolicy
                 or not callable(getattr(port, "read_current_effect", None))
                 or not callable(getattr(port, "current_anchor", None))
@@ -11191,12 +11268,14 @@ class GraphCoordinator:
             if graph is not self:
                 raise UnavailableGuard("final dispatch GraphWorker identity differs; HOLD")
             return self._commit_dispatch_final_claim_v1(
-                context, binding, claimed, witness, snapshot)
+                context, binding, claimed, witness, snapshot, route_port,
+                issuer_id)
 
         return claim_writer
 
     def _commit_dispatch_final_claim_v1(
-            self, context, binding, claimed, witness, authority_snapshot):
+            self, context, binding, claimed, witness, authority_snapshot,
+            route_port=None, issuer_id=None):
         """Recheck the exact P2 and current graph in one write transaction.
 
         All Authority reads precede the GraphStore lock. Incomplete domain
@@ -11222,6 +11301,9 @@ class GraphCoordinator:
         from .runtime.dispatch_current_commitment_check import (
             read_current_commitment_criteria_v1,
         )
+        from .runtime.dispatch_admission import check_receipts_against_specs
+        from .runtime.dispatch_graph_claim import DispatchGraphClaimValueV1
+        from .authority_service.v2_contract import DispatchGraphClaimReceiptV1
         from .runtime.dispatch_current_projection import (
             read_current_dispatch_projection,
         )
@@ -11234,6 +11316,9 @@ class GraphCoordinator:
         from .domains.d05.relationship import RelationshipProvider
         from .runtime.first_ingress_v2 import trusted_upper
         from .host.authority_profile import AdminIngressClockPolicy
+        from .host.installed_dispatch_route import (
+            InstalledDispatchRoutePort, InstalledDispatchRouteReadV1,
+        )
 
         if (type(context) is not DispatchHandoffContextV1
                 or type(binding) is not ExecutionBindingV2
@@ -11281,7 +11366,39 @@ class GraphCoordinator:
                 != (anchor.execution_seq, anchor.execution_digest)):
             raise UnavailableGuard("current Authority P2 effect differs; HOLD")
 
+        # Lock order: release the short graph selector read before the host
+        # loop verifies the live AstrBot scene. Re-read that selector under the
+        # final BEGIN IMMEDIATE; no host or Authority call occurs under it.
         store = self.__store
+        if type(route_port) is not InstalledDispatchRoutePort:
+            raise UnavailableGuard("installed final dispatch route reader unavailable; HOLD")
+        with store._lock:
+            db = store._db
+            db.execute("BEGIN")
+            try:
+                from .runtime.dispatch_admission import load_admission
+                receipt = load_admission(db, namespace, binding.origin.admission_ref)
+                if receipt is None:
+                    raise UnavailableGuard("final dispatch admission is absent; HOLD")
+                frozen = receipt.admission
+                from .runtime.dispatch_current_segment import read_current_dispatch_segment
+                pre_route = read_current_dispatch_segment(
+                    db, namespace, frozen.admission_ref, now_utc=now_utc)
+                selectors = (frozen.account_ref, frozen.destination_ref,
+                             frozen.scene_ref, pre_route.route_digest)
+            finally:
+                db.execute("ROLLBACK")
+        live_route = route_port.read_live_host_scene_only(
+            namespace=namespace, account_ref=selectors[0],
+            destination_ref=selectors[1], scene_ref=selectors[2],
+            route_digest=selectors[3])
+        if (type(live_route) is not InstalledDispatchRouteReadV1
+                or live_route.status != "verified_route"
+                or live_route.route_digest != selectors[3]
+                or live_route.graph_epoch is not None
+                or live_route.current_scene is None):
+            raise UnavailableGuard("current installed AstrBot route unavailable; HOLD")
+
         with store._lock:
             db = store._db
             db.execute("BEGIN IMMEDIATE")
@@ -11315,6 +11432,11 @@ class GraphCoordinator:
                 graph, query = self._dispatch_full_graph_snapshot_locked(namespace)
                 segment = read_current_dispatch_segment(
                     db, namespace, prerequisite.admission_ref, now_utc=now_utc)
+                if ((admission_receipt.admission.account_ref,
+                     admission_receipt.admission.destination_ref,
+                     admission_receipt.admission.scene_ref,
+                     segment.route_digest) != selectors):
+                    raise UnavailableGuard("final dispatch route changed during host read; HOLD")
                 projection = read_current_dispatch_projection(
                     db, namespace, graph, query)
                 blockers = evaluate_dispatch_budget_authority_snapshot(
@@ -11352,7 +11474,7 @@ class GraphCoordinator:
                 schema = next(spec for spec in GoalExecutionProvider().register_types()
                               if spec.name == "d08.action_schema.v1").validator(
                                   schema_atom.value)
-                read_current_commitment_criteria_v1(
+                commitment = read_current_commitment_criteria_v1(
                     db, namespace, graph, query, actions[0], schema,
                     claimed, context, witness, authority_snapshot, effect,
                     now_utc=now_utc)
@@ -11388,15 +11510,67 @@ class GraphCoordinator:
                 if social.status != "verified" or social.verified is not True:
                     raise UnavailableGuard(
                         "current D03/D05 check incomplete: " + social.reason + "; HOLD")
-                if segment.missing_sources:
+                from .domains.d08.execution import BASE_REQUIRED_PROVIDERS
+                if (schema.proactive or binding.origin.proactive_contact
+                        or schema.action_kind != "message"
+                        or {(item.check_kind, item.provider_id)
+                            for item in schema.required_checks}
+                        != set(BASE_REQUIRED_PROVIDERS)
+                        or len(schema.required_checks) != len(BASE_REQUIRED_PROVIDERS)
+                        or schema.required_checks != actions[0].required_checks):
                     raise UnavailableGuard(
-                        "current D09 host route and scene unavailable; HOLD")
-                # No trusted live route, Owner role/scene, D10 issuer or full
-                # RequiredCheck recomputation is installed here yet. Do not
-                # turn historical receipt fields into current PASS evidence.
-                raise UnavailableGuard(
-                    "current Owner route, D03/D05, D10 and RequiredCheck "
-                    "providers unavailable; HOLD")
+                        "final dispatch action needs an unavailable current check; HOLD")
+                try:
+                    check_receipts_against_specs(
+                        admission_receipt.admission, schema.required_checks,
+                        now_utc)
+                except ValueError as exc:
+                    raise UnavailableGuard(
+                        "final dispatch frozen RequiredCheck differs; HOLD") from exc
+                owner_epochs = self._verify_dispatch_owner_graph_locked(
+                    namespace, witness, admission_receipt.admission,
+                    query.revision)
+                if (live_route.route_digest != segment.route_digest
+                        or live_route.current_scene.scene_ref
+                        != admission_receipt.admission.scene_ref
+                        or live_route.current_scene.namespace != namespace):
+                    raise UnavailableGuard("final dispatch live scene differs; HOLD")
+                evidence_digest = "sha256:" + canonical_digest({
+                    "prerequisite": prerequisite,
+                    "graph_epoch": query.revision,
+                    "segment": segment,
+                    "route": live_route,
+                    "projection": projection.digest,
+                    "social": social,
+                    "commitment": commitment,
+                    "action": action,
+                    "owner_witness": witness,
+                    "owner_epochs": owner_epochs,
+                    "authority_snapshot": authority_snapshot,
+                })
+                value = DispatchGraphClaimValueV1(
+                    namespace.bot_id, namespace.persona_id,
+                    binding.graph_incarnation, binding.origin.activity_id,
+                    binding.origin.effect_id, binding.operation_id,
+                    context.handoff_id, prerequisite.admission_ref,
+                    permit.namespace, authority_digest(context.permit),
+                    permit.fence_epoch, claimed.updated_revision,
+                    anchor.execution_seq, anchor.execution_digest,
+                    authority_digest(context), authority_digest(witness),
+                    authority_digest(binding), authority_digest(claimed),
+                    evidence_digest,
+                )
+                version, graph_epoch, _ = self._commit_dispatch_claim_atom_in_transaction(
+                    namespace, value, claimed)
+                claim_receipt = DispatchGraphClaimReceiptV1(
+                    authority_digest(context), binding.graph_namespace,
+                    binding.graph_incarnation, f"graph:{version.revision}",
+                    graph_epoch, owner_epochs[0], owner_epochs[1],
+                    "dispatch-claim:" + binding.origin.effect_id,
+                    "sha256:" + canonical_digest(asdict(value)), issuer_id,
+                )
+                db.execute("COMMIT")
+                return claim_receipt
             except BaseException:
                 db.execute("ROLLBACK")
                 raise
@@ -11537,7 +11711,9 @@ class GraphCoordinator:
     def _issue_dispatch_admission(self, db, bundle, snapshot, candidate,
                                   action, schema, grant, batch, *,
                                   graph_receipt, v2_write, now_utc, projection,
-                                  clock_reading=None):
+                                  clock_reading=None, dispatch_scope=None,
+                                  dispatch_owner_guard=None,
+                                  dispatch_current_effect=None):
         """Fail closed unless a host issuer supplies and proves every current fact.
 
         This is called from the graph receipt hook, after D11's reservation,
@@ -11568,9 +11744,38 @@ class GraphCoordinator:
         if type(now_utc) not in (int, float) or not math.isfinite(now_utc):
             raise UnavailableGuard("trusted dispatch admission clock is invalid")
         now = float(now_utc)
+        trusted_context = None
+        if isinstance(self.__store, ProductionGraphStore):
+            from .authority_service.v2_contract import FencePermitV2
+            from .authority_service.v2_execution_bridge import CurrentEffectReadV2
+            from .authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
+            from .host.authority_profile import AdminIngressClockPolicy
+            from .host.v2_fence_port import VerifiedIngressClockV2
+            from .runtime_contracts import FenceScope
+            from .runtime.installed_dispatch_admission_issuer import (
+                TrustedDispatchAdmissionContextV1,
+            )
+
+            if (type(dispatch_scope) is not FenceScope
+                    or type(dispatch_scope.permit) is not FencePermitV2
+                    or dispatch_scope.permit.operation != "write"
+                    or type(clock_reading) is not VerifiedIngressClockV2
+                    or type(self.__dispatch_clock_policy) is not AdminIngressClockPolicy
+                    or type(dispatch_owner_guard) is not OwnerAuthorizationGuardV1
+                    or type(dispatch_current_effect) is not CurrentEffectReadV2
+                    or dispatch_scope.permit.pinned_anchor != dispatch_scope.pinned_anchor
+                    or dispatch_scope.graph_revision != v2_write[0].graph_revision
+                    or dispatch_scope.graph_epoch != v2_write[1]):
+                raise UnavailableGuard("trusted dispatch admission fence evidence unavailable; HOLD")
+            trusted_context = TrustedDispatchAdmissionContextV1(
+                dispatch_scope, clock_reading, self.__dispatch_clock_policy,
+                projection, graph_receipt, dispatch_owner_guard,
+                dispatch_current_effect)
+        issuer_options = ({"trusted_context": trusted_context}
+                          if trusted_context is not None else {})
         issued = issuer.issue_dispatch_admission(
             bundle, snapshot, candidate, db, graph_incarnation=graph_incarnation,
-            now_utc=now,
+            now_utc=now, **issuer_options,
         )
         if (type(issued) is not tuple or len(issued) != 2
                 or type(issued[1]) is not DispatchAdmissionV1):
@@ -11636,7 +11841,8 @@ class GraphCoordinator:
         preflight = preflight_dispatch_admission(
             schema, action, batch, request, admission.check_receipts,
             now_utc=now, trusted_check_verifier=lambda spec, receipt: (
-                issuer.verify_required_check(spec, receipt, snapshot, db) is True),
+                issuer.verify_required_check(
+                    spec, receipt, snapshot, db, **issuer_options) is True),
         )
         if set(preflight.missing) != {
             "d09.source_qualification", "dispatch.command_provenance",
@@ -11645,9 +11851,12 @@ class GraphCoordinator:
             raise UnavailableGuard("dispatch admission candidate or checks are incomplete")
         check_receipts_against_specs(admission, schema.required_checks, now)
         admission.require_current(now)
-        if (issuer.verify_domain_context(admission, snapshot, db) is not True
-                or issuer.verify_command_provenance(request, admission, db) is not True
-                or issuer.verify_journal_constraints(request, admission) is not True):
+        if (issuer.verify_domain_context(
+                    admission, snapshot, db, **issuer_options) is not True
+                or issuer.verify_command_provenance(
+                    request, admission, db, **issuer_options) is not True
+                or issuer.verify_journal_constraints(
+                    request, admission, **issuer_options) is not True):
             raise UnavailableGuard("dispatch domain, command, or journal is unverified")
         reads = tuple((item.key.token, item.revision) for item in snapshot.versions)
         parts = (action.identity.activity_id, action.identity.effect_id,
@@ -15305,6 +15514,31 @@ class GraphCoordinator:
         })
         if port.validate_fence(scope) != permit:
             raise UnavailableGuard("v2 bundle write permit changed")
+        dispatch_owner_guard = None
+        dispatch_current_effect = None
+        if dispatch_clock_reading is not None:
+            from .authority_service.v2_execution_bridge import CurrentEffectReadV2
+
+            owner_reader = getattr(port, "get_current_owner_guard_for_fence", None)
+            effect_reader = getattr(port, "read_current_effect", None)
+            if not callable(owner_reader) or not callable(effect_reader):
+                raise UnavailableGuard("dispatch admission Owner/effect reader unavailable; HOLD")
+            guarded = owner_reader(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                permit=permit)
+            if (type(guarded) is not tuple or len(guarded) != 2
+                    or type(guarded[0]) is not OwnerAuthorizationGuardV1
+                    or guarded[1] != permit):
+                raise UnavailableGuard("dispatch admission Owner guard differs; HOLD")
+            dispatch_owner_guard = guarded[0]
+            dispatch_current_effect = effect_reader(
+                namespace=namespace, authority_namespace=target.authority_namespace,
+                effect_id=bundle.envelope.identity.effect_id)
+            if (type(dispatch_current_effect) is not CurrentEffectReadV2
+                    or dispatch_current_effect.effect_id
+                    != bundle.envelope.identity.effect_id
+                    or port.validate_fence(scope) != permit):
+                raise UnavailableGuard("dispatch admission current effect differs; HOLD")
         c02_fact = None
         if c02_witness is not None and c02_terminal_recovery is None:
             from .authority_service.v2_worker_result_read_fact_contract import (
@@ -15426,6 +15660,9 @@ class GraphCoordinator:
                                          finish_digest, canonical_json(to_wire(permit))),
                 v2_transaction_state=transaction_state,
                 dispatch_clock_reading=dispatch_clock_reading,
+                dispatch_admission_scope=scope,
+                dispatch_admission_owner_guard=dispatch_owner_guard,
+                dispatch_admission_current_effect=dispatch_current_effect,
                 scene_owner_guard=scene_owner_guard,
                 now_utc=(arrival_issuance[2] if arrival_issuance else
                          baseline_issuance[2] if baseline_issuance else
@@ -15595,8 +15832,11 @@ class GraphCoordinator:
                                      v2_write=None, v2_transaction_state=None,
                                       in_transaction: bool = False,
                                       now_utc: float | None = None,
-                                     dispatch_clock_reading=None,
-                                     ingress_deadline_check=None,
+                                      dispatch_clock_reading=None,
+                                      dispatch_admission_scope=None,
+                                      dispatch_admission_owner_guard=None,
+                                      dispatch_admission_current_effect=None,
+                                      ingress_deadline_check=None,
                                      scene_owner_guard=None,
                                       arrival_issuance=None,
                                       baseline_issuance=None,
@@ -16358,6 +16598,9 @@ class GraphCoordinator:
                             self._dispatch_clock_upper(dispatch_clock_reading)
                             if dispatch_clock_reading is not None else now_utc),
                         clock_reading=dispatch_clock_reading,
+                        dispatch_scope=dispatch_admission_scope,
+                        dispatch_owner_guard=dispatch_admission_owner_guard,
+                        dispatch_current_effect=dispatch_admission_current_effect,
                     )
                     issued = load_request(
                         db, namespace, admission_receipt.admission.admission_ref)
