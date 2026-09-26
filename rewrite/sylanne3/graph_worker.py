@@ -22,7 +22,7 @@ class GraphWorker:
     ``fence_port_factory`` creates the V2FencePort on the same thread before
     ``coordinator_factory`` binds it to the GraphCoordinator. A submitted callable receives that
     coordinator as its first argument. The fixed capacity counts both running
-    and queued calls until the worker actually finishes them.
+    and queued ordinary calls until the worker actually finishes them.
     """
 
     def __init__(self, store_factory: Callable, coordinator_factory: Callable,
@@ -37,10 +37,12 @@ class GraphWorker:
         self._coordinator_factory = coordinator_factory
         self._fence_port_factory = fence_port_factory
         self._slots = BoundedSemaphore(capacity)
-        # One extra cell is reserved for the shutdown marker, never for work.
-        self._queue: Queue = Queue(maxsize=capacity + 1)
+        # Ordinary work uses capacity slots. The two extra cells hold at most
+        # one exclusive callback and the shutdown marker.
+        self._queue: Queue = Queue(maxsize=capacity + 2)
         self._lock = Lock()
         self._closed = False
+        self._callback_active = False
         self._started: Future = Future()
         self._stopped: Future = Future()
         self._thread = Thread(target=self._run, name="sylanne-graph", daemon=True)
@@ -79,21 +81,29 @@ class GraphWorker:
                 item = self._queue.get()
                 if item is _STOP:
                     break
-                function, args, outcome = item
+                function, args, outcome, is_callback = item
                 deliver = outcome.set_running_or_notify_cancel()
+                result = None
+                call_failure = None
                 try:
                     result = function(coordinator, *args)
                     if inspect.isawaitable(result):
                         if inspect.iscoroutine(result):
                             result.close()
                         raise TypeError("graph worker call must be synchronous")
-                    if deliver:
-                        outcome.set_result(result)
                 except BaseException as exc:
-                    if deliver:
-                        outcome.set_exception(exc)
+                    call_failure = exc
                 finally:
-                    self._slots.release()
+                    if is_callback:
+                        with self._lock:
+                            self._callback_active = False
+                    else:
+                        self._slots.release()
+                if deliver:
+                    if call_failure is None:
+                        outcome.set_result(result)
+                    else:
+                        outcome.set_exception(call_failure)
         except BaseException as exc:
             failure = exc
         finally:
@@ -123,10 +133,34 @@ class GraphWorker:
         with self._lock:
             if self._closed:
                 raise RuntimeError("graph worker is closed")
+            if self._callback_active:
+                raise RuntimeError("graph worker callback window is active")
             if not self._slots.acquire(blocking=False):
                 raise CapacityExceeded("graph worker capacity exhausted")
             outcome: Future = Future()
-            self._queue.put_nowait((function, args, outcome))
+            self._queue.put_nowait((function, args, outcome, False))
+        wrapped = asyncio.wrap_future(outcome)
+        # An abandoned result can still be an exception; consume it while the
+        # underlying graph operation finishes and releases its slot.
+        wrapped.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        return await asyncio.shield(wrapped)
+
+    async def call_exclusive_callback(self, function: Callable, *args):
+        """Drain accepted calls, then run one callback with ordinary admission closed.
+
+        The window stays closed until the worker finishes, even if this waiter
+        is cancelled or times out. Concurrent callback requests fail fast.
+        """
+        if not callable(function):
+            raise TypeError("graph worker callback requires a callable")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("graph worker is closed")
+            if self._callback_active:
+                raise RuntimeError("graph worker callback window is active")
+            self._callback_active = True
+            outcome: Future = Future()
+            self._queue.put_nowait((function, args, outcome, True))
         wrapped = asyncio.wrap_future(outcome)
         # An abandoned result can still be an exception; consume it while the
         # underlying graph operation finishes and releases its slot.
