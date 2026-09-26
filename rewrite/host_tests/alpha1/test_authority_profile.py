@@ -82,6 +82,51 @@ def _schema2_payload() -> dict[str, object]:
     }
 
 
+def _source_correction_payload() -> dict[str, object]:
+    payload = _schema2_payload()
+    payload["d06_source_correction"] = {
+        "deadline_after_seconds": 30,
+        "quote_ceiling": {"tokens": 10},
+        "snapshot_ref": "snapshot-a",
+        "resource_ref": "resource-a",
+    }
+    payload["installation_policy"]["root_grant"]["allowed_work_kinds"].append(
+        "d06.source_correction"
+    )
+    return payload
+
+
+def test_source_correction_requires_installed_bounded_policy() -> None:
+    legacy = _schema2_payload()
+    authority_profile._policy_from_payload(legacy)
+    assert authority_profile._d06_source_correction_from_payload(legacy) is None
+
+    payload = _source_correction_payload()
+    authority_profile._policy_from_payload(payload)
+    correction = authority_profile._d06_source_correction_from_payload(payload)
+    assert correction is not None
+    assert correction.digest_payload() == payload["d06_source_correction"]
+    with pytest.raises(TypeError):
+        correction.quote_ceiling["tokens"] = 11
+
+
+@pytest.mark.parametrize("mutation", (
+    lambda p: p["installation_policy"]["root_grant"]["allowed_work_kinds"].remove(
+        "d06.source_correction"),
+    lambda p: p["d06_source_correction"].update(quote_ceiling={"tokens": 101}),
+    lambda p: p["installation_policy"]["root_lease"].update(limits={"tokens": 9}),
+    lambda p: p["d06_source_correction"].update(deadline_after_seconds=float("inf")),
+    lambda p: p["d06_source_correction"].update(resource_ref="bad ref"),
+    lambda p: p["d06_source_correction"].update(quote_ceiling={"tokens": True}),
+    lambda p: p["d06_source_correction"].update(user_quote={"tokens": 10}),
+))
+def test_source_correction_rejects_invalid_or_user_supplied_price(mutation) -> None:
+    payload = _source_correction_payload()
+    mutation(payload)
+    with pytest.raises(ValueError):
+        authority_profile._policy_from_payload(payload)
+
+
 def _model_workflow_payload(work_kind: str, purpose: str,
                             template: str) -> dict[str, object]:
     digest = "c" * 64
