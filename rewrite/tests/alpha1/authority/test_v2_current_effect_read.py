@@ -5,8 +5,13 @@ import pytest
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.v2_contract import PlatformObservationV1
 from sylanne3.authority_service.v2_execution_bridge import CurrentEffectReadV2
+from sylanne3.graph_coordinator import namespace_ref
+from sylanne3.runtime_contracts import NamespaceId
 
-from test_execution_binding_v2_claim import _binding_v2, _prepared, _service
+from test_execution_binding_v2_claim import AUTH_NS, _binding_v2, _prepared, _service
+
+
+OTHER_AUTH_NS = namespace_ref(NamespaceId("other-bot", "persona"))
 
 
 def test_absent_and_exact_prepared_then_claimed_effect(tmp_path):
@@ -14,7 +19,7 @@ def test_absent_and_exact_prepared_then_claimed_effect(tmp_path):
     absent = bridge.read_current_effect(
         credential="ok", subject="subject-a", effect_id="effect-a")
     assert absent == CurrentEffectReadV2(
-        authority_id=absent.authority_id, namespace="ns-a", effect_id="effect-a",
+        authority_id=absent.authority_id, namespace=AUTH_NS, effect_id="effect-a",
         activation_generation=1, state="absent", execution_head_seq=0,
         execution_head_digest="genesis")
     prepared, origin = _prepared(core, fences, bridge)
@@ -45,21 +50,21 @@ def test_stale_head_and_missing_or_tampered_index_fail_closed(tmp_path):
     prepared, _ = _prepared(core, fences, bridge)
     with core._tx() as db:
         db.execute("UPDATE authority_namespaces SET execution_digest=? WHERE namespace=?",
-                   ("sha256:" + "f" * 64, "ns-a"))
+                   ("sha256:" + "f" * 64, AUTH_NS))
     with pytest.raises(AuthorityUnavailable, match="execution journal differs"):
         bridge.read_current_effect(
             credential="ok", subject="subject-a", effect_id="effect-a")
     with core._tx() as db:
         db.execute("UPDATE authority_namespaces SET execution_digest=? WHERE namespace=?",
-                   (prepared.after_anchor.execution_digest, "ns-a"))
+                   (prepared.after_anchor.execution_digest, AUTH_NS))
         db.execute("DELETE FROM authority_effects WHERE namespace=? AND effect_id=?",
-                   ("ns-a", "effect-a"))
+                   (AUTH_NS, "effect-a"))
     with pytest.raises(AuthorityUnavailable, match="index and append history"):
         bridge.read_current_effect(
             credential="ok", subject="subject-a", effect_id="effect-a")
     with core._tx() as db:
         db.execute("INSERT INTO authority_effects VALUES(?,?,?,?,?)",
-                   ("ns-a", "effect-a", "unresolved", "[]", 1))
+                   (AUTH_NS, "effect-a", "unresolved", "[]", 1))
     with pytest.raises(AuthorityUnavailable, match="conflict evidence"):
         bridge.read_current_effect(
             credential="ok", subject="subject-a", effect_id="effect-a")
@@ -103,12 +108,13 @@ def test_namespace_and_authorization_do_not_leak_effect(tmp_path):
     with core._tx() as db:
         db.execute(
             "INSERT INTO authority_namespaces "
-            "SELECT 'ns-b',holder,generation,phase,transfer_id,target,"
+            "SELECT ?,holder,generation,phase,transfer_id,target,"
             "revocation_epoch,deletion_journal_id,deletion_seq,deletion_digest,"
             "deletion_phase,execution_journal_id,execution_seq,execution_digest,"
-            "anchor_nonce FROM authority_namespaces WHERE namespace='ns-a'")
+            "anchor_nonce FROM authority_namespaces WHERE namespace=?",
+            (OTHER_AUTH_NS, AUTH_NS))
         db.execute("INSERT INTO authority_effects VALUES(?,?,?,?,?)",
-                   ("ns-b", "effect-a", "unresolved", "[]", 1))
+                   (OTHER_AUTH_NS, "effect-a", "unresolved", "[]", 1))
     assert bridge.read_current_effect(
         credential="ok", subject="subject-a", effect_id="effect-a").state == "absent"
     _prepared(core, fences, bridge)
