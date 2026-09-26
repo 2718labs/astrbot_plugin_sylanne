@@ -467,11 +467,8 @@ def read_deletion_closure_candidate_from_coordinator(
             if pair not in history_closure:
                 history_closure.add(pair)
                 pending.append(pair)
-    # Historical semantic references may not have corresponding graph edges.
-    # Pull available interpretation versions into this bounded closure and
-    # continue through their reverse-history dependents.
-    for key, revision in tuple(history_closure):
-        row = history_by_version.get((key, revision))
+        key, revision = version
+        row = history_by_version.get(version)
         if (row is None or key.type_name not in {
                 "memory.subjective_trace.v1", "memory.subjective_trace.v2"}):
             continue
@@ -499,13 +496,6 @@ def read_deletion_closure_candidate_from_coordinator(
                     pending.append(pair)
         except (TypeError, KeyError, ValueError):
             missing.append("unreadable_historical_payload")
-    while pending:
-        version = pending.pop()
-        for dependent in reverse_history.get(GraphVersion(*version), ()):
-            pair = (dependent.key, dependent.revision)
-            if pair not in history_closure:
-                history_closure.add(pair)
-                pending.append((pair[0], pair[1]))
 
     historical_versions = tuple(sorted(
         (GraphVersion(key, revision) for key, revision in history_closure),

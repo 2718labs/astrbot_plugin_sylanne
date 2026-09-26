@@ -250,8 +250,12 @@ def test_historical_trace_semantic_interpretation_ref_is_closed_or_reported(
                       "memory.episode.v1", "current")
     trace = AtomKey(Owner("event", "bot", "persona", "trace"),
                     "memory.subjective_trace.v1", "record")
+    trace_two = AtomKey(Owner("event", "bot", "persona", "trace-two"),
+                        "memory.subjective_trace.v1", "record")
     interpretation = AtomKey(Owner("event", "bot", "persona", "interpretation"),
                              "memory.interpretation", "current")
+    interpretation_two = AtomKey(Owner("event", "bot", "persona", "interpretation-two"),
+                                 "memory.interpretation", "current")
     event = AtomKey(Owner("event", "bot", "persona", "event"),
                     "d03.world_event", "current")
     commit("root", (GraphWrite(root, _source("root").to_dict()),))
@@ -265,6 +269,11 @@ def test_historical_trace_semantic_interpretation_ref_is_closed_or_reported(
         "trace_id": "trace", "episode_ref": episode.token,
         "perspective_ref": "perspective", "then_feeling_refs": [],
         "interpretation_refs": [interpretation.token], "detail_weights": [],
+    })
+    history_trace_two = GraphAtom(trace_two, 1, {
+        "trace_id": "trace-two", "episode_ref": episode.token,
+        "perspective_ref": "perspective", "then_feeling_refs": [],
+        "interpretation_refs": [interpretation_two.token], "detail_weights": [],
     })
     history_rows = None
 
@@ -283,12 +292,25 @@ def test_historical_trace_semantic_interpretation_ref_is_closed_or_reported(
                     "subject_id": "self", "claim": "historical", "status": "confirmed",
                     "valid_from": 1.0, "recorded_at": 1.0, "valid_to": None,
                 })
+                history_interpretation_two = GraphAtom(interpretation_two, 1, {
+                    "interpretation_id": "interpretation-two", "source_ids": ["root"],
+                    "subject_id": "self", "claim": "historical-two", "status": "confirmed",
+                    "valid_from": 1.0, "recorded_at": 1.0, "valid_to": None,
+                })
+                history_rows += (
+                    DeletionHistoryRow(history_trace_two, "session", "trace-two-old", 1),
+                    DeletionHistoryRow(
+                        history_interpretation_two, "session", "interpretation-two-old", 0),
+                )
                 history_rows += (DeletionHistoryRow(
                     history_interpretation, "session", "interpretation-old", 0),)
         return replace(
             candidate, history_rows=history_rows,
-            history_edges=(DeletionDependencyEdge(
-                GraphVersion(trace, 1), GraphVersion(root, 1)),),
+            history_edges=(
+                DeletionDependencyEdge(GraphVersion(trace, 1), GraphVersion(root, 1)),
+                DeletionDependencyEdge(
+                    GraphVersion(trace_two, 1), GraphVersion(interpretation, 1)),
+            ),
         )
 
     coordinator.read_deletion_snapshot_candidate = read_with_historical_trace
@@ -304,6 +326,10 @@ def test_historical_trace_semantic_interpretation_ref_is_closed_or_reported(
         assert GraphVersion(trace, 1) in result.historical_read_versions
         assert GraphVersion(interpretation, 1) in result.historical_read_versions
         assert interpretation.token in result.interpretation_refs
+        assert GraphVersion(trace_two, 1) in result.historical_read_versions
+        assert GraphVersion(interpretation_two, 1) in result.historical_read_versions
+        assert trace_two.token in result.trace_refs
+        assert interpretation_two.token in result.interpretation_refs
     else:
         assert result.status == "partial_hold"
         assert "unresolved_historical_interpretation_ref" in result.missing_facets
