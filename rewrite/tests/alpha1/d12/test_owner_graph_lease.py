@@ -58,6 +58,7 @@ class OwnerReadPort:
         self.on_guard_read = None
         self.installation_grant = SimpleNamespace(installation_id="installation")
         self.session_current = True
+        self.operations = {}
 
     def _outside_graph(self):
         assert not self.graph._lock._is_owned()
@@ -72,12 +73,19 @@ class OwnerReadPort:
         self._outside_graph()
         assert self.active is None and namespace == NAMESPACE
         assert authority_namespace == self.anchor.namespace
-        assert holder == "holder" and generation == 1 and operation == "read"
+        assert holder == "holder" and generation == 1 and operation in {"read", "write"}
         assert expected_anchor == self.anchor
+        assert operation_id not in self.operations
         self.active = FencePermitV2(
             self.anchor.authority_id, authority_namespace, "subject", holder,
             generation, operation, operation_id, "x" * 48, 1, 0, self.anchor)
+        self.operations[operation_id] = (self.active, "active")
         return self.active
+
+    def get_fence_operation(self, *, namespace, authority_namespace, operation_id):
+        self._outside_graph()
+        assert namespace == NAMESPACE and authority_namespace == self.anchor.namespace
+        return self.operations.get(operation_id, (None, "absent"))
 
     def validate_fence(self, scope):
         self._outside_graph()
@@ -106,7 +114,14 @@ class OwnerReadPort:
         assert request_id == "finish:" + scope.operation_id
         assert request_digest.startswith("sha256:")
         self.finishes += 1
+        self.operations[scope.operation_id] = (scope.permit, "finished")
         self.active = None
+
+    def read_ingress_clock(self, _policy):
+        import time
+        self._outside_graph()
+        return SimpleNamespace(monotonic_after_seconds=time.monotonic(),
+                               utc_upper_bound_seconds=10.0)
 
 
 class Provider:

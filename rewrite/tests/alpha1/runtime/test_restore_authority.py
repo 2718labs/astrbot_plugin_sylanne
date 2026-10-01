@@ -6,17 +6,17 @@ import sqlite3
 
 import pytest
 
-from rewrite.sylanne3.runtime.activation import (
+from sylanne3.runtime.activation import (
     ActivationDenied, SqliteMigrationAuthority, TransferPlan,
 )
-from rewrite.sylanne3.runtime.deletion import (
+from sylanne3.runtime.deletion import (
     DeletionBlocked, DeletionConflict, DeletionJournal, DeletionJournalUnavailable,
 )
-from rewrite.sylanne3.runtime.restore_anchor import (
+from sylanne3.runtime.restore_anchor import (
     RestoreAnchor, RestoreQuarantined, SnapshotRequirements,
     _execution_head_and_continuity, validate_restore,
 )
-from rewrite.sylanne3.runtime_journal import (
+from sylanne3.runtime_journal import (
     ExecutionJournal, RecoveryConstraintFootprint,
 )
 

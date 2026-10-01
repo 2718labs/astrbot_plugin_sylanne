@@ -8,7 +8,15 @@ import re
 from typing import Protocol
 
 from ..authority_service.v2_contract import SCHEMA as AUTHORITY_V2_PROTOCOL
-from ..authority_service.v2_contract import FencePermitV2
+from ..authority_service.v2_contract import DeletionMutationReceiptV1, FencePermitV2
+from ..authority_service.current_accepted_erasure_read import CurrentAcceptedErasureV1
+from ..authority_service.internal_work_contract import (
+    InternalWorkBindingV1, InternalWorkTerminalProofV1,
+)
+from ..authority_service.internal_work_service import (
+    AuthorityInternalWorkVerifiedReceiptV1, InternalWorkJournalInspectionV1,
+)
+from ..authority_service.v2_migration_rpc import SCHEMA as MIGRATION_RPC_SCHEMA
 from ..authority_service.v2_model_egress_contract import (
     ModelEgressDraftV1, ModelEgressIntentV1, ModelEgressRecoveryV1,
     ModelAdmissionV2, HostObservedModelCompletionV2, ModelTerminalReceiptV2,
@@ -21,6 +29,21 @@ from ..authority_service.v2_worker_model_result_contract import (
 )
 from ..authority_service.v2_reply_worker_model_result_contract import (
     ReplyWorkerModelResultReadRequestV1, ReplyWorkerModelResultReadV1,
+)
+from ..authority_service.v2_context_reply_result_contract import (
+    ContextReplyResultReadRequestV1, ContextReplyPaidResultReadV2,
+)
+from ..authority_service.v2_natural_generation_output_contract import (
+    NaturalGenerationOriginalOutputV2, NaturalGenerationOutputReadRequestV2,
+)
+from ..authority_service.v2_natural_generation_content_contract import (
+    NaturalGenerationContentReadRequestV2, NaturalGenerationCurrentContentV2,
+)
+from ..authority_service.v2_natural_review_output_contract import (
+    NaturalReviewOriginalOutputV2, NaturalReviewOutputReadRequestV2,
+)
+from ..authority_service.v2_natural_paid_review_contract import (
+    NaturalPaidReviewCurrentReadRequestV2, NaturalPaidReviewCurrentReadV2,
 )
 from ..authority_service.v2_self_identity_contract import (
     AuthorityCurrentSelfIdentityV1, SelfIdentityCurrentRequestV1,
@@ -205,6 +228,10 @@ class AuthorityTransport(Protocol):
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
     ) -> InstallationGrantV2: ...
 
+    async def migration_command_v2(self, request: AuthorityProvisioningRequest,
+                                   handshake: AuthorityHandshake,
+                                   command: dict[str, object]) -> object: ...
+
     async def model_prepare_fenced_v1(self, request, handshake, grant, *, namespace,
                                       holder, draft, expected_anchor): ...
 
@@ -253,6 +280,34 @@ class AuthorityTransport(Protocol):
     async def reply_worker_model_result_recover_finish_v1(
         self, request, handshake, grant, *, namespace, read_request): ...
 
+    async def context_reply_result_read_v2(
+        self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def context_reply_result_recover_finish_v2(
+        self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def d04_appraisal_result_read_v3(self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def d04_appraisal_result_recover_finish_v3(self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def natural_generation_output_select_v2(
+        self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def natural_generation_content_read_v2(
+        self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def natural_generation_output_recover_finish_v2(
+        self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def natural_review_output_select_v2(
+        self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def natural_review_output_recover_finish_v2(
+        self, request, handshake, grant, *, namespace, read_request): ...
+
+    async def natural_paid_review_current_read_v2(
+        self, request, handshake, grant, *, namespace, read_request): ...
+
     async def self_identity_current_v1(self, request, handshake, grant,
                                        *, namespace, current_request): ...
 
@@ -261,6 +316,39 @@ class AuthorityTransport(Protocol):
 
     async def worker_result_read_fact_v2(self, request, handshake, grant,
                                          *, namespace, fact_request): ...
+
+    async def v2_get_pending_deletion_for_graph_write(
+        self, request, handshake, *, namespace, deletion_operation_id, permit,
+    ): ...
+
+    async def v2_read_current_accepted_erasure_v1(
+        self, request, handshake, *, namespace, deletion_operation_id,
+        scope_digest, permit,
+    ): ...
+
+    async def v2_get_content_fence_operation(
+        self, request, handshake, *, namespace, operation_id,
+    ): ...
+
+    async def c04_terminal_verify_v1(
+        self, request, handshake, grant, *, namespace, proof,
+    ): ...
+
+    async def c04_execute_v2(
+        self, request, handshake, grant, *, namespace, binding,
+    ): ...
+
+    async def c04_inspect_v2(
+        self, request, handshake, grant, *, namespace, binding,
+    ): ...
+
+    async def c04_execute_v3(
+        self, request, handshake, grant, *, namespace, binding,
+    ): ...
+
+    async def c04_inspect_v3(
+        self, request, handshake, grant, *, namespace, binding,
+    ): ...
 
 
 class AuthorityClient:
@@ -373,6 +461,246 @@ class AuthorityClient:
             and grant.channel_binding_sha256 == self._v2_handshake.channel_binding_sha256
         ) else None
 
+    async def migration_command_v2(self, command: dict[str, object]) -> object:
+        """Use the paired management channel; server-installed facts authorize stages."""
+        if (type(command) is not dict or command.get("schema") != MIGRATION_RPC_SCHEMA
+                or self._transport is None):
+            raise RuntimeError("authority migration command is invalid")
+        if self._v2_request is None or self._v2_handshake is None:
+            if (await self.status_v2()).state != "paired":
+                raise RuntimeError("authority migration channel is unavailable")
+        assert self._v2_request is not None and self._v2_handshake is not None
+        current = await asyncio.to_thread(self._build_request)
+        if current != self._v2_request or not self._v2_handshake.valid_pairing():
+            raise RuntimeError("authority migration channel has changed")
+        return await self._transport.migration_command_v2(
+            self._v2_request, self._v2_handshake, command,
+        )
+
+    async def pending_deletion_for_graph_write_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        deletion_operation_id: str, permit: FencePermitV2,
+    ) -> DeletionMutationReceiptV1:
+        """Read the current original through this installation's paired channel."""
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(permit) is not FencePermitV2 or permit.operation != "delete"
+                or permit.namespace != policy.authority_namespace
+                or permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject):
+            raise RuntimeError("deletion graph read differs from installation")
+        return await self._transport.v2_get_pending_deletion_for_graph_write(
+            request, handshake, namespace=policy.authority_namespace,
+            deletion_operation_id=deletion_operation_id, permit=permit)
+
+    async def current_accepted_erasure_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        deletion_operation_id: str, scope_digest: str, permit: FencePermitV2,
+    ) -> CurrentAcceptedErasureV1:
+        """Read Authority-current acceptance; caller receipts are never inputs."""
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(permit) is not FencePermitV2 or permit.operation != "delete"
+                or permit.namespace != policy.authority_namespace
+                or permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject):
+            raise RuntimeError("accepted erasure read differs from installed namespace")
+        current_permit, state = await self._transport.v2_get_content_fence_operation(
+            request, handshake, namespace=policy.authority_namespace,
+            operation_id=permit.operation_id)
+        if (state != "active" or type(current_permit) is not FencePermitV2
+                or current_permit.operation != "delete"
+                or current_permit.namespace != permit.namespace
+                or current_permit.operation_id != permit.operation_id
+                or current_permit.token != permit.token
+                or current_permit.subject != permit.subject
+                or current_permit.holder != permit.holder
+                or current_permit.authority_id != permit.authority_id
+                or current_permit.generation != permit.generation
+                or current_permit.revision < permit.revision):
+            raise RuntimeError("current live delete fence differs from pending original")
+        return await self._transport.v2_read_current_accepted_erasure_v1(
+            request, handshake, namespace=policy.authority_namespace,
+            deletion_operation_id=deletion_operation_id,
+            scope_digest=scope_digest, permit=current_permit)
+
+    async def prepare_current_erasure_v1(
+        self, bundle, grant: InstallationGrantV2, *, operation_id: str,
+        source_id: str, owner_actor_id: str, owner_session_token: str,
+    ) -> tuple[DeletionMutationReceiptV1, FencePermitV2]:
+        """Ask the paired Authority to durably prepare one Owner-scoped D06 deletion."""
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        return await self._transport.v2_prepare_current_erasure_v1(
+            request, handshake, namespace=policy.authority_namespace,
+            operation_id=operation_id, source_id=source_id,
+            owner_actor_id=owner_actor_id,
+            owner_session_token=owner_session_token)
+
+    async def c04_terminal_verify_v1(self,bundle,grant: InstallationGrantV2,*,proof: InternalWorkTerminalProofV1):
+        if type(proof) is not InternalWorkTerminalProofV1:
+            raise RuntimeError("C04 actual terminal proof required")
+        return await self._execute_c04_original_rpc_v3(bundle,grant,method="c04_terminal_verify_v1",proof=proof)
+
+    async def c04_execute_v2(self, bundle, grant: InstallationGrantV2, *,
+                             binding: InternalWorkBindingV1
+                             ) -> InternalWorkJournalInspectionV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if type(binding) is not InternalWorkBindingV1 or binding.namespace != policy.authority_namespace:
+            raise RuntimeError("C04 execution differs from installed namespace")
+        return await self._transport.c04_execute_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            binding=binding)
+
+    async def c04_inspect_v2(self, bundle, grant: InstallationGrantV2, *,
+                             binding: InternalWorkBindingV1
+                             ) -> InternalWorkJournalInspectionV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if type(binding) is not InternalWorkBindingV1 or binding.namespace != policy.authority_namespace:
+            raise RuntimeError("C04 inspection differs from installed namespace")
+        return await self._transport.c04_inspect_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            binding=binding)
+
+    async def c04_execute_v3(self, bundle, grant: InstallationGrantV2, *, binding: InternalWorkBindingV1):
+        if type(binding) is not InternalWorkBindingV1 or binding.algorithm_ref != "d06.association_activation.v3":
+            raise RuntimeError("C04 V3 execution differs from installed binding")
+        return await self._execute_c04_original_rpc_v3(bundle,grant,method="c04_execute_v3",binding=binding)
+
+    async def c04_inspect_v3(self, bundle, grant: InstallationGrantV2, *, binding: InternalWorkBindingV1):
+        if type(binding) is not InternalWorkBindingV1 or binding.algorithm_ref != "d06.association_activation.v3":
+            raise RuntimeError("C04 V3 inspection differs from installed binding")
+        return await self._execute_c04_original_rpc_v3(bundle,grant,method="c04_inspect_v3",binding=binding)
+
+    async def _execute_c04_original_rpc_v3(self,bundle,grant,*,method,**originals):
+        """Fresh exact installed channel, preserving each once-only C04 original."""
+        from dataclasses import asdict
+        from .mtls_transport import MtlsAuthorityTransport, AuthorityChannelUnavailable
+        if method not in {"c04_execute_v3","c04_inspect_v3","c04_terminal_verify_v1","internal_accounting_v1"}:
+            raise ValueError("unregistered fixed C04 original RPC")
+        request,policy=await self._d04_installation_context_v3(bundle,grant)
+        for attempt in range(2):
+            transport=MtlsAuthorityTransport({bundle.tls_profile.profile_id:bundle.tls_profile})
+            try:
+                handshake=await transport.handshake(request,protocol=AUTHORITY_V2_PROTOCOL)
+                current=await transport.installation_grant_v2(request,handshake)
+                before=asdict(grant);after=asdict(current)
+                before.pop("channel_binding_sha256");after.pop("channel_binding_sha256")
+                if before!=after:raise RuntimeError("C04 reconnected installation identity changed")
+                return await getattr(transport,method)(request,handshake,current,
+                    namespace=policy.authority_namespace,**originals)
+            except AuthorityChannelUnavailable:
+                if attempt or method=="c04_execute_v3":raise
+            finally:await transport.close()
+        raise RuntimeError("C04 original RPC remains unresolved")
+
+    async def _d04_installation_context_v3(self,bundle,grant):
+        from .authority_profile import AdminInstallationBundle
+        from .mtls_transport import MtlsAuthorityTransport
+        if (type(bundle) is not AdminInstallationBundle or type(grant) is not InstallationGrantV2
+                or type(self._transport) is not MtlsAuthorityTransport):raise RuntimeError("actual installed D04 pairing required")
+        request=await asyncio.to_thread(self._build_request);policy=bundle.installation_policy
+        if (type(policy) is not AdminInstallationPolicy or self._transport.profile_for(request.profile_id)!=bundle.tls_profile
+                or (grant.authority_id,grant.installation_id,grant.manifest_digest,grant.administrator_holder)!=
+                (policy.expected_authority_id,policy.installation_id,policy.manifest_digest,policy.administrator_holder)
+                or request.publisher_package.manifest_sha256!=grant.manifest_digest
+                or bundle.tls_profile.expected_authority_id!=grant.authority_id):raise RuntimeError("D04 administrator/package identity changed")
+        return request,policy
+
+    async def _d04_numeric_v3(self, bundle, grant, *, binding, method, **originals):
+        from ..authority_service.d04_numeric_contract_v3 import D04NumericBindingV3
+        request, policy = await self._d04_installation_context_v3(bundle, grant)
+        if (type(binding) is not D04NumericBindingV3
+                or binding.namespace != policy.namespace
+                or binding.authority_namespace != policy.authority_namespace
+                or binding.installation_id != policy.installation_id):
+            raise RuntimeError("D04 numeric identity differs from installation")
+        return await self._execute_d04_rpc_v3(bundle,grant,binding=binding,method=method,transport_method="d04_numeric_v3",**originals)
+
+    async def d04_numeric_bridge_v3(self,bundle,grant,*,binding,method,**originals):
+        from ..authority_service.d04_numeric_contract_v3 import D04NumericBindingV3
+        request,policy=await self._d04_installation_context_v3(bundle,grant)
+        if (type(binding) is not D04NumericBindingV3 or binding.namespace!=policy.namespace
+                or binding.authority_namespace!=policy.authority_namespace or binding.installation_id!=policy.installation_id):
+            raise RuntimeError("numeric bridge identity differs from installed bundle")
+        return await self._execute_d04_rpc_v3(bundle,grant,binding=binding,method=method,transport_method="d04_numeric_bridge_v3",**originals)
+
+    async def d04_root_v3(self,bundle,grant,*,binding,method,**originals):
+        from ..authority_service.d04_root_execution_contract_v3 import D04RootExecutionBindingV3
+        policy=bundle.installation_policy
+        if (type(binding) is not D04RootExecutionBindingV3 or binding.namespace!=policy.namespace
+                or binding.authority_namespace!=policy.authority_namespace or binding.installation_id!=policy.installation_id):raise RuntimeError("root original identity differs from installed bundle")
+        return await self._execute_d04_rpc_v3(bundle,grant,binding=binding,method=method,transport_method="d04_root_v3",**originals)
+
+    async def _execute_d04_rpc_v3(self,bundle,grant,*,binding,method,transport_method,**originals):
+        """Reauthenticate installed originals after long CPU on a fresh channel.
+
+        A separate bounded channel avoids invalidating unrelated live Owner or
+        Graph sessions. Retries keep the identical binding, claim and measured
+        original; a first-claim ACK loss is inspection-only at the caller.
+        """
+        from dataclasses import asdict
+        from .mtls_transport import MtlsAuthorityTransport,AuthorityChannelUnavailable
+        request,policy=await self._d04_installation_context_v3(bundle,grant)
+        if type(self._transport) is not MtlsAuthorityTransport:raise RuntimeError("installed D04 mTLS transport required")
+        for attempt in range(2):
+            transport=MtlsAuthorityTransport({bundle.tls_profile.profile_id:bundle.tls_profile})
+            try:
+                handshake=await transport.handshake(request,protocol=AUTHORITY_V2_PROTOCOL)
+                current=await transport.installation_grant_v2(request,handshake)
+                before=asdict(grant);after=asdict(current)
+                before.pop("channel_binding_sha256");after.pop("channel_binding_sha256")
+                if before!=after:raise RuntimeError("D04 reconnected installed identity changed")
+                return await getattr(transport,transport_method)(request,handshake,current,
+                    namespace=policy.authority_namespace,binding=binding,method=method,**originals)
+            except AuthorityChannelUnavailable:
+                if attempt or method.endswith(("_claim_v3", "_claim_v1")):raise
+            finally:
+                await transport.close()
+        raise RuntimeError("D04 original RPC remains unresolved")
+
+    async def claim_d04_numeric_v3(self, bundle, grant, *, binding, executor_incarnation):
+        return await self._d04_numeric_v3(bundle, grant, binding=binding,
+            method="d04_numeric_claim_v3", executor_incarnation=executor_incarnation)
+
+    async def d04_series_v1(self, bundle, grant, *, binding, method, **values):
+        from ..authority_service.d04_series_contract_v1 import D04SeriesChunkBindingV1
+        _, policy = await self._d04_installation_context_v3(bundle, grant)
+        if (type(binding) is not D04SeriesChunkBindingV1 or binding.numeric.namespace != policy.namespace
+                or binding.numeric.installation_id != policy.installation_id):
+            raise ValueError("series actual installed client binding differs")
+        return await self._execute_d04_rpc_v3(bundle, grant, binding=binding, method=method,
+            transport_method="d04_series_v1", **values)
+
+    async def d10_contact_policy_v1(self, bundle, grant, *, permit, method, **values):
+        request, _, policy = await self._model_installation_context(bundle, grant)
+        from dataclasses import asdict
+        from .mtls_transport import MtlsAuthorityTransport
+        transport = MtlsAuthorityTransport({bundle.tls_profile.profile_id: bundle.tls_profile})
+        try:
+            handshake = await transport.handshake(request, protocol=AUTHORITY_V2_PROTOCOL)
+            current = await transport.installation_grant_v2(request, handshake)
+            expected, observed = asdict(grant), asdict(current)
+            expected.pop("channel_binding_sha256")
+            observed.pop("channel_binding_sha256")
+            if expected != observed:
+                raise RuntimeError("contact policy reconnected installation identity changed")
+            # Issue/revoke are sent once. A missing ACK is resolved by the
+            # protected policy operation original, never an automatic resend.
+            return await transport.d10_contact_policy_v1(request, handshake, current,
+                namespace=policy.authority_namespace, namespace_id=policy.namespace,
+                permit=permit, method=method, **values)
+        finally:
+            await transport.close()
+
+    async def read_d04_numeric_originals_v3(self, bundle, grant, *, binding):
+        return await self._d04_numeric_v3(bundle, grant, binding=binding,
+            method="d04_numeric_inspect_v3")
+
+    async def record_d04_numeric_terminal_v3(self, bundle, grant, *, binding, claim, measurement):
+        return await self._d04_numeric_v3(bundle, grant, binding=binding,
+            method="d04_numeric_terminal_v3", claim=claim, measurement=measurement)
+
+    async def read_d04_numeric_terminal_v3(self, bundle, grant, *, binding):
+        return (await self.read_d04_numeric_originals_v3(bundle, grant, binding=binding))[1]
+
     async def _model_installation_context(self, bundle, grant: InstallationGrantV2):
         """Recheck installed facts and package bytes before each passive model RPC."""
         from .authority_profile import AdminInstallationBundle
@@ -480,6 +808,20 @@ class AuthorityClient:
                     policy.authority_namespace, grant.installation_id)):
             raise RuntimeError("original intent lookup differs from installation")
         return await self._transport.model_original_intent_lookup_v1(
+            request, handshake, grant, lookup=lookup)
+
+    async def model_accounting_intent_lookup_v1(
+        self, bundle, grant: InstallationGrantV2, *,
+        lookup: C02OriginalIntentLookupV1,
+    ) -> ModelEgressIntentV1:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(lookup) is not C02OriginalIntentLookupV1
+                or (lookup.namespace, lookup.authority_id,
+                    lookup.authority_namespace, lookup.installation_id) !=
+                   (policy.namespace, grant.authority_id,
+                    policy.authority_namespace, grant.installation_id)):
+            raise RuntimeError("original intent lookup differs from installation")
+        return await self._transport.model_accounting_intent_lookup_v1(
             request, handshake, grant, lookup=lookup)
 
     async def model_result_read_v1(
@@ -597,6 +939,183 @@ class AuthorityClient:
             request, handshake, grant, namespace=policy.authority_namespace,
             read_request=read_request)
 
+    async def d04_appraisal_result_read_v3(self, bundle, grant, *, read_request):
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if read_request.namespace != policy.namespace or read_request.authority_namespace != policy.authority_namespace:
+            raise RuntimeError("D04 result namespace differs")
+        return await self._transport.d04_appraisal_result_read_v3(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def d04_appraisal_result_recover_finish_v3(self, bundle, grant, *, read_request):
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if read_request.namespace != policy.namespace or read_request.authority_namespace != policy.authority_namespace:
+            raise RuntimeError("D04 result recovery namespace differs")
+        return await self._transport.d04_appraisal_result_recover_finish_v3(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def d07_cognition_result_read_v1(self, bundle, grant, *, read_request):
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if read_request.namespace != policy.namespace or read_request.authority_namespace != policy.authority_namespace:
+            raise RuntimeError("D07 result namespace differs")
+        return await self._transport.d07_cognition_result_read_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def contact_model_result_read_v1(self, bundle, grant, *, read_request):
+        from ..authority_service.contact_model_result_contract_v1 import ContactModelResultReadRequestV1
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ContactModelResultReadRequestV1
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("contact result installed original differs")
+        return await self._transport.contact_model_result_read_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def contact_model_result_recover_finish_v1(self, bundle, grant, *, read_request):
+        from ..authority_service.contact_model_result_contract_v1 import ContactModelResultReadRequestV1
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ContactModelResultReadRequestV1
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("contact result recovery installed original differs")
+        return await self._transport.contact_model_result_recover_finish_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def d07_cognition_result_recover_finish_v1(self, bundle, grant, *, read_request):
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if read_request.namespace != policy.namespace or read_request.authority_namespace != policy.authority_namespace:
+            raise RuntimeError("D07 result recovery namespace differs")
+        return await self._transport.d07_cognition_result_recover_finish_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def natural_generation_output_select_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: NaturalGenerationOutputReadRequestV2,
+    ) -> NaturalGenerationOriginalOutputV2:
+        request, handshake, policy = await self._model_installation_context(
+            bundle, grant)
+        if (type(read_request) is not NaturalGenerationOutputReadRequestV2
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id
+                or read_request.authority_id != grant.authority_id):
+            raise RuntimeError("natural generation result differs from installation")
+        return await self._transport.natural_generation_output_select_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def natural_generation_content_read_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: NaturalGenerationContentReadRequestV2,
+    ) -> NaturalGenerationCurrentContentV2:
+        request, handshake, policy = await self._model_installation_context(
+            bundle, grant)
+        if (type(read_request) is not NaturalGenerationContentReadRequestV2
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id
+                or read_request.authority_id != grant.authority_id):
+            raise RuntimeError("natural content read differs from installation")
+        return await self._transport.natural_generation_content_read_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def natural_generation_output_recover_finish_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: NaturalGenerationOutputReadRequestV2,
+    ) -> bool:
+        request, handshake, policy = await self._model_installation_context(
+            bundle, grant)
+        if (type(read_request) is not NaturalGenerationOutputReadRequestV2
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id
+                or read_request.authority_id != grant.authority_id):
+            raise RuntimeError("natural generation result differs from installation")
+        return await self._transport.natural_generation_output_recover_finish_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def natural_review_output_select_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: NaturalReviewOutputReadRequestV2,
+    ) -> NaturalReviewOriginalOutputV2:
+        request, handshake, policy = await self._model_installation_context(
+            bundle, grant)
+        if (type(read_request) is not NaturalReviewOutputReadRequestV2
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id
+                or read_request.authority_id != grant.authority_id):
+            raise RuntimeError("natural review result differs from installation")
+        return await self._transport.natural_review_output_select_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def natural_review_output_recover_finish_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: NaturalReviewOutputReadRequestV2,
+    ) -> bool:
+        request, handshake, policy = await self._model_installation_context(
+            bundle, grant)
+        if (type(read_request) is not NaturalReviewOutputReadRequestV2
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id
+                or read_request.authority_id != grant.authority_id):
+            raise RuntimeError("natural review result differs from installation")
+        return await self._transport.natural_review_output_recover_finish_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def natural_paid_review_current_read_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: NaturalPaidReviewCurrentReadRequestV2,
+    ) -> NaturalPaidReviewCurrentReadV2:
+        request, handshake, policy = await self._model_installation_context(
+            bundle, grant)
+        if (type(read_request) is not NaturalPaidReviewCurrentReadRequestV2
+                or read_request.namespace != policy.namespace
+                or read_request.generation_content_request.authority_namespace
+                   != policy.authority_namespace
+                or read_request.generation_content_request.installation_id
+                   != grant.installation_id
+                or read_request.generation_content_request.authority_id
+                   != grant.authority_id):
+            raise RuntimeError("natural paid review differs from installation")
+        return await self._transport.natural_paid_review_current_read_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def context_reply_result_read_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: ContextReplyResultReadRequestV1,
+    ) -> ContextReplyPaidResultReadV2:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ContextReplyResultReadRequestV1
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id
+                or read_request.authority_id != grant.authority_id):
+            raise RuntimeError("context reply result read differs from installation")
+        return await self._transport.context_reply_result_read_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
+    async def context_reply_result_recover_finish_v2(
+        self, bundle, grant: InstallationGrantV2, *,
+        read_request: ContextReplyResultReadRequestV1,
+    ) -> bool:
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ContextReplyResultReadRequestV1
+                or read_request.namespace != policy.namespace
+                or read_request.authority_namespace != policy.authority_namespace
+                or read_request.installation_id != grant.installation_id
+                or read_request.authority_id != grant.authority_id):
+            raise RuntimeError("context reply result read differs from installation")
+        return await self._transport.context_reply_result_recover_finish_v2(
+            request, handshake, grant, namespace=policy.authority_namespace,
+            read_request=read_request)
+
     async def self_identity_current_v1(
         self, bundle, grant: InstallationGrantV2, *,
         current_request: SelfIdentityCurrentRequestV1,
@@ -613,9 +1132,25 @@ class AuthorityClient:
                     grant.manifest_digest, grant.subject,
                     grant.administrator_holder)):
             raise RuntimeError("self identity read differs from installed namespace")
-        return await self._transport.self_identity_current_v1(
-            request, handshake, grant, namespace=policy.authority_namespace,
-            current_request=current_request)
+        # A passive current read may follow minutes of installed CPU work. The
+        # original business channel can have closed during that interval; use a
+        # new authenticated channel without replacing unrelated live ports.
+        from dataclasses import asdict
+        from .mtls_transport import MtlsAuthorityTransport
+        transport = MtlsAuthorityTransport({bundle.tls_profile.profile_id: bundle.tls_profile})
+        try:
+            current_handshake = await transport.handshake(request, protocol=AUTHORITY_V2_PROTOCOL)
+            current_grant = await transport.installation_grant_v2(request, current_handshake)
+            original_identity, current_identity = asdict(grant), asdict(current_grant)
+            original_identity.pop("channel_binding_sha256")
+            current_identity.pop("channel_binding_sha256")
+            if original_identity != current_identity:
+                raise RuntimeError("self identity reconnected installation identity changed")
+            return await transport.self_identity_current_v1(
+                request, current_handshake, current_grant, namespace=policy.authority_namespace,
+                current_request=current_request)
+        finally:
+            await transport.close()
 
     async def worker_result_read_fact_v1(
         self, bundle, grant: InstallationGrantV2, *,
@@ -665,6 +1200,10 @@ class AuthorityClient:
         return await self._transport.worker_result_read_fact_v2(
             request, handshake, grant, namespace=policy.authority_namespace,
             fact_request=fact_request)
+
+    async def internal_accounting_v1(self,bundle,grant,*,accounting_request,action,accounting_grant=None):
+        return await self._execute_c04_original_rpc_v3(bundle,grant,method="internal_accounting_v1",
+            accounting_request=accounting_request,action=action,accounting_grant=accounting_grant)
 
     async def accounting_begin_v1(
         self, bundle, grant: InstallationGrantV2, *,

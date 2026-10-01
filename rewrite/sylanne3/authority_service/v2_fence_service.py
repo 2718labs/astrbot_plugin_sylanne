@@ -19,7 +19,7 @@ from ..runtime_journal import RecoveryConstraintFootprint
 from .contract import AuthorityUnavailable, CONTENT_OPERATIONS, identifier
 from .core import AuthorityServiceCore
 from .local_bridge import constraint_keys_from_footprint
-from .v2_contract import FencePermitV2
+from .v2_contract import FencePermitV2, FenceNeverBegunReceiptV2
 from .v2_deletion_guard import AuthorityV2DeletionGuard
 from .v2_execution_journal import AuthorityV2ExecutionJournal
 from .v2_fence_store import AuthorityV2FenceStore
@@ -30,7 +30,7 @@ class AuthorityV2FenceService:
                  fences: AuthorityV2FenceStore,
                  deletion: AuthorityV2DeletionGuard,
                  execution: AuthorityV2ExecutionJournal,
-                 namespace: str):
+                 namespace: str, v2_dispatch_verifier=None):
         identifier(namespace, "namespace")
         if (type(core) is not AuthorityServiceCore
                 or type(fences) is not AuthorityV2FenceStore
@@ -42,6 +42,10 @@ class AuthorityV2FenceService:
         self.core, self.fences = core, fences
         self.deletion, self.execution = deletion, execution
         self.namespace = namespace
+        if v2_dispatch_verifier is not None and not callable(v2_dispatch_verifier):
+            raise AuthorityUnavailable("installed V2 dispatch verifier is invalid")
+        self._v2_dispatch_verifier = (
+            v2_dispatch_verifier or core._dispatch_verifier)
         # Pre-seal Core still verifies journals while holding its DB lock.
         # Reject here before this service can take journal guards and invert it.
         with core._tx() as db:
@@ -55,7 +59,8 @@ class AuthorityV2FenceService:
 
     def _current_locked(self, db, deletion_head, execution_head, *, holder: str | None = None,
                         generation: int | None = None,
-                        require_clear: bool = True) -> RestoreAnchor:
+                        require_clear: bool = True,
+                        require_no_pending: bool = True) -> RestoreAnchor:
         self._require_mode(db)
         self.fences._check_schema(db)
         row = self.core._row(db, self.namespace)
@@ -68,18 +73,24 @@ class AuthorityV2FenceService:
                 or row[10:13] != (execution_head.journal_id, execution_head.seq,
                                    execution_head.digest)):
             raise AuthorityUnavailable("Authority is behind or differs from an independent journal")
-        if db.execute("SELECT 1 FROM authority_v2_fences WHERE namespace=? AND pending IS NOT NULL LIMIT 1",
-                      (self.namespace,)).fetchone():
+        if require_clear and self.deletion.has_deletion_history(self.namespace):
+            self.core.require_current_content_ready_locked(db, namespace=self.namespace)
+        if require_no_pending and db.execute(
+                "SELECT 1 FROM authority_v2_fences WHERE namespace=? "
+                "AND pending IS NOT NULL LIMIT 1",
+                (self.namespace,)).fetchone():
             raise AuthorityUnavailable("namespace has a pending v2 mutation")
         return self.core._anchor(db, self.namespace, row)
 
     @contextmanager
-    def _frozen(self):
+    def _frozen(self, *, first_graph_preflight=None):
         with self.deletion.freeze_writes():
             with self.execution.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 deletion_history = self.deletion.has_deletion_history(self.namespace)
                 execution_head = self.execution.verified_head()
+                if first_graph_preflight is not None:
+                    first_graph_preflight()
                 with self.core._tx() as db:
                     self.deletion.require_target_schema_locked(
                         db, authority_id=self.core._id(db), namespace=self.namespace,
@@ -111,6 +122,11 @@ class AuthorityV2FenceService:
             if not db.execute(
                     "SELECT 1 FROM authority_namespaces WHERE namespace=?",
                     (self.namespace,)).fetchone():
+                if deletion_head.seq or execution_head.seq or deletion_history:
+                    return NamespaceBootstrapV2(
+                        authority_id, namespace_id, self.namespace, None, 0, "unbound",
+                        NamespaceRuntimeState.QUARANTINED, None,
+                        ("orphaned_journal_history",))
                 return NamespaceBootstrapV2(
                     authority_id, namespace_id, self.namespace, None, 0, "unbound",
                     NamespaceRuntimeState.UNBOUND, None, ("not_registered",))
@@ -130,7 +146,10 @@ class AuthorityV2FenceService:
             if row[9] != "clear":
                 blockers.append("deletion_barrier")
             if deletion_history:
-                blockers.append("deletion_history")
+                try:
+                    self.core.require_current_content_ready_locked(db, namespace=self.namespace)
+                except AuthorityUnavailable:
+                    blockers.append("deletion_history")
             if db.execute(
                     "SELECT 1 FROM authority_v2_fences WHERE namespace=? "
                     "AND pending IS NOT NULL LIMIT 1",
@@ -162,7 +181,9 @@ class AuthorityV2FenceService:
         request = json.dumps(
             (self.namespace, namespace_id.bot_id, namespace_id.persona_id, subject, holder),
             separators=(",", ":"), ensure_ascii=True)
-        with self._frozen() as (db, deletion_head, execution_head, deletion_history):
+        from .installer_genesis_v1 import prepare_installer_genesis_consumption_v1, consume_installer_genesis_v1_locked
+        preflight = []
+        with self._frozen(first_graph_preflight=lambda: preflight.append(prepare_installer_genesis_consumption_v1(self))) as (db, deletion_head, execution_head, deletion_history):
             self._require_mode(db)
             self.fences._check_schema(db)
             deletion_kind, _, deletion_meta = self.deletion._check_schema()
@@ -186,9 +207,15 @@ class AuthorityV2FenceService:
             if saved is None:
                 if (deletion_head.seq != 0 or execution_head.seq != 0 or deletion_history):
                     raise AuthorityUnavailable("namespace genesis requires empty independent journals")
-                if existing or db.execute(
+                installed_first = False
+                if existing:
+                    installed_first = consume_installer_genesis_v1_locked(self, db,
+                        namespace_id=namespace_id, subject=subject, holder=holder,
+                        request_id=request_id, request_json=request,
+                        deletion_head=deletion_head, execution_head=execution_head, preflight=preflight[0])
+                if not installed_first and (existing or db.execute(
                         "SELECT 1 FROM authority_events WHERE namespace=? LIMIT 1",
-                        (self.namespace,)).fetchone():
+                        (self.namespace,)).fetchone()):
                     raise AuthorityUnavailable("namespace already has Authority history")
                 if db.execute(
                         "SELECT 1 FROM authority_v2_fences WHERE namespace=? LIMIT 1",
@@ -212,16 +239,21 @@ class AuthorityV2FenceService:
                         "AND execution_journal_id=? LIMIT 1",
                         (self.namespace, execution_head.journal_id)).fetchone():
                     raise AuthorityUnavailable("execution journal already belongs to another namespace")
-                db.execute(
-                    "INSERT INTO authority_namespaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (self.namespace, holder, 1, "active", None, None, 0,
-                     deletion_head.journal_id, 0, deletion_head.digest, "clear",
-                     execution_head.journal_id, 0, execution_head.digest,
-                     self.core._new_nonce()))
-                self.core._event(db, self.namespace, "v2_namespace_genesis", 1, request)
+                if not installed_first:
+                    db.execute(
+                        "INSERT INTO authority_namespaces VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (self.namespace, holder, 1, "active", None, None, 0,
+                         deletion_head.journal_id, 0, deletion_head.digest, "clear",
+                         execution_head.journal_id, 0, execution_head.digest,
+                         self.core._new_nonce()))
+                    self.core._event(db, self.namespace, "v2_namespace_genesis", 1, request)
                 db.execute("INSERT INTO authority_meta(key,value) VALUES(?,?)", (request_key, request))
             elif not existing or deletion_history:
                 raise AuthorityUnavailable("namespace genesis no longer has a clear activation")
+            else:
+                consume_installer_genesis_v1_locked(self, db, namespace_id=namespace_id, subject=subject, holder=holder,
+                    request_id=request_id, request_json=request, deletion_head=deletion_head, execution_head=execution_head,
+                    preflight=preflight[0])
 
             anchor = self._current_locked(
                 db, deletion_head, execution_head, holder=holder, generation=1)
@@ -239,6 +271,8 @@ class AuthorityV2FenceService:
         identifier(subject, "subject")
         identifier(holder, "holder")
         identifier(operation_id, "operation_id")
+        if operation in {"migrate", "recovery"}:
+            raise AuthorityUnavailable("migration permits require the dedicated management service")
         if operation in {"model_egress", "accounting"}:
             raise AuthorityUnavailable(
                 "special fence requires atomic typed service preparation")
@@ -253,7 +287,7 @@ class AuthorityV2FenceService:
                 raise AuthorityUnavailable("dispatch requires exact service-verified footprint")
             keys = constraint_keys_from_footprint(footprint)
             try:
-                verified = self.core._dispatch_verifier(self.namespace, effect_id, keys)
+                verified = self._v2_dispatch_verifier(self.namespace, effect_id, keys)
             except Exception as exc:
                 raise AuthorityUnavailable("D08 dispatch verification unavailable") from exc
             if verified is not True:
@@ -268,7 +302,7 @@ class AuthorityV2FenceService:
             if anchor != expected_anchor:
                 raise AuthorityUnavailable("full v2 anchor changed before fence issuance")
             if deletion_history:
-                raise AuthorityUnavailable("historical deletion closure blocks content fence")
+                self.core.require_current_content_ready_locked(db, namespace=self.namespace)
             if operation == "dispatch":
                 if db.execute("SELECT 1 FROM authority_effects WHERE namespace=? AND effect_id=?",
                               (self.namespace, effect_id)).fetchone():
@@ -279,6 +313,35 @@ class AuthorityV2FenceService:
                 effect_id=effect_id, command_digest=command_digest,
                 footprint_digest=footprint_digest)
 
+    def reject_unbegun_content_fence_v2(
+        self, *, credential, subject: str, installation_id: str,
+        holder: str, generation: int, operation_id: str,
+        expected_anchor: RestoreAnchor, request_id: str, request_digest: str,
+    ) -> FenceNeverBegunReceiptV2:
+        """Close one never-issued write operation under the original anchor."""
+        identifier(subject, "subject")
+        identifier(installation_id, "installation_id")
+        identifier(holder, "holder")
+        identifier(operation_id, "operation_id")
+        identifier(request_id, "request_id")
+        if (type(generation) is not int or generation < 0
+                or type(expected_anchor) is not RestoreAnchor
+                or expected_anchor.namespace != self.namespace
+                or expected_anchor.activation_generation != generation):
+            raise AuthorityUnavailable("never-begun fence activation or anchor differs")
+        self.core._require(credential, "write", self.namespace, holder)
+        with self._frozen() as (db, deletion_head, execution_head, deletion_history):
+            anchor = self._current_locked(
+                db, deletion_head, execution_head, holder=holder,
+                generation=generation, require_no_pending=False)
+            if anchor != expected_anchor or deletion_history:
+                raise AuthorityUnavailable("never-begun fence anchor or deletion history differs")
+            return self.fences.reject_unbegun_content_fence_locked(
+                db, subject=subject, installation_id=installation_id,
+                holder=holder, generation=generation,
+                operation_id=operation_id, current_anchor=anchor,
+                request_id=request_id, request_digest=request_digest)
+
     def _require_permit(self, *, credential, subject: str,
                         permit: FencePermitV2) -> None:
         """Authenticate before taking journal guards; the host supplies subject."""
@@ -286,6 +349,8 @@ class AuthorityV2FenceService:
         if (type(permit) is not FencePermitV2
                 or permit.namespace != self.namespace or permit.subject != subject):
             raise AuthorityUnavailable("v2 fence subject or namespace mismatch")
+        if permit.operation in {"migrate", "recovery"}:
+            raise AuthorityUnavailable("migration permit is not a content fence")
         if permit.operation == "accounting":
             raise AuthorityUnavailable("accounting requires its dedicated service")
         self.core._require(credential, permit.operation, self.namespace, permit.holder)
@@ -299,7 +364,7 @@ class AuthorityV2FenceService:
                 db, deletion_head, execution_head, holder=permit.holder,
                 generation=permit.generation)
             if deletion_history:
-                raise AuthorityUnavailable("historical deletion closure blocks content fence")
+                self.core.require_current_content_ready_locked(db, namespace=self.namespace)
             if anchor != permit.pinned_anchor:
                 raise AuthorityUnavailable("v2 fence pinned anchor changed")
             return self.fences.validate_fence_locked(
@@ -318,7 +383,7 @@ class AuthorityV2FenceService:
                 db, deletion_head, execution_head, holder=permit.holder,
                 generation=permit.generation)
             if deletion_history:
-                raise AuthorityUnavailable("historical deletion closure blocks content fence")
+                self.core.require_current_content_ready_locked(db, namespace=self.namespace)
             self.fences.finish_fence_locked(
                 db, permit, subject=subject, current_anchor=anchor,
                 request_id=request_id, request_digest=request_digest)

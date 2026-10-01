@@ -8,7 +8,7 @@ from sylanne3.domains.d04 import AffectAxis, AffectScheme, MoodField
 from sylanne3.domains.d04.affect import RecollectionExperience
 from sylanne3.domains.d06 import (
     CandidateItem, CandidateSet, D06DomainAdapter, RecollectionContext,
-    RecollectionProjectionUnavailable, SelectionTicket,
+    RecollectionProjectionUnavailable, SelectionTicket, source_correction_head_key,
     inspect_recollection_projection_snapshot,
 )
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, GraphVersion, NamespaceEpoch, Owner
@@ -24,6 +24,11 @@ EXPERIENCE = AtomKey(Owner("activity", "bot", "persona", "activity-1"),
                      "d04.recollection_experience.v1", "experience-1")
 PROJECTION = AtomKey(Owner("activity", "bot", "persona", "activity-1"),
                      "d06.recollection_projection.v1", "projection-1")
+CHOICE = AtomKey(Owner("activity", "bot", "persona", "activity-1"),
+                 "d07.selection_ticket.v1", "ticket-1")
+INTERPRETATION = AtomKey(Owner("activity", "bot", "persona", "activity-1"),
+                         "d07.current_interpretation.v1", "interpretation-1")
+CORRECTION_HEAD = source_correction_head_key(NAMESPACE, "source-1")
 SCHEME = AffectScheme("d04.affect.scheme.v1", "scheme-1", "operator-1",
                       "parameter-1", "coupling-1",
                       (AffectAxis("care", "normalized", "care"),), ())
@@ -52,7 +57,7 @@ def fixture(*, tone=(-0.2, 0.1), mood_revision=1):
     ), "complete")
     ticket = SelectionTicket("ticket-1", "activity-1", "set-1", ("candidate-1",), 1)
     recollection = adapter.prepare_recollection(
-        ticket, candidates, RecollectionContext(("interpretation-1",),
+        ticket, candidates, RecollectionContext((INTERPRETATION.token,),
                                                 (EXPERIENCE.token,), ()),
     )
     recollection_write = adapter.recollection_write(
@@ -86,13 +91,24 @@ def fixture(*, tone=(-0.2, 0.1), mood_revision=1):
         GraphAtom(recollection_write.key, 1, recollection_write.value),
         GraphAtom(EXPERIENCE, 1, json_value(asdict(experience))),
         GraphAtom(PROJECTION, 1, projection),
+        GraphAtom(CHOICE, 1, {
+            "ticket_id": "ticket-1", "activity_id": "activity-1",
+            "candidate_set_id": "set-1", "selected_candidate_ids": ["candidate-1"],
+            "focus_epoch": 1,
+        }),
+        GraphAtom(INTERPRETATION, 1, {
+            "interpretation_id": "interpretation-1", "activity_id": "activity-1",
+            "current": True, "source_refs": [SOURCE.token],
+        }),
+        GraphAtom(CORRECTION_HEAD, 0, {}, False),
     )
     epoch = NamespaceEpoch("bot", "persona", 4)
     snapshot = GraphSnapshot(atoms, (epoch,))
     receipt = CommitReceipt(
         "committed", "operation-1", "0" * 64, "activity-1", None, 1,
         (), (GraphVersion(recollection_write.key, 1),
-             GraphVersion(EXPERIENCE, 1), GraphVersion(PROJECTION, 1)),
+             GraphVersion(EXPERIENCE, 1), GraphVersion(PROJECTION, 1),
+             GraphVersion(CHOICE, 1), GraphVersion(INTERPRETATION, 1)),
         (epoch,), (recollection_write.key.token,), ("outbox-1",),
     )
     return snapshot, receipt
@@ -126,7 +142,9 @@ def test_current_projection_exposes_subjective_feeling_without_source_literal():
 
 def test_old_receipt_and_revoked_access_cannot_read_projection():
     snapshot, receipt = fixture()
-    old = replace(receipt, write_versions=receipt.write_versions[:-1])
+    old = replace(receipt, write_versions=tuple(
+        version for version in receipt.write_versions if version.key != PROJECTION
+    ))
     with pytest.raises(RecollectionProjectionUnavailable, match="receipt does not own"):
         inspect(snapshot, old)
     with pytest.raises(RecollectionProjectionUnavailable, match="access_denied"):
@@ -171,3 +189,60 @@ def test_missing_or_revoked_source_ancestor_is_unavailable():
                                     GraphAtom(parent_access_key, 1, parent_access)))
     with pytest.raises(RecollectionProjectionUnavailable, match="access_denied"):
         inspect(revoked, receipt)
+
+
+def test_correction_requires_rebuild_even_when_original_source_remains_accessible():
+    snapshot, receipt = fixture()
+    without_absence_proof = replace(snapshot, atoms=tuple(
+        atom for atom in snapshot.atoms if atom.key != CORRECTION_HEAD
+    ))
+    with pytest.raises(RecollectionProjectionUnavailable, match="absence proof is missing"):
+        inspect(without_absence_proof, receipt)
+    corrected = replace(snapshot, atoms=tuple(
+        replace(atom, revision=1, value={"state": "resolved_reevaluation"}, valid=True)
+        if atom.key == CORRECTION_HEAD else atom for atom in snapshot.atoms
+    ))
+    with pytest.raises(RecollectionProjectionUnavailable, match="rebuild recollection"):
+        inspect(corrected, receipt)
+
+
+def test_ancestor_correction_invalidates_current_child_projection():
+    snapshot, receipt = fixture()
+    parent = SourceRecord("parent-1", "older private source", "alice",
+                          "observed", "confirmed", 0.5, 1.0, "family-1",
+                          ("owner",), ("context",))
+    parent_key = source_key("bot", "persona", parent.source_id)
+    parent_access = access_key("bot", "persona", parent.source_id)
+    parent_head = source_correction_head_key(NAMESPACE, parent.source_id)
+    child = changed(snapshot, SOURCE, parent_source_ids=[parent.source_id])
+    parent_atoms = (
+        GraphAtom(parent_key, 1, parent.to_dict()),
+        GraphAtom(parent_access, 1, {"source_id": parent.source_id,
+                                   "audiences": ["owner"], "purposes": ["context"],
+                                   "status": "active", "recorded_at": 2.0}),
+    )
+    without_head = replace(child, atoms=(*child.atoms, *parent_atoms))
+    with pytest.raises(RecollectionProjectionUnavailable, match="absence proof is missing"):
+        inspect(without_head, receipt)
+
+    current = replace(without_head, atoms=(*without_head.atoms,
+                                          GraphAtom(parent_head, 0, {}, False)))
+    assert inspect(current, receipt).source_ref == SOURCE.token
+    corrected = replace(current, atoms=tuple(
+        replace(atom, revision=1, value={"state": "pending_reevaluation"}, valid=True)
+        if atom.key == parent_head else atom for atom in current.atoms
+    ))
+    with pytest.raises(RecollectionProjectionUnavailable, match="rebuild recollection"):
+        inspect(corrected, receipt)
+
+
+def test_selection_and_interpretation_require_same_c04_commit_receipt():
+    snapshot, receipt = fixture()
+    for ref in (CHOICE, INTERPRETATION):
+        old_receipt = replace(receipt, write_versions=tuple(
+            version for version in receipt.write_versions if version.key != ref
+        ))
+        with pytest.raises(RecollectionProjectionUnavailable, match="D07 committed"):
+            inspect(snapshot, old_receipt)
+    with pytest.raises(RecollectionProjectionUnavailable, match="D07 committed interpretation"):
+        inspect(changed(snapshot, INTERPRETATION, source_refs=["other-source"]), receipt)

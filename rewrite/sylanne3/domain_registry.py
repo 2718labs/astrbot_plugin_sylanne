@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .domains.d04 import AffectScheme
 
 
-REQUIRED_DOMAINS = tuple(f"d{number:02d}" for number in range(1, 13))
+REQUIRED_DOMAINS = tuple(f"d{number:02d}" for number in range(1, 14))
 
 _PROVIDERS = {
     "d01": (".domains.d01", "PersonaDomain", "d01.proposal.v1"),
@@ -26,6 +26,7 @@ _PROVIDERS = {
     "d10": (".domains.d10", "LifeDomain", "d10.proposal.v1"),
     "d11": (".runtime.d11_types", "D11RuntimeProvider", "d11.runtime.proposal.v1"),
     "d12": (".domains.d12", "D12DomainProvider", "d12.proposal.v1"),
+    "d13": (".domains.d13", "D13ShortContextProvider", "d13.proposal.v1"),
 }
 
 

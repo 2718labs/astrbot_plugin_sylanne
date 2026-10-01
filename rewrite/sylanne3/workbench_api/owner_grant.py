@@ -42,6 +42,7 @@ class CurrentOwnerGrant:
     grant_revision: int
     revocation_epoch: int
     grant: CoordinatorGrant
+    grant_digest: str | None = None
 
     def __post_init__(self) -> None:
         if any(not isinstance(value, str) or not value for value in (
@@ -72,7 +73,8 @@ class CurrentOwnerGrantPort(Protocol):
     def resolve_current_owner(self, *, actor_id: str, scope: str,
                               purpose: str, audience: str,
                               owner_session_token: str | None = None,
-                              owner_session_request: OwnerSessionLoginRequestV1 | None = None
+                              owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+                              domains: tuple[str, ...] | None = None
                               ) -> CurrentOwnerGrant | None: ...
 
 
@@ -122,7 +124,8 @@ class GraphCurrentOwnerGrantPort:
     def resolve_current_owner(self, *, actor_id: str, scope: str,
                               purpose: str, audience: str,
                               owner_session_token: str | None = None,
-                              owner_session_request: OwnerSessionLoginRequestV1 | None = None
+                              owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+                              domains: tuple[str, ...] | None = None
                               ) -> CurrentOwnerGrant | None:
         leases = self._request_leases.get()
         if leases is None:
@@ -132,10 +135,18 @@ class GraphCurrentOwnerGrantPort:
                 or type(owner_session_request) is not OwnerSessionLoginRequestV1):
             return None
         try:
+            selected_domains = self._domains if domains is None else domains
+            if (type(selected_domains) is not tuple or not selected_domains
+                    or not set(selected_domains).issubset(self._domains)):
+                return None
+            # This is only an observed generation. W01 still reauthenticates
+            # its current Authority fence, signed session and Owner grant.
+            with self._coordinator._GraphCoordinator__store._lock:
+                generation = self._coordinator._v2_graph_stamp(self._namespace)[0].requirements.activation_generation
             authority, lease, binding = self._coordinator.grant_current_owner(
                 self._bootstrap, actor=actor_id, namespace=self._namespace,
-                domains=self._domains, purpose=purpose, audience=audience,
-                activation_generation=self._activation_generation,
+                domains=selected_domains, purpose=purpose, audience=audience,
+                activation_generation=generation,
                 owner_session_token=owner_session_token,
                 owner_session_request=owner_session_request,
             )
@@ -143,14 +154,14 @@ class GraphCurrentOwnerGrantPort:
             return None
         leases.append(lease)
         if (binding.actor != actor_id or binding.namespace != self._namespace
-                or binding.scope != "bot/persona" or binding.purpose != purpose
+                or binding.scope != self._scope or binding.purpose != purpose
                 or binding.audience != audience):
             return None
         return CurrentOwnerGrant(
             binding.grant_id, binding.issuer_ref, actor_id, self._scope,
             self._namespace, binding.capabilities, binding.purposes,
             binding.audiences, binding.grant_revision, binding.revocation_epoch,
-            CoordinatorGrant(self._scope, authority, lease),
+            CoordinatorGrant(self._scope, authority, lease), binding.grant_digest,
         )
 
 
@@ -170,10 +181,24 @@ class DurableOwnerGrantResolver:
 
     def resolve(self, *, session: AuthenticatedSession, scope: str,
                 purpose: str, audience: str) -> CoordinatorGrant | None:
+        return self._resolve(session=session, scope=scope, purpose=purpose,
+                             audience=audience, domains=None)
+
+    def resolve_for_domains(self, *, session: AuthenticatedSession, scope: str,
+                            purpose: str, audience: str,
+                            domains: tuple[str, ...]) -> CoordinatorGrant | None:
+        return self._resolve(session=session, scope=scope, purpose=purpose,
+                             audience=audience, domains=domains)
+
+    def _resolve(self, *, session: AuthenticatedSession, scope: str,
+                 purpose: str, audience: str,
+                 domains: tuple[str, ...] | None) -> CoordinatorGrant | None:
         if not isinstance(session, AuthenticatedSession) or not session.allows(
                 scope, "workbench.read", purpose, audience):
             return None
         if self._port is None:
+            return None
+        if domains is not None and not isinstance(self._port, GraphCurrentOwnerGrantPort):
             return None
         session_proof = {}
         if isinstance(self._port, GraphCurrentOwnerGrantPort):
@@ -181,6 +206,8 @@ class DurableOwnerGrantResolver:
                 "owner_session_token": session.owner_session_token,
                 "owner_session_request": session.owner_session_request,
             }
+            if domains is not None:
+                session_proof["domains"] = domains
         current = self._port.resolve_current_owner(
             actor_id=session.actor_id, scope=scope, purpose=purpose,
             audience=audience, **session_proof)
@@ -192,13 +219,17 @@ class DurableOwnerGrantResolver:
                 or grant.scope != scope or authority.actor != session.actor_id
                 or authority.issuer_domain != "d12"
                 or authority.namespace != current.namespace
+                or scope != (f"{current.namespace.bot_id}/"
+                             f"{current.namespace.persona_id}")
                 or "workbench.read" not in current.capabilities
                 or purpose not in current.purposes
                 or audience not in current.audiences
                 or authority.purpose != purpose
                 or audience not in authority.audience):
             return None
-        return grant
+        return CoordinatorGrant(
+            grant.scope, grant.authority, grant.lease, current.capabilities,
+            current.grant_id, current.grant_revision, current.grant_digest)
 
 
 __all__ = ("CurrentOwnerGrant", "CurrentOwnerGrantPort",

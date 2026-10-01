@@ -22,10 +22,12 @@ def _load_verifier():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module.verify_installed_package
+    return module
 
 
-verify_installed_package = _load_verifier()
+_VERIFIER = _load_verifier()
+verify_installed_package = _VERIFIER.verify_installed_package
+verify_backend_candidate_qualification = _VERIFIER.verify_backend_candidate_qualification
 
 
 @pytest.fixture
@@ -152,6 +154,59 @@ def test_rejects_tampered_native_file(installed_dev_probe: tuple[Path, str]) -> 
     assert not result.verified
     assert result.reason == "file_mismatch"
     assert result.failed_path == native_path
+
+
+def test_candidate_mode_requires_backend_scope_and_qualification_binding(
+    installed_dev_probe: tuple[Path, str],
+) -> None:
+    root, _ = installed_dev_probe
+    manifest_path = root / "release-manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest.update({
+        "build_mode": "backend-alpha1-candidate",
+        "candidate_scope": "backend-only",
+        "package_version": "3.0.0-dev.1",
+        "native_math": {
+            "contract": "abi2.fixed-block-interval.v1",
+            "capability_flags": 1,
+        },
+    })
+    required = {
+        "rewrite/sylanne3/domain_registry.py",
+        "rewrite/sylanne3/host/legacy_data_preflight.py",
+        "rewrite/sylanne3/native_runtime/__init__.py",
+        "rewrite/sylanne3/workbench_api/__init__.py",
+        *(f"rewrite/sylanne3/domains/d{number:02d}/__init__.py"
+          for number in range(1, 14)),
+        "resources/catalogue/current.json",
+        "resources/catalogue/d01-onboarding-presets.json",
+        "resources/catalogue/d03-neutral-context-scheme.json",
+        "resources/catalogue/d04-affect-scheme.json",
+        "resources/catalogue/d04-fixed-block-operator.json",
+        "resources/catalogue/d04-tanh-readout.v1.json",
+        "resources/migrations/README.md",
+        "resources/migrations/v1.json",
+    }
+    for relative in sorted(required - {row["path"] for row in manifest["files"]}):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"candidate fixture\n")
+        content = path.read_bytes()
+        manifest["files"].append({
+            "path": relative, "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        })
+    manifest["files"].sort(key=lambda row: row["path"])
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+    verified = verify_installed_package(root, digest)
+    assert verified.verified
+    assert verified.build_mode == "backend-alpha1-candidate"
+    assert verified.candidate_scope == "backend-only"
+    qualification = verify_backend_candidate_qualification(root, digest)
+    assert not qualification.qualified
+    assert qualification.reason == "qualification_binding_invalid"
 
 
 @pytest.mark.parametrize("relative", (

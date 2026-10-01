@@ -63,7 +63,7 @@ class DispatchGraphClaimValueV1:
             value = getattr(self, name)
             if type(value) is not str or _SHA256.fullmatch(value) is None:
                 raise ValueError(f"dispatch claim {name} is invalid")
-        for name, minimum in (("p2_fence_epoch", 1), ("p2_revision", 3),
+        for name, minimum in (("p2_fence_epoch", 1), ("p2_revision", 2),
                               ("p2_execution_seq", 2)):
             value = getattr(self, name)
             if type(value) is not int or value < minimum:

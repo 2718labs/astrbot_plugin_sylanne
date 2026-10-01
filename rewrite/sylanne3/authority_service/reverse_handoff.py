@@ -181,6 +181,24 @@ class ReverseGraphClaimClient:
             "owner_witness": to_wire(witness),
             "authority_snapshot": to_wire(snapshot),
         }
+        response = self._exchange(message)
+        try:
+            value = json.loads(response)
+            if type(value) is not dict or set(value) != {"receipt"}:
+                raise ValueError("reverse graph claim response fields differ")
+            receipt = from_wire(value["receipt"])
+            if (type(receipt) is not DispatchGraphClaimReceiptV1
+                    or to_wire(receipt) != value["receipt"]
+                    or receipt.context_digest != canonical_digest(context)
+                    or receipt.graph_namespace != binding.graph_namespace
+                    or receipt.graph_incarnation != binding.graph_incarnation):
+                raise ValueError("reverse graph claim receipt identity differs")
+            return receipt
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("reverse graph claim response is invalid") from exc
+
+    def _exchange(self, message):
+        profile = self.profile
         data = json.dumps(message, sort_keys=True, separators=(",", ":"),
                           allow_nan=False).encode("utf-8") + b"\n"
         if len(data) > profile.max_message_bytes:
@@ -207,20 +225,23 @@ class ReverseGraphClaimClient:
                         raise RuntimeError("reverse graph claim response exceeds limit")
         except (OSError, ssl.SSLError) as exc:
             raise RuntimeError("reverse graph claim transport unavailable") from exc
-        try:
-            value = json.loads(response)
-            if type(value) is not dict or set(value) != {"receipt"}:
-                raise ValueError("reverse graph claim response fields differ")
-            receipt = from_wire(value["receipt"])
-            if (type(receipt) is not DispatchGraphClaimReceiptV1
-                    or to_wire(receipt) != value["receipt"]
-                    or receipt.context_digest != canonical_digest(context)
-                    or receipt.graph_namespace != binding.graph_namespace
-                    or receipt.graph_incarnation != binding.graph_incarnation):
-                raise ValueError("reverse graph claim receipt identity differs")
-            return receipt
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("reverse graph claim response is invalid") from exc
+        return response
+
+    def commit_first_owner_v1(self, message):
+        from .first_owner_reverse_v1 import SCHEMA
+        from .v2_owner_contract import from_wire as owner_from_wire, to_wire as owner_to_wire, OwnerGraphCommitProofV1
+        if (type(message) is not dict or message.get('schema') != SCHEMA
+                or message.get('namespace') != self.profile.namespace
+                or message.get('profile_id') != self.profile.profile_id
+                or message.get('installation_id') != self.profile.installation_id):
+            raise RuntimeError('first Owner fixed reverse scope differs')
+        value = json.loads(self._exchange(message))
+        if type(value) is not dict or set(value) != {'proof'}:
+            raise RuntimeError('first Owner reverse response fields differ')
+        proof = owner_from_wire(value['proof'])
+        if type(proof) is not OwnerGraphCommitProofV1 or owner_to_wire(proof) != value['proof']:
+            raise RuntimeError('first Owner reverse proof is not canonical')
+        return proof
 
 
 __all__ = (

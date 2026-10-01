@@ -35,6 +35,7 @@ HANDSHAKE = SimpleNamespace(
     {"state": "settled"},
     {"effect_seq": 1},
     {"observation_id": "observation-a"},
+    {"observation_outcome": "accepted"},
     {"channel_binding_sha256": "b" * 64},
     {"content": "secret"},
 ])

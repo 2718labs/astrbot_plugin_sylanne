@@ -8,6 +8,7 @@ from sylanne3.domains.d10 import (
     ContactPolicy,
     ContactPolicyReadSet,
     ContactClaim,
+    ContactContinuation,
     LifeDomain,
     LifeProject,
     ProactiveOpportunity,
@@ -188,6 +189,43 @@ class LifeDomainTests(unittest.TestCase):
         check = self.domain.contact_policy_check(self.policy, second, (unknown,), now=2.0)
         self.assertEqual(check.result, "fail")
         self.assertIn("no_response_gate", check.reasons)
+
+    def test_original_contact_continuation_uses_existing_quota_but_cannot_retry_unknown(self):
+        opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone", "user:one",
+                                           "private", "ordinary", 0.0, 10.0)
+        original = self.domain.claim_contact_window(
+            self.policy, opportunity, "contact:one", "communication:one",
+            ("effect:first", "effect:second"), (), now=1.0,
+        )
+        unknown = self.domain.observe_segment(original, "effect:first", "unknown")
+        continuation = ContactContinuation("contact:one", "communication:one", "effect:second")
+        held = self.domain.contact_policy_check(self.policy, opportunity, (unknown,),
+                                                 now=2.0, continuation=continuation)
+        self.assertEqual(held.result, "fail")
+        self.assertIn("prior_segment_unknown", held.reasons)
+        self.assertFalse(held.dispatch_authorized)
+        fresh = self.domain.contact_policy_check(self.policy, opportunity, (unknown,), now=2.0)
+        self.assertIn("no_response_gate", fresh.reasons)
+        self.assertIn("quota", fresh.reasons)
+
+        retry_unknown = self.domain.contact_policy_check(
+            self.policy, opportunity, (unknown,), now=2.0,
+            continuation=ContactContinuation("contact:one", "communication:one", "effect:first"),
+        )
+        self.assertIn("segment_already_observed", retry_unknown.reasons)
+        for forged in (
+            ContactContinuation("contact:new", "communication:one", "effect:second"),
+            ContactContinuation("contact:one", "communication:new", "effect:second"),
+            ContactContinuation("contact:one", "communication:one", "effect:extra"),
+        ):
+            result = self.domain.contact_policy_check(self.policy, opportunity, (unknown,),
+                                                      now=2.0, continuation=forged)
+            self.assertEqual(result.result, "fail")
+
+        quiet = replace(self.policy, quiet=True)
+        self.assertIn("quiet_hours", self.domain.contact_policy_check(
+            quiet, opportunity, (unknown,), now=2.0, continuation=continuation,
+        ).reasons)
 
     def test_restart_uses_claim_representation_and_only_proven_zero_handoff_releases_it(self):
         opportunity = ProactiveOpportunity("opportunity:one", self.namespace, "source:milestone", "user:one", "private", "ordinary", 0.0, 10.0)

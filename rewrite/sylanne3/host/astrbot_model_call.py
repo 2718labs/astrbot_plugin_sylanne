@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+import json
 import re
 import secrets
 from threading import Lock
@@ -21,7 +22,7 @@ from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 from openai.types.chat.chat_completion import ChatCompletion
 
-from ..runtime_contracts import canonical_digest
+from ..runtime_contracts import canonical_digest, canonical_serialize
 from ..model_broker.broker import (
     ModelCallRequest, ModelProviderDescriptor, ProviderResponse,
 )
@@ -32,6 +33,51 @@ from ..model_broker.first_ingress_encoding import (
 from ..model_broker.reply_language import (
     REPLY_TEMPLATE_VERSION, reply_request_shape_valid,
 )
+from ..model_broker.context_reply import (
+    CONTEXT_REPLY_TEMPLATE_DIGEST, CONTEXT_REPLY_TEMPLATE_VERSION,
+    INPUT_SCHEMA as CONTEXT_REPLY_INPUT_SCHEMA, SYSTEM_MESSAGE as CONTEXT_REPLY_SYSTEM_MESSAGE,
+)
+from ..model_broker.d13_precompression import (
+    D13PrecompressionCallGateV1, D13PrecompressionInstallationV1,
+    FrozenD13PrecompressionRequestV1,
+    INPUT_SCHEMA as D13_INPUT_SCHEMA,
+    SYSTEM_MESSAGE as D13_SYSTEM_MESSAGE,
+    TEMPLATE_DIGEST as D13_TEMPLATE_DIGEST,
+    freeze_d13_precompression_request_v1, gate_d13_exact_token_count_v1,
+)
+from ..model_broker.natural_reply import (
+    INPUT_SCHEMA as NATURAL_INPUT_SCHEMA,
+    SYSTEM_MESSAGE as NATURAL_SYSTEM_MESSAGE,
+    TEMPLATE_DIGEST as NATURAL_TEMPLATE_DIGEST,
+    TEMPLATE_VERSION as NATURAL_TEMPLATE_VERSION,
+)
+from ..model_broker.natural_review import (
+    INPUT_SCHEMA as REVIEW_INPUT_SCHEMA,
+    SYSTEM_MESSAGE as REVIEW_SYSTEM_MESSAGE,
+    REVIEW_TEMPLATE_DIGEST, REVIEW_TEMPLATE_VERSION,
+)
+from ..model_broker.natural_reply_history_v4 import (
+    INPUT_SCHEMA as NATURAL_INPUT_SCHEMA_V4, SYSTEM_MESSAGE as NATURAL_SYSTEM_MESSAGE_V4,
+    TEMPLATE_DIGEST as NATURAL_TEMPLATE_DIGEST_V4, TEMPLATE_VERSION as NATURAL_TEMPLATE_VERSION_V4,
+)
+from ..model_broker.natural_reply_history_v3 import (
+    INPUT_SCHEMA as NATURAL_INPUT_SCHEMA_V3,
+    SYSTEM_MESSAGE as NATURAL_SYSTEM_MESSAGE_V3,
+    TEMPLATE_DIGEST as NATURAL_TEMPLATE_DIGEST_V3,
+    TEMPLATE_VERSION as NATURAL_TEMPLATE_VERSION_V3,
+)
+from ..model_broker.d04_appraisal import (
+    INPUT_SCHEMA as APPRAISAL_INPUT_SCHEMA,
+    MAX_INPUT_BYTES as APPRAISAL_MAX_INPUT_BYTES,
+    SYSTEM_MESSAGE as APPRAISAL_SYSTEM_MESSAGE,
+    TEMPLATE_DIGEST as APPRAISAL_TEMPLATE_DIGEST,
+    TEMPLATE_VERSION as APPRAISAL_TEMPLATE_VERSION,
+)
+from ..model_broker.d07_cognition_v1 import (
+    d07_cognition_messages_v1, TEMPLATE_VERSION as D07_COGNITION_TEMPLATE_VERSION,
+    TEMPLATE_DIGEST as D07_COGNITION_TEMPLATE_DIGEST,
+)
+from ..native_runtime.d04_engineering_scheme import MECHANISMS
 from .authority_profile import (
     AdminIngressEncodingPolicy, AdminIngressModelPolicy, AdminModelWorkflowV2,
     AdminInstallationBundle, installed_model_config_ref,
@@ -57,6 +103,157 @@ _calls: dict[str, _CallEntry] = {}
 _admissions: dict[str, str] = {}
 _HOST_INCARNATION = secrets.token_hex(32)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _context_reply_messages(request: ModelCallRequest) -> list[dict[str, str]] | None:
+    """Accept only the sealed three-message V2 workflow wire shape."""
+    payload = request.payload
+    if (set(payload) != {"model", "messages", "max_output_tokens"}
+            or payload["model"] != request.model_id
+            or payload["max_output_tokens"] != request.max_output_tokens
+            or type(payload["messages"]) is not list
+            or len(payload["messages"]) != 3):
+        return None
+    messages = payload["messages"]
+    if (any(type(item) is not dict or set(item) != {"role", "content"}
+            or type(item["content"]) is not str for item in messages)
+            or [item["role"] for item in messages] != ["system", "user", "user"]
+            or messages[0]["content"] != CONTEXT_REPLY_SYSTEM_MESSAGE):
+        return None
+    try:
+        stable = json.loads(messages[1]["content"])
+        dynamic = json.loads(messages[2]["content"])
+    except (TypeError, ValueError):
+        return None
+    if (type(stable) is not dict or type(dynamic) is not dict
+            or set(stable) != {"schema", "scope", "stable_history"}
+            or set(dynamic) != {"schema", "scope", "sections"}
+            or stable["schema"] != CONTEXT_REPLY_INPUT_SCHEMA
+            or dynamic["schema"] != CONTEXT_REPLY_INPUT_SCHEMA
+            or type(stable["scope"]) is not dict
+            or type(dynamic["scope"]) is not dict
+            or type(stable["stable_history"]) is not list
+            or type(dynamic["sections"]) is not list
+            or len(dynamic["sections"]) != 6
+            or any(type(section) is not dict
+                   or set(section) != {"kind", "parts"}
+                   or type(section["parts"]) is not list
+                   for section in dynamic["sections"])
+            or [section["kind"] for section in dynamic["sections"]] != [
+                    "question", "d06_evidence", "d07_focus", "required_check",
+                    "d09_state", "d13_history"]):
+        return None
+    return [{"role": item["role"], "content": item["content"]}
+            for item in messages]
+
+
+def _natural_messages(
+    request: ModelCallRequest, stage: str,
+) -> list[dict[str, str]] | None:
+    """Validate the internal provider-bound wire, then strip its selector."""
+    payload = request.payload
+    if (set(payload) != {"provider_id", "model", "messages", "max_output_tokens"}
+            or payload["provider_id"] != request.provider_id
+            or payload["model"] != request.model_id
+            or payload["max_output_tokens"] != request.max_output_tokens
+            or type(payload["messages"]) is not list
+            or len(payload["messages"]) != (3 if stage == "generation" else 2)):
+        return None
+    messages = payload["messages"]
+    if (any(type(item) is not dict or set(item) != {"role", "content"}
+            or type(item["content"]) is not str for item in messages)
+            or [item["role"] for item in messages] !=
+               (["system", "user", "user"] if stage == "generation" else
+                ["system", "user"])):
+        return None
+    v3 = stage == "generation" and request.prompt_template_digest == NATURAL_TEMPLATE_DIGEST_V3
+    v4 = stage == "generation" and request.prompt_template_digest == NATURAL_TEMPLATE_DIGEST_V4
+    natural_schema = NATURAL_INPUT_SCHEMA_V4 if v4 else NATURAL_INPUT_SCHEMA_V3 if v3 else NATURAL_INPUT_SCHEMA
+    if messages[0]["content"] != (
+            (NATURAL_SYSTEM_MESSAGE_V4 if v4 else NATURAL_SYSTEM_MESSAGE_V3 if v3 else NATURAL_SYSTEM_MESSAGE) if stage == "generation" else
+            REVIEW_SYSTEM_MESSAGE):
+        return None
+    try:
+        user = [json.loads(item["content"]) for item in messages[1:]]
+    except (TypeError, ValueError):
+        return None
+    if (any(type(item) is not dict
+            or canonical_serialize(item) != messages[index + 1]["content"]
+            for index, item in enumerate(user))):
+        return None
+    if stage == "generation":
+        stable, dynamic = user
+        if (set(stable) != {"schema", "scope", "stable_history"}
+                or stable["schema"] != natural_schema
+                or type(stable["scope"]) is not dict
+                or type(stable["stable_history"]) is not list
+                or set(dynamic) != ({
+                    "schema", "frozen_at_utc", "expires_at_utc", "question",
+                    "expression_plan", "qualified_units"} |
+                    ({"scope", "recent_history", "history_selection"} if v3 or v4 else set()) |
+                    ({"detail_history"} if v4 else set()))
+                or dynamic["schema"] != natural_schema
+                or type(dynamic["question"]) is not dict
+                or type(dynamic["expression_plan"]) is not dict
+                or type(dynamic["qualified_units"]) is not list):
+            return None
+        if (v3 or v4) and (dynamic["scope"] != stable["scope"]
+                or type(dynamic["recent_history"]) is not list
+                or type(dynamic["history_selection"]) is not dict
+                or v4 and type(dynamic["detail_history"]) is not list):
+            return None
+    else:
+        review = user[0]
+        if (set(review) != {
+                "schema", "template_version", "generation_frozen_input_digest",
+                "generation_output_digest", "qualified_units_digest",
+                "review_policy_version", "body", "units", "qualified_basis"}
+                or review["schema"] != REVIEW_INPUT_SCHEMA
+                or review["template_version"] != REVIEW_TEMPLATE_VERSION
+                or type(review["body"]) is not str
+                or type(review["units"]) is not list
+                or type(review["qualified_basis"]) is not list):
+            return None
+    return [{"role": item["role"], "content": item["content"]}
+            for item in messages]
+
+
+def _appraisal_messages(request: ModelCallRequest) -> list[dict[str, str]] | None:
+    """Accept only the frozen D04 two-message wire, stripping its selector."""
+    payload = request.payload
+    if (set(payload) != {"provider_id", "model", "messages", "max_output_tokens"}
+            or payload["provider_id"] != request.provider_id
+            or payload["model"] != request.model_id
+            or payload["max_output_tokens"] != request.max_output_tokens
+            or type(payload["messages"]) is not list
+            or len(payload["messages"]) != 2):
+        return None
+    messages = payload["messages"]
+    if (any(type(item) is not dict or set(item) != {"role", "content"}
+            or type(item["content"]) is not str for item in messages)
+            or [item["role"] for item in messages] != ["system", "user"]
+            or messages[0]["content"] != APPRAISAL_SYSTEM_MESSAGE
+            or len(messages[1]["content"].encode("utf-8")) > APPRAISAL_MAX_INPUT_BYTES):
+        return None
+    try:
+        data = json.loads(messages[1]["content"])
+    except (TypeError, ValueError):
+        return None
+    if (type(data) is not dict
+            or canonical_serialize(data) != messages[1]["content"]
+            or set(data) != {
+                "schema", "namespace", "sources", "source_qualification",
+                "event_ref", "event", "role_ref", "role", "interpretations",
+                "target_ref", "concern_ref", "registered_mechanisms"}
+            or data["schema"] != APPRAISAL_INPUT_SCHEMA
+            or data["registered_mechanisms"] != list(MECHANISMS)
+            or type(data["sources"]) is not list
+            or not 1 <= len(data["sources"]) <= 4
+            or type(data["interpretations"]) is not list
+            or not 1 <= len(data["interpretations"]) <= 4):
+        return None
+    return [{"role": item["role"], "content": item["content"]}
+            for item in messages]
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +308,14 @@ class AstrBotModelProvider:
         else:
             installed = (workflows is not None and
                          (admin_model is workflows.encode
-                          or admin_model is workflows.reply))
+                          or admin_model is workflows.reply
+                          or admin_model is workflows.context_reply
+                          or admin_model is workflows.natural_generation
+                          or admin_model is workflows.natural_review
+                          or admin_model is workflows.contact_generation
+                          or admin_model is workflows.contact_review
+                          or admin_model is workflows.appraisal
+                          or admin_model is workflows.d07_cognition))
         if not installed:
             raise ValueError("model selection is absent from installed administrator snapshot")
         self._context = context
@@ -141,6 +345,17 @@ class AstrBotModelProvider:
     def descriptor(self) -> ModelProviderDescriptor:
         return self._descriptor
 
+    def _contact_messages(self, request: ModelCallRequest):
+        from ..model_broker.contact_expression_v1 import contact_provider_messages_v1
+        from ..model_broker.natural_reply import NaturalReplyInstallationV2
+        model = self._admin_model
+        installation = NaturalReplyInstallationV2(self._installation_bundle.installation_policy.installation_id,
+            model.provider_config_digest, model.provider_id, model.model_id, model.max_output_tokens)
+        try:
+            return contact_provider_messages_v1(request, installation)
+        except (ValueError, TypeError, KeyError):
+            return None
+
     def _request_allowed(self, request: ModelCallRequest) -> bool:
         """Recheck the installed scope and exact request before host dispatch."""
         model = self._admin_model
@@ -153,7 +368,14 @@ class AstrBotModelProvider:
             workflows = bundle.model_workflows
             if (workflows is None
                     or (model is not workflows.encode
-                        and model is not workflows.reply)
+                        and model is not workflows.reply
+                        and model is not workflows.context_reply
+                        and model is not workflows.natural_generation
+                        and model is not workflows.natural_review
+                        and model is not workflows.contact_generation
+                        and model is not workflows.contact_review
+                        and model is not workflows.appraisal
+                        and model is not workflows.d07_cognition)
                     or type(policy) is not AdminInstallationPolicy
                     or policy.namespace != authority.namespace
                     or model.work_kind not in policy.root_grant.allowed_work_kinds
@@ -184,9 +406,79 @@ class AstrBotModelProvider:
                         == FIRST_INGRESS_ENCODING_TEMPLATE_VERSION
                         and request.prompt_template_digest
                         == FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST)
-            return (model is workflows.reply
-                    and model.template_version == REPLY_TEMPLATE_VERSION
-                    and reply_request_shape_valid(request))
+            if model is workflows.reply:
+                if request.identity.phase == "d13.precompress":
+                    payload = request.payload
+                    if (model.template_version != REPLY_TEMPLATE_VERSION
+                            or authority.issuer_domain != "d13"
+                            or type(authority.worker_fence) is not int
+                            or authority.worker_fence < 1
+                            or request.prompt_template_digest != D13_TEMPLATE_DIGEST
+                            or set(payload) != {"system_prompt", "prompt"}
+                            or payload["system_prompt"] != D13_SYSTEM_MESSAGE
+                            or type(payload["prompt"]) is not str):
+                        return False
+                    try:
+                        frozen_input = json.loads(payload["prompt"])
+                    except (ValueError, TypeError):
+                        return False
+                    return (type(frozen_input) is dict
+                            and frozen_input.get("schema") == D13_INPUT_SCHEMA
+                            and canonical_serialize(frozen_input) == payload["prompt"]
+                            and type(frozen_input.get("scope")) is dict
+                            and frozen_input.get("scope", {}).get("namespace") == {
+                                "bot_id": authority.namespace.bot_id,
+                                "persona_id": authority.namespace.persona_id,
+                            })
+                return (model.template_version == REPLY_TEMPLATE_VERSION
+                        and reply_request_shape_valid(request))
+            if model is workflows.natural_generation:
+                return (request.identity.phase == "natural_generation"
+                        and type(authority.worker_fence) is int
+                        and authority.worker_fence >= 1
+                        and (model.template_version, request.prompt_template_digest) in (
+                            (NATURAL_TEMPLATE_VERSION, NATURAL_TEMPLATE_DIGEST),
+                            (NATURAL_TEMPLATE_VERSION_V3, NATURAL_TEMPLATE_DIGEST_V3),
+                            (NATURAL_TEMPLATE_VERSION_V4, NATURAL_TEMPLATE_DIGEST_V4))
+                        and _natural_messages(request, "generation") is not None)
+            if model is workflows.natural_review:
+                return (request.identity.phase == "natural_review"
+                        and type(authority.worker_fence) is int
+                        and authority.worker_fence >= 1
+                        and model.template_version == REVIEW_TEMPLATE_VERSION
+                        and request.prompt_template_digest == REVIEW_TEMPLATE_DIGEST
+                        and _natural_messages(request, "review") is not None)
+            if model is workflows.contact_generation or model is workflows.contact_review:
+                from ..model_broker.contact_expression_v1 import (
+                    GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
+                    REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
+                    REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
+                generation = model is workflows.contact_generation
+                return (request.identity.phase == ("contact_generation" if generation else "contact_review")
+                        and type(authority.worker_fence) is int and authority.worker_fence >= 1
+                        and model.template_version == (GENERATION_TEMPLATE_VERSION if generation else CONTACT_REVIEW_VERSION)
+                        and request.prompt_template_digest == (GENERATION_TEMPLATE_DIGEST if generation else CONTACT_REVIEW_DIGEST)
+                        and self._contact_messages(request) is not None)
+            if model is workflows.appraisal:
+                return (request.identity.phase == "d04.appraisal"
+                        and type(authority.worker_fence) is int
+                        and authority.worker_fence >= 1
+                        and model.template_version == APPRAISAL_TEMPLATE_VERSION
+                        and request.prompt_template_digest == APPRAISAL_TEMPLATE_DIGEST
+                        and _appraisal_messages(request) is not None)
+            if model is workflows.d07_cognition:
+                return (request.identity.phase == "d07.cognition"
+                        and type(authority.worker_fence) is int and authority.worker_fence >= 1
+                        and model.template_version == D07_COGNITION_TEMPLATE_VERSION
+                        and request.prompt_template_digest == D07_COGNITION_TEMPLATE_DIGEST
+                        and d07_cognition_messages_v1(request) is not None)
+            return (model is workflows.context_reply
+                    and request.identity.phase == "context_reply"
+                    and type(authority.worker_fence) is int
+                    and authority.worker_fence >= 1
+                    and model.template_version == CONTEXT_REPLY_TEMPLATE_VERSION
+                    and request.prompt_template_digest == CONTEXT_REPLY_TEMPLATE_DIGEST
+                    and _context_reply_messages(request) is not None)
         if (model is not bundle.ingress_model
                 or type(policy) is not AdminInstallationPolicy
                 or type(encoding) is not AdminIngressEncodingPolicy
@@ -246,6 +538,54 @@ class AstrBotModelProvider:
             return selector(self._trusted_umo)
         raise RuntimeError("AstrBot chat provider selection is unavailable")
 
+    async def selected_d13_main_installation_v1(
+        self,
+    ) -> D13PrecompressionInstallationV1 | None:
+        """Observe the selected UMO's installed main model on the host loop.
+
+        A later D13 dispatch must recheck selection against this frozen main
+        workflow. This read does not grant a paid egress or budget reservation.
+        """
+        workflows = self._installation_bundle.model_workflows
+        if (asyncio.get_running_loop() is not self._host_loop
+                or self._aborted or workflows is None
+                or self._admin_model is not workflows.reply):
+            return None
+        try:
+            provider = await self._selected_provider()
+            if not self._matches_live_provider(provider):
+                return None
+        except Exception:
+            return None
+        model = workflows.reply
+        return D13PrecompressionInstallationV1(
+            self._installation_bundle.installation_policy.installation_id,
+            model.provider_id, model.model_id,
+            model.provider_config_digest, model.max_output_tokens)
+
+    async def preflight_d13_precompression_v1(
+        self, frozen: FrozenD13PrecompressionRequestV1,
+    ) -> D13PrecompressionCallGateV1:
+        """Check the frozen wire against the live main model before any paid job.
+
+        Exact pre-call counting is optional. The signed D11 quote and reserved
+        ceiling must be authenticated separately before paid dispatch.
+        """
+        if type(frozen) is not FrozenD13PrecompressionRequestV1:
+            raise TypeError("frozen D13 request required")
+        try:
+            expected = freeze_d13_precompression_request_v1(
+                frozen.window, frozen.plan, frozen.installation)
+            selected = await self.selected_d13_main_installation_v1()
+        except (TypeError, ValueError):
+            selected = None
+            expected = None
+        if expected != frozen or selected != frozen.installation:
+            return D13PrecompressionCallGateV1(
+                "hold", frozen.digest, frozen.wire_digest, None,
+                "frozen D13 wire differs from the selected conversation model")
+        return gate_d13_exact_token_count_v1(frozen, None)
+
     async def _invoke_on_host(self, request: ModelCallRequest) -> ProviderResponse:
         try:
             provider = await self._selected_provider()
@@ -256,20 +596,42 @@ class AstrBotModelProvider:
         except Exception:
             return ProviderResponse("not_dispatched", None, {}, {}, None)
         payload = request.payload
-        if (set(payload) not in ({"prompt"}, {"prompt", "system_prompt"})
-                or type(payload.get("prompt")) is not str or not payload["prompt"]
-                or ("system_prompt" in payload
-                    and type(payload["system_prompt"]) is not str)):
+        if (type(self._admin_model) is AdminModelWorkflowV2
+                and self._admin_model is self._installation_bundle.model_workflows.context_reply):
+            messages = _context_reply_messages(request)
+        elif (type(self._admin_model) is AdminModelWorkflowV2
+              and self._admin_model is self._installation_bundle.model_workflows.natural_generation):
+            messages = _natural_messages(request, "generation")
+        elif (type(self._admin_model) is AdminModelWorkflowV2
+              and self._admin_model is self._installation_bundle.model_workflows.natural_review):
+            messages = _natural_messages(request, "review")
+        elif (type(self._admin_model) is AdminModelWorkflowV2
+              and (self._admin_model is self._installation_bundle.model_workflows.contact_generation
+                   or self._admin_model is self._installation_bundle.model_workflows.contact_review)):
+            messages = self._contact_messages(request)
+        elif (type(self._admin_model) is AdminModelWorkflowV2
+              and self._admin_model is self._installation_bundle.model_workflows.appraisal):
+            messages = _appraisal_messages(request)
+        elif (type(self._admin_model) is AdminModelWorkflowV2
+              and self._admin_model is self._installation_bundle.model_workflows.d07_cognition):
+            messages = d07_cognition_messages_v1(request)
+        elif (set(payload) in ({"prompt"}, {"prompt", "system_prompt"})
+              and type(payload.get("prompt")) is str and payload["prompt"]
+              and ("system_prompt" not in payload
+                   or type(payload["system_prompt"]) is str)):
+            messages = []
+            if payload.get("system_prompt"):
+                messages.append({"role": "system", "content": payload["system_prompt"]})
+            messages.append({"role": "user", "content": payload["prompt"]})
+        else:
+            messages = None
+        if messages is None:
             return ProviderResponse("not_dispatched", None, {}, {}, None)
         try:
             selected_client = provider.client
             client = selected_client.with_options(
                 max_retries=0, timeout=request.timeout_seconds,
             )
-            messages = []
-            if payload.get("system_prompt"):
-                messages.append({"role": "system", "content": payload["system_prompt"]})
-            messages.append({"role": "user", "content": payload["prompt"]})
             # No network operation has begun. Re-read the selected provider and
             # its live configuration immediately before creating the call.
             try:
@@ -312,7 +674,9 @@ class AstrBotModelProvider:
                     usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)):
                 cached = (usage.prompt_tokens_details.cached_tokens
                           if usage.prompt_tokens_details is not None else None)
-                if cached is not None and (type(cached) is not int or cached < 0):
+                if cached is not None and (
+                        type(cached) is not int or cached < 0
+                        or cached > usage.prompt_tokens):
                     return ProviderResponse("unknown", None, {}, {}, None)
                 amounts = {
                     "input_tokens": usage.prompt_tokens,

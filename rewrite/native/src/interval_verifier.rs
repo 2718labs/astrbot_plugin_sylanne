@@ -4,8 +4,8 @@
 use crate::interval::{environment_supported, Interval, IntervalError};
 use sha2::{Digest, Sha256};
 
-pub(crate) const MAX_VERIFIED_N: usize = 64;
-const MAX_VERIFIED_A_ROWS: usize = 64;
+pub(crate) const MAX_VERIFIED_N: usize = 72;
+const MAX_VERIFIED_A_ROWS: usize = 72;
 const MAX_MATRIX_NNZ: usize = 4_096;
 const MAX_TOTAL_NNZ: usize = 16_384;
 const MAX_ABS_INPUT: f64 = 1.0e6;
@@ -812,6 +812,57 @@ pub(crate) fn nonlinear_readout(
     })
 }
 
+/// Optional globally nonexpansive Euclidean lane. All CSR validation and
+/// K symmetry have already been independently checked by verify_joint_step.
+/// R is strictly positive diagonal, J=0, and each A row has at most one
+/// coordinate. Thus the nonlinear part of (R Hess(E)+Hess(E) R)/2 is
+/// nonnegative diagonal. Outward Gershgorin proves the remaining symmetric
+/// part S=(RK+KR)/2 positive; no nominal eigenvalue or caller norm is trusted.
+fn nonexpansive_lipschitz(
+    input: &JointVerificationInput<'_>, k_norm: f64,
+) -> Result<Option<Interval>, VerifierError> {
+    if input.j.values.iter().any(|v| *v != 0.0) { return Ok(None); }
+    let n = input.x.len();
+    let zero = Interval::point(0.0)?;
+    let two = Interval::point(2.0)?;
+    let mut r = Vec::with_capacity(n);
+    for row in 0..n {
+        if input.r.row_range(row).len() != 1 || input.r.indices[input.r.offsets[row] as usize] as usize != row {
+            return Ok(None);
+        }
+        let value = input.r.values[input.r.offsets[row] as usize];
+        if value <= 0.0 { return Ok(None); }
+        r.push(Interval::point(value)?);
+    }
+    let mut diagonal_hessian = vec![zero; n];
+    for row in 0..input.a.rows {
+        if input.a.row_range(row).len() > 1 { return Ok(None); }
+        for position in input.a.row_range(row) {
+            let column = input.a.indices[position] as usize;
+            let value = Interval::point(input.a.values[position])?;
+            diagonal_hessian[column] = finite_interval(diagonal_hessian[column]
+                .add(Interval::point(input.alpha[row])?.mul(value.mul(value)?)?)?)?;
+        }
+    }
+    for row in 0..n {
+        let mut diagonal = zero;
+        let mut radius = zero;
+        for position in input.k.row_range(row) {
+            let column = input.k.indices[position] as usize;
+            let value = Interval::point(input.k.values[position])?;
+            if row == column { diagonal = finite_interval(r[row].mul(value)?)?; }
+            else {
+                let entry = finite_interval(r[row].add(r[column])?.mul(value)?.div(two)?)?;
+                radius = finite_interval(radius.add(Interval::point(entry.lower().abs().max(entry.upper().abs()))?)?)?;
+            }
+        }
+        if finite_interval(diagonal.sub(radius)?)?.lower() <= 0.0 { return Ok(None); }
+    }
+    let r_max = r.iter().map(|v| v.upper()).fold(0.0, f64::max);
+    let h_max = diagonal_hessian.iter().map(|v| v.upper()).fold(0.0, f64::max);
+    Ok(Some(finite_interval(Interval::point(r_max)?.mul(Interval::point(k_norm)?.add(Interval::point(h_max)?)?)?)?))
+}
+
 /// Derive error bounds from the verified operators, not caller-provided norms.
 ///
 /// `inherited_error` must already be a trusted enclosure of the preceding
@@ -821,13 +872,23 @@ pub(crate) fn verify_joint_error_bounds(
     input: &JointVerificationInput<'_>,
     inherited_error: Interval,
 ) -> Result<JointErrorBounds, VerifierError> {
+    let envelope = verify_joint_step(input)?;
+    verify_joint_error_bounds_from_verified_step(input, inherited_error, &envelope)
+}
+
+/// Internal composition only: the ABI entry passes its just-verified envelope
+/// for these identical input buffers; this is not an external proof API.
+pub(crate) fn verify_joint_error_bounds_from_verified_step(
+    input: &JointVerificationInput<'_>,
+    inherited_error: Interval,
+    envelope: &JointVerificationEnvelope,
+) -> Result<JointErrorBounds, VerifierError> {
     if !inherited_error.lower().is_finite()
         || !inherited_error.upper().is_finite()
         || inherited_error.lower() < 0.0
     {
         return Err(VerifierError::InvalidInheritedError);
     }
-    let envelope = verify_joint_step(input)?;
     let zero = Interval::point(0.0)?;
     let one = Interval::point(1.0)?;
     let step = Interval::point(input.h)?;
@@ -941,12 +1002,25 @@ pub(crate) fn verify_joint_error_bounds(
     }
     let amplification = finite_interval(Interval::new(0.0, lh.upper())?.exp()?)?;
     let integral_factor = finite_interval(Interval::new(0.0, lh.upper())?.exp_integral_factor()?)?;
-    let time_upper = finite_interval(
+    let mut time_upper = finite_interval(
         amplification
             .mul(inherited_error)?
             .add(step.mul(integral_factor)?.mul(reconstruction_defect)?)?,
     )?
     .upper();
+    if let Some(lipschitz) = nonexpansive_lipschitz(input, envelope.operator_bounds.k_row_abs_upper)? {
+        // AVF residual r = y-x-h integral_0^1 F(x+s(y-x)) ds.
+        // The endpoint-preserving corrected reconstruction has displacement
+        // from the line <= h L ||y-x|| s(1-s)/2. Nonexpansivity and integration
+        // (integral_0^1 s(1-s)/2 ds = 1/12) give this second-order GLOBAL
+        // bound, including the actual outward AVF residual and inherited error.
+        // See d04-fixed-trajectory-v2.md for the full, auditable derivation.
+        let corrected = finite_interval(inherited_error
+            .add(envelope.residual_norm)?
+            .add(step.mul(step)?.mul(lipschitz)?.mul(lipschitz)?
+                .mul(interval_l2_norm(&displacement)?)?.div(Interval::point(12.0)?)?)?)?;
+        time_upper = time_upper.min(corrected.upper());
+    }
     Ok(JointErrorBounds {
         gradient_lipschitz_upper: gradient_lipschitz.upper(),
         vector_field_lipschitz_upper: vector_field_lipschitz.upper(),
@@ -1756,6 +1830,28 @@ mod tests {
             verify_joint_error_bounds(&short, Interval::new(0.0, f64::INFINITY).unwrap()),
             Err(VerifierError::InvalidInheritedError)
         );
+    }
+
+    #[test]
+    fn nonexpansive_lane_requires_its_complete_structural_proof() {
+        let offsets=[0,1,2]; let indices=[0,1]; let diagonal=[1.0,1.0];
+        let input=JointVerificationInput {
+            k:SparseMatrix::new(2,2,&offsets,&indices,&diagonal),
+            r:SparseMatrix::new(2,2,&offsets,&indices,&diagonal),
+            j:SparseMatrix::new(2,2,&[0,0,0],&[],&[]),
+            a:SparseMatrix::new(2,2,&offsets,&indices,&diagonal),
+            alpha:&[0.25,0.25],x:&[0.5,0.5],y:&[0.49,0.49],h:0.01,drive:&[0.0,0.0],
+        };
+        assert!(nonexpansive_lipschitz(&input,1.0).unwrap().is_some());
+        let rotating=JointVerificationInput{j:SparseMatrix::new(2,2,&[0,1,2],&[1,0],&[0.1,-0.1]),..input};
+        assert!(nonexpansive_lipschitz(&rotating,1.0).unwrap().is_none());
+        let mixed=JointVerificationInput{a:SparseMatrix::new(1,2,&[0,2],&[0,1],&[1.0,1.0]),alpha:&[0.25],..input};
+        assert!(nonexpansive_lipschitz(&mixed,1.0).unwrap().is_none());
+        let nondiagnonal=JointVerificationInput{r:SparseMatrix::new(2,2,&[0,2,4],&[0,1,0,1],&[1.0,0.1,0.1,1.0]),..input};
+        assert!(nonexpansive_lipschitz(&nondiagnonal,1.0).unwrap().is_none());
+        let unproven=JointVerificationInput{k:SparseMatrix::new(2,2,&[0,2,4],&[0,1,0,1],&[1.0,-0.9,-0.9,1.0]),
+            r:SparseMatrix::new(2,2,&offsets,&indices,&[1.0,0.001]),..input};
+        assert!(nonexpansive_lipschitz(&unproven,1.9).unwrap().is_none());
     }
 
     #[test]

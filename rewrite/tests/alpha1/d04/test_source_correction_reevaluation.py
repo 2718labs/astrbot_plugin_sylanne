@@ -138,3 +138,60 @@ def test_missing_appraisal_cannot_silently_clear_old_current_feeling():
 def test_old_invalidate_hook_fails_closed_without_a_snapshot():
     with pytest.raises(ValueError, match="current correction snapshot"):
         AffectProvider().invalidate((OLD.token,))
+
+
+def test_public_graph_restart_preserves_old_feeling_but_blocks_corrected_belief(tmp_path):
+    from sylanne3.contracts import Event, Scope
+    from sylanne3.domains.d06 import D06DomainProvider
+    from sylanne3.domains.d07 import D07DomainProvider, compile_d07_source_reevaluation
+    from sylanne3.graph_store import GraphStore
+    from sylanne3.graph_types import GraphCandidate, GraphVersion, GraphWrite, TypeRegistry
+    from rewrite.tests.alpha1.d07.test_source_reevaluation import (
+        BELIEF, TARGET, _snapshot as d07_snapshot,
+    )
+
+    base = _snapshot()
+    d07 = d07_snapshot()
+    rows = list(base.atoms)
+    rows.extend(atom for atom in d07.atoms if atom.key in {TARGET, BELIEF})
+    rows[0] = replace(rows[0], revision=1)
+    rows[2] = replace(rows[2], value={**rows[2].value, "source_revision": 1})
+    registry = TypeRegistry()
+    for provider in (AffectProvider(), D07DomainProvider(), D06DomainProvider()):
+        for spec in provider.type_specs():
+            registry.register(spec)
+    path = tmp_path / "correction.db"
+    store = GraphStore(path, registry)
+    keys = tuple(atom.key for atom in rows)
+    try:
+        empty = store.graph_snapshot(keys)
+        receipt = store.graph_commit(GraphCandidate(
+            Event(Scope("bot", "alice", "session"), "fixture-corrected", 20.0,
+                  "fixture-corrected", {}),
+            tuple(GraphVersion(key, 0) for key in keys),
+            tuple(GraphWrite(atom.key, atom.value) for atom in rows), empty.epochs,
+        ))
+        assert receipt.status == "committed"
+    finally:
+        store.close()
+
+    store = GraphStore(path, registry)
+    try:
+        committed = store.graph_snapshot(keys)
+        d04 = compile_d04_source_reevaluation(committed, correction_head_ref=HEAD.token)
+        d07_decision = compile_d07_source_reevaluation(
+            committed, correction_head_ref=HEAD.token,
+        )
+        feeling_ref = next(atom.key.token for atom in committed.atoms
+                           if atom.key.type_name == "d04.feeling_state.v1")
+        assert d04.preserved_historical_feeling_refs == (feeling_ref,)
+        assert d04.blocked_current_feeling_refs == (feeling_ref,)
+        assert committed.get(AtomKey.from_token(feeling_ref)).valid
+        assert d07_decision.historical_belief_refs == (BELIEF.token,)
+        assert d07_decision.question_keys_requiring_reevaluation == ("question",)
+        assert committed.get(BELIEF).value["current"] is False
+        assert len([atom for atom in committed.atoms if atom.key == OLD]) == 1
+        assert d04.status.endswith("atomic_fence")
+        assert d07_decision.status.endswith("w01_adoption")
+    finally:
+        store.close()

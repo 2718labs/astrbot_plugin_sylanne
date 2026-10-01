@@ -25,6 +25,13 @@ from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Own
 from ...memory_types import access_key
 from ...runtime_contracts import CheckReceipt, VersionedRef
 from ..d08.execution import ActionIntent
+from .offline_interval import (
+    OfflineIntervalReadSet, OfflineSimulationSliceCandidate,
+    plan_offline_simulation_slice, OfflineTickRecipeV1,
+    OfflineObservedTickV1, OfflineTickReadSetV1,
+    OfflineSimulatedOccurrenceV1, OfflineTickAdvanceCandidateV1,
+    advance_observed_offline_ticks_v1,
+)
 
 
 def _id(value: object, name: str) -> None:
@@ -310,6 +317,19 @@ class ContactClaim:
         object.__setattr__(self, "observations", observations)
 
 
+@dataclass(frozen=True)
+class ContactContinuation:
+    """One segment from the original, finite contact claim; never a new quota claim."""
+
+    contact_id: str
+    communication_action_id: str
+    segment_effect_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("contact_id", "communication_action_id", "segment_effect_id"):
+            _id(getattr(self, name), name)
+
+
 def contact_policy_key(namespace: NamespaceId, policy_id: str) -> AtomKey:
     _id(policy_id, "policy_id")
     return AtomKey(Owner("persona", *namespace.as_tuple), "d10.contact_policy.v1", policy_id)
@@ -432,13 +452,15 @@ class LifeDomain:
         def opportunity(value: object) -> None:
             decode_proactive_opportunity(value, validation_namespace, enforce_namespace=False)
 
+        from .production_operations_v1 import d10_production_type_specs_v1
+        from .contact_claim_v2 import contact_claim_type_spec_v2
         return (
             D10TypeSpec("d10.life_project.v1", "d10", schema_hash({"d10.life_project.v1": 1}), ("persona",), "state", project),
             D10TypeSpec("d10.activity_recipe.v1", "d10", schema_hash({"d10.activity_recipe.v1": 1}), ("persona",), "state", recipe),
             D10TypeSpec("d10.contact_claim.v1", "d10", schema_hash({"d10.contact_claim.v1": 1}), ("persona",), "state", contact),
             D10TypeSpec("d10.contact_policy.v1", "d10", schema_hash({"d10.contact_policy.v1": 1}), ("persona",), "state", policy),
             D10TypeSpec("d10.proactive_opportunity.v1", "d10", schema_hash({"d10.proactive_opportunity.v1": 1}), ("persona",), "state", opportunity),
-        )
+        ) + (contact_claim_type_spec_v2(),) + d10_production_type_specs_v1()
 
     def proposal_for(self, envelope: CommandEnvelope, contribution_keys: tuple[str, ...] = ()) -> DomainProposal:
         if not isinstance(envelope, CommandEnvelope):
@@ -468,8 +490,8 @@ class LifeDomain:
             policy, owner_grant_revision=grant_version.revision, approval_ref=approval_ref,
             approval_authority_id=approval_authority_id, installation_id=installation_id,
         )
-        if (self._guarded_version(envelope, write.key).revision != policy.version - 1
-                or approval_ref not in envelope.input_refs
+        self._guarded_version(envelope, write.key)
+        if (approval_ref not in envelope.input_refs
                 or policy.policy_id not in envelope.input_refs):
             raise ValueError("policy revision or approval is not bound to the command")
         proposal = DomainProposal(
@@ -534,14 +556,13 @@ class LifeDomain:
         current = self._guarded_version(proposal.envelope, write.key)
         if snapshot is not None:
             atom = snapshot.get(write.key)
-            if (atom.revision if atom is not None and atom.valid else 0) != current.revision:
+            if (atom.revision if atom is not None else 0) != current.revision:
                 raise ValueError("D10 contact write guard differs from snapshot")
         if write.key.type_name == "d10.contact_policy.v1":
             policy = decode_contact_policy(write.value, namespace)
             grant = owner_grant_key(*namespace.as_tuple)
             grant_version = self._guarded_version(proposal.envelope, grant)
             if (write.key != contact_policy_key(namespace, policy.policy_id)
-                    or current.revision != policy.version - 1
                     or write.value["owner_grant_revision"] != grant_version.revision
                     or write.dependencies != (grant,)
                     or proposal.dependencies != DependencySet(current_invalidation=(grant_version,))
@@ -549,6 +570,8 @@ class LifeDomain:
                     or policy.policy_id not in proposal.envelope.input_refs):
                 raise ValueError("D10 policy write, approval, or guarded dependency differs")
             if snapshot is not None:
+                if atom is not None and atom.valid and atom.value["version"] >= policy.version:
+                    raise ValueError("contact policy must advance its actual business version")
                 grant_atom = snapshot.get(grant)
                 if grant_atom is None or not grant_atom.valid or grant_atom.revision != grant_version.revision:
                     raise ValueError("D10 policy Owner grant is absent from snapshot")
@@ -599,7 +622,8 @@ class LifeDomain:
         return LifeProgress(project.project_id, outcome.activity_id, outcome.artifact_ref)
 
     @staticmethod
-    def contact_policy_check(policy: ContactPolicy, opportunity: ProactiveOpportunity, claims: tuple[ContactClaim, ...], *, now: float) -> ContactPolicyCheck:
+    def contact_policy_check(policy: ContactPolicy, opportunity: ProactiveOpportunity, claims: tuple[ContactClaim, ...], *, now: float,
+                             continuation: ContactContinuation | None = None) -> ContactPolicyCheck:
         if policy.namespace != opportunity.namespace:
             raise ValueError("policy and opportunity namespace differ")
         now = _finite(now, "now")
@@ -615,11 +639,42 @@ class LifeDomain:
         active = tuple(claims)
         if any(not isinstance(claim, ContactClaim) for claim in active):
             raise TypeError("claims must contain ContactClaim values")
+        if continuation is not None and not isinstance(continuation, ContactContinuation):
+            raise TypeError("continuation must be ContactContinuation or None")
         same_subject = [claim for claim in active if claim.subject_ref == opportunity.subject_ref and claim.channel == opportunity.channel and claim.category == opportunity.category]
-        if any(claim.status in {"pending_confirmation", "handed_off"} for claim in same_subject):
+        original: ContactClaim | None = None
+        if continuation is not None:
+            matches = [claim for claim in same_subject if claim.contact_id == continuation.contact_id
+                       and claim.communication_action_id == continuation.communication_action_id
+                       and claim.policy_id == policy.policy_id]
+            if len(matches) != 1 or matches[0].status == "released":
+                reasons.append("continuation_scope")
+            else:
+                original = matches[0]
+                if continuation.segment_effect_id not in original.segment_effects:
+                    reasons.append("segment_not_granted")
+                elif continuation.segment_effect_id in dict(original.observations):
+                    reasons.append("segment_already_observed")
+                elif "unknown" in dict(original.observations).values():
+                    reasons.append("prior_segment_unknown")
+        other_claims = [claim for claim in same_subject if claim is not original]
+        if any(claim.status in {"pending_confirmation", "handed_off"} for claim in other_claims):
             reasons.append("no_response_gate")
-        occupied = [claim for claim in same_subject if claim.status != "released"]
-        if len(occupied) >= policy.quota_limit:
+        from .contact_claim_v2 import ContactClaimV2, contact_window_id_v2
+        window_id = contact_window_id_v2(policy)
+        if any(type(claim) is ContactClaimV2 and claim.window_id != window_id
+               and claim.status == "claimed"
+               and not (len(claim.observations) == len(claim.segment_effects)
+                        and all(value == "not_handed_off" for _, value in claim.observations))
+               for claim in other_claims):
+            reasons.append("unresolved_prior_window")
+        occupied = [claim for claim in same_subject if claim.status != "released"
+                    and (type(claim) is not ContactClaimV2 or claim.window_id == window_id)]
+        if original is not None and (original.policy_version != policy.version
+                or type(original) is ContactClaimV2 and original.window_id != window_id):
+            reasons.append("continuation_policy_changed")
+        # The existing contact owns one quota slot; it does not claim another.
+        if len(occupied) + (0 if original is not None else 1) > policy.quota_limit:
             reasons.append("quota")
         return ContactPolicyCheck(policy.policy_id, policy.subject_ref, opportunity.opportunity_id,
                                   "pass" if not reasons else "fail", tuple(reasons), policy.version,
@@ -636,6 +691,7 @@ class LifeDomain:
         input_versions: tuple[VersionedRef, ...],
         now: float,
         read_set: ContactPolicyReadSet | None = None,
+        continuation: ContactContinuation | None = None,
     ) -> CheckReceipt:
         """Adapt a complete, current graph read into D08's proactive check.
 
@@ -702,7 +758,8 @@ class LifeDomain:
             return CheckReceipt(spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
                                 input_versions, coverage, "unknown", _finite(now, "now"), spec.provider_id)
 
-        check = self.contact_policy_check(policy, opportunity, claims, now=now)
+        check = self.contact_policy_check(policy, opportunity, claims, now=now,
+                                          continuation=continuation)
         if policy.namespace != opportunity.namespace:
             raise ValueError("policy and opportunity namespace differ")
         result = "pass" if check.result == "pass" else "fail"

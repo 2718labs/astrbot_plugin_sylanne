@@ -47,6 +47,23 @@ def run_d04_conditional_tanh_readout_math(
     rounds outward to binary64. The result contains marginal output bounds,
     not a claim that all row extremes occur at one state in the joint ball.
     """
+    marginals = conditional_tanh_intervals_24d_math(state_centers, state_error_2norm)
+    return _readout_from_marginals(asset, state_centers, state_error_2norm, marginals)
+
+
+def run_d04_invariant_tanh_readout_math(asset, state_centers, state_error_2norm, certificate):
+    """Propagate the same proved domain intersection used for the checkpoint."""
+    from .d04_invariant_domain_v1 import invariant_d04_state_boxes_v1
+    from .tanh_interval import conditional_tanh_interval_endpoints_math
+    if len(state_centers) != 24:
+        raise ValueError("D04 invariant readout requires one complete 24D member")
+    boxes, _ = invariant_d04_state_boxes_v1(state_centers, state_error_2norm, certificate)
+    marginals = tuple(conditional_tanh_interval_endpoints_math(Fraction.from_float(low), Fraction.from_float(high))
+                      for low, high in boxes)
+    return _readout_from_marginals(asset, state_centers, state_error_2norm, marginals)
+
+
+def _readout_from_marginals(asset, state_centers, state_error_2norm, marginals):
     if type(asset) is not D04LoadedTanhReadoutAsset or len(asset.rows) != 24:
         raise ValueError("D04 conditional readout requires a loaded 24-row asset")
     for row in asset.rows:
@@ -56,7 +73,6 @@ def run_d04_conditional_tanh_readout_math(
                        or not 0 <= weight <= 1.0e6 for weight in weights)):
             raise ValueError("D04 conditional readout requires finite nonnegative 24D rows")
 
-    marginals = conditional_tanh_intervals_24d_math(state_centers, state_error_2norm)
     outputs = []
     for row in asset.rows:
         exact_weights = tuple(Fraction.from_float(weight) for weight in row.coefficients)

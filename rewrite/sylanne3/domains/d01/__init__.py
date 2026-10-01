@@ -5,7 +5,7 @@ does not persist data, sign a commit, or grant action authority; those duties
 remain with the shared runtime coordinator.
 """
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Mapping
 
 from ...graph_types import (
@@ -13,6 +13,8 @@ from ...graph_types import (
     TypeSpec, owner_grant_key, validate_owner_grant_v1,
 )
 from ...authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
+from ...memory_types import SourceRecord, access_key, source_key, validate_access
+from ..d06 import source_correction_head_key
 
 from ...runtime_contracts import (
     CommandEnvelope,
@@ -295,6 +297,16 @@ class PersonaRevision:
         object.__setattr__(self, "blocks", blocks)
 
 
+@dataclass(frozen=True)
+class GrowthAdoptionCandidate:
+    """D01 writes and exact graph versions for one D11 atomic adoption."""
+
+    head_id: str
+    revision: PersonaRevision
+    typed_writes: tuple[GraphWrite, ...]
+    read_versions: tuple[GraphVersion, ...]
+
+
 def _validate_persona_plan(value: object) -> None:
     data = _exact_payload(value, {field.name for field in fields(PersonaPlan)}, "persona plan")
     data["namespace"] = _namespace(data["namespace"])
@@ -341,9 +353,6 @@ def _activation_key(namespace: NamespaceId) -> AtomKey:
 
 class PersonaDomain:
     """Pure D01 validator/projector; integration supplies graph snapshots and commits."""
-
-    def __init__(self) -> None:
-        self._consumed_contributions: set[str] = set()
 
     @property
     def descriptor(self) -> ProviderDescriptor:
@@ -574,6 +583,12 @@ class PersonaDomain:
             if spec is None or write.key.owner.kind not in spec.owner_kinds:
                 raise ValueError("D01 proposal contains an unauthorized graph type or owner")
             spec.validator(write.value)
+            if (write.key.type_name in {
+                    "d01.persona_activation.v1", "d01.persona_revision.v1",
+                    "d01.growth_contribution.v1"}
+                    or (write.key.type_name == "d01.persona_plan.v1"
+                        and write.value["version"] > 1)):
+                raise ValueError("D01 head transition requires W01 fenced adoption")
         return proposal
 
     def compile_scheme(self, plan: PersonaPlan, snapshot: object = None) -> PersonaScheme:
@@ -646,6 +661,85 @@ class PersonaDomain:
         )
         return PersonaRevision(proposal.proposal_id, plan.head_id, f"{plan.plan_id}@{plan.version + 1}", blocks, continuity)
 
+    def issue_growth_candidate(
+        self, snapshot: GraphSnapshot, *, namespace: NamespaceId,
+        current_guard: OwnerAuthorizationGuardV1, proposal: GrowthProposal,
+        source_ids: tuple[str, ...],
+    ) -> GrowthAdoptionCandidate:
+        """Prepare a natural-growth write set from one current shared-graph read.
+
+        D11 must CAS every returned read version and recheck source access and
+        deletion authority at commit. This method grants no write authority.
+        """
+        active = self.resolve_active_role(snapshot, namespace=namespace, current_guard=current_guard)
+        self.validate_growth(active.plan, proposal)
+        source_ids = _unique_strings(source_ids, "source_ids", minimum=1)
+        if len(source_ids) != len(proposal.source_families):
+            raise ValueError("each evidence family needs one independent source")
+        refs: list[GraphVersion] = []
+        roots: list[str] = []
+        for source_id in source_ids:
+            source_atom = snapshot.get(source_key(*namespace.as_tuple, source_id))
+            access_atom = snapshot.get(access_key(*namespace.as_tuple, source_id))
+            head_key = source_correction_head_key(namespace, source_id)
+            head_atom = snapshot.get(head_key)
+            if (source_atom is None or access_atom is None or head_atom is None
+                    or not source_atom.valid or not access_atom.valid or head_atom.valid
+                    or source_atom.revision < 1 or access_atom.revision < 1
+                    or head_atom.revision != 0):
+                raise ValueError("growth evidence or access is unavailable")
+            source = SourceRecord.from_dict(source_atom.value)
+            validate_access(access_atom.value)
+            access = access_atom.value
+            if (source.source_id != source_id or access["source_id"] != source_id
+                    or source.source_kind != "observed" or source.assertion_status != "confirmed"
+                    or source.independence != "independent" or source.parent_source_ids
+                    or "consolidation" not in source.purposes
+                    or access["status"] != "active" or "consolidation" not in access["purposes"]):
+                raise ValueError("source cannot support natural growth")
+            roots.append(source.provenance_root)
+            refs.extend((GraphVersion(source_atom.key, source_atom.revision),
+                         GraphVersion(access_atom.key, access_atom.revision),
+                         GraphVersion(head_key, 0)))
+        if set(roots) != set(proposal.source_families) or len(set(roots)) != len(roots):
+            raise ValueError("evidence provenance differs from independent families")
+        revision = self.activate_revision(active.plan, proposal)
+        next_plan = replace(active.plan, version=active.plan.version + 1,
+                            blocks=revision.blocks, authored=False)
+        grant_atom = snapshot.get(owner_grant_key(*namespace.as_tuple))
+        assert grant_atom is not None  # resolve_active_role already checked it
+        writes = [self.plan_write(next_plan), self.revision_write(namespace, revision),
+                  self.activation_write(next_plan, grant_atom, current_guard)]
+        reads = list(active.read_versions) + refs
+        for source_family in proposal.source_families:
+            key = AtomKey(Owner("persona", *namespace.as_tuple),
+                          "d01.growth_contribution.v1",
+                          self.contribution_key(proposal.target_block, source_family, proposal.change_kind))
+            if snapshot.get(key) is not None:
+                raise ValueError("growth contribution has already been consumed")
+            writes.append(GraphWrite(key, _json_value(asdict(proposal))))
+            reads.append(GraphVersion(key, 0))
+        for write in writes[1:3]:
+            atom = snapshot.get(write.key)
+            reads.append(GraphVersion(write.key, atom.revision if atom else 0))
+        return GrowthAdoptionCandidate(next_plan.head_id, revision, tuple(writes), tuple(reads))
+
+    def validate_growth_candidate(
+        self, candidate: GrowthAdoptionCandidate, snapshot: GraphSnapshot, *,
+        namespace: NamespaceId, current_guard: OwnerAuthorizationGuardV1,
+        proposal: GrowthProposal, source_ids: tuple[str, ...],
+    ) -> GrowthAdoptionCandidate:
+        """Reject modified or stale D01 write sets before D11's atomic commit."""
+        if not isinstance(candidate, GrowthAdoptionCandidate):
+            raise TypeError("candidate must be GrowthAdoptionCandidate")
+        expected = self.issue_growth_candidate(
+            snapshot, namespace=namespace, current_guard=current_guard,
+            proposal=proposal, source_ids=source_ids,
+        )
+        if candidate != expected:
+            raise ValueError("growth candidate differs from current evidence and head")
+        return candidate
+
     @staticmethod
     def contribution_key(target_block: str, source_family: str, change_kind: str) -> str:
         _identifier(target_block, "target_block")
@@ -654,12 +748,10 @@ class PersonaDomain:
             raise ValueError("unknown growth change kind")
         return f"{target_block}|{source_family}|{change_kind}"
 
-    def consume_contribution(self, key: str) -> bool:
+    @staticmethod
+    def consume_contribution(key: str, committed_keys: tuple[str, ...]) -> bool:
         _identifier(key, "contribution key")
-        if key in self._consumed_contributions:
-            return False
-        self._consumed_contributions.add(key)
-        return True
+        return key not in _unique_strings(committed_keys, "committed_keys")
 
     @staticmethod
     def invalidate(refs: tuple[object, ...]) -> tuple[object, ...]:

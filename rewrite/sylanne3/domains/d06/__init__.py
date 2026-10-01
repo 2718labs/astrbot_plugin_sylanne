@@ -718,6 +718,15 @@ class D06DomainProvider:
     """
 
     @staticmethod
+    def compile_scheme(draft: object, snapshot: object = None):
+        """Validate the versioned policy actually used by first-ingress projection."""
+        from .encoding_projection import EncodingProjectionPolicyV1
+
+        if type(draft) is not EncodingProjectionPolicyV1:
+            raise TypeError("D06 scheme must be EncodingProjectionPolicyV1")
+        return draft
+
+    @staticmethod
     def provide_required_check(intent, read: SourceGrantRead, *, valid_until: float):
         return provide_source_grant_check(intent, read, valid_until=valid_until)
 
@@ -834,9 +843,12 @@ class D06DomainProvider:
 
     @staticmethod
     def type_specs() -> tuple[TypeSpec, ...]:
+        from ...runtime.source_attachment_graph_v2 import media_source_spec
+
         registry = TypeRegistry()
         register_memory_types(registry)
         specs = list(registry.specs)
+        specs.append(media_source_spec())
         specs.append(TypeSpec(
             _RECOLLECTION_TYPE,
             ("activity",),
@@ -877,6 +889,26 @@ class D06DomainProvider:
             raise ValueError("proposal is not a D06 memory proposal")
         if proposal.proposal_schema_hash != self.descriptor.request_schema_hash:
             raise ValueError("D06 proposal schema hash is not recognized")
+        from .source_access_revocation import validate_revocation_proposal_shape
+        validate_revocation_proposal_shape(proposal)
+        from ...graph_types import GraphSnapshot
+        access_reads = {version.key: version.revision
+                        for version in proposal.envelope.version_guard.read_versions}
+        for write in proposal.typed_writes:
+            if write.key.type_name != "memory.access":
+                continue
+            if access_reads.get(write.key, 0) > 0 and write.value.get("status") != "withdrawn":
+                raise ValueError("existing D06 source access requires a dedicated mutation path")
+            if write.value.get("status") == "withdrawn" and isinstance(snapshot, GraphSnapshot):
+                prior = snapshot.get(write.key)
+                if (prior is None or prior.revision != access_reads.get(write.key)
+                        or not prior.valid or prior.value.get("status") != "active"
+                        or write.value.get("audiences") != prior.value.get("audiences")
+                        or write.value.get("purposes") != prior.value.get("purposes")
+                        or write.value.get("source_id") != prior.value.get("source_id")
+                        or write.value.get("recorded_at", 0)
+                        <= prior.value.get("recorded_at", 0)):
+                    raise ValueError("source withdrawal differs from current access head")
         registry = TypeRegistry()
         for spec in self.type_specs():
             registry.register(spec)
@@ -926,6 +958,9 @@ class D06DomainProvider:
                     or projection.key.owner != recollection.key.owner):
                 raise ValueError("C04 projection differs from its persisted recollection")
         trace_types = {"memory.subjective_trace.v1", "memory.subjective_trace.v2"}
+        if proposal.envelope.identity.phase == "encode_structured_experience":
+            from .structured_experience_v1 import validate_structured_experience_proposal_v1
+            return validate_structured_experience_proposal_v1(proposal, snapshot)
         encoding = {write.key.type_name: write for write in proposal.typed_writes
                     if write.key.type_name in {"memory.episode.v1", *trace_types}}
         if encoding:
@@ -1753,6 +1788,11 @@ class D06DomainAdapter:
         for source, access in zip(source_keys, access_keys):
             if source.token not in envelope.source_qualification.source_refs:
                 raise ValueError("selected candidate source is absent from source qualification")
+            correction_head = source_correction_head_key(
+                self.namespace, source.owner.subject,
+            )
+            if read_map.get(correction_head) != GraphVersion(correction_head, 0):
+                raise ValueError("selected source requires a correction head absence proof")
             for key in (source, access):
                 version = read_map.get(key)
                 if version is None or version.revision <= 0:

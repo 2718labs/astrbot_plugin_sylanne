@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from ..domains.d06.attachment_contract_v2 import SourceAdmissionV2
 from ..graph_coordinator import IngressHostFacts, IngressLineage
+from .authority_profile import AdminD06PrivateReplySourcePolicy
+from .d06_ingress import source_admission_from_host
 from .ingress import HostIngressEnvelope
 
 
-def ingress_host_facts(envelope: HostIngressEnvelope) -> IngressHostFacts:
+@dataclass(frozen=True)
+class VerifiedMediaIngressV2:
+    host: IngressHostFacts
+    source_admission_v2: SourceAdmissionV2
+
+
+def ingress_host_facts(
+    envelope: HostIngressEnvelope,
+    *, reply_source_policy: AdminD06PrivateReplySourcePolicy | None = None,
+) -> IngressHostFacts | VerifiedMediaIngressV2:
     lineage = envelope.lineage
-    return IngressHostFacts(
+    host = IngressHostFacts(
         envelope.namespace,
         envelope.platform_ref,
         envelope.conversation_ref,
@@ -29,6 +43,17 @@ def ingress_host_facts(envelope: HostIngressEnvelope) -> IngressHostFacts:
             lineage.internal_activity_actuality,
         ),
     )
+    if not envelope.attachments:
+        return host
+    return VerifiedMediaIngressV2(
+        host,
+        SourceAdmissionV2(
+            source_admission_from_host(
+                envelope, reply_source_policy,
+                allow_verified_media_v2=True,
+            ), envelope.attachments,
+        ),
+    )
 
 
-__all__ = ("ingress_host_facts",)
+__all__ = ("VerifiedMediaIngressV2", "ingress_host_facts")

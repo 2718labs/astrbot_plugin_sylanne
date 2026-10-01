@@ -23,7 +23,7 @@ from .v2_model_egress_store import AuthorityV2ModelEgressStore
 from .v2_worker_model_result_attempts import AuthorityV2WorkerModelResultAttempts
 from .v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
-    first_ingress_read_attempt_id_v1,
+    first_ingress_read_attempt_id_v1, d13_paid_read_attempt_id_v1,
 )
 from .v2_reply_worker_model_result_contract import (
     ReplyWorkerModelResultReadRequestV1, ReplyWorkerModelResultReadV1,
@@ -139,7 +139,7 @@ class AuthorityV2WorkerModelResultReadService:
         with fences._frozen() as (db, deletion_head, execution_head, history):
             anchor = fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder)
-            if history or anchor.authority_id != request.authority_id:
+            if anchor.authority_id != request.authority_id:
                 raise AuthorityUnavailable("worker read Authority anchor unavailable")
             intent, _, _ = self._terminal_locked(db, request, anchor, content=False)
         candidate = FencePermitV2(
@@ -164,6 +164,8 @@ class AuthorityV2WorkerModelResultReadService:
         consumer = first_request.consumer_operation_id
         attempt_id = (reply_worker_read_attempt_id_v1
                       if type(first_request) is ReplyWorkerModelResultReadRequestV1
+                      else d13_paid_read_attempt_id_v1
+                      if first_request.purpose == "d13_precompress_paid"
                       else first_ingress_read_attempt_id_v1)
         if first_request.read_attempt_id != attempt_id(consumer, 1):
             raise AuthorityUnavailable("canonical first worker read required")
@@ -226,7 +228,7 @@ class AuthorityV2WorkerModelResultReadService:
             anchor = fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=expected_anchor.activation_generation)
-            if history or anchor != expected_anchor:
+            if anchor != expected_anchor:
                 raise AuthorityUnavailable("worker read anchor changed")
             intent, _, _ = self._terminal_locked(db, request, anchor, content=False)
             if intent != original_intent:
@@ -248,7 +250,7 @@ class AuthorityV2WorkerModelResultReadService:
             anchor = fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=permit.generation)
-            if history or anchor != permit.pinned_anchor:
+            if anchor != permit.pinned_anchor:
                 raise AuthorityUnavailable("worker read anchor changed")
             fences.fences.validate_fence_locked(
                 db, permit, subject=self._read_subject, current_anchor=anchor)
@@ -286,7 +288,7 @@ class AuthorityV2WorkerModelResultReadService:
             anchor = fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=permit.generation)
-            if history or anchor != permit.pinned_anchor:
+            if anchor != permit.pinned_anchor:
                 raise AuthorityUnavailable("worker read anchor changed before finish")
             row = fences.fences._row(db, request.read_attempt_id)
             if row is None or fences.fences._permit(row) != permit:
@@ -337,7 +339,7 @@ class AuthorityV2WorkerModelResultReadService:
         with fences._frozen() as (db, deletion_head, execution_head, history):
             anchor = fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder)
-            if history or anchor.authority_id != request.authority_id:
+            if anchor.authority_id != request.authority_id:
                 raise AuthorityUnavailable("worker read recovery anchor unavailable")
             row = fences.fences._row(db, request.read_attempt_id)
             if row is None:

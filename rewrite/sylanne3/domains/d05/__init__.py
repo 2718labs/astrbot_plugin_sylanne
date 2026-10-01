@@ -9,6 +9,8 @@ from .relationship import (
     RelationshipProvider,
 )
 from .source_correction import D05SourceReevaluationCandidate, compile_d05_source_reevaluation
+from .audience import RelationshipAudienceQualification, qualify_contribution_for_audience
+from .disclosure import SourceDisclosureCandidateV1, qualify_source_disclosure_v1
 
 __all__ = (
     "BoundaryCheck",
@@ -19,4 +21,8 @@ __all__ = (
     "RelationshipProvider",
     "D05SourceReevaluationCandidate",
     "compile_d05_source_reevaluation",
+    "RelationshipAudienceQualification",
+    "qualify_contribution_for_audience",
+    "SourceDisclosureCandidateV1",
+    "qualify_source_disclosure_v1",
 )

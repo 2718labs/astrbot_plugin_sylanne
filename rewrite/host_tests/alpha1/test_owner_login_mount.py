@@ -9,17 +9,17 @@ from unittest.mock import patch
 
 from astrbot.dashboard.api.plugins import _match_registered_web_api
 
-from rewrite.sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
-from rewrite.sylanne3.authority_service.v2_owner_session import (
+from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
+from sylanne3.authority_service.v2_owner_session import (
     OwnerSessionLoginChallengeV1, OwnerSessionLoginRequestV1, to_wire,
 )
-from rewrite.sylanne3.graph_coordinator import namespace_ref
-from rewrite.sylanne3.host.workbench_mount import (
+from sylanne3.graph_coordinator import namespace_ref
+from sylanne3.host.workbench_mount import (
     OWNER_CHALLENGE_ROUTE, OWNER_COMPLETE_ROUTE, OWNER_LOGOUT_ROUTE,
     WorkbenchHostMount,
 )
-from rewrite.sylanne3.runtime_contracts import NamespaceId
-from rewrite.sylanne3.workbench_api.owner_session_resolver import BoundOwnerSessions
+from sylanne3.runtime_contracts import NamespaceId
+from sylanne3.workbench_api.owner_session_resolver import BoundOwnerSessions
 
 
 ORIGIN = "https://dashboard.local"

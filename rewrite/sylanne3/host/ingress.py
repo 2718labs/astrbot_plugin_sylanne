@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import math
 
 from ..runtime_contracts import NamespaceId
+from ..domains.d06.attachment_contract_v2 import SourceAttachmentV2
 
 
 def _identifier(value: object, label: str) -> str:
@@ -47,12 +48,19 @@ class HostIngressEnvelope:
     learned_at: float
     visibility: str
     lineage: SourceLineage
+    attachments: tuple[SourceAttachmentV2, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.namespace, NamespaceId):
             raise TypeError("namespace must be NamespaceId")
         if not isinstance(self.lineage, SourceLineage):
             raise TypeError("lineage must be SourceLineage")
+        if (type(self.attachments) is not tuple
+                or len(self.attachments) > 4
+                or any(type(item) is not SourceAttachmentV2
+                       or item.order != order
+                       for order, item in enumerate(self.attachments))):
+            raise ValueError("ingress attachments must be ordered verified bytes")
         for field in ("platform_ref", "conversation_ref", "sender_ref", "message_id"):
             _identifier(getattr(self, field), field)
         if not isinstance(self.text, str) or not self.text or len(self.text) > 32_768:

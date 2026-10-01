@@ -34,6 +34,22 @@ class ModelCostUnavailable(RuntimeError):
     """The original Authority terminal or its cost dimensions are unavailable."""
 
 
+_MODEL_WORK_KINDS = frozenset({
+    "d06.encode_source", "reply", "context_reply",
+    "natural_generation", "natural_review", "contact_generation", "contact_review",
+    "d13.precompress.paid.v1", "d04.appraisal", "d07.cognition",
+})
+
+
+def original_model_cost_operation_id_v1(namespace: NamespaceId, call_id: str) -> str:
+    """Stable business operation for settling one original model call."""
+    if type(namespace) is not NamespaceId or not isinstance(call_id, str) or not call_id:
+        raise ModelCostUnavailable("original model cost identity is incomplete")
+    return "model-cost-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "call_id": call_id,
+    })[:48]
+
+
 @dataclass(frozen=True, slots=True)
 class OriginalModelCostFactV1:
     intent: ModelEgressIntentV1
@@ -90,18 +106,21 @@ def read_original_model_cost(
 
 def original_model_budget_actual(
     fact: OriginalModelCostFactV1, quote: ResourceQuote,
+    *, work_kind: str = "d06.encode_source",
 ) -> dict[str, int] | None:
     """Return a complete cost only when every declared dimension is measured.
 
     Provider token and currency counters are never D02 body energy. Cached
     input tokens are already included in input_tokens and are not added twice.
     """
-    known, unknown = original_model_budget_measurement(fact, quote)
+    known, unknown = original_model_budget_measurement(
+        fact, quote, work_kind=work_kind)
     return None if unknown else known
 
 
 def original_model_budget_measurement(
     fact: OriginalModelCostFactV1, quote: ResourceQuote,
+    *, work_kind: str = "d06.encode_source",
 ) -> tuple[dict[str, int], tuple[str, ...]]:
     """Keep known dimensions even when another declared dimension is unknown."""
     if type(fact) is not OriginalModelCostFactV1 or type(quote) is not ResourceQuote:
@@ -111,7 +130,8 @@ def original_model_budget_measurement(
     # quote. Authority's namespace has a separate installation identity.
     if (quote.operation_id != intent.budget_reservation_operation_id
             or quote.parent_budget_lease_ref != intent.budget_lease_id
-            or quote.work_kind != "d06.encode_source"):
+            or quote.work_kind != work_kind
+            or work_kind not in _MODEL_WORK_KINDS):
         raise ModelCostUnavailable("original cost differs from D02 quote")
     if dict(intent.budget_ceiling) != dict(quote.ceiling):
         raise ModelCostUnavailable("Authority ceiling differs from original quote")
@@ -143,9 +163,10 @@ def original_model_budget_measurement(
 
 def outcome_from_original_model_cost(
     fact: OriginalModelCostFactV1, quote: ResourceQuote,
+    *, work_kind: str = "d06.encode_source",
 ) -> ResourceOutcome:
     """Candidate D02 outcome; D02 issuer must still verify its trusted origin."""
-    actual = original_model_budget_actual(fact, quote)
+    actual = original_model_budget_actual(fact, quote, work_kind=work_kind)
     return ResourceOutcome(
         outcome_id="model-cost:" + fact.intent.call_id,
         version=1, quote_id=quote.quote_id,
@@ -169,6 +190,7 @@ class OriginalModelCostPlanV1:
     original_operation_id: str
     call_id: str
     quote: ResourceQuote
+    work_kind: str
     outcome: ResourceOutcome
     original_reservation_digest: str
     terminal_receipt_digest: str
@@ -206,6 +228,7 @@ class OriginalModelCostCommitV1:
 def prepare_original_model_cost_plan(
     db, issuer, namespace: NamespaceId, fact: OriginalModelCostFactV1,
     *, quote_id: str, quote_version: int,
+    work_kind: str = "d06.encode_source",
 ) -> OriginalModelCostPlanV1:
     """Join the historical signed quote, original ingress and D11 reservation.
 
@@ -225,7 +248,8 @@ def prepare_original_model_cost_plan(
             or quote.operation_id != intent.budget_reservation_operation_id
             or quote.parent_budget_lease_ref != intent.budget_lease_id
             or dict(quote.ceiling) != dict(intent.budget_ceiling)
-            or quote.work_kind != "d06.encode_source"):
+            or quote.work_kind != work_kind
+            or work_kind not in _MODEL_WORK_KINDS):
         raise ModelCostUnavailable("original signed quote differs from model call")
     original = db.execute(
         "SELECT activity_id FROM graph_bundle_operations WHERE bot=? "
@@ -254,8 +278,10 @@ def prepare_original_model_cost_plan(
         raise ModelCostUnavailable("original D11 reservation is not settleable")
     if json.loads(reservation[1]) != dict(quote.ceiling):
         raise ModelCostUnavailable("original D11 reservation ceiling differs")
-    outcome = outcome_from_original_model_cost(fact, quote)
-    known, unknown = original_model_budget_measurement(fact, quote)
+    outcome = outcome_from_original_model_cost(
+        fact, quote, work_kind=work_kind)
+    known, unknown = original_model_budget_measurement(
+        fact, quote, work_kind=work_kind)
     budget_reservation = BudgetReservation(
         lease.lease_id, quote.operation_id,
         intent.budget_reservation_digest, quote.ceiling)
@@ -271,10 +297,8 @@ def prepare_original_model_cost_plan(
             execution_revoked=outcome.execution_revoked)
     return OriginalModelCostPlanV1(
         namespace,
-        "model-cost-" + canonical_digest({
-            "namespace": list(namespace.as_tuple), "call_id": intent.call_id,
-        })[:48],
-        quote.operation_id, intent.call_id, quote, outcome,
+        original_model_cost_operation_id_v1(namespace, intent.call_id),
+        quote.operation_id, intent.call_id, quote, work_kind, outcome,
         intent.budget_reservation_digest,
         canonical_digest(asdict(fact.receipt)), predicted, known, unknown,
     )
@@ -295,6 +319,7 @@ def apply_original_model_budget_in_transaction(
     current = prepare_original_model_cost_plan(
         db, issuer, plan.namespace, fact,
         quote_id=plan.quote.quote_id, quote_version=plan.quote.version,
+        work_kind=plan.work_kind,
     )
     if current != plan:
         raise ModelCostUnavailable("original cost plan became stale")
@@ -336,4 +361,5 @@ __all__ = (
     "original_model_budget_actual", "outcome_from_original_model_cost",
     "original_model_budget_measurement",
     "read_original_model_cost",
+    "original_model_cost_operation_id_v1",
 )

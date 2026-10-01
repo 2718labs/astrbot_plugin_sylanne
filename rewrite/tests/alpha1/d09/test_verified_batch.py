@@ -7,8 +7,8 @@ from dataclasses import replace
 
 import pytest
 
-from rewrite.sylanne3.domains.d08 import CommunicationIntentGrant, SegmentGrant
-from rewrite.sylanne3.domains.d09 import (
+from sylanne3.domains.d08 import CommunicationIntentGrant, SegmentGrant
+from sylanne3.domains.d09 import (
     ClaimKind,
     ClaimUse,
     D09ExpressionProvider,
@@ -16,7 +16,7 @@ from rewrite.sylanne3.domains.d09 import (
     SegmentCandidate,
     segment_payload_digest,
 )
-from rewrite.sylanne3.runtime_contracts import canonical_digest
+from sylanne3.runtime_contracts import canonical_digest
 
 
 def _inputs():

@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import hashlib
+import pytest
 
 from sylanne3.dispatch_runtime import (
     AdmissionAuthorityDescriptor,
@@ -80,6 +81,13 @@ def _request(*, operation_id="operation-1", effect_id="effect-1", segment_id=Non
         segment_count=3 if contact else None,
         contact_policy_check_ref="check:d10" if contact and proactive else None,
     )
+
+
+def test_authority_urlsafe_content_fence_token_is_accepted():
+    token = "_" + "A" * 63
+    assert _request(content_fence=token).content_fence == token
+    with pytest.raises(ValueError, match="content_fence"):
+        _request(content_fence=token + "\n")
 
 
 class RecordingJournal:

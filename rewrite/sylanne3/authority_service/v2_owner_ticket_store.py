@@ -23,6 +23,7 @@ from .v2_contract import (
 from .v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
+    OwnerMigrationHeadV1,
     canonical_bytes, canonical_digest,
     decode_bytes,
 )
@@ -67,6 +68,24 @@ _HEAD = """CREATE TABLE authority_owner_authorization_heads_v1 (
     FOREIGN KEY(issue_operation_id)
         REFERENCES authority_owner_issue_committed_v1(operation_id)
 ) STRICT"""
+_REVOKE_PENDING = """CREATE TABLE authority_owner_revoke_pending_v1 (
+    operation_id TEXT PRIMARY KEY,
+    authority_namespace TEXT NOT NULL UNIQUE,
+    request_digest TEXT NOT NULL,
+    operation_bytes BLOB NOT NULL,
+    receipt_bytes BLOB NOT NULL,
+    FOREIGN KEY(authority_namespace)
+        REFERENCES authority_owner_authorization_heads_v1(authority_namespace)
+) STRICT"""
+_REVOKE_COMMITTED = """CREATE TABLE authority_owner_revoke_committed_v1 (
+    operation_id TEXT PRIMARY KEY,
+    authority_namespace TEXT NOT NULL UNIQUE,
+    proof_bytes BLOB NOT NULL,
+    receipt_bytes BLOB NOT NULL,
+    guard_bytes BLOB NOT NULL,
+    FOREIGN KEY(operation_id)
+        REFERENCES authority_owner_revoke_pending_v1(operation_id)
+) STRICT"""
 _COLUMNS = {
     "authority_owner_claim_tickets_v1": (
         "authority_namespace", "ticket_id", "ticket_bytes", "issue_operation_id"),
@@ -79,7 +98,19 @@ _COLUMNS = {
     "authority_owner_authorization_heads_v1": (
         "authority_namespace", "issue_operation_id", "current_operation_id",
         "revision", "state", "guard_bytes"),
+    "authority_owner_revoke_pending_v1": (
+        "operation_id", "authority_namespace", "request_digest",
+        "operation_bytes", "receipt_bytes"),
+    "authority_owner_revoke_committed_v1": (
+        "operation_id", "authority_namespace", "proof_bytes", "receipt_bytes",
+        "guard_bytes"),
 }
+_ISSUE_TABLES = set(_COLUMNS) - {
+    "authority_owner_revoke_pending_v1", "authority_owner_revoke_committed_v1"}
+
+
+class OwnerAuthorizationBarrier(AuthorityUnavailable):
+    """A verified pending/revoked Owner head denies this content handoff."""
 
 
 class AuthorityV2OwnerTicketStore:
@@ -91,6 +122,8 @@ class AuthorityV2OwnerTicketStore:
                  claimant_verifier: Callable[[object, OwnerAuthorizationOperationV1], bool] | None = None,
                  graph_commit_verifier: Callable[[OwnerAuthorizationOperationV1,
                                                  OwnerGraphCommitProofV1], bool] | None = None,
+                 revoke_graph_commit_verifier: Callable[[OwnerAuthorizationOperationV1,
+                                                        OwnerGraphCommitProofV1], bool] | None = None,
                  owner_sessions: AuthorityV2OwnerSessionStore | None = None,
                  creation_pairing_source: object | None = None,
                  create: bool = False) -> None:
@@ -101,6 +134,7 @@ class AuthorityV2OwnerTicketStore:
         self._first_claim_verifier = first_claim_verifier
         self._claimant_verifier = claimant_verifier
         self._graph_commit_verifier = graph_commit_verifier
+        self._revoke_graph_commit_verifier = revoke_graph_commit_verifier
         if owner_sessions is not None and (
                 type(owner_sessions) is not AuthorityV2OwnerSessionStore
                 or owner_sessions._core is not core):
@@ -122,7 +156,9 @@ class AuthorityV2OwnerTicketStore:
                 db.execute(_PENDING)
                 db.execute(_COMMITTED)
                 db.execute(_HEAD)
-            elif present == set(_COLUMNS) - {
+                db.execute(_REVOKE_PENDING)
+                db.execute(_REVOKE_COMMITTED)
+            elif present == _ISSUE_TABLES - {
                     "authority_owner_issue_committed_v1",
                     "authority_owner_authorization_heads_v1"} and create:
                 # Explicit, additive upgrade preserves already consumed tickets.
@@ -130,7 +166,7 @@ class AuthorityV2OwnerTicketStore:
                                             "authority_owner_authorization_heads_v1"})
                 db.execute(_COMMITTED)
                 db.execute(_HEAD)
-            elif present == set(_COLUMNS) - {"authority_owner_authorization_heads_v1"} and create:
+            elif present == _ISSUE_TABLES - {"authority_owner_authorization_heads_v1"} and create:
                 # An already committed first issue becomes the initial current
                 # head without changing its immutable historical receipt.
                 self._check_schema(db, old={"authority_owner_authorization_heads_v1"})
@@ -147,15 +183,26 @@ class AuthorityV2OwnerTicketStore:
                         (namespace, operation_id, operation_id, 1, "active",
                          canonical_bytes(committed[1].guard)),
                     )
+            elif present == _ISSUE_TABLES and create:
+                self._check_schema(db, old={"authority_owner_revoke_pending_v1",
+                                            "authority_owner_revoke_committed_v1"})
+                db.execute(_REVOKE_PENDING)
+                db.execute(_REVOKE_COMMITTED)
             elif present != set(_COLUMNS):
                 raise AuthorityUnavailable("partial owner ticket schema")
+            if create and present in (
+                    _ISSUE_TABLES - {"authority_owner_issue_committed_v1",
+                                     "authority_owner_authorization_heads_v1"},
+                    _ISSUE_TABLES - {"authority_owner_authorization_heads_v1"}):
+                db.execute(_REVOKE_PENDING)
+                db.execute(_REVOKE_COMMITTED)
             self._check_schema(db)
 
     @staticmethod
     def _present(db: sqlite3.Connection) -> set[str]:
         return {row[0] for row in db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN (?, ?, ?, ?)", tuple(_COLUMNS))}
+            "AND name IN (?, ?, ?, ?, ?, ?)", tuple(_COLUMNS))}
 
     @staticmethod
     def _checked_committed(db: sqlite3.Connection, authority_namespace: str,
@@ -228,16 +275,133 @@ class AuthorityV2OwnerTicketStore:
             guard = decode_bytes(row[4])
         except (TypeError, ValueError, UnicodeError) as exc:
             raise AuthorityUnavailable("owner current head differs") from exc
-        # Only the first issue transition exists so far. Future revoke/rotate
-        # transitions must add a verified ledger before revision > 1 is readable.
+        issue_guard = committed[1].guard
         if (type(guard) is not OwnerAuthorizationGuardV1
-                or row[1:4] != (row[0], 1, "active")
                 or row[4] != canonical_bytes(guard)
-                or guard != committed[1].guard
-                or guard.authorization_revision != row[2]
-                or guard.pending_revoke_operation_id is not None):
+                or guard.authorization_revision != row[2]):
             raise AuthorityUnavailable("owner current head differs")
+        if row[1:4] == (row[0], 1, "active") and guard == issue_guard:
+            if db.execute(
+                    "SELECT 1 FROM authority_owner_revoke_pending_v1 "
+                    "WHERE authority_namespace=?", (authority_namespace,)).fetchone():
+                raise AuthorityUnavailable("owner revoke ledger lacks a barrier")
+            return guard
+        revoke = AuthorityV2OwnerTicketStore._checked_revoke_pending(
+            db, authority_namespace, row[1])
+        if revoke is None:
+            raise AuthorityUnavailable("owner current head lacks revoke origin")
+        operation, pending_receipt = revoke
+        if operation.expected_guard != issue_guard or row[0] == row[1]:
+            raise AuthorityUnavailable("owner revoke origin differs from issue")
+        saved_commit = AuthorityV2OwnerTicketStore._checked_revoke_committed(
+            db, authority_namespace, row[1])
+        if row[2:4] == (1, "active"):
+            if saved_commit is not None or guard != pending_receipt.guard:
+                raise AuthorityUnavailable("owner pending revoke barrier differs")
+        elif row[2:4] == (2, "revoked"):
+            if saved_commit is None or guard != saved_commit[1].guard:
+                raise AuthorityUnavailable("owner committed revoke head differs")
+        else:
+            raise AuthorityUnavailable("unsupported owner authorization transition")
         return guard
+
+    @staticmethod
+    def _checked_revoke_pending(db: sqlite3.Connection, authority_namespace: str,
+                                operation_id: str) -> tuple[OwnerAuthorizationOperationV1,
+                                                            OwnerAuthorizationReceiptV1] | None:
+        rows = db.execute(
+            "SELECT operation_id,authority_namespace,request_digest,operation_bytes,"
+            "receipt_bytes FROM authority_owner_revoke_pending_v1 "
+            "WHERE operation_id=? OR authority_namespace=?",
+            (operation_id, authority_namespace)).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1 or rows[0][0:2] != (operation_id, authority_namespace):
+            raise AuthorityUnavailable("owner revoke pending identity differs")
+        saved = rows[0]
+        try:
+            operation, receipt = decode_bytes(saved[3]), decode_bytes(saved[4])
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise AuthorityUnavailable("stored owner revoke pending differs") from exc
+        issue_row = db.execute(
+            "SELECT issue_operation_id FROM authority_owner_authorization_heads_v1 "
+            "WHERE authority_namespace=?", (authority_namespace,)).fetchone()
+        issue = (AuthorityV2OwnerTicketStore._checked_committed(
+            db, authority_namespace, issue_row[0]) if issue_row else None)
+        issue_pending = (AuthorityV2OwnerTicketStore._checked_pending(
+            db, authority_namespace, issue_row[0]) if issue_row else None)
+        if (type(operation) is not OwnerAuthorizationOperationV1
+                or type(receipt) is not OwnerAuthorizationReceiptV1
+                or issue is None or issue_pending is None
+                or operation.action != "revoke" or operation.ticket is not None
+                or operation.expected_grant_revision != 1
+                or operation.expected_guard != issue[1].guard
+                or operation.authority_id != issue_pending[0].authority_id
+                or operation.installation_id != issue_pending[0].installation_id
+                or operation.namespace != issue_pending[0].namespace
+                or operation.principal != issue_pending[0].principal
+                or operation.grant_id != issue_pending[0].grant_id
+                or operation.operation_id == issue_row[0]
+                or saved[2] != operation.request_digest
+                or saved[3] != canonical_bytes(operation)
+                or saved[4] != canonical_bytes(receipt)
+                or receipt.operation != operation or receipt.phase != "pending"
+                or receipt.guard != OwnerAuthorizationGuardV1(
+                    operation.authority_id, operation.installation_id,
+                    operation.namespace, 1, issue[1].guard.authorization_head,
+                    0, 0, operation.operation_id)
+                or receipt.receipt_ref != "owner-revoke-pending:"
+                    + operation.request_digest.removeprefix("sha256:")[:48]):
+            raise AuthorityUnavailable("stored owner revoke pending differs")
+        return operation, receipt
+
+    @staticmethod
+    def _checked_revoke_committed(db: sqlite3.Connection, authority_namespace: str,
+                                  operation_id: str) -> tuple[OwnerGraphCommitProofV1,
+                                                              OwnerAuthorizationReceiptV1] | None:
+        rows = db.execute(
+            "SELECT operation_id,authority_namespace,proof_bytes,receipt_bytes,guard_bytes "
+            "FROM authority_owner_revoke_committed_v1 "
+            "WHERE operation_id=? OR authority_namespace=?",
+            (operation_id, authority_namespace)).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1 or rows[0][0:2] != (operation_id, authority_namespace):
+            raise AuthorityUnavailable("owner revoke committed identity differs")
+        saved = rows[0]
+        pending = AuthorityV2OwnerTicketStore._checked_revoke_pending(
+            db, authority_namespace, operation_id)
+        if pending is None:
+            raise AuthorityUnavailable("owner revoke commit lacks pending origin")
+        operation = pending[0]
+        try:
+            proof, receipt, guard = map(decode_bytes, saved[2:5])
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise AuthorityUnavailable("stored owner revoke commit differs") from exc
+        if (type(proof) is not OwnerGraphCommitProofV1
+                or type(receipt) is not OwnerAuthorizationReceiptV1
+                or type(guard) is not OwnerAuthorizationGuardV1
+                or saved[2] != canonical_bytes(proof)
+                or saved[3] != canonical_bytes(receipt)
+                or saved[4] != canonical_bytes(guard)
+                or proof.namespace != operation.namespace
+                or proof.operation_id != operation_id
+                or proof.request_digest != operation.request_digest
+                or proof.grant_id != operation.grant_id
+                or proof.grant_digest != operation.grant_digest
+                or proof.grant_revision != 2 or proof.graph_access_epoch < 2
+                or receipt.operation != operation or receipt.phase != "committed"
+                or receipt.grant_revision != 2
+                or receipt.graph_access_epoch != proof.graph_access_epoch
+                or receipt.guard != guard
+                or guard != OwnerAuthorizationGuardV1(
+                    operation.authority_id, operation.installation_id,
+                    operation.namespace, 2, canonical_digest(proof), 2,
+                    proof.graph_access_epoch)
+                or receipt.receipt_ref != "owner-revoke-committed:"
+                    + proof.graph_receipt_digest.removeprefix("sha256:")[:48]):
+            raise AuthorityUnavailable("stored owner revoke commit differs")
+        return proof, receipt
 
     def current_dispatch_witness_in_tx(
             self, db: sqlite3.Connection, *, context: DispatchHandoffContextV1,
@@ -253,12 +417,14 @@ class AuthorityV2OwnerTicketStore:
         self._require_mode(db)
         authority_namespace = context.permit.namespace
         guard = self._checked_current_head(db, authority_namespace)
+        if guard is not None and (
+                guard.pending_revoke_operation_id is not None
+                or guard.minimum_revocation_revision >= guard.authorization_revision):
+            raise OwnerAuthorizationBarrier("current Owner authorization is barred")
         if (guard is None or guard.authority_id != context.permit.authority_id
                 or guard.installation_id != installation_id
                 or namespace_ref(guard.namespace) != authority_namespace
                 or binding.graph_namespace != "/".join(guard.namespace.as_tuple)
-                or guard.pending_revoke_operation_id is not None
-                or guard.minimum_revocation_revision >= guard.authorization_revision
                 or guard.minimum_revocation_epoch > 0
                 or "/" in guard.namespace.bot_id
                 or "/" in guard.namespace.persona_id):
@@ -288,6 +454,15 @@ class AuthorityV2OwnerTicketStore:
             graph_namespace=binding.graph_namespace, guard=guard,
             issue_operation_id=operation.operation_id,
             grant_id=operation.grant_id, grant_digest=operation.grant_digest)
+
+    def current_migration_head_in_tx(
+            self, db: sqlite3.Connection, *, authority_namespace: str,
+    ) -> OwnerMigrationHeadV1 | None:
+        """Freeze the current Owner ledger head in a caller-held Core transaction."""
+        identifier(authority_namespace, "authority_namespace")
+        if db is not self._core._db or not db.in_transaction:
+            raise AuthorityUnavailable("Owner migration head needs Authority transaction")
+        return read_owner_migration_head_in_tx_v1(db, authority_namespace=authority_namespace)
 
     @staticmethod
     def _checked_pending(db: sqlite3.Connection, authority_namespace: str,
@@ -344,7 +519,9 @@ class AuthorityV2OwnerTicketStore:
             expected = {"authority_owner_claim_tickets_v1": _TICKETS,
                         "authority_owner_issue_pending_v1": _PENDING,
                         "authority_owner_issue_committed_v1": _COMMITTED,
-                        "authority_owner_authorization_heads_v1": _HEAD}[name]
+                        "authority_owner_authorization_heads_v1": _HEAD,
+                        "authority_owner_revoke_pending_v1": _REVOKE_PENDING,
+                        "authority_owner_revoke_committed_v1": _REVOKE_COMMITTED}[name]
             if actual != columns or ddl != (expected,):
                 raise AuthorityUnavailable("owner ticket schema differs")
 
@@ -415,6 +592,36 @@ class AuthorityV2OwnerTicketStore:
                     or authority_namespace != namespace_ref(operation.namespace)))):
             raise AuthorityUnavailable("Owner session differs from issue operation")
         sessions.require_current_in_tx(db, token=session_token, request=session_request)
+
+    def _require_revoke_session(
+        self, db: sqlite3.Connection, authority_namespace: str,
+        operation: OwnerAuthorizationOperationV1 | None,
+        session_token: str | None, session_request: OwnerSessionLoginRequestV1 | None,
+    ) -> None:
+        """Check an Owner-audience session against the immutable issue identity."""
+        sessions = self._owner_sessions
+        if (type(sessions) is not AuthorityV2OwnerSessionStore
+                or type(session_token) is not str or not session_token
+                or type(session_request) is not OwnerSessionLoginRequestV1
+                or session_request.audience != "owner"
+                or session_request.authority_namespace != authority_namespace):
+            raise AuthorityUnavailable("current Owner revoke session is unavailable")
+        if operation is None:
+            row = db.execute(
+                "SELECT issue_operation_id FROM authority_owner_authorization_heads_v1 "
+                "WHERE authority_namespace=?", (authority_namespace,)).fetchone()
+            original = (self._checked_pending(db, authority_namespace, row[0])
+                        if row else None)
+            if original is None:
+                raise AuthorityUnavailable("Owner revoke session lacks issue identity")
+            operation = original[0]
+        if (session_request.authority_id != operation.authority_id
+                or session_request.installation_id != operation.installation_id
+                or session_request.principal != operation.principal
+                or namespace_ref(operation.namespace) != authority_namespace):
+            raise AuthorityUnavailable("Owner revoke session identity differs")
+        sessions.require_current_in_tx(
+            db, token=session_token, request=session_request)
 
     def _require_creation_pairing(self, db: sqlite3.Connection,
                                   credential: object, authority_namespace: str,
@@ -652,6 +859,27 @@ class AuthorityV2OwnerTicketStore:
         return (epoch[0] if epoch is not None else 0,
                 self._core._row(db, authority_namespace))
 
+    def read_committed_issue(self, *, credential, authority_namespace, operation,
+                             session_token=None, session_request=None):
+        """Read the exact already-issued original; never grant or write anew."""
+        if type(operation) is not OwnerAuthorizationOperationV1 or operation.action != 'issue':
+            raise TypeError('exact first Owner issue operation required')
+        self._core._require(credential, 'owner_claim', authority_namespace)
+        with self._core._tx() as db:
+            self._require_mode(db)
+            self._require_owner_session(db,authority_namespace,operation,session_token,session_request)
+            self._require_creation_pairing(db,credential,authority_namespace,operation.ticket)
+            pending=self._checked_pending(db,authority_namespace,operation.operation_id)
+            if pending is None:return None
+            if pending[0]!=operation:raise AuthorityUnavailable('committed Owner replay operation differs')
+            original=self._checked_committed(db,authority_namespace,operation.operation_id)
+            if original is None:return None
+            proof,receipt=original
+            if (receipt.operation!=operation or receipt.phase!='committed'
+                    or proof.operation_id!=operation.operation_id or proof.grant_digest!=operation.grant_digest):
+                raise AuthorityUnavailable('committed Owner original differs')
+            return receipt
+
     def finalize_issue(self, *, credential: object, authority_namespace: str,
                        operation: OwnerAuthorizationOperationV1,
                        proof: OwnerGraphCommitProofV1,
@@ -852,5 +1080,323 @@ class AuthorityV2OwnerTicketStore:
                     raise AuthorityUnavailable("Owner session differs from current grant")
             return guard
 
+    def reserve_revoke(self, *, credential: object, authority_namespace: str,
+                       operation: OwnerAuthorizationOperationV1,
+                       session_token: str | None = None,
+                       session_request: OwnerSessionLoginRequestV1 | None = None,
+                       ) -> OwnerAuthorizationReceiptV1:
+        """Durably block Owner-backed content before the graph changes."""
+        identifier(authority_namespace, "authority_namespace")
+        if (type(operation) is not OwnerAuthorizationOperationV1
+                or operation.action != "revoke"):
+            raise TypeError("Owner revoke operation is required")
+        self._core._require(credential, "owner_authorization_revoke", authority_namespace)
+        with self._core._tx() as db:
+            self._require_mode(db)
+            if session_token is not None or session_request is not None:
+                self._require_revoke_session(db, authority_namespace, operation,
+                                             session_token, session_request)
+            guard = self._checked_current_head(db, authority_namespace)
+            saved = self._checked_revoke_pending(db, authority_namespace,
+                                                 operation.operation_id)
+            if saved is not None:
+                committed = self._checked_revoke_committed(
+                    db, authority_namespace, operation.operation_id)
+                if (saved[0] != operation or guard != (
+                        committed[1].guard if committed is not None
+                        else saved[1].guard)):
+                    raise AuthorityUnavailable("Owner revoke replay differs")
+                return saved[1]
+            if (namespace_ref(operation.namespace) != authority_namespace
+                    or self._core._id(db) != operation.authority_id
+                    or guard is None or guard != operation.expected_guard
+                    or guard.authorization_revision != 1
+                    or guard.pending_revoke_operation_id is not None
+                    or operation.expected_grant_revision != 1):
+                raise AuthorityUnavailable("current Owner issue head differs from revoke")
+            issue_row = db.execute(
+                "SELECT issue_operation_id FROM authority_owner_authorization_heads_v1 "
+                "WHERE authority_namespace=?", (authority_namespace,)).fetchone()
+            issue = self._checked_pending(db, authority_namespace, issue_row[0])
+            if (issue is None or operation.principal != issue[0].principal
+                    or operation.grant_id != issue[0].grant_id
+                    or operation.installation_id != issue[0].installation_id
+                    or operation.operation_id == issue[0].operation_id):
+                raise AuthorityUnavailable("Owner revoke differs from issued grant")
+            namespace_row = self._core._row(db, authority_namespace)
+            if (namespace_row[0] is None or namespace_row[1] < 1
+                    or namespace_row[2] != "active" or namespace_row[3] is not None
+                    or namespace_row[9] != "clear"):
+                raise AuthorityUnavailable("Owner revoke namespace is unavailable")
+            AuthorityV2FenceStore._check_schema(db)
+            AuthorityV2FenceStore._require_no_migration(db)
+            live = db.execute(
+                "SELECT operation_id FROM authority_v2_fences "
+                "WHERE namespace=? AND state='active'", (authority_namespace,)
+            ).fetchone()
+            if live is not None:
+                fence_row = AuthorityV2FenceStore._row(db, live[0])
+                if (fence_row is None or fence_row[6] != "active"
+                        or AuthorityV2FenceStore._permit(fence_row).operation
+                        != "dispatch"):
+                    raise AuthorityUnavailable("non-dispatch fence blocks Owner revoke")
+            elif db.execute(
+                    "SELECT 1 FROM authority_v2_mutations WHERE namespace=? "
+                    "AND state='pending' LIMIT 1", (authority_namespace,)
+            ).fetchone():
+                raise AuthorityUnavailable("pending mutation blocks Owner revoke")
+            pending_guard = OwnerAuthorizationGuardV1(
+                operation.authority_id, operation.installation_id,
+                operation.namespace, 1, guard.authorization_head,
+                guard.minimum_revocation_revision,
+                guard.minimum_revocation_epoch, operation.operation_id)
+            receipt = OwnerAuthorizationReceiptV1(
+                operation, "pending", "owner-revoke-pending:"
+                + operation.request_digest.removeprefix("sha256:")[:48],
+                pending_guard)
+            db.execute(
+                "INSERT INTO authority_owner_revoke_pending_v1"
+                "(operation_id,authority_namespace,request_digest,operation_bytes,"
+                "receipt_bytes) VALUES(?,?,?,?,?)",
+                (operation.operation_id, authority_namespace,
+                 operation.request_digest, canonical_bytes(operation),
+                 canonical_bytes(receipt)))
+            changed = db.execute(
+                "UPDATE authority_owner_authorization_heads_v1 "
+                "SET current_operation_id=?,guard_bytes=? "
+                "WHERE authority_namespace=? AND issue_operation_id=? "
+                "AND current_operation_id=? AND revision=1 AND state='active' "
+                "AND guard_bytes=?",
+                (operation.operation_id, canonical_bytes(pending_guard),
+                 authority_namespace, issue[0].operation_id,
+                 issue[0].operation_id, canonical_bytes(guard))).rowcount
+            if changed != 1:
+                raise AuthorityUnavailable("Owner revoke barrier CAS failed")
+            return receipt
 
-__all__ = ("AuthorityV2OwnerTicketStore",)
+    def get_revoke_pending(self, *, credential: object,
+                           authority_namespace: str, operation_id: str,
+                           session_token: str | None = None,
+                           session_request: OwnerSessionLoginRequestV1 | None = None,
+                           ) -> OwnerAuthorizationReceiptV1 | None:
+        identifier(authority_namespace, "authority_namespace")
+        identifier(operation_id, "operation_id")
+        self._core._require(credential, "owner_authorization_revoke", authority_namespace)
+        with self._core._tx() as db:
+            self._require_mode(db)
+            saved = self._checked_revoke_pending(db, authority_namespace, operation_id)
+            if session_token is not None or session_request is not None:
+                self._require_revoke_session(db, authority_namespace,
+                                             saved[0] if saved else None,
+                                             session_token, session_request)
+            if saved is None:
+                return None
+            guard = self._checked_current_head(db, authority_namespace)
+            if guard != saved[1].guard:
+                if self._checked_revoke_committed(db, authority_namespace,
+                                                  operation_id) is None:
+                    raise AuthorityUnavailable("Owner revoke pending barrier differs")
+            return saved[1]
+
+    def get_revoke_pending_for_graph_write(
+            self, *, credential: object, authority_namespace: str,
+            operation_id: str, installation_id: str, subject: str,
+            permit: FencePermitV2) -> OwnerAuthorizationReceiptV1 | None:
+        """Give the graph worker only the current durable pending barrier."""
+        identifier(authority_namespace, "authority_namespace")
+        identifier(operation_id, "operation_id")
+        identifier(installation_id, "installation_id")
+        identifier(subject, "subject")
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.namespace != authority_namespace
+                or permit.subject != subject):
+            raise AuthorityUnavailable("Owner revoke graph read needs exact write fence")
+        self._core._require(credential, "write", authority_namespace, permit.holder)
+        with self._core._tx() as db:
+            self._require_mode(db)
+            AuthorityV2FenceStore._check_schema(db)
+            AuthorityV2FenceStore._require_no_migration(db)
+            row = AuthorityV2FenceStore._row(db, permit.operation_id)
+            if (row is None or row[1] != authority_namespace or row[2] != subject
+                    or row[3] != permit.token or row[6] != "active"
+                    or row[7] != fence_canonical_bytes(permit)
+                    or row[10] is not None
+                    or AuthorityV2FenceStore._permit(row) != permit
+                    or permit.authority_id != self._core._id(db)):
+                raise AuthorityUnavailable("Owner revoke graph write fence is stale")
+            saved = self._checked_revoke_pending(db, authority_namespace, operation_id)
+            if saved is None:
+                return None
+            guard = self._checked_current_head(db, authority_namespace)
+            if (saved[0].installation_id != installation_id
+                    or guard != saved[1].guard
+                    or self._checked_revoke_committed(
+                        db, authority_namespace, operation_id) is not None):
+                raise AuthorityUnavailable("Owner revoke is not pending for graph write")
+            return saved[1]
+
+    def finalize_revoke(self, *, credential: object, authority_namespace: str,
+                        operation: OwnerAuthorizationOperationV1,
+                        proof: OwnerGraphCommitProofV1,
+                        session_token: str | None = None,
+                        session_request: OwnerSessionLoginRequestV1 | None = None,
+                        ) -> OwnerAuthorizationReceiptV1:
+        """Advance to revoked rev2 only after independent current graph proof."""
+        identifier(authority_namespace, "authority_namespace")
+        if (type(operation) is not OwnerAuthorizationOperationV1
+                or operation.action != "revoke"
+                or type(proof) is not OwnerGraphCommitProofV1):
+            raise TypeError("exact Owner revoke operation and graph proof are required")
+        self._core._require(credential, "owner_authorization_revoke", authority_namespace)
+        if (namespace_ref(operation.namespace) != authority_namespace
+                or proof.namespace != operation.namespace
+                or proof.operation_id != operation.operation_id
+                or proof.request_digest != operation.request_digest
+                or proof.grant_id != operation.grant_id
+                or proof.grant_digest != operation.grant_digest
+                or proof.grant_revision != 2 or proof.graph_access_epoch < 2):
+            raise AuthorityUnavailable("Owner revoke graph proof identity differs")
+        with self._core._tx() as db:
+            self._require_mode(db)
+            if session_token is not None or session_request is not None:
+                self._require_revoke_session(db, authority_namespace, operation,
+                                             session_token, session_request)
+            saved = self._checked_revoke_pending(db, authority_namespace,
+                                                 operation.operation_id)
+            if saved is None or saved[0] != operation:
+                raise AuthorityUnavailable("exact pending Owner revoke is absent")
+            committed = self._checked_revoke_committed(
+                db, authority_namespace, operation.operation_id)
+            if committed is not None:
+                if committed[0] != proof:
+                    raise AuthorityUnavailable("Owner revoke commit replay differs")
+                if self._checked_current_head(db, authority_namespace) != committed[1].guard:
+                    raise AuthorityUnavailable("Owner revoke committed head differs")
+                return committed[1]
+            if self._checked_current_head(db, authority_namespace) != saved[1].guard:
+                raise AuthorityUnavailable("pending Owner revoke barrier differs")
+            before = self._revoke_commit_snapshot(db, authority_namespace)
+        self._verified(self._revoke_graph_commit_verifier, operation, proof)
+        guard = OwnerAuthorizationGuardV1(
+            operation.authority_id, operation.installation_id,
+            operation.namespace, 2, canonical_digest(proof), 2,
+            proof.graph_access_epoch)
+        receipt = OwnerAuthorizationReceiptV1(
+            operation, "committed", "owner-revoke-committed:"
+            + proof.graph_receipt_digest.removeprefix("sha256:")[:48],
+            guard, 2, proof.graph_access_epoch)
+        with self._core._tx() as db:
+            self._require_mode(db)
+            saved = self._checked_revoke_pending(db, authority_namespace,
+                                                 operation.operation_id)
+            if saved is None or saved[0] != operation:
+                raise AuthorityUnavailable("pending Owner revoke changed")
+            committed = self._checked_revoke_committed(
+                db, authority_namespace, operation.operation_id)
+            if committed is not None:
+                if committed[0] != proof:
+                    raise AuthorityUnavailable("Owner revoke commit replay differs")
+                return committed[1]
+            if (self._checked_current_head(db, authority_namespace) != saved[1].guard
+                    or self._revoke_commit_snapshot(db, authority_namespace) != before):
+                raise AuthorityUnavailable("Owner revoke graph proof crossed Authority change")
+            db.execute(
+                "INSERT INTO authority_owner_revoke_committed_v1"
+                "(operation_id,authority_namespace,proof_bytes,receipt_bytes,guard_bytes) "
+                "VALUES(?,?,?,?,?)",
+                (operation.operation_id, authority_namespace,
+                 canonical_bytes(proof), canonical_bytes(receipt), canonical_bytes(guard)))
+            changed = db.execute(
+                "UPDATE authority_owner_authorization_heads_v1 "
+                "SET revision=2,state='revoked',guard_bytes=? "
+                "WHERE authority_namespace=? AND current_operation_id=? "
+                "AND revision=1 AND state='active' AND guard_bytes=?",
+                (canonical_bytes(guard), authority_namespace, operation.operation_id,
+                 canonical_bytes(saved[1].guard))).rowcount
+            if changed != 1:
+                raise AuthorityUnavailable("Owner revoke rev2 CAS failed")
+            return receipt
+
+    def _revoke_commit_snapshot(self, db: sqlite3.Connection,
+                                authority_namespace: str) -> tuple[int, tuple]:
+        AuthorityV2FenceStore._check_schema(db)
+        AuthorityV2FenceStore._require_no_migration(db)
+        epoch = db.execute(
+            "SELECT last_epoch FROM authority_v2_epochs WHERE namespace=?",
+            (authority_namespace,)).fetchone()
+        row = self._core._row(db, authority_namespace)
+        if (row[0] is None or row[2] != "active"
+                or row[3] is not None or row[9] != "clear"):
+            raise AuthorityUnavailable("Owner revoke namespace is unavailable")
+        return (epoch[0] if epoch else 0, row)
+
+    def get_revoke_committed(self, *, credential: object,
+                             authority_namespace: str, operation_id: str,
+                             session_token: str | None = None,
+                             session_request: OwnerSessionLoginRequestV1 | None = None,
+                             ) -> OwnerAuthorizationReceiptV1 | None:
+        identifier(authority_namespace, "authority_namespace")
+        identifier(operation_id, "operation_id")
+        self._core._require(credential, "owner_authorization_revoke", authority_namespace)
+        with self._core._tx() as db:
+            self._require_mode(db)
+            saved = self._checked_revoke_pending(db, authority_namespace, operation_id)
+            if session_token is not None or session_request is not None:
+                self._require_revoke_session(db, authority_namespace,
+                                             saved[0] if saved else None,
+                                             session_token, session_request)
+            committed = self._checked_revoke_committed(
+                db, authority_namespace, operation_id)
+            if committed is None:
+                return None
+            if self._checked_current_head(db, authority_namespace) != committed[1].guard:
+                raise AuthorityUnavailable("Owner revoke committed head differs")
+            return committed[1]
+
+
+__all__ = ("AuthorityV2OwnerTicketStore", "OwnerAuthorizationBarrier")
+
+
+def read_owner_migration_head_in_tx_v1(db, *, authority_namespace):
+    identifier(authority_namespace, "authority_namespace")
+    if not db.in_transaction:
+        raise AuthorityUnavailable("Owner migration head needs pinned Authority transaction")
+    AuthorityV2OwnerTicketStore._require_mode(db)
+    guard = AuthorityV2OwnerTicketStore._checked_current_head(db, authority_namespace)
+    if guard is None:
+        if db.execute(
+                "SELECT 1 FROM authority_owner_issue_pending_v1 "
+                "WHERE authority_namespace=?", (authority_namespace,)
+        ).fetchone():
+            raise AuthorityUnavailable("uncommitted Owner issue blocks migration")
+        return None
+    if guard.pending_revoke_operation_id is not None:
+        raise AuthorityUnavailable("pending Owner revoke blocks migration")
+    row = db.execute(
+        "SELECT issue_operation_id,current_operation_id,state "
+        "FROM authority_owner_authorization_heads_v1 WHERE authority_namespace=?",
+        (authority_namespace,)).fetchone()
+    if row is None:
+        raise AuthorityUnavailable("Owner migration head is absent")
+    issue = AuthorityV2OwnerTicketStore._checked_pending(db, authority_namespace, row[0])
+    committed_issue = AuthorityV2OwnerTicketStore._checked_committed(db, authority_namespace, row[0])
+    if issue is None or committed_issue is None:
+        raise AuthorityUnavailable("Owner migration issue origin differs")
+    if row[2] == "active":
+        return OwnerMigrationHeadV1(
+            authority_namespace, guard, "active", issue[0],
+            committed_issue[0], None, None, 1,
+            committed_issue[0].grant_digest,
+            committed_issue[0].graph_access_epoch)
+    if row[2] != "revoked":
+        raise AuthorityUnavailable("Owner migration state differs")
+    revoke = AuthorityV2OwnerTicketStore._checked_revoke_pending(db, authority_namespace, row[1])
+    committed_revoke = AuthorityV2OwnerTicketStore._checked_revoke_committed(
+        db, authority_namespace, row[1])
+    if revoke is None or committed_revoke is None:
+        raise AuthorityUnavailable("Owner migration revoke origin differs")
+    return OwnerMigrationHeadV1(
+        authority_namespace, guard, "revoked", issue[0],
+        committed_issue[0], revoke[0], committed_revoke[0], 2,
+        committed_revoke[0].grant_digest,
+        committed_revoke[0].graph_access_epoch)

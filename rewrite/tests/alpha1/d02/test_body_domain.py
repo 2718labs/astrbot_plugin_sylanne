@@ -96,6 +96,11 @@ class BodyDomainTests(unittest.TestCase):
         duplicate = domain.settle_component(settled.state, settled.reservation, "work", actual_cost=0.2, component_receipt="segment:1")
         self.assertTrue(duplicate.duplicate)
         self.assertAlmostEqual(duplicate.state.energy, 0.6)
+        with self.assertRaisesRegex(ValueError, "another receipt"):
+            domain.settle_component(
+                settled.state, settled.reservation, "work", actual_cost=0.2,
+                component_receipt="segment:retry-new-id",
+            )
 
     def test_unknown_cancellation_keeps_reservation_and_analytic_advance_is_split_invariant(self):
         domain = BodyDomain()
@@ -108,6 +113,56 @@ class BodyDomainTests(unittest.TestCase):
         one = domain.advance_scalar(0.2, 0.1, 0.4, 3.0)
         two = domain.advance_scalar(domain.advance_scalar(0.2, 0.1, 0.4, 1.0), 0.1, 0.4, 2.0)
         self.assertAlmostEqual(one, two)
+
+    def test_degraded_gross_and_unknown_receipt_block_later_work_on_same_ledger(self):
+        domain = BodyDomain()
+        original = domain.quote_work(
+            profile(), state(), "activity:one", "thinking", 5.0,
+            (WorkComponent("work", "duration", duration_rate=0.1),), valid_until=20.0,
+        )
+        reservation = domain.reserve_work(state(), (), original, "reservation:one", "effect:one")
+        degraded = state(0.2)
+        pending = domain.release_or_cancel(reservation, execution_known=False).reservation
+        admission = domain.check_work_start(degraded, (pending,), reservation_id=reservation.reservation_id)
+        self.assertEqual((admission.balance.gross_energy, admission.balance.encumbered), (0.2, 0.5))
+        self.assertEqual((admission.balance.available, admission.balance.shortfall), (0.0, 0.3))
+        self.assertEqual((admission.status, admission.reason), ("deferred", "reservation_shortfall"))
+        later = domain.quote_work(
+            profile(), degraded, "activity:two", "thinking", 1.0,
+            (WorkComponent("work", "duration", duration_rate=0.1),), valid_until=20.0,
+        )
+        with self.assertRaisesRegex(ValueError, "reservation_shortfall"):
+            domain.reserve_work(degraded, (pending,), later, "reservation:two", "effect:two")
+        restored = state(0.8)
+        unknown = domain.check_work_start(restored, (pending,), reservation_id=reservation.reservation_id)
+        self.assertEqual((unknown.status, unknown.reason), ("pending_confirmation", "receipt_unknown"))
+        self.assertAlmostEqual(unknown.balance.available, 0.3)
+        released = domain.release_or_cancel(pending, execution_known=True).reservation
+        clear = domain.check_work_start(restored, (released,), additional_cost=0.5)
+        self.assertEqual(clear.status, "clear")
+        self.assertEqual(clear.balance.encumbered, 0.0)
+
+    def test_actual_cost_above_gross_retains_unpaid_evidence_and_blocks_new_work(self):
+        domain = BodyDomain()
+        quote = domain.quote_work(
+            profile(), state(), "activity:one", "thinking", 5.0,
+            (WorkComponent("work", "duration", duration_rate=0.1),), valid_until=20.0,
+        )
+        reservation = domain.reserve_work(state(), (), quote, "reservation:one", "effect:one")
+        settled = domain.settle_component(
+            state(0.2), reservation, "work", actual_cost=0.4, component_receipt="segment:one"
+        )
+        self.assertEqual(settled.state.energy, 0.0)
+        self.assertAlmostEqual(settled.unpaid_cost, 0.2)
+        self.assertAlmostEqual(settled.overrun, 0.2)
+        self.assertEqual(settled.reservation.status, "overrun")
+        duplicate = domain.settle_component(
+            settled.state, settled.reservation, "work", actual_cost=0.4, component_receipt="segment:one"
+        )
+        self.assertTrue(duplicate.duplicate)
+        self.assertEqual(domain.check_work_start(state(0.8), (settled.reservation,)).reason, "overrun")
+        with self.assertRaisesRegex(ValueError, "reconciliation"):
+            domain.release_or_cancel(settled.reservation, execution_known=True)
 
 
 if __name__ == "__main__":

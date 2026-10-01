@@ -227,6 +227,15 @@ def test_execution_binding_v2_roundtrip_is_explicit_and_v1_stays_historical() ->
     assert type(from_wire(to_wire(original_v1))) is ExecutionBindingV1
 
 
+def test_execution_binding_accepts_urlsafe_content_fence_without_controls() -> None:
+    token = "_" + "A" * 63
+    original = binding(content_fence=token)
+    assert from_wire(to_wire(binding_v2(origin=original))).origin.content_fence == token
+    for bad in (token + "\n", "_" + "A" * 30 + "!", "_" + "A" * 256):
+        with pytest.raises(ValueError, match="content_fence"):
+            binding(content_fence=bad)
+
+
 @pytest.mark.parametrize("changes", [
     {"graph_namespace": "ns-other"},
     {"graph_incarnation": ""},

@@ -140,7 +140,7 @@ class AuthorityV2TerminalC02RecoveryReadService:
         with fences._frozen() as (db, deletion_head, execution_head, history):
             anchor = fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder)
-            if history or anchor.authority_id != request.original_key.authority_id:
+            if anchor.authority_id != request.original_key.authority_id:
                 raise AuthorityUnavailable("terminal C02 recovery anchor unavailable")
             intent, _ = self._original_locked(db, request, anchor, content=False)
         candidate = FencePermitV2(
@@ -153,7 +153,7 @@ class AuthorityV2TerminalC02RecoveryReadService:
             current = fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=anchor.activation_generation)
-            if history or current != anchor:
+            if current != anchor:
                 raise AuthorityUnavailable("terminal C02 recovery anchor changed")
             original, _ = self._original_locked(db, request, current, content=False)
             if original != intent:
@@ -173,7 +173,7 @@ class AuthorityV2TerminalC02RecoveryReadService:
             current = fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=permit.generation)
-            if history or current != permit.pinned_anchor:
+            if current != permit.pinned_anchor:
                 raise AuthorityUnavailable("terminal C02 recovery anchor changed")
             fences.fences.validate_fence_locked(
                 db, permit, subject=self._read_subject, current_anchor=current)
@@ -209,7 +209,7 @@ class AuthorityV2TerminalC02RecoveryReadService:
                     anchor = fences._current_locked(
                         db, deletion_head, execution_head, holder=self._holder,
                         generation=permit.generation)
-                    if history or anchor != permit.pinned_anchor:
+                    if anchor != permit.pinned_anchor:
                         raise AuthorityUnavailable("terminal C02 recovery anchor changed")
                     intent, _ = self._original_locked(db, request, anchor, content=False)
                 if self._graph.current(request, intent, permit) is not True:
@@ -218,7 +218,7 @@ class AuthorityV2TerminalC02RecoveryReadService:
                     anchor = fences._current_locked(
                         db, deletion_head, execution_head, holder=self._holder,
                         generation=permit.generation)
-                    if history or anchor != permit.pinned_anchor:
+                    if anchor != permit.pinned_anchor:
                         raise AuthorityUnavailable("terminal C02 recovery anchor changed")
                     row = fences.fences._row(db, request.read_attempt_id)
                     if row is None or fences.fences._permit(row) != permit:

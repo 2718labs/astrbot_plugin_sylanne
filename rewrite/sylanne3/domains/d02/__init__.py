@@ -111,6 +111,24 @@ class BodyState:
 
 
 @dataclass(frozen=True)
+class BodyPassiveRates:
+    """Configured rates for a source-qualified interval with no observed work."""
+
+    energy_recovery: float
+    fatigue_recovery: dict[str, float]
+    load_recovery: float
+
+    def __post_init__(self) -> None:
+        _nonnegative(self.energy_recovery, "energy_recovery")
+        _nonnegative(self.load_recovery, "load_recovery")
+        rates = dict(self.fatigue_recovery)
+        for kind, rate in rates.items():
+            _identifier(kind, "fatigue work kind")
+            _nonnegative(rate, "fatigue_recovery")
+        object.__setattr__(self, "fatigue_recovery", rates)
+
+
+@dataclass(frozen=True)
 class WorkComponent:
     component_id: str
     cost_category: str
@@ -119,6 +137,8 @@ class WorkComponent:
 
     def __post_init__(self) -> None:
         _identifier(self.component_id, "component_id")
+        if "|" in self.component_id:
+            raise ValueError("component_id cannot contain the settlement delimiter")
         _identifier(self.cost_category, "cost_category")
         _nonnegative(self.fixed_cost, "fixed_cost")
         _nonnegative(self.duration_rate, "duration_rate")
@@ -161,6 +181,10 @@ class BodyReservation:
             raise ValueError("settled_components must be unique")
         for item in settled:
             _identifier(item, "settled component")
+            if "|" not in item or not item.split("|", 1)[0] or not item.split("|", 1)[1]:
+                raise ValueError("settled component needs its original receipt")
+        if len({item.split("|", 1)[0] for item in settled}) != len(settled):
+            raise ValueError("one work component cannot be settled twice")
         if self.status not in {"reserved", "pending_confirmation", "overrun", "settled", "released"}:
             raise ValueError("unknown reservation status")
         object.__setattr__(self, "settled_components", settled)
@@ -172,6 +196,20 @@ class ResourceBalance:
     encumbered: float
     available: float
     shortfall: float
+    unknown_encumbered: float = 0.0
+
+
+@dataclass(frozen=True)
+class ResourceAdmission:
+    """A read-only decision over one committed state and its reservations.
+
+    The caller must read the state and every reservation from the same graph
+    version, then validate that version again when committing a new segment.
+    """
+
+    balance: ResourceBalance
+    status: str
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -190,6 +228,7 @@ class SettlementResult:
     reservation: BodyReservation
     duplicate: bool
     overrun: float
+    unpaid_cost: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -233,6 +272,7 @@ def _validate_settlement(value: object) -> None:
     if type(data["duplicate"]) is not bool:
         raise TypeError("duplicate must be bool")
     _nonnegative(data["overrun"], "overrun")
+    _nonnegative(data["unpaid_cost"], "unpaid_cost")
     SettlementResult(**data)
 
 
@@ -419,7 +459,44 @@ class BodyDomain:
         if any(not isinstance(item, BodyReservation) for item in active):
             raise TypeError("reservations must contain BodyReservation values")
         encumbered = sum(item.remaining_cost for item in active if item.status in {"reserved", "pending_confirmation"})
-        return ResourceBalance(state.energy, encumbered, max(0.0, state.energy - encumbered), max(0.0, encumbered - state.energy))
+        unknown = sum(item.remaining_cost for item in active if item.status == "pending_confirmation")
+        return ResourceBalance(state.energy, encumbered, max(0.0, state.energy - encumbered),
+                               max(0.0, encumbered - state.energy), unknown)
+
+    @classmethod
+    def check_work_start(
+        cls, state: BodyState, reservations: tuple[BodyReservation, ...],
+        *, reservation_id: str | None = None, additional_cost: float = 0.0,
+    ) -> ResourceAdmission:
+        """Check a new segment or reservation against the same resource ledger.
+
+        A prior reservation only identifies an approved budget; it never
+        overrides a shortfall or an unresolved receipt. This is a candidate,
+        not a durable lease or a substitute for D11's atomic version check.
+        """
+        reservations = tuple(reservations)
+        balance = cls.balance(state, reservations)
+        additional_cost = _nonnegative(additional_cost, "additional_cost")
+        if reservation_id is not None:
+            _identifier(reservation_id, "reservation_id")
+        ids = [item.reservation_id for item in reservations]
+        if len(ids) != len(set(ids)):
+            raise ValueError("reservation IDs must be unique in one resource snapshot")
+        if any(item.status == "overrun" for item in reservations):
+            return ResourceAdmission(balance, "deferred", "overrun")
+        if balance.shortfall > 1e-12:
+            return ResourceAdmission(balance, "deferred", "reservation_shortfall")
+        if reservation_id is not None:
+            matches = [item for item in reservations if item.reservation_id == reservation_id]
+            if not matches:
+                return ResourceAdmission(balance, "stale", "reservation_missing")
+            if matches[0].status == "pending_confirmation":
+                return ResourceAdmission(balance, "pending_confirmation", "receipt_unknown")
+            if matches[0].status != "reserved":
+                return ResourceAdmission(balance, "stale", "reservation_inactive")
+        if balance.available + 1e-12 < additional_cost:
+            return ResourceAdmission(balance, "deferred", "insufficient_unencumbered_energy")
+        return ResourceAdmission(balance, "clear")
 
     def reserve_work(
         self, state: BodyState, reservations: tuple[BodyReservation, ...], quote: BodyQuote,
@@ -429,12 +506,15 @@ class BodyDomain:
             raise TypeError("quote must be BodyQuote")
         _identifier(reservation_id, "reservation_id")
         _identifier(effect_id, "effect_id")
-        if quote.state_version != state.version:
+        if quote.state_version != state.version or quote.profile_id != state.profile_id:
             raise ValueError("quote is stale")
+        if quote.valid_until <= state.cursor:
+            raise ValueError("quote has expired")
         if any(item.reservation_id == reservation_id or item.effect_id == effect_id for item in reservations):
             raise ValueError("reservation or effect already exists")
-        if self.balance(state, reservations).available + 1e-12 < quote.max_energy_cost:
-            raise ValueError("insufficient unencumbered energy")
+        admission = self.check_work_start(state, reservations, additional_cost=quote.max_energy_cost)
+        if admission.status != "clear":
+            raise ValueError(admission.reason or admission.status)
         return BodyReservation(reservation_id, quote.quote_id, effect_id, quote.max_energy_cost, quote.max_energy_cost)
 
     def settle_component(
@@ -444,12 +524,19 @@ class BodyDomain:
         if not isinstance(state, BodyState) or not isinstance(reservation, BodyReservation):
             raise TypeError("state and reservation must be D02 values")
         _identifier(component_id, "component_id")
+        if "|" in component_id:
+            raise ValueError("component_id cannot contain the settlement delimiter")
         _identifier(component_receipt, "component_receipt")
         actual_cost = _nonnegative(actual_cost, "actual_cost")
         settlement_key = f"{component_id}|{component_receipt}"
         if settlement_key in reservation.settled_components:
             return SettlementResult(state, reservation, True, 0.0)
-        overrun = max(0.0, actual_cost - reservation.remaining_cost)
+        if any(item.startswith(f"{component_id}|") for item in reservation.settled_components):
+            raise ValueError("component already settled under another receipt")
+        if reservation.status in {"overrun", "settled", "released"}:
+            raise ValueError("reservation cannot accept another settlement")
+        unpaid_cost = max(0.0, actual_cost - state.energy)
+        overrun = max(0.0, actual_cost - reservation.remaining_cost, unpaid_cost)
         charged = min(state.energy, actual_cost)
         next_state = replace(state, version=state.version + 1, energy=max(0.0, state.energy - charged))
         next_reservation = replace(
@@ -458,12 +545,14 @@ class BodyDomain:
             settled_components=reservation.settled_components + (settlement_key,),
             status="overrun" if overrun else ("settled" if reservation.remaining_cost <= actual_cost else "reserved"),
         )
-        return SettlementResult(next_state, next_reservation, False, overrun)
+        return SettlementResult(next_state, next_reservation, False, overrun, unpaid_cost)
 
     @staticmethod
     def release_or_cancel(reservation: BodyReservation, *, execution_known: bool) -> CancellationResult:
         if not isinstance(reservation, BodyReservation):
             raise TypeError("reservation must be BodyReservation")
+        if reservation.status == "overrun":
+            raise ValueError("overrun requires explicit reconciliation before release")
         if not execution_known:
             return CancellationResult(replace(reservation, status="pending_confirmation"), "pending_confirmation")
         return CancellationResult(replace(reservation, remaining_cost=0.0, status="released"), "released")
@@ -477,6 +566,52 @@ class BodyDomain:
             return value
         equilibrium = a / rate
         return equilibrium + (value - equilibrium) * math.exp(-rate * dt)
+
+    @classmethod
+    def advance_passive_body(
+        cls, state: BodyState, rates: BodyPassiveRates, *,
+        from_cursor: float, to_cursor: float,
+    ) -> BodyState:
+        """Calculate a passive state candidate; D11 proves the time mapping."""
+        if not isinstance(state, BodyState) or not isinstance(rates, BodyPassiveRates):
+            raise TypeError("body state and passive rates are required")
+        start = _nonnegative(from_cursor, "from_cursor")
+        end = _nonnegative(to_cursor, "to_cursor")
+        if start != state.cursor or end <= start:
+            raise ValueError("passive interval must advance the committed body cursor")
+        if set(rates.fatigue_recovery) != set(state.fatigue):
+            raise ValueError("passive rates must cover every current fatigue axis")
+        dt = end - start
+        return replace(
+            state, version=state.version + 1, cursor=end,
+            energy=cls.advance_scalar(state.energy, rates.energy_recovery, 0.0, dt),
+            fatigue={kind: cls.advance_scalar(value, 0.0,
+                                              rates.fatigue_recovery[kind], dt)
+                     for kind, value in state.fatigue.items()},
+            load=cls.advance_scalar(state.load, 0.0, rates.load_recovery, dt),
+        )
+
+    @staticmethod
+    def apply_settled_work_effect(
+        settlement: SettlementResult, *, work_kind: str,
+        fatigue_increase: float, load_increase: float,
+    ) -> SettlementResult:
+        """Attach non-energy effects to one newly settled work component."""
+        if not isinstance(settlement, SettlementResult):
+            raise TypeError("settlement is required")
+        _identifier(work_kind, "work_kind")
+        fatigue_increase = _nonnegative(fatigue_increase, "fatigue_increase")
+        load_increase = _nonnegative(load_increase, "load_increase")
+        if work_kind not in settlement.state.fatigue:
+            raise ValueError("work kind is absent from current body state")
+        if settlement.duplicate:
+            return settlement
+        state = settlement.state
+        fatigue = dict(state.fatigue)
+        fatigue[work_kind] = min(1.0, fatigue[work_kind] + fatigue_increase)
+        affected = replace(state, fatigue=fatigue,
+                           load=min(1.0, state.load + load_increase))
+        return replace(settlement, state=affected)
 
     @staticmethod
     def invalidate(refs: tuple[object, ...]) -> tuple[object, ...]:

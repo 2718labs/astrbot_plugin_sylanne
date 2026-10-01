@@ -35,6 +35,9 @@ class PostC02AttentionCandidateV1:
     bundle: DomainBundle
     ticket: AttentionTicket
     focus: FocusState
+    selected_ticket_id: str
+    inbound_deferred: bool
+    wake_at: float | None
 
 
 def prepare_post_c02_attention_v1(
@@ -44,9 +47,23 @@ def prepare_post_c02_attention_v1(
     parent_budget_lease_ref: str, conversation_ref: str,
     now_utc: float, monotonic_deadline: float,
     ticket_lifetime_seconds: float = 300.0,
+    current_policy: AttentionPolicy | None = None,
+    active_head_ref: GraphVersion | None = None,
+    current_competitor: object | None = None,
 ) -> PostC02AttentionCandidateV1:
     """Build one source-bound ticket and advance focus one graph revision."""
     namespace = authority.namespace
+    if (current_policy is None) != (active_head_ref is None):
+        raise ValueError("D07 current policy and active head must be paired")
+    if current_policy is None:
+        current_policy = AttentionPolicy.default()
+    elif (type(current_policy) is not AttentionPolicy
+          or type(snapshot) is not GraphSnapshot
+          or type(guard) is not VersionGuard
+          or type(active_head_ref) is not GraphVersion
+          or active_head_ref not in snapshot.versions
+          or active_head_ref not in guard.read_versions):
+        raise ValueError("D07 current policy lacks its graph read version")
     source = AtomKey.from_token(source_ref)
     if (type(c02_receipt) is not CommitReceipt
             or c02_receipt.status != "committed"
@@ -102,12 +119,32 @@ def prepare_post_c02_attention_v1(
         c02_receipt.commit_seq or 0, now_utc + ticket_lifetime_seconds,
         True, True, (), (source_ref,),
     )
+    from ..domains.d07.post_c02_competition import choose_post_c02_attention_v2
+    from ..runtime.d07_current_competitor_v2 import D07CurrentCompetingTicketV2
+
+    if current_competitor is not None:
+        if (type(current_competitor) is not D07CurrentCompetingTicketV2
+                or current_competitor.ticket_version
+                   not in snapshot.versions
+                or current_competitor.ticket_version
+                   not in guard.read_versions
+                or any(version not in snapshot.versions
+                       or version not in guard.read_versions
+                       for version in current_competitor.read_versions)):
+            raise ValueError("current competing ticket lacks graph read closure")
+    choice = choose_post_c02_attention_v2(
+        current, ticket,
+        current_competitor.ticket if current_competitor is not None else None,
+        current_policy, now=now_utc)
+    refs = {ticket.ticket_id: ticket_key.token}
+    if current_competitor is not None:
+        refs[current_competitor.ticket.ticket_id] = (
+            current_competitor.ticket_version.key.token)
+    focus = replace(
+        choice.focus, primary_ticket_ref=refs[choice.focus.primary_ticket_ref],
+        auxiliary_ticket_refs=tuple(
+            refs[ref] for ref in choice.focus.auxiliary_ticket_refs))
     provider = D07DomainProvider()
-    focus = provider.allocate_focus(current, (ticket,), AttentionPolicy.default(),
-                                    now=now_utc)
-    if focus.primary_ticket_ref != ticket_id:
-        raise ValueError("inbound source was not selected for focus")
-    focus = replace(focus, primary_ticket_ref=ticket_key.token)
     inputs = (source_ref,)
     identity = OperationIdentity(
         c02_receipt.activity_id, None, "attention-attempt", "post_c02_attention",
@@ -125,7 +162,9 @@ def prepare_post_c02_attention_v1(
     proposal = provider.attention_focus_proposal(
         envelope, snapshot, ticket, focus, now=now_utc)
     bundle = DomainBundle(proposal.envelope, (proposal,), (), (), (), (), (), (), ())
-    return PostC02AttentionCandidateV1(bundle, ticket, focus)
+    return PostC02AttentionCandidateV1(
+        bundle, ticket, focus, choice.selected_ticket_id,
+        choice.inbound_deferred, choice.wake_at)
 
 
 __all__ = (

@@ -4,8 +4,8 @@ from dataclasses import replace
 
 import pytest
 
-from rewrite.sylanne3.domains.d08 import CommunicationIntentGrant, SegmentGrant
-from rewrite.sylanne3.domains.d09 import (
+from sylanne3.domains.d08 import CommunicationIntentGrant, SegmentGrant
+from sylanne3.domains.d09 import (
     AdmissionReceipt,
     ClaimKind,
     ClaimUse,
@@ -17,8 +17,8 @@ from rewrite.sylanne3.domains.d09 import (
     TopicThread,
     segment_payload_digest,
 )
-from rewrite.sylanne3.graph_types import AtomKey, GraphVersion, GraphWrite, Owner, TypeSpec
-from rewrite.sylanne3.runtime_contracts import (
+from sylanne3.graph_types import AtomKey, GraphVersion, GraphWrite, Owner, TypeSpec
+from sylanne3.runtime_contracts import (
     AuthorityContext,
     CommandEnvelope,
     DependencySet,
@@ -302,7 +302,7 @@ def test_dialogue_continuity_preserves_unanswered_slots_through_interruption() -
 def test_provider_supplies_real_d09_type_specs_without_dispatch_capability() -> None:
     provider = D09ExpressionProvider()
     specs = provider.register_types()
-    assert len(specs) == 7
+    assert len(specs) == 11
     assert all(isinstance(spec, TypeSpec) for spec in specs)
     assert all(spec.writer_domain == "d09" for spec in specs)
     assert all(spec.schema_hash and callable(spec.validator) for spec in specs)

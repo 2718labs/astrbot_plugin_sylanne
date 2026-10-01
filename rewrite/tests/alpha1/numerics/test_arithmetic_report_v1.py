@@ -91,6 +91,91 @@ class ArithmeticReportTests(unittest.TestCase):
         self.assertNotEqual(report.input_sha256, other.input_sha256)
         self.assertEqual(other.threshold_relation, -1)
 
+    def test_multiaxis_nonlinear_input_ledger_encloses_decimal_reference(self):
+        # Dense Decimal reference is independent of the native CSR arithmetic.
+        k = ((2.0, -0.25, 0.0), (-0.25, 1.5, 0.125), (0.0, 0.125, 1.0))
+        r = ((1.0, 0.125, 0.0), (0.125, 0.75, 0.0), (0.0, 0.0, 0.5))
+        j = ((0.0, 0.25, 0.0), (-0.25, 0.0, 0.125), (0.0, -0.125, 0.0))
+        a = ((0.5, -0.25, 0.0), (0.0, 0.5, 0.25))
+        alpha = (0.25, 0.125)
+        x, y = (0.25, -0.125, 0.0625), (0.23, -0.11, 0.07)
+        drive, h = (0.125, -0.0625, 0.03125), 0.0625
+
+        def csr(matrix):
+            offsets, indices, values = [0], [], []
+            for row in matrix:
+                for column, value in enumerate(row):
+                    if value:
+                        indices.append(column)
+                        values.append(value)
+                offsets.append(len(indices))
+            return tuple(offsets), tuple(indices), tuple(values)
+
+        report = self.reporter.report(
+            n=3, k=csr(k), r=csr(r), j=csr(j), a=csr(a),
+            alpha=alpha, x=x, y=y, drive=drive, readout=(1.0, 0.0, 0.0),
+            h=h, inherited_error_upper=0.0, threshold=0.0,
+        )
+
+        with localcontext() as context:
+            context.prec = 90
+            d = Decimal.from_float
+            xd, yd, ud = tuple(map(d, x)), tuple(map(d, y)), tuple(map(d, drive))
+            kd, rd, jd, ad = (
+                tuple(tuple(map(d, row)) for row in matrix)
+                for matrix in (k, r, j, a)
+            )
+            weights, step = tuple(map(d, alpha)), d(h)
+
+            def dot(left, right):
+                return sum((u * v for u, v in zip(left, right)), Decimal(0))
+
+            def multiply(matrix, vector):
+                return tuple(dot(row, vector) for row in matrix)
+
+            def log_cosh(value):
+                return ((value.exp() + (-value).exp()) / 2).ln()
+
+            def energy(state):
+                quadratic = dot(state, multiply(kd, state)) / 2
+                return quadratic + sum((weight * log_cosh(dot(row, state))
+                                        for row, weight in zip(ad, weights)), Decimal(0))
+
+            midpoint = tuple((left + right) / 2 for left, right in zip(xd, yd))
+            gradient = list(multiply(kd, midpoint))
+            for row, weight in zip(ad, weights):
+                before, after = dot(row, xd), dot(row, yd)
+                secant = ((log_cosh(after) - log_cosh(before)) / (after - before)
+                           if after != before else (before.exp() - (-before).exp())
+                           / (before.exp() + (-before).exp()))
+                gradient = [value + weight * coefficient * secant
+                            for value, coefficient in zip(gradient, row)]
+            displacement = tuple(right - left for left, right in zip(xd, yd))
+            damping, rotation = multiply(rd, gradient), multiply(jd, gradient)
+            residual = tuple(delta - step * (spin - loss + applied)
+                             for delta, spin, loss, applied
+                             in zip(displacement, rotation, damping, ud))
+            reference = {
+                "energy_difference": energy(yd) - energy(xd),
+                "gradient_displacement": dot(gradient, displacement),
+                "dissipation": -step * dot(gradient, damping),
+                "drive_work": step * dot(gradient, ud),
+                "residual_work": dot(gradient, residual),
+                "residual_norm": dot(residual, residual).sqrt(),
+            }
+            reference["gradient_identity_defect"] = (
+                reference["energy_difference"] - reference["gradient_displacement"]
+            )
+            reference["energy_balance_defect"] = (
+                reference["energy_difference"] - reference["dissipation"]
+                - reference["drive_work"] - reference["residual_work"]
+            )
+            self.assertGreater(abs(reference["drive_work"]), Decimal("1e-5"))
+            for name, exact in reference.items():
+                lower, upper = report.intervals[name]
+                self.assertLessEqual(d(lower), exact, name)
+                self.assertGreaterEqual(d(upper), exact, name)
+
     def test_failure_and_cancel_cannot_reuse_success(self):
         self.reporter.report(**self.args())
         bad = self.args()

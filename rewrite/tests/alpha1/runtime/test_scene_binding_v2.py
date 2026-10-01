@@ -25,14 +25,15 @@ from test_graph_v2_provisioning import _owner_issue_case
 from test_role_initialization_v2 import _resources
 
 
-def _scene_case(tmp_path, *, owner_capabilities=None,
+def _scene_case(tmp_path, *, owner_capabilities=None, owner_purposes=None,
                 enable_ingress=True, owner_command=True, extra_specs=(),
                 arrival_allowed=False, extra_work_kinds=()):
     (store, authority_db, port, coordinator, policy, operation,
      pending, grant_value, bootstrap) = _owner_issue_case(
         tmp_path, first_ingress=enable_ingress, return_bootstrap=True,
         role_types=True, scene_types=True,
-        owner_capabilities=owner_capabilities, extra_specs=extra_specs,
+        owner_capabilities=owner_capabilities, owner_purposes=owner_purposes,
+        extra_specs=extra_specs,
         arrival_allowed=arrival_allowed, extra_work_kinds=extra_work_kinds)
     port.pending_owner = pending
     proof = coordinator.commit_first_owner_grant_v2(
@@ -45,7 +46,7 @@ def _scene_case(tmp_path, *, owner_capabilities=None,
     def guarded(*, namespace, authority_namespace, permit, **session_kwargs):
         port.outside_graph_lock()
         assert namespace == policy.namespace
-        assert authority_namespace == "opaque:" + namespace.persona_id
+        assert authority_namespace == policy.authority_namespace
         assert port.fences.validate_fence(
             permit, subject="subject", current_anchor=port.anchors[namespace]) == permit
         if session_kwargs:
@@ -70,7 +71,7 @@ def _scene_case(tmp_path, *, owner_capabilities=None,
         resources=_resources(store, policy.namespace, plan),
         actor_id="paired-owner", owner_session_token="A" * 43,
         owner_session_request=OwnerSessionLoginRequestV1(
-            operation.authority_id, "opaque:" + policy.namespace.persona_id,
+            operation.authority_id, policy.authority_namespace,
             operation.installation_id, operation.principal,
             "credential:owner", 1, "owner", "http://localhost"),
     )

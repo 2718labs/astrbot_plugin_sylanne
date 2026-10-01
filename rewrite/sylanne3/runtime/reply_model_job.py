@@ -56,6 +56,69 @@ class CurrentReplyModelInputsV1:
 
 
 @dataclass(frozen=True, slots=True)
+class CurrentReplyRouteManifestV2:
+    """Original committed private ingress route, pending live host recheck."""
+
+    namespace: NamespaceId
+    c02_operation_id: str
+    source_ref: str
+    platform_ref: str
+    conversation_ref: str
+    scene_ref: str
+    route_digest: str
+
+
+def read_current_reply_route_manifest_v2(
+    db, namespace: NamespaceId, inputs: CurrentReplyModelInputsV1,
+    source_ref: str,
+) -> CurrentReplyRouteManifestV2:
+    """Derive a reply route from the sealed ingress identity in this graph tx."""
+    from .first_ingress_v2 import scene_ref_for_conversation
+    from .ingress_observation import read_committed_ingress_identity
+
+    if (not db.in_transaction or type(namespace) is not NamespaceId
+            or type(inputs) not in {CurrentReplyModelInputsV1, SettledC02ReplySourceV1}
+            or inputs.c02_receipt.status != "committed"
+            or inputs.source.source_ref != source_ref):
+        raise ReplyModelJobHold("transactional original reply route required")
+    source_id = source_key_from_ref(source_ref, namespace)
+    original = read_committed_ingress_identity(db, namespace, source_id)
+    if original is None:
+        raise ReplyModelJobHold("original private ingress route is absent")
+    try:
+        identity = json.loads(original.identity_json)
+        platform_ref = identity["platform_ref"]
+        conversation_ref = identity["conversation_ref"]
+        visibility = identity["visibility"]
+        platform = json.loads(platform_ref)
+        conversation = json.loads(conversation_ref)
+        if (visibility != "private"
+                or conversation_ref != inputs.conversation_ref
+                or type(platform) is not list or len(platform) != 3
+                or type(conversation) is not list or len(conversation) != 2
+                or any(type(item) is not str or not item
+                       for item in (*platform, *conversation))
+                or json.dumps(platform, ensure_ascii=True, separators=(",", ":"))
+                   != platform_ref
+                or json.dumps(conversation, ensure_ascii=True, separators=(",", ":"))
+                   != conversation_ref):
+            raise ReplyModelJobHold("original private reply route differs")
+        scene_ref = scene_ref_for_conversation(
+            namespace, platform_ref, conversation_ref)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReplyModelJobHold("original private reply route is invalid") from exc
+    return CurrentReplyRouteManifestV2(
+        namespace, inputs.c02_receipt.operation_id, source_ref,
+        platform_ref, conversation_ref, scene_ref,
+        canonical_digest({
+            "account_ref": platform_ref,
+            "destination_ref": conversation_ref,
+            "scene_ref": scene_ref,
+        }),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class SettledC02ReplySourceV1:
     c02_receipt: CommitReceipt
     source: ReplySourceSnapshot
@@ -195,6 +258,25 @@ class ReplyModelQueuedPreparationV1:
     quote: ResourceQuote
     reservation_digest: str
     graph_job_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyModelRecoveryItemV1:
+    job_id: str
+    preparation: ReplyModelQueuedPreparationV1 | None
+    conversation_ref: str | None
+    hold_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReplyModelRecoveryPageV1:
+    namespace: NamespaceId
+    installation_id: str
+    graph_incarnation: str
+    graph_revision: int
+    graph_epoch: int
+    items: tuple[ReplyModelRecoveryItemV1, ...]
+    next_cursor: str | None
 
 
 def read_saved_reply_job_v1(db, issuer: D02ResourceIssuer,
@@ -490,6 +572,14 @@ def issue_reply_job_in_transaction_v1(
         raise ReplyModelJobHold("signed root budget or reply profile differs")
     c02_operation_id = inputs.c02_receipt.operation_id
     source_ref = inputs.source.source_ref
+    from .natural_reply_job_v2 import install_schema as install_natural_schema
+    install_natural_schema(db)
+    if db.execute(
+            "SELECT 1 FROM graph_natural_generation_preparations_v2 "
+            "WHERE bot=? AND persona=? AND parent_original_id=?",
+            namespace.as_tuple + (c02_operation_id,),
+    ).fetchone() is not None:
+        raise ReplyModelJobHold("original natural reply identity already exists")
     original_operation_id = reply_job_original_operation_id_v1(
         c02_operation_id, source_ref)
     job_id = reply_job_id_v1(c02_operation_id, source_ref)

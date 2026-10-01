@@ -420,6 +420,13 @@ def validate_d11_writes(writes: tuple[GraphWrite, ...], namespace: NamespaceId,
     cost_operations: set[str] = set()
     decoded: list[tuple[GraphWrite, object]] = []
     for write in writes:
+        from .d11_life_graph_types_v1 import TYPES as LIFE_TYPES, validate_life_graph_value_v1
+        if write.key.type_name in LIFE_TYPES:
+            binding = validate_life_graph_value_v1(write.key.type_name, write.value)
+            if (binding.namespace != namespace or binding.activity_id != activity_id or binding.effect_id != effect_id
+                    or NamespaceId.from_key(write.key) != namespace):
+                raise ValueError("Life graph fact differs from actual bundle identity")
+            continue
         if (write.key.type_name not in _TYPE_NAMES
                 or write.key.owner.kind != "activity"
                 or NamespaceId.from_key(write.key) != namespace
@@ -485,7 +492,8 @@ class D11RuntimeProvider:
         )
 
     def type_specs(self) -> tuple[TypeSpec, ...]:
-        return graph_type_specs() + (role_resources_spec(), dispatch_claim_type_spec())
+        from .d11_life_graph_types_v1 import life_graph_type_specs_v1
+        return graph_type_specs() + (role_resources_spec(), dispatch_claim_type_spec()) + life_graph_type_specs_v1()
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())

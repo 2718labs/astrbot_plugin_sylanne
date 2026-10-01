@@ -57,6 +57,9 @@ class DeletionReadCandidate:
     current_dependency_refs: tuple[str, ...] = ()
     storage_path_status: str = "unverified"
     pending_c02_sources: tuple[tuple[str, str], ...] = ()
+    graph_cache_refs: tuple[str, ...] = ()
+    graph_cache_historical_versions: tuple[GraphVersion, ...] = ()
+    other_domain_historical_versions: tuple[GraphVersion, ...] = ()
 
 
 def read_deletion_closure_candidate(
@@ -511,6 +514,22 @@ def read_deletion_closure_candidate_from_coordinator(
         (GraphVersion(key, revision) for key, revision in history_closure),
         key=lambda item: (item.key.token, item.revision),
     ))
+    # The fenced graph port also sees D13 cache atoms and history belonging to
+    # other graph writers. These are exact graph dependency hits only: sidecar
+    # indexes, process caches, and semantic references outside graph edges
+    # still need their own owner inventories before deletion can proceed.
+    graph_cache_refs = tuple(sorted(
+        key.token for key in current_dependency_keys
+        if key.type_name == "d13.compressed_turn_block.v2"
+    ))
+    graph_cache_historical_versions = tuple(
+        version for version in historical_versions
+        if version.key.type_name == "d13.compressed_turn_block.v2"
+    )
+    other_domain_historical_versions = tuple(
+        version for version in historical_versions
+        if version.key.type_name not in d06_type_names
+    )
     historical_refs = {key.token for key, _ in history_closure}
     # Include historical D06 objects in the same typed candidate facets.
     for key, revision in history_closure:
@@ -586,6 +605,15 @@ def read_deletion_closure_candidate_from_coordinator(
         for operation_id, source_ref in first.pending_c02_sources
         if source_ref in affected_source_refs
     )
+    covered = (
+        "current_d06_values", "current_reverse_dependency_edges",
+        "historical_graph_values", "historical_dependency_edges",
+        "memory_retriever_direct_graph_atom_path",
+        "pending_first_ingress_c02_inventory",
+    )
+    if complete:
+        covered += ("graph_backed_cache_dependency_inventory",
+                    "other_domain_graph_dependency_history_inventory")
     return DeletionReadCandidate(
         request.request_id, tuple(key.token for key in roots),
         tuple(sorted(key.token for key in source_descendants)),
@@ -596,13 +624,12 @@ def read_deletion_closure_candidate_from_coordinator(
         tuple(sorted(key.token for key in recollections)),
         tuple(sorted(read_versions.values(), key=lambda item: item.key.token)),
         epoch, complete, None,
-        ("current_d06_values", "current_reverse_dependency_edges",
-         "historical_graph_values", "historical_dependency_edges",
-         "memory_retriever_direct_graph_atom_path",
-         "pending_first_ingress_c02_inventory"),
+        covered,
         unique_missing, "hold" if complete else "partial_hold",
         historical_versions, *access_delete_epochs,
         tuple(sorted(key.token for key in current_dependency_keys)),
         "graph_atoms_and_pending_c02_candidates",
         pending_c02_sources,
+        graph_cache_refs, graph_cache_historical_versions,
+        other_domain_historical_versions,
     )

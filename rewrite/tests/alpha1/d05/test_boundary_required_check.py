@@ -1,10 +1,14 @@
 import unittest
+from dataclasses import replace
 
 from sylanne3.domains.d05 import BoundaryRule, BoundaryRuleReadSet, RelationshipProvider
 from sylanne3.domains.d08.execution import ActionIntent, ActionSchema, GoalPredicate, RequiredCheckSpec
 from sylanne3.runtime_contracts import (
     NamespaceId, OperationIdentity, QueryEpoch, VersionedRef, canonical_digest,
 )
+from sylanne3.graph_store import GraphPage
+from sylanne3.graph_types import GraphAtom, GraphSnapshot, NamespaceEpoch
+from dataclasses import asdict
 
 
 class BoundaryRequiredCheckTests(unittest.TestCase):
@@ -99,6 +103,123 @@ class BoundaryRequiredCheckTests(unittest.TestCase):
         allowed = BoundaryRuleReadSet(self.namespace, self.read_set.query_epoch, (allow_rule,), versions, "full")
         receipt = self.check(read_set=allowed, valid_until=15.0)
         self.assertEqual((receipt.result, receipt.valid_until), ("pass", 8.0))
+
+    def test_current_graph_rule_denies_action_and_records_full_read(self):
+        class Coordinator:
+            def __init__(self, atom):
+                self.atom = atom
+                self.calls = []
+
+            def query(self, authority, lease, **filters):
+                self.calls.append(filters)
+                return GraphPage(GraphSnapshot((self.atom,),
+                                               (NamespaceEpoch("bot", "persona", 7),)), None)
+
+        from sylanne3.graph_types import AtomKey, Owner
+        atom = GraphAtom(
+            AtomKey(Owner("relation", "bot", "persona", "entity:alice"),
+                    "d05.boundary_rule", self.rule.rule_id),
+            self.rule.scope_version,
+            {**asdict(self.rule), "source_refs": list(self.rule.source_refs),
+             "communicated_refs": list(self.rule.communicated_refs),
+             "acknowledged_refs": [], "exception_refs": []},
+        )
+        reader = Coordinator(atom)
+        receipt = RelationshipProvider().boundary_required_check_from_graph(
+            self.intent, self.schema, reader, authority=object(), lease=object(),
+            namespace=self.namespace, audience_scope="direct", scene_ref=None,
+            at_time=5.0, valid_until=20.0,
+        )
+        self.assertEqual((receipt.result, receipt.coverage), ("fail", "full"))
+        self.assertEqual(receipt.input_versions, self.required_versions)
+        self.assertEqual(reader.calls[0]["subject"], "entity:alice")
+
+    def test_graph_reader_rejects_other_subject_even_if_rule_would_pass(self):
+        from sylanne3.graph_types import AtomKey, Owner
+        atom = GraphAtom(
+            AtomKey(Owner("relation", "bot", "persona", "entity:bob"),
+                    "d05.boundary_rule", self.rule.rule_id),
+            self.rule.scope_version,
+            {**asdict(self.rule), "source_refs": list(self.rule.source_refs),
+             "communicated_refs": list(self.rule.communicated_refs),
+             "acknowledged_refs": [], "exception_refs": []},
+        )
+
+        class Coordinator:
+            def query(self, authority, lease, **filters):
+                return GraphPage(GraphSnapshot((atom,),
+                                               (NamespaceEpoch("bot", "persona", 7),)), None)
+
+        with self.assertRaisesRegex(ValueError, "scope"):
+            RelationshipProvider().boundary_required_check_from_graph(
+                self.intent, self.schema, Coordinator(), authority=object(), lease=object(),
+                namespace=self.namespace, audience_scope="direct", scene_ref=None,
+                at_time=5.0, valid_until=20.0,
+            )
+
+    def test_deleted_no_contact_rule_does_not_become_proactive_permission(self):
+        versions = self.required_versions[:2]
+        spec = replace(self.spec, required_input_versions=versions)
+        proactive = replace(self.schema, proactive=True, required_checks=(spec,))
+        intent = replace(self.intent, required_checks=(spec,))
+        read_set = BoundaryRuleReadSet(
+            self.namespace, self.read_set.query_epoch, (), versions, "full",
+        )
+        receipt = RelationshipProvider(
+            boundary_read_verifier=lambda candidate: candidate is read_set,
+        ).boundary_required_check(
+            intent, proactive, read_set, audience_scope="direct", scene_ref=None,
+            at_time=5.0, valid_until=20.0,
+        )
+        self.assertEqual((receipt.result, receipt.coverage), ("unknown", "full"))
+        class EmptyRelationQuery:
+            def query(self, authority, lease, **filters):
+                return GraphPage(GraphSnapshot((),
+                                               (NamespaceEpoch("bot", "persona", 7),)), None)
+
+        graph_receipt = RelationshipProvider().boundary_required_check_from_graph(
+            intent, proactive, EmptyRelationQuery(), authority=object(), lease=object(),
+            namespace=self.namespace, audience_scope="direct", scene_ref=None,
+            at_time=5.0, valid_until=20.0,
+        )
+        self.assertEqual((graph_receipt.result, graph_receipt.coverage), ("unknown", "full"))
+        # An inbound reply has a distinct, frozen non-proactive action schema.
+        reply = replace(proactive, proactive=False)
+        reply_receipt = RelationshipProvider(
+            boundary_read_verifier=lambda candidate: candidate is read_set,
+        ).boundary_required_check(
+            intent, reply, read_set, audience_scope="direct", scene_ref=None,
+            at_time=5.0, valid_until=20.0,
+        )
+        self.assertEqual(reply_receipt.result, "pass")
+
+    def test_separate_current_contact_setting_may_keep_or_explicitly_open_scope(self):
+        setting = replace(self.rule, rule_id="boundary:owner-contact-setting",
+                          effect="deny", basis="self_internal",
+                          source_refs=("source:independent-owner-setting",),
+                          revision_actor="persona:persona")
+        versions = (self.required_versions[0], self.required_versions[1],
+                    VersionedRef(setting.rule_id, setting.scope_version))
+        spec = replace(self.spec, required_input_versions=versions)
+        schema = replace(self.schema, proactive=True, required_checks=(spec,))
+        intent = replace(self.intent, required_checks=(spec,))
+        read_set = BoundaryRuleReadSet(self.namespace, self.read_set.query_epoch,
+                                       (setting,), versions, "full")
+        provider = RelationshipProvider(boundary_read_verifier=lambda candidate: candidate is read_set)
+        denied = provider.boundary_required_check(
+            intent, schema, read_set, audience_scope="direct", scene_ref=None,
+            at_time=5.0, valid_until=20.0,
+        )
+        self.assertEqual(denied.result, "fail")
+        opened = replace(setting, effect="allow")
+        open_read = replace(read_set, rules=(opened,))
+        allowed = RelationshipProvider(
+            boundary_read_verifier=lambda candidate: candidate is open_read,
+        ).boundary_required_check(
+            intent, schema, open_read, audience_scope="direct", scene_ref=None,
+            at_time=5.0, valid_until=20.0,
+        )
+        self.assertEqual(allowed.result, "pass")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,8 @@ def owner_rpc(tmp_path):
             return peer == ADMIN and namespace == AUTH_NS
         if action == "owner_claim":
             return peer == CLAIMANT and namespace == AUTH_NS
+        if action == "owner_authorization_revoke":
+            return peer == CLAIMANT and namespace == AUTH_NS
         if action == "owner_guard_read":
             return peer == CLAIMANT and namespace == AUTH_NS and holder == "holder-owner"
         return peer == CLAIMANT and namespace in {"seed", AUTH_NS}
@@ -89,6 +91,8 @@ def owner_rpc(tmp_path):
             first_claim_verifier=lambda *_: True,
             claimant_verifier=lambda peer, operation: peer == CLAIMANT,
             graph_commit_verifier=lambda operation, proof:
+                verified.append((operation, proof)) or True,
+            revoke_graph_commit_verifier=lambda operation, proof:
                 verified.append((operation, proof)) or True,
         )
         installations = {
@@ -128,6 +132,63 @@ def paired(server, peer):
             command=command)
 
     return call
+
+
+def test_owner_revoke_rpc_is_separate_from_owner_claim(owner_rpc):
+    """Canonical revoke RPCs preserve one original operation and capability."""
+    server, _, verified = owner_rpc
+    claimant, admin = paired(server, CLAIMANT), paired(server, ADMIN)
+    claimant("namespace_genesis", {
+        "namespace": asdict(ROLE), "request_id": "revoke-rpc-genesis"})
+    authority_id = server._authority_id()
+    principal = OwnerPrincipalV1("provider", "account", "incarnation")
+    ticket = OwnerClaimTicketV1(
+        authority_id, "installation-owner", ROLE, principal, "ticket-revoke-rpc",
+        "creation-revoke-rpc", digest("a"), digest("b"), "C" * 43,
+        "2030-01-01T00:00:00Z")
+    genesis = OwnerAuthorizationGuardV1(
+        authority_id, "installation-owner", ROLE, 0, "genesis", 0, 0)
+    issue = OwnerAuthorizationOperationV1(
+        "issue", "issue-revoke-rpc", authority_id, "installation-owner", ROLE,
+        principal, "grant-revoke-rpc", digest("c"), 0, genesis, ticket)
+    issue_proof = OwnerGraphCommitProofV1(
+        ROLE, issue.operation_id, issue.request_digest, issue.grant_id,
+        issue.grant_digest, "graph-revoke-rpc", 1, 1, 2, digest("d"))
+    admin("register_owner_ticket", {"namespace": AUTH_NS, "ticket": to_wire(ticket)})
+    claimant("reserve_owner_issue", {
+        "namespace": AUTH_NS, "operation": to_wire(issue)})
+    committed_issue = claimant("finalize_owner_issue", {
+        "namespace": AUTH_NS, "operation": to_wire(issue),
+        "proof": to_wire(issue_proof)})["receipt"]
+    active_guard = OwnerAuthorizationGuardV1(
+        authority_id, "installation-owner", ROLE, 1,
+        committed_issue["guard"]["authorization_head"], 0, 0)
+    revoke = OwnerAuthorizationOperationV1(
+        "revoke", "revoke-owner-rpc", authority_id, "installation-owner", ROLE,
+        principal, issue.grant_id, digest("e"), 1, active_guard)
+    command = {"namespace": AUTH_NS, "operation": to_wire(revoke)}
+    with pytest.raises(RuntimeError):
+        admin("reserve_owner_revoke", command)
+    with pytest.raises(RuntimeError):
+        claimant("reserve_owner_revoke", {
+            **command, "operation": {**to_wire(revoke), "extra": True}})
+    pending = claimant("reserve_owner_revoke", command)["receipt"]
+    assert pending["phase"] == "pending"
+    assert pending["guard"]["pending_revoke_operation_id"] == revoke.operation_id
+    assert claimant("get_pending_owner_revoke", {
+        "namespace": AUTH_NS, "operation_id": revoke.operation_id})["receipt"] == pending
+    assert claimant("reserve_owner_revoke", command)["receipt"] == pending
+    proof = OwnerGraphCommitProofV1(
+        ROLE, revoke.operation_id, revoke.request_digest, revoke.grant_id,
+        revoke.grant_digest, "graph-revoke-rpc", 2, 2, 3, digest("f"))
+    finalized = {**command, "proof": to_wire(proof)}
+    committed = claimant("finalize_owner_revoke", finalized)["receipt"]
+    assert committed["phase"] == "committed"
+    assert committed["guard"]["minimum_revocation_revision"] == 2
+    assert claimant("get_committed_owner_revoke", {
+        "namespace": AUTH_NS, "operation_id": revoke.operation_id})["receipt"] == committed
+    assert claimant("finalize_owner_revoke", finalized)["receipt"] == committed
+    assert len(verified) == 2
 
 
 def test_owner_issue_rpc_exact_replay_and_claimant_boundary(owner_rpc):

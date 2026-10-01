@@ -40,7 +40,8 @@ def _endpoint(ref: object, axis: object) -> tuple[str, str, AtomKey]:
     if type(ref) is not str or type(axis) is not str or not axis:
         raise ValueError("coupling endpoint needs a checkpoint ref and axis")
     key = AtomKey.from_token(ref)
-    if key.owner.kind != "persona" or key.type_name != "d04.numeric_checkpoint.v1":
+    if key.owner.kind != "persona" or key.type_name not in {
+            "d04.numeric_checkpoint.v1", "d04.numeric_checkpoint.v2"}:
         raise ValueError("coupling endpoint must be a D04 numeric checkpoint")
     if axis not in REGISTERED_AXIS_IDS:
         raise ValueError("coupling axis is absent from the registered 24D template")

@@ -67,7 +67,7 @@ def test_retracted_belief_yields_held_question_without_copying_old_stance():
 
 @pytest.mark.parametrize("field,value,expected", [
     ("source_revision", 1, "versions"),
-    ("state", "complete", "pending reevaluation"),
+    ("state", "complete", "state differs"),
 ])
 def test_stale_or_completed_head_is_not_reused(field, value, expected):
     snapshot = _snapshot()

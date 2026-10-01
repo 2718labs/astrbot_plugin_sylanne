@@ -8,6 +8,7 @@ import pytest
 from sylanne3.authority_service.v2_owner_session import OwnerSessionLoginRequestV1
 from sylanne3.contracts import canonical_json
 from sylanne3.domains.d06 import source_correction_head_key
+from sylanne3.domains.d07 import D07DomainProvider
 from sylanne3.graph_coordinator import UnavailableGuard
 from sylanne3.graph_types import AtomKey, Owner
 from sylanne3.memory_types import source_key
@@ -32,7 +33,8 @@ def _read(case, projection):
 
 
 def test_current_d06_projection_uses_same_fenced_source_and_c04_receipt(tmp_path):
-    case, experience, ancestor_access = _fixture(tmp_path)
+    case, experience, ancestor_access = _fixture(
+        tmp_path, extra_specs=D07DomainProvider.type_specs())
     store, authority_db, _, _, namespace, _ = case
     projection = AtomKey(
         Owner("activity", *namespace.as_tuple, "activity-c04"),
@@ -41,6 +43,9 @@ def test_current_d06_projection_uses_same_fenced_source_and_c04_receipt(tmp_path
     mood = AtomKey(Owner("persona", *namespace.as_tuple),
                    "d04.mood_field.v1", "current")
     source = source_key(*namespace.as_tuple, "source-1")
+    choice = AtomKey(projection.owner, "d07.selection_ticket.v1", "selection-1")
+    interpretation = AtomKey(
+        projection.owner, "d07.current_interpretation.v1", "interpretation-1")
     experience_value = json.loads(store._db.execute(
         "SELECT value FROM graph_atoms WHERE token=?", (experience.token,),
     ).fetchone()[0])
@@ -58,6 +63,44 @@ def test_current_d06_projection_uses_same_fenced_source_and_c04_receipt(tmp_path
         "baseline_status": "not_read",
     }
     try:
+        recollection_ref = AtomKey.from_token(
+            experience_value["recollection_ref"])
+        recollection_value = json.loads(store._db.execute(
+            "SELECT value FROM graph_atoms WHERE token=?",
+            (recollection_ref.token,),
+        ).fetchone()[0])
+        store._db.execute(
+            "UPDATE graph_atoms SET value=? WHERE token=?",
+            (canonical_json({
+                **recollection_value, "selection_ref": choice.name,
+                "candidate_set_id": "candidates-1", "focus_epoch": 1,
+                "now_interpretation_refs": [interpretation.token],
+            }), recollection_ref.token),
+        )
+        for key, item in (
+            (choice, {
+                "schema": "d07.selection_ticket.v1", "ticket_id": choice.name,
+                "activity_id": "activity-c04", "candidate_set_id": "candidates-1",
+                "selected_candidate_ids": ["candidate-1"], "focus_epoch": 1,
+            }),
+            (interpretation, {
+                "schema": "d07.current_interpretation.v1",
+                "interpretation_id": interpretation.name,
+                "activity_id": "activity-c04", "question_key": "why-now",
+                "proposition": "a possible subjective interpretation",
+                "stance": "uncertain", "subjective_conviction": 0.4,
+                "evidence_status": "hypothesis", "source_refs": [source.token],
+                "source_families": ["family-1"], "meaningful_unknowns": [],
+                "current": True,
+            }),
+        ):
+            store._db.execute(
+                "INSERT INTO graph_atoms(token,bot,persona,owner_kind,subject,"
+                "type_name,name,revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,1)",
+                (key.token, *namespace.as_tuple, key.owner.kind,
+                 key.owner.subject, key.type_name, key.name, 1,
+                 canonical_json(item)),
+            )
         store._db.execute(
             "INSERT INTO graph_atoms(token,bot,persona,owner_kind,subject,"
             "type_name,name,revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,1)",
@@ -71,6 +114,7 @@ def test_current_d06_projection_uses_same_fenced_source_and_c04_receipt(tmp_path
         store._db.execute(
             "UPDATE graph_events SET revisions=? WHERE event_id='operation-c04'",
             (canonical_json([*json.loads(original_revisions),
+                             [choice.token, 1], [interpretation.token, 1],
                              [projection.token, 1]]),),
         )
         current = _read(case, projection)
@@ -79,10 +123,20 @@ def test_current_d06_projection_uses_same_fenced_source_and_c04_receipt(tmp_path
         assert current.read_status == "hold_uncertified_c02_baseline"
         assert current.encoding_baseline_certified is False
         assert any(item.key == projection for item in current.read_versions)
+        assert any(item.key == choice for item in current.read_versions)
+        assert any(item.key == interpretation for item in current.read_versions)
         assert "details" not in {field.name for field in fields(current)}
         assert "private source literal" not in repr(current)
         assert "private ancestor literal" not in repr(current)
         assert not store._db.in_transaction
+
+        store._db.execute(
+            "UPDATE graph_atoms SET valid=0 WHERE token=?", (choice.token,))
+        with pytest.raises(UnavailableGuard,
+                           match="current D07 recollection choice"):
+            _read(case, projection)
+        store._db.execute(
+            "UPDATE graph_atoms SET valid=1 WHERE token=?", (choice.token,))
 
         store._db.execute(
             "UPDATE graph_events SET revisions=? WHERE event_id='operation-c04'",
@@ -93,6 +147,7 @@ def test_current_d06_projection_uses_same_fenced_source_and_c04_receipt(tmp_path
         store._db.execute(
             "UPDATE graph_events SET revisions=? WHERE event_id='operation-c04'",
             (canonical_json([*json.loads(original_revisions),
+                             [choice.token, 1], [interpretation.token, 1],
                              [projection.token, 1]]),),
         )
         row = store._db.execute(

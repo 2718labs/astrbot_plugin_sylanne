@@ -1,0 +1,209 @@
+/* Base reset + shell chrome + shared keyframes. Component-specific styles live
+ * scoped inside their SFCs; this file is the global skeleton only. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-head);
+  font-size: var(--font-base);
+  -webkit-font-smoothing: antialiased;
+  transition: background 0.4s ease, color 0.4s ease;
+}
+
+#app {
+  height: 100vh;
+  width: 100%;
+  overflow: hidden;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* mono-data helper */
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* drifting scanline overlay — the "specimen slide" texture */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(255, 255, 255, 0.012) 0,
+    rgba(255, 255, 255, 0.012) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  animation: scanDrift 10s linear infinite;
+}
+
+/* thin accent scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(184, 138, 158, 0.3);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* shared keyframes */
+@keyframes scanDrift {
+  to {
+    transform: translateY(4px);
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(8px);
+  }
+  75% {
+    transform: translateX(-8px);
+  }
+}
+@keyframes dotBreath {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 7px 2px rgba(76, 175, 80, 0.18);
+  }
+}
+
+/* ── Two-tissue anatomy stage ─────────────────────────────────────────────
+ * The dashboard content is an ANATOMY TABLE: the spine rail (SpineNav.vue,
+ * fixed on the viewport's center seam) is the specimen's midline axis, and
+ * each routed page is dissected into two independent tissue panes either
+ * side of it. Ported 1:1 in spirit from the old .page-section/.page-left/
+ * .page-right (UI/index.html 8655acd, lines 290-330 + 566-582).
+ *
+ * Structural laws this enforces:
+ *   1. Nothing ever crosses the midline — no full-width cards/tables. Every
+ *      element belongs to .pane-left or .pane-right.
+ *   2. Each pane scrolls INDEPENDENTLY (overflow-y:auto, hidden scrollbar)
+ *      with a mask-image edge fade top+bottom so content dissolves into the
+ *      void instead of clipping.
+ *   3. The seam gap is negative space OWNED BY THE SPINE, not by pane
+ *      padding tricks: grid is 1fr 40px 1fr with an empty middle column
+ *      (sturdier than a `gap` — a real track the fixed spine floats over),
+ *      and each pane's inward padding (44-48px) extends that clearance so
+ *      content doesn't hug the rail.
+ *
+ * Below 900px SpineNav docks as a left strip (see SpineNav.vue) instead of
+ * straddling a seam, so .page-split collapses to one normal-flow column —
+ * panes stack, no independent scroll, no midline. This is also the old
+ * "mobile" fix: the previous build's `.page-right{display:none}` silently
+ * dropped every control that lived in the right column (config save button,
+ * memory danger-zone) — stacking keeps all of it reachable.
+ */
+.page-split {
+  display: grid;
+  grid-template-columns: 1fr 40px 1fr;
+  height: 100%;
+  min-width: 0;
+}
+.pane-left,
+.pane-right {
+  min-width: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+  padding-top: var(--space-8);
+  padding-bottom: var(--space-8);
+}
+.pane-left::-webkit-scrollbar,
+.pane-right::-webkit-scrollbar {
+  display: none;
+}
+.pane-left {
+  grid-column: 1;
+  padding-left: var(--space-8);
+  padding-right: var(--space-11);
+}
+.pane-right {
+  grid-column: 3;
+  padding-left: var(--space-11);
+  padding-right: var(--space-8);
+}
+@supports (mask-image: linear-gradient(#000, #000)) or (-webkit-mask-image: linear-gradient(#000, #000)) {
+  .pane-left,
+  .pane-right {
+    -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 28px, #000 calc(100% - 28px), transparent 100%);
+    mask-image: linear-gradient(180deg, transparent 0, #000 28px, #000 calc(100% - 28px), transparent 100%);
+  }
+}
+
+@media (max-width: 899px) {
+  .page-split {
+    display: block;
+    height: auto;
+  }
+  .pane-left,
+  .pane-right {
+    overflow-y: visible;
+    grid-column: auto;
+    padding: var(--space-7) var(--space-8) var(--space-3);
+    mask-image: none;
+    -webkit-mask-image: none;
+  }
+}
+
+@media (max-width: 620px) {
+  .pane-left,
+  .pane-right {
+    padding: var(--space-7) var(--space-7) var(--space-3);
+  }
+}
+
+/* accessibility: honor reduced-motion globally (canvas engine honors it too) */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

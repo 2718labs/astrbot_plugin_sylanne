@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import uuid4
 from types import MappingProxyType
 import json
 import pytest
 
 from sylanne3.domain_registry import DomainRegistration, DomainRegistry
+from sylanne3.domains.d12 import (
+    CharacterDraft, D12CurrentCreatorDraftV1, active_scheme_head_key,
+    character_draft_key,
+)
 from sylanne3.contracts import StaleRead
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphPage, GraphSnapshot, NamespaceEpoch, Owner
 from sylanne3.graph_types import TypeRegistry, TypeSpec
@@ -22,6 +27,8 @@ SESSION = AuthenticatedSession(
     "actor", "session", {SCOPE: frozenset({"workbench.read"})},
     {SCOPE: frozenset({"owner"})}, {SCOPE: frozenset({"workbench_view"})},
 )
+CREATOR_SESSION = replace(
+    SESSION, scope_capabilities={SCOPE: frozenset({"workbench.read", "workbench.create"})})
 CONTEXT = RequestContext(origin_verified=True, csrf_verified=True, session_bound=True)
 
 
@@ -69,21 +76,101 @@ class Registry:
 
 
 def request(action="read_character_view", **input_data):
-    body = {"view_type": "overview"} if action == "read_character_view" else {"client_protocol": "d12.contract.v1"}
+    body = ({"view_type": "overview"} if action == "read_character_view"
+            else {"client_protocol": "d12.contract.v1"} if action == "open_workspace"
+            else {})
     body.update(input_data)
     return {"schema_version": "d12.contract.v1", "action": action, "scope": SCOPE,
             "purpose": "workbench_view", "audience": "owner", "operation_id": str(uuid4()),
             "input": body}
 
 
-def issuer(*, resolver_grant=None, page=None):
-    resolver = Resolver(resolver_grant or CoordinatorGrant(SCOPE, authority(), object()))
+def issuer(*, resolver_grant=None, page=None, scheme_port=None):
+    resolver = Resolver(resolver_grant or CoordinatorGrant(
+        SCOPE, authority(), object(), frozenset({"workbench.read", "workbench.create"})))
     atom = GraphAtom(AtomKey(Owner("persona", "bot", "persona"), "d01.persona_plan.v1", "current"),
                      3, {"schema": "d01.persona_plan.v1", "head_id": "head", "namespace": "persona",
                          "blocks": [], "values": [], "authored": {}})
     page = page or GraphPage(GraphSnapshot((atom,), (NamespaceEpoch("bot", "persona", 9),)), None)
     coordinator = Coordinator(page)
-    return GraphWorkbenchIssuer(coordinator, resolver, Registry()), coordinator, resolver
+    return GraphWorkbenchIssuer(coordinator, resolver, Registry(),
+                                scheme_port=scheme_port), coordinator, resolver
+
+
+class CreatorDraftPort:
+    def __init__(self):
+        namespace = NamespaceId("bot", "persona")
+        self.frame = D12CurrentCreatorDraftV1(
+            namespace, character_draft_key(namespace).token, 2,
+            CharacterDraft("persona", 2, {"d01.value": {"text": "care"}},
+                           {"d01.value": "administrative_edit"}),
+            active_scheme_head_key(namespace).token, 1, 9, 2, 3, True,
+        )
+        self.calls = 0
+
+    def with_current_creator_draft_v1(self, authority, lease, *, draft_ref,
+                                      required_capability, project):
+        self.calls += 1
+        assert draft_ref == self.frame.draft_ref
+        assert required_capability == "workbench.create"
+        return project(self.frame)
+
+
+def test_current_creator_draft_read_is_fenced_and_detached():
+    port = CreatorDraftPort()
+    provider, coordinator, _ = issuer(scheme_port=port)
+    payload = request("read_creator_draft", draft_ref=port.frame.draft_ref,
+                      expected_graph_revision=9)
+    answer = WorkbenchService(provider).handle(payload, session=CREATOR_SESSION, context=CONTEXT)
+    assert answer.status == "ready"
+    assert answer.projection["fields"]["d01.value"]["text"] == "care"
+    assert answer.projection["draft_revision"] == 2
+    assert answer.projection["active_head_revision"] == 1
+    assert answer.projection["graph_revision"] == 9
+    assert coordinator.calls == [] and port.calls == 1
+    port.frame.draft.fields["d01.value"]["text"] = "changed after read"
+    assert answer.projection["fields"]["d01.value"]["text"] == "care"
+
+    stale = WorkbenchService(provider).handle(
+        request("read_creator_draft", draft_ref=port.frame.draft_ref,
+                expected_graph_revision=8), session=CREATOR_SESSION, context=CONTEXT)
+    assert stale.status == "stale" and stale.projection is None
+    assert stale.problem["code"] == "stale_graph_epoch"
+
+    port.frame = replace(port.frame, creator_authorized=False)
+    denied = WorkbenchService(provider).handle(payload, session=CREATOR_SESSION, context=CONTEXT)
+    assert denied.status == "unavailable" and denied.projection is None
+    assert denied.problem["code"] == "creator_draft_unavailable"
+
+
+def test_creator_draft_requires_current_scope_and_creator_capability():
+    port = CreatorDraftPort()
+    cross_role = AuthorityContext(
+        "actor", "d12", "capability", NamespaceId("bot", "other"),
+        ("persona",), "workbench_view", ("owner",), "policy", 4,
+    )
+    provider, _, _ = issuer(
+        resolver_grant=CoordinatorGrant(SCOPE, cross_role, object()),
+        scheme_port=port)
+    payload = request("read_creator_draft", draft_ref=port.frame.draft_ref)
+    answer = WorkbenchService(provider).handle(payload, session=CREATOR_SESSION, context=CONTEXT)
+    assert answer.status == "unavailable" and answer.projection is None
+    assert port.calls == 0
+    unreadable = SESSION
+    answer = WorkbenchService(provider).handle(payload, session=unreadable, context=CONTEXT)
+    assert answer.status == "unauthorized" and answer.projection is None
+    assert port.calls == 0
+
+    provider, _, _ = issuer(
+        resolver_grant=CoordinatorGrant(
+            SCOPE, authority(), object(), frozenset({"workbench.read"})),
+        scheme_port=port)
+    missing_w01_capability = WorkbenchService(provider).handle(
+        payload, session=CREATOR_SESSION, context=CONTEXT)
+    assert missing_w01_capability.status == "unavailable"
+    assert missing_w01_capability.problem["code"] == "authority_unavailable"
+    assert missing_w01_capability.projection is None
+    assert port.calls == 0
 
 
 def test_character_view_uses_single_coordinator_snapshot_and_server_grant():
@@ -224,6 +311,22 @@ def test_missing_or_mismatched_authority_never_queries_or_leaks_projection():
     assert not coordinator.calls
 
 
+def test_resolver_cannot_bind_one_browser_scope_to_another_namespace():
+    cross_role = AuthorityContext(
+        "actor", "d12", "capability", NamespaceId("bot", "other"),
+        ("persona",), "workbench_view", ("owner",), "policy", 4,
+    )
+    provider, coordinator, _ = issuer(
+        resolver_grant=CoordinatorGrant(SCOPE, cross_role, object()))
+    for command in (request(), request("open_workspace")):
+        answer = WorkbenchService(provider).handle(
+            command, session=SESSION, context=CONTEXT)
+        assert answer.status == "unavailable"
+        assert answer.problem["code"] == "authority_unavailable"
+        assert answer.projection is None
+    assert not coordinator.calls
+
+
 def test_query_failure_and_invalid_snapshot_fail_closed():
     provider, coordinator, _ = issuer(page=object())
     answer = WorkbenchService(provider).handle(request(), session=SESSION, context=CONTEXT)
@@ -239,8 +342,55 @@ def test_open_workspace_is_a_real_read_catalogue_without_a_durable_receipt():
     assert answer.receipt is None
     assert {entry["view_type"] for entry in answer.projection["views"]} == {"overview", "memory"}
     assert all(entry["status"] == "available" for entry in answer.projection["views"])
+    routes = {entry["action"]: entry["status"] for entry in answer.projection["command_routes"]}
+    assert routes["diagnose_and_export_support"] == "unavailable"
+    assert routes["run_experiment"] == "unavailable"
+    assert routes["create_character"] == "unavailable"
     assert len(coordinator.calls) == 2
     assert {call[2]["owner_kind"] for call in coordinator.calls} == {"persona", "event"}
+
+
+def test_experiment_holds_without_owner_fenced_report_reader():
+    class CreatorPortOnly:
+        def with_current_creator_draft_v1(self, *args, **kwargs):
+            raise AssertionError("experiment must not read a creator draft")
+
+    experiment_session = replace(
+        SESSION,
+        scope_capabilities={SCOPE: frozenset({"workbench.experiment"})},
+    )
+    provider, coordinator, _ = issuer(
+        resolver_grant=CoordinatorGrant(
+            SCOPE, authority(), object(), frozenset({"workbench.experiment"})),
+        scheme_port=CreatorPortOnly(),
+    )
+    answer = WorkbenchService(provider).handle(
+        request("run_experiment", experiment="d12.scheme_preview.v1",
+                input_refs=["a" * 64], budget_ref="budget:one",
+                retention_policy_ref="d12.preview_original.v1"),
+        session=experiment_session, context=CONTEXT)
+    assert answer.status == "unavailable" and answer.receipt is None
+    assert answer.problem["code"] == "experiment_report_port_unavailable"
+    assert coordinator.calls == []
+
+
+def test_support_export_holds_without_trusted_managed_directory():
+    support_session = replace(
+        SESSION, scope_capabilities={SCOPE: frozenset({
+            "workbench.read", "workbench.diagnose"})})
+    provider, coordinator, _ = issuer(
+        resolver_grant=CoordinatorGrant(
+            SCOPE, authority(), object(),
+            frozenset({"workbench.read", "workbench.diagnose"})))
+    answer = WorkbenchService(provider).handle(
+        request("diagnose_and_export_support", question="view_health",
+                allowed_data=["view_status"],
+                retention_policy_ref="d12.local_manual_retention.v1",
+                local_destination="managed"),
+        session=support_session, context=CONTEXT)
+    assert answer.status == "unavailable" and answer.receipt is None
+    assert answer.problem["code"] == "support_export_directory_unavailable"
+    assert coordinator.calls == []
 
 
 def test_workspace_does_not_advertise_a_view_when_its_complete_projection_fails():

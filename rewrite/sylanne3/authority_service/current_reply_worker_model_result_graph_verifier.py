@@ -19,10 +19,12 @@ from ..memory_types import SourceRecord, access_key, validate_access
 from ..runtime.d11_types import job_graph_write, runtime_job_key
 from ..runtime.budget import get_budget_lease
 from ..runtime.jobs import get_job
+from ..runtime.ingress_observation import read_committed_ingress_identity
+from ..runtime.reply_model_job import reply_envelope_from_wire_v1
 from ..runtime.issuers import D11BudgetJobIssuer, d06_first_ingress_c02_quote_id
 from ..runtime_contracts import (
     CommitReceipt, NamespaceEpoch, NamespaceId, SnapshotRequirementsV2,
-    canonical_digest,
+    canonical_digest, canonical_serialize,
 )
 from .v2_contract import FencePermitV2
 from .v2_model_egress_contract import ModelEgressIntentV1
@@ -178,15 +180,14 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
                 or access["status"] != "active"
                 or "expression" not in source.purposes
                 or "expression" not in access["purposes"]
-                or not set(request.audience) <= source.audiences
+                or not set(request.audience) <= set(source.audiences)
                 or not set(request.audience) <= set(access["audiences"])):
             return False
-        ingress = db.execute(
-            "SELECT conversation_ref,visibility FROM graph_first_ingress_identity_v1 "
-            "WHERE bot=? AND persona=? AND source_ref=?",
-            ns + (request.source_ref,)).fetchall()
-        if (len(ingress) != 1 or ingress[0][1] != "private"
-                or request.audience != (ingress[0][0],)):
+        ingress = read_committed_ingress_identity(
+            db, request.namespace, source_id)
+        identity = _canonical(ingress.identity_json) if ingress is not None else None
+        if (identity is None or identity["visibility"] != "private"
+                or request.audience != (identity["conversation_ref"],)):
             return False
         focus_key = AtomKey(Owner("persona", *ns), "d07.focus.v1",
                             request.namespace.persona_id)
@@ -304,8 +305,8 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
         ).fetchone()
         if (archive is None or archive[0] != "sylanne.first-ingress-c02-candidate.v2"
                 or archive[1] != original[0]
-                or _canonical(archive[2]).get("source_ref") != request.source_ref
-                or archive[3] != canonical_json(asdict(c02_quote))
+                or _canonical(archive[2]).get("source_ref") != source_id
+                or archive[3] != canonical_serialize(asdict(c02_quote))
                 or cost_attempt != ("committed",) or cost is None
                 or c02_reservation is None
                 or c02_reservation[0] not in {"unknown", "settled", "overrun"}
@@ -425,8 +426,11 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
                 })
                 or reservation_digest != intent.budget_reservation_digest):
             return False
-        if (type(envelope_json) is not str or type(request_json) is not str
-                or _canonical(envelope_json) != _canonical(request_json).get("envelope")):
+        if type(envelope_json) is not str or type(request_json) is not str:
+            return False
+        envelope = reply_envelope_from_wire_v1(envelope_json)
+        if (_canonical(canonical_serialize(asdict(envelope)))
+                != _canonical(request_json).get("envelope")):
             return False
         frozen = _canonical(request_json)
         authority = frozen["envelope"]["authority"]
@@ -442,7 +446,7 @@ class PinnedCurrentReplyWorkerModelResultGraphVerifier:
                 or frozen["model_id"] != intent.model_id):
             return False
         computed_request_digest = canonical_digest({
-            "envelope": frozen["envelope"], "call_id": frozen["call_id"],
+            "envelope": envelope, "call_id": frozen["call_id"],
             "provider_id": frozen["provider_id"],
             "model_id": frozen["model_id"],
             "purpose": authority["purpose"],

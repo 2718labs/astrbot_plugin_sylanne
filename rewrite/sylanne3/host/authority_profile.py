@@ -22,12 +22,35 @@ import re
 import ssl
 import stat
 from types import MappingProxyType
-from typing import Iterator, Mapping
+from typing import Iterator, Mapping, TYPE_CHECKING
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from ..authority_service.d12_package_files_v2 import PackageSelectionV2
 
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.budget import BudgetLease
+from ..runtime.d04_semantic_policy import (
+    AdminD04SemanticDrivePolicyV1, MECHANISMS as D04_MECHANISMS,
+    WORK_KIND as D04_SEMANTIC_WORK_KIND,
+)
+from ..runtime.d13_technical_policy import (
+    AdminD13PaidPrecompressionPolicyV1, AdminD13PrecompressionPolicyV1,
+)
+from ..model_broker.d13_precompression import D13PrecompressionInstallationV1
 from ..runtime_contracts import NamespaceId, canonical_digest
+from ..model_broker.context_reply import CONTEXT_REPLY_TEMPLATE_VERSION
+from ..model_broker.natural_reply import TEMPLATE_VERSION as NATURAL_GENERATION_TEMPLATE_VERSION
+from ..model_broker.natural_reply_history_v3 import TEMPLATE_VERSION as NATURAL_GENERATION_TEMPLATE_VERSION_V3
+from ..model_broker.natural_reply_history_v4 import TEMPLATE_VERSION as NATURAL_GENERATION_TEMPLATE_VERSION_V4
+from ..model_broker.natural_review import REVIEW_TEMPLATE_VERSION
+from ..model_broker.contact_expression_v1 import (
+    GENERATION_TEMPLATE_VERSION as CONTACT_GENERATION_TEMPLATE_VERSION,
+    REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_TEMPLATE_VERSION,
+)
+from ..model_broker.d04_appraisal import (
+    TEMPLATE_VERSION as APPRAISAL_TEMPLATE_VERSION, WORK_KIND as APPRAISAL_WORK_KIND,
+)
 from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 
 
@@ -55,6 +78,18 @@ _D06_PRIVATE_REPLY_SOURCE_FIELDS = frozenset({
     "version", "scope", "grant_expression",
 })
 _D07_ATTENTION_FIELDS = _D03_ARRIVAL_FIELDS
+_PRIVATE_REPLY_DISPATCH_FIELDS = _D03_ARRIVAL_FIELDS | {
+    "segment_max_chars", "host_takeover_wait_seconds",
+}
+_D13_PRECOMPRESSION_FIELDS = frozenset({
+    "history_token_budget", "quote_ceiling", "deadline_after_seconds",
+    "max_slots", "resource_ref",
+})
+_D13_PAID_PRECOMPRESSION_FIELDS = _D13_PRECOMPRESSION_FIELDS
+_D04_SEMANTIC_DRIVE_FIELDS = frozenset({
+    "version", "mapping_version", "basis_version",
+    "mechanism_max_abs_doses", "mechanism_max_family_share",
+})
 _INGRESS_MODEL_FIELDS = frozenset({
     "provider_id", "model_id", "provider_config_ref", "provider_config_digest",
     "timeout_seconds", "max_output_tokens", "required_capabilities", "privacy_tier",
@@ -92,7 +127,8 @@ _REVERSE_FIELDS = frozenset({
 _D11_SIGNING_KEY = "d11-signing.key"
 _D11_SIGNING_KEY_BYTES = 32
 _D02_SIGNING_KEY = "d02-signing.key"
-_MAX_PROFILE_BYTES = 8192
+_C04_SIGNING_KEY = "c04-signing.key"
+_MAX_PROFILE_BYTES = 32768
 _MAX_MATERIAL_BYTES = 1_048_576
 _WIN_GENERIC_READ = 0x80000000
 _WIN_SHARE_READ = 0x00000001
@@ -223,6 +259,56 @@ class AdminD03ArrivalPolicy:
             "quote_ceiling": dict(self.quote_ceiling),
             "snapshot_ref": self.snapshot_ref,
             "resource_ref": self.resource_ref,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AdminPrivateReplyDispatchPolicy:
+    """Installed price and segment bound for a private K03 message dispatch."""
+
+    deadline_after_seconds: float
+    quote_ceiling: Mapping[str, int]
+    snapshot_ref: str
+    resource_ref: str
+    segment_max_chars: int
+    host_takeover_wait_seconds: float
+
+    def __post_init__(self) -> None:
+        from ..runtime.issuers import MAX_DIMENSIONS, MAX_QUANTITY
+
+        deadline = self.deadline_after_seconds
+        if (type(deadline) not in {int, float} or not math.isfinite(deadline)
+                or not 0 < deadline <= 300):
+            raise ValueError("private reply dispatch deadline must be bounded")
+        ceiling = self.quote_ceiling
+        if not isinstance(ceiling, Mapping) or not 0 < len(ceiling) <= MAX_DIMENSIONS:
+            raise ValueError("private reply dispatch quote ceiling must be nonempty")
+        normalized: dict[str, int] = {}
+        for name, amount in ceiling.items():
+            if (type(name) is not str or _RESOURCE_DIMENSION.fullmatch(name) is None
+                    or type(amount) is not int or not 0 < amount <= MAX_QUANTITY):
+                raise ValueError("private reply dispatch quote ceiling is invalid")
+            normalized[name] = amount
+        object.__setattr__(self, "quote_ceiling", MappingProxyType(normalized))
+        for name in ("snapshot_ref", "resource_ref"):
+            value = getattr(self, name)
+            if type(value) is not str or _RESOURCE_DIMENSION.fullmatch(value) is None:
+                raise ValueError(f"private reply dispatch {name} is invalid")
+        if type(self.segment_max_chars) is not int or not 1 <= self.segment_max_chars <= 2048:
+            raise ValueError("private reply dispatch segment_max_chars must be 1..2048")
+        wait = self.host_takeover_wait_seconds
+        if (type(wait) not in {int, float} or not math.isfinite(wait)
+                or not 0 < wait <= 300):
+            raise ValueError("private reply dispatch host takeover wait must be bounded")
+
+    def digest_payload(self) -> dict[str, object]:
+        return {
+            "deadline_after_seconds": self.deadline_after_seconds,
+            "quote_ceiling": dict(self.quote_ceiling),
+            "snapshot_ref": self.snapshot_ref,
+            "resource_ref": self.resource_ref,
+            "segment_max_chars": self.segment_max_chars,
+            "host_takeover_wait_seconds": self.host_takeover_wait_seconds,
         }
 
 
@@ -541,11 +627,18 @@ class AdminModelWorkflowV2:
 
 @dataclass(frozen=True, slots=True)
 class AdminModelWorkflowsV2:
-    """Separate encoding and reply authority in one checked profile snapshot."""
+    """Separate installed model work kinds in one checked profile snapshot."""
 
     version: int
     encode: AdminModelWorkflowV2
     reply: AdminModelWorkflowV2
+    context_reply: AdminModelWorkflowV2 | None = None
+    natural_generation: AdminModelWorkflowV2 | None = None
+    natural_review: AdminModelWorkflowV2 | None = None
+    appraisal: AdminModelWorkflowV2 | None = None
+    d07_cognition: AdminModelWorkflowV2 | None = None
+    contact_generation: AdminModelWorkflowV2 | None = None
+    contact_review: AdminModelWorkflowV2 | None = None
 
     def __post_init__(self) -> None:
         if (type(self.version) is not int or self.version != 2
@@ -554,8 +647,35 @@ class AdminModelWorkflowsV2:
                 or (self.encode.work_kind, self.encode.purpose)
                 != ("d06.encode_source", "consolidation")
                 or (self.reply.work_kind, self.reply.purpose)
-                != ("reply", "proposal")):
+                != ("reply", "proposal")
+                or any(workflow is not None and (
+                    type(workflow) is not AdminModelWorkflowV2
+                    or (workflow.work_kind, workflow.purpose,
+                        workflow.template_version) not in (
+                            (expected, ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V3),
+                                       ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V4))
+                            if workflow is self.natural_generation else (expected,)))
+                    for workflow, expected in (
+                        (self.context_reply, ("context_reply", "proposal",
+                                              CONTEXT_REPLY_TEMPLATE_VERSION)),
+                        (self.natural_generation, ("natural_generation", "proposal",
+                                                   NATURAL_GENERATION_TEMPLATE_VERSION)),
+                        (self.natural_review, ("natural_review", "proposal",
+                                               REVIEW_TEMPLATE_VERSION)),
+                        (self.appraisal, (APPRAISAL_WORK_KIND, "proposal",
+                                          APPRAISAL_TEMPLATE_VERSION)),
+                        (self.d07_cognition, ("d07.cognition", "proposal",
+                                             "sylanne.d07.cognition_template.v1")),
+                        (self.contact_generation, ("contact_generation", "proposal", CONTACT_GENERATION_TEMPLATE_VERSION)),
+                        (self.contact_review, ("contact_review", "proposal", CONTACT_REVIEW_TEMPLATE_VERSION))))):
             raise ValueError("model workflows need distinct version-2 encode and reply authority")
+        if (self.contact_generation is None) != (self.contact_review is None):
+            raise ValueError("contact needs both installed generation and independent review workflows")
+        if self.contact_generation is not None:
+            selected = self.natural_generation if self.natural_generation is not None else self.reply
+            identity = lambda workflow: (workflow.provider_id, workflow.model_id, workflow.provider_config_digest)
+            if identity(self.contact_generation) != identity(selected) or identity(self.contact_review) != identity(selected):
+                raise ValueError("contact must use the actual installed dialogue model")
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,6 +714,14 @@ class AdminInstallationBundle:
     reverse_handoff: object | None = None
     d06_private_reply_source: AdminD06PrivateReplySourcePolicy | None = None
     d07_attention: AdminD07AttentionPolicy | None = None
+    private_reply_dispatch: AdminPrivateReplyDispatchPolicy | None = None
+    d13_precompression: AdminD13PrecompressionPolicyV1 | None = None
+    d04_semantic_drive: AdminD04SemanticDrivePolicyV1 | None = None
+    d13_paid_precompression: AdminD13PaidPrecompressionPolicyV1 | None = None
+    d13_wire_policy: object | None = None
+    d13_wire_counter: object | None = None
+    d04_joint_numeric: object | None = None
+    package_selection: PackageSelectionV2 | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -624,7 +752,7 @@ def _check_posix_tree(profile_dir: Path) -> None:
             raise PermissionError("administrator private key is exposed")
         if name == "client-key.pem" and info.st_mode & 0o040:
             effective_group = getattr(os, "getegid", None)
-            if effective_group is None or info.st_gid != effective_group():
+            if effective_group is None or info.st_gid != effective_group() and os.geteuid() != 0:
                 raise PermissionError("administrator private key group is unsafe")
 
 
@@ -671,7 +799,7 @@ def _check_opened(fd: int, *, directory: bool, key: bool, system: str) -> None:
             raise PermissionError("administrator profile file is unsafe")
         if key and info.st_mode & 0o007:
             raise PermissionError("administrator private key is exposed")
-        if key and info.st_mode & 0o040 and info.st_gid != os.getegid():
+        if key and info.st_mode & 0o040 and info.st_gid != os.getegid() and os.geteuid() != 0:
             raise PermissionError("administrator private key group is unsafe")
     if system == "Darwin":
         from .macos_profile_security import reject_extended_acl
@@ -682,8 +810,13 @@ def _check_opened(fd: int, *, directory: bool, key: bool, system: str) -> None:
         raise AuthorityProfileUnavailable("POSIX profile verification is unavailable")
 
 
+class _OpenedProfileFilesV2(dict):
+    selected_package: PackageSelectionV2 | None = None
+
+
 @contextmanager
 def _opened_profile(profile_dir: Path, system: str, *, signing_key: bool = False,
+                    c04_signing_key: bool = False,
                     reverse_material: bool = False
                     ) -> Iterator[dict[str, int]]:
     """Pin every path component and consumed file before inspecting either."""
@@ -705,18 +838,25 @@ def _opened_profile(profile_dir: Path, system: str, *, signing_key: bool = False
             stack.callback(os.close, child)
             _check_opened(child, directory=True, key=False, system=system)
             current = child
-        files: dict[str, int] = {}
+        files: dict[str, int] = _OpenedProfileFilesV2()
         names = ("profile.json",) + _MATERIAL + ((
             _D11_SIGNING_KEY, _D02_SIGNING_KEY,
-        ) if signing_key else ()) + (_REVERSE_MATERIAL if reverse_material else ())
+        ) if signing_key else ()) + ((_C04_SIGNING_KEY,)
+            if c04_signing_key else ()) + (_REVERSE_MATERIAL if reverse_material else ())
         for name in names:
             fd = os.open(name, file_flags, dir_fd=current)
             stack.callback(os.close, fd)
             _check_opened(fd, directory=False,
                           key=name in {"client-key.pem", "reverse-key.pem",
-                                       _D11_SIGNING_KEY, _D02_SIGNING_KEY}, system=system)
+                                       _D11_SIGNING_KEY, _D02_SIGNING_KEY,
+                                       _C04_SIGNING_KEY}, system=system)
             files[name] = fd
-        yield files
+        from .selected_profile_cohort_v2 import selected_profile_payload_v2
+        with selected_profile_payload_v2(profile_dir, system) as selected:
+            if selected is not None:
+                files['profile.json'] = selected.descriptor
+                files.selected_package = selected.selection
+            yield files
 
 
 def _read_fd_bounded(fd: int, limit: int) -> bytes:
@@ -765,6 +905,7 @@ def _prepared_ssl_context(files: dict[str, int], system: str) -> ssl.SSLContext:
 
 @contextmanager
 def _opened_windows_profile(profile_dir: Path, *, signing_key: bool = False,
+                            c04_signing_key: bool = False,
                             reverse_material: bool = False
                             ) -> Iterator[dict[Path, int]]:
     """Pin the whole path while pathname-only OpenSSL loads the same objects.
@@ -790,7 +931,8 @@ def _opened_windows_profile(profile_dir: Path, *, signing_key: bool = False,
     directories = tuple(reversed(profile_dir.parents)) + (profile_dir,)
     names = ("profile.json",) + _MATERIAL + ((
         _D11_SIGNING_KEY, _D02_SIGNING_KEY,
-    ) if signing_key else ()) + (_REVERSE_MATERIAL if reverse_material else ())
+    ) if signing_key else ()) + ((_C04_SIGNING_KEY,)
+        if c04_signing_key else ()) + (_REVERSE_MATERIAL if reverse_material else ())
     paths = directories + tuple(profile_dir / name for name in names)
     with ExitStack() as stack:
         handles: dict[Path, int] = {}
@@ -843,7 +985,8 @@ def _check_windows_handles(profile_dir: Path, handles: dict[Path, int]) -> None:
         runtime_user, runtime_sids = security_gate._runtime_token_sids(win32security)
         protected_root = profile_dir.parents[2]
         key_paths = {profile_dir / name for name in (
-            "client-key.pem", "reverse-key.pem", _D11_SIGNING_KEY, _D02_SIGNING_KEY,
+            "client-key.pem", "reverse-key.pem", _D11_SIGNING_KEY,
+            _D02_SIGNING_KEY, _C04_SIGNING_KEY,
         )}
         for path, handle in handles.items():
             security_gate._check_security_descriptor(
@@ -899,9 +1042,32 @@ def _read_profile_json(path: Path | int) -> dict[str, object]:
     return value
 
 
+def _d13_wire_counter_from_payload(payload):
+    from ..authority_service.d13_installed_counter_v1 import installed_d13_counter_from_payload_v1
+    counter = installed_d13_counter_from_payload_v1(payload.get("d13_wire_counter"))
+    if counter is not None and payload.get("d13_wire_policy") is None:
+        raise ValueError("installed D13 counter requires its signed full-wire policy")
+    return counter
+
+
+def _d13_wire_policy_from_payload(payload, policy):
+    from ..authority_service.d13_wire_evidence_v1 import installed_d13_wire_policy_from_payload_v1
+    configured = installed_d13_wire_policy_from_payload_v1(payload.get("d13_wire_policy"))
+    if configured is None:
+        return None
+    workflows = _model_workflows_from_payload(payload)
+    main = workflows.natural_generation if workflows is not None else None
+    actual = configured.installation
+    if main is None or (actual.installation_id, actual.provider_id, actual.model_id,
+            actual.provider_config_digest, actual.max_output_tokens) != (policy.installation_id,
+            main.provider_id, main.model_id, main.provider_config_digest, main.max_output_tokens):
+        raise ValueError("D13 full-wire policy differs from actual foreground installation")
+    return configured
+
+
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "d07_attention", "model_workflows", "reverse_handoff"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d04_semantic_drive", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "d07_attention", "private_reply_dispatch", "d13_precompression", "d13_paid_precompression", "d13_wire_policy", "d13_wire_counter", "d04_joint_numeric", "model_workflows", "reverse_handoff"}
     )
 
 
@@ -1049,6 +1215,19 @@ def _d03_arrival_from_payload(payload: dict[str, object]) -> AdminD03ArrivalPoli
     return AdminD03ArrivalPolicy(**values)
 
 
+def _private_reply_dispatch_from_payload(
+        payload: dict[str, object]) -> AdminPrivateReplyDispatchPolicy | None:
+    if "private_reply_dispatch" not in payload:
+        return None
+    if type(payload.get("schema")) is not int or payload["schema"] != 2:
+        raise ValueError("private reply dispatch requires profile schema 2")
+    values = _exact_object(payload["private_reply_dispatch"],
+                           _PRIVATE_REPLY_DISPATCH_FIELDS, "private reply dispatch")
+    if type(values["quote_ceiling"]) is not dict:
+        raise ValueError("private reply dispatch quote ceiling must be an object")
+    return AdminPrivateReplyDispatchPolicy(**values)
+
+
 def _d07_attention_from_payload(payload: dict[str, object]) -> AdminD07AttentionPolicy | None:
     if "d07_attention" not in payload:
         return None
@@ -1071,6 +1250,46 @@ def _d04_baseline_from_payload(payload: dict[str, object]) -> AdminD04EncodingBa
     if type(values["quote_ceiling"]) is not dict:
         raise ValueError("D04 baseline quote ceiling must be an object")
     return AdminD04EncodingBaselinePolicy(**values)
+
+
+def _d04_joint_numeric_from_payload(payload, installation):
+    from ..runtime.d04_numeric_policy_v3 import numeric_policy_from_payload_v3
+    return numeric_policy_from_payload_v3(payload, installation)
+
+
+def _d04_semantic_drive_from_payload(
+        payload: dict[str, object],
+        installation: AdminInstallationPolicy,
+) -> AdminD04SemanticDrivePolicyV1 | None:
+    if "d04_semantic_drive" not in payload:
+        return None
+    raw = _exact_object(payload["d04_semantic_drive"],
+                        _D04_SEMANTIC_DRIVE_FIELDS, "D04 semantic drive")
+    limits = _exact_object(raw["mechanism_max_abs_doses"],
+                           frozenset(D04_MECHANISMS),
+                           "D04 semantic mechanism dose limits")
+    family_shares = _exact_object(raw["mechanism_max_family_share"],
+                                  frozenset(D04_MECHANISMS),
+                                  "D04 semantic mechanism family shares")
+    if any(type(values) is not list or len(values) != 3
+           or any(type(value) not in (int, float) for value in values)
+                  for values in limits.values()):
+        raise ValueError("D04 semantic policy needs three dose limits per mechanism")
+    policy = AdminD04SemanticDrivePolicyV1(
+        namespace=installation.namespace,
+        installation_id=installation.installation_id,
+        grant_id=installation.root_grant.grant_id,
+        grant_version=installation.root_grant.version,
+        lease_id=installation.root_lease.lease_id,
+        mapping_version=raw["mapping_version"],
+        basis_version=raw["basis_version"],
+        mechanism_max_abs_doses={key: tuple(value) for key, value in limits.items()},
+        mechanism_max_family_share=family_shares,
+        version=raw["version"],
+    )
+    if D04_SEMANTIC_WORK_KIND not in installation.root_grant.allowed_work_kinds:
+        raise ValueError("D04 semantic drive requires an explicit root grant work kind")
+    return policy
 
 
 def _d06_c02_from_payload(payload: dict[str, object]) -> AdminD06FirstIngressC02Policy | None:
@@ -1138,10 +1357,19 @@ def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkf
         return None
     if payload.get("schema") != 2 or "ingress_model" in payload:
         raise ValueError("model workflows require an unambiguous schema-2 profile")
-    raw = _exact_object(payload["model_workflows"],
-                        frozenset({"version", "encode", "reply"}), "model workflows")
+    raw_value = payload["model_workflows"]
+    if type(raw_value) is not dict:
+        raise ValueError("model workflows must be an object")
+    raw = _exact_object(raw_value,
+                        frozenset({"version", "encode", "reply"}) |
+                        {name for name in ("context_reply", "natural_generation",
+                                           "natural_review", "appraisal", "d07_cognition", "contact_generation", "contact_review") if name in raw_value},
+                        "model workflows")
     workflows = {}
-    for name in ("encode", "reply"):
+    for name in ("encode", "reply", "context_reply", "natural_generation",
+                 "natural_review", "appraisal", "d07_cognition", "contact_generation", "contact_review"):
+        if name not in raw:
+            continue
         item = _exact_object(raw[name], _MODEL_WORKFLOW_FIELDS,
                              f"model {name} workflow")
         if (type(item["audiences"]) is not list
@@ -1168,6 +1396,64 @@ def _d06_private_reply_source_from_payload(
     return AdminD06PrivateReplySourcePolicy(**raw)
 
 
+def _d13_precompression_from_payload(
+    payload: dict[str, object], policy: AdminInstallationPolicy,
+) -> AdminD13PrecompressionPolicyV1 | None:
+    if "d13_precompression" not in payload:
+        return None
+
+    raw = _exact_object(payload["d13_precompression"],
+                        _D13_PRECOMPRESSION_FIELDS, "D13 precompression")
+    installed = AdminD13PrecompressionPolicyV1(
+        namespace=policy.namespace,
+        installation_id=policy.installation_id,
+        grant_id=policy.root_grant.grant_id,
+        grant_version=policy.root_grant.version,
+        lease_id=policy.root_lease.lease_id,
+        **raw,
+    )
+    if "d13.precompress" not in policy.root_grant.allowed_work_kinds:
+        raise ValueError("D13 precompression requires an explicit root grant work kind")
+    if any(amount > policy.root_grant.max_ceiling.get(name, 0)
+           or amount > policy.root_lease.limits.get(name, 0)
+           for name, amount in installed.quote_ceiling.items()):
+        raise ValueError("D13 precompression quote exceeds signed root budget")
+    return installed
+
+
+def _d13_paid_precompression_from_payload(
+    payload: dict[str, object], policy: AdminInstallationPolicy,
+) -> AdminD13PaidPrecompressionPolicyV1 | None:
+    """Install a distinct paid D13 allowance on the signed parent budget."""
+    if "d13_paid_precompression" not in payload:
+        return None
+    raw = _exact_object(payload["d13_paid_precompression"],
+                        _D13_PAID_PRECOMPRESSION_FIELDS,
+                        "D13 paid precompression")
+    workflows = _model_workflows_from_payload(payload)
+    if (type(workflows) is not AdminModelWorkflowsV2
+            or type(workflows.reply) is not AdminModelWorkflowV2
+            or "d13.precompress.paid.v1"
+               not in policy.root_grant.allowed_work_kinds):
+        raise ValueError("D13 paid compression needs a signed work kind and main model")
+    main = workflows.reply
+    selected = D13PrecompressionInstallationV1(
+        policy.installation_id, main.provider_id, main.model_id,
+        main.provider_config_digest, main.max_output_tokens)
+    installed = AdminD13PaidPrecompressionPolicyV1(
+        namespace=policy.namespace, installation_id=policy.installation_id,
+        grant_id=policy.root_grant.grant_id,
+        grant_version=policy.root_grant.version,
+        lease_id=policy.root_lease.lease_id,
+        selected_main=selected, **raw)
+    if (any(amount > policy.root_grant.max_ceiling.get(name, 0)
+            or amount > policy.root_lease.limits.get(name, 0)
+            or amount > main.quote_ceiling.get(name, 0)
+            for name, amount in installed.quote_ceiling.items())):
+        raise ValueError("D13 paid quote exceeds signed parent or main model")
+    return installed
+
+
 def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     """Parse schema 2 after the enclosing profile passed its trusted read gate."""
     from ..runtime.issuers import BudgetLeaseGrant
@@ -1178,6 +1464,7 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     _ingress_clock_from_payload(payload)
     encoding = _ingress_encoding_from_payload(payload)
     arrival = _d03_arrival_from_payload(payload)
+    private_reply_dispatch = _private_reply_dispatch_from_payload(payload)
     attention = _d07_attention_from_payload(payload)
     baseline = _d04_baseline_from_payload(payload)
     c02 = _d06_c02_from_payload(payload)
@@ -1219,12 +1506,21 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
             **grant, "allowed_work_kinds": tuple(grant["allowed_work_kinds"]),
         }),
     )
+    _d04_semantic_drive_from_payload(payload, policy)
+    _d04_joint_numeric_from_payload(payload, policy)
     if arrival is not None:
         if "d03.message_received" not in policy.root_grant.allowed_work_kinds:
             raise ValueError("D03 arrival requires an explicit root grant work kind")
         if any(amount > policy.root_grant.max_ceiling.get(name, 0)
                for name, amount in arrival.quote_ceiling.items()):
             raise ValueError("D03 arrival quote exceeds the signed root grant")
+    if private_reply_dispatch is not None:
+        if "message" not in policy.root_grant.allowed_work_kinds:
+            raise ValueError("private reply dispatch requires message root grant work kind")
+        if any(amount > policy.root_grant.max_ceiling.get(name, 0)
+               or amount > policy.root_lease.limits.get(name, 0)
+               for name, amount in private_reply_dispatch.quote_ceiling.items()):
+            raise ValueError("private reply dispatch quote exceeds signed root budget")
     if attention is not None:
         if "d07.attention" not in policy.root_grant.allowed_work_kinds:
             raise ValueError("D07 attention requires an explicit root grant work kind")
@@ -1269,7 +1565,12 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     if workflows is not None:
         if encoding is None:
             raise ValueError("encoding workflow requires an installed encoding quote")
-        for workflow in (workflows.encode, workflows.reply):
+        for workflow in (workflows.encode, workflows.reply) + tuple(
+                item for item in (workflows.context_reply,
+                                  workflows.natural_generation,
+                                  workflows.natural_review,
+                                  workflows.appraisal, workflows.d07_cognition,
+                                  workflows.contact_generation, workflows.contact_review) if item is not None):
             if workflow.work_kind not in policy.root_grant.allowed_work_kinds:
                 raise ValueError("model workflow lacks its own root grant work kind")
             if any(amount > policy.root_grant.max_ceiling.get(name, 0)
@@ -1279,6 +1580,8 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
         if any(amount > encoding.quote_ceiling.get(name, 0)
                for name, amount in workflows.encode.quote_ceiling.items()):
             raise ValueError("encoding workflow exceeds installed encoding quote")
+    _d13_precompression_from_payload(payload, policy)
+    _d13_paid_precompression_from_payload(payload, policy)
     return policy
 
 
@@ -1442,7 +1745,15 @@ def _load_installation_bundle_from_root(
                                    _d06_source_correction_from_payload(payload),
                                    reverse_handoff,
                                    _d06_private_reply_source_from_payload(payload),
-                                   _d07_attention_from_payload(payload))
+                                    _d07_attention_from_payload(payload),
+                                    _private_reply_dispatch_from_payload(payload),
+                                    _d13_precompression_from_payload(payload, policy),
+                                    _d04_semantic_drive_from_payload(payload, policy),
+                                    _d13_paid_precompression_from_payload(payload, policy),
+                                    _d13_wire_policy_from_payload(payload, policy),
+                                    _d13_wire_counter_from_payload(payload),
+                                    _d04_joint_numeric_from_payload(payload, policy),
+                                    package_selection=getattr(files, 'selected_package', None))
 
 
 def _load_windows_installation_bundle(
@@ -1480,7 +1791,14 @@ def _load_windows_installation_bundle(
                                    _d06_source_correction_from_payload(payload),
                                    reverse_handoff,
                                    _d06_private_reply_source_from_payload(payload),
-                                   _d07_attention_from_payload(payload))
+                                    _d07_attention_from_payload(payload),
+                                    _private_reply_dispatch_from_payload(payload),
+                                    _d13_precompression_from_payload(payload, policy),
+                                    _d04_semantic_drive_from_payload(payload, policy),
+                                    _d13_paid_precompression_from_payload(payload, policy),
+                                    _d13_wire_policy_from_payload(payload, policy),
+                                    _d13_wire_counter_from_payload(payload),
+                                    _d04_joint_numeric_from_payload(payload, policy))
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:
@@ -1531,15 +1849,47 @@ def load_admin_d11_signing_key(profile_id: str) -> bytes:
     return raw
 
 
+def load_admin_c04_signing_key(profile_id: str) -> bytes:
+    """Read the independent persistent C04 key through the installed handle gate."""
+    _check_profile_id(profile_id)
+    system = platform.system()
+    if system in {"Linux", "Darwin"}:
+        if os.name != "posix":
+            raise AuthorityProfileUnavailable("POSIX directory-descriptor traversal is unavailable")
+        if os.geteuid() == 0:
+            raise AuthorityProfileUnavailable("Authority client must run without administrator identity")
+        root = (Path("/etc/sylanne/client/profiles") if system == "Linux" else
+                Path("/Library/Application Support/Sylanne/client/profiles"))
+        with _opened_profile(root / profile_id, system, c04_signing_key=True) as files:
+            _policy_from_payload(_read_profile_json(files["profile.json"]))
+            raw = _read_fd_bounded(files[_C04_SIGNING_KEY], _D11_SIGNING_KEY_BYTES)
+    elif system == "Windows":
+        from .windows_profile_security import programdata_profile_root
+
+        profile_dir = programdata_profile_root() / profile_id
+        with _opened_windows_profile(profile_dir, c04_signing_key=True) as handles:
+            _check_windows_handles(profile_dir, handles)
+            _policy_from_payload(_read_profile_json(profile_dir / "profile.json"))
+            raw = _read_windows_signing_key(handles[profile_dir / _C04_SIGNING_KEY])
+    else:
+        raise AuthorityProfileUnavailable("unsupported Authority profile platform")
+    return _checked_signing_key(raw, "C04")
+
+
 __all__ = (
     "AdminD03ArrivalPolicy", "AdminD03SelfIdentityProjectionPolicy", "AdminD04EncodingBaselinePolicy", "AdminD06FirstIngressC02Policy", "AdminD06SourceCorrectionPolicy", "AdminIngressClockPolicy", "AdminIngressEncodingPolicy", "AdminIngressModelPolicy",
     "AdminModelWorkflowV2", "AdminModelWorkflowsV2",
     "AdminD06PrivateReplySourcePolicy",
     "AdminD07AttentionPolicy",
+    "AdminD04SemanticDrivePolicyV1",
+    "AdminPrivateReplyDispatchPolicy",
+    "AdminD13PrecompressionPolicyV1",
+    "AdminD13PaidPrecompressionPolicyV1",
     "AdminInstallationBundle",
     "AdminInstallationPolicy",
     "AuthorityProfileUnavailable",
     "build_admin_authority_transport", "load_admin_installation_policy",
     "installed_model_config_ref",
-    "load_admin_d11_signing_key", "load_admin_installation_bundle",
+    "load_admin_d11_signing_key", "load_admin_c04_signing_key",
+    "load_admin_installation_bundle",
 )

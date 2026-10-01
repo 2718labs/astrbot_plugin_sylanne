@@ -37,6 +37,12 @@ class InstalledOriginalC02CostIntentPort:
         self._timeout = max(5.0, 3 * bundle.tls_profile.timeout_seconds)
 
     def __call__(self, lookup: C02OriginalIntentLookupV1):
+        return self._read(lookup, historical_accounting=False)
+
+    def read_historical_accounting_v1(self, lookup: C02OriginalIntentLookupV1):
+        return self._read(lookup, historical_accounting=True)
+
+    def _read(self, lookup: C02OriginalIntentLookupV1, *, historical_accounting):
         if (type(lookup) is not C02OriginalIntentLookupV1
                 or (lookup.namespace, lookup.authority_id,
                     lookup.authority_namespace, lookup.installation_id) !=
@@ -53,8 +59,10 @@ class InstalledOriginalC02CostIntentPort:
             running = None
         if running is self._loop:
             raise RuntimeError("original C02 intent lookup must run on graph worker")
+        lookup_method = (self._client.model_accounting_intent_lookup_v1 if historical_accounting
+                         else self._client.model_original_intent_lookup_v1)
         future = asyncio.run_coroutine_threadsafe(
-            self._client.model_original_intent_lookup_v1(
+            lookup_method(
                 self._bundle, self._grant, lookup=lookup), self._loop)
         try:
             return future.result(self._timeout)

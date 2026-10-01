@@ -36,7 +36,7 @@ GUARD = OwnerAuthorizationGuardV1(
 BINDING = OwnerLeaseBindingV1(
     principal=PRINCIPAL, actor="owner-actor", namespace=NAMESPACE,
     purpose="workbench_view", audience="owner", grant_id="grant-1",
-    scope="bot/persona", issuer_ref="issuer", capabilities=frozenset({
+    scope="/".join(NAMESPACE.as_tuple), issuer_ref="issuer", capabilities=frozenset({
         "workbench.read", "workbench.create"}),
     purposes=frozenset({"workbench_view", "workbench_user_action"}),
     audiences=frozenset({"owner"}), grant_digest="sha256:" + "b" * 64,

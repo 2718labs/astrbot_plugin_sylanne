@@ -1,7 +1,7 @@
 """C02 frozen bundle codec accepts only the known canonical DTO tree."""
 
 import json
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 
@@ -57,7 +57,13 @@ def test_c02_bundle_roundtrip_retains_original_canonical_bytes_and_digest():
     bundle = _bundle()
     text = c02_bundle_to_wire(bundle)
     recovered = c02_bundle_from_wire(text)
-    assert text == canonical_serialize(bundle)
+    legacy_wire = {
+        "$type": f"{type(bundle).__module__}.{type(bundle).__qualname__}",
+        **{field.name: getattr(bundle, field.name) for field in fields(bundle)
+           if field.name != "root_adoption"},
+    }
+    assert text == canonical_serialize(legacy_wire)
+    assert "root_adoption" not in json.loads(text)
     assert recovered == bundle
     assert recovered.digest == bundle.digest
     assert c02_bundle_to_wire(recovered) == text
@@ -92,3 +98,6 @@ def test_c02_bundle_rejects_noncanonical_text_and_other_bundle_shapes():
         c02_bundle_to_wire(replace(bundle, choice_refs=("choice-a",)))
     with pytest.raises(ValueError):
         c02_bundle_to_wire(replace(bundle, proposals=bundle.proposals[:1]))
+    with pytest.raises(ValueError, match="fields"):
+        c02_bundle_from_wire(text.replace('"product_advance":null',
+                                          '"product_advance":null,"root_adoption":null'))

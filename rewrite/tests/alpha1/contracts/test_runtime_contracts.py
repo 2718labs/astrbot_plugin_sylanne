@@ -221,6 +221,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertEqual(bundle.proposals, (proposal,))
         legacy_wire = json.loads(canonical_serialize(bundle))
         legacy_wire.pop("product_advance")
+        legacy_wire.pop("root_adoption")
         self.assertEqual(bundle.digest, canonical_digest(legacy_wire))
         self.assertEqual(proposal.typed_writes[0].value, {"value": 1})
         other_proposal = dataclasses.replace(

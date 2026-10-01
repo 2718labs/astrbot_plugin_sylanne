@@ -1,4 +1,4 @@
-"""Identity-only worker read contract for the original first-ingress model call.
+"""Identity-only worker read contract for original worker model calls.
 
 The request grants no access. Authority derives actor and transport credentials,
 then verifies current job, acquire, call binding, graph and terminal state.
@@ -35,6 +35,20 @@ def first_ingress_read_attempt_id_v1(
     })[:48]
 
 
+def d13_paid_read_attempt_id_v1(
+    consumer_operation_id: str, attempt: int,
+) -> str:
+    """Stable D13 read identity, separate from the first-ingress scope."""
+    identifier(consumer_operation_id, "consumer_operation_id")
+    if type(attempt) is not int or not 1 <= attempt <= 64:
+        raise ValueError("D13 worker read attempt is outside the bounded sequence")
+    return "d13-worker-read-" + canonical_digest({
+        "schema": "sylanne3.d13-paid-worker-read-attempt.v1",
+        "consumer_operation_id": consumer_operation_id,
+        "attempt": attempt,
+    })[:48]
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerModelResultReadRequestV1:
     authority_id: str
@@ -53,7 +67,8 @@ class WorkerModelResultReadRequestV1:
     schema: str = SCHEMA
 
     def __post_init__(self) -> None:
-        if self.schema != SCHEMA or self.purpose != "first_ingress_c02":
+        if self.schema != SCHEMA or self.purpose not in {
+                "first_ingress_c02", "d13_precompress_paid"}:
             raise ValueError("unknown worker model result read scope")
         for name in ("authority_id", "authority_namespace", "installation_id", "job_id",
                      "acquire_operation_id", "original_operation_id", "call_id",
@@ -158,5 +173,6 @@ def from_wire(raw: object, kind: type):
 
 __all__ = (
     "SCHEMA", "WorkerModelResultReadRequestV1", "WorkerModelResultReadV1",
-    "first_ingress_read_attempt_id_v1", "from_wire", "to_wire",
+    "first_ingress_read_attempt_id_v1", "d13_paid_read_attempt_id_v1",
+    "from_wire", "to_wire",
 )

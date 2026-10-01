@@ -1,18 +1,26 @@
-"""Only the reviewed D06/D11 types may append to a populated graph catalogue."""
+"""Only reviewed types may append to a populated graph catalogue."""
 
 import sqlite3
 
 import pytest
 
 from sylanne3.domains.d06 import D06DomainProvider
+from sylanne3.domains.d07 import D07DomainProvider
+from sylanne3.domains.d08 import GoalExecutionProvider, NATURAL_PLAN_TYPE_V2
+from sylanne3.domains.d12 import graph_type_specs as d12_graph_type_specs
 from sylanne3.graph_store import ProductionGraphStore
 from sylanne3.graph_types import TypeRegistry, TypeSpec
 from sylanne3.runtime.d11_types import D11RuntimeProvider
 from sylanne3.runtime.role_resources import ROLE_RESOURCES_TYPE
+from sylanne3.runtime.source_attachment_graph_v2 import SOURCE_MEDIA_TYPE_V2
 
 
 PROJECTION_TYPE = "d06.recollection_projection.v1"
-APPEND_TYPES = frozenset({PROJECTION_TYPE, ROLE_RESOURCES_TYPE})
+ACTIVE_HEAD_TYPE = "d12.active_scheme_head.v1"
+CONCERN_ROUND_TYPE = "d07.concern_round.v1"
+APPEND_TYPES = frozenset({PROJECTION_TYPE, ROLE_RESOURCES_TYPE,
+                          ACTIVE_HEAD_TYPE, CONCERN_ROUND_TYPE,
+                          NATURAL_PLAN_TYPE_V2, SOURCE_MEDIA_TYPE_V2})
 
 
 def _registries(present=()):
@@ -22,7 +30,9 @@ def _registries(present=()):
                     writer_domain="d06", schema_hash="a" * 64)
     old.register(base)
     current.register(base)
-    specs = D06DomainProvider.type_specs() + D11RuntimeProvider().type_specs()
+    specs = (D06DomainProvider.type_specs() + D07DomainProvider.type_specs() +
+             GoalExecutionProvider().register_types() +
+             D11RuntimeProvider().type_specs() + d12_graph_type_specs())
     assert APPEND_TYPES <= {spec.name for spec in specs}
     for spec in specs:
         current.register(spec)
@@ -47,7 +57,13 @@ def _populated_old_graph(path, registry):
 
 @pytest.mark.parametrize("present", [
     (), (ROLE_RESOURCES_TYPE,), (PROJECTION_TYPE,),
+    (ACTIVE_HEAD_TYPE,), (ROLE_RESOURCES_TYPE, ACTIVE_HEAD_TYPE),
+    (CONCERN_ROUND_TYPE,),
+    (NATURAL_PLAN_TYPE_V2,),
+    (SOURCE_MEDIA_TYPE_V2,),
+    (PROJECTION_TYPE, ACTIVE_HEAD_TYPE),
     (ROLE_RESOURCES_TYPE, PROJECTION_TYPE),
+    (ROLE_RESOURCES_TYPE, PROJECTION_TYPE, ACTIVE_HEAD_TYPE),
 ])
 def test_populated_graph_appends_each_exact_missing_type(tmp_path, present):
     previous, current = _registries(present)
@@ -70,19 +86,40 @@ def test_populated_graph_appends_each_exact_missing_type(tmp_path, present):
     reopened.close()
 
 
-def test_fresh_graph_installs_both_types_without_migration(tmp_path):
+def test_fresh_graph_installs_reviewed_types_without_migration(tmp_path):
     _, current = _registries()
     store = ProductionGraphStore(tmp_path / "fresh.db", current)
     try:
         assert store._db.execute("SELECT COUNT(*) FROM graph_atoms").fetchone() == (0,)
         for table in ("graph_type_catalog", "graph_type_authority"):
             rows = store._db.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE name IN (?,?)",
+                f"SELECT COUNT(*) FROM {table} WHERE name IN (?,?,?,?,?,?)",
                 tuple(sorted(APPEND_TYPES)),
             ).fetchone()
-            assert rows == (2,)
+            assert rows == (6,)
     finally:
         store.close()
+
+
+def test_populated_graph_without_writer_authority_stays_legacy(tmp_path):
+    previous, _ = _registries()
+    path = tmp_path / "legacy.db"
+    _populated_old_graph(path, previous)
+    db = sqlite3.connect(path)
+    try:
+        db.execute("DELETE FROM graph_type_authority")
+        db.commit()
+    finally:
+        db.close()
+
+    with pytest.raises(ValueError, match="legacy graph requires explicit writer-authority migration"):
+        ProductionGraphStore(path, previous)
+    db = sqlite3.connect(path)
+    try:
+        assert db.execute("SELECT COUNT(*) FROM graph_atoms").fetchone() == (1,)
+        assert db.execute("SELECT COUNT(*) FROM graph_type_authority").fetchone() == (0,)
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize("fault", [
@@ -141,9 +178,11 @@ def test_other_catalogue_drift_rejects_without_partial_append(tmp_path, fault):
     db = sqlite3.connect(path)
     try:
         for table in ("graph_type_catalog", "graph_type_authority"):
-            assert db.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE name=?",
-                (ROLE_RESOURCES_TYPE,),
-            ).fetchone() == (0,)
+            untouched = (APPEND_TYPES - {PROJECTION_TYPE}
+                         if fault == "split_catalogue" and
+                            table == "graph_type_catalog" else APPEND_TYPES)
+            assert all(db.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE name=?", (name,),
+            ).fetchone() == (0,) for name in untouched)
     finally:
         db.close()

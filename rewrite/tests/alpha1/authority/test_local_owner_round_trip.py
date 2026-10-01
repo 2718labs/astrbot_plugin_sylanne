@@ -108,7 +108,8 @@ class LocalFencePort:
             request_id=request_id, request_digest=request_digest)
 
 
-def _installed(tmp_path, *, client_peer=None, admin_peer=None):
+def _installed(tmp_path, *, client_peer=None, admin_peer=None,
+               extra_specs=()):
     worker_credential = client_peer if client_peer is not None else WORKER
     claimant_credential = client_peer if client_peer is not None else CLAIMANT
     admin_credential = admin_peer if admin_peer is not None else ADMIN
@@ -116,6 +117,8 @@ def _installed(tmp_path, *, client_peer=None, admin_peer=None):
     graph_path = tmp_path / "business.db"
     registry = TypeRegistry()
     registry.register(owner_grant_spec())
+    for spec in extra_specs:
+        registry.register(spec)
     graph = ProductionGraphStore(graph_path, registry)
     seed = DeletionJournal(tmp_path / "seed-deletion.db", create=True)
     deletion = DeletionJournal(tmp_path / "deletion.db", create=True)

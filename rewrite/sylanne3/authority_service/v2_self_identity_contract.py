@@ -6,7 +6,7 @@ administrator, a peer, a graph head, or a live content fence.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, field
 import hashlib
 import json
 import re
@@ -119,6 +119,8 @@ class AuthorityCurrentSelfIdentityV1:
     request_operation_id: str
     permit: FencePermitV2
     schema: str = SCHEMA
+    origin_graph_incarnation: str | None = field(default=None, kw_only=True)
+    storage_admission_digest: str | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.schema != SCHEMA or type(self.namespace) is not NamespaceId:
@@ -156,6 +158,29 @@ class AuthorityCurrentSelfIdentityV1:
                    (self.authority_id, self.authority_namespace,
                     self.activation_generation)):
             raise ValueError("current self identity permit differs")
+        if (self.origin_graph_incarnation is None) != (self.storage_admission_digest is None):
+            raise ValueError("self identity storage continuation must be a complete pair")
+        if self.origin_graph_incarnation is not None:
+            identifier(self.origin_graph_incarnation, "origin_graph_incarnation")
+            if (self.origin_graph_incarnation == self.graph_incarnation
+                    or type(self.storage_admission_digest) is not str
+                    or not self.storage_admission_digest.startswith("sha256:")):
+                raise ValueError("self identity continuation must name a distinct original location")
+            _digest(self.storage_admission_digest[7:], "storage_admission_digest")
+
+
+_CURRENT_EXTENSION = {"origin_graph_incarnation", "storage_admission_digest"}
+
+
+def current_self_identity_commitment_v1(value):
+    """Preserve the original canonical DTO preimage when no extension exists."""
+    from ..runtime_contracts import canonical_digest
+    if type(value) is not AuthorityCurrentSelfIdentityV1:
+        raise TypeError("exact current self identity required")
+    material = {"$type": f"{type(value).__module__}.{type(value).__qualname__}",
+        **{item.name: getattr(value, item.name) for item in fields(value)
+           if item.name not in _CURRENT_EXTENSION or value.origin_graph_incarnation is not None}}
+    return canonical_digest(material)
 
 
 def to_wire(value: SelfIdentityMutationV1 | SelfIdentityCurrentRequestV1 |
@@ -169,6 +194,9 @@ def to_wire(value: SelfIdentityMutationV1 | SelfIdentityCurrentRequestV1 |
         AuthorityCurrentSelfIdentityV1: "authority_current_self_identity_v1",
     }[type(value)]
     raw = asdict(value)
+    if type(value) is AuthorityCurrentSelfIdentityV1 and value.origin_graph_incarnation is None:
+        for name in _CURRENT_EXTENSION:
+            raw.pop(name)
     raw["namespace"] = asdict(value.namespace)
     if "permit" in raw:
         raw["permit"] = fence_to_wire(value.permit)
@@ -185,7 +213,15 @@ def from_wire(raw: object) -> (SelfIdentityMutationV1 |
         "self_identity_current_request_v1": SelfIdentityCurrentRequestV1,
         "authority_current_self_identity_v1": AuthorityCurrentSelfIdentityV1,
     }.get(raw.get("kind"))
-    if target is None or set(raw) != {"kind"} | {field.name for field in fields(target)}:
+    if target is None:
+        raise ValueError("self identity wire fields differ")
+    expected = {"kind"} | {item.name for item in fields(target)}
+    if target is AuthorityCurrentSelfIdentityV1:
+        if set(raw) not in (expected, expected - _CURRENT_EXTENSION):
+            raise ValueError("self identity wire fields differ")
+        if _CURRENT_EXTENSION <= set(raw) and any(raw[name] is None for name in _CURRENT_EXTENSION):
+            raise ValueError("explicit null self identity extension is not a wire original")
+    elif set(raw) != expected:
         raise ValueError("self identity wire fields differ")
     parts = {key: value for key, value in raw.items() if key != "kind"}
     namespace = parts["namespace"]

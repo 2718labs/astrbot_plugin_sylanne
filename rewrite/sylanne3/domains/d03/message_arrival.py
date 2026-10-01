@@ -17,7 +17,7 @@ from ...runtime_contracts import (
     CommandEnvelope, DependencySet, DomainProposal, SourceQualification,
     canonical_digest,
 )
-from .context import ContextProvider, EntityAnchor, WorldEvent
+from .context import AccountBinding, ContextProvider, EntityAnchor, WorldEvent
 
 if TYPE_CHECKING:
     from ...host.current_scene import CurrentHostScene
@@ -29,6 +29,8 @@ class MessageArrivalCandidate:
 
     sender_anchor: EntityAnchor
     sender_key: AtomKey
+    account_binding: AccountBinding
+    account_binding_key: AtomKey
     event: WorldEvent
     event_key: AtomKey
     source_version: GraphVersion
@@ -97,11 +99,13 @@ def build_message_arrival_candidate(
     ):
         raise ValueError("current qualified source differs from host message")
 
-    sender_id = "entity:account-v1:" + canonical_digest({
+    account_identity = {
         "namespace": namespace.as_tuple,
         "platform_ref": ingress.platform_ref,
         "sender_ref": ingress.sender_ref,
-    })
+    }
+    sender_id = "entity:account-v1:" + canonical_digest(account_identity)
+    account_id = "account:v1:" + canonical_digest(account_identity)
     event_id = "world:message-arrival-v1:" + canonical_digest({
         "namespace": namespace.as_tuple,
         "platform_ref": ingress.platform_ref,
@@ -118,11 +122,20 @@ def build_message_arrival_candidate(
         source.recorded_at, source.recorded_at, source.recorded_at,
         expected_scene, (source_atom.token,), "host_observed",
     )
+    event_key = AtomKey(
+        Owner("event", *namespace.as_tuple, event_id), "d03.world_event", "current",
+    )
+    account_binding = AccountBinding(
+        account_id, ingress.platform_ref, ingress.sender_ref, sender_id,
+        event_key.token, source.recorded_at, None,
+    )
     return MessageArrivalCandidate(
         sender,
         AtomKey(Owner("persona", *namespace.as_tuple), "d03.entity_anchor", sender_id),
+        account_binding,
+        AtomKey(Owner("persona", *namespace.as_tuple), "d03.account_binding", account_id),
         event,
-        AtomKey(Owner("event", *namespace.as_tuple, event_id), "d03.world_event", "current"),
+        event_key,
         source_version, access_version,
     )
 
@@ -132,34 +145,43 @@ def build_message_arrival_proposal(
     candidate: MessageArrivalCandidate,
     *,
     sender_atom: GraphAtom | None,
+    binding_atom: GraphAtom | None,
 ) -> DomainProposal:
     """Compile guarded D03 writes; the coordinator alone can adopt them.
 
-    ``sender_atom`` is the current graph read for the account key, or None
-    when that key was absent. The caller must obtain it alongside the D06
-    source/access read and carry the same revisions into ``envelope``.
+    ``sender_atom`` and ``binding_atom`` are current graph reads, or None
+    when their keys were absent. The caller carries both revisions in the
+    envelope and includes the namespace query closure.
     """
     if type(envelope) is not CommandEnvelope or type(candidate) is not MessageArrivalCandidate:
         raise TypeError("typed command and message arrival candidate are required")
     namespace = envelope.authority.namespace
     authority = envelope.authority
     source, access = candidate.source_version, candidate.access_version
-    sender_key, event_key = candidate.sender_key, candidate.event_key
+    sender_key, binding_key, event_key = (
+        candidate.sender_key, candidate.account_binding_key, candidate.event_key,
+    )
     sender = candidate.sender_anchor
+    binding = candidate.account_binding
     event = candidate.event
     if (
         authority.issuer_domain != "d11" or authority.purpose != "context"
         or not {"persona", "event"}.issubset(authority.owner_scope)
         or len(authority.audience) != 1
         or any(key.owner.bot != namespace.bot_id or key.owner.persona != namespace.persona_id
-               for key in (source.key, access.key, sender_key, event_key))
+               for key in (source.key, access.key, sender_key, binding_key, event_key))
         or source.key != source_key(*namespace.as_tuple, source.key.owner.subject or "")
         or access.key != access_key(*namespace.as_tuple, source.key.owner.subject or "")
         or sender_key != AtomKey(Owner("persona", *namespace.as_tuple),
                                  "d03.entity_anchor", sender.entity_id)
         or event_key != AtomKey(Owner("event", *namespace.as_tuple, event.event_id),
                                 "d03.world_event", "current")
+        or binding_key != AtomKey(Owner("persona", *namespace.as_tuple),
+                                  "d03.account_binding", binding.account_id)
         or sender.kind != "account" or sender.owner_scope != f"persona:{namespace.persona_id}"
+        or binding.entity_id != sender.entity_id
+        or binding.verification_ref != event_key.token
+        or binding.valid_from != event.learned_at or binding.valid_until is not None
         or event.kind != "message_received" or event.reality != "host_observed"
         or event.source_refs != (source.key.token,)
         or event.participant_roles != ((sender.entity_id, "sender_account"),)
@@ -198,7 +220,40 @@ def build_message_arrival_proposal(
                        or AtomKey.from_token(ref).owner.persona != namespace.persona_id
                        for ref in prior.creation_evidence_refs)):
             raise ValueError("existing sender anchor is not a compatible account")
+    binding_revision = reads.get(binding_key)
+    if binding_atom is None:
+        if binding_revision != 0:
+            raise ValueError("new account binding needs a revision-0 guard")
+    else:
+        if (type(binding_atom) is not GraphAtom or binding_atom.key != binding_key
+                or not binding_atom.valid or binding_atom.revision < 1
+                or binding_revision != binding_atom.revision):
+            raise ValueError("existing account binding lacks a matching current guard")
+        prior_binding = AccountBinding(**binding_atom.value)
+        try:
+            prior_event = AtomKey.from_token(prior_binding.verification_ref)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("existing account binding has invalid event evidence") from exc
+        if (prior_binding.account_id != binding.account_id
+                or prior_binding.platform_namespace != binding.platform_namespace
+                or prior_binding.platform_identifier != binding.platform_identifier
+                or prior_binding.entity_id != sender.entity_id
+                or prior_binding.valid_until is not None
+                or prior_event.type_name != "d03.world_event"
+                or prior_event.owner.kind != "event"
+                or prior_event.owner.bot != namespace.bot_id
+                or prior_event.owner.persona != namespace.persona_id
+                or prior_event.name != "current"
+                or reads.get(prior_event) is None or reads[prior_event] < 1):
+            raise ValueError("existing account binding is not a compatible account")
     dependencies = (source, access, GraphVersion(sender_key, sender_revision))
+    if binding_atom is not None:
+        dependencies += (GraphVersion(binding_key, binding_revision),
+                         GraphVersion(prior_event, reads[prior_event]))
+    else:
+        # The new binding points to the event written in this bundle.  Classify
+        # that absent-key dependency just like every GraphWrite edge.
+        dependencies += (GraphVersion(event_key, 0),)
     writes = []
     if sender_atom is None:
         sender_value = asdict(sender)
@@ -207,7 +262,13 @@ def build_message_arrival_proposal(
     event_value = asdict(event)
     event_value["participant_roles"] = [list(role) for role in event.participant_roles]
     event_value["source_refs"] = list(event.source_refs)
-    writes.append(GraphWrite(event_key, event_value, tuple(item.key for item in dependencies)))
+    event_dependencies = (source.key, access.key, sender_key)
+    if binding_atom is not None:
+        event_dependencies += (binding_key, prior_event)
+    writes.append(GraphWrite(event_key, event_value, event_dependencies))
+    if binding_atom is None:
+        writes.append(GraphWrite(binding_key, asdict(binding),
+                                 (source.key, access.key, sender_key, event_key)))
     return DomainProposal(
         "d03", "d03.proposal.v1", ContextProvider().descriptor.request_schema_hash,
         envelope, tuple(writes), DependencySet(current_invalidation=dependencies), (), (),
@@ -223,7 +284,7 @@ def validate_message_arrival_snapshot(
     events = tuple(write for write in proposal.typed_writes
                    if write.key.type_name == "d03.world_event"
                    and write.value.get("kind") == "message_received")
-    if len(events) != 1 or len(proposal.typed_writes) not in (1, 2):
+    if len(events) != 1 or len(proposal.typed_writes) not in (1, 2, 3):
         raise ValueError("message arrival must contain one received event")
     event_write = events[0]
     event = WorldEvent(**{
@@ -238,17 +299,22 @@ def validate_message_arrival_snapshot(
     access = access_key(*namespace.as_tuple, source.owner.subject or "")
     sender_id, role = event.participant_roles[0]
     sender = AtomKey(Owner("persona", *namespace.as_tuple), "d03.entity_anchor", sender_id)
+    binding_id = "account:v1:" + sender_id.removeprefix("entity:account-v1:")
+    binding_key = AtomKey(Owner("persona", *namespace.as_tuple),
+                          "d03.account_binding", binding_id)
     event_prior = snapshot.get(event_write.key)
     source_atom = snapshot.get(source)
     access_atom = snapshot.get(access)
     sender_atom = snapshot.get(sender)
+    binding_atom = snapshot.get(binding_key)
     if (source != source_key(*namespace.as_tuple, source.owner.subject or "")
             or event_write.key != AtomKey(Owner("event", *namespace.as_tuple, event.event_id),
                                           "d03.world_event", "current")
             or event_prior is None or event_prior.revision != 0
             or source_atom is None or not source_atom.valid or source_atom.revision < 1
             or access_atom is None or not access_atom.valid or access_atom.revision < 1
-            or sender_atom is None or role != "sender_account"
+            or sender_atom is None or binding_atom is None
+            or role != "sender_account"
             or event.reality != "host_observed"
             or event.occurred_from != event.learned_at
             or event.occurred_until != event.learned_at):
@@ -275,9 +341,13 @@ def validate_message_arrival_snapshot(
         raise ValueError("message arrival source or access lost current eligibility")
     anchor_writes = tuple(write for write in proposal.typed_writes
                           if write.key.type_name == "d03.entity_anchor")
+    binding_writes = tuple(write for write in proposal.typed_writes
+                           if write.key.type_name == "d03.account_binding")
     expected_writes = {event_write.key}
     if sender_atom.revision == 0:
         expected_writes.add(sender)
+    if binding_atom.revision == 0:
+        expected_writes.add(binding_key)
     if (len(proposal.typed_writes) != len(expected_writes)
             or {write.key for write in proposal.typed_writes} != expected_writes):
         raise ValueError("message arrival write shape differs from sender state")
@@ -300,12 +370,61 @@ def validate_message_arrival_snapshot(
             or anchor.owner_scope != f"persona:{namespace.persona_id}"
             or anchor.status != "active"):
         raise ValueError("sender anchor differs from current account identity")
-    if (set(event_write.dependencies) != {source, access, sender}
+    if binding_atom.revision == 0:
+        if len(binding_writes) != 1 or binding_writes[0].key != binding_key:
+            raise ValueError("new account binding write is missing")
+        binding_value = binding_writes[0].value
+        if set(binding_writes[0].dependencies) != {source, access, sender, event_write.key}:
+            raise ValueError("new account binding lost its event evidence dependency")
+    else:
+        if not binding_atom.valid or binding_writes:
+            raise ValueError("existing account binding cannot be overwritten")
+        binding_value = binding_atom.value
+    binding = AccountBinding(**binding_value)
+    if (binding.account_id != binding_id
+            or binding.entity_id != sender_id
+            or binding.valid_until is not None):
+        raise ValueError("account binding differs from current account identity")
+    try:
+        verification_key = AtomKey.from_token(binding.verification_ref)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("account binding lacks trusted event evidence") from exc
+    if binding_atom.revision == 0:
+        if (verification_key != event_write.key
+                or binding.valid_from != event.learned_at):
+            raise ValueError("new account binding must cite this arrival event")
+    else:
+        verification_atom = snapshot.get(verification_key)
+        if (verification_key.type_name != "d03.world_event"
+                or verification_key.owner.kind != "event"
+                or verification_key.owner.bot != namespace.bot_id
+                or verification_key.owner.persona != namespace.persona_id
+                or verification_key.name != "current"
+                or verification_atom is None or not verification_atom.valid
+                or verification_atom.revision < 1
+                or verification_atom.value.get("kind") != "message_received"
+                or verification_atom.value.get("reality") != "host_observed"
+                or verification_atom.value.get("participant_roles")
+                != [[sender_id, "sender_account"]]
+                or verification_atom.value.get("learned_at") != binding.valid_from):
+            raise ValueError("existing account binding lacks current trusted arrival evidence")
+    expected_dependencies = {source, access, sender}
+    expected_event_dependencies = {source, access, sender}
+    if binding_atom.revision > 0:
+        expected_dependencies.update((binding_key, verification_key))
+        expected_event_dependencies.update((binding_key, verification_key))
+    else:
+        expected_dependencies.add(event_write.key)
+    if (set(event_write.dependencies) != expected_event_dependencies
             or {ref.key for ref in proposal.dependencies.current_invalidation}
-            != {source, access, sender}):
-        raise ValueError("message arrival lost source, access, or sender dependencies")
+            != expected_dependencies):
+        raise ValueError("message arrival lost source, access, sender, or binding dependencies")
     scene_ref, visibility = derive_trusted_message_arrival_identity(
         proposal, snapshot)
+    trusted_identity = json.loads(snapshot.ingress_receipts[0].identity_json)
+    if (binding.platform_namespace != trusted_identity["platform_ref"]
+            or binding.platform_identifier != trusted_identity["sender_ref"]):
+        raise ValueError("account binding differs from trusted host account")
     if (len(snapshot.scene_proofs) != 1
             or type(snapshot.scene_proofs[0]) is not CurrentSceneProof
             or len(snapshot.epochs) != 1):

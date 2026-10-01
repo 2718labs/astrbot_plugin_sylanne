@@ -19,9 +19,11 @@ from ..authority_service.local_composition import compose_local_owner_authority
 from ..authority_service.mtls_server import (
     AdministratorInstallationV2, AuthorityRpcServer, MtlsPeerCredential,
 )
+from ..authority_service.reverse_handoff import ReverseGraphClaimClient
 from ..authority_service.v2_clock import AuthorityClockReadingV2
 from ..authority_service.v2_fence_service import AuthorityV2FenceService
 from ..authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
+from ..authority_service.installed_platform_observation import HostOneBotObservationInstallationV2
 from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationOperationV1, OwnerClaimTicketV1, OwnerPrincipalV1,
 )
@@ -193,8 +195,17 @@ def compose_owner_deployment(
     publisher_manifest_verifier: Callable[[str, str, str, str], bool],
     installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2],
     namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
+    v2_final_handoff_reverse: Mapping[str, ReverseGraphClaimClient] | None = None,
+    v2_final_handoff_issuers: Mapping[str, str] | None = None,
+    v2_dispatch_verifiers: Mapping[str, Callable] | None = None,
     v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
     model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
+    accounting_observers_v2: Mapping[str, tuple[str, str]] | None = None,
+    worker_result_readers_v2: Mapping[str, tuple[str, str]] | None = None,
+    worker_result_fact_committers_v2: Mapping[str, tuple[str, str]] | None = None,
+    self_identity_readers_v2: Mapping[str, tuple[str, str]] | None = None,
+    host_onebot_observations_v2: Mapping[
+        str, HostOneBotObservationInstallationV2] | None = None,
     model_result_source_purposes: Mapping[str, str] | None = None,
     clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
     create_owner_schema: bool = False,
@@ -232,8 +243,16 @@ def compose_owner_deployment(
         publisher_manifest_verifier=publisher_manifest_verifier,
         installations_v2=installations_v2,
         namespace_bindings_v2=namespace_bindings_v2,
+        v2_final_handoff_reverse=v2_final_handoff_reverse,
+        v2_final_handoff_issuers=v2_final_handoff_issuers,
+        v2_dispatch_verifiers=v2_dispatch_verifiers,
         v2_model_egress=v2_model_egress,
         model_observers_v2=model_observers_v2,
+        accounting_observers_v2=accounting_observers_v2,
+        worker_result_readers_v2=worker_result_readers_v2,
+        worker_result_fact_committers_v2=worker_result_fact_committers_v2,
+        self_identity_readers_v2=self_identity_readers_v2,
+        host_onebot_observations_v2=host_onebot_observations_v2,
         model_result_source_purposes=model_result_source_purposes,
         clock_provider=clock_provider, create_owner_schema=create_owner_schema,
     )

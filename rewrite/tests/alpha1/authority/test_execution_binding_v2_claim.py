@@ -123,7 +123,8 @@ def _service(tmp_path, *, create=True, final_authorizer=None, final_issuer=None,
         core=core, fences=fences, journal=journal, namespace=AUTH_NS,
         deletion=deletion, final_handoff_authorizer=final_authorizer,
         final_handoff_issuer_id=final_issuer, owner_tickets=owner_tickets,
-        owner_installation_id="install-a" if with_owner else None)
+        owner_installation_id="install-a" if with_owner else None,
+        observation_verifier=lambda *_: None)
     return core, fences, journal, bridge
 
 
@@ -151,6 +152,26 @@ def _prepared(core, fences, bridge):
         destination_ref="destination-a", worker_fence=1,
         content_fence="content-a", cancel_epoch=0, footprint=footprint)
     return prepared, origin
+
+
+def test_content_fence_keeps_prior_write_token_separate_from_dispatch_permit(tmp_path):
+    core, fences, journal, bridge = _service(tmp_path)
+    try:
+        _, origin = _prepared(core, fences, bridge)
+        token = "_" + "A" * 63
+        permit = replace(origin.permit, token=token)
+        assert replace(origin, permit=permit, content_fence=token).content_fence == token
+        prior_write_token = "_" + "B" * 63
+        binding = replace(origin, permit=permit, content_fence=prior_write_token)
+        assert binding.content_fence == prior_write_token
+        assert binding.permit.token == token
+        with pytest.raises(ValueError, match="content_fence"):
+            replace(origin, permit=permit, content_fence=token + "\n")
+        with pytest.raises(ValueError, match="content_fence"):
+            replace(origin, permit=permit, content_fence="_" + "B" * 64 + "!")
+    finally:
+        core.close()
+        journal.close()
 
 
 def test_v2_claim_replay_preserves_original_p0_and_complete_admission(tmp_path):
@@ -317,7 +338,7 @@ def test_v2_owner_head_change_during_graph_callback_cannot_write_start(tmp_path)
     claimed, _ = bridge.execution_claim_v2(
         credential="ok", subject="subject-a", prepared_receipt=prepared,
         binding=_binding_v2(origin))
-    with pytest.raises(AuthorityUnavailable, match="owner current head differs"):
+    with pytest.raises(AuthorityUnavailable, match="owner current head lacks revoke origin"):
         bridge.begin_handoff_v2(
             credential="ok", subject="subject-a", claimed_receipt=claimed,
             handoff_id="handoff-a")

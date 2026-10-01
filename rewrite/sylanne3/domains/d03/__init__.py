@@ -36,6 +36,7 @@ from .self_identity_qualification import (
     qualify_authority_current_self_identity,
     self_identity_mapping_from_current,
 )
+from .cross_scene_social import CrossSceneSocialCandidateV1, project_cross_scene_social_v1
 
 __all__ = (
     "AccountBinding",
@@ -64,4 +65,6 @@ __all__ = (
     "AuthorityCurrentSelfIdentityPort",
     "qualify_authority_current_self_identity",
     "self_identity_mapping_from_current",
+    "CrossSceneSocialCandidateV1",
+    "project_cross_scene_social_v1",
 )

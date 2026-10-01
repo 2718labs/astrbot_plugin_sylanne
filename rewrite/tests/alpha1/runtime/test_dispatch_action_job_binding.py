@@ -18,7 +18,7 @@ from sylanne3.runtime_contracts import NamespaceId, canonical_digest
 from test_dispatch_admission_preflight import _candidates
 
 
-def _case(path=":memory:"):
+def _case(path=":memory:", *, post_c02_reply=False):
     from sylanne3.runtime.dispatch_action_job_binding import (
         bind_action_job, load_action_job_binding,
     )
@@ -39,10 +39,15 @@ def _case(path=":memory:"):
         PRIMARY KEY(bot,persona,admission_ref))""")
     namespace = NamespaceId("bot", "persona")
     _, intent, _, _, checks = _candidates()
+    operation_id = ("post-c02-reply:one" if post_c02_reply
+                    else "operation:one")
+    if post_c02_reply:
+        intent = replace(intent, identity=replace(
+            intent.identity, operation_id=operation_id))
     admission = DispatchAdmissionV1(
         namespace="bot/persona", graph_incarnation="incarnation:one",
         activity_id="activity:one", effect_id="effect:one",
-        attempt_id="attempt:one", operation_id="operation:one",
+        attempt_id="attempt:one", operation_id=operation_id,
         dispatch_generation=1, admission_ref="admission:one",
         candidate_digest="0" * 64, request_digest="1" * 64,
         action_intent_digest=canonical_digest(intent),
@@ -61,7 +66,7 @@ def _case(path=":memory:"):
         graph_reads=(("source:one", 1),), query_epoch=1,
         access_epoch=0, delete_epoch=0, check_receipts=checks,
         budget_parent_lease_ref="parent:one", budget_lease_ref="parent:one",
-        budget_reservation_operation_id="operation:one",
+        budget_reservation_operation_id=operation_id,
         budget_reservation_digest="8" * 64,
         budget_ceiling={"cpu_ms": 1}, budget_currency="USD",
         budget_version=1, contact_reservation_ref=None,
@@ -88,8 +93,12 @@ def _case(path=":memory:"):
         intent.revision, canonical_json(json.loads(json.dumps(asdict(intent)))), 1,
     ))
     job = PersistentJob(
-        "job:one", "operation:one", "activity:one", "effect:one",
-        "bot", "persona", "snapshot:one", "queued", "dispatch", {}, None,
+        "job:one", operation_id, "activity:one", "effect:one",
+        "bot", "persona", "snapshot:one",
+        "waiting" if post_c02_reply else "queued",
+        "message" if post_c02_reply else "dispatch", {},
+        ({"kind": "post_c02_reply_host_takeover",
+          "operation_id": operation_id} if post_c02_reply else None),
         "2099-01-01T00:00:00Z", "parent:one", "resource:one", {},
         None, None, 0, 0, {}, None,
     )
@@ -101,6 +110,26 @@ def _case(path=":memory:"):
     ))
     db.commit()
     return db, namespace, intent, receipt, job, bind_action_job, load_action_job_binding
+
+
+def test_post_c02_message_waiting_job_binds_only_exact_takeover_operation():
+    db, _, intent, receipt, job, bind, _ = _case(post_c02_reply=True)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        assert bind(db, intent, receipt).job_id == job.job_id
+    finally:
+        db.close()
+
+    db, _, intent, receipt, job, bind, _ = _case(post_c02_reply=True)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("UPDATE runtime_jobs SET wake_condition_json=? WHERE job_id=?", (
+            canonical_json({"kind": "post_c02_reply_host_takeover",
+                            "operation_id": "post-c02-reply:other"}), job.job_id))
+        with pytest.raises(ValueError, match="job identity or cancellation"):
+            bind(db, intent, receipt)
+    finally:
+        db.close()
 
 
 def test_exact_action_attempt_admission_and_job_bind_once_and_survive_reopen(tmp_path):

@@ -10,15 +10,15 @@ from unittest.mock import patch
 
 from astrbot.dashboard.api.plugins import _match_registered_web_api
 
-from rewrite.sylanne3.host.workbench_mount import STATUS_ROUTE, WorkbenchHostMount
-from rewrite.sylanne3.host.scene_candidates import ObservedSceneCandidate
-from rewrite.sylanne3.runtime_contracts import NamespaceId
-from rewrite.sylanne3.workbench_api.http_transport import (
+from sylanne3.host.workbench_mount import STATUS_ROUTE, WorkbenchHostMount
+from sylanne3.host.scene_candidates import ObservedSceneCandidate
+from sylanne3.runtime_contracts import NamespaceId
+from sylanne3.workbench_api.http_transport import (
     ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, SCENE_CANDIDATES_ROUTE,
     SESSION_ROUTE, TransportConfig, WorkbenchHttpTransport,
 )
-from rewrite.sylanne3.workbench_api.owner_session_resolver import BoundOwnerSessions
-from rewrite.sylanne3.workbench_api.service import AuthenticatedSession
+from sylanne3.workbench_api.owner_session_resolver import BoundOwnerSessions
+from sylanne3.workbench_api.service import AuthenticatedSession
 
 
 class _Context:
@@ -71,6 +71,30 @@ def test_host_mount_serves_packaged_assets_without_promoting_dashboard_admin_to_
         mount.close()
         assert json.loads(asyncio.run(handler()).body)["problem"]["code"] == "host_stopped"
         assert asyncio.run(page()).status_code == 503
+
+
+def test_backend_only_mount_starts_without_packaged_ui(tmp_path, monkeypatch):
+    import sylanne3.host.workbench_mount as workbench_mount
+
+    monkeypatch.setattr(workbench_mount, "_WORKBENCH_ROOT", tmp_path / "no-ui")
+    context = _Context()
+    mount = WorkbenchHostMount()
+    with patch("astrbot.api.web.request", SimpleNamespace(username="dashboard-admin")):
+        mount.register(context)
+        assert len(context.registered_web_apis) == 9
+        command, _ = _match_registered_web_api(
+            context.registered_web_apis, COMMAND_ROUTE, "POST")
+        assert json.loads(asyncio.run(command()).body)["problem"]["code"] == (
+            "authority_unavailable")
+        page, _ = _match_registered_web_api(
+            context.registered_web_apis, PLUGIN_ROUTE_PREFIX, "GET")
+        missing = asyncio.run(page())
+        assert missing.status_code == 404
+        assert json.loads(missing.body)["problem"]["code"] == "asset_unavailable"
+        status, _ = _match_registered_web_api(
+            context.registered_web_apis, STATUS_ROUTE, "GET")
+        assert json.loads(asyncio.run(status()).body)["problem"]["code"] == (
+            "runtime_unavailable")
 
 
 def test_installation_stage_is_readable_without_owner_but_only_exposes_safe_codes():

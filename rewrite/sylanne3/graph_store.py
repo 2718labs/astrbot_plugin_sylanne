@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import secrets
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
+from typing import Protocol
 
 from .contracts import Event, EventConflict, StaleRead, canonical_json, json_object, nonempty
 from .graph_types import (
@@ -16,11 +20,15 @@ from .graph_types import (
     GraphVersion,
     NamespaceEpoch,
     OWNER_GRANT_TYPE,
+    owner_grant_key,
+    validate_owner_grant_v1,
     TypeRegistry,
 )
 from .store import Store
 from .runtime import install_schema as install_runtime_schema
 from .runtime_contracts import NamespaceId, SnapshotRequirementsV2
+from .authority_service.v2_owner_contract import OwnerMigrationHeadV1
+from .runtime_contracts import canonical_digest
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +47,112 @@ class GraphRecoveryMetadataV2:
             raise TypeError("requirements must be SnapshotRequirementsV2")
         if type(self.graph_revision) is not int or self.graph_revision < 0:
             raise ValueError("graph_revision must be a nonnegative integer")
+
+
+@dataclass(frozen=True, slots=True)
+class GraphMigrationVerifiedTransferV1:
+    """Result of a trusted local check of an externally verified transfer receipt.
+
+    This is a comparison result, not a caller-supplied permission. The bound
+    verifier must authenticate the Authority transfer and journal continuity
+    before returning it; remote work belongs outside the graph transaction.
+    """
+
+    transfer_id: str
+    source: GraphRecoveryMetadataV2
+    target: SnapshotRequirementsV2
+    authority_phase: str
+    source_snapshot_digest: str
+    owner_head: OwnerMigrationHeadV1 | None = None
+
+    def __post_init__(self):
+        nonempty(self.transfer_id, "transfer_id")
+        if type(self.source) is not GraphRecoveryMetadataV2:
+            raise TypeError("source must be GraphRecoveryMetadataV2")
+        if type(self.target) is not SnapshotRequirementsV2:
+            raise TypeError("target must be SnapshotRequirementsV2")
+        nonempty(self.source_snapshot_digest, "source_snapshot_digest")
+        if self.owner_head is not None and type(self.owner_head) is not OwnerMigrationHeadV1:
+            raise TypeError("owner_head must be the frozen Authority head")
+
+
+class GraphMigrationTransferVerifier(Protocol):
+    """Pinned installation verifier for a previously authenticated transfer."""
+
+    def verify_local(self, transfer_receipt: object) -> GraphMigrationVerifiedTransferV1:
+        ...
+
+
+def _assert_migration_owner_head_in_transaction(
+        db, namespace: NamespaceId, head: OwnerMigrationHeadV1 | None) -> None:
+    """Compare restored graph originals with Authority's frozen latest Owner head."""
+    key = owner_grant_key(*namespace.as_tuple)
+    grant_row = db.execute(
+        "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+        (key.token,),
+    ).fetchone()
+    issue_row = db.execute(
+        "SELECT operation_id,request_digest,grant_id,grant_digest,"
+        "graph_incarnation,graph_access_epoch,graph_epoch,"
+        "graph_receipt_digest,proof_json FROM graph_owner_issue_operations_v1 "
+        "WHERE bot=? AND persona=?", namespace.as_tuple,
+    ).fetchone()
+    revoke_row = db.execute(
+        "SELECT operation_id,request_digest,grant_id,grant_digest,"
+        "graph_incarnation,previous_grant_digest,graph_access_epoch,"
+        "graph_epoch,graph_receipt_digest,proof_json "
+        "FROM graph_owner_revoke_operations_v1 WHERE bot=? AND persona=?",
+        namespace.as_tuple,
+    ).fetchone()
+    if head is None:
+        if any(row is not None for row in (grant_row, issue_row, revoke_row)):
+            raise PermissionError("restored Owner graph lacks current Authority head")
+        return
+    if (type(head) is not OwnerMigrationHeadV1
+            or head.issue_operation.namespace != namespace
+            or head.guard.namespace != namespace
+            or grant_row is None or grant_row[2] != 1
+            or issue_row is None):
+        raise PermissionError("restored Owner issue identity differs")
+    try:
+        grant = json.loads(grant_row[1])
+        validate_owner_grant_v1(grant)
+    except (TypeError, ValueError) as exc:
+        raise PermissionError("restored Owner grant is invalid") from exc
+    issue = head.issue_proof
+    expected_issue = (
+        issue.operation_id, issue.request_digest, issue.grant_id,
+        issue.grant_digest, issue.graph_incarnation,
+        issue.graph_access_epoch, issue.graph_epoch,
+        issue.graph_receipt_digest, canonical_json(asdict(issue)),
+    )
+    expected_digest = "sha256:" + canonical_digest(grant)
+    access = db.execute(
+        "SELECT access_epoch FROM graph_authority_epochs "
+        "WHERE bot=? AND persona=?", namespace.as_tuple,
+    ).fetchone()
+    if (grant_row[1] != canonical_json(grant)
+            or grant_row[0] != head.grant_revision
+            or grant["grant_revision"] != head.grant_revision
+            or grant["state"] != ("revoked" if head.state == "revoked"
+                                   else "pending_authority")
+            or grant["grant_id"] != head.issue_operation.grant_id
+            or expected_digest != head.grant_digest
+            or access != (head.graph_access_epoch,)
+            or issue_row != expected_issue):
+        raise PermissionError("restored Owner graph is behind Authority head")
+    if head.state == "active":
+        if revoke_row is not None:
+            raise PermissionError("restored Owner revoke lacks Authority head")
+        return
+    revoke = head.revoke_proof
+    if revoke is None or revoke_row != (
+            revoke.operation_id, revoke.request_digest, revoke.grant_id,
+            revoke.grant_digest, revoke.graph_incarnation,
+            issue.grant_digest, revoke.graph_access_epoch,
+            revoke.graph_epoch, revoke.graph_receipt_digest,
+            canonical_json(asdict(revoke))):
+        raise PermissionError("restored Owner rev2 proof differs from Authority")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,16 +206,121 @@ class DeletionSnapshotPage:
 class GraphStore(Store):
     """Adds a typed, multi-owner graph to :class:`Store`'s database and lock."""
 
-    def __init__(self, path, registry: TypeRegistry):
+    def __init__(self, path, registry: TypeRegistry, *,
+                 migration_transfer_verifier: GraphMigrationTransferVerifier | None = None):
         if not isinstance(registry, TypeRegistry):
             raise TypeError("registry must be TypeRegistry")
         self._registry = registry.freeze()
+        self._migration_transfer_verifier = migration_transfer_verifier
         super().__init__(path)
         with self._lock:
             try:
                 self._create_graph_schema()
+                from .runtime.d04_joint_advance_v2 import install_joint_advance_store_v2
+                from .runtime.d04_joint_output_original_store_v1 import (
+                    install_d04_joint_output_original_store_v1,
+                )
+                from .runtime.d04_root_original_store_v1 import (
+                    install_d04_root_original_store_v1,
+                )
+                from .runtime.d04_root_adoption_original_v2 import (
+                    install_d04_root_adoption_original_v2,
+                )
+                from .runtime.d04_root_original_store_v3 import (
+                    install_d04_root_original_store_v3,
+                )
+                from .runtime.d11_d04_root_freeze_v3 import install_d11_root_freeze_v3
+                install_joint_advance_store_v2(self._db)
+                install_d04_joint_output_original_store_v1(self._db)
+                install_d04_root_original_store_v1(self._db)
+                install_d04_root_adoption_original_v2(self._db)
+                install_d04_root_original_store_v3(self._db)
+                install_d11_root_freeze_v3(self._db)
+                from .runtime.d04_appraisal_driver_v3 import install_d04_appraisal_schema_v3
+                from .runtime.d07_current_behavior_v1 import install_current_d07_behavior_schema_v1
+                from .runtime.lifecycle_operations_v1 import LifecycleOriginalStoreV1
+                install_d04_appraisal_schema_v3(self._db)
+                from .runtime.d04_installed_stage_fence_v3 import install_schema as install_d04_stage_fence
+                install_d04_stage_fence(self._db)
+                install_current_d07_behavior_schema_v1(self._db)
+                LifecycleOriginalStoreV1(db=self._db, lock=self._lock).install_schema()
+                from .runtime.d13_paid_intent_original_v1 import (
+                    install_d13_paid_intent_original_v1,
+                )
+                install_d13_paid_intent_original_v1(self._db)
+                from .runtime.d13_paid_coordinator_v1 import (
+                    install_d13_paid_coordinator_schema_v1,
+                )
+                install_d13_paid_coordinator_schema_v1(self._db)
+                from .runtime.installed_d13_wire_evidence_v1 import install_d13_wire_evidence_schema_v1
+                install_d13_wire_evidence_schema_v1(self._db)
+                from .runtime.d04_semantic_installation_original_v3 import install_d04_semantic_installation_schema_v3
+                install_d04_semantic_installation_schema_v3(self._db)
+                from .runtime.d04_owner_initialization_v3 import install_d04_root_topology_originals_v3
+                install_d04_root_topology_originals_v3(self._db)
+                from .runtime.d13_outbound_observation_v1 import install_d13_outbound_schema_v1
+                install_d13_outbound_schema_v1(self._db)
+                from .domains.d02.body_quote_original import install_body_quote_schema
+                install_body_quote_schema(self._db)
+                from .runtime.c04_encoding_baseline_store_v3 import install_c04_encoding_baseline_store_v3
+                install_c04_encoding_baseline_store_v3(self._db)
+                from .runtime.c04_frozen_association_original_v3 import install_c04_frozen_association_original_v3
+                from .runtime.c04_product_original_v3 import install_c04_product_original_v3
+                from .runtime.c04_interpretation_policy_v3 import install_c04_interpretation_policy_original_v3
+                install_c04_frozen_association_original_v3(self._db)
+                install_c04_product_original_v3(self._db)
+                install_c04_interpretation_policy_original_v3(self._db)
+                from .runtime.c04_historical_accounting_v1 import install_c04_historical_schema_v1
+                install_c04_historical_schema_v1(self._db)
+                from .runtime.c04_historical_accounting_v1 import install_c04_adoption_provenance_schema_v3
+                install_c04_adoption_provenance_schema_v3(self._db)
+                from .authority_service.c09_graph_application_v1 import install_c09_graph_application_schema_v1
+                install_c09_graph_application_schema_v1(self._db)
+                from .runtime.d01_production_operations_v1 import install_d01_production_schema_v1
+                from .runtime.d02_production_operations_v1 import install_d02_production_schema_v1
+                from .runtime.d05_production_operations_v1 import install_d05_production_schema_v1
+                from .runtime.d08_production_operations_v1 import install_d08_production_schema_v1
+                from .runtime.d10_production_operations_v1 import install_d10_production_schema_v1
+                from .runtime.d11_offline_originals_v1 import install_d11_offline_schema_v1
+                from .runtime.d11_life_preparation_v1 import install_d11_life_schema_v1
+                for install in (install_d01_production_schema_v1, install_d02_production_schema_v1,
+                        install_d05_production_schema_v1, install_d08_production_schema_v1,
+                        install_d10_production_schema_v1, install_d11_offline_schema_v1, install_d11_life_schema_v1):
+                    install(self._db)
                 self._db.execute("BEGIN IMMEDIATE")
                 install_runtime_schema(self._db)
+                from .runtime.d12_installed_graph_schema_v1 import install_d12_installed_graph_schema_v1
+                install_d12_installed_graph_schema_v1(self._db)
+                from .runtime.c09_erasure_barrier_store_v1 import (
+                    install_c09_erasure_barrier_store_v1,
+                )
+                from .runtime.c09_erasure_plan_original_v1 import (
+                    install_c09_erasure_plan_schema_v1,
+                )
+                from .runtime.c04_cpu_quote_policy import (
+                    install_c04_cpu_quote_schema_v1,
+                )
+                from .runtime.c04_frozen_association_original_v2 import (
+                    install_c04_frozen_association_original_v2,
+                )
+                from .runtime.c04_internal_work_original_v1 import (
+                    install_c04_internal_work_original_v1,
+                )
+                from .runtime.d11_c04_internal_cost import (
+                    install_d11_c04_cost_schema,
+                )
+                from .domains.d02.c04_fixed_component_cost import (
+                    install_d02_c04_body_cost_schema,
+                )
+                install_c09_erasure_barrier_store_v1(self._db)
+                install_c09_erasure_plan_schema_v1(self._db)
+                install_c04_cpu_quote_schema_v1(self._db)
+                install_c04_internal_work_original_v1(self._db)
+                install_c04_frozen_association_original_v2(self._db)
+                install_d11_c04_cost_schema(self._db)
+                install_d02_c04_body_cost_schema(self._db)
+                from .runtime.source_attachment_graph_v2 import install_media_blob_schema
+                install_media_blob_schema(self._db)
                 self._check_catalog()
                 self._db.execute("COMMIT")
             except BaseException:
@@ -133,6 +352,9 @@ class GraphStore(Store):
                 ON graph_atoms(bot, persona);
             CREATE INDEX IF NOT EXISTS graph_atoms_namespace_type_token
                 ON graph_atoms(bot, persona, type_name, token);
+            CREATE INDEX IF NOT EXISTS graph_d09_turn_slot_origin
+                ON graph_atoms(bot, persona, json_extract(value, '$.origin_ref'))
+                WHERE type_name='d09.turn_slot.v1';
             CREATE TABLE IF NOT EXISTS graph_dependencies (
                 dependent_token TEXT NOT NULL,
                 dependency_token TEXT NOT NULL,
@@ -171,10 +393,89 @@ class GraphStore(Store):
                 PRIMARY KEY(token, revision),
                 FOREIGN KEY(event_bot, event_persona, event_session, event_id)
                     REFERENCES graph_events(bot, persona, session, event_id));
+            CREATE TABLE IF NOT EXISTS graph_d13_retirements_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, input_digest TEXT NOT NULL,
+                block_token TEXT NOT NULL, old_revision INTEGER NOT NULL,
+                cache_revision INTEGER NOT NULL, graph_revision INTEGER NOT NULL,
+                graph_epoch INTEGER NOT NULL, cleanup_task_ref TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                PRIMARY KEY(bot, persona, operation_id),
+                UNIQUE(bot, persona, block_token));
+            CREATE TABLE IF NOT EXISTS graph_d13_cleanup_tasks_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                task_ref TEXT NOT NULL, block_token TEXT NOT NULL,
+                retirement_operation_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state='pending'),
+                PRIMARY KEY(bot, persona, task_ref),
+                UNIQUE(bot, persona, block_token));
+            CREATE TABLE IF NOT EXISTS graph_d13_inbound_turn_attempts_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                ingress_operation_id TEXT NOT NULL,
+                c02_operation_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                anchor_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL,
+                pre_graph_epoch INTEGER NOT NULL,
+                permit_json TEXT,
+                finish_request_id TEXT,
+                finish_request_digest TEXT,
+                receipt_json TEXT,
+                PRIMARY KEY(bot, persona, ingress_operation_id),
+                UNIQUE(bot, persona, attempt_id));
+            CREATE TABLE IF NOT EXISTS graph_d13_precompression_attempts_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, intent_digest TEXT NOT NULL,
+                intent_json TEXT NOT NULL,
+                attempt_id TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL,
+                pre_graph_epoch INTEGER NOT NULL,
+                permit_json TEXT, finish_request_id TEXT,
+                finish_request_digest TEXT, receipt_json TEXT,
+                rejected_json TEXT,
+                finish_confirmed INTEGER NOT NULL DEFAULT 0
+                    CHECK(finish_confirmed IN (0,1)),
+                PRIMARY KEY(bot, persona, operation_id),
+                UNIQUE(bot, persona, attempt_id));
+            CREATE TABLE IF NOT EXISTS graph_d13_worker_attempts_v2 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+                attempt_id TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL,
+                pre_graph_epoch INTEGER NOT NULL,
+                permit_json TEXT, finish_request_id TEXT,
+                finish_request_digest TEXT, receipt_json TEXT,
+                PRIMARY KEY(bot, persona, operation_id),
+                UNIQUE(bot, persona, attempt_id));
+            CREATE TABLE IF NOT EXISTS graph_d13_paid_write_attempts_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                phase TEXT NOT NULL, operation_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+                anchor_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL,
+                pre_graph_epoch INTEGER NOT NULL,
+                permit_json TEXT, finish_request_id TEXT,
+                finish_request_digest TEXT, receipt_json TEXT,
+                PRIMARY KEY(bot, persona, phase, operation_id),
+                UNIQUE(bot, persona, attempt_id));
             CREATE TABLE IF NOT EXISTS graph_type_authority (
                 name TEXT PRIMARY KEY,
                 writer_domain TEXT NOT NULL,
                 schema_hash TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS graph_source_access_revocations_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                request_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL, request_json TEXT NOT NULL,
+                attempt_id TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                requirements_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL,
+                pre_graph_epoch INTEGER NOT NULL,
+                permit_json TEXT, finish_request_id TEXT,
+                finish_request_digest TEXT, receipt_json TEXT,
+                rejected INTEGER NOT NULL DEFAULT 0 CHECK(rejected IN (0,1)),
+                PRIMARY KEY(bot,persona,request_id),
+                UNIQUE(bot,persona,operation_id),
+                UNIQUE(bot,persona,attempt_id));
             CREATE TABLE IF NOT EXISTS graph_authority_epochs (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 access_epoch INTEGER NOT NULL DEFAULT 0,
@@ -285,6 +586,32 @@ class GraphStore(Store):
                 FOREIGN KEY(bot,persona,operation_id,grant_digest)
                     REFERENCES graph_owner_issue_intents_v1(
                         bot,persona,operation_id,grant_digest));
+            CREATE TABLE IF NOT EXISTS graph_owner_revoke_intents_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+                operation_json TEXT NOT NULL, pending_receipt_json TEXT NOT NULL,
+                attempt_id TEXT NOT NULL UNIQUE,
+                requirements_json TEXT NOT NULL, anchor_json TEXT NOT NULL,
+                pre_graph_revision INTEGER NOT NULL,
+                pre_graph_epoch INTEGER NOT NULL,
+                pre_access_epoch INTEGER NOT NULL,
+                permit_json TEXT, finish_request_id TEXT,
+                finish_request_digest TEXT,
+                state TEXT NOT NULL CHECK(state IN ('prepared','committed')),
+                PRIMARY KEY(bot,persona,operation_id));
+            CREATE TABLE IF NOT EXISTS graph_owner_revoke_operations_v1 (
+                bot TEXT NOT NULL, persona TEXT NOT NULL,
+                operation_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+                grant_id TEXT NOT NULL, grant_digest TEXT NOT NULL,
+                graph_incarnation TEXT NOT NULL,
+                previous_grant_digest TEXT NOT NULL,
+                graph_access_epoch INTEGER NOT NULL,
+                graph_epoch INTEGER NOT NULL,
+                graph_receipt_digest TEXT NOT NULL, proof_json TEXT NOT NULL,
+                fence_attempt_id TEXT NOT NULL,
+                finish_request_id TEXT NOT NULL,
+                finish_request_digest TEXT NOT NULL,
+                PRIMARY KEY(bot,persona), UNIQUE(operation_id));
             CREATE TABLE IF NOT EXISTS graph_role_init_intents_v1 (
                 bot TEXT NOT NULL, persona TEXT NOT NULL,
                 operation_id TEXT NOT NULL, input_digest TEXT NOT NULL,
@@ -541,6 +868,19 @@ class GraphStore(Store):
                   OR NEW.graph_incarnation != OLD.graph_incarnation
                 BEGIN SELECT RAISE(ABORT, 'provisioning intent is immutable'); END;
         """)
+        # Existing local graphs predate the finish acknowledgement. A missing
+        # acknowledgement is deliberately replayed once after restart.
+        columns = {row[1] for row in self._db.execute(
+            "PRAGMA table_info(graph_d13_precompression_attempts_v2)")}
+        if "finish_confirmed" not in columns:
+            self._db.execute(
+                "ALTER TABLE graph_d13_precompression_attempts_v2 ADD COLUMN "
+                "finish_confirmed INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(finish_confirmed IN (0,1))")
+        if "rejected_json" not in columns:
+            self._db.execute(
+                "ALTER TABLE graph_d13_precompression_attempts_v2 "
+                "ADD COLUMN rejected_json TEXT")
 
     @staticmethod
     def _catalog_row(spec):
@@ -563,11 +903,47 @@ class GraphStore(Store):
         ).fetchall())
         expected_authority = tuple((spec.name, spec.writer_domain or "",
                                     spec.schema_hash or "") for spec in self._registry.specs)
-        # These two additions have reviewed append-only identities.  Every
+        # The reserved Owner type gains one exact terminal rev2 value. Migrate
+        # only the prior reviewed hash; no other writer identity may drift.
+        old_owner_hash = hashlib.sha256(
+            b"sylanne3.graph.owner_grant.v1:strict:pending").hexdigest()
+        old_authority = tuple(
+            (name, writer, old_owner_hash if name == OWNER_GRANT_TYPE else digest)
+            for name, writer, digest in expected_authority)
+        if (actual == expected and authority == old_authority
+                and authority != expected_authority):
+            rows = self._db.execute(
+                "SELECT token,revision,value,valid FROM graph_atoms WHERE type_name=?",
+                (OWNER_GRANT_TYPE,),
+            ).fetchall()
+            for token, revision, raw, valid in rows:
+                value = json.loads(raw)
+                validate_owner_grant_v1(value)
+                history = self._db.execute(
+                    "SELECT revision,value,valid,event_session,event_id "
+                    "FROM graph_history WHERE token=?", (token,),
+                ).fetchall()
+                if (canonical_json(value) != raw or revision != 1 or valid != 1
+                        or value.get("state") != "pending_authority"
+                        or value.get("grant_revision") != 1
+                        or history != [(1, raw, 1, "owner-authorization-v1",
+                                        value["issue_operation_id"])]):
+                    raise ValueError("Owner grant catalogue migration requires rev1")
+            self._db.execute(
+                "UPDATE graph_type_authority SET schema_hash=? WHERE name=? AND schema_hash=?",
+                (dict((name, digest) for name, _, digest in expected_authority)[OWNER_GRANT_TYPE],
+                 OWNER_GRANT_TYPE, old_owner_hash),
+            )
+            authority = expected_authority
+        # These additions have reviewed append-only identities.  Every
         # previously installed row must still match exactly, including its
         # owner, storage, writer domain and schema hash.
         append_types = frozenset({
             "runtime.role_resources.v1", "d06.recollection_projection.v1",
+            "d12.active_scheme_head.v1", "d07.concern_round.v1",
+            "d08.natural_expression_plan.v2",
+            "d04.encoding_baseline.v2", "d04.encoding_projection_receipt.v2",
+            "memory.source.v2",
         })
         expected_names = {row[0] for row in expected}
         missing = expected_names - {row[0] for row in actual}
@@ -874,6 +1250,62 @@ class GraphStore(Store):
                 raise
         return result
 
+    def cas_c09_recovery_identity_v1(self, expected, replacement, *, storage_reader, core,
+                                     credential, _capability=None):
+        """Apply the signed current C09 transition; ordinary CAS keeps its identity guard."""
+        from .authority_service.c09_storage_control_v1 import C09StorageControlV1
+        from .authority_service.core import AuthorityServiceCore
+        from pathlib import Path
+        self._require_recovery_capability(_capability)
+        if (type(storage_reader) is not C09StorageControlV1 or type(core) is not AuthorityServiceCore
+                or type(expected) is not GraphRecoveryMetadataV2
+                or getattr(core, "_c09_storage_reader_v1", None) is not storage_reader):
+            raise PermissionError("installed C09 recovery identity authority required")
+        before = expected.requirements
+        core._require(credential, "deletion", before.authority_namespace)
+        context = storage_reader.read_verified_current_storage_v1()
+        context.require_current("maintenance")
+        if context.stage not in {"SWITCHED", "CLEANED"} or context.prepared_original is None:
+            raise StaleRead("C09 current transition is not open for recovery identity")
+        prepared = context.prepared_original
+        members = {member["role"]: member for member in context.manifest["members"]}
+        path = self._db.execute("PRAGMA database_list").fetchone()
+        old = prepared["old_execution_head_original"]
+        with core._lock:
+            if core._db is None or not core._db.in_transaction:
+                raise RuntimeError("C09 recovery identity needs actual Core and Graph transactions")
+            anchor = core._anchor(core._db, before.authority_namespace,
+                core._row(core._db, before.authority_namespace))
+        if (path is None or str(Path(path[2]).resolve()) != members["graph"]["resolved_path"]
+                or before.namespace != replacement.namespace
+                or before.authority_id != replacement.authority_id or before.authority_id != core._id(core._db)
+                or before.authority_namespace != replacement.authority_namespace
+                or before.activation_generation != replacement.activation_generation
+                or before.graph_incarnation != replacement.graph_incarnation
+                or before.graph_incarnation != members["graph"]["incarnation_or_journal_id"]
+                or before.execution_journal_id != old["journal_id"] or before.execution_seq > old["seq"]
+                or (before.execution_seq == old["seq"] and before.execution_digest != old["digest"])
+                or replacement.execution_journal_id != members["execution"]["incarnation_or_journal_id"]
+                or (replacement.deletion_journal_id, replacement.deletion_seq, replacement.deletion_digest,
+                    replacement.execution_journal_id, replacement.execution_seq, replacement.execution_digest,
+                    replacement.revocation_epoch, replacement.activation_generation) != (
+                    anchor.deletion_journal_id, anchor.deletion_seq, anchor.deletion_digest,
+                    anchor.execution_journal_id, anchor.execution_seq, anchor.execution_digest,
+                    anchor.revocation_epoch, anchor.activation_generation)
+                or replacement.deletion_seq < before.deletion_seq
+                or replacement.revocation_epoch < before.revocation_epoch):
+            raise StaleRead("actual C09 signed identity transition differs from current stores")
+        with self._lock:
+            if not self._db.in_transaction:
+                raise RuntimeError("C09 recovery identity needs current Graph transaction")
+            changed = self._db.execute("UPDATE graph_recovery_metadata_v2 SET requirements_json=?,graph_revision=graph_revision+1 "
+                "WHERE bot=? AND persona=? AND schema=? AND requirements_json=? AND graph_revision=?",
+                (self._recovery_payload(replacement), *before.namespace.as_tuple, before.schema,
+                    self._recovery_payload(before), expected.graph_revision)).rowcount
+            if changed != 1:
+                raise StaleRead("C09 recovery identity CAS changed")
+            return GraphRecoveryMetadataV2(replacement, expected.graph_revision + 1)
+
     def cas_graph_recovery_metadata(self, expected, replacement, *, _capability=None):
         """Advance the namespace commit stamp inside the caller's SQL transaction."""
         self._require_recovery_capability(_capability)
@@ -893,6 +1325,11 @@ class GraphStore(Store):
                 or replacement.execution_seq < before.execution_seq
                 or replacement.revocation_epoch < before.revocation_epoch):
             raise StaleRead("graph recovery watermark regressed")
+        if ((replacement.deletion_seq == before.deletion_seq
+             and replacement.deletion_digest != before.deletion_digest)
+                or (replacement.execution_seq == before.execution_seq
+                    and replacement.execution_digest != before.execution_digest)):
+            raise StaleRead("graph recovery digest changed without journal advance")
         with self._lock:
             self._ensure_open()
             if not self._db.in_transaction:
@@ -906,6 +1343,61 @@ class GraphStore(Store):
             ).rowcount
             if changed != 1:
                 raise StaleRead("graph recovery metadata changed")
+            return GraphRecoveryMetadataV2(replacement, expected.graph_revision + 1)
+
+    def cas_graph_migration_recovery_metadata(
+            self, expected, replacement, transfer_receipt, *, _capability=None):
+        """CAS a migration target in the caller's transaction after trusted proof.
+
+        Only the verifier bound when this store was opened may authenticate the
+        transfer. It must perform any remote checks before this short local CAS.
+        The caller owns the surrounding graph import, receipt, COMMIT/ROLLBACK.
+        """
+        self._require_recovery_capability(_capability)
+        if type(expected) is not GraphRecoveryMetadataV2:
+            raise TypeError("expected must be GraphRecoveryMetadataV2")
+        encoded = self._recovery_payload(replacement)
+        verifier = self._migration_transfer_verifier
+        if verifier is None:
+            raise RuntimeError("trusted migration transfer verifier is unavailable")
+        proof = verifier.verify_local(transfer_receipt)
+        if (type(proof) is not GraphMigrationVerifiedTransferV1
+                or proof.source != expected or proof.target != replacement
+                or proof.authority_phase != "target_recovering"):
+            raise PermissionError("migration transfer proof does not match target recovery")
+        before = expected.requirements
+        if (replacement.namespace != before.namespace
+                or replacement.authority_id != before.authority_id
+                or replacement.authority_namespace != before.authority_namespace
+                or replacement.deletion_journal_id != before.deletion_journal_id
+                or replacement.execution_journal_id != before.execution_journal_id
+                or replacement.activation_generation != before.activation_generation + 2
+                or replacement.graph_incarnation == before.graph_incarnation):
+            raise StaleRead("graph migration identity or generation changed")
+        if (replacement.deletion_seq < before.deletion_seq
+                or replacement.execution_seq < before.execution_seq
+                or replacement.revocation_epoch <= before.revocation_epoch):
+            raise StaleRead("graph migration watermark regressed")
+        if ((replacement.deletion_seq == before.deletion_seq
+             and replacement.deletion_digest != before.deletion_digest)
+                or (replacement.execution_seq == before.execution_seq
+                    and replacement.execution_digest != before.execution_digest)):
+            raise StaleRead("graph migration digest changed without journal advance")
+        with self._lock:
+            self._ensure_open()
+            if not self._db.in_transaction:
+                raise RuntimeError("graph migration CAS requires an active SQL transaction")
+            _assert_migration_owner_head_in_transaction(
+                self._db, before.namespace, proof.owner_head)
+            changed = self._db.execute(
+                "UPDATE graph_recovery_metadata_v2 SET requirements_json=?,"
+                "graph_revision=graph_revision+1 WHERE bot=? AND persona=? "
+                "AND schema=? AND requirements_json=? AND graph_revision=?",
+                (encoded, *before.namespace.as_tuple, before.schema,
+                 self._recovery_payload(before), expected.graph_revision),
+            ).rowcount
+            if changed != 1:
+                raise StaleRead("graph migration recovery metadata changed")
             return GraphRecoveryMetadataV2(replacement, expected.graph_revision + 1)
 
     def graph_epoch(self, bot, persona, *, _capability=None):
@@ -933,6 +1425,7 @@ class GraphStore(Store):
             try:
                 atoms = []
                 for key in keys:
+                    self._assert_c09_key_not_erased(key)
                     row = self._db.execute(
                         "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)
                     ).fetchone()
@@ -952,6 +1445,19 @@ class GraphStore(Store):
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
+
+    def _assert_c09_key_not_erased(self, key: AtomKey) -> None:
+        """A C09 rebase tombstone permanently closes the old graph address."""
+        if self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='graph_c09_erased_keys_v1'").fetchone() is None:
+            return
+        if self._db.execute(
+                "SELECT 1 FROM graph_c09_erased_keys_v1 "
+                "WHERE bot=? AND persona=? AND key_digest=?",
+                (*self._namespace(key), canonical_digest(key.token)),
+        ).fetchone() is not None:
+            raise PermissionError("C09 erased graph address cannot be reused or read raw")
 
 
     @staticmethod
@@ -1209,6 +1715,9 @@ class GraphStore(Store):
         return closure
 
     def _assert_acyclic(self, namespace, replacements):
+        # Replacing outgoing edges with empty sets cannot introduce a cycle.
+        if not any(replacements.values()):
+            return
         bot, persona = namespace
         nodes = {
             row[0]: set() for row in self._db.execute(
@@ -1244,7 +1753,8 @@ class GraphStore(Store):
             raise ValueError("instantaneous dependency cycle")
 
     def _prepare_graph_candidate(self, candidate: GraphCandidate, *,
-                                 _owner_issue: bool = False):
+                                 _owner_issue: bool = False,
+                                 _owner_revoke: bool = False):
         if not isinstance(candidate, GraphCandidate):
             raise TypeError("candidate must be GraphCandidate")
         event = candidate.event
@@ -1272,8 +1782,9 @@ class GraphStore(Store):
         read_set = set(read_keys)
         prepared = []
         for write in writes:
-            if write.key.type_name == OWNER_GRANT_TYPE and not _owner_issue:
-                raise PermissionError("Owner grant requires the W01 fenced issue path")
+            if write.key.type_name == OWNER_GRANT_TYPE and not (
+                    _owner_issue or _owner_revoke):
+                raise PermissionError("Owner grant requires a fenced W01 authorization path")
             spec = self._validate_key(write.key)
             if self._namespace(write.key) != namespace:
                 raise ValueError("cross-namespace graph candidate")
@@ -1320,7 +1831,8 @@ class GraphStore(Store):
 
     def _graph_commit_in_transaction(self, candidate: GraphCandidate, *,
                                      _guard=None, _receipt_hook=None, _capability=None,
-                                     _owner_issue: bool = False):
+                                     _owner_issue: bool = False,
+                                     _owner_revoke: bool = False):
         """Run a graph commit inside the coordinator's existing write transaction.
 
         Caller holds this store's lock and owns COMMIT or ROLLBACK.
@@ -1329,13 +1841,50 @@ class GraphStore(Store):
         if not self._lock._is_owned() or not self._db.in_transaction:
             raise RuntimeError("graph transaction requires the store lock and active transaction")
         self._ensure_open()
-        prepared = self._prepare_graph_candidate(candidate, _owner_issue=_owner_issue)
+        prepared = self._prepare_graph_candidate(
+            candidate, _owner_issue=_owner_issue, _owner_revoke=_owner_revoke)
         return self._graph_commit_core(*prepared, _guard=_guard, _receipt_hook=_receipt_hook)
+
+    @contextmanager
+    def _provisional_graph_stage_in_transaction(
+            self, candidate: GraphCandidate, *, _capability=None):
+        """Expose a tentative graph E+1 only inside a caller-owned transaction.
+
+        Every row, event, history entry and epoch written by this stage is
+        rolled back before the caller may seal a final candidate. A check made
+        here is only a provisional candidate: it must be reissued against the
+        final graph rows in the final receipt hook before admission.
+        """
+        self._require_recovery_capability(_capability)
+        if not self._lock._is_owned() or not self._db.in_transaction:
+            raise RuntimeError("provisional stage requires the held graph transaction")
+        if (type(candidate) is not GraphCandidate or not candidate.writes
+                or len(candidate.epochs) != 1):
+            raise ValueError("provisional stage needs one guarded graph write")
+        event = candidate.event
+        staged_event = Event(
+            event.scope, "provisional:" + secrets.token_hex(24),
+            event.occurred_at, event.kind, event.payload)
+        staged = GraphCandidate(
+            staged_event, candidate.reads, candidate.writes, candidate.epochs)
+        name = "provisional_" + secrets.token_hex(16)
+        self._db.execute("SAVEPOINT " + name)
+        try:
+            receipt = self._graph_commit_in_transaction(
+                staged, _capability=_capability)
+            if receipt.status != "committed":
+                raise EventConflict("provisional graph event unexpectedly replayed")
+            yield receipt
+        finally:
+            self._db.execute("ROLLBACK TO SAVEPOINT " + name)
+            self._db.execute("RELEASE SAVEPOINT " + name)
 
     def _graph_commit_core(self, namespace, reads, writes, epochs, prepared,
                            digest, scope_key, *, _guard=None, _receipt_hook=None):
         if _guard is not None:
             _guard(self._db)
+        for write in writes:
+            self._assert_c09_key_not_erased(write.key)
         prior = self._db.execute(
             "SELECT digest,revisions,invalidated,epoch_revision FROM graph_events "
             "WHERE bot=? AND persona=? AND session=? AND event_id=?", scope_key

@@ -79,7 +79,7 @@ class AuthorityV2ModelResultReadService:
             anchor = fences._current_locked(
                 db, deletion_head, execution_head, holder=self._holder,
                 generation=permit.generation)
-            if history or anchor != permit.pinned_anchor:
+            if anchor != permit.pinned_anchor:
                 raise AuthorityUnavailable("result read Authority anchor changed")
             fences.fences.validate_fence_locked(
                 db, permit, subject=self._read_subject, current_anchor=anchor)

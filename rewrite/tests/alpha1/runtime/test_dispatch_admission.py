@@ -653,6 +653,11 @@ def test_current_d03_d05_projection_preserves_admission_transaction_test(
     assert stored.graph_epoch == committed.invalidated_epochs[0].revision
     assert coordinator.get_committed_dispatch_request(
         authority, lease, "admission:one") == issuer.request
+    assert coordinator.get_committed_dispatch_for_operation_v2(
+        authority, lease, bundle.envelope.identity.operation_id) == (
+            stored, issuer.request)
+    assert coordinator.get_committed_dispatch_for_operation_v2(
+        authority, lease, "operation:missing") is None
     assert coordinator.get_committed_dispatch_action_job_binding(
         authority, lease, "admission:one") == job_binding
     # The fixture admission uses abstract account/destination strings. It

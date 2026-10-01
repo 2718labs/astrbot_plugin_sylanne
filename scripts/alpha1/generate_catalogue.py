@@ -104,7 +104,7 @@ def main() -> int:
                         help="export actual DomainRegistry with an external D04 scheme asset; remains candidate-only")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--allow-incomplete", action="store_true")
-    parser.add_argument("--expected-domain", action="append", default=[f"d{number:02d}" for number in range(1, 13)])
+    parser.add_argument("--expected-domain", action="append", default=[f"d{number:02d}" for number in range(1, 14)])
     args = parser.parse_args()
     if args.active_affect_scheme is None and not args.registrar:
         parser.error("--registrar is required without --active-affect-scheme")

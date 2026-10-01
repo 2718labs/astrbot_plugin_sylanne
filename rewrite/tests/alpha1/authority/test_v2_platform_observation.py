@@ -45,7 +45,11 @@ def _report(start, binding, *, outcome="accepted", message_id="17"):
         "onebot-ack-a", outcome, "2026-09-27T01:00:00Z", "clock-a")
 
 
-def test_v2_handoff_observation_is_durable_and_replay_is_exact(tmp_path):
+@pytest.mark.parametrize("outcome,message_id", [
+    ("accepted", "17"), ("unknown", None),
+])
+def test_v2_handoff_observation_is_durable_and_replay_is_exact(
+        tmp_path, outcome, message_id):
     core, journal, bridge, claimed, start, binding = _ready(tmp_path)
     try:
         permit, anchor, effect = bridge.read_current_dispatch_handoff(
@@ -55,7 +59,8 @@ def test_v2_handoff_observation_is_durable_and_replay_is_exact(tmp_path):
         assert anchor == permit.pinned_anchor
         assert effect.state == "unresolved"
         assert effect.execution_head_seq == anchor.execution_seq
-        report = _report(start, binding)
+        report = _report(start, binding, outcome=outcome,
+                         message_id=message_id)
         assert from_wire(to_wire(report)) == report
         bridge._observation_verifier = lambda namespace, receipt, value: value
         receipt, _ = bridge.execution_observe_v2(
@@ -63,13 +68,19 @@ def test_v2_handoff_observation_is_durable_and_replay_is_exact(tmp_path):
             claimed_receipt=claimed, observation=report)
         assert receipt.pending.platform_observation == report
         assert receipt.pending.phase == "observed"
+        assert core._db.execute(
+            "SELECT state,pending FROM authority_v2_fences WHERE operation_id=?",
+            (claimed.pending.permit.operation_id,),
+        ).fetchone() == ("finished", None)
         assert bridge.execution_observe_v2(
             credential="ok", subject="subject-a",
             claimed_receipt=claimed, observation=report)[0] == receipt
         assert journal.verified_head().seq == 3
-        assert bridge.read_current_effect(
+        current = bridge.read_current_effect(
             credential="ok", subject="subject-a", effect_id="effect-a"
-        ).observation_id == report.observation_id
+        )
+        assert current.observation_id == report.observation_id
+        assert current.observation_outcome == outcome
         with pytest.raises(AuthorityUnavailable, match="no longer current"):
             bridge.read_current_dispatch_handoff(
                 credential="ok", subject="subject-a", start=start,

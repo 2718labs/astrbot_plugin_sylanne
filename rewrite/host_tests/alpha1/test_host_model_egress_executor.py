@@ -1,20 +1,53 @@
 """Executor control-flow fixture; the paired RPC has a separate real TLS test."""
 
 import hashlib
+import json
+import sqlite3
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import MethodType
+from uuid import uuid4
 
 import pytest
 
 from rewrite.host_tests.alpha1 import test_astrbot_model_call as model_fixture
+from rewrite.tests.alpha1.runtime.test_natural_reply_job_v2 import (
+    _case as natural_case, _generation_call,
+)
+from sylanne3.authority_service.natural_original_binding_verifier import (
+    PinnedNaturalOriginalCallIdentityVerifierV2,
+)
 from rewrite.tests.alpha1.authority.test_v2_model_egress_store import intent as model_intent
 from sylanne3.authority_service.v2_contract import FencePermitV2
 from sylanne3.authority_service.v2_model_egress_contract import (
-    ModelAdmissionV2, ModelEgressRecoveryV1, ModelTerminalReceiptV2,
+    ModelAdmissionV2, ModelEgressDraftV1, ModelEgressRecoveryV1,
+    ModelTerminalReceiptV2,
 )
 from sylanne3.host.authority_client import AuthorityClient, AuthoritySelection
 from sylanne3.host.model_egress_executor import HostModelEgressExecutor
+from sylanne3.host.authority_profile import AdminModelWorkflowsV2
+from sylanne3.host.astrbot_model_call import AstrBotModelProvider
+from sylanne3.model_broker.natural_reply import (
+    NaturalReplyInstallationV2, TEMPLATE_DIGEST as NATURAL_TEMPLATE_DIGEST,
+    TEMPLATE_VERSION as NATURAL_TEMPLATE_VERSION,
+    freeze_natural_reply_request_v2,
+)
+from sylanne3.model_broker.natural_review import (
+    NaturalReviewInstallationV1, REVIEW_TEMPLATE_DIGEST,
+    REVIEW_TEMPLATE_VERSION, freeze_natural_reply_review_v1,
+)
+from sylanne3.runtime.jobs import (
+    acquire_job, create_job, install_schema as jobs_schema,
+    transition_job,
+)
+from sylanne3.runtime.natural_reply_job_v2 import (
+    bind_original_call, install_schema as natural_schema,
+    natural_job_ids_v2, read_original_preparation, record_terminal,
+    save_original_preparation,
+)
+from sylanne3.runtime_contracts import (
+    NaturalReplyReviewOriginalSealV2,
+)
 from sylanne3.model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
 )
@@ -53,6 +86,276 @@ def fixture_values(host, request):
     authority = AuthorityClient(
         AuthoritySelection(), package_root=Path.cwd(), data_dir=Path.cwd())
     return original, anchor, permit, admission, grant, authority
+
+
+def _natural_originals(host, path):
+    """Durable original rows only; this fixture supplies no current graph grant."""
+    bundle, encoder, replier = host.v2_adapters()
+    namespace, parent, generation_seal, sample, versions, queries, job = (
+        natural_case())
+    parent = "c02-original:" + uuid4().hex
+    generation_ids = natural_job_ids_v2(namespace, parent, "generation")
+    generation_seal = replace(
+        generation_seal, c02_operation_id=parent,
+        job_id=generation_ids[0], original_operation_id=generation_ids[1],
+        acquire_operation_id=generation_ids[2], call_id=generation_ids[3],
+        reservation_operation_id=generation_ids[4])
+    job = replace(job, job_id=generation_ids[0],
+                  operation_id=generation_ids[1])
+    config = replier._admin_model
+    audience = sample.input.plan.audience_ref.ref
+    generation = replace(
+        config, work_kind="natural_generation",
+        template_version=NATURAL_TEMPLATE_VERSION, audiences=(audience,))
+    review = replace(
+        config, work_kind="natural_review",
+        template_version=REVIEW_TEMPLATE_VERSION, audiences=(audience,))
+    policy = replace(bundle.installation_policy, root_grant=replace(
+        bundle.installation_policy.root_grant,
+        allowed_work_kinds=("d06.encode_source", "reply",
+                            "natural_generation", "natural_review")))
+    bundle = replace(bundle, installation_policy=policy,
+                     model_workflows=AdminModelWorkflowsV2(
+                         2, encoder._admin_model, config,
+                         natural_generation=generation, natural_review=review))
+    frozen = freeze_natural_reply_request_v2(
+        sample.input, NaturalReplyInstallationV2(
+            "install", config.provider_config_digest,
+            config.provider_id, config.model_id,
+            generation.max_output_tokens))
+    generation_seal = replace(
+        generation_seal, installation_id="install",
+        provider_config_digest=config.provider_config_digest,
+        frozen_input_digest=frozen.frozen_input_digest,
+        model_request_digest=frozen.model_request_digest)
+    gen_call = _generation_call(
+        namespace, generation_seal, frozen, versions, queries)
+    gen_call = replace(
+        gen_call,
+        envelope=replace(gen_call.envelope, authority=replace(
+            gen_call.envelope.authority,
+            actor=policy.administrator_holder,
+            provider_policy_ref=config.provider_config_ref)),
+        provider_id=config.provider_id, model_id=config.model_id,
+        payload=json.loads(frozen.canonical_wire),
+        timeout_seconds=config.timeout_seconds,
+        max_output_tokens=config.max_output_tokens)
+    output = {
+        "schema": "sylanne.d09.context_reply_output.v2", "body": "Hello.",
+        "units": [{"start": 0, "end": 6, "kind": "rhetoric",
+                   "basis_ids": ["basis:greeting"], "speech_act": "rhetoric",
+                   "promise_grant_id": None, "slot_ids": []}],
+    }
+    review_frozen = freeze_natural_reply_review_v1(
+        generation_seal, output, sample.input.plan.units, (), "policy:review",
+        NaturalReviewInstallationV1(
+            "install", config.provider_id, config.provider_config_digest,
+            config.model_id, review.max_output_tokens))
+    review_ids = natural_job_ids_v2(namespace, parent, "review")
+    review_seal = NaturalReplyReviewOriginalSealV2(
+        namespace=namespace, installation_id="install",
+        provider_config_digest=config.provider_config_digest,
+        job_id=review_ids[0], original_operation_id=review_ids[1],
+        acquire_operation_id=review_ids[2], call_id=review_ids[3],
+        generation_original_operation_id=generation_seal.original_operation_id,
+        generation_call_id=generation_seal.call_id,
+        generation_frozen_input_digest=generation_seal.frozen_input_digest,
+        generation_output_digest=review_frozen.generation_output_digest,
+        qualified_units_digest=generation_seal.qualified_units_digest,
+        review_frozen_input_digest=review_frozen.digest,
+        model_request_digest=review_frozen.wire_digest,
+        original_graph_guard_digest=generation_seal.original_graph_guard_digest,
+        parent_budget_lease_id=generation_seal.parent_budget_lease_id,
+        reservation_operation_id=review_ids[4],
+        review_policy_version="policy:review")
+    review_call = replace(
+        gen_call, envelope=replace(
+            gen_call.envelope, identity=replace(
+                gen_call.envelope.identity, phase="natural_review",
+                operation_id=review_seal.acquire_operation_id)),
+        call_id=review_seal.call_id,
+        prompt_template_digest=REVIEW_TEMPLATE_DIGEST,
+        payload=json.loads(review_frozen.canonical_wire))
+    with sqlite3.connect(path) as db:
+        jobs_schema(db)
+        natural_schema(db)
+        db.execute("BEGIN")
+        create_job(db, job, "create:generation", "1" * 64)
+        saved = save_original_preparation(
+            db, stage="generation", namespace=namespace,
+            parent_original_id=parent, seal=generation_seal, frozen=frozen,
+            read_versions=versions, query_epochs=queries, graph_epoch=2,
+            access_epoch=3, deletion_epoch=4, job=job)
+        running = acquire_job(db, job.job_id, policy.administrator_holder,
+                              now_utc="2026-09-28T00:00:00Z", lease_seconds=30)
+        bind_original_call(db, saved, running, gen_call)
+        acquired = read_original_preparation(db, namespace, parent, "generation")
+        completed = transition_job(db, job.job_id, policy.administrator_holder,
+                                   running.fence,
+                                   target_phase="completed",
+                                   result_ref="controlled-generation-result")
+        record_terminal(
+            db, acquired, completed, terminal_receipt_digest="2" * 64,
+            output_digest=review_frozen.generation_output_digest)
+        review_job = replace(
+            job, job_id=review_seal.job_id,
+            operation_id=review_seal.original_operation_id,
+            work_kind="natural_review")
+        create_job(db, review_job, "create:review", "3" * 64)
+        saved_review = save_original_preparation(
+            db, stage="review", namespace=namespace,
+            parent_original_id=parent, seal=review_seal,
+            frozen=review_frozen, read_versions=versions,
+            query_epochs=queries, graph_epoch=2, access_epoch=3,
+            deletion_epoch=4, job=review_job)
+        running_review = acquire_job(
+            db, review_job.job_id, policy.administrator_holder,
+            now_utc="2026-09-28T00:00:00Z", lease_seconds=30)
+        bind_original_call(db, saved_review, running_review, review_call)
+        db.commit()
+    verifier = PinnedNaturalOriginalCallIdentityVerifierV2(
+        path, installation_id="install", generation=generation, review=review)
+    reads = {stage: verifier.read(namespace, parent, stage)
+             for stage in ("generation", "review")}
+    assert all(read is not None for read in reads.values())
+    return bundle, reads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ("generation", "review"))
+@pytest.mark.parametrize("uncertain", (False, True))
+async def test_natural_executor_requires_original_binding_and_authority_admission(
+        tmp_path, stage, uncertain):
+    """A controlled Authority reply exercises host mechanics, not graph currentness."""
+    host = model_fixture.AstrBotModelCallTests(
+        methodName="test_one_http_request_on_host_loop_with_usage")
+    await host.asyncSetUp()
+    try:
+        bundle, reads = _natural_originals(host, tmp_path / "natural-graph.db")
+        original = reads[stage]
+        workflow = (bundle.model_workflows.natural_generation
+                    if stage == "generation" else bundle.model_workflows.natural_review)
+        adapter = AstrBotModelProvider(
+            context=host.context, host_loop=host.adapter._host_loop,
+            trusted_umo=model_fixture.UMO, descriptor=host.descriptor,
+            admin_model=workflow, installation_bundle=bundle)
+        request = original.request
+        intent, anchor, permit, admission, grant, authority = fixture_values(
+            host, request)
+        anchor = replace(
+            anchor, namespace=bundle.installation_policy.authority_namespace)
+        intent = replace(
+            intent, namespace=anchor.namespace,
+            anchor_digest=canonical_digest(asdict(anchor)),
+            subject=request.envelope.authority.actor,
+            operation_id=original.seal.acquire_operation_id,
+            call_id=original.seal.call_id, request_digest=request.digest,
+            job_id=original.seal.job_id, worker_fence=original.worker_fence,
+            budget_lease_id=original.seal.parent_budget_lease_id,
+            budget_reservation_operation_id=original.seal.reservation_operation_id,
+            budget_ceiling=(("output_tokens", workflow.max_output_tokens),),
+            provider_id=workflow.provider_id, model_id=workflow.model_id,
+            provider_config_digest=workflow.provider_config_digest,
+            max_output_tokens=workflow.max_output_tokens,
+            acquire_operation_id=original.seal.acquire_operation_id,
+            binding_digest=canonical_digest({
+                "original_seal_digest": canonical_digest(asdict(original.seal)),
+                "model_call_request_digest": request.digest,
+                "worker_fence": original.worker_fence,
+            }))
+        permit = replace(
+            permit, namespace=anchor.namespace,
+            operation_id=intent.operation_id, pinned_anchor=anchor)
+        admission = replace(
+            admission, namespace=anchor.namespace, subject=intent.subject,
+            operation_id=intent.operation_id,
+            call_id=intent.call_id, request_digest=intent.request_digest,
+            provider_config_digest=intent.provider_config_digest)
+        calls = []
+
+        async def prepare(self, *args, **kwargs):
+            calls.append("prepare")
+            assert kwargs["draft"] == ModelEgressDraftV1.from_intent(intent)
+            return ModelEgressRecoveryV1(intent, "prepared"), permit
+
+        async def terminal_fact(self, *args, **kwargs):
+            calls.append("terminal_fact")
+            return ModelEgressRecoveryV1(intent, "prepared"), permit, admission, None
+
+        async def recover(self, *args, **kwargs):
+            calls.append("recover")
+            return ModelEgressRecoveryV1(intent, "prepared"), permit
+
+        async def admit(self, *args, **kwargs):
+            calls.append("admit")
+            assert kwargs["model_request"] == request
+            return ModelEgressRecoveryV1(intent, "dispatch_started"), permit, admission
+
+        async def complete(self, *args, **kwargs):
+            calls.append("complete")
+            if uncertain:
+                raise RuntimeError("terminal response lost")
+            report = kwargs["report"]
+            observed = report.observation_for(intent)
+            receipt = ModelTerminalReceiptV2(
+                admission.admission_id, intent.call_id, intent.request_digest,
+                report.digest, observed.digest, "sha256:" + "c" * 64,
+                admission.installation_id, admission.host_incarnation)
+            return (ModelEgressRecoveryV1(
+                intent, "observed", observed.digest, report.usage,
+                report.cost), permit, receipt)
+
+        authority.model_prepare_fenced_v1 = MethodType(prepare, authority)
+        authority.model_terminal_fact_v2 = MethodType(terminal_fact, authority)
+        authority.model_recover_fenced_v1 = MethodType(recover, authority)
+        authority.model_admit_dispatch_once_v2 = MethodType(admit, authority)
+        authority.model_complete_observed_v2 = MethodType(complete, authority)
+        executor = HostModelEgressExecutor(
+            authority=authority, bundle=bundle, grant=grant, adapter=adapter)
+        assert await executor.execute_once(
+            intent=intent, expected_anchor=anchor, request=request) is None
+        assert await executor.execute_once(
+            intent=intent, expected_anchor=anchor, request=request,
+            natural_original=reads["review" if stage == "generation" else
+                                   "generation"]) is None
+        other_workflow = (
+            bundle.model_workflows.natural_review if stage == "generation"
+            else bundle.model_workflows.natural_generation)
+        wrong_adapter = AstrBotModelProvider(
+            context=host.context, host_loop=host.adapter._host_loop,
+            trusted_umo=model_fixture.UMO, descriptor=host.descriptor,
+            admin_model=other_workflow, installation_bundle=bundle)
+        wrong_executor = HostModelEgressExecutor(
+            authority=authority, bundle=bundle, grant=grant,
+            adapter=wrong_adapter)
+        assert await wrong_executor.execute_once(
+            intent=intent, expected_anchor=anchor, request=request,
+            natural_original=original) is None
+        assert calls == [] and host.requests == []
+        assert await executor.execute_frozen_natural_once(
+            original=original,
+            draft=replace(ModelEgressDraftV1.from_intent(intent),
+                          binding_digest="e" * 64),
+            expected_anchor=anchor) is None
+        assert calls == [] and host.requests == []
+        result = await executor.execute_frozen_natural_once(
+            original=original, draft=ModelEgressDraftV1.from_intent(intent),
+            expected_anchor=anchor)
+        assert result is not None
+        assert (result.terminal is None) == uncertain
+        assert result.intent == intent and result.original == original
+        assert calls == (["prepare", "terminal_fact", "recover", "admit",
+                          "complete"] + (["terminal_fact"] if uncertain else []))
+        sent = json.loads(host.requests[0][1].content)
+        assert "provider_id" not in sent
+        assert sent["messages"] == request.payload["messages"]
+        assert len(host.requests) == 1
+        assert await executor.execute_frozen_natural_once(
+            original=original, draft=ModelEgressDraftV1.from_intent(intent),
+            expected_anchor=anchor) is None
+        assert len(host.requests) == 1
+    finally:
+        await host.asyncTearDown()
 
 
 @pytest.mark.asyncio

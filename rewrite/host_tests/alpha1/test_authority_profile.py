@@ -179,6 +179,61 @@ def test_model_workflows_are_separate_bounded_admin_authorities() -> None:
     assert authority_profile._model_workflows_from_payload(_schema2_payload()) is None
 
 
+def test_context_reply_workflow_is_explicit_and_version_pinned() -> None:
+    payload = _workflow_profile_payload()
+    payload["installation_policy"]["root_grant"]["allowed_work_kinds"].append(
+        "context_reply")
+    payload["model_workflows"]["context_reply"] = _model_workflow_payload(
+        "context_reply", "proposal",
+        authority_profile.CONTEXT_REPLY_TEMPLATE_VERSION)
+    authority_profile._policy_from_payload(payload)
+    workflows = authority_profile._model_workflows_from_payload(payload)
+    assert workflows.context_reply.template_version == (
+        authority_profile.CONTEXT_REPLY_TEMPLATE_VERSION)
+    assert workflows.reply.template_version == "reply-template-v1"
+    payload["installation_policy"]["root_grant"]["allowed_work_kinds"].remove(
+        "context_reply")
+    with pytest.raises(ValueError, match="own root grant"):
+        authority_profile._policy_from_payload(payload)
+    payload["installation_policy"]["root_grant"]["allowed_work_kinds"].append(
+        "context_reply")
+    payload["model_workflows"]["context_reply"]["template_version"] = (
+        "sylanne.d09.source_reply.v1")
+    with pytest.raises(ValueError):
+        authority_profile._model_workflows_from_payload(payload)
+
+
+def test_natural_workflows_need_independent_installed_identity_and_grants() -> None:
+    payload = _workflow_profile_payload()
+    workflows = payload["model_workflows"]
+    assert authority_profile._model_workflows_from_payload(payload).natural_generation is None
+    assert authority_profile._model_workflows_from_payload(payload).natural_review is None
+    workflows["natural_generation"] = _model_workflow_payload(
+        "natural_generation", "proposal",
+        authority_profile.NATURAL_GENERATION_TEMPLATE_VERSION)
+    workflows["natural_review"] = _model_workflow_payload(
+        "natural_review", "proposal",
+        authority_profile.REVIEW_TEMPLATE_VERSION)
+    workflows["natural_review"]["provider_id"] = "review-provider"
+    workflows["natural_review"]["provider_config_ref"] = (
+        authority_profile.installed_model_config_ref(
+            "review-provider", "model-a", "c" * 64))
+    grant = payload["installation_policy"]["root_grant"]["allowed_work_kinds"]
+    grant.extend(("natural_generation", "natural_review"))
+    authority_profile._policy_from_payload(payload)
+    installed = authority_profile._model_workflows_from_payload(payload)
+    assert installed.natural_generation.work_kind == "natural_generation"
+    assert installed.natural_review.provider_id == "review-provider"
+    grant.remove("natural_review")
+    with pytest.raises(ValueError, match="own root grant"):
+        authority_profile._policy_from_payload(payload)
+    grant.append("natural_review")
+    workflows["natural_review"]["template_version"] = (
+        authority_profile.NATURAL_GENERATION_TEMPLATE_VERSION)
+    with pytest.raises(ValueError):
+        authority_profile._model_workflows_from_payload(payload)
+
+
 def test_private_reply_expression_requires_explicit_schema2_workflow() -> None:
     payload = _workflow_profile_payload()
     payload["d06_private_reply_source"] = {
@@ -381,7 +436,7 @@ def test_schema2_nested_duplicate_and_oversize_rejected(tmp_path: Path) -> None:
                        encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate"):
         authority_profile._read_profile_json(profile)
-    profile.write_text(" " * 8193, encoding="utf-8")
+    profile.write_text(" " * (authority_profile._MAX_PROFILE_BYTES + 1), encoding="utf-8")
     with pytest.raises(ValueError, match="bounded|too large"):
         authority_profile._read_profile_json(profile)
 
@@ -459,6 +514,26 @@ def test_windows_pinned_objects_cannot_be_replaced_or_written(tmp_path: Path) ->
         with pytest.raises(OSError):
             key.open("r+b")
         assert cert.read_text(encoding="ascii") == "test fixture"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows file sharing required")
+def test_c04_signing_key_is_pinned_and_needs_installed_dacl(tmp_path: Path) -> None:
+    profile_dir = _provision(tmp_path, payload=_schema2_payload())
+    key = profile_dir / "c04-signing.key"
+    key.write_bytes(b"c" * 32)
+    with authority_profile._opened_windows_profile(
+            profile_dir, c04_signing_key=True) as handles:
+        assert authority_profile._checked_signing_key(
+            authority_profile._read_windows_signing_key(handles[key]), "C04") == b"c" * 32
+        with pytest.raises(OSError):
+            key.rename(profile_dir / "replaced-c04.key")
+    with patch.dict(sys.modules, {"sylanne3.host": _host_package}):
+        windows_profile_security = importlib.import_module(
+            "sylanne3.host.windows_profile_security")
+        with patch.object(windows_profile_security, "programdata_profile_root",
+                          return_value=tmp_path):
+            with pytest.raises(PermissionError):
+                authority_profile.load_admin_c04_signing_key("safe")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows security descriptors required")

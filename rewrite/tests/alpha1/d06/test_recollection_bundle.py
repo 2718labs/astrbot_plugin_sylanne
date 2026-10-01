@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from sylanne3.domains.d06 import (
     CandidateItem,
@@ -7,6 +8,7 @@ from sylanne3.domains.d06 import (
     D06DomainProvider,
     RecollectionContext,
     SelectionTicket,
+    source_correction_head_key,
 )
 from sylanne3.graph_types import AtomKey, GraphVersion, GraphWrite, Owner, TypeRegistry
 from sylanne3.memory_types import access_key, source_key
@@ -32,6 +34,7 @@ class RecollectionBundleTests(unittest.TestCase):
         self.domain = D06DomainAdapter(self.namespace)
         self.source = source_key("bot", "persona", "source-1")
         self.access = access_key("bot", "persona", "source-1")
+        self.correction_head = source_correction_head_key(self.namespace, "source-1")
         self.ticket = SelectionTicket("ticket-1", "activity-1", "set-1", ("candidate-1",), 4)
         self.candidates = CandidateSet(
             "set-1",
@@ -70,7 +73,8 @@ class RecollectionBundleTests(unittest.TestCase):
                 "context", ("owner",), "provider-policy-1", 1,
             ),
             VersionGuard(
-                (GraphVersion(self.source, 3), GraphVersion(self.access, 2)), (),
+                (GraphVersion(self.source, 3), GraphVersion(self.access, 2),
+                 GraphVersion(self.correction_head, 0)), (),
                 access_epoch, delete_epoch, "catalogue-1", "scheme-1", "operator-1",
                 "d06.policy.v1", (), (VersionedRef("focus-lease", 4),), (),
             ),
@@ -149,6 +153,21 @@ class RecollectionBundleTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.domain.prepare_recollection(None, self.candidates, self.context)
 
+    def test_c04_bundle_requires_current_correction_head_absence(self):
+        guard = self.envelope.version_guard
+        without_head = replace(self.envelope, version_guard=replace(
+            guard, read_versions=tuple(version for version in guard.read_versions
+                                       if version.key != self.correction_head),
+        ))
+        with self.assertRaisesRegex(ValueError, "correction head absence proof"):
+            self.domain.assemble_recollection_bundle(
+                without_head, self.ticket, self.candidates, self.context,
+                supporting_proposals=(), choice_ref=self.choice.token,
+                d02_settlement_ref=self.settlement.token,
+                d11_cost_settlement_ref=self.cost.token,
+                persistent_job_ref=self.job.token, outbox_ref=self.outbox.token,
+            )
+
     def test_missing_supporting_domain_or_write_fails_closed(self):
         proposals = self._supporting_proposals()
         with self.assertRaisesRegex(ValueError, "supporting domains are incomplete"):
@@ -223,6 +242,7 @@ class RecollectionBundleTests(unittest.TestCase):
                 "memory.subjective_trace.v2",
                 "memory.association.v1", "d06.recollection.v1",
                 "d06.recollection_projection.v1",
+                "d06.source_correction_head.v1",
             },
         )
         registry = TypeRegistry()

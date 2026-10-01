@@ -81,6 +81,20 @@ def test_first_ingress_c02_v2_commits_with_presealed_quote(c02_case):
             120.0, {"cpu_ms": 3}, "c02-snapshot", "c02-resource"),
         clock)
     assert receipt.status == "committed"
+    archived = store._db.execute(
+        "SELECT schema,bundle_digest FROM "
+        "graph_first_ingress_c02_committed_seals_v2 WHERE bot=? "
+        "AND persona=? AND operation_id=?",
+        namespace.as_tuple + (receipt.operation_id,),
+    ).fetchone()
+    business = store._db.execute(
+        "SELECT receipt_json FROM graph_bundle_operations WHERE bot=? "
+        "AND persona=? AND operation_id=?",
+        namespace.as_tuple + (receipt.operation_id,),
+    ).fetchone()
+    assert archived == (
+        "sylanne.first-ingress-c02-candidate.v2", receipt.operation_digest)
+    assert json.loads(business[0])["first_ingress_c02"]["seal_schema"] == archived[0]
     quote_id = store._db.execute(
         "SELECT quote_id FROM runtime_resource_quotes WHERE quote_json "
         "LIKE '%d06.first_ingress_c02%'"

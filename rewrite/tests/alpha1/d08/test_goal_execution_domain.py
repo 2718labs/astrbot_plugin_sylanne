@@ -1,5 +1,8 @@
 from dataclasses import replace
 import unittest
+import pytest
+import json
+from dataclasses import asdict
 
 from sylanne3.domains.d08 import (
     ActionIntent,
@@ -13,6 +16,14 @@ from sylanne3.domains.d08 import (
     CommitmentConflictSnapshot,
     Goal,
     GoalExecutionProvider,
+    NATURAL_PLAN_TYPE_V2,
+    NaturalPlanPreparationEvidenceV2,
+    natural_plan_key_v2,
+    natural_plan_id_v2,
+    natural_final_effect_id_v2,
+    natural_route_semantic_digest_v2,
+    prepare_coordinator_natural_plan_write_v2,
+    verify_current_natural_plan_v2,
     GoalPredicate,
     JointPlan,
     JointPlanAcceptance,
@@ -23,7 +34,16 @@ from sylanne3.domains.d08 import (
     RequiredCheckSpec,
     prepare_expression_plan,
 )
-from sylanne3.graph_types import AtomKey, GraphVersion, GraphWrite, Owner
+from sylanne3.graph_types import (
+    AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite,
+    NamespaceEpoch, Owner,
+)
+from sylanne3.memory_types import SourceRecord, access_key, source_key
+from sylanne3.domains.d06 import source_correction_head_key
+from sylanne3.domains.d06.qualified_expression import (
+    QualifiedExpressionRequest, SourceTextSpan,
+    prepare_qualified_expression_unit,
+)
 from sylanne3.runtime_contracts import (
     AuthorityContext,
     CheckReceipt,
@@ -37,6 +57,7 @@ from sylanne3.runtime_contracts import (
     VersionGuard,
     VersionedRef,
     canonical_digest,
+    canonical_serialize,
     schema_hash,
 )
 from sylanne3.domains.d09 import (
@@ -45,6 +66,8 @@ from sylanne3.domains.d09 import (
     ClaimUse,
     D09ExpressionProvider,
     ExpressionClaim,
+    NaturalExpressionPlanV2,
+    QualifiedExpressionUnitV2,
     SegmentCandidate,
     segment_payload_digest,
 )
@@ -165,6 +188,53 @@ def _proposal(domain="d08", writes=()):
 
 
 class GoalExecutionDomainTests(unittest.TestCase):
+    def test_goal_adoption_stages_only_a_source_bound_active_candidate(self):
+        source = source_key("bot", "persona", "request-1")
+        base = _proposal()
+        guard = replace(base.envelope.version_guard,
+                        read_versions=base.envelope.version_guard.read_versions
+                        + (GraphVersion(source, 1),))
+        qualification = replace(base.envelope.source_qualification,
+                                source_refs=(source.token,))
+        identity = replace(base.envelope.identity,
+                           canonical_input_digest=canonical_digest({
+                               "input_refs": [source.token]}))
+        envelope = replace(base.envelope, version_guard=guard,
+                           source_qualification=qualification,
+                           identity=identity,
+                           input_refs=(source.token,))
+        proposal = replace(base, envelope=envelope)
+        goal = Goal(
+            "goal:reply-1", 1, "active",
+            GoalPredicate("communicated", "d11.delivery",
+                          (("source", source.token),), 0.0, None),
+            (source.token,), (), None, (), (),
+        )
+        provider = GoalExecutionProvider()
+        staged = provider.prepare_goal_candidate(
+            proposal, goal, source_ref=source.token)
+        writes = tuple(write for write in staged.typed_writes
+                       if write.key.type_name == "d08.goal.v1")
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0].value["state"], "active")
+        self.assertEqual(staged.envelope.authority.owner_scope, ("activity",))
+        self.assertEqual(writes[0].key.owner.kind, "activity")
+        self.assertIn(GraphVersion(writes[0].key, 0),
+                      staged.envelope.version_guard.read_versions)
+        with self.assertRaisesRegex(ValueError, "current D06 read"):
+            provider.prepare_goal_candidate(
+                replace(proposal, envelope=replace(
+                    envelope, version_guard=replace(
+                        guard, read_versions=base.envelope.version_guard.read_versions))),
+                goal, source_ref=source.token)
+        with self.assertRaisesRegex(ValueError, "active at revision one"):
+            provider.prepare_goal_candidate(
+                proposal, replace(goal, state="satisfied"),
+                source_ref=source.token)
+        with self.assertRaisesRegex(ValueError, "absent graph head"):
+            provider.prepare_goal_candidate(
+                staged, goal, source_ref=source.token)
+
     def test_goal_commitment_and_joint_plan_keep_distinct_lifecycles(self):
         predicate = GoalPredicate(
             "artifact_verified", "d10.activity", (("artifact", "artifact:sketch"),), 0.0, None
@@ -694,3 +764,238 @@ class GoalExecutionDomainTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_paid_multi_source_action_scope_rejects_missing_or_stale_secondary_head():
+    namespace = NamespaceId("bot", "persona")
+    first = source_key("bot", "persona", "first")
+    second = source_key("bot", "persona", "second")
+    refs = (first.token, second.token)
+    intent = replace(_intent(), source_refs=refs)
+    reads = (GraphVersion(first, 1), GraphVersion(second, 2))
+    verify = GoalExecutionProvider.verify_paid_claim_source_scope_v2
+    verify(intent, refs, reads, namespace=namespace, current_read_confirmed=True)
+    with pytest.raises(ValueError, match="current D06 head"):
+        verify(intent, refs, reads[:1], namespace=namespace,
+               current_read_confirmed=True)
+    with pytest.raises(ValueError, match="action sources"):
+        verify(intent, refs[:1], reads, namespace=namespace,
+               current_read_confirmed=True)
+
+
+def _natural_preparation_case():
+    from sylanne3.host.post_c02_reply_driver import post_c02_reply_operation_id
+
+    namespace = NamespaceId("bot", "persona")
+    c02_operation_id = "operation:c02"
+    activity_id = "activity:natural"
+    source = source_key(*namespace.as_tuple, "report")
+    access = access_key(*namespace.as_tuple, "report")
+    correction = source_correction_head_key(namespace, "report")
+    scene_id = "scene:private"
+    audience_id = "audience:private"
+    scene_proof = AtomKey(Owner("scene", "bot", "persona", scene_id),
+                          "d03.role_binding", "role:reply")
+    audience_proof = AtomKey(Owner("persona", "bot", "persona"),
+                             "d03.account_binding", "account:reply")
+    focus = AtomKey(Owner("persona", "bot", "persona"), "d07.focus.v1", "persona")
+    ticket = AtomKey(Owner("persona", "bot", "persona"),
+                     "d07.attention_ticket.v1", "ticket:reply")
+    text = "Alice said the payment was not sent."
+    source_record = SourceRecord(
+        "report", text, "alice", "reported", "reported", 3.0, 4.0,
+        "family", (audience_id,), ("expression",), (),
+    )
+    plan_key = natural_plan_key_v2(
+        namespace, activity_id,
+        natural_plan_id_v2(namespace, c02_operation_id, source.token),
+    )
+    before = GraphSnapshot((
+        GraphAtom(plan_key, 0, {}, False),
+        GraphAtom(scene_proof, 1, {}), GraphAtom(audience_proof, 1, {}),
+        GraphAtom(focus, 1, {}), GraphAtom(ticket, 1, {}),
+        GraphAtom(source, 1, source_record.to_dict()),
+        GraphAtom(access, 1, {"source_id": "report", "status": "active",
+                              "audiences": [audience_id],
+                              "purposes": ["expression"], "recorded_at": 4.0}),
+        GraphAtom(correction, 0, {}, False),
+    ), (NamespaceEpoch("bot", "persona", 5),))
+    candidate = prepare_qualified_expression_unit(
+        before, namespace=namespace,
+        request=QualifiedExpressionRequest(
+            source.token, "attributed_report", SourceTextSpan(0, len(text))),
+        audiences=(audience_id,), access_epoch=2, deletion_epoch=0,
+        valid_until=90.0,
+    )
+    versions = {row.key.token: row.revision for row in candidate.read_versions}
+    unit = QualifiedExpressionUnitV2(
+        "basis:report", ClaimKind.REPORTED_CLAIM, candidate.source_excerpt,
+        None,
+        tuple(VersionedRef(ref, versions[ref])
+              for ref in candidate.lineage_source_refs),
+        tuple(VersionedRef(row.key.token, row.revision)
+              for row in candidate.read_versions if row.key.type_name == "memory.access"),
+        tuple(VersionedRef(row.key.token, row.revision)
+              for row in candidate.read_versions
+              if row.key.type_name == "d06.source_correction_head.v1"),
+        audience_id, "expression", candidate.valid_until,
+        speaker_id=candidate.speaker_id, content_reality="external_report",
+        qualification_digest=candidate.qualification_digest,
+        occurred_at=candidate.occurred_at, learned_at=candidate.learned_at,
+        source_kind=candidate.source_kind,
+        assertion_status=candidate.assertion_status,
+        d06_claim_kind=candidate.claim_kind,
+        attribution_required=candidate.attribution_required,
+        polarity_status=candidate.polarity_status,
+        source_excerpt=candidate.source_excerpt,
+        evidence_span=(candidate.evidence_span.start, candidate.evidence_span.end),
+    )
+    plan = NaturalExpressionPlanV2(
+        namespace, VersionedRef(plan_key.token, 1),
+        VersionedRef(scene_proof.token, 1),
+        VersionedRef(audience_proof.token, 1),
+        ("answer",), ("paraphrase",), (), (unit,), 80.0,
+        activity_id, post_c02_reply_operation_id(c02_operation_id, source.token),
+        natural_final_effect_id_v2(namespace, c02_operation_id, source.token),
+        scene_id, audience_id,
+    )
+    evidence = NaturalPlanPreparationEvidenceV2(
+        c02_operation_id, VersionedRef(source.token, 1),
+        VersionedRef(focus.token, 1), VersionedRef(ticket.token, 1),
+        "a" * 64, "b" * 64, "budget:root", 1, "c" * 64,
+        (("tokens", 100),), (("tokens", 50),),
+    )
+    return plan, evidence, before, candidate, plan_key, access, correction
+
+
+def test_preparation_plan_is_adopted_without_future_action_or_payload_grant():
+    plan, evidence, before, candidate, plan_key, _, _ = _natural_preparation_case()
+    write, reads = prepare_coordinator_natural_plan_write_v2(
+        plan=plan, evidence=evidence, snapshot=before,
+        d06_candidates=(candidate,), access_epoch=2,
+        deletion_epoch=0, now_utc=10.0,
+    )
+    spec = next(item for item in GoalExecutionProvider().register_types()
+                if item.name == NATURAL_PLAN_TYPE_V2)
+    assert spec.schema_version == 2 and spec.immutable
+    spec.validator(write.value)
+    assert GraphVersion(plan_key, 0) in reads
+    assert write.key == plan_key
+    assert "action_ref" not in write.value
+    assert "qualification_receipt_digest" not in write.value
+    assert "payload_digest" not in write.value
+    assert write.value["final_effect_id"] == plan.final_effect_id
+    with pytest.raises(ValueError, match="coordinator current-read CAS"):
+        GoalExecutionProvider().validate(replace(
+            _proposal(), typed_writes=(write,)))
+    old_action_claim = dict(write.value, action_ref={"ref": "forged", "version": 1})
+    with pytest.raises(ValueError, match="graph fields differ"):
+        spec.validator(old_action_claim)
+    missing_qualification = replace(plan, units=(replace(
+        plan.units[0], qualification_digest="d" * 64),))
+    with pytest.raises(ValueError, match="qualification set is incomplete"):
+        prepare_coordinator_natural_plan_write_v2(
+            plan=missing_qualification, evidence=evidence, snapshot=before,
+            d06_candidates=(candidate,), access_epoch=2,
+            deletion_epoch=0, now_utc=10.0,
+        )
+    with pytest.raises(ValueError, match="final identity"):
+        prepare_coordinator_natural_plan_write_v2(
+            plan=replace(plan, final_effect_id="effect:forged"),
+            evidence=evidence, snapshot=before,
+            d06_candidates=(candidate,), access_epoch=2,
+            deletion_epoch=0, now_utc=10.0,
+        )
+
+
+def test_preparation_plan_stable_across_unrelated_epochs_but_rejects_revocation():
+    plan, evidence, before, candidate, plan_key, access, correction = (
+        _natural_preparation_case())
+    write, _ = prepare_coordinator_natural_plan_write_v2(
+        plan=plan, evidence=evidence, snapshot=before,
+        d06_candidates=(candidate,), access_epoch=2,
+        deletion_epoch=0, now_utc=10.0,
+    )
+    adopted = replace(before, atoms=tuple(
+        GraphAtom(plan_key, 1, write.value) if atom.key == plan_key else atom
+        for atom in before.atoms
+    ), epochs=(NamespaceEpoch("bot", "persona", 6),))
+    later = replace(adopted, epochs=(NamespaceEpoch("bot", "persona", 7),),
+                    atoms=adopted.atoms + (GraphAtom(
+                        AtomKey(plan_key.owner, "d11.job.v1", "job:unrelated"), 1, {}),))
+    for current in (adopted, later):
+        record, reads = verify_current_natural_plan_v2(
+            plan=plan, evidence=evidence, snapshot=current,
+            d06_candidates=(candidate,), access_epoch=2,
+            deletion_epoch=0, now_utc=11.0,
+        )
+        assert record.qualified_units_digest == canonical_digest(plan.units)
+        assert GraphVersion(plan_key, 1) in reads
+    revoked = replace(later, atoms=tuple(
+        replace(atom, revision=2, value={**atom.value, "status": "withdrawn"})
+        if atom.key == access else atom for atom in later.atoms
+    ))
+    with pytest.raises((ValueError, PermissionError)):
+        verify_current_natural_plan_v2(
+            plan=plan, evidence=evidence, snapshot=revoked,
+            d06_candidates=(candidate,), access_epoch=2,
+            deletion_epoch=0, now_utc=11.0,
+        )
+    corrected = replace(later, atoms=tuple(
+        replace(atom, revision=1, valid=True, value={"correction_id": "new"})
+        if atom.key == correction else atom for atom in later.atoms
+    ))
+    with pytest.raises(ValueError):
+        verify_current_natural_plan_v2(
+            plan=plan, evidence=evidence, snapshot=corrected,
+            d06_candidates=(candidate,), access_epoch=2,
+            deletion_epoch=0, now_utc=11.0,
+        )
+
+
+def test_natural_route_semantic_identity_ignores_query_epoch_only():
+    from sylanne3.runtime.reply_entity_route_v2 import (
+        CurrentReplyEntityRouteBindingV2,
+    )
+
+    namespace = NamespaceId("bot", "persona")
+    version = GraphVersion(AtomKey(Owner("persona", "bot", "persona"),
+                                   "d03.account_binding", "account:one"), 1)
+    route = CurrentReplyEntityRouteBindingV2(
+        namespace, "operation:c02", "source:one", "platform:one",
+        "sender:one", "audience:one", "scene:one", "entity:one", "account:one",
+        version, version, version, version, version, version, (version,),
+        QueryEpoch(namespace, "all", 5), 100.0, "a" * 64,
+    )
+    assert natural_route_semantic_digest_v2(route) == (
+        natural_route_semantic_digest_v2(replace(
+            route, query=QueryEpoch(namespace, "all", 6),
+            binding_scan_versions=(),
+        )))
+    assert natural_route_semantic_digest_v2(route) != (
+        natural_route_semantic_digest_v2(replace(route, account_id="account:other")))
+
+
+def test_natural_preparation_allows_rhetoric_without_using_c02_as_claim_source():
+    plan, evidence, before, _, _, _, _ = _natural_preparation_case()
+    greeting = QualifiedExpressionUnitV2(
+        "basis:greeting", ClaimKind.RHETORIC, "Hello.",
+        evidence.ticket_ref, (), (), (), plan.audience_id,
+        "expression", 90.0,
+    )
+    greeting_plan = replace(plan, units=(greeting,))
+    write, reads = prepare_coordinator_natural_plan_write_v2(
+        plan=greeting_plan, evidence=evidence, snapshot=before,
+        d06_candidates=(), access_epoch=2, deletion_epoch=0, now_utc=10.0,
+    )
+    assert write.value["d06_qualification_digests"] == []
+    assert GraphVersion(AtomKey.from_token(evidence.source_ref.ref), 1) in reads
+    missing_trigger = replace(before, atoms=tuple(
+        atom for atom in before.atoms
+        if atom.key.token != evidence.source_ref.ref
+    ))
+    with pytest.raises(ValueError, match="scope changed"):
+        prepare_coordinator_natural_plan_write_v2(
+            plan=greeting_plan, evidence=evidence, snapshot=missing_trigger,
+            d06_candidates=(), access_epoch=2, deletion_epoch=0, now_utc=10.0,
+        )

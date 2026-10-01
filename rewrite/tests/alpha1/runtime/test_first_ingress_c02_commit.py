@@ -196,7 +196,7 @@ def c02_case(tmp_path, monkeypatch):
     coordinator._GraphCoordinator__accounting_maintenance_port = AccountingPort(
         store, original_fact)
     store._db.execute("""
-        CREATE TABLE graph_original_model_cost_attempts_v1 (
+        CREATE TABLE IF NOT EXISTS graph_original_model_cost_attempts_v1 (
             bot TEXT NOT NULL, persona TEXT NOT NULL,
             call_id TEXT NOT NULL, intent_digest TEXT NOT NULL,
             attempt_id TEXT NOT NULL, anchor_json TEXT NOT NULL,

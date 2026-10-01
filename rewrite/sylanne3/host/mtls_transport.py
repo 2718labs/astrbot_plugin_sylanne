@@ -15,17 +15,33 @@ from pathlib import Path
 import re
 import secrets
 import ssl
+import time
 from typing import Mapping
 
 from ..authority_service.contract import CONTENT_OPERATIONS, ContentPermit, identifier
 from ..authority_service.final_handoff_pairing import FinalHandoffPairingV1
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
-    ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
+    AuthorityCurrentEffectSnapshotV2, ExecutionBindingV1, ExecutionBindingV2,
+    FencePermitV2, FenceNeverBegunReceiptV2, MutationReceiptV2,
+    DeletionMutationReceiptV1,
     PlatformObservationV2,
     SCHEMA as AUTHORITY_V2_PROTOCOL,
     canonical_digest, from_wire, to_wire,
 )
+from ..authority_service.current_accepted_erasure_read import CurrentAcceptedErasureV1
+from ..authority_service.current_accepted_erasure_wire import accepted_from_wire
+from ..authority_service.v2_migration_rpc import response_from_wire as migration_response_from_wire
+from ..authority_service.internal_work_contract import (
+    InternalWorkBindingV1, InternalWorkTerminalProofV1,
+)
+from ..authority_service.internal_work_service import (
+    AuthorityInternalWorkVerifiedReceiptV1, InternalWorkJournalInspectionV1,
+)
+from ..authority_service.internal_work_rpc_wire import (
+    from_wire as c04_from_wire, to_wire as c04_to_wire,
+)
+from ..runtime_contracts import canonical_digest as runtime_canonical_digest
 from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
     OwnerAuthorizationReceiptV1, OwnerClaimTicketV1, OwnerGraphCommitProofV1,
@@ -68,6 +84,31 @@ from ..authority_service.v2_worker_model_result_contract import (
 from ..authority_service.v2_reply_worker_model_result_contract import (
     ReplyWorkerModelResultReadRequestV1, ReplyWorkerModelResultReadV1,
     from_wire as reply_result_from_wire, to_wire as reply_result_to_wire,
+)
+from ..authority_service.v2_context_reply_result_contract import (
+    ContextReplyResultReadRequestV1, ContextReplyPaidResultReadV2,
+    from_wire as context_reply_result_from_wire,
+    to_wire as context_reply_result_to_wire,
+)
+from ..authority_service.v2_natural_generation_output_contract import (
+    NaturalGenerationOriginalOutputV2, NaturalGenerationOutputReadRequestV2,
+    from_wire as natural_output_from_wire,
+    to_wire as natural_output_to_wire,
+)
+from ..authority_service.v2_natural_generation_content_contract import (
+    NaturalGenerationContentReadRequestV2, NaturalGenerationCurrentContentV2,
+    from_wire as natural_content_from_wire,
+    to_wire as natural_content_to_wire,
+)
+from ..authority_service.v2_natural_review_output_contract import (
+    NaturalReviewOriginalOutputV2, NaturalReviewOutputReadRequestV2,
+    from_wire as natural_review_output_from_wire,
+    to_wire as natural_review_output_to_wire,
+)
+from ..authority_service.v2_natural_paid_review_contract import (
+    NaturalPaidReviewCurrentReadRequestV2, NaturalPaidReviewCurrentReadV2,
+    from_wire as natural_paid_review_from_wire,
+    to_wire as natural_paid_review_to_wire,
 )
 from ..authority_service.v2_self_identity_contract import (
     AuthorityCurrentSelfIdentityV1, SelfIdentityCurrentRequestV1,
@@ -146,6 +187,18 @@ def _request_payload(request: AuthorityProvisioningRequest) -> dict[str, str]:
     }
 
 
+class AuthorityChannelUnavailable(RuntimeError):
+    """Transport lost before a trustworthy response; original outcome is unknown."""
+
+
+class V2OwnerAuthorizationBarrier(RuntimeError):
+    """The paired Authority confirmed a current Owner revoke barrier."""
+
+
+class V2PlatformObservationVerifierUnavailable(RuntimeError):
+    """The paired Authority cannot persist a V2 platform observation."""
+
+
 @dataclass(frozen=True)
 class AuthorityTlsProfile:
     """Installation-owned connection material; no key bytes are retained here."""
@@ -211,6 +264,7 @@ class _Session:
     writer: asyncio.StreamWriter
     binding: str
     request_digest: str
+    handshake_started_at: float = 0.0
 
 
 class MtlsAuthorityTransport:
@@ -304,6 +358,18 @@ class MtlsAuthorityTransport:
         handshake_binding: str | None = None,
         command: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        # Authority expires its paired-channel registration after 30 seconds.
+        # Renew on this same TLS channel before sending a business command;
+        # an uncertain business response is never retried here.
+        if method != "handshake" and time.monotonic() - session.handshake_started_at >= 20.0:
+            renewed = await self._rpc(session, profile, "handshake", request)
+            if (renewed.get("state") != "paired"
+                    or renewed.get("publisher_trusted") is not True
+                    or renewed.get("installation_authority_id") != profile.expected_authority_id
+                    or renewed.get("channel_binding_sha256") != session.binding):
+                await self._discard(session, profile.timeout_seconds)
+                raise AuthorityChannelUnavailable("authority channel renewal differs")
+        handshake_started_at = time.monotonic() if method == "handshake" else None
         message: dict[str, object] = {
             "protocol": request["protocol"],
             "request_id": secrets.token_hex(16),
@@ -327,7 +393,7 @@ class MtlsAuthorityTransport:
             await self._discard(session, profile.timeout_seconds)
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            raise RuntimeError("authority transport unavailable") from exc
+            raise AuthorityChannelUnavailable("authority transport unavailable") from exc
         if not line or len(line) > profile.max_message_bytes:
             await self._discard(session, profile.timeout_seconds)
             raise RuntimeError("authority response is invalid")
@@ -339,8 +405,19 @@ class MtlsAuthorityTransport:
         if not isinstance(response, dict) or response.get("request_id") != message["request_id"]:
             await self._discard(session, profile.timeout_seconds)
             raise RuntimeError("authority response is invalid")
+        if (method == "execution_begin_handoff_v2"
+                and response == {"request_id": message["request_id"], "ok": False,
+                                 "error": "owner_authorization_barrier"}):
+            raise V2OwnerAuthorizationBarrier("current Owner authorization bars handoff")
+        if (method == "execution_begin_handoff_v2"
+                and response == {"request_id": message["request_id"], "ok": False,
+                                 "error": "platform_observation_verifier_unavailable"}):
+            raise V2PlatformObservationVerifierUnavailable(
+                "installed platform observation verifier is unavailable")
         if response.get("ok") is not True or not isinstance(response.get("result"), dict):
             raise RuntimeError("authority service unavailable")
+        if handshake_started_at is not None:
+            session.handshake_started_at = handshake_started_at
         if method == "terminal_c02_recovery_read_v1":
             try:
                 if command is None or set(command) != {"namespace", "read_request"}:
@@ -430,7 +507,7 @@ class MtlsAuthorityTransport:
                 session = None
             if (session is None or session.binding != handshake.channel_binding_sha256
                     or session.request_digest != digest):
-                raise RuntimeError("authority handshake channel is unavailable")
+                raise AuthorityChannelUnavailable("authority handshake channel is unavailable")
             response = await self._rpc(
                 session, profile, method, wire_request,
                 handshake_binding=session.binding, command=command,
@@ -457,7 +534,7 @@ class MtlsAuthorityTransport:
                     profile.timeout_seconds,
                 )
             except Exception as exc:
-                raise RuntimeError("authority transport unavailable") from exc
+                raise AuthorityChannelUnavailable("authority transport unavailable") from exc
             wire_request = _request_payload(request)
             wire_request["protocol"] = protocol
             session = _Session(
@@ -508,7 +585,7 @@ class MtlsAuthorityTransport:
                 session = None
             if (session is None or session.binding != handshake.channel_binding_sha256
                     or session.request_digest != digest):
-                raise RuntimeError("authority handshake channel is unavailable")
+                raise AuthorityChannelUnavailable("authority handshake channel is unavailable")
             response = await self._rpc(
                 session, profile, "capability_grant", wire_request, session.binding
             )
@@ -814,9 +891,16 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority model terminal identity differs")
         return record, permit, admission, receipt
 
-    async def model_original_intent_lookup_v1(
+    async def model_original_intent_lookup_v1(self, request, handshake, grant, *, lookup):
+        return await self._model_original_intent_lookup_v1(request, handshake, grant, lookup=lookup)
+
+    async def model_accounting_intent_lookup_v1(self, request, handshake, grant, *, lookup):
+        return await self._model_original_intent_lookup_v1(request, handshake, grant,
+            lookup=lookup, historical_accounting=True)
+
+    async def _model_original_intent_lookup_v1(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
-        grant: InstallationGrantV2, *, lookup: C02OriginalIntentLookupV1,
+        grant: InstallationGrantV2, *, lookup: C02OriginalIntentLookupV1, historical_accounting=False,
     ) -> ModelEgressIntentV1:
         """Read only the original terminal intent from the designated observer."""
         if (type(lookup) is not C02OriginalIntentLookupV1
@@ -824,7 +908,8 @@ class MtlsAuthorityTransport:
                    != (grant.authority_id, grant.installation_id)):
             raise RuntimeError("original model lookup installation differs")
         response = await self._content_rpc(
-            request, handshake, "model_original_intent_lookup_v1", {
+            request, handshake, ("model_accounting_intent_lookup_v1" if historical_accounting
+                                 else "model_original_intent_lookup_v1"), {
                 "namespace": lookup.authority_namespace,
                 "installation_id": lookup.installation_id,
                 "job_id": lookup.job_id,
@@ -1060,6 +1145,292 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority reply read finish is unresolved")
         return True
 
+    async def d04_appraisal_result_read_v3(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.current_d04_appraisal_v3 import D04AppraisalResultReadRequestV3, D04AppraisalResultReadV3, to_wire, from_wire
+        if (type(read_request) is not D04AppraisalResultReadRequestV3
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("D04 result installation differs")
+        response = await self._content_rpc(request, handshake, "d04_appraisal_result_read_v3",
+            {"namespace": namespace, "read_request": to_wire(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("D04 result response fields differ")
+        result = from_wire(response["result"], D04AppraisalResultReadV3)
+        if result.request != read_request:
+            raise RuntimeError("D04 result original differs")
+        return result
+
+    async def d04_appraisal_result_recover_finish_v3(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.current_d04_appraisal_v3 import to_wire
+        if (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) != (grant.authority_id, namespace, grant.installation_id):
+            raise RuntimeError("D04 result recovery installation differs")
+        response = await self._content_rpc(request, handshake, "d04_appraisal_result_recover_finish_v3",
+            {"namespace": namespace, "read_request": to_wire(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if response != {"finished": True, "channel_binding_sha256": response.get("channel_binding_sha256")}:
+            raise RuntimeError("D04 result recovery is unresolved")
+        return True
+
+    async def d07_cognition_result_read_v1(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.d07_current_execution_v1 import D07CognitionResultReadRequestV1, D07CognitionResultReadV1, to_wire, from_wire
+        if (type(read_request) is not D07CognitionResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("D07 result installation differs")
+        response = await self._content_rpc(request, handshake, "d07_cognition_result_read_v1",
+            {"namespace": namespace, "read_request": to_wire(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("D07 result response fields differ")
+        result = from_wire(response["result"], D07CognitionResultReadV1)
+        if result.request != read_request:
+            raise RuntimeError("D07 result original differs")
+        return result
+
+    async def contact_model_result_read_v1(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.contact_model_result_contract_v1 import ContactModelResultReadRequestV1, ContactModelResultReadV1, contact_result_to_wire_v1, contact_result_from_wire_v1
+        if (type(read_request) is not ContactModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("contact result installation differs")
+        response = await self._content_rpc(request, handshake, "contact_model_result_read_v1",
+            {"namespace": namespace, "read_request": contact_result_to_wire_v1(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("contact result response fields differ")
+        result = contact_result_from_wire_v1(response["result"], ContactModelResultReadV1)
+        if result.request != read_request:
+            raise RuntimeError("contact result original differs")
+        return result
+
+    async def contact_model_result_recover_finish_v1(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.contact_model_result_contract_v1 import ContactModelResultReadRequestV1, contact_result_to_wire_v1
+        if (type(read_request) is not ContactModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("contact result recovery installation differs")
+        response = await self._content_rpc(request, handshake, "contact_model_result_recover_finish_v1",
+            {"namespace": namespace, "read_request": contact_result_to_wire_v1(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if response != {"finished": True, "channel_binding_sha256": response.get("channel_binding_sha256")}:
+            raise RuntimeError("contact result recovery is unresolved")
+        return True
+
+    async def d07_cognition_result_recover_finish_v1(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.d07_current_execution_v1 import to_wire
+        if (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) != (grant.authority_id, namespace, grant.installation_id):
+            raise RuntimeError("D07 result recovery installation differs")
+        response = await self._content_rpc(request, handshake, "d07_cognition_result_recover_finish_v1",
+            {"namespace": namespace, "read_request": to_wire(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if response != {"finished": True, "channel_binding_sha256": response.get("channel_binding_sha256")}:
+            raise RuntimeError("D07 result recovery is unresolved")
+        return True
+
+    async def natural_generation_output_select_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: NaturalGenerationOutputReadRequestV2,
+    ) -> NaturalGenerationOriginalOutputV2:
+        if (type(read_request) is not NaturalGenerationOutputReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed natural output identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "natural_generation_output_select_v2",
+            {"namespace": namespace,
+             "read_request": natural_output_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("authority natural output response is invalid")
+        try:
+            result = natural_output_from_wire(
+                response["result"], NaturalGenerationOriginalOutputV2)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority natural output response is invalid") from exc
+        if result.request != read_request:
+            raise RuntimeError("authority natural output identity differs")
+        return result
+
+    async def natural_generation_content_read_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: NaturalGenerationContentReadRequestV2,
+    ) -> NaturalGenerationCurrentContentV2:
+        if (type(read_request) is not NaturalGenerationContentReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed natural content identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "natural_generation_content_read_v2",
+            {"namespace": namespace,
+             "read_request": natural_content_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("authority natural content response is invalid")
+        try:
+            result = natural_content_from_wire(
+                response["result"], NaturalGenerationCurrentContentV2)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority natural content response is invalid") from exc
+        if result.request != read_request:
+            raise RuntimeError("authority natural content identity differs")
+        return result
+
+    async def natural_generation_output_recover_finish_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: NaturalGenerationOutputReadRequestV2,
+    ) -> bool:
+        if (type(read_request) is not NaturalGenerationOutputReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed natural output identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "natural_generation_output_recover_finish_v2",
+            {"namespace": namespace,
+             "read_request": natural_output_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"finished", "channel_binding_sha256"}
+                or response["finished"] is not True):
+            raise RuntimeError("authority natural output read finish unresolved")
+        return True
+
+    async def natural_review_output_select_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: NaturalReviewOutputReadRequestV2,
+    ) -> NaturalReviewOriginalOutputV2:
+        if (type(read_request) is not NaturalReviewOutputReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed natural review identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "natural_review_output_select_v2",
+            {"namespace": namespace,
+             "read_request": natural_review_output_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("authority natural review response is invalid")
+        try:
+            result = natural_review_output_from_wire(
+                response["result"], NaturalReviewOriginalOutputV2)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority natural review response is invalid") from exc
+        if result.request != read_request:
+            raise RuntimeError("authority natural review identity differs")
+        return result
+
+    async def natural_review_output_recover_finish_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: NaturalReviewOutputReadRequestV2,
+    ) -> bool:
+        if (type(read_request) is not NaturalReviewOutputReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed natural review identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "natural_review_output_recover_finish_v2",
+            {"namespace": namespace,
+             "read_request": natural_review_output_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"finished", "channel_binding_sha256"}
+                or response["finished"] is not True):
+            raise RuntimeError("authority natural review finish unresolved")
+        return True
+
+    async def natural_paid_review_current_read_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: NaturalPaidReviewCurrentReadRequestV2,
+    ) -> NaturalPaidReviewCurrentReadV2:
+        if type(read_request) is not NaturalPaidReviewCurrentReadRequestV2:
+            raise RuntimeError("installed natural paid review identity is invalid")
+        generation = read_request.generation_content_request
+        review = read_request.review_output_request
+        if ((generation.authority_id, generation.authority_namespace,
+                    generation.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)
+                or review.installation_id != grant.installation_id):
+            raise RuntimeError("installed natural paid review identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "natural_paid_review_current_read_v2",
+            {"namespace": namespace,
+             "read_request": natural_paid_review_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("authority natural paid review response is invalid")
+        try:
+            result = natural_paid_review_from_wire(
+                response["result"], NaturalPaidReviewCurrentReadV2)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority natural paid review response is invalid") from exc
+        if result.request != read_request:
+            raise RuntimeError("authority natural paid review identity differs")
+        return result
+
+    async def context_reply_result_read_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: ContextReplyResultReadRequestV1,
+    ) -> ContextReplyPaidResultReadV2:
+        if (type(read_request) is not ContextReplyResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed context reply read identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "context_reply_result_read_v2",
+            {"namespace": namespace,
+             "read_request": context_reply_result_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("authority context reply response is invalid")
+        try:
+            result = context_reply_result_from_wire(
+                response["result"], ContextReplyPaidResultReadV2)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority context reply response is invalid") from exc
+        if (result.read_attempt_id != read_request.read_attempt_id
+                or (result.original_seal.namespace,
+                    result.original_seal.c02_operation_id,
+                    result.original_seal.source_ref,
+                    result.original_seal.original_operation_id,
+                    result.original_seal.call_id,
+                    result.original_seal.job_id,
+                    result.original_seal.acquire_operation_id,
+                    result.original_seal.model_request_digest,
+                    result.original_seal.frozen_input_digest) !=
+                   (read_request.namespace, read_request.c02_operation_id,
+                    read_request.source_ref, read_request.original_operation_id,
+                    read_request.call_id, read_request.job_id,
+                    read_request.acquire_operation_id,
+                    read_request.model_request_digest,
+                    read_request.frozen_input_digest)):
+            raise RuntimeError("authority context reply identity differs")
+        return result
+
+    async def context_reply_result_recover_finish_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        read_request: ContextReplyResultReadRequestV1,
+    ) -> bool:
+        if (type(read_request) is not ContextReplyResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace,
+                    read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("installed context reply read identity is invalid")
+        response = await self._content_rpc(
+            request, handshake, "context_reply_result_recover_finish_v2",
+            {"namespace": namespace,
+             "read_request": context_reply_result_to_wire(read_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"finished", "channel_binding_sha256"}
+                or response["finished"] is not True):
+            raise RuntimeError("authority context reply read finish is unresolved")
+        return True
+
     async def self_identity_current_v1(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         grant: InstallationGrantV2, *, namespace: str,
@@ -1231,6 +1602,44 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority worker result fact differs")
         return fact
 
+    async def internal_accounting_v1(self, request, handshake, grant, *, namespace,
+                                     accounting_request, action, accounting_grant=None):
+        from ..authority_service.internal_accounting_v1 import (
+            HistoricalInternalCostRequestV1, HistoricalInternalCostGrantV1,
+            to_wire as internal_to_wire, from_wire as internal_from_wire,
+        )
+        if (type(accounting_request) is not HistoricalInternalCostRequestV1
+                or action not in {"begin", "validate", "finish", "recover_finish"}
+                or not handshake.valid_pairing()
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256
+                or accounting_request.expected_anchor.authority_id != grant.authority_id
+                or accounting_request.binding.namespace != namespace
+                or accounting_request.expected_anchor.namespace != namespace):
+            raise RuntimeError("paired historical internal accounting identity differs")
+        command = {"namespace": namespace, "request": internal_to_wire(accounting_request)}
+        if action in {"validate", "finish"}:
+            if type(accounting_grant) is not HistoricalInternalCostGrantV1:
+                raise TypeError("original historical internal accounting grant required")
+            command["grant"] = internal_to_wire(accounting_grant)
+        response = await self._content_rpc(request, handshake,
+            "internal_accounting_" + action + "_v1", command, protocol=AUTHORITY_V2_PROTOCOL)
+        field = "grant" if action == "begin" else "valid" if action == "validate" else "finished"
+        if (set(response) != {field, "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("historical internal accounting response differs")
+        if action == "begin":
+            observed = internal_from_wire(response[field], HistoricalInternalCostGrantV1)
+            if (observed.evidence.installation_id != grant.installation_id
+                    or observed.evidence.binding != accounting_request.binding
+                    or observed.permit.operation_id != accounting_request.operation_id
+                    or observed.permit.pinned_anchor != accounting_request.expected_anchor
+                    or observed.permit.holder != grant.administrator_holder):
+                raise RuntimeError("historical internal accounting grant identity differs")
+            return observed
+        if response[field] is not True:
+            raise RuntimeError("historical internal accounting operation remains unresolved")
+        return True
+
     async def _accounting_rpc(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         grant: InstallationGrantV2, *, namespace: str, holder: str,
@@ -1334,6 +1743,24 @@ class MtlsAuthorityTransport:
                 or sample.installation_id != installation_id):
             raise RuntimeError("authority v2 clock response is invalid")
         return sample
+
+    async def migration_command_v2(
+        self, request: AuthorityProvisioningRequest,
+        handshake: AuthorityHandshake, command: dict[str, object],
+    ) -> object:
+        """Return only a strictly decoded response from the paired TLS session."""
+        if (not handshake.valid_pairing() or type(command) is not dict
+                or type(command.get("operation")) is not str):
+            raise RuntimeError("authority migration command is invalid")
+        response = await self._content_rpc(
+            request, handshake, "migration_v2", command,
+            protocol=AUTHORITY_V2_PROTOCOL,
+        )
+        return migration_response_from_wire(
+            {key: value for key, value in response.items()
+             if key != "channel_binding_sha256"},
+            command["operation"],
+        )
 
     async def v2_namespace_bootstrap(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
@@ -1591,6 +2018,38 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority v2 permit binding is invalid")
         return permit
 
+    async def v2_reject_unbegun_content_fence_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, holder: str, generation: int, operation_id: str,
+        expected_anchor: RestoreAnchor, request_id: str, request_digest: str,
+    ) -> FenceNeverBegunReceiptV2:
+        if type(expected_anchor) is not RestoreAnchor:
+            raise TypeError("RestoreAnchor is required")
+        response = await self._content_rpc(
+            request, handshake, "reject_unbegun_content_fence_v2",
+            {"namespace": namespace, "holder": holder, "generation": generation,
+             "operation_id": operation_id, "expected_anchor": asdict(expected_anchor),
+             "request_id": request_id, "request_digest": request_digest},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"receipt", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority never-begun fence response is invalid")
+        try:
+            receipt = from_wire(response["receipt"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority never-begun fence response is invalid") from exc
+        if (type(receipt) is not FenceNeverBegunReceiptV2
+                or receipt.authority_id != handshake.installation_authority_id
+                or receipt.subject != handshake.installation_identity_ref
+                or receipt.namespace != namespace or receipt.holder != holder
+                or receipt.generation != generation
+                or receipt.operation_id != operation_id
+                or receipt.pinned_anchor != expected_anchor
+                or receipt.request_id != request_id
+                or receipt.request_digest != request_digest):
+            raise RuntimeError("authority never-begun fence binding is invalid")
+        return receipt
+
     async def v2_begin_read_fence(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, holder: str, operation_id: str,
@@ -1635,6 +2094,54 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority v2 dispatch permit binding is invalid")
         return permit
 
+    async def v2_execution_read_current_effect_snapshot_for_write_fence(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, permit: FencePermitV2,
+    ) -> AuthorityCurrentEffectSnapshotV2:
+        """Read the Authority's complete effect index under an existing write fence."""
+        if type(permit) is not FencePermitV2 or permit.operation != "write":
+            raise ValueError("ordinary write permit required for effect snapshot")
+        response = await self._content_rpc(
+            request, handshake,
+            "execution_read_current_effect_snapshot_for_write_fence",
+            {"permit": to_wire(permit)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict
+                or set(response) != {"snapshot", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority effect snapshot response is invalid")
+        try:
+            snapshot = from_wire(response["snapshot"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise RuntimeError("authority effect snapshot response is invalid") from exc
+        if (type(snapshot) is not AuthorityCurrentEffectSnapshotV2
+                or snapshot.authority_id != handshake.installation_authority_id
+                or snapshot.namespace != permit.namespace
+                or snapshot.anchor != permit.pinned_anchor
+                or snapshot.permit_digest != canonical_digest(permit)
+                or snapshot.execution_head_seq != permit.pinned_anchor.execution_seq
+                or snapshot.execution_head_digest != permit.pinned_anchor.execution_digest
+                or snapshot.coverage != "complete"):
+            raise RuntimeError("authority effect snapshot binding is invalid")
+        return snapshot
+
+    async def v2_execution_read_current_observation_receipt_v1(
+            self, request, handshake, *, namespace, effect_id):
+        identifier(namespace, "namespace")
+        identifier(effect_id, "effect_id")
+        response = await self._content_rpc(request, handshake,
+            "execution_read_current_observation_receipt_v1",
+            {"namespace": namespace, "effect_id": effect_id}, protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"receipt", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("platform observation receipt channel differs")
+        receipt = from_wire(response["receipt"])
+        if (type(receipt) is not MutationReceiptV2 or receipt.durable_state != "committed"
+                or receipt.pending.phase != "observed"
+                or receipt.pending.permit.namespace != namespace
+                or receipt.pending.permit.effect_id != effect_id):
+            raise RuntimeError("platform observation receipt identity differs")
+        return receipt
+
     async def v2_execution_read_current_effect(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, effect_id: str,
@@ -1666,7 +2173,9 @@ class MtlsAuthorityTransport:
             evidence = (reading.effect_seq, reading.append_id,
                         reading.append_digest, reading.mutation_id)
             if reading.state == "absent":
-                if any(item is not None for item in (*evidence, reading.observation_id)):
+                if any(item is not None for item in (
+                        *evidence, reading.observation_id,
+                        reading.observation_outcome)):
                     raise ValueError("absent effect contains append evidence")
             else:
                 if (type(reading.effect_seq) is not int
@@ -1677,7 +2186,12 @@ class MtlsAuthorityTransport:
                     identifier(getattr(reading, name), name)
                 if reading.state == "observed":
                     identifier(reading.observation_id, "observation_id")
-                elif reading.observation_id is not None:
+                    if reading.observation_outcome not in {
+                            "handed_off", "accepted", "delivered", "read",
+                            "failed_before_acceptance", "unknown"}:
+                        raise ValueError("observed effect lacks original outcome")
+                elif (reading.observation_id is not None
+                      or reading.observation_outcome is not None):
                     raise ValueError("unresolved effect contains observation")
         except (TypeError, ValueError) as exc:
             raise RuntimeError("authority current effect response is invalid") from exc
@@ -1752,7 +2266,9 @@ class MtlsAuthorityTransport:
             {"claimed_receipt": to_wire(claimed_receipt),
              "observation": to_wire(observation)},
             protocol=AUTHORITY_V2_PROTOCOL)
-        if set(response) != {"receipt", "permit", "channel_binding_sha256"}:
+        if (set(response) != {"receipt", "permit", "channel_binding_sha256"}
+                or response["channel_binding_sha256"]
+                   != handshake.channel_binding_sha256):
             raise RuntimeError("V2 observation response differs")
         try:
             receipt = from_wire(response["receipt"])
@@ -1763,8 +2279,12 @@ class MtlsAuthorityTransport:
                 or type(permit) is not FencePermitV2
                 or receipt.durable_state != "committed"
                 or receipt.pending.phase != "observed"
-                or receipt.pending.binding != observation.binding
+                or receipt.pending.claimed_receipt != claimed_receipt
                 or receipt.pending.platform_observation != observation
+                or receipt.pending.permit.operation_id
+                   != claimed_receipt.pending.permit.operation_id
+                or receipt.pending.permit.effect_id
+                   != claimed_receipt.pending.permit.effect_id
                 or permit.operation_id != observation.binding.operation_id
                 or permit.authority_id != handshake.installation_authority_id
                 or permit.subject != handshake.installation_identity_ref
@@ -2284,6 +2804,664 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority owner commit response is invalid")
         return result
 
+    async def v2_reserve_owner_revoke(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation: OwnerAuthorizationOperationV1,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+    ) -> OwnerAuthorizationReceiptV1:
+        if (type(operation) is not OwnerAuthorizationOperationV1
+                or operation.action != "revoke"):
+            raise TypeError("owner revoke operation is required")
+        response = await self._content_rpc(
+            request, handshake, "reserve_owner_revoke",
+            {"namespace": namespace, "operation": owner_to_wire(operation),
+             **self._owner_issue_session_fields(
+                 handshake, namespace, owner_session_token, owner_session_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        result = self._owner_result(
+            response, handshake, "receipt", OwnerAuthorizationReceiptV1)
+        if (result.operation != operation or result.phase != "pending"
+                or result.operation.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority owner revoke response differs")
+        return result
+
+    async def v2_finalize_owner_revoke(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation: OwnerAuthorizationOperationV1,
+        proof: OwnerGraphCommitProofV1,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+    ) -> OwnerAuthorizationReceiptV1:
+        if (type(operation) is not OwnerAuthorizationOperationV1
+                or operation.action != "revoke"
+                or type(proof) is not OwnerGraphCommitProofV1):
+            raise TypeError("owner revoke operation and graph proof are required")
+        response = await self._content_rpc(
+            request, handshake, "finalize_owner_revoke",
+            {"namespace": namespace, "operation": owner_to_wire(operation),
+             "proof": owner_to_wire(proof),
+             **self._owner_issue_session_fields(
+                 handshake, namespace, owner_session_token, owner_session_request)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        result = self._owner_result(
+            response, handshake, "receipt", OwnerAuthorizationReceiptV1)
+        if (result.operation != operation or result.phase != "committed"
+                or result.operation.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("authority owner revoke commit response differs")
+        return result
+
+    async def _v2_read_owner_revoke(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, method: str, namespace: str, operation_id: str,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+        permit: FencePermitV2 | None = None,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        expected = {"get_pending_owner_revoke", "get_committed_owner_revoke",
+                    "get_pending_owner_revoke_for_graph_write"}
+        if method not in expected:
+            raise ValueError("unsupported owner revoke read")
+        fields = {"namespace": namespace,
+                  "operation_id": identifier(operation_id, "operation_id")}
+        if permit is None:
+            fields.update(self._owner_issue_session_fields(
+                handshake, namespace, owner_session_token, owner_session_request))
+        else:
+            if (method != "get_pending_owner_revoke_for_graph_write"
+                    or type(permit) is not FencePermitV2
+                    or permit.operation != "write" or permit.namespace != namespace
+                    or permit.subject != handshake.installation_identity_ref):
+                raise RuntimeError("owner revoke graph read requires this write fence")
+            fields["permit"] = to_wire(permit)
+        response = await self._content_rpc(
+            request, handshake, method, fields, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict
+                or set(response) != {"receipt", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority owner revoke read response differs")
+        if response["receipt"] is None:
+            return None
+        receipt = self._owner_result(response, handshake, "receipt",
+                                     OwnerAuthorizationReceiptV1)
+        phase = ("committed" if method == "get_committed_owner_revoke"
+                 else "pending")
+        if (receipt.operation.action != "revoke"
+                or receipt.operation.operation_id != operation_id
+                or receipt.operation.authority_id != handshake.installation_authority_id
+                or receipt.phase != phase):
+            raise RuntimeError("authority owner revoke read identity differs")
+        return receipt
+
+    async def v2_get_pending_owner_revoke(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation_id: str,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        return await self._v2_read_owner_revoke(
+            request, handshake, method="get_pending_owner_revoke",
+            namespace=namespace, operation_id=operation_id,
+            owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
+
+    async def v2_get_committed_owner_revoke(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation_id: str,
+        owner_session_token: str | None = None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        return await self._v2_read_owner_revoke(
+            request, handshake, method="get_committed_owner_revoke",
+            namespace=namespace, operation_id=operation_id,
+            owner_session_token=owner_session_token,
+            owner_session_request=owner_session_request)
+
+    async def v2_get_pending_owner_revoke_for_graph_write(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation_id: str, permit: FencePermitV2,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        return await self._v2_read_owner_revoke(
+            request, handshake, method="get_pending_owner_revoke_for_graph_write",
+            namespace=namespace, operation_id=operation_id, permit=permit)
+
+    async def v2_get_pending_deletion_for_graph_write(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, deletion_operation_id: str, permit: FencePermitV2,
+    ) -> DeletionMutationReceiptV1:
+        if (type(permit) is not FencePermitV2 or permit.operation != "delete"
+                or permit.namespace != namespace
+                or permit.subject != handshake.installation_identity_ref
+                or permit.authority_id != handshake.installation_authority_id):
+            raise RuntimeError("deletion graph read needs this installation's delete fence")
+        response = await self._content_rpc(
+            request, handshake, "get_pending_deletion_for_graph_write", {
+                "namespace": namespace,
+                "deletion_operation_id": identifier(
+                    deletion_operation_id, "deletion_operation_id"),
+                "permit": to_wire(permit),
+            }, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict
+                or set(response) != {"receipt", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("deletion graph read response differs")
+        receipt = from_wire(response["receipt"])
+        if (type(receipt) is not DeletionMutationReceiptV1
+                or receipt.pending.deletion_operation_id != deletion_operation_id
+                or receipt.pending.permit.operation_id != permit.operation_id
+                or receipt.pending.permit.token != permit.token
+                or receipt.after_anchor != permit.pinned_anchor
+                or receipt.updated_revision != permit.revision):
+            raise RuntimeError("deletion graph read original identity differs")
+        return receipt
+
+    async def v2_read_current_accepted_erasure_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, deletion_operation_id: str, scope_digest: str,
+        permit: FencePermitV2,
+    ) -> CurrentAcceptedErasureV1:
+        """Read the Authority's current accepted original under its live delete fence."""
+        if (type(permit) is not FencePermitV2 or permit.operation != "delete"
+                or permit.namespace != namespace
+                or permit.subject != handshake.installation_identity_ref
+                or permit.authority_id != handshake.installation_authority_id
+                or type(scope_digest) is not str or len(scope_digest) != 71
+                or not scope_digest.startswith("sha256:")
+                or any(char not in "0123456789abcdef" for char in scope_digest[7:])):
+            raise RuntimeError("accepted erasure read needs this installation's scoped delete fence")
+        response = await self._content_rpc(
+            request, handshake, "read_current_accepted_erasure_v1", {
+                "namespace": identifier(namespace, "namespace"),
+                "deletion_operation_id": identifier(
+                    deletion_operation_id, "deletion_operation_id"),
+                "scope_digest": scope_digest, "permit": to_wire(permit),
+            }, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict
+                or set(response) != {"original", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("Authority accepted erasure response differs")
+        try:
+            original = accepted_from_wire(response["original"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Authority accepted erasure original is invalid") from exc
+        if (type(original) is not CurrentAcceptedErasureV1
+                or original.namespace != namespace
+                or original.deletion_operation_id != deletion_operation_id
+                or original.scope_digest != scope_digest
+                or original.permit != permit
+                or original.accepted_receipt.pending.target_phase != "accepted"):
+            raise RuntimeError("Authority accepted erasure identity differs")
+        return original
+
+    async def v2_prepare_current_erasure_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        *, namespace: str, operation_id: str, source_id: str,
+        owner_actor_id: str, owner_session_token: str,
+    ) -> tuple[DeletionMutationReceiptV1, FencePermitV2]:
+        """Prepare one source-scoped deletion and expose only its durable pending original."""
+        for name, value in (("namespace", namespace), ("operation_id", operation_id),
+                            ("source_id", source_id), ("owner_actor_id", owner_actor_id),
+                            ("owner_session_token", owner_session_token)):
+            identifier(value, name)
+        if (not handshake.valid_pairing()
+                or handshake.installation_identity_ref == ""
+                or handshake.installation_authority_id == ""):
+            raise RuntimeError("current paired installation is required")
+        response = await self._content_rpc(
+            request, handshake, "prepare_current_erasure_v1", {
+                "namespace": namespace, "operation_id": operation_id,
+                "source_id": source_id, "owner_actor_id": owner_actor_id,
+                "owner_session_token": owner_session_token,
+            }, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict
+                or set(response) != {"receipt", "permit", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("authority erasure prepare response differs")
+        try:
+            receipt = from_wire(response["receipt"])
+            permit = from_wire(response["permit"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("authority erasure prepare response is invalid") from exc
+        if (type(receipt) is not DeletionMutationReceiptV1
+                or type(permit) is not FencePermitV2):
+            raise RuntimeError("authority erasure prepare response is invalid")
+        pending = receipt.pending
+        if (pending.source_phase != "absent" or pending.target_phase != "pending"
+                or pending.deletion_operation_id != operation_id
+                or pending.closure_roots != (source_id,)
+                or pending.permit.namespace != namespace
+                or pending.permit.subject != handshake.installation_identity_ref
+                or pending.permit.authority_id != handshake.installation_authority_id
+                or pending.permit.operation != "delete"
+                or permit.operation != "delete"
+                or permit.namespace != namespace
+                or permit.subject != handshake.installation_identity_ref
+                or permit.authority_id != handshake.installation_authority_id
+                or permit.operation_id != pending.permit.operation_id
+                or permit.token != pending.permit.token
+                or permit.revision != receipt.updated_revision
+                or permit.pinned_anchor != receipt.after_anchor):
+            raise RuntimeError("authority erasure prepare identity differs")
+        return receipt, permit
+
+    async def _c04_work(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        binding: InternalWorkBindingV1, method: str,
+    ) -> InternalWorkJournalInspectionV1:
+        algorithms = {
+            "c04_execute_v2": "d06.association_activation.v2",
+            "c04_inspect_v2": "d06.association_activation.v2",
+            "c04_execute_v3": "d06.association_activation.v3",
+            "c04_inspect_v3": "d06.association_activation.v3",
+        }
+        if (method not in algorithms
+                or type(binding) is not InternalWorkBindingV1
+                or binding.namespace != namespace
+                or binding.algorithm_ref != algorithms[method]
+                or (grant.authority_id, grant.subject,
+                    grant.channel_binding_sha256) !=
+                   (handshake.installation_authority_id,
+                    handshake.installation_identity_ref,
+                    handshake.channel_binding_sha256)):
+            raise RuntimeError("installed C04 work identity differs")
+        response = await self._content_rpc(
+            request, handshake, method,
+            {"namespace": namespace, "binding": c04_to_wire(binding)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or
+                set(response) != {"inspection", "channel_binding_sha256"} or
+                response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("C04 work channel response differs")
+        inspection = c04_from_wire(
+            response["inspection"], InternalWorkJournalInspectionV1)
+        if inspection.binding != binding:
+            raise RuntimeError("C04 work original binding differs")
+        return inspection
+
+    async def c04_execute_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        binding: InternalWorkBindingV1,
+    ) -> InternalWorkJournalInspectionV1:
+        return await self._c04_work(
+            request, handshake, grant, namespace=namespace, binding=binding,
+            method="c04_execute_v2")
+
+    async def c04_inspect_v2(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        binding: InternalWorkBindingV1,
+    ) -> InternalWorkJournalInspectionV1:
+        return await self._c04_work(
+            request, handshake, grant, namespace=namespace, binding=binding,
+            method="c04_inspect_v2")
+
+    async def c04_execute_v3(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        binding: InternalWorkBindingV1,
+    ) -> InternalWorkJournalInspectionV1:
+        return await self._c04_work(
+            request, handshake, grant, namespace=namespace, binding=binding,
+            method="c04_execute_v3")
+
+    async def c04_inspect_v3(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        binding: InternalWorkBindingV1,
+    ) -> InternalWorkJournalInspectionV1:
+        return await self._c04_work(
+            request, handshake, grant, namespace=namespace, binding=binding,
+            method="c04_inspect_v3")
+
+    async def d04_root_v3(self,request,handshake,grant,*,namespace,binding,method,
+            claim=None,measurement=None,executor_incarnation=None,gate=None,outcome=None,action=None):
+        from ..authority_service.d04_root_execution_contract_v3 import (D04RootExecutionBindingV3,
+            D04RootExecutionClaimV3,D04RootExecutionTerminalV3,D04RootMeasuredCostClosureV3,
+            root_execution_to_wire_v3 as to_wire,root_execution_from_wire_v3 as from_wire)
+        from ..authority_service.d04_root_execution_bridge_v3 import (D04RootOriginalAppendV3,D04RootAdoptionBridgeV3,
+            root_bridge_to_wire_v3,root_bridge_from_wire_v3)
+        if (type(binding) is not D04RootExecutionBindingV3 or grant.installation_id!=binding.installation_id
+                or grant.authority_id!=binding.authority_id or namespace!=binding.authority_namespace
+                or grant.channel_binding_sha256!=handshake.channel_binding_sha256):raise RuntimeError("root paired identity differs")
+        if method=='d04_root_restore_original_v3':
+            from ..authority_service.d04_root_restore_stream_v3 import read_root_restore_stream_v3
+            return await read_root_restore_stream_v3(self,request,handshake,namespace=namespace,binding=binding,installation_grant=grant)
+        command={'namespace':namespace,'binding':to_wire(binding)}
+        if method=='d04_root_claim_v3':command['executor_incarnation']=executor_incarnation;fields={'claim'}
+        elif method=='d04_root_inspect_v3':fields={'claim','terminal'}
+        elif method in {'d04_root_terminal_v3','d04_root_cost_only_v3'}:
+            command.update(claim=to_wire(claim),measurement=to_wire(measurement));fields={'terminal' if method=='d04_root_terminal_v3' else 'cost_closure'}
+        elif method=='d04_root_cost_inspect_v3':fields={'cost_closure'}
+        elif method=='d04_root_original_append_v3':command['claim']=to_wire(claim);fields={'gate'}
+        elif method=='d04_root_adoption_bridge_v3':fields={'gate'}
+        elif method=='d04_root_accounting_v3':
+            from ..authority_service.d04_root_accounting_v3 import root_accounting_to_wire_v3
+            command.update(action=action,gate=None if gate is None else root_accounting_to_wire_v3(gate));fields={'gate'} if action=='begin' else {'ok'}
+        elif method in {'d04_root_validate_gate_v3','d04_root_finish_adoption_v3','d04_root_gate_status_v3'}:
+            command['gate']=root_bridge_to_wire_v3(gate)
+            if method=='d04_root_finish_adoption_v3':command['outcome']=outcome;fields={'finished'}
+            else:fields={'state' if method=='d04_root_gate_status_v3' else 'gate'}
+        else:raise ValueError('unknown root RPC')
+        response=await self._content_rpc(request,handshake,method,command,protocol=AUTHORITY_V2_PROTOCOL)
+        if type(response) is not dict or set(response)!=fields|{'channel_binding_sha256'} or response['channel_binding_sha256']!=handshake.channel_binding_sha256:raise RuntimeError('root actual response channel/fields differ')
+        if fields in ({'ok'},{'finished'}):
+            if response[next(iter(fields))] is not True:raise RuntimeError('root original operation unresolved')
+            return True
+        if fields=={'state'}:
+            if response['state'] not in {'active','finished'}:raise RuntimeError('root original gate state differs')
+            return response['state']
+        if fields=={'gate'}:
+            if method=='d04_root_accounting_v3':
+                from ..authority_service.d04_root_accounting_v3 import root_accounting_from_wire_v3
+                result=root_accounting_from_wire_v3(response['gate'])
+            else:
+                raw=response['gate'];kind={'d04.authored-root-original-append.v3':D04RootOriginalAppendV3,'d04.authored-root-adoption-bridge.v3':D04RootAdoptionBridgeV3}.get(raw.get('schema') if type(raw) is dict else None)
+                result=root_bridge_from_wire_v3(raw,kind)
+            if result.binding!=binding or result.permit.namespace!=namespace:raise RuntimeError('root issued gate differs')
+            if method=='d04_root_validate_gate_v3' and result!=gate:raise RuntimeError('root validation changes gate')
+            return result
+        values={}
+        for key in fields:
+            raw=response[key]
+            kind=(D04RootExecutionClaimV3 if key=='claim' else D04RootMeasuredCostClosureV3 if raw is not None and raw.get('schema')=='d04.authored-root-measured-cost-closure.v3' else D04RootExecutionTerminalV3)
+            value=None if raw is None else from_wire(raw,kind)
+            if value is not None and (value.binding_digest!=binding.digest if key=='claim' else value.binding!=binding):raise RuntimeError('root original response differs')
+            values[key]=value
+        if fields=={'claim','terminal'}:
+            if values['terminal'] is not None and values['terminal'].claim!=values['claim']:raise RuntimeError('root inspection claim/terminal disagree')
+            return values['claim'],values['terminal']
+        result=values[next(iter(fields))]
+        if result is None and method!='d04_root_cost_inspect_v3':raise RuntimeError('root requested original unavailable')
+        return result
+
+    async def d11_offline_tick_v1(self, request, handshake, grant, *, binding, method):
+        from ..authority_service.d11_offline_tick_contract_v1 import (
+            D11OfflineTickBindingV1, D11OfflineTickClaimV1, D11OfflineTickTerminalV1,
+            offline_tick_from_wire_v1, offline_tick_to_wire_v1)
+        if (method not in {"d11_offline_tick_execute_v1", "d11_offline_tick_original_v1",
+                "d11_offline_tick_historical_original_v1", "d11_offline_tick_recover_claimed_v1"}
+                or type(binding) is not D11OfflineTickBindingV1
+                or (binding.authority_id, binding.installation_id) != (grant.authority_id, grant.installation_id)
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
+            raise RuntimeError("offline tick paired installation differs")
+        response = await self._content_rpc(request, handshake, method,
+            {"namespace": binding.authority_namespace, "binding": offline_tick_to_wire_v1(binding)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != {"claim", "terminal", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("offline original response channel or fields differ")
+        claim = None if response["claim"] is None else offline_tick_from_wire_v1(response["claim"], D11OfflineTickClaimV1)
+        terminal = None if response["terminal"] is None else offline_tick_from_wire_v1(response["terminal"], D11OfflineTickTerminalV1)
+        if ((claim is not None and claim.binding != binding)
+                or (terminal is not None and (terminal.binding != binding or terminal.claim != claim))):
+            raise RuntimeError("offline original response crossed binding or claim")
+        return claim, terminal
+
+    async def d11_offline_tick_unstarted_cancellation_v1(self, request, handshake, grant, *, binding, action, gate=None):
+        from ..authority_service.d11_offline_tick_contract_v1 import D11OfflineTickBindingV1, offline_tick_to_wire_v1
+        from ..authority_service.d11_offline_unstarted_cancellation_v1 import unstarted_cancellation_to_wire_v1, unstarted_cancellation_from_wire_v1
+        if (type(binding) is not D11OfflineTickBindingV1 or action not in {"begin", "validate", "finish", "status"}
+                or (binding.authority_id, binding.installation_id) != (grant.authority_id, grant.installation_id)
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
+            raise RuntimeError("offline cancellation actual paired installation differs")
+        response = await self._content_rpc(request, handshake, "d11_offline_tick_unstarted_cancellation_v1",
+            {"namespace": binding.authority_namespace, "binding": offline_tick_to_wire_v1(binding), "action": action,
+                "gate": None if gate is None else unstarted_cancellation_to_wire_v1(gate)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != {"result", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("offline cancellation response channel/fields differ")
+        result = response["result"]
+        if action in {"begin", "validate"}:
+            result = unstarted_cancellation_from_wire_v1(result)
+            if result.binding != binding or result.permit.holder != grant.administrator_holder or action == "validate" and result != gate:
+                raise RuntimeError("offline cancellation response original differs")
+        elif action == "finish" and result is not True:
+            raise RuntimeError("offline cancellation finish remains unresolved")
+        elif action == "status" and result not in {"active", "finished"}:
+            raise RuntimeError("offline cancellation original state differs")
+        return result
+
+    async def d11_offline_tick_historical_accounting_v1(self, request, handshake, grant, *, binding, action, gate=None):
+        from ..authority_service.d11_offline_tick_contract_v1 import D11OfflineTickBindingV1, offline_tick_to_wire_v1
+        from ..authority_service.d11_offline_historical_accounting_v1 import historical_accounting_to_wire_v1, historical_accounting_from_wire_v1
+        if (type(binding) is not D11OfflineTickBindingV1 or action not in {"begin", "validate", "finish", "status"}
+                or (binding.authority_id, binding.installation_id) != (grant.authority_id, grant.installation_id)
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
+            raise RuntimeError("offline historical accounting paired installation differs")
+        response = await self._content_rpc(request, handshake, "d11_offline_tick_historical_accounting_v1",
+            {"namespace": binding.authority_namespace, "binding": offline_tick_to_wire_v1(binding),
+             "action": action, "gate": None if gate is None else historical_accounting_to_wire_v1(gate)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != {"result", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("offline historical accounting response channel or fields differ")
+        result = response["result"]
+        if action in {"begin", "validate"}:
+            result = historical_accounting_from_wire_v1(result)
+            if (result.binding != binding or result.permit.holder != grant.administrator_holder
+                    or action == "validate" and result != gate):
+                raise RuntimeError("offline historical accounting response changed its exact original")
+        elif action == "finish" and result is not True:
+            raise RuntimeError("offline historical accounting finish is unresolved")
+        elif action == "status" and result not in {"active", "finished"}:
+            raise RuntimeError("offline historical accounting state differs")
+        return result
+
+    async def d11_offline_tick_bridge_v1(self, request, handshake, grant, *, binding, action, gate=None, outcome=None):
+        from ..authority_service.d11_offline_tick_contract_v1 import D11OfflineTickBindingV1, offline_tick_to_wire_v1
+        from ..authority_service.d11_offline_tick_bridge_v1 import offline_bridge_to_wire_v1, offline_bridge_from_wire_v1
+        if (type(binding) is not D11OfflineTickBindingV1 or action not in {"begin", "validate", "finish", "status"}
+                or (binding.authority_id, binding.installation_id) != (grant.authority_id, grant.installation_id)
+                or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
+            raise RuntimeError("offline bridge paired installation differs")
+        response = await self._content_rpc(request, handshake, "d11_offline_tick_bridge_v1",
+            {"namespace": binding.authority_namespace, "binding": offline_tick_to_wire_v1(binding),
+             "action": action, "gate": None if gate is None else offline_bridge_to_wire_v1(gate), "outcome": outcome},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != {"result", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("offline bridge response channel or fields differ")
+        result = response["result"]
+        if action in {"begin", "validate"}:
+            result = offline_bridge_from_wire_v1(result)
+            if result.binding != binding or (action == "validate" and result != gate):
+                raise RuntimeError("offline bridge response changed its exact original")
+        elif action == "finish" and result is not True:
+            raise RuntimeError("offline bridge finish is unresolved")
+        elif action == "status" and result not in {"active", "finished"}:
+            raise RuntimeError("offline bridge state differs")
+        return result
+
+    async def d04_numeric_bridge_v3(self, request, handshake, grant, *, namespace,
+            binding, method, claim=None, gate=None, outcome=None, measurement=None, action=None):
+        from ..authority_service.d04_numeric_contract_v3 import D04NumericBindingV3, D04NumericMeasuredCostClosureV3, from_wire, to_wire
+        from ..authority_service.d04_numeric_claim_bridge_v3 import (D04NumericOriginalAppendV3,
+            D04NumericAdoptionBridgeV3,numeric_bridge_to_wire_v3,numeric_bridge_from_wire_v3,numeric_restore_from_wire_v3)
+        if (type(binding) is not D04NumericBindingV3 or binding.authority_namespace!=namespace
+                or binding.authority_id!=grant.authority_id or binding.installation_id!=grant.installation_id
+                or (grant.authority_id,grant.subject,grant.channel_binding_sha256)!=(
+                    handshake.installation_authority_id,handshake.installation_identity_ref,handshake.channel_binding_sha256)):
+            raise RuntimeError("numeric bridge actual paired installation differs")
+        if method=="d04_numeric_restore_original_v3":
+            if any(value is not None for value in (claim,gate,outcome,measurement,action)):
+                raise ValueError("numeric restoration accepts its binding only")
+            from ..authority_service.d04_numeric_restore_stream_v3 import read_numeric_restore_stream_v3
+            return await read_numeric_restore_stream_v3(self,request,handshake,namespace=namespace,binding=binding,installation_grant=grant)
+        command={"namespace":namespace,"binding":to_wire(binding)}
+        if method=="d04_numeric_accounting_v3":
+            from ..authority_service.d04_numeric_accounting_v3 import numeric_accounting_to_wire_v3
+            if action not in {"begin","validate","finish","recover_finish"} or any(value is not None for value in (claim,measurement,outcome)):
+                raise ValueError("numeric accounting action/original inputs differ")
+            command.update(action=action,gate=None if gate is None else numeric_accounting_to_wire_v3(gate))
+            field="accounting_gate" if action=="begin" else "ok"
+        elif method in {"d04_numeric_cost_only_v3","d04_numeric_cost_inspect_v3"}:
+            if gate is not None or outcome is not None:raise ValueError("numeric cost closure accepts no gate/outcome")
+            if method=="d04_numeric_cost_only_v3":command.update(claim=to_wire(claim),measurement=to_wire(measurement))
+            elif claim is not None or measurement is not None:raise ValueError("numeric cost inspection accepts identity only")
+            field="cost_closure"
+        elif method=="d04_numeric_original_append_v3":
+            if gate is not None or outcome is not None:raise ValueError("technical original accepts actual claim only")
+            command["claim"]=to_wire(claim);field="gate"
+        elif method in {"d04_numeric_adoption_bridge_v3","d04_numeric_restore_original_v3"}:
+            if any(value is not None for value in (claim,gate,outcome)):raise ValueError("numeric bridge/restore accepts identity only")
+            field="restore_original" if method=="d04_numeric_restore_original_v3" else "gate"
+        elif method in {"d04_numeric_validate_gate_v3","d04_numeric_finish_adoption_v3","d04_numeric_gate_status_v3"}:
+            if claim is not None:raise ValueError("numeric gate operation does not issue claims")
+            command["gate"]=numeric_bridge_to_wire_v3(gate)
+            if method=="d04_numeric_finish_adoption_v3":command["outcome"]=outcome;field="finished"
+            else:
+                if outcome is not None:raise ValueError("numeric validation has no outcome")
+                field="state" if method=="d04_numeric_gate_status_v3" else "gate"
+        else:raise ValueError("unknown numeric bridge RPC")
+        response=await self._content_rpc(request,handshake,method,command,protocol=AUTHORITY_V2_PROTOCOL)
+        response_field="gate" if field=="accounting_gate" else field
+        if (type(response) is not dict or set(response)!={response_field,"channel_binding_sha256"}
+                or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+            raise RuntimeError("numeric bridge response channel/fields differ")
+        if field=="accounting_gate":
+            from ..authority_service.d04_numeric_accounting_v3 import numeric_accounting_from_wire_v3
+            result=numeric_accounting_from_wire_v3(response["gate"])
+            if result.binding!=binding or result.permit.holder!=grant.administrator_holder:
+                raise RuntimeError("numeric accounting grant installation differs")
+            return result
+        if field=="ok":
+            if response[field] is not True:raise RuntimeError("numeric accounting original did not complete")
+            return True
+        if field=="state":
+            if response[field] not in {"active","finished"}:raise RuntimeError("numeric gate original state differs")
+            return response[field]
+        if field=="cost_closure":
+            raw=response[field]
+            if raw is None:
+                if method!="d04_numeric_cost_inspect_v3":raise RuntimeError("numeric cost closure is not durable")
+                return None
+            result=from_wire(raw,D04NumericMeasuredCostClosureV3)
+            if result.binding!=binding:raise RuntimeError("numeric cost closure binding differs")
+            return result
+        if field=="finished":
+            if response[field] is not True:raise RuntimeError("original numeric gate finish unresolved")
+            return None
+        if field=="restore_original":
+            result=numeric_restore_from_wire_v3(response[field])
+            if result.terminal.binding!=binding or result.prepared.binding!=binding:raise RuntimeError("restored numeric binding differs")
+            return result
+        raw=response[field]
+        kind={"d04.numeric-original-append.v3":D04NumericOriginalAppendV3,
+            "d04.numeric-adoption-bridge.v3":D04NumericAdoptionBridgeV3}.get(raw.get("schema") if type(raw) is dict else None)
+        result=numeric_bridge_from_wire_v3(raw,kind)
+        if (result.binding!=binding or result.permit.holder!=grant.administrator_holder
+                or result.permit.generation!=binding.activation_generation):
+            raise RuntimeError("numeric gate current installation differs")
+        if method=="d04_numeric_validate_gate_v3" and result!=gate:raise RuntimeError("numeric gate validation changed original")
+        return result
+
+    async def d04_series_v1(self, request, handshake, grant, **values):
+        from .d04_series_transport_v1 import transport_d04_series_v1
+        return await transport_d04_series_v1(self, request, handshake, grant, **values)
+
+    async def d10_contact_policy_v1(self, request, handshake, grant, **values):
+        from .d10_contact_policy_transport_v1 import transport_d10_contact_policy_v1
+        return await transport_d10_contact_policy_v1(self, request, handshake, grant, **values)
+
+    async def d04_numeric_v3(self, request, handshake, grant, *, namespace,
+                             binding, method, executor_incarnation=None,
+                             claim=None, measurement=None):
+        from ..authority_service.d04_numeric_contract_v3 import (
+            D04NumericBindingV3, D04NumericClaimV3, D04NumericTerminalV3,
+            from_wire as numeric_from_wire, to_wire as numeric_to_wire,
+        )
+        if (type(binding) is not D04NumericBindingV3
+                or binding.authority_namespace != namespace
+                or binding.authority_id != grant.authority_id
+                or binding.installation_id != grant.installation_id
+                or (grant.authority_id, grant.subject, grant.channel_binding_sha256) !=
+                   (handshake.installation_authority_id, handshake.installation_identity_ref,
+                    handshake.channel_binding_sha256)):
+            raise RuntimeError("D04 numeric paired installation differs")
+        command = {"namespace": namespace, "binding": numeric_to_wire(binding)}
+        if method == "d04_numeric_claim_v3":
+            if claim is not None or measurement is not None:
+                raise ValueError("D04 numeric claim accepts no measured result")
+            command["executor_incarnation"] = executor_incarnation
+            fields = {"claim"}
+        elif method == "d04_numeric_terminal_v3":
+            if executor_incarnation is not None:
+                raise ValueError("D04 numeric terminal cannot create an executor identity")
+            command.update(claim=numeric_to_wire(claim), measurement=numeric_to_wire(measurement))
+            fields = {"terminal"}
+        elif method == "d04_numeric_inspect_v3":
+            if any(v is not None for v in (executor_incarnation, claim, measurement)):
+                raise ValueError("D04 numeric inspection accepts identity only")
+            fields = {"claim", "terminal"}
+        else:
+            raise ValueError("unknown D04 numeric RPC")
+        response = await self._content_rpc(request, handshake, method, command,
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != fields | {"channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("D04 numeric Authority channel response differs")
+        result = {}
+        for name in fields:
+            raw = response[name]
+            value = None if raw is None else numeric_from_wire(raw,
+                D04NumericClaimV3 if name == "claim" else D04NumericTerminalV3)
+            if value is not None and ((name == "claim" and value.binding_digest != binding.digest)
+                    or (name == "terminal" and value.binding != binding)):
+                raise RuntimeError("D04 numeric Authority original binding differs")
+            result[name] = value
+        if method == "d04_numeric_inspect_v3":
+            if result["terminal"] is not None and result["terminal"].claim != result["claim"]:
+                raise RuntimeError("D04 numeric inspection originals disagree")
+            return result["claim"], result["terminal"]
+        original = result[next(iter(fields))]
+        if original is None:
+            raise RuntimeError("D04 numeric append returned no original")
+        return original
+
+    async def c04_terminal_verify_v1(
+        self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
+        grant: InstallationGrantV2, *, namespace: str,
+        proof: InternalWorkTerminalProofV1,
+    ) -> AuthorityInternalWorkVerifiedReceiptV1:
+        if (type(proof) is not InternalWorkTerminalProofV1
+                or proof.binding.namespace != namespace
+                or (grant.authority_id, grant.subject,
+                    grant.channel_binding_sha256) !=
+                   (handshake.installation_authority_id,
+                    handshake.installation_identity_ref,
+                    handshake.channel_binding_sha256)):
+            raise RuntimeError("installed C04 terminal identity differs")
+        response = await self._content_rpc(
+            request, handshake, "c04_terminal_verify_v1",
+            {"namespace": namespace, "proof": c04_to_wire(proof)},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict
+                or set(response) != {"verified", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("C04 terminal channel response differs")
+        verified = c04_from_wire(
+            response["verified"], AuthorityInternalWorkVerifiedReceiptV1)
+        if (verified.namespace != namespace
+                or verified.proof_digest != runtime_canonical_digest(proof)
+                or (verified.activity_id, verified.operation_id,
+                    verified.execution_id, verified.input_digest,
+                    verified.resource_quote_ref,
+                    verified.resource_quote_version,
+                    verified.resource_quote_digest,
+                    verified.terminal_receipt_ref,
+                    verified.terminal_receipt_digest) !=
+                   (proof.binding.activity_id, proof.binding.operation_id,
+                    proof.binding.execution_id, proof.binding.input_digest,
+                    proof.binding.resource_quote_ref,
+                    proof.binding.resource_quote_version,
+                    proof.binding.resource_quote_digest,
+                    proof.terminal_receipt_ref,
+                    proof.terminal_receipt_digest)):
+            raise RuntimeError("C04 terminal original identity differs")
+        return verified
+
     async def v2_get_current_owner_guard_for_fence(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         *, namespace: str, permit: FencePermitV2,
@@ -2447,4 +3625,6 @@ class MtlsAuthorityTransport:
             raise RuntimeError("authority v2 finish response is invalid")
 
 
-__all__ = ("AuthorityTlsProfile", "MtlsAuthorityTransport")
+__all__ = ("AuthorityTlsProfile", "MtlsAuthorityTransport",
+           "V2OwnerAuthorizationBarrier",
+           "V2PlatformObservationVerifierUnavailable")

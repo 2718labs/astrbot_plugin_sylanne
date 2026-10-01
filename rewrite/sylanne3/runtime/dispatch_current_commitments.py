@@ -22,7 +22,9 @@ from ..runtime_contracts import (
     CheckReceipt, NamespaceId, QueryEpoch, VersionedRef, canonical_digest,
 )
 from .d11_types import job_graph_write
-from .dispatch_action_job_binding import load_action_job_binding
+from .dispatch_action_job_binding import (
+    _is_post_c02_reply_waiting_job, load_action_job_binding,
+)
 from .dispatch_admission import load_admission
 from .jobs import JobConflict, PersistentJob, get_job
 from .dispatch_source_correction_barrier import read_source_correction_barrier
@@ -746,7 +748,9 @@ def read_current_d08_action_conflict_evidence(
                 (projected.key.token, *namespace.as_tuple),
             ).fetchone()
             if (binding.job_id != job.job_id
-                    or job.work_kind != "dispatch"
+                    or not (job.work_kind == "dispatch"
+                            or _is_post_c02_reply_waiting_job(
+                                job, intent, admission.admission))
                     or job.budget_ref != admission.admission.budget_lease_ref
                     or job.fence < binding.job_fence
                     or job.cancel_epoch < binding.job_cancel_epoch):

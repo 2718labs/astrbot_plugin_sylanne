@@ -1,6 +1,7 @@
 """Product Owner composition binds current installer pairing to first issue."""
 
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,7 @@ from rewrite.tests.alpha1.authority.test_owner_identity_sqlite import (
 )
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.mtls_server import AdministratorInstallationV2
+from sylanne3.authority_service.reverse_handoff import ReverseGraphClaimClient
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
 from sylanne3.authority_service.v2_fence_service import AuthorityV2FenceService
@@ -96,7 +98,19 @@ def test_product_composition_rechecks_creation_pairing_after_pending(tmp_path):
         another_source = AuthorityOwnerPairingSource(core, utc_clock=lambda: NOW)
         with pytest.raises(AuthorityUnavailable, match="current installation pairing"):
             compose_owner_deployment(identity=another_source, **options)
-        server = compose_owner_deployment(identity=source, **options)
+        client = object.__new__(ReverseGraphClaimClient)
+        client.profile = SimpleNamespace(
+            namespace=AUTH_NS, profile_id="installed", installation_id="installation")
+        with pytest.raises(TypeError, match="graph claim issuers"):
+            compose_owner_deployment(
+                identity=source, v2_final_handoff_reverse={AUTH_NS: client},
+                **options)
+        server = compose_owner_deployment(
+            identity=source, v2_final_handoff_reverse={AUTH_NS: client},
+            v2_final_handoff_issuers={AUTH_NS: "graph-issuer"}, **options)
+        bridge = server._v2_execution[AUTH_NS]
+        assert bridge._final_handoff_authorizer.__self__ is client
+        assert bridge._final_handoff_issuer_id == "graph-issuer"
         assert server._v2_owner_proofs._current_pairing_source is source
         assert server._v2_owner_tickets._creation_pairing_source is source
         assert server._v2_owner_sessions._current_pairing_source is source

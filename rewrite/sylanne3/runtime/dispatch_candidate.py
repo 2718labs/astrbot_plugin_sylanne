@@ -7,6 +7,9 @@ from dataclasses import asdict, dataclass, replace
 from ..domains.d06 import D06DomainProvider, SourceGrantRead
 from ..domains.d08 import ActionIntent, ActionSchema, ActionSchemaRecord, GoalExecutionProvider
 from ..domains.d09 import ClaimUse, D09ExpressionProvider
+from ..domains.d09.natural_batch import (
+    NATURAL_BATCH_SCHEMA_V2, validate_natural_verified_batch_value_v2,
+)
 from ..graph_types import GraphWrite
 from ..memory_types import access_key, source_key
 from ..graph_types import AtomKey, GraphSnapshot, GraphVersion
@@ -28,6 +31,19 @@ def dispatch_segment_payload_ref(batch_ref: str, index: int) -> str:
     if type(index) is not int or index < 0:
         raise ValueError("segment index must be a nonnegative exact integer")
     return "d09:" + canonical_digest({
+        "batch_ref": batch_ref, "segment_index": index,
+    })
+
+
+def natural_dispatch_segment_payload_ref_v2(batch_ref: str, index: int) -> str:
+    """Name a natural V2 segment without changing existing V1 payload IDs."""
+    if (type(batch_ref) is not str
+            or AtomKey.from_token(batch_ref).type_name != NATURAL_BATCH_SCHEMA_V2):
+        raise ValueError("payload reference requires a natural V2 batch atom")
+    if type(index) is not int or index < 0:
+        raise ValueError("segment index must be a nonnegative exact integer")
+    return "d09-natural:" + canonical_digest({
+        "schema": NATURAL_BATCH_SCHEMA_V2,
         "batch_ref": batch_ref, "segment_index": index,
     })
 
@@ -71,6 +87,46 @@ class DispatchCandidateRecoveryV1:
 
 
 @dataclass(frozen=True)
+class NaturalDispatchCandidateEvidenceV2:
+    """Typed same-bundle identity for a reviewed natural segment, not admission."""
+
+    operation_id: str
+    effect_id: str
+    action_ref: str
+    schema_ref: str
+    grant_ref: str
+    batch_ref: str
+    action_digest: str
+    schema_digest: str
+    grant_digest: str
+    batch_digest: str
+    segment_id: str
+    payload_digest: str
+    paid_review_digest: str
+    generation_original_operation_id: str
+    review_original_operation_id: str
+    source_refs: tuple[str, ...]
+    current_read_versions: tuple[GraphVersion, ...]
+    access_epoch: int
+    delete_epoch: int
+    query_epoch: int
+    status: str = "natural_paid_review_current_hold"
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(asdict(self))
+
+
+@dataclass(frozen=True)
+class NaturalDispatchCandidateRecoveryV2:
+    evidence: NaturalDispatchCandidateEvidenceV2
+    write_versions: tuple[tuple[str, int], ...]
+    graph_epoch: int
+    graph_incarnation: str | None
+    graph_revision: int | None
+
+
+@dataclass(frozen=True)
 class GraphDispatchTextSegmentV1:
     """One committed D09 text segment with a proven AstrBot route."""
 
@@ -90,8 +146,20 @@ def validate_dispatch_candidate_writes(
     namespace: NamespaceId, identity: OperationIdentity,
     read_versions: tuple[GraphVersion, ...], source_refs: tuple[str, ...],
     access_epoch: int, delete_epoch: int, query_epoch: int,
-) -> DispatchCandidateEvidenceV1 | None:
+) -> DispatchCandidateEvidenceV1 | NaturalDispatchCandidateEvidenceV2 | None:
     """Require a single exact D08/D09 candidate in the same bundle transaction."""
+    natural_writes = tuple((domain, write) for domain, write in writes
+                           if write.key.type_name == NATURAL_BATCH_SCHEMA_V2)
+    if natural_writes:
+        if len(natural_writes) != 1 or any(
+                write.key.type_name == "d09.verified_segment_batch.v1"
+                for _, write in writes):
+            raise ValueError("natural and source reply batches cannot share a bundle")
+        return validate_natural_dispatch_candidate_writes(
+            writes, namespace=namespace, identity=identity,
+            read_versions=read_versions, source_refs=source_refs,
+            access_epoch=access_epoch, delete_epoch=delete_epoch,
+            query_epoch=query_epoch)
     selected: dict[str, GraphWrite] = {}
     for domain, write in writes:
         expected = _LINKED_TYPES.get(write.key.type_name)
@@ -196,6 +264,112 @@ def validate_dispatch_candidate_writes(
     )
 
 
+def validate_natural_dispatch_candidate_writes(
+    writes: tuple[tuple[str, GraphWrite], ...], *,
+    namespace: NamespaceId, identity: OperationIdentity,
+    read_versions: tuple[GraphVersion, ...], source_refs: tuple[str, ...],
+    access_epoch: int, delete_epoch: int, query_epoch: int,
+) -> NaturalDispatchCandidateEvidenceV2:
+    """Bind D08 and natural D09 graph writes without granting dispatch."""
+    names = {"d08.action_intent.v1", "d08.action_schema.v1",
+             "d08.communication_intent_grant.v1", NATURAL_BATCH_SCHEMA_V2}
+    selected: dict[str, GraphWrite] = {}
+    for domain, write in writes:
+        name = write.key.type_name
+        if name not in names:
+            continue
+        if (name in selected or domain != ("d09" if name == NATURAL_BATCH_SCHEMA_V2
+                                             else "d08")
+                or (write.key.owner.bot, write.key.owner.persona)
+                   != namespace.as_tuple
+                or write.key.owner.kind != "activity"
+                or write.key.owner.subject != identity.activity_id):
+            raise ValueError("natural dispatch graph owner or writer differs")
+        selected[name] = write
+    if set(selected) != names:
+        raise ValueError("natural batch requires paired D08 action, schema and grant")
+    if (type(access_epoch) is not int or access_epoch < 0
+            or type(delete_epoch) is not int or delete_epoch < 0
+            or type(query_epoch) is not int or query_epoch < 0):
+        raise ValueError("natural dispatch requires current graph barriers")
+    d08 = {spec.name: spec for spec in GoalExecutionProvider().register_types()}
+    action_write = selected["d08.action_intent.v1"]
+    schema_write = selected["d08.action_schema.v1"]
+    grant_write = selected["d08.communication_intent_grant.v1"]
+    batch_write = selected[NATURAL_BATCH_SCHEMA_V2]
+    action = d08[action_write.key.type_name].validator(action_write.value)
+    schema = d08[schema_write.key.type_name].validator(schema_write.value)
+    grant = d08[grant_write.key.type_name].validator(grant_write.value)
+    validate_natural_verified_batch_value_v2(batch_write.value)
+    batch = batch_write.value
+    paid = batch["paid_review"]
+    segment = batch["segment"]
+    if (type(schema) is not ActionSchemaRecord
+            or ActionSchemaRecord.bind(action, ActionSchema(
+                schema.schema_id, schema.action_kind, schema.proactive,
+                schema.required_checks)) != schema
+            or action.identity != identity
+            or action_write.key.name != action.action_id
+            or schema_write.key.name != schema.schema_ref
+            or grant_write.key.name != grant.grant_id
+            or batch_write.key.name != batch["batch_id"]
+            or grant.action_id != action.action_id
+            or grant.intent_revision != action.revision
+            or grant.target_ref != action.target_ref
+            or grant.purpose != "expression"
+            or grant.route_binding_digest != batch["route_binding_digest"]
+            or batch["activity_id"] != identity.activity_id
+            or batch["operation_id"] != identity.operation_id
+            or batch["effect_id"] != identity.effect_id
+            or batch["grant_id"] != grant.grant_id
+            or batch["grant_digest"] != canonical_digest(grant)
+            or batch["action_id"] != action.action_id
+            or batch["intent_ref"] != grant.intent_ref
+            or batch["segment_authorization_ref"]
+               != grant.segment_authorization_ref(segment["segment_id"])
+            or batch["required_check_refs"] != list(grant.required_check_refs)
+            or grant.audiences != (batch["audience_id"],)
+            or len(grant.segment_grants) != 1
+            or (grant.segment_grants[0].segment_id,
+                grant.segment_grants[0].effect_id,
+                grant.segment_grants[0].payload_digest)
+               != (segment["segment_id"], identity.effect_id,
+                   segment["payload_digest"])):
+        raise ValueError("natural D08/D09 action or segment identity differs")
+    reads = {item.key.token: item.revision for item in read_versions}
+    if (len(reads) != len(read_versions)
+            or tuple(source_refs) != tuple(action.source_refs)
+            or batch["source_ref"]["ref"] not in source_refs):
+        raise ValueError("natural source qualification differs")
+    for ref in source_refs:
+        key = AtomKey.from_token(ref)
+        if key != source_key(*namespace.as_tuple, key.owner.subject or ""):
+            raise ValueError("natural source is not a canonical D06 graph source")
+    if reads.get(batch["source_ref"]["ref"]) != batch["source_ref"]["version"]:
+        raise ValueError("natural triggering source version differs")
+    current = tuple(GraphVersion(AtomKey.from_token(item["ref"]),
+                                 item["version"])
+                    for item in batch["current_reads"])
+    if (len({item.key for item in current}) != len(current)
+            or any(reads.get(item.key.token) != item.revision for item in current)
+            or any(reads.get(ref, 0) < 1 or reads.get(access_key(
+                *namespace.as_tuple,
+                AtomKey.from_token(ref).owner.subject or "").token, 0) < 1
+                   for ref in source_refs)):
+        raise ValueError("natural current source or paid read closure differs")
+    return NaturalDispatchCandidateEvidenceV2(
+        identity.operation_id, identity.effect_id,
+        action_write.key.token, schema_write.key.token,
+        grant_write.key.token, batch_write.key.token,
+        canonical_digest(action), canonical_digest(schema),
+        canonical_digest(grant), batch["batch_digest"],
+        segment["segment_id"], segment["payload_digest"],
+        paid["receipt_digest"],
+        paid["generation_original_operation_id"],
+        paid["review_original_operation_id"], tuple(source_refs), current,
+        access_epoch, delete_epoch, query_epoch)
+
+
 def qualify_dispatch_candidate_sources(
     candidate: DispatchCandidateEvidenceV1, intent: ActionIntent,
     snapshot: GraphSnapshot, *, audience: tuple[str, ...],
@@ -240,6 +414,9 @@ def qualify_dispatch_candidate_sources(
 
 __all__ = [
     "DispatchCandidateEvidenceV1", "DispatchCandidateRecoveryV1",
+    "NaturalDispatchCandidateEvidenceV2", "NaturalDispatchCandidateRecoveryV2",
     "GraphDispatchTextSegmentV1", "dispatch_segment_payload_ref",
+    "natural_dispatch_segment_payload_ref_v2",
     "qualify_dispatch_candidate_sources", "validate_dispatch_candidate_writes",
+    "validate_natural_dispatch_candidate_writes",
 ]

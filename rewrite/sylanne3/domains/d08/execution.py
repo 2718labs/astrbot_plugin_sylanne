@@ -12,9 +12,11 @@ import json
 import math
 
 from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeSpec
+from ...memory_types import source_key
 from ...runtime_contracts import (
     CheckReceipt,
     DomainProposal,
+    NamespaceId,
     OperationIdentity,
     ProviderDescriptor,
     RUNTIME_SCHEMA,
@@ -701,6 +703,7 @@ class CommunicationIntentGrant:
     valid_until: float
     cancellation_epoch: int
     contact_policy_check_ref: str | None = None
+    route_binding_digest: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.grant_id, "grant_id", "communication-grant:")
@@ -736,6 +739,8 @@ class CommunicationIntentGrant:
             _text(self.contact_policy_check_ref, "contact_policy_check_ref", "check:")
             if self.contact_policy_check_ref not in checks:
                 raise ValueError("contact policy check must be part of required_check_refs")
+        if self.route_binding_digest is not None:
+            _sha256(self.route_binding_digest, "route_binding_digest")
         for item in segments:
             if item.required_check_refs != checks:
                 raise ValueError("every segment must revalidate the complete required-check set")
@@ -996,6 +1001,87 @@ class RequiredCheckRegistry:
             raise ValueError("only a qualified message action can produce a communication grant")
         if intent.target_ref not in request.audiences:
             raise ValueError("communication audiences must include the qualified action target")
+        return self._freeze_communication_grant_checked(
+            intent, decision, request, route_binding_digest=None,
+        )
+
+    def freeze_communication_grant_v2(
+        self,
+        intent: ActionIntent,
+        decision: QualificationDecision,
+        request: CommunicationGrantRequest,
+        *,
+        route_binding: object,
+        db: object,
+        snapshot: GraphSnapshot,
+        scope: object,
+        now: float,
+    ) -> CommunicationIntentGrant:
+        """Freeze an entity-targeted private reply using W01's current route join.
+
+        W01 must call this in the held E+1 graph transaction and reissue the
+        identical binding against the final SQL rows before admission.
+        """
+        from .communication_route_binding import validate_communication_route_binding_v2
+
+        if not isinstance(intent, ActionIntent) or not isinstance(decision, QualificationDecision):
+            raise TypeError("a qualified action decision is required")
+        if not isinstance(request, CommunicationGrantRequest):
+            raise TypeError("request must be CommunicationGrantRequest")
+        timestamp = _time(now, "now")
+        if (decision.action_id != intent.action_id
+                or decision.schema_id != intent.schema_id
+                or not self.is_current(decision, now=timestamp)
+                or intent.action_kind != "message" or intent.purpose != "expression"):
+            raise ValueError("communication grant requires the current qualified action decision")
+        binding_digest = validate_communication_route_binding_v2(
+            route_binding, intent, request.audiences, db=db, snapshot=snapshot,
+            scope=scope, now=timestamp,
+        )
+        return self._freeze_communication_grant_checked(
+            intent, decision, request, route_binding_digest=binding_digest,
+        )
+
+    def freeze_contact_communication_grant_v1(
+        self, intent: ActionIntent, decision: QualificationDecision,
+        request: CommunicationGrantRequest, *, route_binding: object,
+        db: object, read: object, scope: object, now: float,
+    ) -> CommunicationIntentGrant:
+        """Freeze the complete proactive manifest on the actual held graph read."""
+        from ...runtime.contact_route_binding_v1 import (
+            CurrentContactRouteBindingV1, contact_route_semantic_digest_v1,
+            read_current_contact_route_binding_v1,
+        )
+        timestamp = _time(now, "now")
+        if (not isinstance(intent, ActionIntent) or not isinstance(decision, QualificationDecision)
+                or not isinstance(request, CommunicationGrantRequest)
+                or type(route_binding) is not CurrentContactRouteBindingV1):
+            raise TypeError("contact grant requires a qualified action and actual current route")
+        schema = self._schemas[intent.schema_id]
+        frame = read.frame
+        if (not db.in_transaction or scope.operation != "write"
+                or scope.namespace != route_binding.namespace
+                or frame.envelope.authority.namespace != route_binding.namespace
+                or frame.envelope.authority.purpose != "expression"
+                or frame.envelope.authority.audience != request.audiences
+                or decision.action_id != intent.action_id or decision.schema_id != intent.schema_id
+                or not self.is_current(decision, now=timestamp)
+                or not schema.proactive or intent.action_kind != "message" or intent.purpose != "expression"
+                or intent.target_ref != route_binding.target_entity_ref
+                or request.audiences != (route_binding.conversation_ref,)):
+            raise ValueError("contact grant requires the current six checks and held target route")
+        actual = read_current_contact_route_binding_v1(db, read,
+            account_ref=route_binding.account_version.key.token,
+            target_entity_ref=intent.target_ref, audience=route_binding.conversation_ref)
+        if actual != route_binding:
+            raise ValueError("contact route changed before whole-manifest grant freeze")
+        return self._freeze_communication_grant_checked(intent, decision, request,
+            route_binding_digest=contact_route_semantic_digest_v1(actual))
+
+    def _freeze_communication_grant_checked(
+        self, intent: ActionIntent, decision: QualificationDecision,
+        request: CommunicationGrantRequest, *, route_binding_digest: str | None,
+    ) -> CommunicationIntentGrant:
         assert decision.valid_until is not None  # guaranteed by is_current
         check_refs = tuple(
             "check:" + canonical_digest({
@@ -1035,6 +1121,8 @@ class RequiredCheckRegistry:
             "decision": decision,
             "request": request,
         }
+        if route_binding_digest is not None:
+            identity["route_binding_digest"] = route_binding_digest
         grant_id = f"communication-grant:{canonical_digest(identity)}"
         return CommunicationIntentGrant(
             grant_id,
@@ -1056,6 +1144,7 @@ class RequiredCheckRegistry:
             decision.valid_until,
             request.cancellation_epoch,
             contact_policy_ref,
+            route_binding_digest,
         )
 
 
@@ -1267,6 +1356,12 @@ def _decode(type_name: str, payload: dict) -> object:
         return _decode_action_schema(payload)
     if type_name == "d08.communication_intent_grant.v1":
         return _decode_communication_grant(payload)
+    if type_name == "d08.contact_expression_plan.v1":
+        from .contact_plan_v1 import decode_contact_plan_v1
+        return decode_contact_plan_v1(payload)
+    if type_name == "d08.natural_expression_plan.v2":
+        from .natural_plan import decode_natural_plan_v2
+        return decode_natural_plan_v2(payload)
     if type_name == "d08.action_outcome.v1":
         return ActionOutcome(**_tuple_fields(payload, "observation_refs", "completed_effects", "unknown_effects"))
     if type_name == "d08.decision_record.v1":
@@ -1288,6 +1383,8 @@ class GoalExecutionProvider:
         "d08.action_cancellation.v1": ("activity",),
         "d08.action_schema.v1": ("activity",),
         "d08.communication_intent_grant.v1": ("activity",),
+        "d08.natural_expression_plan.v2": ("activity",),
+        "d08.contact_expression_plan.v1": ("activity",),
         "d08.action_outcome.v1": ("activity",),
         "d08.decision_record.v1": ("activity",),
     }
@@ -1323,10 +1420,17 @@ class GoalExecutionProvider:
                 immutable=type_name in {
                     "d08.action_outcome.v1", "d08.decision_record.v1",
                     "d08.communication_intent_grant.v1", "d08.action_schema.v1",
+                    "d08.natural_expression_plan.v2",
+                    "d08.contact_expression_plan.v1",
                 },
-                schema_version=1,
+                schema_version=2 if type_name == "d08.natural_expression_plan.v2" else 1,
                 writer_domain="d08",
-                schema_hash=schema_hash({"type": type_name, "version": 1}),
+                schema_hash=schema_hash({
+                    "type": type_name,
+                    "version": 2 if type_name == "d08.natural_expression_plan.v2" else 1,
+                    **({"contract": "preparation-c02-source-focus-route-budget-v2"}
+                       if type_name == "d08.natural_expression_plan.v2" else {}),
+                }),
             ))
         return tuple(specs)
 
@@ -1346,6 +1450,16 @@ class GoalExecutionProvider:
             if write.key.owner.kind not in spec.owner_kinds:
                 raise ValueError("D08 graph type does not support this owner")
             spec.validator(write.value)
+            if (write.key.type_name == "d08.commitment.v1"
+                    and write.value.get("establishment_state") == "acknowledged"):
+                raise ValueError(
+                    "acknowledged commitment requires the coordinator's "
+                    "privileged bilateral evidence transition"
+                )
+            if write.key.type_name == "d08.natural_expression_plan.v2":
+                raise ValueError(
+                    "natural plan adoption requires coordinator current-read CAS"
+                )
         action_writes = tuple(item for item in proposal.typed_writes
                               if item.key.type_name == "d08.action_intent.v1")
         schema_writes = tuple(item for item in proposal.typed_writes
@@ -1462,6 +1576,49 @@ class GoalExecutionProvider:
         write = GraphWrite(key, json.loads(canonical_serialize(asdict(value))))
         return self.validate(replace(proposal, typed_writes=proposal.typed_writes + (write,)), snapshot)
 
+    def prepare_goal_candidate(
+        self, proposal: DomainProposal, goal: Goal, *, source_ref: str,
+    ) -> DomainProposal:
+        """Stage a source-bound goal adoption; the graph must still admit it.
+
+        This is a candidate writer, not evidence that an action is qualified or
+        that the goal has been satisfied. The caller must obtain the source and
+        its current read guard through the installed graph/Authority path.
+        """
+        if type(proposal) is not DomainProposal or type(goal) is not Goal:
+            raise TypeError("typed D08 proposal and goal required")
+        if goal.revision != 1 or goal.state != "active":
+            raise ValueError("new goal adoption must begin active at revision one")
+        source = AtomKey.from_token(source_ref)
+        namespace = proposal.envelope.authority.namespace
+        reads = {item.key: item.revision
+                 for item in proposal.envelope.version_guard.read_versions}
+        if source != source_key(
+            source.owner.bot, source.owner.persona, source.owner.subject or ""):
+            raise ValueError("goal adoption requires a D06 source")
+        # The D06 event-owned source is read-only input here.  Owner scope
+        # authorizes D08's activity-owned writes, not cross-domain reads.
+        if ((source.owner.bot, source.owner.persona) != namespace.as_tuple
+                or source_ref not in goal.reason_refs
+                or source_ref not in proposal.envelope.source_qualification.source_refs
+                or source_ref not in proposal.envelope.input_refs
+                or reads.get(source, 0) < 1):
+            raise ValueError("goal source is not bound to the current D06 read")
+        owner = Owner("activity", *namespace.as_tuple,
+                      proposal.envelope.identity.activity_id)
+        key = AtomKey(owner, "d08.goal.v1", goal.goal_id)
+        if (reads.get(key, 0) != 0
+                or any(write.key == key for write in proposal.typed_writes)):
+            raise ValueError("new goal requires an absent graph head")
+        extra = () if key in reads else (GraphVersion(key, 0),)
+        envelope = replace(proposal.envelope, version_guard=replace(
+            proposal.envelope.version_guard,
+            read_versions=proposal.envelope.version_guard.read_versions + extra))
+        write = GraphWrite(key, json.loads(canonical_serialize(asdict(goal))))
+        return self.validate(replace(
+            proposal, envelope=envelope,
+            typed_writes=proposal.typed_writes + (write,)))
+
     def prepare_action_candidate(
         self, proposal: DomainProposal, intent: ActionIntent, schema: ActionSchema,
     ) -> DomainProposal:
@@ -1505,6 +1662,35 @@ class GoalExecutionProvider:
         envelope = replace(proposal.envelope, version_guard=replace(
             guard, read_versions=guard.read_versions + extra))
         return self.validate(replace(proposal, envelope=envelope, typed_writes=writes))
+
+    @staticmethod
+    def verify_paid_claim_source_scope_v2(
+        intent: ActionIntent, claim_source_refs: tuple[str, ...],
+        source_reads: tuple[GraphVersion, ...], *, namespace: NamespaceId,
+        current_read_confirmed: bool,
+    ) -> None:
+        """Require every paid claim source in the action and current D06 read set.
+
+        The coordinator must provide the authoritative current graph read and
+        still run D06 access/correction checks before D11 final admission.
+        """
+        if type(intent) is not ActionIntent or type(claim_source_refs) is not tuple:
+            raise TypeError("typed action and claim source closure required")
+        if not current_read_confirmed or not claim_source_refs or len(set(claim_source_refs)) != len(claim_source_refs):
+            raise ValueError("current complete claim source read required")
+        if set(claim_source_refs) != set(intent.source_refs):
+            raise ValueError("paid claim sources differ from action sources")
+        reads = {row.key.token: row.revision for row in source_reads}
+        if len(reads) != len(source_reads):
+            raise ValueError("duplicate source read")
+        if type(namespace) is not NamespaceId:
+            raise TypeError("typed namespace required")
+        for ref in claim_source_refs:
+            key = AtomKey.from_token(ref)
+            if (key.type_name != "memory.source" or key.owner.kind != "event"
+                    or (key.owner.bot, key.owner.persona) != namespace.as_tuple
+                    or reads.get(ref, 0) < 1):
+                raise ValueError("paid claim source lacks current D06 head")
 
     def provide_required_check(
         self, intent: ActionIntent, schema: ActionSchema, snapshot: CommitmentConflictSnapshot,

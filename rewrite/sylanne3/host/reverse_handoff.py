@@ -123,6 +123,16 @@ class HostReverseGraphClaimServer:
         self.profile = profile
         self._registration: _Registration | None = None
         self._lock = asyncio.Lock()
+        self._first_owner = None
+
+    def install_first_owner_v1(self, service):
+        from .first_owner_reverse_v1 import InstalledFirstOwnerGraphCommitV1
+        from ..graph_coordinator import namespace_ref
+        if (type(service) is not InstalledFirstOwnerGraphCommitV1 or self._first_owner is not None
+                or namespace_ref(service.namespace) != self.profile.namespace
+                or service.installation.installation_policy.installation_id != self.profile.installation_id):
+            raise TypeError('one actual installed first Owner Host service required')
+        self._first_owner = service
 
     @asynccontextmanager
     async def register(self, *, context: DispatchHandoffContextV1,
@@ -234,8 +244,18 @@ class HostReverseGraphClaimServer:
                                           profile.timeout_seconds)
             if len(line) > profile.max_message_bytes:
                 return
-            receipt = await self._claim(json.loads(line))
-            data = json.dumps({"receipt": to_wire(receipt)}, sort_keys=True,
+            message = json.loads(line)
+            from ..authority_service.first_owner_reverse_v1 import SCHEMA as FIRST_OWNER_SCHEMA
+            if type(message) is dict and message.get('schema') == FIRST_OWNER_SCHEMA:
+                if self._first_owner is None:
+                    raise RuntimeError('first Owner Host service unavailable')
+                from ..authority_service.v2_owner_contract import to_wire as owner_to_wire
+                proof = await self._first_owner.commit(message)
+                result = {'proof': owner_to_wire(proof)}
+            else:
+                receipt = await self._claim(message)
+                result = {'receipt': to_wire(receipt)}
+            data = json.dumps(result, sort_keys=True,
                               separators=(",", ":"), allow_nan=False).encode() + b"\n"
             if len(data) > profile.max_message_bytes:
                 return

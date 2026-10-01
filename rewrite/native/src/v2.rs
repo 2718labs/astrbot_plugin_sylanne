@@ -4,7 +4,7 @@
 //! independent outward-interval verifier accepts its candidate endpoint.
 use crate::interval::{environment_supported, Interval};
 use crate::interval_verifier::{
-    verify_affine_parameter_switch, verify_joint_error_bounds, verify_joint_step,
+    verify_affine_parameter_switch, verify_joint_error_bounds_from_verified_step, verify_joint_step,
     JointVerificationInput, SparseMatrix,
 };
 use std::{
@@ -428,7 +428,7 @@ fn verify_fixed_block(
     };
     let envelope = verify_joint_step(&input).ok()?;
     let inherited_error = Interval::new(0.0, previous_error).ok()?;
-    let errors = verify_joint_error_bounds(&input, inherited_error).ok()?;
+    let errors = verify_joint_error_bounds_from_verified_step(&input, inherited_error, &envelope).ok()?;
     if errors.contraction_upper > 0.8 || errors.endpoint_error.upper() > tolerance {
         return None;
     }
@@ -968,6 +968,63 @@ mod tests {
             offsets: offsets.as_ptr(),
             indices: indices.as_ptr(),
             values: values.as_ptr(),
+        }
+    }
+
+    #[test]
+    fn installed_72d_full_and_loo_cover_eight_second_trajectory() {
+        // Exactly the installed three 24-axis blocks: two Feeling blocks,
+        // one Mood block, 48 complete beta=1/8 cross-block couplings.
+        let n = 72usize;
+        let mut k = vec![vec![0.0f64; n]; n];
+        for i in 0..n { k[i][i] = 1.0; }
+        let mut edge = |i: usize, j: usize| {
+            k[i][i] += 0.125; k[j][j] += 0.125;
+            k[i][j] -= 0.125; k[j][i] -= 0.125;
+        };
+        for block in 0..3 {
+            for mechanism in 0..8 {
+                let i = block * 24 + mechanism * 3;
+                edge(i, i+1); edge(i+1, i+2);
+            }
+        }
+        for axis in 0..24 { edge(axis, 48+axis); edge(24+axis, 48+axis); }
+        let mut offsets = vec![0u32]; let mut indices = Vec::new(); let mut values = Vec::new();
+        for row in &k {
+            for (column, value) in row.iter().enumerate() {
+                if *value != 0.0 { indices.push(column as u32); values.push(*value); }
+            }
+            offsets.push(values.len() as u32);
+        }
+        let diagonal_offsets: Vec<u32> = (0..=n as u32).collect();
+        let diagonal_indices: Vec<u32> = (0..n as u32).collect();
+        let r: Vec<f64> = (0..n).map(|i| [1.0, 0.125, 0.015625][i%3]).collect();
+        let identity = vec![1.0;n]; let zero_offsets = vec![0u32;n+1]; let alpha=vec![0.25;n];
+        for omit_family in [false,true] {
+            let drive: Vec<f64> = (0..n).map(|i| if omit_family {0.0} else {
+                [0.0625,0.03125,0.015625][i%3] * (if i<48 {0.25} else {0.5}) / 8.0
+            }).collect();
+            let mut current=vec![0.5;n]; let mut error=0.0;
+            for _ in 0..512 {
+                let input=StepInput {
+                    struct_size: std::mem::size_of::<StepInput>() as u32, abi_version:2,n:n as u32,
+                    k:csr(n as u32,n as u32,&offsets,&indices,&values),
+                    r:csr(n as u32,n as u32,&diagonal_offsets,&diagonal_indices,&r),
+                    j:csr(n as u32,n as u32,&zero_offsets,&[],&[]),
+                    a:csr(n as u32,n as u32,&diagonal_offsets,&diagonal_indices,&identity),
+                    alpha:alpha.as_ptr(),previous:current.as_ptr(),drive:drive.as_ptr(),iterate:current.as_ptr(),
+                    h:1.0/64.0,previous_error:error,max_iterations:256,tolerance:1e-8,boundary_eta:0.0,
+                };
+                let mut output=vec![0.0;n]; let mut result=StepResult::default();
+                assert_eq!(unsafe{sylanne3_v2_step(&input,output.as_mut_ptr(),n as u32,&mut result)},0);
+                assert_eq!(result.certificate_flags,ABI2_FIXED_BLOCK_INTERVAL_V1);
+                assert!(result.q_upper<=0.8);
+                assert!(result.trajectory_error>=error);
+                current=output;error=result.trajectory_error;
+            }
+            assert!(error>0.0 && error<0.01, "complete inherited error: {error}");
+            assert!(current.iter().all(|v| *v-error>=0.0 && *v+error<=4.0),
+                "full duration must fit the installed readout domain, error={error}");
         }
     }
 

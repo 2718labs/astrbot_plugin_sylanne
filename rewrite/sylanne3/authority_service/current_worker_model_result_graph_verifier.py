@@ -90,11 +90,50 @@ class PinnedCurrentWorkerModelResultGraphVerifier:
                 db.execute("PRAGMA query_only=ON")
                 db.execute("BEGIN")
                 try:
+                    if request.purpose == "d13_precompress_paid":
+                        return self._check_d13_paid(
+                            db, request, intent, permit, float(now))
                     return self._check(db, request, intent, permit, float(now))
                 finally:
                     db.execute("ROLLBACK")
         except Exception:
             return False
+
+    def _check_d13_paid(self, db: sqlite3.Connection,
+                        request: WorkerModelResultReadRequestV1,
+                        intent: ModelEgressIntentV1,
+                        permit: FencePermitV2, now: float) -> bool:
+        from .current_d13_paid_model_graph import read_current_d13_paid_model_graph
+        from .v2_worker_model_result_contract import d13_paid_read_attempt_id_v1
+        current = read_current_d13_paid_model_graph(
+            db, intent, self._issuer, now)
+        binding = current.original.binding
+        anchor = permit.pinned_anchor
+        if (request.namespace != current.original.namespace
+                or request.installation_id != binding.installation_id
+                or request.binding_digest != binding.binding_digest
+                or request.consumer_operation_id !=
+                   "d13-adopt:" + binding.binding_digest
+                or not any(request.read_attempt_id == d13_paid_read_attempt_id_v1(
+                    request.consumer_operation_id, attempt)
+                    for attempt in range(1, 65))
+                or (request.job_id, request.acquire_operation_id,
+                    request.original_operation_id, request.call_id,
+                    request.model_request_digest) != (
+                    binding.job_ref, binding.original_operation_id,
+                    current.original.budget_operation_id, binding.call_id,
+                    current.request.digest)
+                or permit.subject != intent.subject
+                or (anchor.authority_id, anchor.namespace,
+                    anchor.activation_generation, anchor.revocation_epoch,
+                    anchor.deletion_seq, anchor.execution_seq) != (
+                    intent.authority_id, intent.namespace,
+                    intent.authority_activation_generation,
+                    intent.authority_revocation_epoch,
+                    intent.authority_deletion_seq,
+                    intent.authority_execution_seq)):
+            return False
+        return True
 
     def _check(self, db: sqlite3.Connection, request: WorkerModelResultReadRequestV1,
                intent: ModelEgressIntentV1, permit: FencePermitV2,

@@ -28,6 +28,7 @@ from .authority_profile import (
     AdminInstallationBundle, AdminModelWorkflowV2,
 )
 from .ingress import HostIngressEnvelope, IngressReceipt
+from .installation_grant_identity import same_installed_grant_identity_v2
 from .model_egress_executor import HostModelEgressExecutor
 from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 from .terminal_c02_recovery_query import PinnedTerminalC02RecoveryQueryV1
@@ -104,8 +105,10 @@ async def installed_first_ingress_c02_pairing_ready_v1(
             package_root=installation.package_root,
             data_dir=installation.data_dir, transport=transport,
         )
-        return (await client.status_v2()).state == "paired" and (
-            await client.installation_grant_v2()) == installation.installation_grant
+        return ((await client.status_v2()).state == "paired"
+                and same_installed_grant_identity_v2(
+                    installation.installation_grant,
+                    await client.installation_grant_v2()))
     except Exception:
         return False
     finally:
@@ -172,10 +175,12 @@ async def run_installed_first_ingress_c02_v2(
             data_dir=installation.data_dir, transport=transport,
         )
         status = await client.status_v2()
-        if status.state != "paired" or await client.installation_grant_v2() != grant:
+        client_grant = await client.installation_grant_v2()
+        if (status.state != "paired"
+                or not same_installed_grant_identity_v2(grant, client_grant)):
             return None
         executor = HostModelEgressExecutor(
-            authority=client, bundle=bundle, grant=grant, adapter=adapter)
+            authority=client, bundle=bundle, grant=client_grant, adapter=adapter)
         try:
             return await runtime.commit_first_ingress_c02_v2(
                 envelope, receipt, executor=executor,
@@ -230,7 +235,8 @@ async def run_installed_pending_first_ingress_c02_v2(
             provisioning, protocol=AUTHORITY_V2_PROTOCOL)
         grant = await transport.installation_grant_v2(provisioning, handshake)
         if (not handshake.valid_pairing()
-                or grant != installation.installation_grant
+                or not same_installed_grant_identity_v2(
+                    installation.installation_grant, grant)
                 or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
             return None
         pinned_query = PinnedTerminalC02RecoveryQueryV1(
@@ -315,7 +321,8 @@ async def run_installed_committed_first_ingress_c02_cost_v2(
             provisioning, protocol=AUTHORITY_V2_PROTOCOL)
         grant = await transport.installation_grant_v2(provisioning, handshake)
         if (not handshake.valid_pairing()
-                or grant != installation.installation_grant
+                or not same_installed_grant_identity_v2(
+                    installation.installation_grant, grant)
                 or grant.channel_binding_sha256 != handshake.channel_binding_sha256):
             return None
         pinned_query = PinnedTerminalC02RecoveryQueryV1(

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import asyncio
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,12 +13,16 @@ from rewrite.tests.alpha1.runtime.test_authority_v2_fence_service import install
 from sylanne3.authority_service.contract import AuthorityUnavailable
 from sylanne3.authority_service.local_composition import compose_local_owner_authority
 from sylanne3.authority_service.mtls_server import AdministratorInstallationV2, MtlsPeerCredential
+from sylanne3.authority_service.reverse_handoff import ReverseGraphClaimClient
 from sylanne3.authority_service.v2_model_egress_service import AuthorityV2ModelEgressService
 from sylanne3.authority_service.v2_model_egress_store import AuthorityV2ModelEgressStore
 from sylanne3.authority_service.v2_accounting_service import AuthorityV2AccountingMaintenanceService
 from sylanne3.authority_service.v2_model_result_read_service import AuthorityV2ModelResultReadService
 from sylanne3.authority_service.v2_owner_proof import AuthorityV2OwnerProofStore
 from sylanne3.authority_service.v2_owner_session import AuthorityV2OwnerSessionStore
+from sylanne3.authority_service.v2_migration_rpc import MigrationRpcHandlerV2
+from sylanne3.authority_service.v2_migration_service import AuthorityV2MigrationService
+from sylanne3.authority_service.v2_migration_store import AuthorityV2MigrationStore
 from sylanne3.authority_service.v2_model_result_read_wire import to_wire as result_to_wire
 from rewrite.tests.alpha1.authority.test_v2_model_result_read import _request as result_request
 from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
@@ -27,7 +32,8 @@ from sylanne3.runtime_contracts import NamespaceId
 ROLE = NamespaceId("bot", "persona")
 
 
-def _compose(tmp_path, service, core, *, graph_path=None, bindings=True):
+def _compose(tmp_path, service, core, *, graph_path=None, bindings=True,
+             reverse=None, issuers=None, migration_factory=None, migration_rpc=None):
     graph_path = Path(graph_path) if graph_path is not None else tmp_path / "graph.db"
     if graph_path.is_absolute() and not graph_path.exists():
         sqlite3.connect(graph_path).close()
@@ -42,8 +48,65 @@ def _compose(tmp_path, service, core, *, graph_path=None, bindings=True):
             "installation", "holder-a", "policy", "capabilities-v2", "b" * 64)},
         namespace_bindings_v2={
             ("a" * 64, "profile", ROLE): "ns-a"} if bindings else {},
+        v2_final_handoff_reverse=reverse,
+        v2_final_handoff_issuers=issuers,
+        v2_migration_rpc_factory=migration_factory,
+        v2_migration_rpc=migration_rpc,
         create_owner_schema=True,
     )
+
+
+def test_migration_handler_uses_exact_installed_owner_store(tmp_path):
+    service, core, _, deletion, guard, execution, _ = installed(tmp_path)
+    try:
+        def migration_factory(owner_tickets):
+            migration = AuthorityV2MigrationService(
+                fences=service,
+                store=AuthorityV2MigrationStore(
+                    core._db, lock=core._lock, create=True),
+                pairing_verifier=None, source_snapshot_verifier=None,
+                target_recovery_verifier=None, owner_tickets=owner_tickets)
+            return MigrationRpcHandlerV2(
+                {"ns-a": migration},
+                resolve_management_binding=lambda *_: None)
+
+        server = _compose(tmp_path, service, core,
+                          migration_factory=migration_factory)
+        assert server._v2_migration_rpc._services["ns-a"]._owner_tickets is server._v2_owner_tickets
+
+        different_owner = _compose(tmp_path, service, core)
+        different_handler = migration_factory(different_owner._v2_owner_tickets)
+        with pytest.raises(AuthorityUnavailable, match="migration handler differs"):
+            _compose(tmp_path, service, core, migration_rpc=different_handler)
+        with pytest.raises(AuthorityUnavailable, match="two installation sources"):
+            _compose(tmp_path, service, core, migration_rpc=different_handler,
+                     migration_factory=migration_factory)
+    finally:
+        core.close()
+        deletion.close()
+        guard.close()
+        execution.close()
+
+
+def test_composition_passes_reverse_handoff_to_server_validation(tmp_path):
+    service, core, _, deletion, guard, execution, _ = installed(tmp_path)
+    try:
+        client = object.__new__(ReverseGraphClaimClient)
+        client.profile = SimpleNamespace(
+            namespace="ns-a", profile_id="profile", installation_id="installation")
+        with pytest.raises(TypeError, match="graph claim issuers"):
+            _compose(tmp_path, service, core, reverse={"ns-a": client})
+        server = _compose(tmp_path, service, core, reverse={"ns-a": client},
+                          issuers={"ns-a": "graph-issuer"})
+        bridge = server._v2_execution["ns-a"]
+        assert bridge._final_handoff_authorizer.__self__ is client
+        assert bridge._final_handoff_issuer_id == "graph-issuer"
+        assert bridge._owner_installation_id == "installation"
+    finally:
+        core.close()
+        deletion.close()
+        guard.close()
+        execution.close()
 
 
 def test_composition_reads_exact_finished_authority_fence(tmp_path):

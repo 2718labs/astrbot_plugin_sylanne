@@ -9,6 +9,7 @@ from sylanne3.domains.d06 import D06DomainProvider, ErasureRequest
 from sylanne3.domains.d06.deletion_read import (
     read_deletion_closure_candidate_from_coordinator,
 )
+from sylanne3.domains.d13.provider import D13ShortContextProvider, block_graph_value
 from sylanne3.graph_coordinator import AuthorityDenied, GraphCoordinator
 from sylanne3.graph_store import (
     DeletionDependencyEdge, DeletionHistoryRow, GraphStore, ProductionGraphStore,
@@ -20,7 +21,8 @@ from sylanne3.runtime.c02_bundle_codec import c02_bundle_to_wire
 from sylanne3.memory_types import SourceRecord, source_key
 from sylanne3.runtime.restore_anchor import RestoreAnchor
 from sylanne3.runtime_contracts import (
-    NamespaceId, QueryEpoch, SnapshotRequirementsV2, canonical_digest,
+    CompressedTurnBlockV2, NamespaceId, QueryEpoch, SnapshotRequirementsV2,
+    TurnAnchorV1, TurnTimelineItemV1, VersionedRef, canonical_digest,
 )
 
 from rewrite.tests.alpha1.runtime.test_graph_coordinator_v2_read import (
@@ -36,6 +38,8 @@ NAMESPACE = NamespaceId("bot", "persona")
 def deletion_runtime(tmp_path):
     registry = TypeRegistry()
     for spec in D06DomainProvider.type_specs():
+        registry.register(spec)
+    for spec in D13ShortContextProvider.register_types():
         registry.register(spec)
     store = ProductionGraphStore(tmp_path / "memory.db", registry)
     anchor = RestoreAnchor(
@@ -54,6 +58,7 @@ def deletion_runtime(tmp_path):
         store, bootstrap, holder="holder", content_fence_v2=port,
     )
     coordinator.register_provider(bootstrap, "d06", Provider(), "d06-schema", "a" * 64)
+    coordinator.register_provider(bootstrap, "d13", Provider(), "d13-schema", "b" * 64)
     install(store, target)
     with store._lock:
         store._db.execute(
@@ -106,6 +111,19 @@ def _source(source_id, parents=()):
         source_id, source_id, "speaker", "reported", "reported", None, 1.0,
         "family", ("owner",), ("context",), parents,
     )
+
+
+def _cache_value(block_ref, source):
+    ref = VersionedRef(source.token, 1)
+    audience = VersionedRef("audience:1", 1)
+    turn = TurnAnchorV1("conversation:1", audience, 1, ref, ref, ref,
+                        "speaker:user", 100.0)
+    return block_graph_value(CompressedTurnBlockV2(
+        block_ref, "conversation:1", audience, (turn,), (ref,),
+        (TurnTimelineItemV1(1, ref, "speaker:user", "summary"),),
+        (), (), "compiler:1", "job:1", "candidate:1", 200.0,
+        "standby",
+    ))
 
 
 def _pending_c02(store, source, operation_id, *, evidence_source=None,
@@ -239,6 +257,41 @@ def test_coordinator_candidate_includes_current_and_historical_d06_dependencies(
     )
     assert limited.status == "partial_hold"
     assert not limited.scan_complete
+    assert "graph_backed_cache_dependency_inventory" not in limited.covered_facets
+
+
+def test_fenced_graph_inventory_names_current_and_historical_d13_cache_versions(
+        deletion_runtime):
+    _, coordinator, _, _, authority, lease, commit, allow_epoch = deletion_runtime
+    root = source_key("bot", "persona", "root")
+    other = source_key("bot", "persona", "other")
+    current_cache = AtomKey(Owner("persona", "bot", "persona"),
+                            "d13.compressed_turn_block.v2", "current")
+    revised_cache = AtomKey(Owner("persona", "bot", "persona"),
+                            "d13.compressed_turn_block.v2", "revised")
+    commit("root", (GraphWrite(root, _source("root").to_dict()),))
+    commit("other", (GraphWrite(other, _source("other").to_dict()),))
+    commit("current-cache", (GraphWrite(
+        current_cache, _cache_value("current", root), (root,)),))
+    commit("old-cache", (GraphWrite(
+        revised_cache, _cache_value("revised", root), (root,)),))
+    commit("revised-cache", (GraphWrite(
+        revised_cache, _cache_value("revised", other), (other,)),))
+    allow_epoch()
+
+    result = read_deletion_closure_candidate_from_coordinator(
+        coordinator, authority, lease,
+        ErasureRequest("erase", (root.token,), "all_derived", 1, 0),
+    )
+    assert result.scan_complete and result.status == "hold"
+    assert result.graph_cache_refs == (current_cache.token,)
+    assert result.graph_cache_historical_versions == (
+        GraphVersion(current_cache, 1), GraphVersion(revised_cache, 1))
+    assert result.other_domain_historical_versions == result.graph_cache_historical_versions
+    assert "graph_backed_cache_dependency_inventory" in result.covered_facets
+    assert "other_domain_graph_dependency_history_inventory" in result.covered_facets
+    assert "source_derived_cache_inventory_unavailable" in result.missing_facets
+    assert "other_domain_history" in result.missing_facets
 
 
 @pytest.mark.parametrize("interpretation_history_available", [True, False])
@@ -383,6 +436,7 @@ def test_coordinator_candidate_holds_when_graph_changes_between_pages(deletion_r
     assert changed, result
     assert result.status == "partial_hold"
     assert "current_snapshot_drift" in result.missing_facets
+    assert "graph_backed_cache_dependency_inventory" not in result.covered_facets
 
 
 def test_pending_c02_inventory_matches_root_and_descendant_only(deletion_runtime):

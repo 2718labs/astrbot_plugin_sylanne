@@ -131,6 +131,59 @@ class FixedBlockMathTranscript:
     transcript_sha256: str
 
 
+class _FixedBlockInputEncoder:
+    """Encode the original complete JSON, reusing only exact fixed model bytes."""
+
+    def __init__(self, first: FixedBlockStep):
+        self.first = first
+
+        def matrix(m):
+            return dict(rows=m.rows, cols=m.cols, nnz=len(m.values),
+                        offsets=m.offsets, indices=m.indices, values=m.values)
+
+        fixed = {
+            "a": matrix(first.a), "abi_version": ABI_VERSION, "alpha": first.alpha,
+            "boundary_eta": first.boundary_eta, "drive": first.drive,
+            "j": matrix(first.j), "k": matrix(first.k),
+            "max_iterations": first.max_iterations, "n": len(first.previous),
+            "r": matrix(first.r), "struct_size": ctypes.sizeof(ABI2StepInput),
+            "tolerance": first.tolerance,
+        }
+
+        def group(names):
+            return b",".join(
+                (json.dumps(name) + ":" + json.dumps(fixed[name], sort_keys=True,
+                    separators=(",", ":"), allow_nan=False)).encode("utf-8")
+                for name in names)
+
+        self.prefix = b"{" + group(("a", "abi_version", "alpha", "boundary_eta", "drive")) + b',"h":'
+        self.middle = b"," + group(("j", "k", "max_iterations", "n")) + b',"previous":'
+        self.suffix = b"," + group(("r", "struct_size", "tolerance")) + b"}"
+
+    def digest(self, actual: FixedBlockStep):
+        first = self.first
+        if (any(left is not right and not _same_csr_bits(left, right)
+                for left, right in ((first.k, actual.k), (first.r, actual.r),
+                                    (first.j, actual.j), (first.a, actual.a)))
+                or not _same_float_bits(first.alpha, actual.alpha)
+                or not _same_float_bits(first.drive, actual.drive)
+                or not _same_float_bits((first.tolerance, first.boundary_eta),
+                                       (actual.tolerance, actual.boundary_eta))
+                or first.max_iterations != actual.max_iterations
+                or len(first.previous) != len(actual.previous)):
+            raise ValueError("fixed input encoding model differs in exact binary64")
+        digest = hashlib.sha256()
+        digest.update(self.prefix)
+        for value, following in (
+            (actual.h, b',"iterate":'), (actual.iterate, self.middle),
+            (actual.previous, b',"previous_error":'), (actual.previous_error, self.suffix),
+        ):
+            digest.update(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode("utf-8"))
+            digest.update(following)
+        return digest.hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class FixedBlockContinuation:
     """Next step settings and complete model, without caller-supplied chain state.
@@ -189,6 +242,18 @@ class FixedBlockTrajectoryMathTranscript:
     final_error: float
     production_binding: NativeLoadBinding
     transcript_sha256: str
+
+    @property
+    def input(self):
+        return self.steps[0].input
+
+    @property
+    def output(self):
+        return self.steps[-1].output
+
+    @property
+    def output_sha256(self):
+        return self.steps[-1].output_sha256
 
 
 def _same_float_bits(lhs: tuple[float, ...], rhs: tuple[float, ...]) -> bool:
@@ -263,6 +328,10 @@ def run_fixed_block_trajectory_math(
 
 
 def run_fixed_block_math(handle: ABI2NativeLibrary, block: FixedBlockStep) -> FixedBlockMathTranscript:
+    return _run_fixed_block_math_with_input_encoder(handle, block, None)
+
+
+def _run_fixed_block_math_with_input_encoder(handle, block, input_encoder):
     """Run an owned fixed block through a verified-package handle synchronously."""
     if not isinstance(handle, ABI2NativeLibrary) or handle.production_binding is None:
         raise ABI2ResultError("fixed-block math requires a package-bound ABI2 handle")
@@ -308,7 +377,7 @@ def run_fixed_block_math(handle: ABI2NativeLibrary, block: FixedBlockStep) -> Fi
     output = tuple(output_buffer)
     if not all(math.isfinite(value) for value in output):
         raise ABI2ResultError("ABI2 fixed-block output is non-finite")
-    input_sha256 = block.digest()
+    input_sha256 = block.digest() if input_encoder is None else input_encoder.digest(block)
     output_sha256 = _digest(output)
     binding = handle.production_binding
     transcript_sha256 = _digest({

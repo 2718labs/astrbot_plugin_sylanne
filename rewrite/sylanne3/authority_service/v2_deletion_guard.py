@@ -364,9 +364,14 @@ class AuthorityV2DeletionGuard:
                 or self._db is None or not self._db.in_transaction
                 or self.schema_version() != 2):
             raise AuthorityUnavailable("schema-2 guarded deletion pending is required")
-        if (pending.source_phase, pending.target_phase,
-                pending.evidence.kind) != ("absent", "pending", "request_authorized"):
-            raise AuthorityUnavailable("deletion barrier and cleanup phases remain HOLD")
+        phases = {
+            ("absent", "pending"): ("clear", "request_authorized"),
+            ("pending", "accepted"): ("pending", "barrier_installed"),
+            ("accepted", "closed"): ("accepted", "cleanup_complete"),
+        }
+        expected = phases.get((pending.source_phase, pending.target_phase))
+        if expected is None or pending.evidence.kind != expected[1]:
+            raise AuthorityUnavailable("unknown deletion phase transition")
         _, journal_id, metadata = self._check_schema()
         permit = pending.permit
         before = pending.before_anchor
@@ -384,8 +389,9 @@ class AuthorityV2DeletionGuard:
             if (core._id(db) != permit.authority_id
                     or core._anchor(db, permit.namespace, namespace_row) != before
                     or namespace_row[0] != permit.holder
-                    or namespace_row[2] != "active" or namespace_row[9] != "clear"):
+                    or namespace_row[2] != "active" or namespace_row[9] != expected[0]):
                 raise AuthorityUnavailable("Authority deletion owner or anchor differs")
+            fences.require_prior_deletion_transition_locked(db, pending, core=core)
             row = fences._row(db, permit.operation_id)
             mutation = fences.mutation_locked(db, pending.mutation_id)
             if (row is None or row[6] != "active"
@@ -407,7 +413,8 @@ class AuthorityV2DeletionGuard:
             raise AuthorityUnavailable("deletion journal identity differs")
         if (head.seq, head.digest) == (before.deletion_seq, before.deletion_digest):
             phases = self.latest_phases()
-            if phases.get((pending.permit.namespace, pending.deletion_operation_id)) is not None:
+            if phases.get((pending.permit.namespace, pending.deletion_operation_id),
+                          "absent") != pending.source_phase:
                 raise AuthorityUnavailable("deletion operation already has history; quarantine")
             return None
         if (head.seq, head.digest) != (pending.expected_deletion_seq,
@@ -444,7 +451,19 @@ class AuthorityV2DeletionGuard:
             return self._inspect_pending_locked(pending)
 
     def append_pending(self, pending: DeletionPendingV1, *, core, fences):
-        """One FULL-WAL append; Authority pending must already be durable."""
+        """Retain the original request entry's explicit later-phase HOLD."""
+        if (type(pending) is not DeletionPendingV1
+                or pending.source_phase != "absent"
+                or pending.target_phase != "pending"):
+            raise AuthorityUnavailable("deletion barrier and cleanup phases remain HOLD")
+        return self.append_transition(pending, core=core, fences=fences)
+
+    def append_transition(self, pending: DeletionPendingV1, *, core, fences):
+        """One FULL-WAL typed phase append; Authority pending is durable first.
+
+        This is an internal storage port. A trusted service must authenticate
+        Owner, graph barrier, or cleanup evidence before preparing the phase.
+        """
         with self.freeze_writes():
             self._require_persisted_pending(pending, core=core, fences=fences)
             existing = self._inspect_pending_locked(pending)

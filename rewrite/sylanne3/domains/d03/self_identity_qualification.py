@@ -63,7 +63,7 @@ def self_identity_mapping_from_current(
         current.self_entity_ref,
         "authority:self-identity:" + certification_digest,
         current.role_head_id,
-        current.graph_incarnation,
+        current.origin_graph_incarnation or current.graph_incarnation,
         "active",
     )
 
@@ -78,6 +78,9 @@ def qualify_authority_current_self_identity(
     request_operation_id: str,
     permit: FencePermitV2,
     port: AuthorityCurrentSelfIdentityPort | None,
+    storage_admission=None,
+    graph_metadata=None,
+    graph_epoch=None,
 ) -> SelfIdentityMapping:
     """Qualify one mapping candidate; graph issuance remains unavailable.
 
@@ -136,7 +139,7 @@ def qualify_authority_current_self_identity(
             or current.installation_id != policy.installation_id
             or current.manifest_digest != policy.manifest_digest
             or current.activation_generation != activation["activation_generation"]
-            or current.graph_incarnation != activation["graph_incarnation"]
+            or (current.origin_graph_incarnation or current.graph_incarnation) != activation["graph_incarnation"]
             or current.role_head_id != role.head_id
             or current.graph_epoch != role.graph_epoch
             or current.owner_authorization_revision != owner_guard.authorization_revision
@@ -146,7 +149,42 @@ def qualify_authority_current_self_identity(
             or current.request_operation_id != request_operation_id
             or current.permit != permit):
         raise ValueError("Authority self identity differs from current role or fence")
+    if current.origin_graph_incarnation is not None or storage_admission is not None:
+        require_self_identity_storage_binding_v1(current, storage_admission, permit,
+            owner_guard=owner_guard, metadata=graph_metadata, graph_epoch=graph_epoch,
+            request_operation_id=request_operation_id)
     return self_identity_mapping_from_current(current)
+
+
+def require_self_identity_storage_binding_v1(current, admission, permit, *,
+        owner_guard, metadata, graph_epoch, request_operation_id):
+    """Compare a receipt to the actual same-fence D12 source observation."""
+    from ...authority_service.d12_owner_storage_admission_v1 import D12OwnerStorageAdmissionV1
+    if (type(current) is not AuthorityCurrentSelfIdentityV1
+            or current.permit != permit or current.request_operation_id != request_operation_id
+            or metadata is None or graph_epoch is None
+            or current.graph_revision != metadata.graph_revision
+            or current.graph_epoch != graph_epoch.revision
+            or current.graph_incarnation != metadata.requirements.graph_incarnation):
+        raise ValueError("self identity current Graph/fence observation differs")
+    if current.origin_graph_incarnation is None:
+        if admission is not None:
+            raise ValueError("self identity storage continuation was stripped")
+        return current
+    if (type(admission) is not D12OwnerStorageAdmissionV1
+            or admission.source_owner_guard != owner_guard
+            or admission.original_digest != current.storage_admission_digest
+            or admission.source_graph_incarnation != current.origin_graph_incarnation
+            or admission.current_graph_incarnation != current.graph_incarnation
+            or admission.namespace != current.namespace or admission.authority_namespace != permit.namespace
+            or admission.installation_id != current.installation_id or admission.holder != permit.holder
+            or admission.activation_generation != permit.generation
+            or admission.revocation_epoch != permit.pinned_anchor.revocation_epoch
+            or current.owner_authorization_head != owner_guard.authorization_head
+            or current.owner_authorization_revision != owner_guard.authorization_revision
+            or metadata.requirements.revocation_epoch != admission.revocation_epoch):
+        raise ValueError("self identity does not match the actual source storage admission")
+    return current
 
 
 __all__ = (

@@ -85,9 +85,14 @@ class LocalCreationCatalogue:
                 return None
             manifest = _read_json(manifest_bytes)
             if (type(manifest) is not dict or manifest.get("schema_version") != 1
-                    or manifest.get("build_mode") != "formal-alpha1"
+                    or manifest.get("build_mode") not in {"formal-alpha1", "snapshot-alpha1-test"}
                     or type(manifest.get("files")) is not list):
                 return None
+            if manifest["build_mode"] == "snapshot-alpha1-test":
+                from ..host.installed_package import verify_installed_backend_runtime_v1
+                qualified = verify_installed_backend_runtime_v1(self._root, self._expected_manifest_digest)
+                if not qualified.verified or qualified.runtime_scope != "backend-production-acceptance":
+                    return None
             entries = [entry for entry in manifest["files"]
                        if type(entry) is dict and entry.get("path") == _PRESET_PATH]
             if (len(entries) != 1 or type(entries[0].get("bytes")) is not int

@@ -12,7 +12,7 @@ from sylanne3.domains.d04 import AffectProvider
 from sylanne3.domains.d04.affect import AffectAxis, AffectScheme, RecollectionExperience
 from sylanne3.domains.d06 import (
     CandidateItem, CandidateSet, D06DomainAdapter, D06DomainProvider,
-    RecollectionContext,
+    RecollectionContext, source_correction_head_key,
 )
 from sylanne3.domains.d07 import (
     CurrentInterpretationCandidate, D07DomainProvider, EvidenceStatus, Stance,
@@ -21,7 +21,7 @@ from sylanne3.graph_coordinator import (
     AuthorityDenied, GraphCoordinator, budget_operation_digest,
 )
 from sylanne3.graph_store import GraphStore
-from sylanne3.graph_types import AtomKey, GraphWrite, Owner, TypeRegistry
+from sylanne3.graph_types import AtomKey, GraphCandidate, GraphWrite, Owner, TypeRegistry
 from sylanne3.memory_repository import MemoryRepository
 from sylanne3.memory_types import SourceRecord, access_key, source_key
 from sylanne3.runtime.budget import (
@@ -76,7 +76,7 @@ class C04Harness:
         self.d02, self.d11 = build_runtime_issuers(
             b"c04-signer-key" * 3,
             outcome_verifier=lambda outcome, quote, db:
-                outcome.provider_receipt_ref == "provider-receipt-c04"
+                outcome.provider_receipt_ref == f"provider-receipt-{quote.quote_id.removeprefix('quote-')}"
                 and outcome.operation_id == quote.operation_id,
         )
         with self.store._lock:
@@ -104,7 +104,7 @@ class C04Harness:
         )
         self.authority = AuthorityContext(
             "host", "d06", capability, self.namespace,
-            ("event", "activity"), "context", ("owner",), "policy-1", 1,
+            ("persona", "event", "activity"), "context", ("owner",), "policy-1", 1,
         )
         for kind, ref, version in (
             ("scheme", "current", "scheme-1"),
@@ -128,12 +128,16 @@ class C04Harness:
     def close(self):
         self.store.close()
 
-    def bundle(self):
-        activity, operation = "activity-c04", "operation-c04"
+    def bundle(self, suffix="c04"):
+        activity, operation = f"activity-{suffix}", f"operation-{suffix}"
+        if suffix != "c04":
+            self.coordinator.set_guard_version(
+                self.bootstrap, self.namespace, "resource_lease", f"quote-{suffix}", 1,
+            )
         source = source_key("bot", "persona", "source-1")
         access = access_key("bot", "persona", "source-1")
         candidates = CandidateSet(
-            "set-c04", (CandidateItem(
+            f"set-{suffix}", (CandidateItem(
                 "candidate-1", "source-1", "family-1", "association",
                 ("context",), 0.8, "observed",
             ),), "complete", access_epoch=0, delete_epoch=0,
@@ -148,23 +152,44 @@ class C04Harness:
             ticket, candidates, RecollectionContext((), (), ()),
         )
         owner = Owner("activity", "bot", "persona", activity)
+        body_state = BodyState(
+            f"profile-{suffix}", 1, 0.8, {"encode": 0.1}, 0.0, 1.0)
+        body_reservation = BodyReservation(
+            f"reserve-{suffix}", f"quote-{suffix}", f"effect-{suffix}",
+            0.1, 0.1)
+        body_state_write = BodyDomain.state_write(self.namespace, body_state)
+        body_reservation_write = BodyDomain.reservation_write(
+            self.namespace, activity, body_reservation)
+        body_original = self.store.graph_snapshot((
+            body_state_write.key, body_reservation_write.key))
+        if all(atom.revision == 0 for atom in body_original.atoms):
+            self.store.graph_commit(GraphCandidate(
+                Event(Scope("bot", "persona", "session"),
+                      f"body-{suffix}", 2.0, "body", {}),
+                body_original.versions,
+                (body_state_write, body_reservation_write),
+                body_original.epochs,
+            ))
         recollection_key = AtomKey(owner, "d06.recollection.v1",
                                    recollection.recollection_id)
         choice_key = AtomKey(owner, "d07.selection_ticket.v1", ticket.ticket_id)
-        interpretation_key = AtomKey(owner, "d07.current_interpretation.v1", "meaning-c04")
-        feeling_key = AtomKey(owner, "d04.recollection_experience.v1", "feeling-c04")
-        settlement_key = AtomKey(owner, "d02.settlement.v1", "body-c04")
-        cost_key = runtime_cost_settlement_key("bot", "persona", activity, "cost-c04")
-        job_key = runtime_job_key("bot", "persona", activity, "job-c04")
-        outbox_key = runtime_outbox_key("bot", "persona", activity, "outbox-c04")
-        keys = (source, access, recollection_key, choice_key, interpretation_key,
+        interpretation_key = AtomKey(owner, "d07.current_interpretation.v1", f"meaning-{suffix}")
+        feeling_key = AtomKey(owner, "d04.recollection_experience.v1", f"feeling-{suffix}")
+        settlement_key = AtomKey(owner, "d02.settlement.v1", f"body-{suffix}")
+        cost_key = runtime_cost_settlement_key("bot", "persona", activity, f"cost-{suffix}")
+        job_key = runtime_job_key("bot", "persona", activity, f"job-{suffix}")
+        outbox_key = runtime_outbox_key("bot", "persona", activity, f"outbox-{suffix}")
+        correction_head = source_correction_head_key(self.namespace, "source-1")
+        keys = (source, access, correction_head,
+                body_state_write.key, body_reservation_write.key,
+                recollection_key, choice_key, interpretation_key,
                 feeling_key, settlement_key, cost_key, job_key, outbox_key)
         snapshot = self.coordinator.read_snapshot(self.authority, self.lease, keys)
         inputs = (ticket.ticket_id, candidates.candidate_set_id)
         ceiling = {"cpu_ms": 200, "model_microusd": 300}
         envelope = CommandEnvelope(
             RUNTIME_SCHEMA,
-            OperationIdentity(activity, None, "attempt-c04", "realize-recollection",
+            OperationIdentity(activity, None, f"attempt-{suffix}", "realize-recollection",
                               operation, canonical_digest({"input_refs": list(inputs)})),
             self.authority,
             VersionGuard(
@@ -172,28 +197,31 @@ class C04Harness:
                 (QueryEpoch(self.namespace, "all", snapshot.epochs[0].revision),),
                 0, 0, self.registry.catalogue_hash, "scheme-1", "operator-1",
                 "policy-1", (), (VersionedRef("focus-1", 4),),
-                (VersionedRef("quote-c04", 1),),
+                (VersionedRef(f"quote-{suffix}", 1),),
             ),
             SourceQualification((source.token,), "observed", 1.0, 2.0,
                                 "external_observation", "eligible", 0.8,
                                 "not_applicable"),
             inputs, "parent", 4_102_444_800.0, 100.0, "character-1",
-            ("trigger-c04",),
+            (f"trigger-{suffix}",),
         )
         with self.store._lock:
             self.d02.issue_quote(self.store._db, ResourceQuote(
-                "quote-c04", 1, "bot", "persona", activity, operation, None,
-                "parent", "encode", "snapshot-c04", envelope.deadline_utc,
-                "resource-c04", job_key.token, (outbox_key.token,),
+                f"quote-{suffix}", 1, "bot", "persona", activity, operation, None,
+                "parent", "encode", f"snapshot-{suffix}", envelope.deadline_utc,
+                f"resource-{suffix}", job_key.token, (outbox_key.token,),
                 (settlement_key.token,), ceiling, None, 4_102_444_900.0,
             ))
-            self.d11.issue_budget_grant(self.store._db, BudgetLeaseGrant(
-                "grant-c04", 1, "bot", "persona", "parent", "USD",
-                ceiling, ("encode",), 4_102_445_000.0, "policy-1",
-            ))
+            if self.store._db.execute(
+                "SELECT 1 FROM runtime_budget_grants WHERE lease_id='parent' AND version=1"
+            ).fetchone() is None:
+                self.d11.issue_budget_grant(self.store._db, BudgetLeaseGrant(
+                    f"grant-{suffix}", 1, "bot", "persona", "parent", "USD",
+                    ceiling, ("encode",), 4_102_445_000.0, "policy-1",
+                ))
             self.d02.issue_outcome(self.store._db, ResourceOutcome(
-                "outcome-c04", 1, "quote-c04", "bot", "persona", activity,
-                operation, ceiling, False, "provider-receipt-c04",
+                f"outcome-{suffix}", 1, f"quote-{suffix}", "bot", "persona", activity,
+                operation, ceiling, False, f"provider-receipt-{suffix}",
             ))
             job = self.d11.job_for(envelope, self.store._db)
             durable_lease = get_budget_lease(self.store._db, "parent")
@@ -202,12 +230,12 @@ class C04Harness:
             durable_lease, operation, digest, ceiling, ceiling, inline_reserve=True,
         )
         cost = RuntimeCostSettlement(
-            "bot", "persona", activity, operation, None, "cost-c04", "parent",
+            "bot", "persona", activity, operation, None, f"cost-{suffix}", "parent",
             "USD", operation, "settled", ceiling, ceiling, {}, "settle",
             operation, prediction.receipt_json_sha256, None, False,
         )
         interpretation = CurrentInterpretationCandidate(
-            "meaning-c04", activity, "question:memory", "perhaps it matters now",
+            f"meaning-{suffix}", activity, "question:memory", "perhaps it matters now",
             Stance.SUSPEND, 0.4, EvidenceStatus.INSUFFICIENT,
             (source.token,), ("family-1",), ("present meaning is uncertain",),
         )
@@ -215,30 +243,29 @@ class C04Harness:
             envelope, handoff, interpretation, source_dependencies=(source,),
         )
         feeling = RecollectionExperience(
-            "feeling-c04", activity, recollection_key.token, source.token,
+            f"feeling-{suffix}", activity, recollection_key.token, source.token,
             (source.token,), "mood-c04", (source.token,), (0.2, 0.4), (-0.2, 0.1),
             "coupling-c04", "coupling-1",
         )
         d04 = self.providers["d04"].proposal_for(
             envelope,
             typed_writes=(GraphWrite(feeling_key, _json(asdict(feeling))),),
-            dependencies=DependencySet(), contribution_keys=("feeling-c04",),
+            dependencies=DependencySet(), contribution_keys=(f"feeling-{suffix}",),
             required_bundle_parts=("experience",),
         )
-        body = SettlementResult(
-            BodyState("profile-c04", 1, 0.8, {"encode": 0.1}, 0.0, 1.0),
-            BodyReservation("reserve-c04", "quote-c04", "effect-c04", 0.1,
-                            0.0, ("encode",), "settled"),
-            False, 0.0,
-        )
+        body = BodyDomain().settle_component(
+            body_state, body_reservation, "encode", actual_cost=0.1,
+            component_receipt=f"provider-receipt-{suffix}")
         d02 = DomainProposal(
             "d02", "d02.proposal.v1",
             self.providers["d02"].descriptor.request_schema_hash, envelope,
-            (BodyDomain.settlement_write(self.namespace, activity, "body-c04", body),),
+            (BodyDomain.state_write(self.namespace, body.state),
+             BodyDomain.reservation_write(self.namespace, activity, body.reservation),
+             BodyDomain.settlement_write(self.namespace, activity, f"body-{suffix}", body)),
             DependencySet(), (), (),
         )
         outbox = RuntimeOutboxValue(
-            "bot", "persona", activity, operation, None, "outbox-c04",
+            "bot", "persona", activity, operation, None, f"outbox-{suffix}",
             job.job_id, job_key.token, recollection.recollection_id,
             f"d06:c04:{activity}", "pending", 1,
         )
@@ -329,7 +356,7 @@ def test_c04_rejected_cost_receipt_rolls_back_all_domains(tmp_path):
         with pytest.raises(AuthorityDenied, match="D11 cost graph atom differs"):
             harness.coordinator.commit_domain_bundle(bad_bundle, harness.lease)
         db = harness.store._db
-        assert db.execute("SELECT COUNT(*) FROM graph_atoms").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM graph_atoms").fetchone()[0] == 4
         assert db.execute("SELECT COUNT(*) FROM graph_bundle_operations").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM graph_outbox_jobs").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM runtime_jobs").fetchone()[0] == 0

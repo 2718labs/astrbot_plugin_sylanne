@@ -15,11 +15,30 @@ from ..domains.d08.execution import ActionIntent
 from ..graph_types import AtomKey, Owner
 from ..runtime_contracts import NamespaceId, canonical_digest
 from .d11_types import job_graph_write
-from .dispatch_admission import DispatchAdmissionReceiptV1, load_admission
-from .jobs import get_job
+from .dispatch_admission import (
+    DispatchAdmissionReceiptV1, DispatchAdmissionV1, load_admission,
+)
+from .jobs import PersistentJob, get_job
 
 
 SCHEMA = "sylanne.d08_d11.dispatch_action_job_binding.v1"
+
+
+def _is_post_c02_reply_waiting_job(
+        job: PersistentJob, action: ActionIntent,
+        admission: DispatchAdmissionV1) -> bool:
+    """Recognize the one signed message job shape held for host takeover."""
+    return (
+        action.action_kind == "message"
+        and action.purpose == "expression"
+        and admission.operation_id.startswith("post-c02-reply:")
+        and job.work_kind == "message"
+        and job.phase == "waiting"
+        and job.wake_condition == {
+            "kind": "post_c02_reply_host_takeover",
+            "operation_id": admission.operation_id,
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -176,11 +195,13 @@ def bind_action_job(
     if len(rows) != 1:
         raise ValueError("dispatch admission lacks a unique job")
     job = get_job(db, rows[0][0])
+    post_c02_reply_job = _is_post_c02_reply_waiting_job(
+        job, action, admission)
     if ((job.bot_id, job.persona_id, job.activity_id, job.effect_id,
          job.operation_id) != (
              *namespace.as_tuple, admission.activity_id, admission.effect_id,
              admission.operation_id)
-            or job.work_kind != "dispatch"
+            or not (job.work_kind == "dispatch" or post_c02_reply_job)
             or job.budget_ref != admission.budget_lease_ref
             or job.phase not in {"queued", "running", "waiting", "deferred"}
             or job.cancel_epoch != 0):

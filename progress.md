@@ -1,5 +1,64 @@
 # Rewrite progress
 
+## 2026-09-23：alpha1 首次入口与恢复闸门增量
+
+- 已获用户授权把已验证的实现候选保存到远端 checkpoint：`codex/alpha1-runtime-checkpoint-20260923` 的提交 `70672008993e5359669d31a90564cb76d4864cc9` 已核对远端同 SHA。该分支从共同 base `codex/embodiment-3-rewrite` 派生，仅含实现/测试/构建资源/CI；设计目录和本地进度账未推送，未创建 PR、合并或发布。当前仍是 `3.0.0-dev.1`。
+- W01 首次 D06 来源与 D11 内部编码作业共用一个提交 bundle；签发以持久首次观察、现行激活/权限栅栏、四个 rev-0 键、真实 D02 报价和 D11 授权/作业为条件。无关图提交后原操作可重试，自身键漂移及跨激活未提交重试拒绝；只有匹配已签发记录和封存摘要的首次 bundle 能省略全 namespace 查询 epoch。
+- W01 独立审查提出的并发提交与跨 activation 已提交重放疑点已按当前源码复核；补充真实图提交后切换 activation 的回归。主任务独立重跑 `test_ingress_issuance.py` 23 passed；旧 generation 未提交拒绝和可信时钟重绑也在该组中。生产宿主到外部 Authority 的完整签发路径仍未验收。
+- W01 再补受控图层联测：HostIngressEnvelope 经 assembler、现行 W01、真实 D02/D11 签发进入共享图提交，duplicate 不再签发或重复写入。主任务独立重跑完整宿主 Windows 94 passed/5 skipped、WSL Linux 87 passed/12 skipped；夹具显式绕过外部 Authority 内容准入，故仍非生产入口验收。
+- W09 生产接线只读复核：`main.py` 目前拿到 v1 enrollment/grant 后仍以 `dependencies=None` 构造 RuntimeContext；没有服务端 v2 RPC/客户端、贯穿图事务的 typed fence、两日志 observe/settle/删除与恢复水位端口，也没有管理员冷启动依赖装配。后续顺序为真实独立服务身份→严格 v2 RPC→同一 permit 图/外送准入→日志/恢复端口→宿主依赖注入；paired 本身不能解锁运行。
+- 已提交消息先用当前操作绑定 lease 和读栅栏核对原始指纹、封存摘要、协调器收据，再返回 `duplicate`；不重签过期报价或重建 bundle。旧 envelope 的单调截止值仅保留摘要身份；W01 现在要求注入受信时钟，按原 UTC 截止重建进程内资格，并在最终提交前重验。生产依赖尚未供应受信时钟与服务级执行日志验证，真实入口仍 BLOCKED。
+- 恢复校验默认要求独立服务实际验证当前执行日志连续链；本地 SQLite 路径只在显式测试/历史模式可用。独立 Authority mTLS/profile 接线仍只提供 enrollment，安装级凭据、权限及完整运行授权未验收。
+- W09 已将 `ingress_clock` 列为启动前必需依赖；mTLS 客户端现串行化单连接 RPC、关闭时移除 session 并等待关闭；Windows 候选 verifier 修复私钥宽泛读取 ACE 与 ProgramData 祖先权限规则。服务端配对续期、同步恢复桥和 Windows 句柄级防替换仍未接线，不能将此作为安装资格。
+- Astra high 对 Authority v1 的并发恢复作战略复核：现有内容 permit 不冻结执行日志头，日志 fsync 与 Authority 提交之间也没有预先耐久绑定的 mutation intent。已冻结 `docs/plans/alpha1-20260923/authority-v2-fence.md`；v2 服务端独占栅栏、两阶段日志追加、锁序与实际故障注入完成前，生产 RuntimeDependencies 不得接通。
+- Authority v2 B0 严格 DTO/codec、B1 服务库内独占栅栏存储和 B2.1 服务持有执行日志底层已落盘，分别 28、6、6 项定向测试通过；B1 保留 pending 与 epoch，重启不自动释放。B2.1 校验追加链并提供唯一追加检查，但还没有 Authority 提交/恢复闭环、RPC 或生产接线。
+- D12 九类视图中，D01 的 `creation` 现在由领域提供方从图中投影受限候选元数据；真实 GraphCoordinator.query 到 issuer 的受控整合测试验证 rev/epoch、权限拒绝和私密 claim/价值标签不外泄。该测试使用非生产 GraphStore；其余八类视图、命令和订阅仍未达到产品验收。
+- D08 `action` 视图经权限审查保持 unavailable：现有 D12 provider 接口没有逐条来源/受众资格，候选 ID 或数量也可能泄露意图；新增拒绝测试确认在此条件下不查询图、不输出内容。
+- Authority v2 B2.2 已补 `prepared` 阶段 pending→FULL 日志追加→Authority head/effect/permit revision/receipt 提交与 0/1/多追加恢复；主任务独立重跑 v2 四文件共 45 项测试、编译和 Ruff 均通过。随后并发审查确认旧 Core 查询持 core 锁等待 journal verifier、B2.2 持 journal guard 等 core 锁可死锁；B2.2 仅是隔离顺序底层原型，生产服务与 G0 继续 HOLD。
+- Authority v2 B2.3a 已加入同一 Authority DB 的持久 `v2-only` 封印：切换前拒绝遗留 permit、迁移及未收敛状态；旧 Core/LocalJournalBridge 路径通过跨进程事务屏障，在 journal 核验或追加前拒绝。v2 bridge 要求封印后才能执行。定向 22 项与下述组合回归通过。旧二进制绕过、v2 受保护查询/发证/删除及生产接线仍 HOLD；封印不构成 G0 完成。
+- Authority v2 B2.3b 服务原型已增加双日志固定锁序的完整 anchor 元数据读取与同事务发 fence；prepared append/reconcile 重核删除头，含独立进程写锁竞争和删除漂移反例的定向 18 项通过。裸删除日志写者仍可在 fence 存续期间变更 head，日志路径身份、v2 删除/观察/结算、生产接线与 G0 仍 HOLD。
+- B2.4a 已落同文件、停机式删除日志迁移切片：Authority 先持久阻断，原删除 SQLite 的单事务核旧头并封存旧表 INSERT/UPDATE/DELETE、建立禁写 v2 尾表；重启可续办，读链保留各历史 operation 的 pending/accepted/closed 约束，内容对任何删除历史保守拒绝。定向 30 passed，另旧 `DeletionJournal` 写拒绝补测 1 passed；主任务随后独立运行当前 Windows 核心 398 passed/2 skipped、Linux 核心 399 passed/1 skipped。尚不能证明旧进程/句柄、路径身份或有 DDL 权限写者的隔离，且没有 v2 删除 append/accepted/closed，G0 继续 HOLD。
+- B2.4b 的跨模块接口冲突已裁决：执行专用 pending/receipt 不放宽，另设删除 DTO/证据与 FenceStore 2→3、删除尾表 1→2 的显式升级；D06/D11 真实屏障证据未接线前只允许获授权的删除 pending 意图，返回 pending_confirmation，不放行历史闭包。裁决见 `docs/plans/alpha1-20260923/authority-v2-fence.md`。
+- B2.4b 第一切片现已落地：独立删除 DTO/codec、FenceStore schema 2→3 原子升级及旧执行记录保真读取；删除 pending 写入继续关闭。B2.3c 内部服务已加双日志守卫下的 validate/finish，同事务调用存储 locked 方法；主任务独立重跑 Authority v2 相关 91 项通过。v2 mTLS 已接通只读 fence 的 current/begin/validate/finish，主体由真实 TLS peer 证书派生；主任务在 AstrBot 受控环境独立重跑 loopback 2 passed。独立远程查询、删除尾表可写升级、删除业务闭环与生产 RuntimeContext 装配仍缺。
+- D06 增加版本绑定的删除闭包候选，仅记录规范根、范围、前置访问/删除纪元和四类闭包引用，不冒充 Authority 屏障或已接受删除；主任务独立重跑 D06 26 项通过。D11 区间验证器再经独立源码复核，未发现可证明的低估缺口，未扩张证书声明。
+- D04 已增加活动归属的不可变回忆感受写，当前心境调制后的 tone/salience 与历史来源分列，外部证据权重增量固定为 0；D06 回忆与 D07 选择/解释的不可变写不再误用图失效依赖，历史来源版本仍受读集守卫。D06/D07 的隔离 GraphCoordinator 回归及 D04 真实 GraphStore 写入通过；主任务独立重跑 D04 24、D06 28、D07 20 项。完整 C04 仍未提交：当前 outbox 没有同包 runtime.job，真实签名 D02/D11 quote、任务绑定和首次费用回执预构也尚未接通。
+- POSIX/Darwin profile 候选改为逐级 no-follow 文件句柄校验，CA/cert/key 从固定句柄交给 TLS；Darwin 扩展 ACL 校验失败时关闭。主任务独立重跑 Windows 相关宿主 13 passed/4 skipped 与 WSL `/run` 真实 POSIX 反例 4 passed。macOS 两架构现场 API、安装与 TLS 验证尚无收据，仍 HOLD；Windows 句柄级 DACL 门和安装器也未完成。
+- Windows Authority profile 已用原生 CreateFileW 句柄固定祖先与 TLS 材料，对句柄检查 owner/DACL/type/reparse，并在句柄持有期间让 OpenSSL 消费材料；原生定向测试含拒绝 rename/write 与成功加载。无管理员真实冷安装和正式包，Windows 资格仍 HOLD。macOS 增加原生 ACL 与 `/dev/fd` smoke，但尚未在 Darwin 执行，资格仍 HOLD。
+- 五平台 AstrBot CI job 已改用 pytest 执行 `rewrite/host_tests/alpha1`，并安装 pytest/pytest-asyncio；原 unittest discover 漏掉的顶层 pytest 函数现进入目标命令。本机只验证 YAML、命令、Ruff 与 whitespace；工作流未推送运行，不能作为平台资格。
+- D11 区间 verifier 新增完整联合块的 q 上界、离散残差端点界、连续重建缺陷与前步误差传播；来源/事件边界/参数固定性尚未由外层认证，ABI2 `certificate_flags` 仍为 0。主任务独立重跑 Windows 与 WSL Linux Rust 各 39 passed；这不是 G2 数值认证。
+- 当前未提交源码切片：Windows Python 3.11.15 核心/包/日志测试 432 passed、2 skipped、20 subtests；WSL Ubuntu 24.04.4 Python 3.12.3 为 434 passed、20 subtests；受控 AstrBot 4.28.1 宿主 Windows Python 3.13.14 为 95 passed、5 skipped、11 subtests，WSL Linux 为 88 passed、12 skipped、11 subtests。Windows/Linux Rust 各 39 passed（在本次 D04/D06/D07 与 mTLS 改动前执行）；当前 Python 编译、Ruff 与 Git whitespace 检查通过。确切文件指纹与三平台 HOLD 见 `docs/plans/alpha1-20260923/acceptance/requirements-runtime.md` 和 `platform-matrix.md`。macOS 未运行；本轮没有正式包、冷安装、真实消息或产品 G0–G7 完成收据。
+
+## 2026-09-23：Embodiment 3.0.0 alpha1 实施启动
+
+- 用户新指令为落地 `embodiment-3.0.0-alpha1`，并明确验收边界是完整重型插件。此前“只本地设计”的阶段限制已由这项实施指令替代；未授权把开发适配器改名当交付。
+- 启动时真实入口仍为 `main.py → Store/Application/Engine` 的显式 `/sylanne3` 开发切片；后续 W09 已替换宿主入口，见下方增量。`metadata.yaml` 仍为 `3.0.0-dev.1`；在完整门槛通过前不提早改成 alpha1。
+- 本轮启动时 `python -m compileall -q main.py rewrite/sylanne3` 与 `cargo check`（`rewrite/native`）均通过；这是当前源码的编译基线，不是新功能或 alpha1 验收。只读审计已划出公共事务/权限/执行日志、领域接线、产品与分发的依赖，战略架构门禁正在收敛。
+- 保留已有设计脏改动，不触碰其他旧模块工作树。普通实现优先低一档代理，Astra 仅承担最重的跨域架构裁决且按用户新指令使用 high。
+- 用户明确 alpha1 首发须覆盖 Windows、Linux、macOS。当前仅核实本机旧受控 AstrBot 虚拟环境 `D:\bun\tmp\codex\sylanne3-host` 存在且安装版本为 4.28.1；这不是三平台冷安装或真实消息验收。
+- P0 公共合同已落盘；主任务复核发现并修复非空候选去重失败，以及 D06 对未知发生时间/确信/现实资格无法如实表达的合同缺口。合同目标测试 8 项通过；领域与生产共享图接线仍在进行。
+- D11 独立执行写前日志基础 9 项定向测试通过，整库回滚需外部可信 RestoreAnchor，尚未接入运行准入。ABI 2 受限 Rust 增量 `cargo check` 与 4 项 Rust 测试通过，但 `certificate_flags=0`，不具备数值认证；包内 ABI 2 loader 的 8 项检查通过、1 项本机符号链接权限跳过。正式信任根与取消能力仍缺。
+- D01/D02 的 9 项目标测试、D03/D05 连同合同的 22 项目标测试通过，均只是纯领域候选/校验；共享图正式提交、D06 来源、D08 必查和真实宿主尚未验收。D12 九页客户端的 check/test/build 与桌面/390px Playwright 检查通过，服务端与真实投影尚未接通。
+- 确定性平台包构建器 8 项定向测试通过，正式模式会拒绝当前 `3.0.0-dev.1`；未产生正式 alpha1 构件，Linux/macOS 运行验收均为 HOLD。
+- 后续独立领域增量：D04 连续混合感受、D08 意图/必查、D10 主动联系、多段资格、D12 服务端候选均落盘；各自目标测试分别由写者通过 20、11、7、7 项。D03/D05 已补生产 TypeSpec；主任务将 D07 六类图数据从最小字段检查改为完整字段与语义校验，编译和 15 项 D07 目标测试通过。这些仍是领域候选，不是十二域整合验收。
+- W01 删除/恢复锚/激活迁移基础件和 W09 模型代理第一增量已落盘，定向测试分别由写者通过 4、5 项。真实独立权威、预算/作业/执行日志与同一事务和宿主入口的接线尚未通过。W01 正收紧内容读屏障；瞬时 generation 检查不足以挡迁移并发，生产需与迁移权威共用序列化 fence。
+
+## 2026-09-23：alpha1 实施增量与当前 HOLD
+
+- W09 已用实际 AstrBot 4.28.1 `Star` 生命周期及全消息事件入口替换旧 Application/Engine 运行入口；受控 SDK 6 项测试通过。十二域目录已发现 D01–D10、D12 的真实提供者，D11 新 TypeSpec/Provider 随后落盘待重验。缺安装级删除/恢复/迁移权威、共享 content fence、真实 ingress handler 时启动明确 BLOCKED，不接管消息或创建业务库；真实平台收发未验收。
+- W01 的共享图、类型写者与 CAS/来源屏障、预算/作业/费用/发件箱同事务接线有定向测试；D11 三类图类型及严格 Provider 已落盘。仍缺真实可信签发器、跨宿主权威和规模成本证据，不将候选图事务测试记作完整产品验收。
+- D06 C04 已可装配回忆的五域候选 bundle；D07 SelectionTicket 图类型与真实选择/解释写入正在接线。D08→D09 多段资格及 D09 严格校验 26 项定向测试通过，仍需 D11 最终准入、平台 handoff 与重启资格化。
+- 受限 ABI2 数值核中原先 `0b111` 线性证书声明经 Astra high 独立战略复核判定没有逐算子舍入证明，已撤回为 `certificate_flags=0` 的诊断输出。Rust 10 项与实际 Python FFI 3 项通过；独立向外舍入验证层在编写，非线性完整认证与三平台数值验收仍 HOLD。
+- 平台包构建器现在同时拒绝候选目录及未证迁移占位；10 项构建测试和 5 个 target 子测试通过。这只是打包机制测试；当前目录为 candidate_only、迁移为 reject_without_proven_migrator，因此没有正式 alpha1 ZIP。主任务还为 ModelBroker 加入可信外送开始收据的生产必需端口；9 项定向测试通过，实际外送权威与真实模型调用仍未接线。
+- 隔离 WSL Ubuntu 24.04 x86_64 安装了 Python 3.12/Rust 1.98.1；Linux 原生核 10 项测试、alpha1 Python 211 项加 15 子测试、包构建器 10 项加 5 子测试通过。Linux release `.so` 被打入非正式 `3.0.0-dev.1` dirty dev-probe ZIP，SHA256 `19764ea8d43fb334449d32a722f31bf34862aa018a162e2143d8a977e9d5529e`；提取后严格 ABI2 loader 读到 abi=2、max_dimension=65536、diagnostic_only=True。此包使用本地提供的 manifest digest，仅验证机制，不是外部发行信任或 Linux 正式冷安装。
+- Astra high 对宿主权威作第二次战略复核：stock AstrBot 4.28.1 不提供原假设的 `get_trusted_service`。方案改为普通插件的 AuthorityClient 连接经管理员独立配对的 Sylanne Authority；无配对时仅安装引导/无内容诊断。业务库回滚及跨主机迁移以同一外部权威为前提；同 UID 侧车不能自称 OS 隔离或防整机回滚。W09 正改客户端 seam，独立权威核心另行实现；当前普通冷安装激活仍 HOLD。
+
+## 2026-09-23：十二模块本地设计
+
+- D01–D12 各有主规格、公共操作合同与未来验收；D01/D04 原回收稿哈希保持不变，D11 另有数值合同。当前入口：`docs/architecture/sylanne-3-design-index.md`。
+- 跨域权威、身份/时间、必查、行动与投递、删除/旧备份/迁移均已在 `docs/architecture/module-collaboration-contracts.md` 收敛；`sylanne-3-integration-acceptance.md` 定义十六个联合场景及 OPS-10 连续轨迹。
+- `sylanne-3-requirements-coverage.md` 对旧账 62 项逐条映射：60 DESIGN、2 REVISED、0 OPEN。REVISED 对应用户明确否定的旧情绪阶段机；不是运行验收通过。
+- 本轮只执行文档/链接/编号/哈希/工作区边界检查，收据在忽略的 `rewrite/artifacts/all-module-design-20260923-checks.json`；未编译、运行新设计测试、真实平台发送、构建包、提交、推送或创建 PR。Astra 只用于重型战略级设计，普通补漏由低成本代理处理。
+
 ## 2026-09-22
 - Read user-supplied redesign and obtained explicit authorization to start phased rewriting.
 - Independent mathematical review completed; implementation conditions recorded in findings.
@@ -30,7 +89,7 @@
 - Final root SDK acceptance: 9 tests passed against isolated AstrBot 4.28.1, with controlled external inputs. Receipt: rewrite/artifacts/host-verification-20260922T031049.710520Z.json. Both receipts have no source drift.
 - Ruff and Git whitespace checks passed. Source-based SDK tests do not establish live AstrBot/plugin-manager/platform, remote CI or complete 3.0 acceptance. Detailed evidence and manual checks: rewrite/HOST_ACCEPTANCE.md.
 - Final fingerprint reconciliation found the host verifier had changed after the earlier core run. Re-ran the combined verifier on frozen source: PASS, 67 Python tests and 2 Rust tests; final core receipt rewrite/artifacts/verification-20260922T031457.661662Z.json. Host receipt remains current with no hash mismatch.
-- User requested further heavyweight design. This turn expands design only: docs/architecture/embodiment-3-mechanisms.md defines seven shared graph views, persistent concerns, competing beliefs, object-specific emotion episodes, relationship facets, autobiographical revision, isolated counterfactuals, typed operator compilation and execution/result boundaries.
+- User requested further heavyweight design after accepting an approximately 10 MB compressed distribution budget. This turn expands design only: docs/architecture/embodiment-3-mechanisms.md defines seven shared graph views, persistent concerns, competing beliefs, object-specific emotion episodes, relationship facets, autobiographical revision, isolated counterfactuals, typed operator compilation and execution/result boundaries.
 - Two Sol design reviewers examined character behavior and runtime consistency. Addressed concern identity/closure, emotion-to-action intervention checks, actual-versus-anticipated experience, downstream narrative invalidation, storage authority, clock contracts and external-result settlement. No new runtime capabilities or behavioral validation are claimed by this design draft.
 - Continued design with social scenes, shared projects, attention, life practices, strategy evolution, character-package compilation and full architecture Mermaid in docs/architecture/embodiment-3-ecosystem.md. Sol reviewers supplied bounded read-only domain/runtime reviews.
 - User steered toward a complete memory redesign, newer theory, fast/high-quality recall and explicit recall timing. Added embodiment-3-memory.md plus embodiment-3-memory-theory.md: source/interpretation separation, temporal and audience semantics, correction/deletion, event-based organization, mandatory checks, optional recall triggers, bounded search tiers and stopping conditions.
@@ -48,3 +107,5 @@
 - Independent types/repository review and main retrieval/bridge review completed with no remaining blocking finding. Clarified that an already-invalid interpretation needs only a sanitized invalid-atom/epoch denial proof; avoid unnecessary ancestry traversal for a conclusive denial.
 - Combined current-source verification PASS: 173 core Python tests, 2 Rust tests, native release build/compile/boundary checks, and 9 controlled AstrBot 4.28.1 SDK tests. Receipts: rewrite/artifacts/verification-20260922T124852.309287Z.json and host-verification-20260922T124852.707557Z.json. Both report no drift; all 46 core/29 host manifest entries rechecked with zero mismatches. Ruff 0.16.0 and diff whitespace checks passed.
 - New scope, evidence and manual gates recorded in rewrite/MEMORY_ACCEPTANCE.md. Full memory semantics, async lifecycle, domain checks, role behavior, host cutover and complete release remain open. No Git commit/push, production data migration or real-platform send was performed.
+- 2026-09-23: Completed the local D06 design in docs/modules/06-memory.md, 06-memory-contracts.md and 06-memory-acceptance.md. Covers eleven peer domains, nine operation contracts, 25 requirements and 35 future acceptance cases. Two independent reviewers rechecked fixes with no remaining substantive P1/P2. Document checks passed; receipt: rewrite/artifacts/memory-design-20260923-checks.json. Recovered D01/D04 source hashes remain unchanged. This is design completion only: no runtime tests, source implementation, commit, push or PR this turn. Full audit: docs/plans/memory-20260923/progress.md.
+- 2026-09-23: Completed local D07 attention/cognition design in docs/modules/07-attention-cognition.md, 07-cognition-contracts.md and 07-cognition-acceptance.md: eleven peer domains, eleven operation contracts, 30 requirements and 40 future scenarios. Independent reviews found three P2 ambiguities (within-class fairness, work duration, simulated content versus actual internal experience), all fixed and rechecked with no remaining substantive P1/P2. Document checks passed; receipt: rewrite/artifacts/cognition-design-20260923-checks.json. Five D01/D04/D06 drafts match recorded hashes; initial hand-copied expected-hash typo was corrected against the recovery manifest. Design only, no runtime tests or source implementation, commit, push or PR. Completion audit: docs/plans/cognition-20260923/progress.md.

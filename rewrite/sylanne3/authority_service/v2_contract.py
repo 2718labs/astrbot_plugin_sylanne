@@ -155,6 +155,36 @@ class FencePermitV2:
 
 
 @dataclass(frozen=True, slots=True)
+class FenceNeverBegunReceiptV2:
+    """Durable proof that this operation ID can never acquire a fence."""
+
+    authority_id: str
+    namespace: str
+    subject: str
+    installation_id: str
+    holder: str
+    generation: int
+    operation_id: str
+    pinned_anchor: RestoreAnchor
+    request_id: str
+    request_digest: str
+    state: str = "rejected_before_begin"
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        for name in ("authority_id", "namespace", "subject", "installation_id",
+                     "holder", "operation_id", "request_id"):
+            identifier(getattr(self, name), name)
+        _exact_int(self.generation, "generation")
+        _digest(self.request_digest, "request_digest")
+        if self.state != "rejected_before_begin" or type(self.state) is not str:
+            raise ValueError("invalid never-begun fence state")
+        _anchor(self.pinned_anchor, self.authority_id, self.namespace,
+                self.generation)
+
+
+@dataclass(frozen=True, slots=True)
 class PendingMutationV2:
     """One durable phase transition for one service-owned execution append."""
 
@@ -295,8 +325,12 @@ class ExecutionBindingV1:
             raise ValueError("execution binding requires recovery footprint")
         for name in ("namespace", "activity_id", "effect_id", "attempt_id",
                      "operation_id", "admission_ref", "platform_capability_ref",
-                     "adapter_ref", "content_fence"):
+                     "adapter_ref"):
             identifier(getattr(self, name), name)
+        # The committed command carries the earlier graph write fence. The
+        # dispatch permit is issued later and has its own independent token.
+        if type(self.content_fence) is not str or not _TOKEN.fullmatch(self.content_fence):
+            identifier(self.content_fence, "content_fence")
         for name, length in (("account_ref", 3), ("destination_ref", 2)):
             value = getattr(self, name)
             if type(value) is not str:
@@ -692,6 +726,44 @@ class AuthorityDispatchSnapshotV1:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthorityCurrentEffectSnapshotV2:
+    """Complete current effect inventory bound to one ordinary write fence."""
+
+    authority_id: str
+    namespace: str
+    anchor: RestoreAnchor
+    permit_digest: str
+    execution_head_seq: int
+    execution_head_digest: str
+    coverage: str
+    unresolved_effects: tuple[AuthorityUnresolvedEffectV1, ...]
+    schema: str = SCHEMA
+
+    def __post_init__(self) -> None:
+        _schema(self.schema)
+        identifier(self.authority_id, "authority_id")
+        identifier(self.namespace, "namespace")
+        _anchor(self.anchor, self.authority_id, self.namespace,
+                self.anchor.activation_generation)
+        _digest(self.permit_digest, "permit_digest")
+        _exact_int(self.execution_head_seq, "execution_head_seq")
+        if (self.execution_head_seq != self.anchor.execution_seq
+                or self.execution_head_digest != self.anchor.execution_digest
+                or self.coverage != "complete"):
+            raise ValueError("effect snapshot head or coverage differs")
+        if (type(self.unresolved_effects) is not tuple
+                or any(type(effect) is not AuthorityUnresolvedEffectV1
+                       or effect.footprint.namespace != self.namespace
+                       or effect.execution_seq > self.execution_head_seq
+                       for effect in self.unresolved_effects)
+                or tuple(sorted(self.unresolved_effects, key=lambda item: item.effect_id))
+                   != self.unresolved_effects
+                or len({effect.effect_id for effect in self.unresolved_effects})
+                   != len(self.unresolved_effects)):
+            raise ValueError("current unresolved effect set differs")
+
+
+@dataclass(frozen=True, slots=True)
 class DispatchGraphClaimReceiptV1:
     """Graph writer's committed claim identity; only a trusted callback may supply it."""
 
@@ -896,12 +968,13 @@ def _footprint_from_wire(value: object) -> RecoveryConstraintFootprint:
     return footprint
 
 
-def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
+def to_wire(value: FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
             DeletionEvidenceV1 | DeletionPendingV1 | DeletionMutationReceiptV1 |
             ExecutionBindingV1 | ExecutionBindingV2 | PlatformObservationV1 |
             PlatformObservationV2 |
             DispatchHandoffContextV1 | OwnerDispatchWitnessV1 |
             AuthorityUnresolvedEffectV1 | AuthorityDispatchSnapshotV1 |
+            AuthorityCurrentEffectSnapshotV2 |
             DispatchGraphClaimReceiptV1) -> dict[str, Any]:
     """Produce a fresh, JSON-shaped dict with an explicit object kind."""
     if type(value) is FencePermitV2:
@@ -914,6 +987,17 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
             "pinned_anchor": _anchor_wire(value.pinned_anchor),
             "effect_id": value.effect_id, "command_digest": value.command_digest,
             "footprint_digest": value.footprint_digest,
+        }
+    if type(value) is FenceNeverBegunReceiptV2:
+        return {
+            "schema": value.schema, "kind": "fence_never_begun_receipt_v2",
+            "authority_id": value.authority_id, "namespace": value.namespace,
+            "subject": value.subject, "installation_id": value.installation_id,
+            "holder": value.holder, "generation": value.generation,
+            "operation_id": value.operation_id,
+            "pinned_anchor": _anchor_wire(value.pinned_anchor),
+            "request_id": value.request_id, "request_digest": value.request_digest,
+            "state": value.state,
         }
     if type(value) is DispatchHandoffContextV1:
         return {"schema": value.schema, "kind": "dispatch_handoff_context_v1",
@@ -948,6 +1032,16 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
                 "authority_schema_version": value.authority_schema_version,
                 "active_dispatch_operation_id": value.active_dispatch_operation_id,
                 "pending_mutation_ids": list(value.pending_mutation_ids),
+                "unresolved_effects": [to_wire(effect)
+                                       for effect in value.unresolved_effects]}
+    if type(value) is AuthorityCurrentEffectSnapshotV2:
+        return {"schema": value.schema, "kind": "authority_current_effect_snapshot_v2",
+                "authority_id": value.authority_id, "namespace": value.namespace,
+                "anchor": _anchor_wire(value.anchor),
+                "permit_digest": value.permit_digest,
+                "execution_head_seq": value.execution_head_seq,
+                "execution_head_digest": value.execution_head_digest,
+                "coverage": value.coverage,
                 "unresolved_effects": [to_wire(effect)
                                        for effect in value.unresolved_effects]}
     if type(value) is DispatchGraphClaimReceiptV1:
@@ -1103,13 +1197,14 @@ def to_wire(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
     raise TypeError("unsupported authority v2 DTO")
 
 
-def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
+def from_wire(value: object) -> (FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
                                  DeletionEvidenceV1 | DeletionPendingV1 |
                                  DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                                  PlatformObservationV1 | PlatformObservationV2 |
                                  DispatchHandoffContextV1 |
                                  OwnerDispatchWitnessV1 | AuthorityUnresolvedEffectV1 |
                                  AuthorityDispatchSnapshotV1 |
+                                 AuthorityCurrentEffectSnapshotV2 |
                                  DispatchGraphClaimReceiptV1):
     """Reject unknown schemas, fields, kinds and nested shapes before use."""
     if type(value) is not dict or value.get("schema") != SCHEMA:
@@ -1142,6 +1237,19 @@ def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationRec
             **{key: item for key, item in value.items()
                if key not in ("kind", "anchor", "unresolved_effects",
                               "pending_mutation_ids")})
+    if kind == "authority_current_effect_snapshot_v2":
+        _fields(value, frozenset({"schema", "kind", "authority_id", "namespace",
+                                  "anchor", "permit_digest", "execution_head_seq",
+                                  "execution_head_digest", "coverage", "unresolved_effects"}),
+                "Authority current effect snapshot")
+        effects = value["unresolved_effects"]
+        if type(effects) is not list:
+            raise ValueError("current effect snapshot list differs")
+        return AuthorityCurrentEffectSnapshotV2(
+            anchor=_anchor_from_wire(value["anchor"]),
+            unresolved_effects=tuple(from_wire(item) for item in effects),
+            **{key: item for key, item in value.items()
+               if key not in ("kind", "anchor", "unresolved_effects")})
     if kind == "owner_dispatch_witness_v1":
         from .v2_owner_contract import (
             OwnerAuthorizationGuardV1, from_wire as owner_from_wire,
@@ -1185,6 +1293,15 @@ def from_wire(value: object) -> (FencePermitV2 | PendingMutationV2 | MutationRec
         }), "fence permit")
         return FencePermitV2(**{key: (_anchor_from_wire(item) if key == "pinned_anchor" else item)
                                 for key, item in value.items() if key != "kind"})
+    if kind == "fence_never_begun_receipt_v2":
+        _fields(value, frozenset({
+            "schema", "kind", "authority_id", "namespace", "subject",
+            "installation_id", "holder", "generation", "operation_id",
+            "pinned_anchor", "request_id", "request_digest", "state",
+        }), "never-begun fence receipt")
+        return FenceNeverBegunReceiptV2(
+            **{key: (_anchor_from_wire(item) if key == "pinned_anchor" else item)
+               for key, item in value.items() if key != "kind"})
     if kind == "pending_mutation":
         fields = frozenset({
             "schema", "kind", "permit", "mutation_id", "request_digest", "phase",
@@ -1349,7 +1466,7 @@ def _reject_constant(value: str) -> None:
     raise ValueError(f"nonfinite JSON number: {value}")
 
 
-def canonical_bytes(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
+def canonical_bytes(value: FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
                     DeletionEvidenceV1 | DeletionPendingV1 |
                     DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                      PlatformObservationV1 | DispatchHandoffContextV1 |
@@ -1359,17 +1476,18 @@ def canonical_bytes(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
-def canonical_digest(value: FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
+def canonical_digest(value: FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
                      DeletionEvidenceV1 | DeletionPendingV1 |
                      DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                      PlatformObservationV1 | DispatchHandoffContextV1 |
                      OwnerDispatchWitnessV1 | AuthorityUnresolvedEffectV1 |
                      AuthorityDispatchSnapshotV1 |
+                     AuthorityCurrentEffectSnapshotV2 |
                      DispatchGraphClaimReceiptV1) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
-def decode_bytes(data: bytes) -> (FencePermitV2 | PendingMutationV2 | MutationReceiptV2 |
+def decode_bytes(data: bytes) -> (FencePermitV2 | FenceNeverBegunReceiptV2 | PendingMutationV2 | MutationReceiptV2 |
                                   DeletionEvidenceV1 | DeletionPendingV1 |
                                   DeletionMutationReceiptV1 | ExecutionBindingV1 | ExecutionBindingV2 |
                                   PlatformObservationV1 | OwnerDispatchWitnessV1):
@@ -1380,7 +1498,7 @@ def decode_bytes(data: bytes) -> (FencePermitV2 | PendingMutationV2 | MutationRe
     return from_wire(value)
 
 
-__all__ = ["SCHEMA", "FencePermitV2", "PendingMutationV2", "MutationReceiptV2",
+__all__ = ["SCHEMA", "FencePermitV2", "FenceNeverBegunReceiptV2", "PendingMutationV2", "MutationReceiptV2",
            "ExecutionBindingV1", "ExecutionBindingV2", "PlatformObservationV1",
            "PlatformObservationV2",
            "DeletionEvidenceV1", "DeletionPendingV1", "DeletionMutationReceiptV1",
@@ -1388,4 +1506,5 @@ __all__ = ["SCHEMA", "FencePermitV2", "PendingMutationV2", "MutationReceiptV2",
            "canonical_digest", "decode_bytes", "DispatchHandoffContextV1",
            "OwnerDispatchWitnessV1", "AuthorityUnresolvedEffectV1",
            "AuthorityDispatchSnapshotV1",
+           "AuthorityCurrentEffectSnapshotV2",
            "DispatchGraphClaimReceiptV1"]

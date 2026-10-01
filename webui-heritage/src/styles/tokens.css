@@ -1,0 +1,104 @@
+/* Design tokens — ported from the current UI/index.html identity (dusty-rose
+ * bioluminescent), refined per docs/architecture/webui-design-system.md.
+ * The user likes this look; we evolve it, not replace it. */
+
+:root {
+  /* surfaces */
+  --bg: #1a1a1b;
+  --card: rgba(30, 30, 30, 0.8);
+  --card-border: rgba(255, 255, 255, 0.06);
+  --text: #f0ece4;
+  --text-muted: #888;
+
+  /* signature color — the ONE accent */
+  --accent: #b88a9e;
+  --accent-rgb: 184, 138, 158;
+  --glow: rgba(184, 138, 158, 0.15);
+
+  /* status hues */
+  --cyan: #00b4d8;
+  --red: #ff4444;
+  --amber: #ffaa00;
+  --green: #4caf50;
+
+  /* specimen canvas — lighter fill so the blob reads as a translucent membrane
+   * on near-black instead of a muddy black smudge behind the login form */
+  --void-fill: rgba(0, 0, 0, 0.22);
+  --void-solid: 26, 26, 27; /* raw rgb = bg, for canvas rgba() building */
+
+  /* fonts */
+  --font-head: 'Rajdhani', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-xs: 12px;
+  --font-sm: 13px;
+  --font-base: 14px;
+  --font-md: 15px;
+  --font-lg: 18px;
+  --font-xl: 24px;
+
+  /* spacing scale (new — was hand-tuned literals before) */
+  --space-1: 4px;
+  --space-2: 6px;
+  --space-3: 8px;
+  --space-4: 10px;
+  --space-5: 12px;
+  --space-6: 14px;
+  --space-7: 16px;
+  --space-8: 20px;
+  --space-9: 24px;
+  --space-10: 32px;
+  --space-11: 44px;
+
+  /* radii */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 100px;
+
+  /* elevation + bioluminescent glow (the identity — must actually render on
+   * near-black, so pushed well past the old 6px/40% that read as flat) */
+  --shadow-toast: 0 8px 32px rgba(0, 0, 0, 0.3);
+  --ring-focus: 0 0 0 2px var(--glow);
+  --glow-accent: 0 0 10px rgba(184, 138, 158, 0.6);
+  --glow-strong: 0 0 16px rgba(184, 138, 158, 0.7);
+  --glow-text: 0 0 12px rgba(184, 138, 158, 0.45);
+  /* card + stat surfaces: faint rose tint so structure survives BOTH themes
+   * (fixes the light-theme invisible stat-box) and reads as "glowing tissue" */
+  --stat-bg: rgba(184, 138, 158, 0.07);
+  --stat-border: rgba(184, 138, 158, 0.16);
+  --card-tick: rgba(184, 138, 158, 0.5);
+
+  /* motion */
+  --ease-snap: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-organic: cubic-bezier(0.25, 1, 0.2, 1);
+  --dur-fast: 0.2s;
+  --dur-mid: 0.35s;
+  --dur-slow: 0.6s;
+
+  /* semantic, theme-aware (collapses the old per-component light overrides) */
+  --btn-primary-bg: var(--text);
+  --btn-primary-fg: var(--bg);
+  --input-bg: rgba(255, 255, 255, 0.03);
+  --track: rgba(255, 255, 255, 0.12);
+
+  /* chrome geometry */
+  --header-h: 52px;
+  --footer-h: 36px;
+  --nav-w: 92px;
+}
+
+[data-theme='light'] {
+  --bg: #f5f4f2;
+  --card: rgba(255, 255, 255, 0.7);
+  --card-border: rgba(0, 0, 0, 0.1);
+  --text: #1a1a1a;
+  --text-muted: #666;
+  --void-fill: rgba(0, 0, 0, 0.12);
+  --void-solid: 245, 244, 242;
+  --btn-primary-bg: var(--accent);
+  --btn-primary-fg: #fff;
+  --input-bg: #fff;
+  --track: rgba(0, 0, 0, 0.1);
+}

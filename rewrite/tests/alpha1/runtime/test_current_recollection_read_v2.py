@@ -21,7 +21,7 @@ from sylanne3.memory_types import SourceRecord, access_key, source_key
 from test_graph_v2_provisioning import _owner_issue_case
 
 
-def _fixture(tmp_path):
+def _fixture(tmp_path, *, extra_specs=()):
     scheme = AffectScheme(
         "d04.affect.scheme.v1", "scheme-1", "operator-1", "parameter-1",
         "coupling-1", (AffectAxis("care", "normalized", "care"),), (),
@@ -30,7 +30,7 @@ def _fixture(tmp_path):
     (store, authority_db, port, coordinator, policy, operation,
      pending, grant_value, bootstrap) = _owner_issue_case(
          tmp_path, first_ingress=True, return_bootstrap=True,
-         extra_specs=provider.type_specs(),
+         extra_specs=(*provider.type_specs(), *extra_specs),
      )
     namespace = policy.namespace
     port.pending_owner = pending

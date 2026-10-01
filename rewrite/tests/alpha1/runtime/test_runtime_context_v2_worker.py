@@ -2,7 +2,9 @@
 
 import asyncio
 from dataclasses import replace
+import hmac
 from pathlib import Path
+import ssl
 import sys
 from threading import get_ident
 import time
@@ -21,6 +23,7 @@ from sylanne3.graph_coordinator import UnavailableGuard
 from sylanne3.domain_registry import discover_domain_registry
 from sylanne3.domains.d04 import AffectAxis, AffectScheme
 from sylanne3.host.installed_package import InstalledPackageVerification
+from sylanne3.host.mtls_transport import AuthorityTlsProfile
 from sylanne3.host.authority_profile import (
     AdminIngressEncodingPolicy, AdminInstallationBundle, AdminModelWorkflowV2,
     AdminModelWorkflowsV2, installed_model_config_ref,
@@ -143,6 +146,7 @@ def test_v2_worker_installs_only_current_scoped_encoding_issuer(
         class Coordinator:
             def __init__(self, _store, _bootstrap, **kwargs):
                 captured["issuer"] = kwargs["encoding_request_issuer"]
+                captured["body_quote_authority"] = kwargs["body_quote_authority"]
                 captured["model_ports"] = (
                     kwargs["model_terminal_cost_port"],
                     kwargs["accounting_maintenance_port"],
@@ -166,6 +170,7 @@ def test_v2_worker_installs_only_current_scoped_encoding_issuer(
         assert health.status == "limited"
         assert "model egress and C02 HOLD: paired Authority TLS unavailable" in health.detail
         assert captured["model_ports"] == (None, None, None, None)
+        assert captured["body_quote_authority"] is None
         assert context._v2_cost_transport is None
         issuer = captured["issuer"]
         if profile_case == "current":
@@ -190,6 +195,72 @@ def test_v2_worker_installs_only_current_scoped_encoding_issuer(
         assert (await context.stop()).status == "stopped"
 
     asyncio.run(scenario())
+
+
+def test_body_quote_signer_uses_only_prepared_matching_admin_profile(tmp_path):
+    from sylanne3.domains.d02.body_quote_original import D02BodyQuoteAuthority
+
+    grant = InstallationGrantV2(
+        "authority", "subject", "administrator", "installation",
+        "a" * 64, "publisher-trust", "2", "b" * 64,
+    )
+    assembled = installation(grant, object, tmp_path, tmp_path / "data")
+    profile = AuthorityTlsProfile(
+        "profile", "127.0.0.1", 443, "authority.local", grant.authority_id,
+        tmp_path / "ca.pem", tmp_path / "client.pem", tmp_path / "client.key",
+        prepared_ssl_context=ssl.create_default_context(),
+    )
+    bundle = AdminInstallationBundle(
+        profile, assembled.installation_policy, b"k" * 32, b"d" * 32,
+    )
+    paired = replace(assembled, admin_bundle=bundle)
+    signer = runtime_context._installed_body_quote_authority_v1(paired)
+    assert type(signer) is D02BodyQuoteAuthority
+    assert signer._key == hmac.digest(
+        bundle.d02_signing_key,
+        b"sylanne3.d02.body_quote_original.v1\0"
+        + paired.installation_policy.installation_id.encode("utf-8"), "sha256")
+    assert signer._key != paired.d02_signing_key
+    assert runtime_context._installed_body_quote_authority_v1(paired)._key == signer._key
+    assert runtime_context._installed_body_quote_authority_v1(
+        replace(paired, d02_signing_key=b"x" * 32)) is None
+    assert runtime_context._installed_body_quote_authority_v1(
+        replace(paired, admin_bundle=replace(bundle, tls_profile=replace(
+            profile, prepared_ssl_context=None)))) is None
+
+
+def test_c04_cpu_quote_signer_is_stable_only_for_prepared_d11_identity(tmp_path):
+    from sylanne3.runtime.c04_cpu_quote_policy import C04InternalCpuQuotePolicyAuthorityV1
+
+    grant = InstallationGrantV2(
+        "authority", "subject", "administrator", "installation",
+        "a" * 64, "publisher-trust", "2", "b" * 64,
+    )
+    assembled = installation(grant, object, tmp_path, tmp_path / "data")
+    profile = AuthorityTlsProfile(
+        "profile", "127.0.0.1", 443, "authority.local", grant.authority_id,
+        tmp_path / "ca.pem", tmp_path / "client.pem", tmp_path / "client.key",
+        prepared_ssl_context=ssl.create_default_context(),
+    )
+    bundle = AdminInstallationBundle(
+        profile, assembled.installation_policy, b"k" * 32, b"d" * 32,
+    )
+    paired = replace(assembled, admin_bundle=bundle)
+    signer = runtime_context._installed_c04_cpu_quote_authority_v1(paired)
+    assert type(signer) is C04InternalCpuQuotePolicyAuthorityV1
+    derived_key = hmac.digest(
+        bundle.d11_signing_key,
+        b"sylanne3.c04.internal_cpu_quote_policy.v1\0"
+        + paired.installation_policy.installation_id.encode("utf-8"), "sha256")
+    expected = hmac.new(derived_key, b"test\npayload", "sha256").hexdigest()
+    assert signer._sign("test", "payload") == expected
+    assert runtime_context._installed_c04_cpu_quote_authority_v1(paired)._sign(
+        "test", "payload") == expected
+    assert runtime_context._installed_c04_cpu_quote_authority_v1(
+        replace(paired, d11_signing_key=b"x" * 32)) is None
+    assert runtime_context._installed_c04_cpu_quote_authority_v1(
+        replace(paired, admin_bundle=replace(bundle, tls_profile=replace(
+            profile, prepared_ssl_context=None)))) is None
 
 
 @pytest.mark.parametrize("unresolved_fence", [False, True])

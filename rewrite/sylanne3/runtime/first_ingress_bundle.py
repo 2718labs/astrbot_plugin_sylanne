@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 
 from ..domains.d06 import D06DomainAdapter, SourceAdmission
 from ..memory_types import access_key, source_key
 from ..runtime_contracts import CommandEnvelope, DependencySet, DomainBundle, DomainProposal
+from ..graph_types import GraphVersion, GraphWrite
+from .source_attachment_graph_v2 import media_source_key, media_source_value
+from ..domains.d06.attachment_contract_v2 import SourceAdmissionV2
 from .d11_types import (
     D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH, RuntimeOutboxValue,
     job_graph_write, outbox_graph_write, runtime_job_key, runtime_outbox_key,
@@ -22,6 +26,7 @@ def build_first_ingress_bundle(
     source_identity: str,
     payload_ref: str,
     idempotency_key: str,
+    media_admission: SourceAdmissionV2 | None = None,
 ) -> DomainBundle:
     """Build the canonical first-ingress bundle from issued, immutable inputs.
 
@@ -53,8 +58,9 @@ def build_first_ingress_bundle(
 
     source = source_key(*namespace.as_tuple, admission.source_id)
     access = access_key(*namespace.as_tuple, admission.source_id)
+    media = media_source_key(namespace, admission.source_id) if media_admission else None
     reads = {item.key: item for item in command.version_guard.read_versions}
-    if (set(reads) != {source, access, job_key, outbox_key}
+    if (set(reads) != {source, access, job_key, outbox_key} | ({media} if media else set())
             or len(reads) != len(command.version_guard.read_versions)
             or any(item.revision != 0 for item in reads.values())):
         raise ValueError("first ingress requires complete revision-0 source/runtime proofs")
@@ -71,6 +77,15 @@ def build_first_ingress_bundle(
         raise ValueError("D11 issuer job differs from ingress encoding work")
 
     d06_proposal = D06DomainAdapter(namespace).compile_source_ingress(command, admission)
+    if media_admission is not None:
+        if media_admission.source != admission or reads.get(media) != GraphVersion(media, 0):
+            raise ValueError("media admission differs from first source or absence proof")
+        d06_proposal = replace(
+            d06_proposal,
+            typed_writes=d06_proposal.typed_writes + (
+                GraphWrite(media, media_source_value(media_admission, source.token)),
+            ),
+        )
     outbox_value = RuntimeOutboxValue(
         namespace.bot_id, namespace.persona_id, activity_id, operation_id,
         None, outbox_id, job_id, job_key.token, payload_ref,

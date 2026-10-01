@@ -6,7 +6,7 @@ from pathlib import Path
 from sylanne3.contracts import Event, Scope
 from sylanne3.domains.d06 import (
     CandidateItem, CandidateSet, D06DomainAdapter, D06DomainProvider,
-    RecollectionContext, SelectionTicket,
+    RecollectionContext, SelectionTicket, source_correction_head_key,
 )
 from sylanne3.domains.d06.pipeline import D06MemoryPipeline
 from sylanne3.graph_coordinator import BudgetAdmission, GraphCoordinator, RuntimeAdmission
@@ -85,6 +85,7 @@ class RecollectionCoordinatorCommitTests(unittest.TestCase):
 
             source = source_key("bot", "persona", "source-1")
             access = access_key("bot", "persona", "source-1")
+            correction_head = source_correction_head_key(namespace, "source-1")
             candidates = CandidateSet(
                 "set-1",
                 (CandidateItem(
@@ -113,7 +114,8 @@ class RecollectionCoordinatorCommitTests(unittest.TestCase):
                 ("owner",), "policy-1", 1,
             )
             snapshot = coordinator.read_snapshot(
-                authority, lease, (source, access, recollection_key, projection_key),
+                authority, lease, (source, access, correction_head,
+                                   recollection_key, projection_key),
             )
             input_refs = (ticket.ticket_id, candidates.candidate_set_id)
             envelope = CommandEnvelope(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import uuid4
 
 from sylanne3.graph_types import GraphPage, GraphSnapshot, NamespaceEpoch
@@ -108,6 +109,16 @@ def test_w01_resolution_is_checked_on_every_read_and_revoke_blocks_next_read():
     assert len(port.calls) == 2
 
 
+def test_resolver_exposes_only_current_w01_grant_capabilities():
+    granted = current()
+    port = W01Port(granted)
+    resolver = DurableOwnerGrantResolver(port)
+    resolved = resolver.resolve(
+        session=SESSION, scope=SCOPE, purpose="workbench_view", audience="owner")
+    assert resolved.capabilities == frozenset({"workbench.read"})
+    assert "workbench.create" not in resolved.capabilities
+
+
 def test_wrong_actor_or_untrusted_scope_is_not_promoted_to_owner():
     port = W01Port(current(actor="another-user"))
     subject, graph = service(port)
@@ -129,3 +140,19 @@ def test_wrong_actor_or_untrusted_scope_is_not_promoted_to_owner():
     answer = subject.handle(request(), session=SESSION,
                             context=RequestContext(True, True, True))
     assert answer.status == "unavailable" and graph.queries == 0
+
+
+def test_w01_grant_namespace_must_match_the_browser_scope():
+    granted = current()
+    other = NamespaceId("bot", "other")
+    authority = replace(granted.grant.authority, namespace=other)
+    mismatched = replace(
+        granted, namespace=other,
+        grant=CoordinatorGrant(SCOPE, authority, granted.grant.lease),
+    )
+    subject, graph = service(W01Port(mismatched))
+    answer = subject.handle(request(), session=SESSION,
+                            context=RequestContext(True, True, True))
+    assert answer.status == "unavailable"
+    assert answer.problem["code"] == "authority_unavailable"
+    assert graph.queries == 0

@@ -288,10 +288,10 @@ def attention_ticket_key(namespace, ticket_id: str) -> AtomKey:
                    "d07.attention_ticket.v1", ticket_id)
 
 
-def read_current_focus_attention_ticket(
-    snapshot: GraphSnapshot, namespace, *, now: float,
+def _read_focus_attention_ticket(
+    snapshot: GraphSnapshot, namespace, *, now: float | None,
 ) -> CurrentAttentionTicketReadV1 | None:
-    """Resolve the focus's exact current ticket and current source atoms.
+    """Resolve the focus's exact ticket and source atoms.
 
     A caller must supply a fresh fenced graph snapshot that includes focus,
     ticket and every source key. A partial or stale snapshot cannot qualify a
@@ -300,7 +300,8 @@ def read_current_focus_attention_ticket(
     from ...runtime_contracts import NamespaceId
 
     if (type(snapshot) is not GraphSnapshot or type(namespace) is not NamespaceId
-            or type(now) not in (int, float) or not math.isfinite(now)):
+            or (now is not None and
+                (type(now) not in (int, float) or not math.isfinite(now)))):
         return None
     focus_key = AtomKey(Owner("persona", *namespace.as_tuple),
                         "d07.focus.v1", namespace.persona_id)
@@ -330,7 +331,8 @@ def read_current_focus_attention_ticket(
             "cancel_refs": tuple(value["cancel_refs"]),
             "source_refs": tuple(value["source_refs"]),
         })
-        if (ticket.ticket_id != ticket_key.name or ticket.valid_until <= now
+        if (ticket.ticket_id != ticket_key.name
+                or (now is not None and ticket.valid_until <= now)
                 or not ticket.eligible or not ticket.resources_available
                 or ticket.cancel_refs or not ticket.source_refs
                 or ticket.causal_root not in ticket.source_refs):
@@ -350,6 +352,47 @@ def read_current_focus_attention_ticket(
     return CurrentAttentionTicketReadV1(
         focus, ticket, GraphVersion(focus_key, focus_atom.revision),
         GraphVersion(ticket_key, ticket_atom.revision), tuple(versions))
+
+
+def read_current_focus_attention_ticket(
+    snapshot: GraphSnapshot, namespace, *, now: float,
+) -> CurrentAttentionTicketReadV1 | None:
+    """Resolve one live focus ticket from a fenced current graph snapshot."""
+    return _read_focus_attention_ticket(snapshot, namespace, now=now)
+
+
+def _require_prior_primary_if_selected(
+    snapshot: GraphSnapshot, envelope: CommandEnvelope, *,
+    primary_ref: str, auxiliary_refs: tuple[str, ...],
+    inbound_key: AtomKey, now: float | None,
+) -> None:
+    """An old winner must remain the exact qualified, guarded current focus."""
+    if primary_ref == inbound_key.token:
+        return
+    if auxiliary_refs != (inbound_key.token,) or len(envelope.authority.audience) != 1:
+        raise ValueError("attention ticket or focus identity differs: old primary must retain inbound")
+    from .qualified_attention_read import (
+        read_qualified_focus_attention_ticket,
+        read_structural_focus_attention_ticket,
+    )
+
+    namespace = envelope.authority.namespace
+    audience = envelope.authority.audience[0]
+    if now is None:
+        old = read_structural_focus_attention_ticket(
+            snapshot, namespace, audience=audience,
+            purpose=envelope.authority.purpose)
+    else:
+        old = read_qualified_focus_attention_ticket(
+            snapshot, namespace, now=now, audience=audience,
+            purpose=envelope.authority.purpose)
+    if (old is None
+            or old.attention.focus.primary_ticket_ref != primary_ref
+            or old.attention.ticket_version.key.token != primary_ref
+            or not set(old.read_versions) <= set(snapshot.versions)
+            or not set(old.read_versions)
+               <= set(envelope.version_guard.read_versions)):
+        raise ValueError("old primary lacks a qualified current graph closure")
 
 
 @dataclass(frozen=True)
@@ -610,6 +653,13 @@ class SimulationResult:
 class D07DomainProvider:
     """Pure D07 policy and proposal provider; it owns no writable database."""
 
+    @staticmethod
+    def compile_scheme(draft: object, snapshot: object = None) -> AttentionPolicy:
+        """Validate the policy consumed by ticket ranking and focus allocation."""
+        if type(draft) is not AttentionPolicy:
+            raise TypeError("D07 scheme must be AttentionPolicy")
+        return draft
+
     @property
     def descriptor(self) -> ProviderDescriptor:
         request_hash = schema_hash({"domain": "d07", "proposal": 1})
@@ -634,6 +684,8 @@ class D07DomainProvider:
     def register_types() -> tuple[str, ...]:
         return (
             "d07.concern.v1",
+            "d07.concern_round.v1",
+            "d07.reflection_checkpoint.v1",
             "d07.attention_ticket.v1",
             "d07.focus.v1",
             "d07.working_set.v1",
@@ -651,6 +703,8 @@ class D07DomainProvider:
         definitions = (
             ("d07.concern.v1", ("persona",), "state", Concern,
              ("reason_refs", "wake_conditions"), False),
+            ("d07.reflection_checkpoint.v1", ("persona",), "state", ReflectionCheckpoint,
+             ("unresolved_slots", "discriminating_refs"), False),
             ("d07.attention_ticket.v1", ("persona",), "state", AttentionTicket,
              ("cancel_refs", "source_refs"), True),
             ("d07.focus.v1", ("persona",), "state", FocusState,
@@ -687,7 +741,7 @@ class D07DomainProvider:
                 }),
             )
             for name, owners, storage_role, value_type, tuple_fields, immutable in definitions
-        )
+        ) + (concern_round_type_spec(),)
 
     def attention_focus_proposal(
         self, envelope: CommandEnvelope, snapshot: GraphSnapshot,
@@ -708,7 +762,6 @@ class D07DomainProvider:
         if (len(guarded) != len(envelope.version_guard.read_versions)
                 or "persona" not in envelope.authority.owner_scope
                 or focus.persona_id != namespace.persona_id
-                or focus.primary_ticket_ref != ticket_key.token
                 or not ticket.source_refs
                 or ticket.causal_root not in ticket.source_refs
                 or ticket.source_refs != envelope.source_qualification.source_refs
@@ -734,6 +787,10 @@ class D07DomainProvider:
             previous_epoch = 0
         if focus.focus_epoch != previous_epoch + 1:
             raise ValueError("attention focus epoch must advance one current graph head")
+        _require_prior_primary_if_selected(
+            snapshot, envelope, primary_ref=focus.primary_ticket_ref,
+            auxiliary_refs=focus.auxiliary_ticket_refs,
+            inbound_key=ticket_key, now=now)
         sources = []
         for ref in ticket.source_refs:
             key = AtomKey.from_token(ref)
@@ -1226,6 +1283,8 @@ class D07DomainProvider:
         interpretations = []
         attention_tickets = []
         focus_writes = []
+        concern_round_writes = []
+        reflection_writes = []
         for write in proposal.typed_writes:
             spec = specs.get(write.key.type_name)
             if spec is None:
@@ -1251,6 +1310,18 @@ class D07DomainProvider:
                 attention_tickets.append(write)
             elif write.key.type_name == "d07.focus.v1":
                 focus_writes.append(write)
+            elif write.key.type_name == "d07.concern_round.v1":
+                concern_round_writes.append(write)
+            elif write.key.type_name == "d07.reflection_checkpoint.v1":
+                reflection_writes.append(write)
+        if reflection_writes:
+            raise ValueError("D07 reflection requires W01 fenced transition adoption")
+        if concern_round_writes:
+            # A plain DomainProposal carries no proof that a D02/D11 effect
+            # receipt was verified under W01's current fence. Even a correctly
+            # shaped GraphWrite could forge a served count, so all round state
+            # transitions require the dedicated W01 adoption path.
+            raise ValueError("D07 concern round requires W01 fenced transition adoption")
         if attention_tickets:
             if (type(snapshot) is not GraphSnapshot
                     or len(attention_tickets) != 1 or len(focus_writes) != 1
@@ -1263,8 +1334,6 @@ class D07DomainProvider:
                     or focus_write.key != AtomKey(
                         Owner("persona", *namespace.as_tuple),
                         "d07.focus.v1", namespace.persona_id)
-                    or focus_write.value["primary_ticket_ref"]
-                       != ticket_write.key.token
                     or ticket["causal_root"] not in ticket["source_refs"]
                     or tuple(ticket["source_refs"])
                        != proposal.envelope.source_qualification.source_refs
@@ -1294,6 +1363,11 @@ class D07DomainProvider:
                     or proposal.dependencies.historical_provenance
                        != tuple(expected_sources)):
                 raise ValueError("attention focus/source graph read differs")
+            _require_prior_primary_if_selected(
+                snapshot, proposal.envelope,
+                primary_ref=focus_write.value["primary_ticket_ref"],
+                auxiliary_refs=tuple(focus_write.value["auxiliary_ticket_refs"]),
+                inbound_key=ticket_write.key, now=None)
             prior_epoch = 0
             if focus_atom is not None and focus_atom.revision > 0:
                 specs["d07.focus.v1"].validator(focus_atom.value)
@@ -1608,6 +1682,31 @@ class D07DomainProvider:
         )
 
     @staticmethod
+    def select_bounded_recollection(
+        *, activity_id: str, focus_epoch: int, candidates: CandidateSet,
+        purpose: str, eligible_candidate_ids: tuple[str, ...],
+        max_considered: int = 16,
+    ) -> RecollectionHandoff:
+        """Choose one qualified fragment; W01 still owns focus and commit admission."""
+        if not isinstance(candidates, CandidateSet) or candidates.coverage == "unavailable":
+            raise ValueError("a D06 candidate set is required")
+        _nonempty(purpose, "purpose")
+        eligible = _names(eligible_candidate_ids, "eligible_candidate_ids")
+        if type(max_considered) is not int or not 1 <= max_considered <= 32:
+            raise ValueError("max_considered must be in [1, 32]")
+        ranked = sorted(
+            (item for item in candidates.items
+             if item.candidate_id in eligible and purpose in item.allowed_purposes),
+            key=lambda item: (-item.activation, item.candidate_id),
+        )[:max_considered]
+        if not ranked:
+            raise ValueError("no qualified source fragment is available for recollection")
+        return D07DomainProvider.select_recollection(
+            activity_id=activity_id, focus_epoch=focus_epoch,
+            candidates=candidates, selected_candidate_ids=(ranked[0].candidate_id,),
+        )
+
+    @staticmethod
     def advance_reflection(
         checkpoint: ReflectionCheckpoint,
         *,
@@ -1620,8 +1719,15 @@ class D07DomainProvider:
         evidence = _names(discriminating_refs, "discriminating_refs")
         if checkpoint.meta_depth >= 2:
             raise ValueError("meta depth limit reached")
+        if checkpoint.status in {"complete", "deferred"}:
+            raise ValueError("closed reflection cannot advance")
+        if not set(resolved).issubset(checkpoint.unresolved_slots):
+            raise ValueError("resolved slots must belong to the current reflection")
+        novel = tuple(ref for ref in evidence if ref not in checkpoint.discriminating_refs)
+        if checkpoint.status == "waiting_for_new_trigger" and not novel:
+            raise ValueError("waiting reflection requires a new discriminating trigger")
         remaining = tuple(slot for slot in checkpoint.unresolved_slots if slot not in resolved)
-        progressed = len(remaining) < len(checkpoint.unresolved_slots) or bool(evidence)
+        progressed = len(remaining) < len(checkpoint.unresolved_slots) or bool(novel)
         no_progress = 0 if progressed else checkpoint.no_progress_count + 1
         if not remaining:
             status = "complete"
@@ -1634,7 +1740,7 @@ class D07DomainProvider:
             checkpoint.meta_depth,
             no_progress,
             remaining,
-            tuple(dict.fromkeys(checkpoint.discriminating_refs + evidence)),
+            checkpoint.discriminating_refs + novel,
             status,
         )
 
@@ -1663,6 +1769,7 @@ class D07DomainProvider:
 
 
 from .source_correction import D07SourceReevaluationCandidate, compile_d07_source_reevaluation
+from .concern_round import ConcernRoundV1, concern_round_type_spec
 
 
 __all__ = [
@@ -1672,4 +1779,5 @@ __all__ = [
     "RecollectionHandoff", "ReflectionCheckpoint", "SimulationBranch", "SimulationRequest",
     "SimulationResult", "Stance", "WorkingSet", "WorkingSetItem",
     "D07SourceReevaluationCandidate", "compile_d07_source_reevaluation",
+    "ConcernRoundV1", "concern_round_type_spec",
 ]

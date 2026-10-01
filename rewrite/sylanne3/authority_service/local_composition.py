@@ -13,21 +13,44 @@ from typing import Callable, Mapping
 from .contract import AuthorityUnavailable
 from .core import AuthorityServiceCore
 from .current_graph_verifier import PinnedCurrentGraphVerifier
+from .current_owner_revoke_graph_verifier import PinnedCurrentOwnerRevokeGraphVerifier
 from .mtls_server import (
     AdministratorInstallationV2, AuthorityRpcServer,
 )
+from .reverse_handoff import ReverseGraphClaimClient
 from .v2_clock import AuthorityClockReadingV2
 from .v2_contract import FencePermitV2
 from .v2_fence_service import AuthorityV2FenceService
 from .v2_fence_store import AuthorityV2FenceStore
+from .v2_migration_rpc import MigrationRpcHandlerV2
+from .v2_migration_service import AuthorityV2MigrationService
 from .v2_accounting_service import AuthorityV2AccountingMaintenanceService
 from .v2_model_egress_service import AuthorityV2ModelEgressService
 from .v2_model_result_read_service import AuthorityV2ModelResultReadService
 from .current_model_result_read_graph_verifier import PinnedCurrentModelResultReadGraphVerifier
 from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
 from .current_worker_model_result_graph_verifier import PinnedCurrentWorkerModelResultGraphVerifier
+from .current_reply_worker_model_result_graph_verifier import PinnedCurrentReplyWorkerModelResultGraphVerifier
 from .v2_worker_model_result_attempts import AuthorityV2WorkerModelResultAttempts
 from .v2_worker_model_result_read_service import AuthorityV2WorkerModelResultReadService
+from .current_context_reply_original_verifier import PinnedCurrentContextReplyOriginalVerifier
+from .v2_context_reply_result_service import AuthorityV2ContextReplyResultReadService
+from .v2_natural_generation_output_service import (
+    AuthorityV2NaturalGenerationOutputService,
+    PinnedNaturalGenerationOriginalPaidVerifierV2,
+)
+from .v2_natural_generation_content_service import (
+    AuthorityV2NaturalGenerationContentService,
+    PinnedCurrentNaturalGenerationContentVerifierV2,
+)
+from .v2_natural_review_output_service import (
+    AuthorityV2NaturalReviewOutputService,
+    PinnedNaturalReviewOriginalPaidVerifierV2,
+)
+from .v2_natural_paid_review_service import (
+    AuthorityV2NaturalPaidReviewService,
+    PinnedCurrentNaturalPaidReviewVerifierV2,
+)
 from .v2_worker_result_read_fact_service import AuthorityV2WorkerResultReadFactService
 from .v2_owner_contract import OwnerAuthorizationOperationV1, OwnerClaimTicketV1
 from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
@@ -35,6 +58,10 @@ from .v2_owner_proof import AuthorityV2OwnerProofStore, OwnerProofAcceptanceV1
 from .v2_owner_session import AuthorityV2OwnerSessionStore
 from .v2_self_identity_service import AuthorityV2SelfIdentityService
 from .current_self_identity_graph_verifier import PinnedCurrentSelfIdentityGraphVerifier
+from .installed_platform_observation import (
+    HostOneBotObservationInstallationV2,
+    InstalledHostOneBotObservationVerifierV2,
+)
 from ..runtime_contracts import NamespaceId
 
 
@@ -49,6 +76,13 @@ def compose_local_owner_authority(
     publisher_manifest_verifier: Callable[[str, str, str, str], bool],
     installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2],
     namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str],
+    v2_migration_rpc: MigrationRpcHandlerV2 | None = None,
+    v2_migration_rpc_factory: Callable[[AuthorityV2OwnerTicketStore], MigrationRpcHandlerV2] | None = None,
+    v2_final_handoff_reverse: Mapping[str, ReverseGraphClaimClient] | None = None,
+    v2_final_handoff_issuers: Mapping[str, str] | None = None,
+    v2_dispatch_verifiers: Mapping[str, Callable] | None = None,
+    host_onebot_observations_v2: Mapping[
+        str, HostOneBotObservationInstallationV2] | None = None,
     v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
     model_observers_v2: Mapping[str, tuple[str, str]] | None = None,
     accounting_observers_v2: Mapping[str, tuple[str, str]] | None = None,
@@ -133,7 +167,7 @@ def compose_local_owner_authority(
         with service._frozen() as (db, deletion_head, execution_head,
                                    deletion_history):
             current = service._current_locked(db, deletion_head, execution_head)
-            if deletion_history or current != permit.pinned_anchor:
+            if current != permit.pinned_anchor:
                 return False
             AuthorityV2FenceStore._check_schema(db)
             AuthorityV2FenceStore._require_no_migration(db)
@@ -151,15 +185,33 @@ def compose_local_owner_authority(
 
     graph_verifier = PinnedCurrentGraphVerifier(
         graph_db_path, finished_fence_verifier=finished_fence)
+    revoke_graph_verifier = PinnedCurrentOwnerRevokeGraphVerifier(
+        graph_db_path, finished_fence_verifier=finished_fence)
     owner_tickets = AuthorityV2OwnerTicketStore(
         core, utc_clock=utc_clock,
         first_claim_verifier=first_claim_verifier,
         claimant_verifier=verified_claimant,
         graph_commit_verifier=graph_verifier,
+        revoke_graph_commit_verifier=revoke_graph_verifier,
         owner_sessions=owner_sessions,
         creation_pairing_source=creation_pairing_source,
         create=create_owner_schema,
     )
+    if v2_migration_rpc is not None and v2_migration_rpc_factory is not None:
+        raise AuthorityUnavailable("migration handler has two installation sources")
+    if v2_migration_rpc_factory is not None:
+        if not callable(v2_migration_rpc_factory):
+            raise AuthorityUnavailable("migration handler factory is unavailable")
+        v2_migration_rpc = v2_migration_rpc_factory(owner_tickets)
+    if v2_migration_rpc is not None:
+        if (type(v2_migration_rpc) is not MigrationRpcHandlerV2
+                or not v2_migration_rpc._services
+                or any(type(service) is not AuthorityV2MigrationService
+                       or service.core is not core
+                       or service.fences is not services.get(namespace)
+                       or service._owner_tickets is not owner_tickets
+                       for namespace, service in v2_migration_rpc._services.items())):
+            raise AuthorityUnavailable("migration handler differs from installed Owner Authority")
     self_readers = dict(self_identity_readers_v2 or {})
     self_services = {}
     if self_readers:
@@ -217,6 +269,11 @@ def compose_local_owner_authority(
             source_purpose=purpose)
     worker_readers = dict(worker_result_readers_v2 or {})
     worker_result_reads = {}
+    context_reply_result_reads = {}
+    natural_generation_output_reads = {}
+    natural_generation_content_reads = {}
+    natural_review_output_reads = {}
+    natural_paid_review_reads = {}
 
     def trusted_worker_now_utc() -> float:
         reading = utc_clock()
@@ -245,12 +302,53 @@ def compose_local_owner_authority(
         worker_graph = PinnedCurrentWorkerModelResultGraphVerifier(
             graph_db_path, d11_issuer=model_graph._issuer,
             trusted_now_utc=trusted_worker_now_utc)
+        reply_graph = PinnedCurrentReplyWorkerModelResultGraphVerifier(
+            graph_db_path, d11_issuer=model_graph._issuer,
+            trusted_now_utc=trusted_worker_now_utc)
         worker_result_reads[namespace] = AuthorityV2WorkerModelResultReadService(
             store=model._store, fences=services[namespace], attempts=attempts,
-            graph_verifier=worker_graph,
+            graph_verifier=worker_graph, reply_graph_verifier=reply_graph,
             installation_id=installed.installation_id,
             read_subject="mtls:sha256:" + observer[0],
             holder=installed.administrator_holder)
+        context_reply_result_reads[namespace] = AuthorityV2ContextReplyResultReadService(
+            store=model._store, fences=services[namespace],
+            graph_verifier=PinnedCurrentContextReplyOriginalVerifier(graph_db_path),
+            installation_id=installed.installation_id,
+            read_subject="mtls:sha256:" + observer[0],
+            holder=installed.administrator_holder,
+            trusted_now_utc=trusted_worker_now_utc)
+        natural_generation_output_reads[namespace] = (
+            AuthorityV2NaturalGenerationOutputService(
+                store=model._store, fences=services[namespace],
+                graph_verifier=PinnedNaturalGenerationOriginalPaidVerifierV2(
+                    graph_db_path),
+                installation_id=installed.installation_id,
+                read_subject="mtls:sha256:" + observer[0],
+                holder=installed.administrator_holder,
+                trusted_now_utc=trusted_worker_now_utc))
+        natural_generation_content_reads[namespace] = (
+            AuthorityV2NaturalGenerationContentService(
+                original=natural_generation_output_reads[namespace],
+                graph=PinnedCurrentNaturalGenerationContentVerifierV2(
+                    graph_db_path, natural_history_verifier=model_graph._natural_history),
+                trusted_now_utc=trusted_worker_now_utc))
+        natural_review_output_reads[namespace] = (
+            AuthorityV2NaturalReviewOutputService(
+                store=model._store, fences=services[namespace],
+                graph_verifier=PinnedNaturalReviewOriginalPaidVerifierV2(
+                    graph_db_path),
+                installation_id=installed.installation_id,
+                read_subject="mtls:sha256:" + observer[0],
+                holder=installed.administrator_holder,
+                trusted_now_utc=trusted_worker_now_utc))
+        natural_paid_review_reads[namespace] = (
+            AuthorityV2NaturalPaidReviewService(
+                generation=natural_generation_output_reads[namespace],
+                review=natural_review_output_reads[namespace],
+                graph=PinnedCurrentNaturalPaidReviewVerifierV2(
+                    graph_db_path, natural_history_verifier=model_graph._natural_history),
+                trusted_now_utc=trusted_worker_now_utc))
     fact_committers = dict(worker_result_fact_committers_v2 or {})
     fact_services = {}
     for namespace, committer in fact_committers.items():
@@ -283,10 +381,39 @@ def compose_local_owner_authority(
             store=model._store, fences=services[namespace],
             subject="mtls:sha256:" + observer[0],
             holder=installed.administrator_holder)
+    observation_verifiers = {}
+    for namespace, config in dict(host_onebot_observations_v2 or {}).items():
+        if type(config) is not HostOneBotObservationInstallationV2:
+            raise AuthorityUnavailable("OneBot observation installation is invalid")
+        peer = (config.peer_certificate_sha256, config.profile_id)
+        installed = installations_v2.get(peer)
+        reverse = (v2_final_handoff_reverse or {}).get(namespace)
+        profile = reverse.profile if type(reverse) is ReverseGraphClaimClient else None
+        if (namespace not in services or installed is None or profile is None
+                or installed.source_id != config.clock_source_ref
+                or profile.namespace != namespace
+                or profile.profile_id != config.profile_id
+                or profile.installation_id != installed.installation_id
+                or not any((certificate, profile_id) == peer
+                           and mapped == namespace
+                           for (certificate, profile_id, _), mapped
+                           in namespace_bindings_v2.items())):
+            raise AuthorityUnavailable("OneBot observation installation differs")
+        observation_verifiers[namespace] = InstalledHostOneBotObservationVerifierV2(
+            namespace=namespace,
+            peer_certificate_sha256=config.peer_certificate_sha256,
+            adapter_ref=config.adapter_ref, account_ref=config.account_ref,
+            clock_source_ref=config.clock_source_ref)
     return AuthorityRpcServer(
-        core, v2_fences=services, v2_model_egress=v2_model_egress,
+        core, v2_fences=services, v2_migration_rpc=v2_migration_rpc,
+        v2_model_egress=v2_model_egress,
         v2_model_result_reads=result_reads,
         v2_worker_model_result_reads=worker_result_reads,
+        v2_context_reply_result_reads=context_reply_result_reads,
+        v2_natural_generation_output_reads=natural_generation_output_reads,
+        v2_natural_generation_content_reads=natural_generation_content_reads,
+        v2_natural_review_output_reads=natural_review_output_reads,
+        v2_natural_paid_review_reads=natural_paid_review_reads,
         worker_result_readers_v2=worker_result_readers_v2,
         v2_worker_result_read_facts=fact_services,
         worker_result_fact_committers_v2=fact_committers,
@@ -299,6 +426,10 @@ def compose_local_owner_authority(
         v2_owner_pairings=creation_pairing_source,
         v2_self_identity=self_services,
         self_identity_readers_v2=self_readers,
+        v2_final_handoff_reverse=v2_final_handoff_reverse,
+        v2_final_handoff_issuers=v2_final_handoff_issuers,
+        v2_dispatch_verifiers=v2_dispatch_verifiers,
+        v2_platform_observation_verifiers=observation_verifiers,
         administrator_authorizer=administrator_authorizer,
         publisher_manifest_verifier=publisher_manifest_verifier,
         installations_v2=installations_v2,

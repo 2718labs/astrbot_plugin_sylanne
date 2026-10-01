@@ -102,7 +102,7 @@ def test_drive_proposal_pins_committed_source_access_and_checkpoint(tmp_path):
     try:
         drive = _drive(root, source)
         write = sourced_numeric_drive_write(drive)
-        refs = write.dependencies
+        refs = tuple(AtomKey.from_token(ref) for ref in (drive.checkpoint_ref, drive.source_ref, drive.access_ref))
         atoms = []
         for key in refs:
             revision, encoded = store._db.execute(
@@ -129,6 +129,9 @@ def test_drive_proposal_pins_committed_source_access_and_checkpoint(tmp_path):
         provider = AffectProvider(active_scheme=scheme)
         proposal = provider.propose_sourced_numeric_drive(envelope, snapshot, drive)
         assert proposal.typed_writes == (write,)
+        assert write.dependencies == ()
+        assert proposal.dependencies.current_invalidation == ()
+        assert proposal.dependencies.historical_provenance == tuple(GraphVersion(atom.key, atom.revision) for atom in atoms)
         with pytest.raises(ValueError, match="dependency is absent"):
             provider.validate(proposal, replace(snapshot, atoms=snapshot.atoms[:-1]))
         with pytest.raises(ValueError, match="provenance"):

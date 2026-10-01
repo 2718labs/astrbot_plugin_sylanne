@@ -3,11 +3,13 @@ from dataclasses import replace
 import pytest
 
 from sylanne3.authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
-from sylanne3.domains.d01 import PersonaBlock, PersonaDomain, PersonaPlan
+from sylanne3.domains.d01 import GrowthProposal, PersonaBlock, PersonaDomain, PersonaPlan
 from sylanne3.graph_types import (
     GraphAtom, GraphSnapshot, NamespaceEpoch, TypeRegistry, owner_grant_key,
 )
 from sylanne3.runtime_contracts import NamespaceId
+from sylanne3.memory_types import SourceRecord, access_key, source_key
+from sylanne3.domains.d06 import source_correction_head_key
 
 
 NAMESPACE = NamespaceId("bot", "persona")
@@ -106,3 +108,81 @@ def test_activation_rejects_owner_from_another_namespace_or_uncommitted_guard():
         PersonaDomain.activation_write(
             _plan(), grant, replace(_guard(), authorization_revision=0,
                                     authorization_head="genesis"))
+
+
+def test_growth_candidate_uses_current_head_and_graph_source_consumption():
+    domain = PersonaDomain()
+    growth_plan = PersonaPlan(
+        "chosen", NAMESPACE, 1,
+        (_plan().blocks[0], PersonaBlock("care", "value", "be caring", "growth")),
+        (), True,
+    )
+    grant = _grant()
+    plan_write = domain.plan_write(growth_plan)
+    activation = domain.activation_write(growth_plan, grant, _guard())
+    atoms = [grant, GraphAtom(plan_write.key, 1, plan_write.value),
+             GraphAtom(activation.key, 1, activation.value)]
+    for source_id, root in (("observed:one", "family:one"), ("observed:two", "family:two")):
+        source = SourceRecord(source_id, "observed outcome", "user", "observed", "confirmed",
+                              1.0, 1.0, root, ("owner",), ("consolidation",), (), "independent")
+        atoms.append(GraphAtom(source_key("bot", "persona", source_id), 1, source.to_dict()))
+        atoms.append(GraphAtom(access_key("bot", "persona", source_id), 1, {
+            "source_id": source_id, "audiences": ["owner"], "purposes": ["consolidation"],
+            "status": "active", "recorded_at": 1.0,
+        }))
+        atoms.append(GraphAtom(source_correction_head_key(NAMESPACE, source_id), 0, {}, False))
+    snapshot = GraphSnapshot(tuple(atoms), (NamespaceEpoch("bot", "persona", 3),))
+    growth = GrowthProposal("growth:one", "chosen@1", "care", "care with consent",
+                            ("family:one", "family:two"), True, "core")
+    candidate = domain.issue_growth_candidate(
+        snapshot, namespace=NAMESPACE, current_guard=_guard(), proposal=growth,
+        source_ids=("observed:one", "observed:two"),
+    )
+    assert candidate.head_id == "chosen@2"
+    assert {write.key.type_name for write in candidate.typed_writes} == {
+        "d01.persona_plan.v1", "d01.persona_revision.v1",
+        "d01.persona_activation.v1", "d01.growth_contribution.v1",
+    }
+    assert len(candidate.read_versions) == 13  # head/grant, source/access/correction, absent contributions, revision/activation
+    assert tuple(ref.revision for ref in candidate.read_versions[-4:-2]) == (0, 0)
+    assert domain.validate_growth_candidate(
+        candidate, snapshot, namespace=NAMESPACE, current_guard=_guard(),
+        proposal=growth, source_ids=("observed:one", "observed:two"),
+    ) is candidate
+    with pytest.raises(ValueError, match="differs"):
+        domain.validate_growth_candidate(
+            replace(candidate, read_versions=candidate.read_versions[:-1]), snapshot,
+            namespace=NAMESPACE, current_guard=_guard(), proposal=growth,
+            source_ids=("observed:one", "observed:two"),
+        )
+    consumed = candidate.typed_writes[-1]
+    with pytest.raises(ValueError, match="already been consumed"):
+        domain.issue_growth_candidate(
+            replace(snapshot, atoms=snapshot.atoms + (GraphAtom(consumed.key, 1, consumed.value),)),
+            namespace=NAMESPACE, current_guard=_guard(), proposal=growth,
+            source_ids=("observed:one", "observed:two"),
+        )
+    with pytest.raises(ValueError, match="stale persona head"):
+        domain.issue_growth_candidate(
+            snapshot, namespace=NAMESPACE, current_guard=_guard(),
+            proposal=replace(growth, base_head="chosen@0"),
+            source_ids=("observed:one", "observed:two"),
+        )
+    authored_source = replace(SourceRecord.from_dict(atoms[3].value), source_kind="authored")
+    with pytest.raises(ValueError, match="cannot support natural growth"):
+        domain.issue_growth_candidate(
+            replace(snapshot, atoms=tuple(
+                GraphAtom(atom.key, atom.revision, authored_source.to_dict()) if atom.key == atoms[3].key else atom
+                for atom in snapshot.atoms
+            )), namespace=NAMESPACE, current_guard=_guard(), proposal=growth,
+            source_ids=("observed:one", "observed:two"),
+        )
+    corrected_head = source_correction_head_key(NAMESPACE, "observed:one")
+    with pytest.raises(ValueError, match="growth evidence or access"):
+        domain.issue_growth_candidate(
+            replace(snapshot, atoms=tuple(
+                replace(atom, valid=True, revision=1) if atom.key == corrected_head else atom
+                for atom in snapshot.atoms
+            )), namespace=NAMESPACE, current_guard=_guard(), proposal=growth,
+            source_ids=("observed:one", "observed:two"),
+        )

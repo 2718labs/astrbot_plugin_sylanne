@@ -1,8 +1,8 @@
-"""Internal recovery of a durably prepared original v2 deletion intent.
+"""Internal recovery of durably prepared original v2 deletion phases.
 
 This service cannot create a deletion request, append a journal event, or
-advance accepted/closed. A trusted D12 issuer and prepare service are still
-required before this recovery core can be used by a production caller.
+issue phase evidence. A trusted Owner/D12 issuer, graph barrier verifier, and
+cleanup verifier are required before a production caller may prepare phases.
 """
 
 from __future__ import annotations
@@ -16,13 +16,13 @@ from .v2_fence_store import AuthorityV2FenceStore
 
 
 class AuthorityV2DeletionPendingRecovery:
-    """Complete only the exact absent→pending mutation already in Authority."""
+    """Complete one exact prepared deletion phase already in Authority."""
 
     def __init__(self, *, core: AuthorityServiceCore,
                  fences: AuthorityV2FenceStore,
                  deletion: AuthorityV2DeletionGuard,
                  execution: AuthorityV2ExecutionJournal,
-                 namespace: str):
+                 namespace: str, scoped_store=None):
         identifier(namespace, "namespace")
         if (type(core) is not AuthorityServiceCore
                 or type(fences) is not AuthorityV2FenceStore
@@ -34,8 +34,26 @@ class AuthorityV2DeletionPendingRecovery:
         self.core, self.fences = core, fences
         self.deletion, self.execution = deletion, execution
         self.namespace = namespace
+        if scoped_store is not None:
+            from .v2_scoped_erasure_store import AuthorityV2ScopedErasureStore
+
+            if (type(scoped_store) is not AuthorityV2ScopedErasureStore
+                    or scoped_store.core is not core
+                    or scoped_store.fences is not fences
+                    or scoped_store.deletion is not deletion
+                    or scoped_store.execution is not execution
+                    or scoped_store.namespace != namespace):
+                raise AuthorityUnavailable("paired scoped deletion store required")
+        self.scoped_store = scoped_store
         with core._tx() as db:
             self._require_mode(db)
+            scoped_present = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='authority_scoped_erasure_v2'").fetchone() is not None
+            if scoped_present != (scoped_store is not None):
+                raise AuthorityUnavailable("scoped deletion recovery mode differs")
+            if scoped_store is not None:
+                scoped_store.state_locked(db, allow_reserved=True)
 
     @staticmethod
     def _require_mode(db):
@@ -59,9 +77,16 @@ class AuthorityV2DeletionPendingRecovery:
             raise AuthorityUnavailable("original deletion mutation required")
         permit = pending.permit
         self.core._require(credential, "deletion", self.namespace, permit.holder)
-        if (pending.source_phase, pending.target_phase, pending.evidence.kind) != (
-                "absent", "pending", "request_authorized"):
-            raise AuthorityUnavailable("later deletion phases remain HOLD")
+        phase_sources = {
+            ("absent", "pending", "request_authorized"): "clear",
+            ("pending", "accepted", "barrier_installed"): "pending",
+            ("accepted", "closed", "cleanup_complete"): "accepted",
+        }
+        source_phase = phase_sources.get((pending.source_phase,
+                                          pending.target_phase,
+                                          pending.evidence.kind))
+        if source_phase is None:
+            raise AuthorityUnavailable("unknown deletion phase transition")
 
         # Fixed lock order. No credential verifier, graph callback or D12 issuer
         # is invoked while any journal guard or Authority transaction is held.
@@ -85,6 +110,7 @@ class AuthorityV2DeletionPendingRecovery:
                         self.fences._decode_mutation_row(mutation))
                     if live_kind != "deletion" or live_pending != pending:
                         raise AuthorityUnavailable("deletion mutation changed during recovery")
+                    self.fences.require_prior_deletion_transition_locked(db, pending, core=self.core)
                     row = self.core._row(db, self.namespace)
                     fence = self.fences._row(db, permit.operation_id)
                     if (fence is None or fence[6] != "active"
@@ -108,32 +134,40 @@ class AuthorityV2DeletionPendingRecovery:
                                 or deletion_head.digest != receipt.after_anchor.deletion_digest
                                 or self.core._anchor(db, self.namespace, row)
                                    != receipt.after_anchor
-                                or row[9] != "pending"
+                                or row[9] != (
+                                    "accepted" if self.scoped_store is not None
+                                    and pending.target_phase == "closed"
+                                    else pending.target_phase)
                                 or fence[10] is not None
                                 or self.fences._permit(fence) != updated):
                             raise AuthorityUnavailable("completed deletion receipt differs from heads")
                         return receipt
 
                     if (self.core._anchor(db, self.namespace, row) != pending.before_anchor
-                            or row[9] != "clear"
+                            or row[9] != source_phase
                             or self.fences._permit(fence) != permit
                             or fence[10] != canonical_bytes(pending)):
                         raise AuthorityUnavailable("original deletion pending anchor differs")
                     if observed is None:
                         return None
 
+                    target_phase = (
+                        self.scoped_store.transition_locked(db, pending)
+                        if self.scoped_store is not None else pending.target_phase)
                     changed = db.execute(
                         "UPDATE authority_namespaces SET deletion_seq=?,deletion_digest=?,"
-                        "deletion_phase='pending',revocation_epoch=?,anchor_nonce=? "
+                        "deletion_phase=?,revocation_epoch=?,anchor_nonce=? "
                         "WHERE namespace=? AND holder=? AND generation=? AND phase='active' "
-                        "AND deletion_phase='clear' AND deletion_journal_id=? "
+                        "AND deletion_phase=? AND deletion_journal_id=? "
                         "AND deletion_seq=? AND deletion_digest=? AND execution_journal_id=? "
                         "AND execution_seq=? AND execution_digest=? AND revocation_epoch=? "
                         "AND anchor_nonce=?",
                         (pending.expected_deletion_seq, pending.expected_append_digest,
+                         target_phase,
                          pending.before_anchor.revocation_epoch + 1,
                          self.core._new_nonce(), self.namespace, permit.holder,
-                         permit.generation, pending.before_anchor.deletion_journal_id,
+                         permit.generation, source_phase,
+                         pending.before_anchor.deletion_journal_id,
                          pending.before_anchor.deletion_seq,
                          pending.before_anchor.deletion_digest,
                          pending.before_anchor.execution_journal_id,
@@ -150,7 +184,7 @@ class AuthorityV2DeletionPendingRecovery:
                     self.fences.finish_deletion_mutation_locked(
                         db, result, subject=subject)
                     self.core._event(
-                        db, self.namespace, "v2_deletion_pending",
+                        db, self.namespace, "v2_deletion_" + pending.target_phase,
                         permit.generation,
                         (pending.deletion_operation_id, pending.mutation_id,
                          pending.expected_append_id, pending.expected_append_digest))

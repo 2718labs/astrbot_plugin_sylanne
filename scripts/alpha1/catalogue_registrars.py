@@ -1,4 +1,4 @@
-"""One explicit adapter for the twelve real D01-D12 TypeSpec exports.
+"""One explicit adapter for the thirteen real D01-D13 TypeSpec exports.
 
 This is an export-time registry only. Registering candidates here has no
 runtime effect and must never be interpreted as character-scheme activation.
@@ -29,6 +29,7 @@ def register_all(registry: TypeRegistry) -> None:
     from sylanne3.domains.d09 import D09ExpressionProvider
     from sylanne3.domains.d10 import LifeDomain
     from sylanne3.domains.d12.types import graph_type_specs
+    from sylanne3.domains.d13 import D13ShortContextProvider
 
     _register(registry, PersonaDomain().type_specs())
     _register(registry, BodyDomain().type_specs())
@@ -41,6 +42,7 @@ def register_all(registry: TypeRegistry) -> None:
     _register(registry, D09ExpressionProvider.register_types())
     _register(registry, tuple(spec.to_graph_spec() for spec in LifeDomain.type_specs()))
     _register(registry, graph_type_specs())
+    _register(registry, D13ShortContextProvider.register_types())
     # D11 is owned by the runtime workstream. Once its real export arrives,
     # include it automatically; absence remains visible in current.json.
     if importlib.util.find_spec("sylanne3.runtime.d11_types") is not None:

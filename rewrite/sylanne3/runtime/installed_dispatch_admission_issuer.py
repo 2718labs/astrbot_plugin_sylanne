@@ -39,6 +39,7 @@ from .dispatch_current_commitment_check import CRITERIA_REF, CRITERIA_VERSION
 from .d11_types import RuntimeOutboxValue, job_graph_write
 from .jobs import JobConflict, get_job
 from .issuers import D02ResourceIssuer, D11BudgetGrantIssuer, IssuerAuthorityDenied
+from .dispatch_check_reissue import PostC02FinalReissueV2
 
 if TYPE_CHECKING:
     from ..authority_service.v2_execution_bridge import CurrentEffectReadV2
@@ -62,6 +63,7 @@ class TrustedDispatchAdmissionContextV1:
     graph_receipt: GraphReceipt
     owner_guard: OwnerAuthorizationGuardV1 | None
     current_effect: CurrentEffectReadV2 | None
+    effect_snapshot: object | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,22 @@ class DispatchCommandInspectionV1:
     budget_reservation_digest: str | None = None
 
 
+def _message_reservation_dimension_limit(lease, ceiling: dict[str, int]
+                                         ) -> tuple[str, int] | None:
+    """Select the one reserved dimension from a possibly multi-use parent lease.
+
+    The caller must first verify the signed quote and current reservation.
+    """
+    if len(ceiling) != 1 or lease.state != "active":
+        return None
+    dimension, amount = next(iter(ceiling.items()))
+    limit = lease.limits.get(dimension)
+    if (type(dimension) is not str or type(amount) is not int
+            or type(limit) is not int or not 0 < amount <= limit):
+        return None
+    return dimension, limit
+
+
 def inspect_current_private_command(
     db, bundle, candidate: DispatchCandidateEvidenceV1,
     budget: DispatchBudgetInspectionV1,
@@ -172,9 +190,21 @@ def inspect_current_private_command(
         if reservation is None:
             return hold("dispatch.current_budget_reservation_missing")
         ceiling = json.loads(reservation[1])
+        awaiting_host_takeover = (
+            job.phase == "waiting"
+            and job.work_kind == "message"
+            and job.wake_condition == {
+                "kind": "post_c02_reply_host_takeover",
+                "operation_id": identity.operation_id,
+            }
+            and len(bundle.envelope.version_guard.resource_lease_versions) == 1
+            and bundle.envelope.version_guard.resource_lease_versions[0].ref
+                .startswith("private-reply-dispatch-q-")
+        )
         if (job_atom.value != job_graph_write(job).value
                 or outbox.job_ref != job_ref or outbox.job_id != job.job_id
-                or outbox.phase != "pending" or job.phase != "queued"
+                or outbox.phase != "pending"
+                or not (job.phase == "queued" or awaiting_host_takeover)
                 or (job.bot_id, job.persona_id) != namespace.as_tuple
                 or (job.activity_id, job.operation_id, job.effect_id) != (
                     identity.activity_id, identity.operation_id, identity.effect_id)
@@ -184,7 +214,7 @@ def inspect_current_private_command(
                 or outbox.payload_ref != dispatch_segment_payload_ref(
                     candidate.batch_ref, 0)
                 or reservation[2] != "reserved" or not ceiling
-                or len(ceiling) != 1 or len(lease.limits) != 1
+                or len(ceiling) != 1
                 or budget.receipt is None
                 or frozen_grant.required_check_refs
                 != tuple(batch["required_check_refs"])
@@ -192,10 +222,11 @@ def inspect_current_private_command(
                 or frozen_grant.segment_manifest_digest
                 != batch["grant_manifest_digest"]):
             return hold("dispatch.current_job_outbox_budget_batch_differs")
-        dimension, limit = next(iter(lease.limits.items()))
-        if (set(ceiling) != {dimension} or ceiling[dimension] <= 0
-                or lease.state != "active"):
+        selected_dimension = _message_reservation_dimension_limit(
+            lease, ceiling)
+        if selected_dimension is None:
             return hold("dispatch.narrow_single_dimension_budget")
+        dimension, limit = selected_dimension
         segment = batch["segments"][0]
         deadline = min(
             float(batch["valid_until"]),
@@ -404,11 +435,179 @@ class DispatchAdmissionHold(RuntimeError):
         super().__init__("dispatch admission HOLD: " + ", ".join(self.missing))
 
 
+@dataclass(frozen=True, slots=True)
+class _PostC02FinalInspectionV2:
+    missing: tuple[str, ...]
+    receipts: tuple[CheckReceipt, ...]
+    binding: RoleBinding
+
+
+def _inspect_post_c02_final_reissue_v2(
+    db, bundle, snapshot: GraphSnapshot, candidate: DispatchCandidateEvidenceV1,
+    action: ActionIntent, detail: PostC02FinalReissueV2, *,
+    context: ContextProvider | None,
+    trusted_context: TrustedDispatchAdmissionContextV1 | None,
+    now_utc: float,
+) -> _PostC02FinalInspectionV2:
+    """Match W01's final E+1 receipts against independent current SQL rows."""
+    from ..domains.d03.prebatch_social import match_prebatch_batch_v1
+    from ..domains.d08.communication_route_binding import verify_route_bound_grant_v2
+    from .reply_entity_route_v2 import read_current_reply_entity_route_binding_v2
+    from .reply_model_job import CurrentReplyRouteManifestV2
+
+    if (type(detail) is not PostC02FinalReissueV2
+            or type(context) is not ContextProvider
+            or type(trusted_context) is not TrustedDispatchAdmissionContextV1
+            or type(snapshot) is not GraphSnapshot
+            or len(snapshot.epochs) != 1
+            or detail.graph_receipt != trusted_context.graph_receipt
+            or detail.candidate.graph_epoch != snapshot.epochs[0].revision
+            or detail.candidate.graph_epoch != trusted_context.graph_receipt.epoch.revision
+            or detail.candidate.permit_token != trusted_context.scope.permit.token
+            or detail.candidate.authority_head != trusted_context.scope.pinned_anchor
+            or trusted_context.scope.graph_epoch.revision + 1
+               != detail.candidate.graph_epoch
+            or detail.action.intent != action
+            or detail.action.schema is None
+            or detail.social.manifest is None
+            or detail.social.manifest.operation_id != action.identity.operation_id
+            or detail.social.manifest.action_id != action.action_id
+            or detail.social.manifest.target_ref != action.target_ref
+            or detail.social.manifest.source_ref not in action.source_refs
+            or detail.social.manifest.audience
+               != (detail.route_binding.conversation_ref,)
+            or candidate.operation_id != action.identity.operation_id
+            or candidate.action_digest != canonical_digest(action)):
+        raise DispatchAdmissionHold(("dispatch.post_c02_final_reissue_scope",))
+    namespace = trusted_context.scope.namespace
+    route_binding = detail.route_binding
+    if (route_binding.namespace != namespace
+            or route_binding.query != QueryEpoch(namespace, "all",
+                                                  detail.candidate.graph_epoch)
+            or route_binding.target_entity_ref != action.target_ref
+            or candidate.source_audience != (route_binding.conversation_ref,)
+            or candidate.source_refs != (route_binding.source_ref,)):
+        raise DispatchAdmissionHold(("dispatch.post_c02_entity_route_scope",))
+    receipts = detail.candidate.checks
+    if (len(receipts) != 5
+            or {item.check_kind for item in receipts}
+               != {"role_binding", "boundary", "source_grant",
+                   "commitment_conflict", "dispatch_budget"}
+            or any(item.result != "pass" or item.coverage != "full"
+                   or item.valid_until <= now_utc for item in receipts)):
+        raise DispatchAdmissionHold(("dispatch.post_c02_five_final_checks",))
+    by_kind = {item.check_kind: item for item in receipts}
+    if (len(by_kind) != 5
+            or {spec.check_kind for spec in action.required_checks} != set(by_kind)
+            or len(action.required_checks) != 5
+            or any(by_kind[spec.check_kind].issuer != spec.provider_id
+                   or by_kind[spec.check_kind].subject_ref != spec.subject_ref
+                   or by_kind[spec.check_kind].action_ref != spec.action_ref
+                   or by_kind[spec.check_kind].purpose != spec.purpose
+                   or by_kind[spec.check_kind].input_versions
+                      != spec.required_input_versions
+                   for spec in action.required_checks)
+            or detail.social.role_receipt != by_kind["role_binding"]
+            or detail.social.boundary_receipt != by_kind["boundary"]
+            or detail.d08_scope.receipt != by_kind["commitment_conflict"]):
+        raise DispatchAdmissionHold(("dispatch.post_c02_frozen_check_scope",))
+    try:
+        current_route = read_current_reply_entity_route_binding_v2(
+            db, namespace, CurrentReplyRouteManifestV2(
+                namespace, route_binding.c02_operation_id,
+                route_binding.source_ref, route_binding.platform_ref,
+                route_binding.conversation_ref, route_binding.scene_ref,
+                canonical_digest({
+                    "account_ref": route_binding.platform_ref,
+                    "destination_ref": route_binding.conversation_ref,
+                    "scene_ref": route_binding.scene_ref,
+                })), route_binding.query, now_utc=now_utc)
+        if current_route != route_binding:
+            raise ValueError("current route binding changed")
+        for item in detail.candidate.positive_reads:
+            row = db.execute(
+                "SELECT revision,valid FROM graph_atoms WHERE token=? "
+                "AND bot=? AND persona=?", (item.ref, *namespace.as_tuple),
+            ).fetchone()
+            if row != (item.version, 1):
+                raise ValueError("final positive graph read changed")
+        expected_negative = tuple((
+            item.predicate_ref, item.query, item.scanned_versions,
+            len(item.matching_refs)) for item in detail.d08_scope.negative_queries)
+        actual_negative = tuple((
+            item.predicate_ref, item.query, item.scanned_versions,
+            item.matching_count) for item in detail.candidate.negative_queries)
+        if (not actual_negative or actual_negative != expected_negative
+                or any(item.query != route_binding.query
+                       or item.matching_count != 0 or item.coverage != "full"
+                       for item in detail.candidate.negative_queries)):
+            raise ValueError("final negative query is incomplete")
+        for closure in detail.candidate.negative_queries:
+            for item in closure.scanned_versions:
+                row = db.execute(
+                    "SELECT revision,valid FROM graph_atoms WHERE token=? "
+                    "AND bot=? AND persona=?", (item.ref, *namespace.as_tuple),
+                ).fetchone()
+                if row != (item.version, 1):
+                    raise ValueError("final negative scan row changed")
+        grant_atom = _current_atom(
+            db, namespace, candidate.grant_ref,
+            "d08.communication_intent_grant.v1")
+        batch_atom = _current_atom(
+            db, namespace, candidate.batch_ref,
+            "d09.verified_segment_batch.v1")
+        schema_atom = _current_atom(
+            db, namespace, candidate.schema_ref, "d08.action_schema.v1")
+        d08_types = {spec.name: spec for spec in GoalExecutionProvider().register_types()}
+        grant = d08_types["d08.communication_intent_grant.v1"].validator(
+            grant_atom.value)
+        schema = d08_types["d08.action_schema.v1"].validator(schema_atom.value)
+        if (grant != detail.grant or canonical_digest(grant) != candidate.grant_digest
+                or schema != ActionSchemaRecord.bind(action, detail.action.schema)
+                or canonical_digest(schema) != candidate.schema_digest
+                or batch_atom.value["batch_digest"] != candidate.batch_digest
+                or not match_prebatch_batch_v1(detail.social, batch_atom.value)
+                or batch_atom.value["target_ref"] != route_binding.target_entity_ref
+                or batch_atom.value["audiences"] != [route_binding.conversation_ref]
+                or batch_atom.value["grant_digest"] != canonical_digest(grant)):
+            raise ValueError("current action grant or batch differs")
+        verify_route_bound_grant_v2(
+            grant, action, detail.action.communication, route_binding)
+        request = RoleBindingRequest(
+            f"persona:{namespace.persona_id}", action.target_ref, None,
+            route_binding.scene_ref, action.action_kind, action.purpose,
+            now_utc, True)
+        resolution, _ = derive_current_domain_reads(
+            db, trusted_context.projection, request, context)
+        if resolution.status != "complete" or len(resolution.matched_bindings) != 1:
+            raise ValueError("one current role resolution is required")
+        binding_id = resolution.matched_bindings[0]
+        matching = []
+        for atom in trusted_context.projection.role_bindings:
+            value = RoleBinding(**{
+                **atom.value, "norm_refs": tuple(atom.value["norm_refs"]),
+                "source_refs": tuple(atom.value["source_refs"]),
+            })
+            if (value.role_binding_id == binding_id
+                    and atom.key.name == binding_id
+                    and atom.revision == value.binding_version
+                    and value.applies_to(request)):
+                matching.append(value)
+        if len(matching) != 1:
+            raise ValueError("resolved binding differs from current SQL")
+    except (sqlite3.Error, RuntimeError, TypeError, ValueError, KeyError,
+            StopIteration) as exc:
+        raise DispatchAdmissionHold((
+            "dispatch.post_c02_final_current_rows_or_binding",)) from exc
+    return _PostC02FinalInspectionV2((), receipts, matching[0])
+
+
 def inspect_current_d06_source_grant(
     db, intent: ActionIntent, spec: RequiredCheckSpec,
     candidate: DispatchCandidateEvidenceV1, *, audience: tuple[str, ...],
     trusted_context: TrustedDispatchAdmissionContextV1 | None = None,
     now_utc: float | None = None,
+    valid_until_utc: float | None = None,
 ) -> DispatchSourceInspectionV1:
     """Read D06 inputs from the caller-held graph transaction.
 
@@ -506,10 +705,16 @@ def inspect_current_d06_source_grant(
     if barrier and (type(now_utc) not in (int, float)
                     or not math.isfinite(now_utc)):
         raise DispatchAdmissionHold(("d06.trusted_admission_time",))
+    if valid_until_utc is not None and (
+            not barrier or type(valid_until_utc) not in (int, float)
+            or not math.isfinite(valid_until_utc)
+            or valid_until_utc <= now_utc):
+        raise DispatchAdmissionHold(("d06.trusted_source_expiry",))
     try:
         receipt = provide_source_grant_check(
             intent, SourceGrantRead(snapshot, audience, "expression", True, barrier),
-            valid_until=now_utc + 1.0 if barrier else 0.0,
+            valid_until=(valid_until_utc if valid_until_utc is not None else
+                         now_utc + 1.0 if barrier else 0.0),
         )
     except (TypeError, ValueError) as exc:
         raise DispatchAdmissionHold(("d06.provider_recomputation",)) from exc
@@ -691,6 +896,7 @@ def inspect_current_d03_d05(
 def inspect_current_d11_dispatch_budget(
     db, intent: ActionIntent, *, d11_issuer: D11BudgetGrantIssuer | None,
     d02_issuer: D02ResourceIssuer | None, now_utc: float,
+    natural_communication: bool = False,
 ) -> DispatchBudgetInspectionV1:
     """Recompute one scoped D11 budget check from signed and durable state.
 
@@ -758,12 +964,27 @@ def inspect_current_d11_dispatch_budget(
     except (TypeError, ValueError, json.JSONDecodeError):
         return hold("d11.current_reservation_ceiling_invalid",
                     lease_id=lease_id, quote_id=quote_id)
+    from .issuers import private_reply_dispatch_quote_id
+
+    quoted_action = (
+        quote.work_kind == intent.action_kind
+        or (natural_communication
+            and intent.action_kind == "communication"
+            and intent.identity.phase == "post_c02_reply_dispatch"
+            and quote.work_kind == "message"
+            and quote.quote_id == private_reply_dispatch_quote_id(
+                NamespaceId(quote.bot_id, quote.persona_id),
+                intent.identity.operation_id)
+            and quote.snapshot_ref.startswith(
+                "k03snap:private-reply-dispatch-policy-")
+            and quote.resource_ref.startswith("private-reply-dispatch-src:"))
+    )
     if (quote.quote_id != quote_id or quote.version != by_ref[quote_refs[0]]
             or quote.persona_id != spec.subject_ref.removeprefix("persona:")
             or (quote.activity_id, quote.effect_id, quote.operation_id) != (
                 intent.identity.activity_id, intent.identity.effect_id,
                 intent.identity.operation_id)
-            or quote.work_kind != intent.action_kind
+            or not quoted_action
             or quote.parent_budget_lease_ref != lease_id
             or quote.valid_until_utc <= now_utc
             or quote.deadline_utc <= now_utc
@@ -1024,7 +1245,8 @@ class InstalledDispatchAdmissionIssuer:
 
     def issue_dispatch_admission(self, bundle, snapshot, candidate, db, *,
                                  graph_incarnation: str, now_utc: float,
-                                 trusted_context: TrustedDispatchAdmissionContextV1 | None = None):
+                                 trusted_context: TrustedDispatchAdmissionContextV1 | None = None,
+                                 post_c02_final_reissue: PostC02FinalReissueV2 | None = None):
         self._issued = None
         if not getattr(db, "in_transaction", False):
             raise DispatchAdmissionHold(("graph.current_write_transaction",))
@@ -1052,28 +1274,87 @@ class InstalledDispatchAdmissionIssuer:
         if (candidate.action_digest != canonical_digest(action)
                 or candidate.operation_id != action.identity.operation_id):
             raise DispatchAdmissionHold(("d08.current_action_identity",))
+        if post_c02_final_reissue is None:
+            try:
+                namespace = NamespaceId(action_key.owner.bot, action_key.owner.persona)
+                grant_row = db.execute(
+                    "SELECT value FROM graph_atoms WHERE token=? AND bot=? "
+                    "AND persona=? AND valid=1",
+                    (candidate.grant_ref, *namespace.as_tuple),
+                ).fetchone()
+                if grant_row is not None:
+                    grant = next(
+                        spec for spec in GoalExecutionProvider().register_types()
+                        if spec.name == "d08.communication_intent_grant.v1"
+                    ).validator(json.loads(grant_row[0]))
+                    if grant.route_binding_digest is not None:
+                        raise DispatchAdmissionHold((
+                            "dispatch.post_c02_final_reissue_required",))
+            except DispatchAdmissionHold:
+                raise
+            except (StopIteration, TypeError, ValueError, sqlite3.Error,
+                    json.JSONDecodeError):
+                pass  # Existing current-command inspection reports a malformed grant.
         specs = tuple(item for item in action.required_checks
                       if item.check_kind == "source_grant")
         if len(specs) != 1:
             raise DispatchAdmissionHold(("d06.unique_source_grant_spec",))
+        budget = inspect_current_d11_dispatch_budget(
+            db, action, d11_issuer=self._d11, d02_issuer=self._d02,
+            now_utc=now_utc,
+        )
+        source_expiry = None
+        if post_c02_final_reissue is not None:
+            guard = bundle.envelope.version_guard.resource_lease_versions
+            if (budget.status != "check_pass" or budget.receipt is None
+                    or budget.quote_id is None
+                    or budget.lease_id is None or self._d02 is None
+                    or self._d11 is None or len(guard) != 1
+                    or guard[0].ref != budget.quote_id):
+                raise DispatchAdmissionHold((
+                    "dispatch.post_c02_signed_deadline_unavailable",))
+            try:
+                quote = self._d02._load_quote(
+                    db, budget.quote_id, guard[0].version)
+                grant = self._d11.current_budget_grant(db, budget.lease_id)
+            except (IssuerAuthorityDenied, ValueError, TypeError) as exc:
+                raise DispatchAdmissionHold((
+                    "dispatch.post_c02_signed_deadline_unavailable",)) from exc
+            source_expiry = bundle.envelope.deadline_utc
+            if (quote.quote_id != guard[0].ref
+                    or quote.version != guard[0].version
+                    or quote.operation_id != action.identity.operation_id
+                    or quote.deadline_utc != source_expiry
+                    or quote.valid_until_utc < source_expiry
+                    or grant.valid_until_utc < source_expiry
+                    or budget.receipt.valid_until < source_expiry
+                    or source_expiry <= now_utc):
+                raise DispatchAdmissionHold((
+                    "dispatch.post_c02_signed_deadline_differs",))
         inspection = inspect_current_d06_source_grant(
             db, action, specs[0], candidate, audience=candidate.source_audience,
             trusted_context=trusted_context, now_utc=now_utc,
+            valid_until_utc=source_expiry,
         )
+        post_c02 = None
         social_missing = ("d03.d05.installed_context_provider",)
-        if self._context is not None:
+        if post_c02_final_reissue is not None:
+            post_c02 = _inspect_post_c02_final_reissue_v2(
+                db, bundle, snapshot, candidate, action,
+                post_c02_final_reissue, context=self._context,
+                trusted_context=trusted_context, now_utc=now_utc)
+            social_missing = post_c02.missing
+        elif self._context is not None:
             social = inspect_current_d03_d05(
                 db, candidate, context=self._context, now_utc=now_utc,
                 trusted_context=trusted_context,
             )
             social_missing = social.missing
-        budget = inspect_current_d11_dispatch_budget(
-            db, action, d11_issuer=self._d11, d02_issuer=self._d02,
-            now_utc=now_utc,
-        )
-        commitments = inspect_current_d08_commitments(
-            db, candidate, trusted_context=trusted_context, now_utc=now_utc,
-        )
+        commitments = (DispatchCommitmentInspectionV1(
+            "check_pass", (), snapshot.epochs[0].revision, (), (),
+            post_c02.receipts[3]) if post_c02 is not None and not post_c02.missing
+            else inspect_current_d08_commitments(
+                db, candidate, trusted_context=trusted_context, now_utc=now_utc))
         route = inspect_current_private_route(db, candidate, now_utc=now_utc)
         owner = inspect_current_owner_grant(
             db, NamespaceId(action_key.owner.bot, action_key.owner.persona),
@@ -1101,10 +1382,13 @@ class InstalledDispatchAdmissionIssuer:
                 or trusted_context.current_effect.state != "absent"
                 or bundle.envelope.parent_budget_lease_ref != budget.lease_id):
             raise DispatchAdmissionHold(("dispatch.current_trusted_context_scope",))
-        receipts = (
-            social.role_receipt, social.boundary_receipt,
-            inspection.receipt, commitments.receipt, budget.receipt,
-        )
+        receipts = (post_c02.receipts if post_c02 is not None and not post_c02.missing
+                    else (social.role_receipt, social.boundary_receipt,
+                          inspection.receipt, commitments.receipt, budget.receipt))
+        if (post_c02 is not None and not post_c02.missing
+                and (receipts[2] != inspection.receipt
+                     or receipts[4] != budget.receipt)):
+            raise DispatchAdmissionHold(("dispatch.final_source_or_budget_reissue_differs",))
         if (any(item is None or item.result != "pass" or item.coverage != "full"
                 for item in receipts)
                 or {item.check_kind for item in action.required_checks}
@@ -1116,25 +1400,28 @@ class InstalledDispatchAdmissionIssuer:
                for spec in action.required_checks):
             raise DispatchAdmissionHold(("dispatch.frozen_check_provider_differs",))
         receipts = tuple(by_kind[spec.check_kind] for spec in action.required_checks)
-        projection = trusted_context.projection
-        bindings = []
-        for atom in projection.role_bindings:
-            try:
-                binding = RoleBinding(**{
-                    **atom.value, "norm_refs": tuple(atom.value["norm_refs"]),
-                    "source_refs": tuple(atom.value["source_refs"]),
-                })
-            except (KeyError, TypeError, ValueError):
-                continue
-            if (binding.role_binding_id == atom.key.name
-                    and binding.binding_version == atom.revision
-                    and binding.status == "active"
-                    and binding.scene_ref == route.scene_ref
-                    and binding.target_entity_ref == action.target_ref
-                    and binding.effective_from <= now_utc
-                    and (binding.effective_until is None
-                         or now_utc <= binding.effective_until)):
-                bindings.append(binding)
+        if post_c02 is not None:
+            bindings = (post_c02.binding,)
+        else:
+            projection = trusted_context.projection
+            bindings = []
+            for atom in projection.role_bindings:
+                try:
+                    binding = RoleBinding(**{
+                        **atom.value, "norm_refs": tuple(atom.value["norm_refs"]),
+                        "source_refs": tuple(atom.value["source_refs"]),
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (binding.role_binding_id == atom.key.name
+                        and binding.binding_version == atom.revision
+                        and binding.status == "active"
+                        and binding.scene_ref == route.scene_ref
+                        and binding.target_entity_ref == action.target_ref
+                        and binding.effective_from <= now_utc
+                        and (binding.effective_until is None
+                             or now_utc <= binding.effective_until)):
+                    bindings.append(binding)
         if len(bindings) != 1:
             raise DispatchAdmissionHold(("d03.unique_current_private_binding",))
         request = command.request

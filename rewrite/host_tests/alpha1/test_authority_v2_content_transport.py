@@ -10,7 +10,10 @@ import types
 import unittest
 
 from sylanne3.authority_service.contract import CONTENT_OPERATIONS
-from sylanne3.authority_service.v2_contract import FencePermitV2, SCHEMA, to_wire
+from sylanne3.authority_service.v2_contract import (
+    DeletionEvidenceV1, DeletionMutationReceiptV1, DeletionPendingV1,
+    FencePermitV2, SCHEMA, deletion_scope_digest, to_wire,
+)
 # Import the transport without requiring an installed AstrBot host.
 _host_package = sys.modules.get("sylanne3.host")
 if _host_package is None:
@@ -125,6 +128,133 @@ class ContentTransportTests(unittest.IsolatedAsyncioTestCase):
                         request_id="finish-a", request_digest="sha256:" + "e" * 64,
                     )
         self.assertEqual(len(self.calls), before)
+
+    async def test_current_erasure_prepare_is_exact_typed_pending_only_rpc(self):
+        from uuid import UUID
+
+        operation_id = str(UUID("550e8400-e29b-41d4-a716-446655440000"))
+        root = "source-a"
+        request_digest = "sha256:" + "a" * 64
+        append_digest = "sha256:" + "b" * 64
+        permit = FencePermitV2(
+            "authority-1", "authority:ns", self.handshake.installation_identity_ref,
+            "admin-holder", 1, "delete", "fence-operation", "t" * 32, 0, 0,
+            RestoreAnchor("authority-1", "authority:ns", 1,
+                          "deletion", 0, "genesis", "execution", 0,
+                          "genesis", 0, "proof-a"),
+        )
+        anchor = permit.pinned_anchor
+        scope_digest = deletion_scope_digest((root,), 1, "policy-a")
+        evidence = DeletionEvidenceV1(
+            "authority-1", "authority:ns", operation_id, "request_authorized",
+            "c09-owner-graph-plan-v2", "evidence-a", anchor, request_digest,
+            scope_digest, "sha256:" + "c" * 64,
+        )
+        pending = DeletionPendingV1(
+            permit, "mutation-a", request_digest, operation_id, "absent", "pending",
+            (root,), 1, "policy-a", anchor, evidence, "append-a", append_digest,
+        )
+        after = RestoreAnchor(
+            "authority-1", "authority:ns", 1, "deletion", 1, append_digest,
+            "execution", 0, "genesis", 1, "proof-b",
+        )
+        receipt = DeletionMutationReceiptV1(pending, after, 1)
+        updated = replace(permit, revision=1, pinned_anchor=after)
+
+        async def rpc(request, handshake, method, command, *, protocol):
+            self.calls.append((method, command, protocol))
+            return {"receipt": to_wire(receipt), "permit": to_wire(updated),
+                    "channel_binding_sha256": handshake.channel_binding_sha256}
+
+        self.transport._content_rpc = rpc
+        actual, actual_permit = await self.transport.v2_prepare_current_erasure_v1(
+            self.request, self.handshake, namespace="authority:ns",
+            operation_id=operation_id, source_id=root,
+            owner_actor_id="owner-actor", owner_session_token="owner-token",
+        )
+        self.assertEqual((actual, actual_permit), (receipt, updated))
+        self.assertEqual(self.calls[-1], (
+            "prepare_current_erasure_v1",
+            {"namespace": "authority:ns", "operation_id": operation_id,
+             "source_id": root, "owner_actor_id": "owner-actor",
+             "owner_session_token": "owner-token"}, SCHEMA,
+        ))
+
+        async def forged_rpc(request, handshake, method, command, *, protocol):
+            return {"receipt": to_wire(receipt), "permit": to_wire(updated),
+                    "extra": "not in v1 wire", "channel_binding_sha256":
+                    handshake.channel_binding_sha256}
+
+        self.transport._content_rpc = forged_rpc
+        with self.assertRaisesRegex(RuntimeError, "response differs"):
+            await self.transport.v2_prepare_current_erasure_v1(
+                self.request, self.handshake, namespace="authority:ns",
+                operation_id=operation_id, source_id=root,
+                owner_actor_id="owner-actor", owner_session_token="owner-token",
+            )
+
+    async def test_current_accepted_erasure_read_is_typed_and_fence_bound(self):
+        from sylanne3.authority_service.current_accepted_erasure_read import (
+            CurrentAcceptedErasureV1,
+        )
+        from sylanne3.authority_service.current_accepted_erasure_wire import accepted_to_wire
+
+        operation_id = "550e8400-e29b-41d4-a716-446655440000"
+        namespace = "authority:ns"
+        scope_digest = "sha256:" + "a" * 64
+        from sylanne3.authority_service.v2_contract import DeletionEvidenceV1
+        root = "source-a"
+        scope_digest = deletion_scope_digest((root,), 1, "policy-a")
+        before = RestoreAnchor("authority-1", namespace, 1, "deletion", 0,
+                               "genesis", "execution", 0, "genesis", 0, "proof-a")
+        pending_permit = FencePermitV2(
+            "authority-1", namespace, self.handshake.installation_identity_ref,
+            "admin-holder", 1, "delete", "fence-operation", "t" * 32, 0, 0, before)
+        pending_evidence = DeletionEvidenceV1(
+            "authority-1", namespace, operation_id, "request_authorized",
+            "authority-owner-graph-plan-v2", "evidence-pending", before,
+            "sha256:" + "d" * 64, scope_digest, "sha256:" + "e" * 64)
+        pending = DeletionPendingV1(
+            pending_permit, "mutation-pending", "sha256:" + "d" * 64,
+            operation_id, "absent", "pending", (root,), 1, "policy-a",
+            before, pending_evidence, "append-pending", "sha256:" + "f" * 64)
+        pending_after = RestoreAnchor(
+            "authority-1", namespace, 1, "deletion", 1, "sha256:" + "f" * 64,
+            "execution", 0, "genesis", 1, "proof-b")
+        pending_receipt = DeletionMutationReceiptV1(pending, pending_after, 1)
+        accepted_evidence = DeletionEvidenceV1(
+            "authority-1", namespace, operation_id, "barrier_installed",
+            "authority-pinned-graph-barrier-v1", "evidence-accepted", pending_after,
+            "sha256:" + "d" * 64, scope_digest, "sha256:" + "c" * 64,
+            "graph-v1", "graph-incarnation", 1, 1, scope_digest)
+        accepted = DeletionPendingV1(
+            replace(pending_permit, revision=1, pinned_anchor=pending_after),
+            "mutation-accepted", "sha256:" + "d" * 64, operation_id,
+            "pending", "accepted", (root,), 1, "policy-a", pending_after,
+            accepted_evidence, "append-accepted", "sha256:" + "b" * 64)
+        accepted_after = RestoreAnchor(
+            "authority-1", namespace, 1, "deletion", 2, "sha256:" + "b" * 64,
+            "execution", 0, "genesis", 2, "proof-c")
+        accepted_receipt = DeletionMutationReceiptV1(accepted, accepted_after, 2)
+        permit = replace(accepted.permit, revision=2, pinned_anchor=accepted_after)
+        original = CurrentAcceptedErasureV1(
+            namespace, operation_id, pending_receipt, accepted_receipt, permit,
+            (root,), 1, scope_digest, "sha256:" + "c" * 64)
+        async def rpc(request, handshake, method, command, *, protocol):
+            self.calls.append((method, command, protocol))
+            return {"original": accepted_to_wire(original),
+                    "channel_binding_sha256": handshake.channel_binding_sha256}
+
+        self.transport._content_rpc = rpc
+        actual = await self.transport.v2_read_current_accepted_erasure_v1(
+            self.request, self.handshake, namespace=namespace,
+            deletion_operation_id=operation_id, scope_digest=scope_digest,
+            permit=permit)
+        self.assertEqual(actual, original)
+        self.assertEqual(self.calls[-1], (
+            "read_current_accepted_erasure_v1",
+            {"namespace": namespace, "deletion_operation_id": operation_id,
+             "scope_digest": scope_digest, "permit": to_wire(permit)}, SCHEMA))
 
     async def test_v1_session_and_wrong_handshake_binding_cannot_send_v2_rpc(self):
         class Writer:

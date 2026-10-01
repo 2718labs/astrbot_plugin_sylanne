@@ -8,13 +8,18 @@ external facts owned by D11.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import math
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from ...authority_service.v2_context_reply_result_contract import ContextReplyResultReadRequestV1
+    from ...model_broker.context_reply import ContextReplyInputV1
+    from ...runtime_contracts import VersionedRef
 
 from ..d08 import CommunicationIntentGrant, SegmentGrant
-from ...graph_types import TypeSpec
+from ...graph_types import AtomKey, GraphVersion, GraphWrite, TypeSpec
 from ...runtime_contracts import (
     DomainProposal,
     ProviderDescriptor,
@@ -554,6 +559,9 @@ class D09ExpressionProvider:
                 ("claim_refs", "str_list"), ("version", "positive_int"),
             )),
             ("d09.verified_segment_batch.v1", ("activity",), "state", True, ()),
+            ("d09.paid_verified_segment_batch.v2", ("activity",), "state", True, ()),
+            ("d09.natural_verified_segment_batch.v2", ("activity",), "state", True, ()),
+            ("d09.contact_verified_batch.v1", ("activity",), "state", True, ()),
             ("d09.dialogue_progress.v1", ("activity",), "projection", False, (
                 ("progress_id", "str"), ("segment_id", "str"),
                 ("delivery_state", "enum:prepared|verified|admitted|handed_off|accepted|unknown|rejected|superseded"),
@@ -566,16 +574,21 @@ class D09ExpressionProvider:
             storage_role=role,
             validator=(
                 _validate_verified_batch_value_v1 if name == _VERIFIED_BATCH_SCHEMA
+                else validate_paid_batch_value_v2 if name == PAID_BATCH_SCHEMA_V2
+                else validate_natural_verified_batch_value_v2
+                if name == NATURAL_BATCH_SCHEMA_V2
+                else validate_contact_verified_batch_v1 if name == CONTACT_BATCH_SCHEMA_V1
                 else _strict_graph_validator(name, fields)
             ),
             immutable=immutable,
-            schema_version=1,
+            schema_version=2 if name in {PAID_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V2} else 1,
             writer_domain="d09",
             schema_hash=schema_hash({
                 "domain": "d09", "type": name, "owners": owners, "role": role,
-                "immutable": immutable, "fields": fields, "version": 1,
+                "immutable": immutable, "fields": fields,
+                "version": 2 if name in {PAID_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V2} else 1,
             }),
-        ) for name, owners, role, immutable, fields in definitions)
+        ) for name, owners, role, immutable, fields in definitions) + turn_order_type_specs_v1()
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):
@@ -842,6 +855,87 @@ class D09ExpressionProvider:
         )
 
     @staticmethod
+    def build_paid_batch_v2(
+        intent: CommunicationIntentGrant, blueprint: ExpressionBlueprint,
+        paid: PaidContextReplyExpressionV2, *, now: float,
+    ) -> dict:
+        if type(paid) is not PaidContextReplyExpressionV2:
+            raise TypeError("typed paid expression required")
+        if blueprint.claims != paid.claims:
+            raise ValueError("paid claims differ from expression blueprint")
+        content = D09ExpressionProvider.build_verified_batch_v1(
+            intent, blueprint, paid.segments, now=now,
+        )
+        return paid_batch_value_v2(content, paid)
+
+    def prepare_paid_batch_proposal_v2(
+        self, proposal: DomainProposal, value: dict, *, batch_key: AtomKey,
+    ) -> DomainProposal:
+        """Stage a paid V2 graph candidate under an absent-head CAS guard."""
+        validate_paid_batch_value_v2(value)
+        if (type(batch_key) is not AtomKey
+                or batch_key.type_name != PAID_BATCH_SCHEMA_V2
+                or batch_key.owner.kind != "activity"
+                or batch_key.owner.subject != proposal.envelope.identity.activity_id
+                or batch_key.name != value["verified_batch"]["batch_id"]
+                or any(write.key == batch_key for write in proposal.typed_writes)):
+            raise ValueError("paid batch key or proposal differs")
+        reads = {row.key: row.revision for row in proposal.envelope.version_guard.read_versions}
+        if reads.get(batch_key, 0) != 0:
+            raise ValueError("paid batch requires an absent graph head")
+        source_refs = tuple(value["source_refs"])
+        if not set(source_refs).issubset(proposal.envelope.source_qualification.source_refs):
+            raise ValueError("paid batch sources absent from proposal qualification")
+        guard = proposal.envelope.version_guard
+        extra = () if batch_key in reads else (GraphVersion(batch_key, 0),)
+        envelope = replace(proposal.envelope, version_guard=replace(
+            guard, read_versions=guard.read_versions + extra,
+        ))
+        return self.validate(replace(
+            proposal, envelope=envelope,
+            typed_writes=proposal.typed_writes + (GraphWrite(batch_key, value),),
+        ))
+
+    @staticmethod
+    def recheck_paid_batch_v2(
+        value: dict, *, intent: CommunicationIntentGrant | None,
+        request: ContextReplyResultReadRequestV1,
+        result_service: ContextReplyResultServicePortV2 | None,
+        current_input: ContextReplyInputV1, scene_ref: VersionedRef,
+        audience_ref: VersionedRef, covered_slots: tuple[str, ...],
+        max_chars: int, now: float,
+        conversation_epoch: int,
+    ) -> VerifiedBatchRecheckV1:
+        """Require fresh Authority-paid read and exact D08 finite grant match."""
+        validate_paid_batch_value_v2(value)
+        if intent is None:
+            return VerifiedBatchRecheckV1("hold", None, ("current_d08_grant",))
+        paid = issue_paid_context_reply_expression_v2(
+            request, result_service=result_service, current_input=current_input,
+            scene_ref=scene_ref, audience_ref=audience_ref,
+            covered_slots=covered_slots, max_chars=max_chars, now_utc=now,
+        )
+        if paid.status != "paid_current_source_verified_hold":
+            return VerifiedBatchRecheckV1("hold", None, paid.missing)
+        if set(value["source_refs"]) != {ref for claim in paid.claims for ref in claim.source_refs}:
+            return VerifiedBatchRecheckV1("hold", None, ("paid_source_closure",))
+        prepared = D09ExpressionProvider.prepare_blueprint(
+            intent, scene_ref.ref, conversation_epoch,
+            paid.claims, now=now,
+        )
+        if prepared.status != "complete" or prepared.blueprint is None:
+            return VerifiedBatchRecheckV1("hold", None, ("current_d08_grant_scope",))
+        expected = D09ExpressionProvider.build_paid_batch_v2(
+            intent, prepared.blueprint, paid, now=now,
+        )
+        if value != expected:
+            raise ValueError("paid batch differs from original paid result or current grant")
+        return VerifiedBatchRecheckV1(
+            "paid_current_source_verified_hold", value,
+            ("current_d08_grant_provenance", "coordinator_source_and_access_cas"),
+        )
+
+    @staticmethod
     def prepare_delivery(
         staged: StagingResult,
         intent: CommunicationIntentGrant | None,
@@ -967,4 +1061,84 @@ __all__ = [
     "DialogueProgress", "ExpressionBlueprint", "ExpressionClaim", "SegmentCandidate", "SegmentGrant",
     "StagingResult", "TopicThread", "VerifiedBatchRecheckV1", "VerifiedSegment",
     "segment_payload_digest",
+]
+
+from .source_reply import SourceReplyExpressionV1, issue_source_reply_expression_v1
+from .context_reply import (
+    CONTEXT_REPLY_OUTPUT_SCHEMA, ContextReplyExpressionV1,
+    issue_context_reply_expression_v1, ContextReplyResultServicePortV2,
+    PaidContextReplyExpressionV2, issue_paid_context_reply_expression_v2,
+    PAID_BATCH_SCHEMA_V2, paid_batch_value_v2, validate_paid_batch_value_v2,
+)
+from .natural_reply import (
+    NATURAL_REPLY_OUTPUT_SCHEMA_V2, QualifiedExpressionUnitV2,
+    NaturalExpressionPlanV2, NaturalMechanicalCandidateV2,
+    mechanically_verify_natural_reply_v2,
+    verify_current_qualified_natural_reply_v2,
+    NaturalReviewCandidateV2, assess_untrusted_natural_review_v2,
+    NaturalPaidReviewVerifierV2, NaturalFinalActionMaterialV2,
+    NaturalFinalActionCandidateV2, prepare_natural_final_action_candidate_v2,
+)
+from .expression_policy import (
+    EXPRESSION_POLICY_SCHEMA_V1, DEFAULT_MAX_VISIBLE_CHARS_V1,
+    D09ExpressionPolicyV1, compile_expression_policy_v1,
+)
+from .natural_batch import (
+    NATURAL_BATCH_SCHEMA_V2, NaturalVerifiedBatchProposalV2,
+    prepare_natural_verified_batch_proposal_v2,
+    validate_natural_verified_batch_value_v2,
+)
+from .contact_batch_v1 import CONTACT_BATCH_SCHEMA_V1, validate_contact_verified_batch_v1
+from .interruption import (
+    SegmentInterruptionReadV1, SegmentInterruptionCandidateV1,
+    interrupt_remaining_segments_v1,
+)
+from .turn_order import (
+    TurnReservationCandidateV1, TurnCompletionCandidateV1,
+    TurnOutboundObservationCandidateV1, TurnOrderProjectionV1,
+    turn_order_key, turn_slot_key, turn_completion_key,
+    turn_outbound_observation_key, turn_order_type_specs_v1,
+    reserve_turn_slot_v1, complete_inbound_turn_v1, observe_outbound_turn_v1,
+    complete_outbound_turn_v1,
+    project_completed_turns_v1,
+)
+
+__all__ += ["SourceReplyExpressionV1", "issue_source_reply_expression_v1"]
+__all__ += [
+    "NATURAL_REPLY_OUTPUT_SCHEMA_V2", "QualifiedExpressionUnitV2",
+    "NaturalExpressionPlanV2", "NaturalMechanicalCandidateV2",
+    "mechanically_verify_natural_reply_v2",
+    "verify_current_qualified_natural_reply_v2",
+    "NaturalReviewCandidateV2", "assess_untrusted_natural_review_v2",
+    "NaturalPaidReviewVerifierV2", "NaturalFinalActionMaterialV2",
+    "NaturalFinalActionCandidateV2", "prepare_natural_final_action_candidate_v2",
+]
+__all__ += [
+    "EXPRESSION_POLICY_SCHEMA_V1", "DEFAULT_MAX_VISIBLE_CHARS_V1",
+    "D09ExpressionPolicyV1", "compile_expression_policy_v1",
+]
+__all__ += [
+    "NATURAL_BATCH_SCHEMA_V2", "NaturalVerifiedBatchProposalV2",
+    "prepare_natural_verified_batch_proposal_v2",
+    "validate_natural_verified_batch_value_v2",
+]
+__all__ += [
+    "CONTEXT_REPLY_OUTPUT_SCHEMA", "ContextReplyExpressionV1",
+    "issue_context_reply_expression_v1",
+    "ContextReplyResultServicePortV2", "PaidContextReplyExpressionV2",
+    "issue_paid_context_reply_expression_v2",
+    "PAID_BATCH_SCHEMA_V2", "paid_batch_value_v2", "validate_paid_batch_value_v2",
+]
+__all__ += [
+    "SegmentInterruptionReadV1", "SegmentInterruptionCandidateV1",
+    "interrupt_remaining_segments_v1",
+]
+__all__ += [
+    "TurnReservationCandidateV1", "TurnCompletionCandidateV1",
+    "TurnOutboundObservationCandidateV1", "TurnOrderProjectionV1",
+    "turn_order_key", "turn_slot_key", "turn_completion_key",
+    "turn_outbound_observation_key", "turn_order_type_specs_v1",
+    "reserve_turn_slot_v1", "complete_inbound_turn_v1", "observe_outbound_turn_v1",
+    "complete_outbound_turn_v1",
+    "project_completed_turns_v1",
 ]

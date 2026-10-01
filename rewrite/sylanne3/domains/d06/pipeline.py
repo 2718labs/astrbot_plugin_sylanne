@@ -44,7 +44,9 @@ from . import (
     RetrievalChannel,
     RecollectionContext,
     SelectionTicket,
+    source_correction_head_key,
 )
+from .vector_channel import VolatileVectorGeneration
 
 
 def _epoch(value: object, label: str) -> int:
@@ -256,6 +258,8 @@ class RetrievalOutcome:
     proof_versions: tuple[GraphVersion, ...]
     epoch: NamespaceEpoch | None
     batches: tuple[MemoryBatch, ...]
+    qualification: RecallQualification | None = None
+    vector_coverage: str = "not_requested"
 
 
 @dataclass(frozen=True)
@@ -489,6 +493,12 @@ class D06MemoryPipeline:
                     *result.read_versions, *encoding.proof_versions,
                 ))),
             )
+        correction_head_key = source_correction_head_key(
+            self.adapter.namespace, selected.content_ref,
+        )
+        result = replace(result, read_versions=tuple(dict.fromkeys((
+            *result.read_versions, GraphVersion(correction_head_key, 0),
+        ))))
         current = self.repository.store.graph_snapshot(
             tuple(dict.fromkeys((
                 *proof_by_key, mood_key,
@@ -499,7 +509,7 @@ class D06MemoryPipeline:
                 current.get(mood_key) != mood_snapshot.get(mood_key) or any(
             current.get(version.key) is None or
             current.get(version.key).revision != version.revision or
-            not current.get(version.key).valid
+            current.get(version.key).valid != (version.revision > 0)
             for version in (*source_proof.versions, *result.read_versions)
         )):
             raise RuntimeError("recollection source, access, or mood changed during preparation")
@@ -560,8 +570,12 @@ class D06MemoryPipeline:
                 or reconstruction.coupling_version != coupling.version):
             raise ValueError("C04 prepared reconstruction differs from the selected source or experience")
         guarded = set(envelope.version_guard.read_versions)
+        correction_head_key = source_correction_head_key(
+            self.adapter.namespace, expected.content_refs[0],
+        )
         if (not reconstruction.read_versions
                 or not set(reconstruction.read_versions) <= guarded
+                or GraphVersion(correction_head_key, 0) not in reconstruction.read_versions
                 or not any(v.key == selected_source and v.revision > 0
                            for v in reconstruction.read_versions)
                 or not any(v.key == mood_key and v.revision > 0
@@ -600,7 +614,8 @@ class D06MemoryPipeline:
         d04 = affect_provider.propose_recollection_experience(
             envelope, experience_id=experience_id, recollection_ref=recollection_ref,
             influence=influence, mood=mood, coupling=coupling,
-            source_versions=reconstruction.read_versions,
+            source_versions=tuple(version for version in reconstruction.read_versions
+                                  if version.revision > 0),
             dependencies=DependencySet(),
         )
         bundle = self.adapter.assemble_recollection_bundle(
@@ -1040,6 +1055,11 @@ class D06MemoryPipeline:
         as_known_at: float | None = None,
         valid_at: float | None = None,
         expected_epoch: NamespaceEpoch | None = None,
+        vector_generation: VolatileVectorGeneration | None = None,
+        vector_query: tuple[float, ...] | None = None,
+        vector_model_id: str | None = None,
+        vector_preprocessing_id: str | None = None,
+        vector_enabled: bool = True,
     ) -> RetrievalOutcome:
         """Run only qualified bounded searches and return authorization-bound candidates."""
 
@@ -1052,13 +1072,14 @@ class D06MemoryPipeline:
         _epoch(access_epoch, "access_epoch")
         _epoch(delete_epoch, "delete_epoch")
         if qualification.mode in {"no_history_search", "working_set_only"}:
-            return RetrievalOutcome("not_requested", None, (), None, ())
+            return RetrievalOutcome("not_requested", None, (), None, (), qualification)
         if qualification.mode not in {"mandatory", "optional_association"}:
             raise ValueError("unknown recall qualification mode")
         if not plans:
             raise ValueError("qualified history retrieval requires at least one search plan")
 
         batches: list[MemoryBatch] = []
+        channels: list[RetrievalChannel] = []
         for plan in plans:
             batch = self.retriever.search(
                 plan.query,
@@ -1073,13 +1094,30 @@ class D06MemoryPipeline:
                 expected_epoch=expected_epoch,
             )
             batches.append(batch)
+            channels.append(RetrievalChannel(plan.name, batch, plan.activation))
             expected_epoch = batch.epoch
+
+        vector_coverage = "not_requested"
+        if vector_generation is not None or vector_query is not None:
+            if (not isinstance(vector_generation, VolatileVectorGeneration)
+                    or vector_query is None or vector_model_id is None
+                    or vector_preprocessing_id is None):
+                raise ValueError("vector query needs a complete generation identity")
+            vector_batch, vector_coverage = vector_generation.search(
+                self.retriever, query=vector_query, model_id=vector_model_id,
+                preprocessing_id=vector_preprocessing_id, audience=audience,
+                purpose=purpose, enabled=vector_enabled,
+            )
+            if vector_batch is not None:
+                if expected_epoch is not None and vector_batch.epoch != expected_epoch:
+                    raise ValueError("vector and structural channels use different graph epochs")
+                batches.append(vector_batch)
+                channels.append(RetrievalChannel("vector", vector_batch, 0.5))
 
         batch_tuple = tuple(batches)
         candidates = self.adapter.assemble_candidates(
             candidate_set_id,
-            tuple(RetrievalChannel(plan.name, batch, plan.activation)
-                  for plan, batch in zip(plans, batch_tuple, strict=True)),
+            tuple(channels),
             purpose=purpose,
             max_candidates=64,
             access_epoch=access_epoch,
@@ -1091,4 +1129,6 @@ class D06MemoryPipeline:
             _unique_versions(batch_tuple),
             batch_tuple[0].epoch,
             batch_tuple,
+            qualification,
+            vector_coverage,
         )

@@ -4,7 +4,9 @@ from pathlib import Path
 
 from sylanne3.contracts import Event, Scope
 from sylanne3.domains.d04 import AffectAxis, AffectCoupling, AffectProvider, AffectScheme, FeelingState, MoodField
-from sylanne3.domains.d06 import D06DomainAdapter, D06DomainProvider, RecallIntent, RecollectionContext, SelectionTicket, TriggerKind
+from sylanne3.domains.d06 import (D06DomainAdapter, D06DomainProvider, RecallIntent,
+                                   RecollectionContext, SelectionTicket, TriggerKind,
+                                   source_correction_head_key)
 from sylanne3.domains.d06.pipeline import D06MemoryPipeline, SearchPlan
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import AtomKey, GraphCandidate, GraphWrite, Owner, TypeRegistry
@@ -12,7 +14,7 @@ from sylanne3.memory_repository import MemoryRepository
 from sylanne3.memory_reconstruction import DetailCue
 from sylanne3.memory_retrieval import MemoryQuery
 from sylanne3.memory_types import (
-    SourceRecord, episode_key, register_memory_types, source_key,
+    SourceRecord, episode_key, interpretation_key, register_memory_types, source_key,
     subjective_trace_key, subjective_trace_v2_key,
 )
 from sylanne3.runtime_contracts import NamespaceId, SourceQualification
@@ -32,7 +34,8 @@ class AffectivePipelineTests(unittest.TestCase):
         for spec in AffectProvider(active_scheme=self.scheme).type_specs():
             registry.register(spec)
         for spec in D06DomainProvider.type_specs():
-            if spec.name in {"d06.recollection.v1", "d06.recollection_projection.v1"}:
+            if spec.name in {"d06.recollection.v1", "d06.recollection_projection.v1",
+                             "d06.source_correction_head.v1"}:
                 registry.register(spec)
         self.store = GraphStore(Path(self.tmp.name) / "memory.db", registry)
         self.addCleanup(self.store.close)
@@ -90,6 +93,28 @@ class AffectivePipelineTests(unittest.TestCase):
         self.assertNotEqual(warm.subjective_tone, guarded.subjective_tone)
         self.assertNotEqual(warm.subjective_weight, guarded.subjective_weight)
         self.assertEqual(warm.status, "candidate_hold")
+
+    def test_committed_correction_head_blocks_old_source_reconstruction(self):
+        self.prepare(self.mood(0.8, "initial-mood"))
+        head_key = source_correction_head_key(NamespaceId("bot", "persona"), "message-1")
+        head_snapshot = self.store.graph_snapshot((head_key,))
+        self.store.graph_commit(GraphCandidate(
+            Event(self.scope, "correction-head", 3, "correction", {}),
+            head_snapshot.versions,
+            (GraphWrite(head_key, {
+                "source_ref": source_key("bot", "persona", "message-1").token,
+                "source_revision": 1,
+                "correction_source_ref": source_key("bot", "persona", "correction-1").token,
+                "target_refs": [interpretation_key("bot", "persona", "belief-1").token],
+                "operation_id": "correction-1", "state": "pending_reevaluation",
+                "access_epoch": 1, "deletion_epoch": 1,
+            }),),
+            head_snapshot.epochs,
+        ))
+        self.refresh()
+        current_mood = self.store.graph_snapshot((self.mood_key,))
+        with self.assertRaisesRegex(RuntimeError, "changed during preparation"):
+            self.prepare(current_mood)
 
     def test_committed_projection_round_trips_without_copying_source_text_or_changing_evidence(self):
         projections = []

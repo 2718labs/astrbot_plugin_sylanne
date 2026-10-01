@@ -14,13 +14,19 @@ from sylanne3.authority_service.v2_model_egress_contract import (
     ModelTerminalReceiptV2,
 )
 from sylanne3.authority_service.v2_contract import FencePermitV2
+from sylanne3.authority_service.v2_reply_worker_model_result_contract import (
+    ReplyWorkerModelResultReadRequestV1, ReplyWorkerModelResultReadV1,
+    reply_worker_read_attempt_id_v1,
+)
 from sylanne3.domains.d07 import AttentionTicket
 from sylanne3.graph_types import AtomKey, GraphVersion, Owner
 from sylanne3.host.installed_reply_model_driver import (
     execute_or_recover_reply_model_v1, freeze_reply_model_preparation_v1,
     prepare_and_run_installed_reply_model_v1,
     parse_authority_reply_observation_v1, reply_model_operation_id_v1,
+    read_and_parse_installed_reply_with_receipt_v1,
 )
+from sylanne3.host.post_c02_reply_driver import post_c02_reply_operation_id
 from sylanne3.host.model_egress_executor import HostModelEgressExecutor
 from sylanne3.model_broker.reply_language import REPLY_TEMPLATE_VERSION
 from sylanne3.runtime.restore_anchor import RestoreAnchor
@@ -186,6 +192,71 @@ async def test_completed_authority_observation_yields_only_source_claim_candidat
             parse_authority_reply_observation_v1(
                 prepared, observation=observation,
                 terminal=replace(terminal, observation_digest="f" * 64))
+    finally:
+        await host.asyncTearDown()
+
+
+@pytest.mark.asyncio
+async def test_reply_result_read_keeps_the_verified_authority_receipt():
+    host = model_fixture.AstrBotModelCallTests(
+        methodName="test_one_http_request_on_host_loop_with_usage")
+    await host.asyncSetUp()
+    try:
+        bundle, _, _ = host.v2_adapters()
+        prepared = _preparation(bundle)
+        intent = prepared.intent
+        consumer_id = post_c02_reply_operation_id(
+            prepared.c02_receipt.operation_id, prepared.source.source_ref)
+        request = ReplyWorkerModelResultReadRequestV1(
+            intent.authority_id, intent.namespace,
+            prepared.envelope.authority.namespace,
+            bundle.installation_policy.installation_id, intent.job_id,
+            intent.operation_id, intent.budget_reservation_operation_id,
+            intent.call_id, intent.binding_digest, intent.request_digest,
+            consumer_id, reply_worker_read_attempt_id_v1(consumer_id, 1),
+            prepared.c02_receipt.operation_id, prepared.source.source_ref,
+            prepared.source.source_revision, prepared.source.access_revision,
+            prepared.attention.ticket_id, prepared.focus_revision,
+            prepared.envelope.authority.audience)
+        observation = ModelEgressObservationV1(
+            intent.authority_id, intent.namespace, intent.subject,
+            intent.operation_id, intent.call_id, intent.request_digest,
+            "completed", canonical_serialize({"text": json.dumps({
+                "schema": "sylanne.d09.source_reply_output.v1",
+                "body": "你好", "spans": [
+                    {"start": 0, "end": 2, "source_quote": "你好"}],
+            }, ensure_ascii=False)}), (), (), "provider-call")
+        terminal = ModelTerminalReceiptV2(
+            "a" * 64, intent.call_id, intent.request_digest,
+            "b" * 64, observation.digest, "sha256:" + "d" * 64,
+            request.installation_id, "e" * 64)
+        response = ReplyWorkerModelResultReadV1(request, observation, terminal)
+        calls = []
+
+        class Authority:
+            async def reply_worker_model_result_select_attempt_v1(
+                self, _bundle, _grant, *, first_request,
+            ):
+                calls.append("select")
+                assert first_request == request
+                return request
+
+            async def reply_worker_model_result_read_v1(
+                self, _bundle, _grant, *, read_request,
+            ):
+                calls.append("read")
+                assert read_request == request
+                return response
+
+        executor = object.__new__(HostModelEgressExecutor)
+        executor._bundle = bundle
+        executor._grant = SimpleNamespace(installation_id=request.installation_id)
+        executor._authority = Authority()
+        read = await read_and_parse_installed_reply_with_receipt_v1(
+            prepared, executor=executor, read_request=request, terminal=terminal)
+        assert read is not None and read.result_read is response
+        assert read.candidate.body == "你好"
+        assert calls == ["select", "read"]
     finally:
         await host.asyncTearDown()
 

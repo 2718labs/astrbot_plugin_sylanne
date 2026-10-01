@@ -83,7 +83,7 @@ async def test_explicit_c02_driver_uses_paired_bundle_and_holds_without_it(
             assert executor._bundle is bundle and executor._grant == grant
             return committed
 
-        runtime.commit_first_ingress_c02_v1 = MethodType(commit, runtime)
+        runtime.commit_first_ingress_c02_v2 = MethodType(commit, runtime)
         pairing = {"state": "paired"}
 
         async def status_v2(self):

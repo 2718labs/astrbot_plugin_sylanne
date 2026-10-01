@@ -152,7 +152,7 @@ class BudgetReceipt:
     unconfirmed: Mapping[str, int]
 
     def __post_init__(self) -> None:
-        if self.status not in {"created", "reserved", "settled", "overrun", "pending_confirmation", "pending_overrun", "closed", "duplicate"}:
+        if self.status not in {"created", "reserved", "settled", "overrun", "pending_confirmation", "pending_overrun", "closed", "duplicate", "cancelled_unstarted"}:
             raise ValueError("invalid budget receipt status")
         _identifier(self.operation_id, "operation_id")
         _digest(self.digest)
@@ -223,9 +223,16 @@ def install_schema(db) -> None:
             digest TEXT NOT NULL,
             lease_id TEXT NOT NULL,
             receipt_json TEXT NOT NULL,
+            resolution_binding_json TEXT,
             PRIMARY KEY(bot_id, persona_id, operation_id, phase)
         )
     """)
+    # Older local stores may predate the explicit original-call binding.
+    # Their unbound resolution receipts remain held for manual reconciliation.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(runtime_budget_operations)")}
+    if "resolution_binding_json" not in columns:
+        db.execute("ALTER TABLE runtime_budget_operations "
+                   "ADD COLUMN resolution_binding_json TEXT")
     db.execute("""
         CREATE TABLE IF NOT EXISTS runtime_budget_debt_blocks(
             lease_id TEXT NOT NULL,
@@ -281,6 +288,33 @@ def _record_debt_block(db, lease_id: str, operation_id: str) -> None:
             "(lease_id,cause_lease_id,cause_operation_id) VALUES(?,?,?)",
             (ancestor.lease_id, lease_id, operation_id),
         )
+
+
+def _propagate_closed_resolution(
+    db, lease: BudgetLease, held_ceiling: Mapping[str, int],
+    actual: Mapping[str, int],
+) -> None:
+    """Replace a transferred unknown ceiling with its bill in closed ancestry.
+
+    Closing a child moves its used and unconfirmed counters into its parent.
+    Each subsequently closed parent moves those counters upward again. A late
+    provider receipt must update those ledgers as well as the original child.
+    """
+    seen = {lease.lease_id}
+    current = lease
+    while current.state == "closed":
+        if current.parent_id is None or current.parent_id in seen:
+            raise BudgetConflict("closed budget ancestry is invalid")
+        seen.add(current.parent_id)
+        parent = get_budget_lease(db, current.parent_id)
+        updated = BudgetLease(
+            parent.lease_id, parent.parent_id, parent.bot_id, parent.persona_id,
+            parent.currency, parent.limits, _plus(parent.used, actual),
+            parent.reserved, _minus(parent.unconfirmed, held_ceiling),
+            parent.version + 1, parent.state,
+        )
+        _save_lease(db, updated)
+        current = parent
 
 
 def _assert_no_ancestor_debt(db, lease_id: str) -> None:
@@ -459,10 +493,35 @@ def predict_budget_settlement(
     return BudgetPrediction(receipt, hashlib.sha256(_receipt_json(receipt).encode("utf-8")).hexdigest())
 
 
+def _resolution_binding(original_operation_id: str, actual: Mapping[str, int],
+                        execution_revoked: bool) -> str:
+    if not isinstance(execution_revoked, bool):
+        raise ValueError("execution_revoked must be boolean")
+    _amounts(actual)
+    return json.dumps({
+        "original_operation_id": original_operation_id,
+        "actual": dict(sorted(actual.items())),
+        "execution_revoked": execution_revoked,
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def _settlement_binding(actual: Mapping[str, int] | None,
+                        execution_revoked: bool) -> str:
+    if not isinstance(execution_revoked, bool):
+        raise ValueError("execution_revoked must be boolean")
+    if actual is not None:
+        _amounts(actual)
+    return json.dumps({
+        "actual": None if actual is None else dict(sorted(actual.items())),
+        "execution_revoked": execution_revoked,
+    }, sort_keys=True, separators=(",", ":"))
+
+
 def _prior(db, lease: BudgetLease, operation_id: str, phase: str,
-           digest: str) -> BudgetReceipt | None:
+           digest: str, *, resolution_binding: str | None = None) -> BudgetReceipt | None:
     row = db.execute(
-        "SELECT digest,lease_id,receipt_json FROM runtime_budget_operations WHERE "
+        "SELECT digest,lease_id,receipt_json,resolution_binding_json "
+        "FROM runtime_budget_operations WHERE "
         "bot_id=? AND persona_id=? AND operation_id=? AND phase=?",
         (lease.bot_id, lease.persona_id, operation_id, phase),
     ).fetchone()
@@ -470,16 +529,21 @@ def _prior(db, lease: BudgetLease, operation_id: str, phase: str,
         return None
     if row[0] != digest or row[1] != lease.lease_id:
         raise BudgetConflict("operation identity was reused with different input")
+    if phase == "resolve" and row[3] != resolution_binding:
+        raise BudgetConflict("resolution original call or actual cost differs")
+    if phase == "settle" and resolution_binding is not None and row[3] != resolution_binding:
+        raise BudgetConflict("settlement actual cost or revocation differs")
     return _receipt_from_json(row[2])
 
 
 def _record(db, lease: BudgetLease, operation_id: str, phase: str,
-            digest: str, receipt: BudgetReceipt) -> None:
+            digest: str, receipt: BudgetReceipt, *,
+            resolution_binding: str | None = None) -> None:
     db.execute(
         "INSERT INTO runtime_budget_operations(bot_id,persona_id,operation_id,phase,"
-        "digest,lease_id,receipt_json) VALUES(?,?,?,?,?,?,?)",
+        "digest,lease_id,receipt_json,resolution_binding_json) VALUES(?,?,?,?,?,?,?,?)",
         (lease.bot_id, lease.persona_id, operation_id, phase, digest,
-         lease.lease_id, _receipt_json(receipt)),
+         lease.lease_id, _receipt_json(receipt), resolution_binding),
     )
 
 
@@ -563,8 +627,10 @@ def settle_budget(db, lease_id: str, operation_id: str, digest: str,
     _digest(digest)
     if not isinstance(execution_revoked, bool):
         raise ValueError("execution_revoked must be boolean")
+    binding = _settlement_binding(actual, execution_revoked)
     lease = get_budget_lease(db, lease_id)
-    prior = _prior(db, lease, operation_id, "settle", digest)
+    prior = _prior(db, lease, operation_id, "settle", digest,
+                   resolution_binding=binding)
     if prior is not None:
         return prior
     row = db.execute(
@@ -586,9 +652,55 @@ def settle_budget(db, lease_id: str, operation_id: str, digest: str,
         (reservation_state, actual_json, lease_id, operation_id),
     )
     receipt = _receipt(updated, status, operation_id, digest)
-    _record(db, updated, operation_id, "settle", digest, receipt)
+    _record(db, updated, operation_id, "settle", digest, receipt,
+            resolution_binding=binding)
     if status == "overrun":
         _record_debt_block(db, lease_id, operation_id)
+    return receipt
+
+
+def cancel_unstarted_offline_reservation_v1(db, *, witness) -> BudgetReceipt:
+    """Release a never-started D11 reserve after actual permanent claim retirement.
+
+    An active child still encumbers its full allocation in its parent. Only
+    closing that child transfers its counters and releases the allocation;
+    cancelling this child reservation must not release the parent twice.
+    """
+    from .d11_offline_unstarted_cancellation_v1 import require_offline_cancellation_witness_v1
+    gate = require_offline_cancellation_witness_v1(db, witness)
+    binding = gate.binding
+    lease = get_budget_lease(db, binding.parent_budget_lease_ref)
+    proof_binding = json.dumps({"schema": "d11.unstarted-reservation-cancellation-binding.v1",
+        "binding_digest": binding.digest, "accounting_original_digest": gate.accounting_original_digest,
+        "claim_gate_id": gate.claim_gate_id, "no_future_claim_digest": gate.no_future_claim_digest,
+        "cancellation_gate_digest": gate.digest, "ceiling": {"thread_cpu_ms": binding.cpu_ceiling_ms}},
+        sort_keys=True, separators=(",", ":"))
+    prior = db.execute("SELECT digest,lease_id,receipt_json,resolution_binding_json FROM runtime_budget_operations "
+        "WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='cancel_unstarted'",
+        (*binding.namespace.as_tuple, binding.reservation_operation_id)).fetchone()
+    if prior is not None:
+        if prior[:2] != (binding.reservation_digest, lease.lease_id) or prior[3] != proof_binding:
+            raise BudgetConflict("offline cancellation replay changed its no-future-claim original")
+        receipt = _receipt_from_json(prior[2])
+        if receipt.status != "cancelled_unstarted":
+            raise BudgetConflict("offline cancellation original has another status")
+        return receipt
+    ceiling = {"thread_cpu_ms": binding.cpu_ceiling_ms}
+    row = db.execute("SELECT digest,ceiling_json,state,actual_json FROM runtime_budget_reservations "
+        "WHERE lease_id=? AND operation_id=?", (lease.lease_id, binding.reservation_operation_id)).fetchone()
+    if (row != (binding.reservation_digest, _json(ceiling), "reserved", None)
+            or (lease.bot_id, lease.persona_id) != binding.namespace.as_tuple or lease.state == "closed"
+            or db.execute("SELECT 1 FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? "
+                "AND phase IN ('settle','resolve')", (*binding.namespace.as_tuple, binding.reservation_operation_id)).fetchone() is not None):
+        raise BudgetConflict("offline cancellation has no exact unstarted reserved ceiling")
+    updated = BudgetLease(lease.lease_id, lease.parent_id, lease.bot_id, lease.persona_id, lease.currency,
+        lease.limits, lease.used, _minus(lease.reserved, ceiling), lease.unconfirmed, lease.version + 1, lease.state)
+    _save_lease(db, updated)
+    db.execute("UPDATE runtime_budget_reservations SET state='cancelled_unstarted' WHERE lease_id=? AND operation_id=?",
+        (lease.lease_id, binding.reservation_operation_id))
+    receipt = _receipt(updated, "cancelled_unstarted", binding.reservation_operation_id, binding.reservation_digest)
+    _record(db, updated, binding.reservation_operation_id, "cancel_unstarted", binding.reservation_digest, receipt,
+        resolution_binding=proof_binding)
     return receipt
 
 
@@ -647,8 +759,11 @@ def resolve_partial_budget(
     _identifier(original_operation_id, "original_operation_id")
     _identifier(resolution_operation_id, "resolution_operation_id")
     _digest(digest)
+    binding = _resolution_binding(
+        original_operation_id, newly_known_actual, execution_revoked)
     lease = get_budget_lease(db, lease_id)
-    prior = _prior(db, lease, resolution_operation_id, "resolve", digest)
+    prior = _prior(db, lease, resolution_operation_id, "resolve", digest,
+                   resolution_binding=binding)
     if prior is not None:
         return prior
     row = db.execute(
@@ -678,6 +793,10 @@ def resolve_partial_budget(
         lease.version + 1, lease.state,
     )
     _save_lease(db, updated)
+    _propagate_closed_resolution(
+        db, lease, {dimension: ceiling[dimension] for dimension in unknown},
+        charged,
+    )
     db.execute(
         "UPDATE runtime_budget_reservations SET state=?,actual_json=? "
         "WHERE lease_id=? AND operation_id=?",
@@ -685,7 +804,8 @@ def resolve_partial_budget(
                             separators=(",", ":")), lease_id, original_operation_id),
     )
     receipt = _receipt(updated, status, resolution_operation_id, digest)
-    _record(db, updated, resolution_operation_id, "resolve", digest, receipt)
+    _record(db, updated, resolution_operation_id, "resolve", digest, receipt,
+            resolution_binding=binding)
     if status == "overrun":
         _record_debt_block(db, lease_id, original_operation_id)
     return receipt
@@ -698,8 +818,12 @@ def resolve_unconfirmed(db, lease_id: str, original_operation_id: str,
     _identifier(original_operation_id, "original_operation_id")
     _identifier(resolution_operation_id, "resolution_operation_id")
     _digest(digest)
+    if actual is None:
+        raise BudgetUnavailable("actual cost remains unknown")
+    binding = _resolution_binding(original_operation_id, actual, execution_revoked)
     lease = get_budget_lease(db, lease_id)
-    prior = _prior(db, lease, resolution_operation_id, "resolve", digest)
+    prior = _prior(db, lease, resolution_operation_id, "resolve", digest,
+                   resolution_binding=binding)
     if prior is not None:
         return prior
     row = db.execute(
@@ -724,13 +848,15 @@ def resolve_unconfirmed(db, lease_id: str, original_operation_id: str,
         _minus(lease.unconfirmed, ceiling), lease.version + 1, lease.state,
     )
     _save_lease(db, updated)
+    _propagate_closed_resolution(db, lease, ceiling, charged)
     db.execute(
         "UPDATE runtime_budget_reservations SET state=?,actual_json=? "
         "WHERE lease_id=? AND operation_id=?",
         (status, _json(charged), lease_id, original_operation_id),
     )
     receipt = _receipt(updated, status, resolution_operation_id, digest)
-    _record(db, updated, resolution_operation_id, "resolve", digest, receipt)
+    _record(db, updated, resolution_operation_id, "resolve", digest, receipt,
+            resolution_binding=binding)
     if status == "overrun":
         _record_debt_block(db, lease_id, original_operation_id)
     return receipt
@@ -799,4 +925,5 @@ __all__ = [
     "predict_budget_settlement", "require_budget_family_admissible",
     "reserve_budget", "resolve_partial_budget",
     "resolve_unconfirmed", "settle_budget", "settle_budget_partial",
+    "cancel_unstarted_offline_reservation_v1",
 ]

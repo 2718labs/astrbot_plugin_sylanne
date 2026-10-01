@@ -396,6 +396,23 @@ test("overview reads the Owner-authorized service catalogue without inventing do
   } finally { ui.restore(); }
 });
 
+test("unconnected experiment and lifecycle actions are clearly unavailable without sending a command", async () => {
+  const ui = await mountWorkbench();
+  try {
+    ui.setRole("bot/persona");
+    const opened = ui.clickCommand("switch-role");
+    (await ui.nextRequest(0)).resolve({ status: "ready", projection: { views: [], unavailable_domains: [] } });
+    await opened;
+    for (const [view, phrase] of [["diagnostics", "隔离实验或支持诊断"], ["lifecycle", "备份、迁移、升级、删除、停用或卸载"]]) {
+      await ui.clickView(view);
+      assert.match(ui.app.innerHTML, new RegExp(phrase));
+      assert.match(ui.app.innerHTML, /工作台不会创建本地替身状态/);
+      assert.doesNotMatch(ui.app.innerHTML, /data-command="page-action"/);
+      assert.equal(ui.requests.length, 1, "unavailable operations must not make a pretend API call");
+    }
+  } finally { ui.restore(); }
+});
+
 test("catalogue opens only a service-available known page and requests its fresh projection", async () => {
   const ui = await mountWorkbench();
   try {
@@ -1012,4 +1029,32 @@ test("setup receipts are cleared on role switch and Owner logout", async () => {
     await logout;
     assert.doesNotMatch(ui.app.innerHTML, /角色初始化<\/strong><span>已初始化/);
   } finally { ui.restore(); }
+});
+
+const initializationProfile = () => ({schema:'d12.d04_initialization_profile.v3',profile_digest:'a'.repeat(64),profile:{content_digest:'a'.repeat(64),calibration_status:'engineering_unvalidated_owner_selection_required',template_shares:[['one',.5],['two',.25],['mood',.25]]},clock_requires_explicit_rate_and_interval:true,root_budget_dimension:'thread_cpu_ms',current:{mapping_revision:3,clock_version:2}});
+test('initialization reads full profile without adoption; explicit retry keeps operation ID',async()=>{
+ const ui=await mountWorkbench();
+ try {
+  ui.setRole('bot/persona');const opened=ui.clickCommand('switch-role');(await ui.nextRequest(0)).resolve({status:'ready',projection:{views:[]}});await opened;
+  const selected=ui.clickView('initialization');const read=await ui.nextRequest(1);assert.equal(read.payload.action,'read_d04_initialization_profile');read.resolve({status:'ready',projection:initializationProfile()});await selected;
+  assert.equal(ui.requests.length,2);assert.match(ui.app.innerHTML,/engineering_unvalidated/);assert.doesNotMatch(ui.app.innerHTML,/checked/);
+  ui.setPageFields({mode:'d04_semantic_mapping',expected_revision:'3',profile_reviewed:'on',confirm:'on'});
+  const first=ui.clickCommand('page-action');const submit=await ui.nextRequest(2);assert.equal(submit.payload.action,'d04_semantic_mapping');assert.deepEqual(submit.payload.input,{profile_digest:'a'.repeat(64),expected_revision:3});
+  await ui.clickCommand('page-action');assert.equal(ui.requests.length,3);
+  submit.resolve({status:'unavailable',problem:{code:'pending',message:'未确认'}});await first;
+  const retry=ui.clickCommand('page-action');const retried=await ui.nextRequest(3);assert.equal(retried.payload.operation_id,submit.payload.operation_id);
+  retried.resolve({status:'ready',receipt:{schema:'d12.d04_initialization_receipt.v3',operation_id:submit.payload.operation_id,phase:'owner_operation_committed'}});
+  const reread=await ui.nextRequest(4);assert.equal(reread.payload.action,'read_d04_initialization_profile');reread.resolve({status:'ready',projection:initializationProfile()});await retry;
+  assert.match(ui.app.innerHTML,/owner_operation_committed/);
+ } finally {ui.restore();}
+});
+test('late initialization profile cannot cross role change and unauthorized clears it',async()=>{
+ const ui=await mountWorkbench();
+ try {
+  ui.setRole('bot/one');const opened=ui.clickCommand('switch-role');(await ui.nextRequest(0)).resolve({status:'ready',projection:{views:[]}});await opened;
+  const old=ui.clickView('initialization');await ui.nextRequest(1);
+  ui.setRole('bot/two');const newer=ui.clickCommand('switch-role');(await ui.nextRequest(2)).resolve({status:'unauthorized',problem:{code:'owner_session_locked'}});await newer;
+  ui.requests[1].resolve({status:'ready',projection:initializationProfile()});await old;
+  assert.doesNotMatch(ui.app.innerHTML,/engineering_unvalidated|aaaaaaaaaaaaaaaa/);assert.match(ui.app.innerHTML,/锁定|尚未解锁/);
+ } finally {ui.restore();}
 });

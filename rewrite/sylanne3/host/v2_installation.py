@@ -19,7 +19,7 @@ from .authority_profile import (
     AdminInstallationBundle,
     load_admin_installation_bundle,
 )
-from .installed_package import verify_installed_package
+from .installed_package import verify_installed_backend_runtime_v1
 from .mtls_transport import MtlsAuthorityTransport
 from .v2_fence_port import V2FencePort
 
@@ -43,6 +43,14 @@ class V2InstallationAssembly:
     admin_bundle: AdminInstallationBundle | None = None
     d03_arrival: AdminD03ArrivalPolicy | None = None
     reverse_handoff: object | None = None
+    storage_admission: object | None = None
+
+    @property
+    def graph_path(self):
+        if self.storage_admission is not None:
+            self.storage_admission.require_current_process_v1()
+            return self.storage_admission.graph_path
+        return self.data_dir / "sylanne3.sqlite3"
 
 
 async def assemble_v2_installation(
@@ -74,14 +82,19 @@ async def assemble_v2_installation(
         raise RuntimeError("administrator installation profile identity is invalid")
 
     package = await asyncio.to_thread(
-        verify_installed_package, root, policy.manifest_digest,
+        verify_installed_backend_runtime_v1, root, policy.manifest_digest,
         available_cpu_features=available_cpu_features,
     )
-    if not package.verified or package.build_mode != "formal-alpha1":
+    if not package.verified:
         raise RuntimeError(
             "installed formal-alpha1 package verification failed: "
             + (package.reason if not package.verified else "wrong build mode")
         )
+
+    from .selected_profile_cohort_v2 import require_current_bundle_selection_v2
+    await asyncio.to_thread(require_current_bundle_selection_v2, bundle, root, require_selected_python=True)
+    from .c09_storage_admission_v1 import load_installed_host_storage_v1
+    storage_admission = await asyncio.to_thread(load_installed_host_storage_v1, selection.profile_id, bundle)
 
     profiles = {selection.profile_id: profile}
     transport = MtlsAuthorityTransport(profiles)
@@ -102,6 +115,8 @@ async def assemble_v2_installation(
             raise RuntimeError("v2 Authority grant differs from administrator installation")
     finally:
         await transport.close()
+
+    await asyncio.to_thread(require_current_bundle_selection_v2, bundle, root, require_selected_python=True)
 
     request = AuthorityProvisioningRequest(
         protocol=AUTHORITY_PROTOCOL,
@@ -124,6 +139,7 @@ async def assemble_v2_installation(
         bundle,
         getattr(bundle, "d03_arrival", None),
         getattr(bundle, "reverse_handoff", None),
+        storage_admission,
     )
 
 

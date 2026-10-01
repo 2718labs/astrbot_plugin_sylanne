@@ -130,9 +130,14 @@ def _decode(raw: object, kind: object) -> object:
     if allowed is None or type(raw) is not dict:
         raise ValueError("unsupported C02 bundle DTO")
     expected_type = f"{kind.__module__}.{kind.__qualname__}"
+    model_fields = {field.name for field in fields(kind)}
+    if kind is DomainBundle:
+        # Root adoption is outside the frozen C02 wire schema. Its absent
+        # optional field is supplied by the DomainBundle constructor.
+        model_fields.remove("root_adoption")
     if (set(raw) != {"$type", *allowed}
             or raw.get("$type") != expected_type
-            or set(allowed) != {field.name for field in fields(kind)}):
+            or set(allowed) != model_fields):
         raise ValueError("C02 bundle DTO fields or type differ")
     return kind(**{name: _decode(raw[name], spec)
                    for name, spec in allowed.items()})
@@ -147,14 +152,24 @@ def _require_c02(bundle: DomainBundle) -> None:
                     bundle.d02_settlement_refs, bundle.d11_cost_settlement_refs,
                     bundle.idempotency_keys, bundle.persistent_job_refs,
                     bundle.outbox_refs))
-            or bundle.product_advance is not None):
+            or bundle.product_advance is not None
+            or bundle.root_adoption is not None):
         raise ValueError("only a two-proposal C02 bundle is supported")
+
+
+def _c02_wire(bundle: DomainBundle) -> str:
+    """Keep the pre-root DomainBundle C02 bytes, including its type marker."""
+    return canonical_serialize({
+        "$type": f"{type(bundle).__module__}.{type(bundle).__qualname__}",
+        **{field.name: getattr(bundle, field.name) for field in fields(bundle)
+           if field.name != "root_adoption"},
+    })
 
 
 def c02_bundle_to_wire(bundle: DomainBundle) -> str:
     """Save the existing canonical DomainBundle wire representation unchanged."""
     _require_c02(bundle)
-    text = canonical_serialize(bundle)
+    text = _c02_wire(bundle)
     if c02_bundle_from_wire(text) != bundle:
         raise ValueError("C02 bundle contains an unsupported DTO")
     return text
@@ -169,7 +184,7 @@ def c02_bundle_from_wire(text: str) -> DomainBundle:
             _reject_constant()))
         bundle = _decode(raw, DomainBundle)
         _require_c02(bundle)
-        if canonical_serialize(bundle) != text:
+        if _c02_wire(bundle) != text:
             raise ValueError("noncanonical C02 bundle wire value")
         # Recompute through the model property, including its legacy digest
         # rule for product_advance=None.

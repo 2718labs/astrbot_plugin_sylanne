@@ -7,10 +7,10 @@ from hashlib import sha256
 import json
 from typing import Any, Mapping
 
-from ...graph_types import GraphWrite, TypeSpec
+from ...graph_types import AtomKey, GraphWrite, Owner, TypeSpec
 from ...runtime_contracts import (
     CommandEnvelope, DependencySet, DomainProposal, ProviderDescriptor, RUNTIME_SCHEMA,
-    schema_hash,
+    NamespaceId, schema_hash,
 )
 
 
@@ -70,6 +70,68 @@ class CharacterDraft:
         if any(not isinstance(value, str) or not value for value in sources.values()):
             raise ValueError("field source values must be nonempty strings")
         object.__setattr__(self, "field_sources", sources)
+
+
+@dataclass(frozen=True)
+class ActiveSchemeHeadV1:
+    """D12's current administrative pointer; only W01 may atomically advance it."""
+
+    scope: str
+    generation: int
+    compiled_digest: str
+    draft_ref: str
+    draft_revision: int
+    draft_digest: str
+    previous_compiled_digest: str | None
+    adopted_operation_id: str
+    adoption_kind: str
+
+    def __post_init__(self) -> None:
+        _text(self.scope, "scope")
+        if type(self.generation) is not int or self.generation < 1:
+            raise ValueError("active scheme generation must be positive")
+        if type(self.draft_revision) is not int or self.draft_revision < 1:
+            raise ValueError("active scheme draft revision must be positive")
+        for name in ("compiled_digest", "draft_digest"):
+            value = getattr(self, name)
+            if type(value) is not str or len(value) != 64 or any(
+                    ch not in "0123456789abcdef" for ch in value):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+        if self.previous_compiled_digest is not None and (
+                type(self.previous_compiled_digest) is not str
+                or len(self.previous_compiled_digest) != 64
+                or any(ch not in "0123456789abcdef"
+                       for ch in self.previous_compiled_digest)):
+            raise ValueError("previous_compiled_digest must be SHA-256")
+        _text(self.draft_ref, "draft_ref", limit=4096)
+        try:
+            draft_key = AtomKey.from_token(self.draft_ref)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("draft_ref must be a canonical graph key") from exc
+        if (draft_key.type_name != "d12.character_draft.v1"
+                or draft_key.owner.kind != "persona"
+                or draft_key.owner.persona != self.scope
+                or draft_key.name != "current"):
+            raise ValueError("active scheme draft_ref must name the current draft")
+        _text(self.adopted_operation_id, "adopted_operation_id")
+        if self.adoption_kind not in ("initial", "administrative_edit"):
+            raise ValueError("active scheme has unsupported adoption kind")
+        if (self.generation == 1) != (self.previous_compiled_digest is None):
+            raise ValueError("first scheme must have no prior digest")
+
+
+def character_draft_key(namespace: NamespaceId) -> AtomKey:
+    if type(namespace) is not NamespaceId:
+        raise TypeError("namespace is required")
+    return AtomKey(Owner("persona", namespace.bot_id, namespace.persona_id),
+                   "d12.character_draft.v1", "current")
+
+
+def active_scheme_head_key(namespace: NamespaceId) -> AtomKey:
+    if type(namespace) is not NamespaceId:
+        raise TypeError("namespace is required")
+    return AtomKey(Owner("persona", namespace.bot_id, namespace.persona_id),
+                   "d12.active_scheme_head.v1", "current")
 
 
 @dataclass(frozen=True)
@@ -140,6 +202,7 @@ def graph_type_specs() -> tuple[TypeSpec, ...]:
 
     definitions = (
         ("d12.character_draft.v1", ("persona",), "state", CharacterDraft, (), False),
+        ("d12.active_scheme_head.v1", ("persona",), "state", ActiveSchemeHeadV1, (), False),
         ("d12.compiled_scheme_candidate.v1", ("activity",), "cache", CompiledSchemeCandidate,
          ("domain_candidates",), True),
         ("d12.operation_plan.v1", ("activity",), "source", OperationPlan, ("audience",), True),
@@ -204,6 +267,8 @@ class D12DomainProvider:
             raise ValueError("D12 proposal schema is not registered")
         specs = {spec.name: spec for spec in self.type_specs()}
         for write in proposal.typed_writes:
+            if write.key.type_name == "d12.active_scheme_head.v1":
+                raise ValueError("active scheme head requires W01 atomic adoption")
             spec = specs.get(write.key.type_name)
             if spec is None or write.key.owner.kind not in spec.owner_kinds:
                 raise ValueError("D12 may write only its administrative candidate types")

@@ -42,7 +42,8 @@ class PinnedCurrentSelfIdentityGraphVerifier:
 
     def current(self, namespace: NamespaceId, anchor: RestoreAnchor,
                 installation_id: str,
-                guard: OwnerAuthorizationGuardV1) -> tuple[str, str, int, int] | None:
+                guard: OwnerAuthorizationGuardV1, *, source_location=None,
+                location_observation=None, storage_admission=None, holder=None) -> tuple[str, str, int, int] | None:
         if (type(namespace) is not NamespaceId or type(anchor) is not RestoreAnchor
                 or type(guard) is not OwnerAuthorizationGuardV1
                 or guard.namespace != namespace
@@ -53,18 +54,33 @@ class PinnedCurrentSelfIdentityGraphVerifier:
                 or guard.minimum_revocation_epoch > 0):
             return None
         try:
+            if (source_location is None) != (location_observation is None):
+                return None
+            if source_location is not None:
+                from .current_source_location_v1 import InstalledCurrentSourceLocationQualifierV1
+                if (type(source_location) is not InstalledCurrentSourceLocationQualifierV1
+                        or source_location._graph_db_path != self._path):
+                    return None
+            elif storage_admission is not None:
+                return None
             with closing(sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True)) as db:
                 db.execute("PRAGMA query_only=ON")
                 db.execute("BEGIN")
                 try:
-                    return self._check(db, namespace, anchor, installation_id, guard)
+                    if source_location is not None:
+                        issued = source_location.require_graph_snapshot_v1(db, location_observation, graph_db_path=self._path)
+                        if issued.core_anchor != anchor or issued.holder != holder:
+                            return None
+                    return self._check(db, namespace, anchor, installation_id, guard,
+                        location_observation=location_observation, storage_admission=storage_admission, holder=holder)
                 finally:
                     db.execute("ROLLBACK")
         except Exception:
             return None
 
     @staticmethod
-    def _check(db, namespace, anchor, installation_id, guard):
+    def _check(db, namespace, anchor, installation_id, guard, *,
+               location_observation=None, storage_admission=None, holder=None):
         ns = namespace.as_tuple
         meta = db.execute(
             "SELECT schema,requirements_json,graph_revision FROM graph_recovery_metadata_v2 "
@@ -75,7 +91,8 @@ class PinnedCurrentSelfIdentityGraphVerifier:
             "SELECT access_epoch,delete_epoch FROM graph_authority_epochs "
             "WHERE bot=? AND persona=?", ns).fetchone()
         if (meta is None or meta[0] != "sylanne3.authority.v2"
-                or epoch is None or access is None or access[1] != 0):
+                or epoch is None or access is None
+                or access[1] != 0 and location_observation is None):
             return None
         raw = _canonical(meta[1])
         if type(raw) is not dict or raw.get("namespace") != asdict(namespace):
@@ -116,6 +133,27 @@ class PinnedCurrentSelfIdentityGraphVerifier:
         })
         grant = _canonical(grant_row[1])
         validate_owner_grant_v1(grant)
+        origin_incarnation = grant["graph_incarnation"]
+        if origin_incarnation != requirements.graph_incarnation:
+            from .d12_owner_storage_admission_v1 import D12OwnerStorageAdmissionV1
+            admission = storage_admission
+            if (location_observation is None or type(admission) is not D12OwnerStorageAdmissionV1
+                    or admission.namespace != namespace or admission.authority_namespace != anchor.namespace
+                    or admission.installation_id != installation_id or admission.holder != holder
+                    or admission.source_owner_guard != guard
+                    or admission.source_grant_ref != owner_grant_key(*ns).token
+                    or admission.source_grant_revision != grant_row[0]
+                    or admission.source_grant_digest != "sha256:" + canonical_digest(grant)
+                    or asdict(admission.principal) != grant["principal"]
+                    or admission.source_graph_incarnation != origin_incarnation
+                    or admission.current_graph_incarnation != requirements.graph_incarnation
+                    or admission.activation_generation != anchor.activation_generation
+                    or admission.revocation_epoch != anchor.revocation_epoch
+                    or origin_incarnation not in location_observation.graph_incarnations
+                    or location_observation.graph_incarnations[-1] != requirements.graph_incarnation):
+                return None
+        elif storage_admission is not None:
+            return None
         proof_row = db.execute(
             "SELECT operation_id,request_digest,grant_id,grant_digest,"
             "graph_incarnation,graph_access_epoch,graph_epoch,"
@@ -134,7 +172,7 @@ class PinnedCurrentSelfIdentityGraphVerifier:
                 or proof.grant_digest != "sha256:" + canonical_digest(grant)
                 or proof.grant_revision != grant_row[0]
                 or proof.operation_id != grant["issue_operation_id"]
-                or proof.graph_incarnation != requirements.graph_incarnation
+                or proof.graph_incarnation != origin_incarnation
                 or guard.authorization_head != owner_digest(proof)
                 or proof.graph_access_epoch > access[0]
                 or proof.graph_epoch > epoch[0]):
@@ -211,7 +249,7 @@ class PinnedCurrentSelfIdentityGraphVerifier:
                 or original_requirements.get("authority_id") != anchor.authority_id
                 or original_requirements.get("authority_namespace") != anchor.namespace
                 or original_requirements.get("graph_incarnation")
-                   != requirements.graph_incarnation
+                   != origin_incarnation
                 or role_request != (
                     role_intent[0], role_receipt.request_digest,
                     role_intent[1])
@@ -235,7 +273,7 @@ class PinnedCurrentSelfIdentityGraphVerifier:
                 or role_receipt.owner_grant_id != grant["grant_id"]
                 or role_receipt.owner_grant_revision != grant_row[0]
                 or role_receipt.owner_authorization_head != guard.authorization_head
-                or role_receipt.graph_incarnation != requirements.graph_incarnation
+                or role_receipt.graph_incarnation != origin_incarnation
                 or (resources.namespace, resources.operation_id,
                     resources.plan_id, resources.head_id) != (
                         namespace, role_receipt.operation_id,
@@ -249,14 +287,14 @@ class PinnedCurrentSelfIdentityGraphVerifier:
                 or plan_value.get("namespace") != asdict(namespace)
                 or plan_value.get("plan_id") != activation.plan_id
                 or plan_value.get("version") != activation.plan_version
-                or activation.graph_incarnation != requirements.graph_incarnation
+                or activation.graph_incarnation != origin_incarnation
                 or activation.activation_generation != anchor.activation_generation
                 or activation.owner_grant_id != grant["grant_id"]
                 or activation.owner_grant_revision != grant_row[0]
                 or activation.authorization_revision != guard.authorization_revision
                 or grant["authority_id"] != anchor.authority_id
                 or grant["installation_id"] != installation_id
-                or grant["graph_incarnation"] != requirements.graph_incarnation
+                or grant["graph_incarnation"] != origin_incarnation
                 or grant["activation_generation"] != anchor.activation_generation
                 or guard.authorization_revision != grant["grant_revision"]
                 or guard.minimum_revocation_revision > guard.authorization_revision):

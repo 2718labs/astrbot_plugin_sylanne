@@ -9,6 +9,8 @@ from sylanne3.graph_coordinator import UnavailableGuard
 from sylanne3.graph_coordinator import GraphCoordinator
 from sylanne3.graph_types import GraphAtom, GraphSnapshot
 from sylanne3.domains.d07 import D07DomainProvider
+from sylanne3.domains.d12 import graph_type_specs as d12_graph_type_specs
+from sylanne3.domains.d06 import source_correction_head_key
 from sylanne3.host.authority_profile import (
     AdminD06PrivateReplySourcePolicy, AdminD07AttentionPolicy,
     AdminInstallationBundle, AdminModelWorkflowV2, AdminModelWorkflowsV2,
@@ -18,6 +20,10 @@ from sylanne3.host.post_c02_attention_driver import (
     post_c02_attention_operation_id, prepare_post_c02_attention_v1,
 )
 from sylanne3.host.installed_reply_model_driver import reply_model_operation_id_v1
+from sylanne3.host.post_c02_reply_driver import post_c02_reply_operation_id
+from sylanne3.authority_service.v2_reply_worker_model_result_contract import (
+    ReplyWorkerModelResultReadRequestV1, reply_worker_read_attempt_id_v1,
+)
 from sylanne3.memory_types import access_key, source_key
 from sylanne3.runtime.c02_bundle_codec import c02_bundle_from_wire
 from sylanne3.runtime.reply_model_job import (
@@ -45,7 +51,8 @@ def private_reply_c02_case(monkeypatch, request):
         kwargs["extra_work_kinds"] = tuple(
             kwargs.get("extra_work_kinds", ())) + ("reply", "d07.attention")
         kwargs["extra_specs"] = tuple(
-            kwargs.get("extra_specs", ())) + D07DomainProvider().type_specs()
+            kwargs.get("extra_specs", ())) + D07DomainProvider().type_specs() + (
+                d12_graph_type_specs())
         return original_scene(*args, **kwargs)
 
     def reply_ingress(self, bootstrap, host, policy, clock, encoding,
@@ -136,13 +143,15 @@ def test_explicit_private_reply_source_can_be_read_after_settlement(
         object(), case[4], b"d11", b"d02", ingress_clock=case[5],
         d07_attention=AdminD07AttentionPolicy(
             300.0, {"cpu_ms": 1}, "attention-snapshot", "attention-resource"))
-    receipt, snapshot, qualification, conversation_ref, guard, _, _ = (
+    receipt, snapshot, qualification, conversation_ref, guard, _, _, policy, competitor = (
         coordinator.read_post_c02_attention_inputs_v1(
             case[2], namespace, seal.consumer_operation_id, None, installed))
+    assert competitor is None
     assert receipt.operation_id == seal.consumer_operation_id
     assert qualification.source_refs and len(qualification.source_refs) == 1
     assert conversation_ref == "conversation"
     assert guard.read_versions == snapshot.versions
+    assert policy.active_head_ref in guard.read_versions
 
 
 def test_private_reply_source_can_commit_durable_attention(
@@ -157,9 +166,10 @@ def test_private_reply_source_can_commit_durable_attention(
         object(), case[4], b"d11", b"d02", ingress_clock=case[5],
         d07_attention=AdminD07AttentionPolicy(
             300.0, {"cpu_ms": 1}, "attention-snapshot", "attention-resource"))
-    c02, snapshot, qualification, audience, guard, anchor, clock = (
+    c02, snapshot, qualification, audience, guard, anchor, clock, policy, competitor = (
         graph.read_post_c02_attention_inputs_v1(
             case[2], namespace, seal.consumer_operation_id, None, installed))
+    assert competitor is None
     source_ref = qualification.source_refs[0]
     operation_id = post_c02_attention_operation_id(c02.operation_id, source_ref)
     lease, capability = graph.grant(
@@ -178,7 +188,9 @@ def test_private_reply_source_can_commit_durable_attention(
             parent_budget_lease_ref=case[4].root_grant.lease_id,
             conversation_ref=audience, now_utc=trusted_upper(clock),
             monotonic_deadline=clock.monotonic_after_seconds + 299.0,
-            ticket_lifetime_seconds=299.0)
+            ticket_lifetime_seconds=299.0,
+            current_policy=policy.policy,
+            active_head_ref=policy.active_head_ref)
         receipt = graph.commit_post_c02_attention_v1(
             candidate.bundle, lease, installed)
         assert receipt.status == "committed"
@@ -225,9 +237,10 @@ def test_settled_private_c02_attention_prepares_one_signed_reply_job(
         d07_attention=AdminD07AttentionPolicy(
             300.0, {"cpu_ms": 1}, "attention-snapshot", "attention-resource"),
         model_workflows=_reply_workflows())
-    c02, snapshot, qualification, audience, guard, anchor, clock = (
+    c02, snapshot, qualification, audience, guard, anchor, clock, policy, competitor = (
         graph.read_post_c02_attention_inputs_v1(
             case[2], namespace, seal.consumer_operation_id, None, installed))
+    assert competitor is None
     source_ref = qualification.source_refs[0]
     operation_id = post_c02_attention_operation_id(c02.operation_id, source_ref)
     lease, capability = graph.grant(
@@ -246,7 +259,9 @@ def test_settled_private_c02_attention_prepares_one_signed_reply_job(
             parent_budget_lease_ref=case[4].root_grant.lease_id,
             conversation_ref=audience, now_utc=trusted_upper(clock),
             monotonic_deadline=clock.monotonic_after_seconds + 299.0,
-            ticket_lifetime_seconds=299.0)
+            ticket_lifetime_seconds=299.0,
+            current_policy=policy.policy,
+            active_head_ref=policy.active_head_ref)
         graph.commit_post_c02_attention_v1(candidate.bundle, lease, installed)
     finally:
         graph.release_authority_lease(case[2], lease)
@@ -283,6 +298,13 @@ def test_settled_private_c02_attention_prepares_one_signed_reply_job(
     replay = graph.prepare_post_c02_reply_model_job_v1(
         case[2], namespace, seal.consumer_operation_id, source_ref, installed)
     assert replay == prepared
+    page = graph.discover_pending_post_c02_reply_model_jobs_v1(
+        case[2], namespace, installed_bundle=installed)
+    assert page.next_cursor is None
+    assert len(page.items) == 1
+    assert page.items[0].preparation == prepared
+    assert page.items[0].conversation_ref == audience
+    assert page.items[0].hold_reason is None
     acquire_operation_id = reply_model_operation_id_v1(
         seal.consumer_operation_id, source_ref)
     worker_lease, worker_capability = graph.grant(
@@ -300,6 +322,10 @@ def test_settled_private_c02_attention_prepares_one_signed_reply_job(
             installed, lease_seconds=30)
         assert acquired.phase == "running"
         assert acquired.fence > 0
+        acquired_page = graph.discover_pending_post_c02_reply_model_jobs_v1(
+            case[2], namespace, installed_bundle=installed)
+        assert acquired_page.items[0].preparation.job == acquired
+        assert acquired_page.items[0].conversation_ref == audience
         assert graph.acquire_post_c02_reply_model_job_v1(
             worker, worker_lease, seal.consumer_operation_id, source_ref,
             installed, lease_seconds=30) == acquired
@@ -308,5 +334,46 @@ def test_settled_private_c02_attention_prepares_one_signed_reply_job(
             seal.consumer_operation_id, source_ref, installed)
         assert frozen[0].operation_id == seal.consumer_operation_id
         assert frozen[5].job_id == acquired.job_id
+        read_request = graph.read_post_c02_reply_model_result_request_v1(
+            replace(worker, worker_fence=acquired.fence), worker_lease,
+            seal.consumer_operation_id, source_ref, installed)
+        consumer_id = post_c02_reply_operation_id(
+            seal.consumer_operation_id, source_ref)
+        assert isinstance(read_request, ReplyWorkerModelResultReadRequestV1)
+        assert read_request.consumer_operation_id == consumer_id
+        assert read_request.read_attempt_id == reply_worker_read_attempt_id_v1(
+            consumer_id, 1)
+        assert read_request.job_id == acquired.job_id
+        assert read_request.model_request_digest == frozen[5].request_digest
+        source_id = source_key_from_ref(source_ref, namespace)
+        head = source_correction_head_key(namespace, source_id)
+        store._db.execute(
+            "INSERT INTO graph_atoms(token,bot,persona,owner_kind,subject,"
+            "type_name,name,revision,value,valid) VALUES(?,?,?,?,?,?,?,?,?,1)",
+            (head.token, *namespace.as_tuple, head.owner.kind,
+             head.owner.subject, head.type_name, head.name, 1,
+             json.dumps({"state": "pending_reevaluation"})),
+        )
+        with pytest.raises(UnavailableGuard,
+                           match="qualified D07 attention"):
+            graph.read_post_c02_reply_model_egress_preparation_v1(
+                replace(worker, worker_fence=acquired.fence), worker_lease,
+                seal.consumer_operation_id, source_ref, installed)
+        store._db.execute(
+            "DELETE FROM graph_atoms WHERE token=?", (head.token,))
+        # A damaged/stale audience must remain visible for recovery audit,
+        # without giving the host a conversation to dispatch to.
+        store._db.execute(
+            "UPDATE graph_post_c02_reply_model_preparations_v1 SET "
+            "audience='other' WHERE bot=? AND persona=? AND job_id=?",
+            namespace.as_tuple + (acquired.job_id,),
+        )
+        held_page = graph.discover_pending_post_c02_reply_model_jobs_v1(
+            case[2], namespace, installed_bundle=installed)
+        assert len(held_page.items) == 1
+        assert held_page.items[0].job_id == acquired.job_id
+        assert held_page.items[0].preparation is None
+        assert held_page.items[0].conversation_ref is None
+        assert held_page.items[0].hold_reason
     finally:
         graph.release_authority_lease(case[2], worker_lease)

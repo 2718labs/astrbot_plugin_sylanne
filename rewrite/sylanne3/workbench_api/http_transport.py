@@ -94,11 +94,37 @@ class CurrentOwnerDashboardSessions:
             return None
         return session
 
+    async def resolve_operation_status(self, *, username, session_hint, original_ref, purpose):
+        reader = getattr(self._pairing, "resolve_current_operation_status_session", None)
+        if (not callable(reader) or type(username) is not str or not username
+                or type(session_hint) is not str or not session_hint):
+            return None
+        session = reader(username=username, owner_session_token=session_hint,
+                         original_ref=original_ref, purpose=purpose)
+        if inspect.isawaitable(session):
+            session = await session
+        if (type(session) is not AuthenticatedSession or session.host_username != username
+                or session.backend_operation_ref != original_ref
+                or any(value != frozenset({"workbench.operation_status"})
+                       for value in session.scope_capabilities.values())):
+            return None
+        return session
+
+    async def resolve_package_status(self,*,username,session_hint,operation_id,purpose):
+        reader=getattr(self._pairing,"resolve_current_package_status_session",None)
+        if not callable(reader) or type(username) is not str or not username or type(session_hint) is not str or not session_hint:return None
+        session=reader(username=username,owner_session_token=session_hint,operation_id=operation_id,purpose=purpose)
+        if inspect.isawaitable(session):session=await session
+        if (type(session) is not AuthenticatedSession or session.host_username!=username or session.package_operation_id!=operation_id
+                or any(v!=frozenset({"workbench.package_status"}) for v in session.scope_capabilities.values())):return None
+        return session
+
 
 class CsrfValidator(Protocol):
     """Validate a CSRF token bound to the same server-side session."""
 
     def validate(self, *, session: AuthenticatedSession, token: str) -> bool: ...
+
 
 
 class PluginRequest(Protocol):
@@ -167,17 +193,11 @@ class WorkbenchHttpTransport:
         self._service, self._sessions, self._csrf, self._config = service, sessions, csrf, config
 
     async def command(self, request: PluginRequest) -> dict[str, Any]:
-        """Handle a mounted POST only after host session, Origin and CSRF checks."""
-        session = await self._bound_session(request)
+        """Bounded parsing selects ordinary content or exact status admission."""
         if not isinstance(request.username, str) or not request.username:
             return self._error("unauthorized", "host_session_missing", "AstrBot 未提供已认证会话。", 401)
-        if session is None:
-            return self._error("unauthorized", "owner_session_locked", "Sylanne Owner 会话未解锁或已失效。", 401)
         if not self._origin_allowed(request):
             return self._error("unauthorized", "origin_denied", "请求来源未获允许。", 403)
-        token = request.headers.get("x-csrf-token")
-        if not isinstance(token, str) or not token or not self._csrf.validate(session=session, token=token):
-            return self._error("unauthorized", "csrf_denied", "防跨站校验未通过。", 403)
         if request.content_type is None or request.content_type.split(";", 1)[0].strip().lower() != "application/json":
             return self._error("unavailable", "unsupported_content_type", "请求必须使用 application/json。", 415)
         length = request.headers.get("content-length")
@@ -196,6 +216,32 @@ class WorkbenchHttpTransport:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return self._error("unavailable", "invalid_json", "请求 JSON 无效。", 400)
+        if type(payload) is dict and payload.get("action") in {"read_backend_operation","read_package_operation"}:
+            # Validate its exact request shape before selecting the separate
+            # operation-only resolver. A normal content failure never comes here.
+            from .service import WorkbenchService
+            try:
+                command = WorkbenchService._parse(payload)
+            except (ValueError, TypeError, KeyError):
+                return self._error("unavailable", "invalid_request", "操作状态请求无效。", 400)
+            package_status=command["action"]=="read_package_operation"
+            resolver = getattr(self._sessions, "resolve_package_status" if package_status else "resolve_operation_status", None)
+            session = None
+            if callable(resolver):
+                selector={"operation_id":command["input"]["operation_id"]} if package_status else {"original_ref":command["input"]["original_ref"]}
+                session = resolver(username=request.username,
+                    session_hint=request.cookies.get(SYLANNE_OWNER_SESSION_COOKIE),
+                    **selector, purpose=command["purpose"])
+                if inspect.isawaitable(session):
+                    session = await session
+        else:
+            session = await self._bound_session(request)
+        if (not isinstance(session, AuthenticatedSession)
+                or session.host_username != request.username):
+            return self._error("unauthorized", "owner_session_locked", "Sylanne Owner 会话未解锁或已失效。", 401)
+        token = request.headers.get("x-csrf-token")
+        if not isinstance(token, str) or not token or not self._csrf.validate(session=session, token=token):
+            return self._error("unauthorized", "csrf_denied", "防跨站校验未通过。", 403)
         response = self._service.handle(payload, session=session,
                                         context=RequestContext(True, True, True))
         if inspect.isawaitable(response):

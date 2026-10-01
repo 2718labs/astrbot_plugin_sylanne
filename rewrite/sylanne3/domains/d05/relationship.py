@@ -420,6 +420,104 @@ class RelationshipProvider:
             return BoundaryCheck("conflict", allowed, ("multiple_allow_rules",))
         return BoundaryCheck("pass" if allowed else "pass", allowed, ())
 
+    def boundary_required_check_from_graph(
+        self, intent: ActionIntent, schema: ActionSchema, coordinator: object, *,
+        authority: object, lease: object, namespace: NamespaceId,
+        audience_scope: str, scene_ref: str | None, at_time: float,
+        valid_until: float,
+    ) -> CheckReceipt:
+        """Evaluate D05 boundaries from a complete current relation-owner query.
+
+        The coordinator owns read authorization and deletion fences.  This
+        method retains every returned rule version and the range-query epoch;
+        D11 still has to recheck both at final admission.
+        """
+        if type(intent) is not ActionIntent or type(schema) is not ActionSchema:
+            raise TypeError("D08 action intent and schema are required")
+        if not isinstance(namespace, NamespaceId):
+            raise TypeError("namespace is required")
+        if not callable(getattr(coordinator, "query", None)):
+            raise TypeError("authorized graph coordinator query is required")
+        _id(intent.target_ref, "target_ref", "entity:")
+        if namespace.persona_id != next(
+            (item.subject_ref.removeprefix("persona:")
+             for item in intent.required_checks
+             if item.check_kind == "boundary" and item.provider_id == "d05.boundary"),
+            None,
+        ):
+            raise ValueError("boundary subject differs from namespace")
+
+        epoch = None
+        after = None
+        rules = []
+        while True:
+            page = coordinator.query(
+                authority, lease, type_names=("d05.boundary_rule",),
+                owner_kind="relation", subject=intent.target_ref,
+                after=after, expected_epoch=epoch, limit=512,
+            )
+            if len(page.snapshot.epochs) != 1:
+                raise ValueError("boundary query requires one namespace epoch")
+            current_epoch = page.snapshot.epochs[0]
+            if (current_epoch.bot, current_epoch.persona) != namespace.as_tuple:
+                raise ValueError("boundary query crossed namespace")
+            if epoch is None:
+                epoch = current_epoch
+            elif epoch != current_epoch:
+                raise ValueError("boundary query changed epoch")
+            for atom in page.snapshot.atoms:
+                if (not atom.valid or atom.key.type_name != "d05.boundary_rule"
+                        or atom.key.owner.kind != "relation"
+                        or (atom.key.owner.bot, atom.key.owner.persona) != namespace.as_tuple
+                        or atom.key.owner.subject != intent.target_ref):
+                    raise ValueError("boundary rule escaped its relation scope")
+                _strict_payload(
+                    atom.value, BoundaryRule, "source_refs", "communicated_refs",
+                    "acknowledged_refs", "exception_refs",
+                )
+                rule = BoundaryRule(**_tuple_payload(
+                    atom.value, "source_refs", "communicated_refs",
+                    "acknowledged_refs", "exception_refs",
+                ))
+                if (atom.key.name != rule.rule_id
+                        or atom.revision != rule.scope_version
+                        or rule.target_entity_ref != intent.target_ref
+                        or rule.subject_persona_ref != f"persona:{namespace.persona_id}"):
+                    raise ValueError("boundary rule differs from its graph scope or revision")
+                rules.append(rule)
+            if page.next_after is None:
+                break
+            if (not page.snapshot.atoms or page.next_after != page.snapshot.atoms[-1].key
+                    or page.next_after == after):
+                raise ValueError("boundary query pagination is invalid")
+            after = page.next_after
+
+        specs = tuple(item for item in intent.required_checks
+                      if item.check_kind == "boundary" and item.provider_id == "d05.boundary")
+        if len(specs) != 1:
+            raise ValueError("action needs one D05 boundary check")
+        spec = specs[0]
+        criteria = tuple(item for item in spec.required_input_versions
+                         if item.ref == spec.criteria_version)
+        if len(criteria) != 1:
+            raise ValueError("boundary criteria version is missing")
+        assert epoch is not None
+        observed = tuple(sorted((
+            *criteria, VersionedRef("d05.boundary", epoch.revision),
+            *(VersionedRef(rule.rule_id, rule.scope_version) for rule in rules),
+        ), key=lambda item: item.ref))
+        read_set = BoundaryRuleReadSet(
+            namespace, QueryEpoch(namespace, "d05.boundary", epoch.revision),
+            tuple(rules), observed, "full",
+        )
+        # The verifier is scoped to this one freshly obtained read.  No caller
+        # supplied coverage assertion can turn a different read into a pass.
+        checker = RelationshipProvider(boundary_read_verifier=lambda value: value is read_set)
+        return checker.boundary_required_check(
+            intent, schema, read_set, audience_scope=audience_scope,
+            scene_ref=scene_ref, at_time=at_time, valid_until=valid_until,
+        )
+
     def boundary_required_check(
         self,
         intent: ActionIntent,
@@ -526,6 +624,15 @@ class RelationshipProvider:
             and (rule.valid_until is None or timestamp <= rule.valid_until)
         )
         if revoked_or_superseded:
+            return CheckReceipt(spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
+                                spec.required_input_versions, "full", "unknown", timestamp, provider_id)
+        # A full current query can prove there is no surviving rule, but it
+        # cannot prove why an older no-contact rule disappeared.  Source
+        # deletion is not an instruction to initiate contact.  A proactive
+        # action needs a current, independently sourced contact setting or
+        # permission rule in this exact scope; inbound replies keep their
+        # separate frozen non-proactive qualification.
+        if schema.proactive and not matches:
             return CheckReceipt(spec.check_kind, spec.subject_ref, spec.action_ref, spec.purpose,
                                 spec.required_input_versions, "full", "unknown", timestamp, provider_id)
         denied = tuple(item for item in matches if item.effect == "deny")

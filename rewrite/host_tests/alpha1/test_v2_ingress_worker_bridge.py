@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 from threading import get_ident
 from types import ModuleType, SimpleNamespace
@@ -20,6 +21,7 @@ if installed_stub:
 from sylanne3 import runtime_context
 from sylanne3.graph_coordinator import UnavailableGuard
 from sylanne3.domains.d01 import ActiveRoleQualification, PersonaBlock, PersonaPlan
+from sylanne3.domains.d06.attachment_contract_v2 import SourceAttachmentV2
 from sylanne3.domains.d03.context import RoleBinding
 from sylanne3.graph_coordinator import (
     FirstIngressOutcomeUnknown, IngressHostFacts, ingress_host_fingerprint,
@@ -192,13 +194,18 @@ async def test_v2_ingress_uses_installed_path_while_global_health_stays_limited(
             trace.append("provision")
             return operation_id
 
-        def commit_first_ingress_v2(self, bootstrap, host, policy, clock_policy, encoding_policy):
+        def commit_first_ingress_v2(self, bootstrap, host, policy, clock_policy,
+                                    encoding_policy, reply_source_policy=None, *,
+                                    source_admission_v2=None):
             nonlocal committed
             assert bootstrap is self.bootstrap
             assert policy is installed.installation_policy
             assert clock_policy is clock
             assert encoding_policy is encoding
             assert type(host) is IngressHostFacts
+            if source_admission_v2 is not None:
+                assert source_admission_v2.source.source_id == host.lineage.source_ref
+                assert source_admission_v2.attachments[0].content == b"\x89PNG\r\n\x1a\n"
             assert get_ident() == self.worker_thread
             trace.append((host, ingress_host_fingerprint(host)))
             if not admitted:
@@ -212,7 +219,7 @@ async def test_v2_ingress_uses_installed_path_while_global_health_stays_limited(
             nonlocal arrived
             assert bootstrap is self.bootstrap
             assert namespace == installed.installation_policy.namespace
-            assert source_ref == "a" * 64
+            assert source_ref in {"a" * 64, "b" * 64}
             assert policy is installed.installation_policy
             assert arrival_policy is arrival
             assert clock_policy is clock
@@ -283,6 +290,20 @@ async def test_v2_ingress_uses_installed_path_while_global_health_stays_limited(
                      and type(item[0]) is IngressHostFacts]
     assert len(ingress_calls) == 3
     assert ingress_calls[1] == ingress_calls[2]
+    media_bytes = b"\x89PNG\r\n\x1a\n"
+    media_host = replace(
+        envelope(installed.installation_policy.namespace),
+        message_id="media-message",
+        lineage=SourceLineage(
+            "b" * 64, "reported", "platform", "external_report", "reported_claim",
+        ),
+        attachments=(SourceAttachmentV2(
+            0, "image", "image/png", media_bytes,
+            hashlib.sha256(media_bytes).hexdigest(),
+        ),),
+    )
+    assert await context.handle_ingress(media_host) == IngressReceipt("duplicate", "ingress-op")
+    assert trace.count(("arrival", "b" * 64)) == 1
     assert context.health.status == "limited"
     await context.stop()
 

@@ -87,7 +87,7 @@ class BoundOwnerSessions:
                  worker: GraphWorker, bootstrap: object,
                  owner_actor: Callable[[OwnerPrincipalV1, NamespaceId], str | None],
                  namespace: NamespaceId, authority_id: str,
-                 installation_id: str, origin: str) -> None:
+                 installation_id: str, origin: str, operation_status_port=None, package_maintenance_port=None) -> None:
         if (not all(callable(getattr(authority, name, None)) for name in (
                 "begin_owner_session", "accept_owner_session", "describe_owner_session",
                 "logout_owner_session"))
@@ -97,6 +97,11 @@ class BoundOwnerSessions:
                 or not all(type(value) is str and value for value in (
                     authority_id, installation_id, origin))):
             raise TypeError("trusted Owner session dependencies are required")
+        self._operation_status_port = operation_status_port
+        from ..host.d12_package_workbench_port_v2 import InstalledD12PackageWorkbenchPortV2
+        if package_maintenance_port is not None and type(package_maintenance_port) is not InstalledD12PackageWorkbenchPortV2:
+            raise TypeError("actual installed paired package status port required")
+        self._package_maintenance_port = package_maintenance_port
         self._authority = authority
         self._worker = worker
         self._bootstrap = bootstrap
@@ -154,14 +159,36 @@ class BoundOwnerSessions:
         if type(view) is not CurrentOwnerViewV1:
             return False
         guard, binding = view.authority_guard, view.graph_binding
+        admission = getattr(binding, "target_admission", None)
+        installation_matches = guard.installation_id == request.installation_id
+        if admission is not None:
+            from ..authority_service.d12_target_owner_admission_v1 import D12TargetOwnerAdmissionV1
+            installation_matches = (type(admission) is D12TargetOwnerAdmissionV1
+                and admission.source_owner_guard == guard
+                and admission.target_installation_id == request.installation_id
+                and admission.principal == request.principal
+                and admission.target_actor_id == actor
+                and admission.target_credential_id == request.credential_id
+                and admission.target_credential_epoch == request.credential_epoch
+                and admission.graph_incarnation == binding.graph_incarnation
+                and admission.source_grant_digest == binding.grant_digest)
+        storage = getattr(binding, "storage_admission", None)
+        if storage is not None:
+            from ..authority_service.d12_owner_storage_admission_v1 import D12OwnerStorageAdmissionV1
+            installation_matches = (admission is None and type(storage) is D12OwnerStorageAdmissionV1
+                and storage.source_owner_guard == guard
+                and storage.installation_id == request.installation_id
+                and storage.principal == request.principal
+                and storage.current_graph_incarnation == binding.graph_incarnation
+                and storage.source_grant_digest == binding.grant_digest)
         return (guard.authority_id == request.authority_id
-                and guard.installation_id == request.installation_id
+                and installation_matches
                 and guard.namespace == self._namespace
                 and guard.pending_revoke_operation_id is None
                 and binding.principal == request.principal
                 and binding.actor == actor
                 and binding.namespace == self._namespace
-                and binding.scope == "bot/persona"
+                and binding.scope == f"{self._namespace.bot_id}/{self._namespace.persona_id}"
                 and binding.authorization_revision == guard.authorization_revision
                 and binding.authorization_head == guard.authorization_head
                 and binding.revocation_epoch == guard.minimum_revocation_epoch
@@ -279,6 +306,72 @@ class BoundOwnerSessions:
             owner_session_token=owner_session_token,
             owner_session_request=binding.request)
         return VerifiedOwnerPairing(session, described.principal, view.authority_guard)
+
+    async def resolve_current_package_status_session(self,*,username,owner_session_token,operation_id,purpose):
+        """Explicit exact-operation auth after package admission closes."""
+        from uuid import UUID
+        port=self._package_maintenance_port
+        if port is None or purpose not in {"audit","workbench_view"}:return None
+        try:
+            operation=UUID(operation_id);key=self._key(owner_session_token)
+            if operation.version!=4 or str(operation)!=operation_id:return None
+        except (ValueError,TypeError,AttributeError):return None
+        with self._lock:
+            binding=self._bindings.get(key)
+            if binding is None or binding.username!=username or key in self._revoked:return None
+        if not self._request_matches(binding.request):return None
+        scope="/".join(self._namespace.as_tuple)
+        session=AuthenticatedSession(binding.actor_id,binding.session_id,
+            {scope:frozenset({"workbench.package_status"})},{scope:frozenset({"owner"})},
+            {scope:frozenset({"audit","workbench_view"})},host_username=binding.username,
+            owner_session_token=owner_session_token,owner_session_request=binding.request,package_operation_id=operation_id)
+        try:
+            await asyncio.to_thread(port.read_session_package_operation_v2,session=session,scope=scope,operation_id=operation_id)
+        except (RuntimeError,ValueError,TypeError,PermissionError,LookupError):return None
+        with self._lock:
+            if self._bindings.get(key)!=binding or key in self._revoked:return None
+        return session
+
+    async def resolve_current_operation_status_session(self, *, username: str,
+            owner_session_token: str, original_ref: str, purpose: str) -> AuthenticatedSession | None:
+        """Authenticate exactly one content-free operation after source freeze.
+
+        This is selected by the explicit status action before ordinary session
+        resolution. It is never an error fallback or a content-capability lease.
+        """
+        port = self._operation_status_port
+        if (port is None or not callable(getattr(port, "read_session_operation_status_v1", None))
+                or type(original_ref) is not str
+                or re.fullmatch(r"d12authority:[0-9a-f]{64}", original_ref) is None
+                or purpose not in {"audit", "workbench_view"}):
+            return None
+        try:
+            key = self._key(owner_session_token)
+        except ValueError:
+            return None
+        with self._lock:
+            binding = self._bindings.get(key)
+            if binding is None or binding.username != username or key in self._revoked:
+                return None
+        if not self._request_matches(binding.request):
+            return None
+        scope = "/".join(self._namespace.as_tuple)
+        session = AuthenticatedSession(binding.actor_id, binding.session_id,
+            {scope: frozenset({"workbench.operation_status"})}, {scope: frozenset({"owner"})},
+            {scope: frozenset({"audit", "workbench_view"})}, host_username=binding.username,
+            owner_session_token=owner_session_token, owner_session_request=binding.request,
+            backend_operation_ref=original_ref)
+        try:
+            original = await asyncio.to_thread(port.read_session_operation_status_v1,
+                session=session, scope=scope, original_ref=original_ref, refresh=False)
+        except (RuntimeError, ValueError, TypeError, PermissionError, LookupError):
+            return None
+        if original.namespace != self._namespace or original.original_ref != original_ref:
+            return None
+        with self._lock:
+            if self._bindings.get(key) != binding or key in self._revoked:
+                return None
+        return session
 
     async def revoke_bound_session(self, *, username: str, owner_session_token: str) -> bool:
         """Local logout locks W11 immediately; Authority logout follows."""

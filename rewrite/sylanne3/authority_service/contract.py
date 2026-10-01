@@ -24,6 +24,10 @@ class AuthorityUnavailable(RuntimeError):
     """Current independent authority cannot grant the requested operation."""
 
 
+class AuthorityColdRestartRequired(AuthorityUnavailable):
+    """The protected pointer switched; this process must exit before reopening."""
+
+
 def identifier(value: str, name: str) -> str:
     if type(value) is not str or not _ID.fullmatch(value):
         raise ValueError(f"invalid {name}")

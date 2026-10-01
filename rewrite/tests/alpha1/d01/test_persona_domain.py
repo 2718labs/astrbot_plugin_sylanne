@@ -171,8 +171,8 @@ class PersonaDomainTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             domain.validate_growth(plan(), proposal)
         key = domain.contribution_key("honesty", "family:one", "core")
-        self.assertTrue(domain.consume_contribution(key))
-        self.assertFalse(domain.consume_contribution(key))
+        self.assertTrue(domain.consume_contribution(key, ()))
+        self.assertFalse(domain.consume_contribution(key, (key,)))
 
     def test_domain_candidate_uses_the_shared_envelope_and_does_not_claim_write_authority(self):
         domain = PersonaDomain()

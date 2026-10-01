@@ -33,6 +33,15 @@ from .numeric_coupling import (
     requires_joint_numeric_compiler,
     validate_numeric_coupling,
 )
+from .joint_numeric_receipt import (
+    D04FamilyContributionDoseV1,
+    D04JointMemberNumericResultV1,
+    D04JointNumericReceiptCandidateV1,
+    D04JointNumericReceiptHold,
+    D04NumericOutputIntervalV1,
+    compile_joint_numeric_receipt_candidate_v1,
+    verify_joint_numeric_receipt_candidate_v1,
+)
 from .recollection_read import (
     RecollectionExperienceSnapshotCandidate,
     RecollectionSnapshotUnavailable,
@@ -59,6 +68,24 @@ from .root import (
     encode_numeric_checkpoint,
 )
 from .source_correction import D04SourceReevaluationCandidate, compile_d04_source_reevaluation
+from .product_readout import (
+    AffectiveReadoutCandidate,
+    AffectiveTendencyCandidate,
+    D04ReadoutHold,
+    project_conditional_affect_behaviour,
+)
+from .product_issuer import (
+    D04CurrentProductReadFrameV1,
+    D04CurrentProductReadPort,
+    D04ProductReadoutIssuer,
+    D04ProductReadoutReceiptV1,
+    D04VerifiedNumericAdoptionV1,
+)
+from .product_admission import (
+    D04ProductAdmissionCandidateV1,
+    D04SchemeOriginalClaimV1,
+    compile_d04_product_admission_candidate,
+)
 
 __all__ = (
     "AdvanceRequirements",
@@ -91,6 +118,13 @@ __all__ = (
     "coupling_id",
     "requires_joint_numeric_compiler",
     "validate_numeric_coupling",
+    "D04FamilyContributionDoseV1",
+    "D04JointMemberNumericResultV1",
+    "D04JointNumericReceiptCandidateV1",
+    "D04JointNumericReceiptHold",
+    "D04NumericOutputIntervalV1",
+    "compile_joint_numeric_receipt_candidate_v1",
+    "verify_joint_numeric_receipt_candidate_v1",
     "RecollectionExperienceSnapshotCandidate",
     "RecollectionSnapshotUnavailable",
     "inspect_recollection_experience_snapshot",
@@ -114,4 +148,16 @@ __all__ = (
     "encode_numeric_checkpoint",
     "D04SourceReevaluationCandidate",
     "compile_d04_source_reevaluation",
+    "AffectiveReadoutCandidate",
+    "AffectiveTendencyCandidate",
+    "D04ReadoutHold",
+    "project_conditional_affect_behaviour",
+    "D04CurrentProductReadFrameV1",
+    "D04CurrentProductReadPort",
+    "D04ProductReadoutIssuer",
+    "D04ProductReadoutReceiptV1",
+    "D04VerifiedNumericAdoptionV1",
+    "D04ProductAdmissionCandidateV1",
+    "D04SchemeOriginalClaimV1",
+    "compile_d04_product_admission_candidate",
 )

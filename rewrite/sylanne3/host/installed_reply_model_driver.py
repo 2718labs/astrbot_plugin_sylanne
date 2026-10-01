@@ -20,15 +20,26 @@ from ..authority_service.v2_reply_worker_model_result_contract import (
     reply_worker_read_attempt_id_v1,
 )
 from ..domains.d07 import AttentionTicket
+from ..domains.d09 import SourceReplyExpressionV1, issue_source_reply_expression_v1
 from ..model_broker.reply_language import (
     InstalledReplyRequestV1, ReplyLanguageCandidate, ReplySourceSnapshot,
     freeze_installed_reply_request_v1, parse_reply_result_v1,
 )
 from ..runtime.restore_anchor import RestoreAnchor
+from ..runtime.model_cost_settlement import (
+    OriginalModelCostCommitV1, original_model_cost_operation_id_v1,
+)
+from ..runtime.issuers import ResourceQuote
+from ..runtime.jobs import PersistentJob
+from ..runtime.reply_model_job import (
+    ReplyModelQueuedPreparationV1, reply_job_id_v1,
+    reply_job_original_operation_id_v1,
+)
 from ..runtime_contracts import (
     CommandEnvelope, CommitReceipt, canonical_digest,
 )
 from .authority_profile import AdminInstallationBundle
+from .installation_grant_identity import same_installed_grant_identity_v2
 from .model_egress_executor import HostModelEgressExecutor
 
 
@@ -130,6 +141,110 @@ class ReplyModelTerminalHoldV1:
 class InstalledReplyModelRunV1:
     preparation: FrozenReplyModelPreparationV1
     terminal: ReplyModelTerminalHoldV1
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledReplyProgressV1:
+    """Content stays unadmitted even after original cost is durable."""
+
+    run: InstalledReplyModelRunV1
+    cost: OriginalModelCostCommitV1 | None
+    candidate: ReplyLanguageCandidate | None
+    result_read: ReplyWorkerModelResultReadV1 | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledReplyReadV1:
+    """Parsed source content and the same verified Authority read response."""
+
+    candidate: ReplyLanguageCandidate
+    result_read: ReplyWorkerModelResultReadV1
+
+
+def issue_installed_post_c02_source_expression_v1(
+    queued: ReplyModelQueuedPreparationV1,
+    progress: InstalledReplyProgressV1, *,
+    current_source: ReplySourceSnapshot,
+    current_envelope: CommandEnvelope,
+    scene_ref: str, covered_slots: tuple[str, ...],
+    max_chars: int,
+) -> SourceReplyExpressionV1:
+    """Turn one paid Authority result into a source-bound D09 candidate.
+
+    W01 must supply the graph-issued queued job and current source/envelope,
+    and must verify the signed quote and current dispatch clock in its own
+    transaction. An expired original model quote does not erase an already
+    completed, settled and Authority-read result.
+    This pure host bridge does not issue checks, admission, or send authority.
+    """
+    from ..host.post_c02_reply_driver import post_c02_reply_operation_id
+    from ..runtime.d11_types import runtime_job_key
+
+    if (type(queued) is not ReplyModelQueuedPreparationV1
+            or type(progress) is not InstalledReplyProgressV1
+            or type(current_source) is not ReplySourceSnapshot
+            or type(current_envelope) is not CommandEnvelope):
+        raise ValueError("typed current reply inputs required")
+    run, cost, candidate, read = (
+        progress.run, progress.cost, progress.candidate, progress.result_read)
+    if (type(run) is not InstalledReplyModelRunV1
+            or type(run.preparation) is not FrozenReplyModelPreparationV1
+            or type(run.terminal) is not ReplyModelTerminalHoldV1
+            or type(cost) is not OriginalModelCostCommitV1
+            or type(candidate) is not ReplyLanguageCandidate
+            or type(read) is not ReplyWorkerModelResultReadV1
+            or type(run.terminal.terminal) is not ModelTerminalReceiptV2):
+        raise ValueError("paid original Authority reply result required")
+    prep = run.preparation
+    intent = prep.intent
+    terminal = run.terminal.terminal
+    quote = queued.quote
+    job = queued.job
+    namespace = current_envelope.authority.namespace
+    cost_operation_id = original_model_cost_operation_id_v1(
+        namespace, intent.call_id)
+    if (type(quote) is not ResourceQuote or type(job) is not PersistentJob
+            or queued.c02_operation_id != prep.c02_receipt.operation_id
+            or queued.source_ref != prep.source.source_ref
+            or queued.source_ref != current_source.source_ref
+            or queued.original_operation_id != reply_job_original_operation_id_v1(
+                queued.c02_operation_id, queued.source_ref)
+            or job.job_id != reply_job_id_v1(
+                queued.c02_operation_id, queued.source_ref)
+            or job.operation_id != queued.original_operation_id
+            or (job.bot_id, job.persona_id) != namespace.as_tuple
+            or (quote.bot_id, quote.persona_id) != namespace.as_tuple
+            or quote.work_kind != "reply"
+            or quote.operation_id != queued.original_operation_id
+            or quote.graph_job_ref != runtime_job_key(
+                *namespace.as_tuple, job.activity_id, job.job_id).token
+            or quote.activity_id != job.activity_id
+            or quote.parent_budget_lease_ref != intent.budget_lease_id
+            or dict(quote.ceiling) != dict(intent.budget_ceiling)
+            or intent.job_id != job.job_id
+            or intent.budget_reservation_operation_id != queued.original_operation_id
+            or intent.budget_reservation_digest != queued.reservation_digest
+            or current_envelope.identity.operation_id != post_c02_reply_operation_id(
+                queued.c02_operation_id, queued.source_ref)
+            or queued.c02_operation_id not in current_envelope.causation):
+        raise ValueError("original C02/source or signed budget differs")
+    if (run.terminal.status != "observed_pending_result_read"
+            or (run.terminal.operation_id, run.terminal.call_id) != (
+                intent.operation_id, intent.call_id)
+            or read.terminal_receipt != terminal
+            or read.request.installation_id != terminal.installation_id
+            or cost.status != "committed"
+            or (cost.operation_id, cost.call_id, cost.quote_id,
+                cost.quote_version) != (
+                    cost_operation_id, intent.call_id,
+                    quote.quote_id, quote.version)
+            or cost.terminal_receipt_digest != canonical_digest(asdict(terminal))):
+        raise ValueError("original Authority read or durable model cost differs")
+    return issue_source_reply_expression_v1(
+        candidate, result_read=read, model_request=prep.installed.request,
+        original_intent=intent, current_source=current_source,
+        current_envelope=current_envelope, scene_ref=scene_ref,
+        covered_slots=covered_slots, max_chars=max_chars)
 
 
 async def prepare_and_run_installed_reply_model_v1(
@@ -270,11 +385,10 @@ def parse_authority_reply_observation_v1(
     preparation: FrozenReplyModelPreparationV1, *,
     observation, terminal: ModelTerminalReceiptV2,
 ) -> ReplyLanguageCandidate:
-    """Parse an Authority-read observation after its future reply read gate.
+    """Parse an observation already released by the reply-scoped read RPC.
 
-    This function does not accept a result-read DTO as qualification. The
-    calling installed driver must first obtain it through a reply-scoped
-    Authority result-read RPC, which is not yet present in alpha1.
+    This parser does not itself prove current read eligibility. The installed
+    driver must obtain the result through Authority before invoking it.
     """
     from ..authority_service.v2_model_egress_contract import ModelEgressObservationV1
 
@@ -301,12 +415,12 @@ def parse_authority_reply_observation_v1(
         snapshot=preparation.source)
 
 
-async def read_and_parse_installed_reply_v1(
+async def read_and_parse_installed_reply_with_receipt_v1(
     preparation: FrozenReplyModelPreparationV1, *,
     executor: HostModelEgressExecutor,
     read_request: ReplyWorkerModelResultReadRequestV1,
     terminal: ModelTerminalReceiptV2,
-) -> ReplyLanguageCandidate | None:
+) -> InstalledReplyReadV1 | None:
     """Use only the Authority's reply-scoped worker read; failures remain HOLD."""
     from .post_c02_reply_driver import post_c02_reply_operation_id
 
@@ -362,11 +476,143 @@ async def read_and_parse_installed_reply_v1(
                 or result.request != selected
                 or result.terminal_receipt != terminal):
             return None
-        return parse_authority_reply_observation_v1(
+        candidate = parse_authority_reply_observation_v1(
             preparation, observation=result.observation,
             terminal=result.terminal_receipt)
+        return InstalledReplyReadV1(candidate, result)
     except Exception:
         return None
+
+
+async def read_and_parse_installed_reply_v1(
+    preparation: FrozenReplyModelPreparationV1, *,
+    executor: HostModelEgressExecutor,
+    read_request: ReplyWorkerModelResultReadRequestV1,
+    terminal: ModelTerminalReceiptV2,
+) -> ReplyLanguageCandidate | None:
+    """Compatibility view of a verified read; discards its provenance DTO."""
+    read = await read_and_parse_installed_reply_with_receipt_v1(
+        preparation, executor=executor, read_request=read_request,
+        terminal=terminal)
+    return read.candidate if read is not None else None
+
+
+async def run_installed_post_c02_reply_model_v1(
+    runtime, installation, *, context, trusted_umo: str,
+    queued: ReplyModelQueuedPreparationV1,
+) -> InstalledReplyProgressV1 | None:
+    """Continue one graph-issued reply job through its original model call.
+
+    The returned language candidate has not passed D09/D08/D11 final
+    admission and grants no platform send authorization.
+    """
+    import asyncio
+
+    from astrbot.api.star import Context
+
+    from ..model_broker.broker import ModelProviderDescriptor
+    from ..runtime_context import RuntimeContext
+    from .astrbot_model_call import AstrBotModelProvider
+    from .authority_client import AuthorityClient, AuthoritySelection
+    from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
+    from .v2_installation import V2InstallationAssembly
+
+    if (type(runtime) is not RuntimeContext
+            or type(installation) is not V2InstallationAssembly
+            or not isinstance(context, Context)
+            or type(trusted_umo) is not str or not trusted_umo
+            or type(queued) is not ReplyModelQueuedPreparationV1
+            or queued.original_operation_id != queued.job.operation_id
+            or queued.quote.operation_id != queued.original_operation_id
+            or queued.quote.work_kind != "reply"
+            or not queued.c02_operation_id or not queued.source_ref):
+        return None
+    c02_operation_id, source_ref = queued.c02_operation_id, queued.source_ref
+    bundle = installation.admin_bundle
+    grant = installation.installation_grant
+    if (type(bundle) is not AdminInstallationBundle
+            or type(bundle.tls_profile) is not AuthorityTlsProfile
+            or bundle.installation_policy is not installation.installation_policy
+            or bundle.model_workflows is None
+            or bundle.model_workflows.reply.work_kind != "reply"
+            or bundle.model_workflows.reply.purpose != "proposal"):
+        return None
+    transport = MtlsAuthorityTransport({
+        bundle.tls_profile.profile_id: bundle.tls_profile})
+    adapter = None
+    try:
+        client = AuthorityClient(
+            AuthoritySelection(bundle.tls_profile.profile_id),
+            package_root=installation.package_root,
+            data_dir=installation.data_dir, transport=transport)
+        status = await client.status_v2()
+        client_grant = await client.installation_grant_v2()
+        if (status.state != "paired"
+                or not same_installed_grant_identity_v2(grant, client_grant)):
+            return None
+        async with runtime.acquired_post_c02_reply_model_v1(
+                c02_operation_id=c02_operation_id,
+                source_ref=source_ref) as acquired:
+            if acquired is None:
+                return None
+            prepared = await runtime.read_post_c02_reply_model_egress_v1(acquired)
+            if prepared is None or len(prepared) != 7:
+                return None
+            (c02, envelope, source, attention, focus_revision,
+             draft, anchor) = prepared
+            try:
+                audience = json.loads(envelope.authority.audience[0])
+            except (AttributeError, IndexError, TypeError, ValueError):
+                return None
+            if (type(audience) is not list or len(audience) != 2
+                    or any(type(value) is not str or not value for value in audience)
+                    or audience[0] != trusted_umo
+                    or len(envelope.authority.audience) != 1
+                    or source.source_ref != source_ref
+                    or c02.operation_id != c02_operation_id
+                    or draft.operation_id != acquired.acquire_operation_id):
+                return None
+            workflow = bundle.model_workflows.reply
+            descriptor = ModelProviderDescriptor(
+                workflow.provider_id, "astrbot-openai-official-v1",
+                workflow.model_id, frozenset({"text"}),
+                frozenset({workflow.purpose}),
+                frozenset({workflow.privacy_tier}),
+                workflow.provider_config_ref, "unknown", False, False)
+            adapter = AstrBotModelProvider(
+                context=context, host_loop=asyncio.get_running_loop(),
+                trusted_umo=trusted_umo, descriptor=descriptor,
+                admin_model=workflow, installation_bundle=bundle)
+            executor = HostModelEgressExecutor(
+                authority=client, bundle=bundle, grant=client_grant, adapter=adapter)
+            run = await prepare_and_run_installed_reply_model_v1(
+                c02_receipt=c02, envelope=envelope, source=source,
+                attention=attention, focus_revision=focus_revision,
+                draft=draft, expected_anchor=anchor, executor=executor)
+            if run is None:
+                return None
+            terminal = run.terminal.terminal
+            if terminal is None:
+                return InstalledReplyProgressV1(run, None, None)
+            request = await runtime.read_post_c02_reply_model_result_request_v1(
+                acquired)
+            read = (await read_and_parse_installed_reply_with_receipt_v1(
+                run.preparation, executor=executor, read_request=request,
+                terminal=terminal) if request is not None else None)
+            cost = await runtime.commit_post_c02_reply_model_cost_v1(
+                queued, run.preparation.intent, terminal)
+            return InstalledReplyProgressV1(
+                run, cost,
+                read.candidate if cost is not None and read is not None else None,
+                read.result_read if cost is not None and read is not None else None)
+    except asyncio.CancelledError:
+        if adapter is not None:
+            await adapter.abort_local_dispatches()
+        raise
+    except Exception:
+        return None
+    finally:
+        await transport.close()
 
 
 __all__ = (
@@ -374,5 +620,8 @@ __all__ = (
     "freeze_reply_model_preparation_v1", "ReplyModelTerminalHoldV1",
     "execute_or_recover_reply_model_v1", "parse_authority_reply_observation_v1",
     "read_and_parse_installed_reply_v1",
+    "read_and_parse_installed_reply_with_receipt_v1", "InstalledReplyReadV1",
     "InstalledReplyModelRunV1", "prepare_and_run_installed_reply_model_v1",
+    "InstalledReplyProgressV1", "run_installed_post_c02_reply_model_v1",
+    "issue_installed_post_c02_source_expression_v1",
 )

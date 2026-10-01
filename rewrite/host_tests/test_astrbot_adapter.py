@@ -15,8 +15,8 @@ from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.event_message_type import EventMessageTypeFilter
 from astrbot.core.star.star_handler import star_handlers_registry
 
-from rewrite.sylanne3.host.ingress import HostIngressEnvelope, SourceLineage
-from rewrite.sylanne3.runtime_contracts import NamespaceId
+from sylanne3.host.ingress import HostIngressEnvelope, SourceLineage
+from sylanne3.runtime_contracts import NamespaceId
 
 ROOT = Path(os.environ.get("SYLANNE3_PLUGIN_ROOT", Path(__file__).resolve().parents[2])).resolve()
 MODULE = "data.plugins.sylanne3_acceptance.main"

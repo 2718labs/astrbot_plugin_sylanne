@@ -181,6 +181,8 @@ def install_schema(db) -> None:
             PRIMARY KEY(bot_id,persona_id,operation_id,phase)
         )
     """)
+    db.execute("CREATE INDEX IF NOT EXISTS runtime_jobs_d13_namespace_kind "
+               "ON runtime_jobs(bot_id,persona_id,work_kind)")
 
 
 def _job_dict(job: PersistentJob) -> dict[str, Any]:

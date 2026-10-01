@@ -19,6 +19,7 @@ from .runtime_journal import RecoveryConstraintFootprint
 
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@#=+-]{0,255}\Z")
+_AUTHORITY_FENCE_TOKEN = re.compile(r"[A-Za-z0-9_-]{32,256}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _OPERATION_STATES = frozenset({"absent", "claimed", "observed", "unknown", "settled"})
 _OBSERVATION_STATES = frozenset({
@@ -48,6 +49,14 @@ def _identifier(value: object, label: str, *, optional: bool = False) -> str | N
         return None
     if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
         raise ValueError(f"{label} must be a stable content-free identifier")
+    return value
+
+
+def _content_fence(value: object) -> str:
+    if (type(value) is not str
+            or not (_IDENTIFIER.fullmatch(value)
+                    or _AUTHORITY_FENCE_TOKEN.fullmatch(value))):
+        raise ValueError("content_fence must be a stable Authority fence identity")
     return value
 
 
@@ -154,9 +163,10 @@ class DispatchRequest:
     def __post_init__(self) -> None:
         for name in (
             "namespace", "operation_id", "activity_id", "effect_id", "attempt_id",
-            "payload_ref", "platform_capability_ref", "content_fence",
+            "payload_ref", "platform_capability_ref",
         ):
             _identifier(getattr(self, name), name)
+        _content_fence(self.content_fence)
         _digest(self.command_digest, "command_digest")
         _digest(self.payload_digest, "payload_digest")
         object.__setattr__(self, "required_check_refs", _refs(
@@ -260,7 +270,7 @@ class RecoveryDecision:
         _identifier(self.effect_id, "effect_id")
         _digest(self.command_digest, "command_digest")
         _generation(self.activation_generation, "activation_generation")
-        _identifier(self.content_fence, "content_fence")
+        _content_fence(self.content_fence)
         _identifier(self.proof_ref, "proof_ref")
         if self.status == "unresolved":
             if not isinstance(self.operation, BusinessOperation) or self.operation.status == "absent":
@@ -301,9 +311,10 @@ class BusinessDispatchClaim:
     def __post_init__(self) -> None:
         for name in (
             "admission_ref", "dispatch_id", "operation_id", "effect_id",
-            "platform_capability_ref", "content_fence",
+            "platform_capability_ref",
         ):
             _identifier(getattr(self, name), name)
+        _content_fence(self.content_fence)
         _digest(self.command_digest, "command_digest")
         _digest(self.payload_digest, "payload_digest")
         object.__setattr__(self, "verified_check_refs", _refs(
@@ -424,9 +435,10 @@ class HandoffStartReceipt:
     def __post_init__(self) -> None:
         for name in (
             "start_ref", "permit_ref", "operation_id", "effect_id",
-            "platform_capability_ref", "content_fence",
+            "platform_capability_ref",
         ):
             _identifier(getattr(self, name), name)
+        _content_fence(self.content_fence)
         for name in ("dispatch_generation", "activation_generation", "worker_fence", "cancel_epoch"):
             _generation(getattr(self, name), name)
         if type(self.proactive_contact) is not bool:

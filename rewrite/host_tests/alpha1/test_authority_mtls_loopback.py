@@ -25,7 +25,8 @@ from sylanne3.authority_service.mtls_server import (
     MtlsPeerCredential,
 )
 from sylanne3.authority_service.v2_contract import (
-    ExecutionBindingV1, SCHEMA as AUTHORITY_V2_PROTOCOL,
+    AuthorityCurrentEffectSnapshotV2, ExecutionBindingV1,
+    SCHEMA as AUTHORITY_V2_PROTOCOL, canonical_digest,
 )
 from sylanne3.authority_service.v2_deletion_guard import AuthorityV2DeletionGuard
 from sylanne3.authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
@@ -436,6 +437,16 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(write_permit.subject, permit.subject)
                 self.assertEqual(await first.v2_validate_fence(
                     first_request, first_handshake, write_permit), write_permit)
+                effects = await first.v2_execution_read_current_effect_snapshot_for_write_fence(
+                    first_request, first_handshake, permit=write_permit)
+                self.assertIs(type(effects), AuthorityCurrentEffectSnapshotV2)
+                self.assertEqual(effects.anchor, write_permit.pinned_anchor)
+                self.assertEqual(effects.permit_digest, canonical_digest(write_permit))
+                self.assertEqual(effects.coverage, "complete")
+                self.assertEqual(effects.unresolved_effects, ())
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    await second.v2_execution_read_current_effect_snapshot_for_write_fence(
+                        second_request, second_handshake, permit=write_permit)
                 with self.assertRaisesRegex(RuntimeError, "unavailable"):
                     await second.v2_validate_fence(
                         second_request, second_handshake, write_permit)
@@ -682,8 +693,52 @@ class AuthorityMtlsLoopbackTests(unittest.IsolatedAsyncioTestCase):
                         request, handshake, NamespaceId("bot-x", "persona-x"),
                         "genesis-x")
 
+                # Separate TLS sessions for one installation have different
+                # channel grants. The installed identity can match, while a
+                # grant from the other connection must fail the client check.
+                from sylanne3.host.authority_client import AuthorityClient
+                from sylanne3.host.authority_profile import AdminInstallationBundle
+                from sylanne3.host.installation_grant_identity import (
+                    same_installed_grant_identity_v2,
+                )
+                from sylanne3.installation_policy import AdminInstallationPolicy
+
+                peer, peer_request, peer_handshake = await connect("client")
+                peer_grant = await peer.installation_grant_v2(
+                    peer_request, peer_handshake)
+                self.assertTrue(same_installed_grant_identity_v2(
+                    grant, peer_grant))
+                self.assertNotEqual(
+                    grant.channel_binding_sha256,
+                    peer_grant.channel_binding_sha256)
+                policy = object.__new__(AdminInstallationPolicy)
+                for field, value in (
+                    ("expected_authority_id", peer_grant.authority_id),
+                    ("installation_id", peer_grant.installation_id),
+                    ("manifest_digest", peer_grant.manifest_digest),
+                    ("administrator_holder", peer_grant.administrator_holder),
+                ):
+                    object.__setattr__(policy, field, value)
+                bundle = object.__new__(AdminInstallationBundle)
+                object.__setattr__(bundle, "installation_policy", policy)
+                object.__setattr__(bundle, "tls_profile",
+                                   peer.profile_for("installed"))
+                client = AuthorityClient.__new__(AuthorityClient)
+                client._transport = peer
+                client._v2_request = peer_request
+                client._v2_handshake = peer_handshake
+                client._build_request = lambda: peer_request
+                self.assertEqual(
+                    (await client._model_installation_context(
+                        bundle, peer_grant))[0], peer_request)
+                with self.assertRaisesRegex(RuntimeError, "binding"):
+                    await client._model_installation_context(bundle, grant)
+
                 second, second_request, second_handshake = await connect("second")
-                await second.installation_grant_v2(second_request, second_handshake)
+                second_grant = await second.installation_grant_v2(
+                    second_request, second_handshake)
+                self.assertFalse(same_installed_grant_identity_v2(
+                    grant, second_grant))
                 with self.assertRaisesRegex(RuntimeError, "unavailable"):
                     await second.v2_namespace_genesis(
                         second_request, second_handshake, role, "genesis-b")

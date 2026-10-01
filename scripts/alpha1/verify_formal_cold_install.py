@@ -20,10 +20,13 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from _runtime_bootstrap import load_canonical_runtime_v1
+load_canonical_runtime_v1(ROOT)
+
 from rewrite.tools.build_plugin_package import verify_package  # noqa: E402
 
 
-def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> dict:
+def _cold_verify_package(package: Path, expected_manifest_sha256: str, *, expected_mode: str) -> dict:
     """Verify a formal ZIP and load its D04 scheme and ABI2 library in isolation."""
     if len(expected_manifest_sha256) != 64 or any(
         character not in "0123456789abcdef" for character in expected_manifest_sha256
@@ -33,8 +36,8 @@ def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> 
     with zipfile.ZipFile(package) as archive:
         manifest_bytes = archive.read("release-manifest.json")
         manifest = json.loads(manifest_bytes)
-        if manifest.get("build_mode") != "formal-alpha1":
-            raise ValueError("cold formal install requires a formal-alpha1 ZIP")
+        if manifest.get("build_mode") != expected_mode:
+            raise ValueError("cold install package mode differs from explicitly selected mode")
         digest = hashlib.sha256(manifest_bytes).hexdigest()
         if digest != expected_manifest_sha256:
             raise ValueError("formal manifest differs from the trusted digest")
@@ -54,13 +57,14 @@ def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> 
                 "assert shutil.which('cargo') is None and shutil.which('rustc') is None",
                 "assert all(not Path(value).resolve().is_relative_to(source_root) for value in sys.path if value)",
                 "sys.path.insert(0, str(root))",
+                "from _runtime_bootstrap import load_canonical_runtime_v1; load_canonical_runtime_v1(root)",
                 "import rewrite",
-                "from rewrite.sylanne3.host.installed_package import verify_installed_package",
-                "from rewrite.sylanne3.host.affect_scheme_asset import load_verified_affect_scheme",
-                "from rewrite.sylanne3.native_runtime import load_production_native",
+                "from sylanne3.host.installed_package import verify_installed_backend_runtime_v1",
+                "from sylanne3.host.affect_scheme_asset import load_verified_affect_scheme",
+                "from sylanne3.native_runtime import load_production_native",
                 "assert Path(rewrite.__file__).resolve().is_relative_to(root)",
-                "installed = verify_installed_package(root, sys.argv[2])",
-                "assert installed.verified and installed.build_mode == 'formal-alpha1', installed",
+                "installed = verify_installed_backend_runtime_v1(root, sys.argv[2])",
+                "assert installed.verified and installed.build_mode == sys.argv[4], installed",
                 "scheme = load_verified_affect_scheme(root, sys.argv[2])",
                 "manifest = json.loads((root / 'release-manifest.json').read_bytes())",
                 "relative = 'resources/catalogue/d04-fixed-block-operator.json'",
@@ -91,23 +95,40 @@ def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> 
             }
             environment["PATH"] = ""
             result = subprocess.run(
-                [sys.executable, "-I", "-S", "-c", code, str(extracted), digest, str(ROOT.resolve())],
+                [sys.executable, "-I", "-S", "-c", code, str(extracted), digest, str(ROOT.resolve()), expected_mode],
                 cwd=run_dir, env=environment, check=True, capture_output=True, text=True,
             )
             return {
-                "status": "formal_package_mechanics_only",
+                "status": ("formal_package_mechanics_only" if expected_mode == "formal-alpha1"
+                           else "snapshot_alpha1_test_package_mechanics_only" if expected_mode == "snapshot-alpha1-test"
+                           else "backend_candidate_package_mechanics_only"),
                 "package_bytes": package.stat().st_size,
                 "package_sha256": hashlib.sha256(package.read_bytes()).hexdigest(),
                 **json.loads(result.stdout),
             }
 
 
+def cold_verify_formal_package(package: Path, expected_manifest_sha256: str) -> dict:
+    return _cold_verify_package(package, expected_manifest_sha256, expected_mode="formal-alpha1")
+
+
+def cold_verify_backend_candidate_package(package: Path, expected_manifest_sha256: str) -> dict:
+    return _cold_verify_package(package, expected_manifest_sha256,
+                                expected_mode="backend-alpha1-candidate")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cold-verify a pinned formal alpha1 ZIP")
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--expected-manifest-sha256", required=True)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--backend-alpha1-candidate", action="store_true")
+    modes.add_argument("--snapshot-alpha1-test", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(cold_verify_formal_package(args.package, args.expected_manifest_sha256), sort_keys=True))
+    verifier = ((lambda package, pin: _cold_verify_package(package, pin, expected_mode="snapshot-alpha1-test"))
+                if args.snapshot_alpha1_test else cold_verify_backend_candidate_package if args.backend_alpha1_candidate
+                else cold_verify_formal_package)
+    print(json.dumps(verifier(args.package, args.expected_manifest_sha256), sort_keys=True))
 
 
 if __name__ == "__main__":

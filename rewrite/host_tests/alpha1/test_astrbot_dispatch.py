@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, call
 
+import pytest
+
 from astrbot.api.star import Context
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
 
@@ -19,7 +21,13 @@ from sylanne3.dispatch_runtime import (
 )
 from sylanne3.domains.d09 import ClaimKind, ClaimUse, segment_payload_digest
 from sylanne3.host.astrbot_dispatch import (
-    AstrBotTextPlatformCapability, GraphTextPayloadResolver, ResolvedTextPayload,
+    AstrBotTextPlatformCapability, GraphTextPayloadResolver,
+    NaturalGraphTextPayloadResolver, ResolvedTextPayload,
+)
+from sylanne3.graph_types import AtomKey, GraphVersion, Owner
+from sylanne3.runtime.dispatch_candidate import (
+    GraphDispatchTextSegmentV1, NaturalDispatchCandidateEvidenceV2,
+    natural_dispatch_segment_payload_ref_v2,
 )
 from sylanne3.host.identity import astrbot_namespace
 from sylanne3.runtime.first_ingress_v2 import scene_ref_for_conversation
@@ -85,6 +93,51 @@ def test_graph_resolver_passes_complete_command_to_fenced_reader() -> None:
     command = _request()
     resolved = GraphTextPayloadResolver(Coordinator(), "authority", "lease").resolve(command)
     assert resolved.payload == PAYLOAD and resolved.umo == UMO and resolved.scene_ref == SCENE_REF
+
+
+def test_natural_resolver_requires_typed_paid_committed_read() -> None:
+    batch_key = AtomKey(Owner("activity", *NAMESPACE_ID.as_tuple, "activity-1"),
+                        "d09.natural_verified_segment_batch.v2", "batch-1")
+    command = replace(
+        _request(),
+        payload_ref=natural_dispatch_segment_payload_ref_v2(batch_key.token, 0),
+        footprint=RecoveryConstraintFootprint(
+            NAMESPACE, "activity-1", "effect-1",
+            communication_action="action-1", contact_id="contact-1",
+            segment_id="segment-1"),
+        segment_authorization_ref="authorization-1",
+        segment_manifest_digest=_digest(b"manifest"),
+        segment_index=0, segment_count=1,
+    )
+    evidence = NaturalDispatchCandidateEvidenceV2(
+        command.operation_id, command.effect_id,
+        "action-ref", "schema-ref", "grant-ref", batch_key.token,
+        "action-digest", "schema-digest", "grant-digest", "batch-digest",
+        "segment-1", command.payload_digest, "paid-review-digest",
+        "generation-operation", "review-operation", ("source-ref",),
+        (GraphVersion(batch_key, 1),),
+        1, 1, 1,
+    )
+    segment = GraphDispatchTextSegmentV1(
+        TEXT, (), (), "platform-1", "aiocqhttp", "bot-1",
+        UMO, "conversation-1", SCENE_REF,
+    )
+
+    class Coordinator:
+        def get_natural_dispatch_text_segment_v2(self, authority, lease, request):
+            assert (authority, lease, request) == ("authority", "lease", command)
+            return segment, evidence
+
+    resolved = NaturalGraphTextPayloadResolver(
+        Coordinator(), "authority", "lease").resolve(command)
+    assert resolved.payload == PAYLOAD and resolved.umo == UMO
+    with pytest.raises(DispatchBlocked, match="differs"):
+        NaturalGraphTextPayloadResolver(
+            SimpleNamespace(get_natural_dispatch_text_segment_v2=lambda *_:
+                            (segment, replace(evidence, effect_id="other"))),
+            "authority", "lease").resolve(command)
+    with pytest.raises(DispatchBlocked, match="unavailable"):
+        NaturalGraphTextPayloadResolver(object(), "authority", "lease").resolve(command)
 
 
 class AstrBotTextDispatchTests(unittest.IsolatedAsyncioTestCase):

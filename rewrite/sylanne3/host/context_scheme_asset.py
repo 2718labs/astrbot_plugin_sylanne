@@ -8,7 +8,7 @@ import hmac
 import json
 from pathlib import Path
 
-from .installed_package import _safe_file, verify_installed_package
+from .installed_package import _safe_file, verify_installed_backend_runtime_v1
 
 
 _ASSET_PATH = "resources/catalogue/d03-neutral-context-scheme.json"
@@ -53,10 +53,10 @@ def load_verified_context_scheme(
     """Accept one exact neutral D03 draft only from pinned formal bytes."""
 
     root = Path(package_root).absolute()
-    verification = verify_installed_package(
+    verification = verify_installed_backend_runtime_v1(
         root, expected_manifest_digest, available_cpu_features=available_cpu_features,
     )
-    if not verification.verified or verification.build_mode != "formal-alpha1":
+    if not verification.verified:
         raise ValueError("verified formal-alpha1 package is required for D03 scheme loading")
     manifest_path = _safe_file(root, "release-manifest.json")
     if manifest_path is None:

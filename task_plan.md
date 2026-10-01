@@ -1,12 +1,16 @@
 # Embodiment 3.0 rewrite
 
+> 2026-09-30：用户将原会话 `01a0c908-2e83-7453-9d34-25628e22b8e7` 的任务交由本会话接手，并再次明确要求完成插件全部后端。当前执行记录见 `docs/plans/alpha1-20260923/backend-execution-20260930.md`；目标仍是 alpha1 全部非前端部分，接手、局部编译或四条链路补漏均不代表完成。
+
+> 当前阶段（2026-09-23）：用户已要求落地完整重型 `embodiment-3.0.0-alpha1`。当前实施闸门和工作包见 `docs/plans/alpha1-20260923/architecture-gate.md`、`docs/plans/alpha1-20260923/task_plan.md`；十二域设计入口见 `docs/architecture/sylanne-3-design-index.md`。此前纯本地设计阶段与 D06/D07 计划保留作历史；下文早期实施进度不代表 alpha1 已通过。正式版号、PR、推送和发布待实际门槛与授权，不能把开发适配器改名交付。
+
 ## Authority and baseline
 - User approved the attached whole-plugin redesign and explicitly requested phased implementation on 2026-09-22.
 - Baseline: `72de068bf6f97a70086abdddc8cc487933350c5c` (`Embodiment-2.5.1`).
 - Workspace: `G:\Sylanne`; branch: `codex/embodiment-3-rewrite`.
 - New implementation lives in `rewrite/`; no import of `sylanne_alpha`, `v2core`, `_engine`, or old `v3core` is permitted there.
 - Subsequent user instruction retires old interfaces and core; the new root plugin is the sole entry. Legacy reference is Git history, not a runtime fallback.
-- Measure the actual compressed and extracted release package, including required modules, native kernel, workbench and resources. Package size is not evidence of runtime cost or product acceptance.
+- User permits a compressed release ZIP of approximately 10 MB. Treat this as acceptable distribution capacity, not a minimum size or permission for unbounded runtime costs; measure actual package contents and sizes at packaging acceptance.
 - User requested further design depth beyond the twelve-system outline. Candidate mechanism design is in docs/architecture/embodiment-3-mechanisms.md; this design turn does not implement those future capabilities or claim their acceptance.
 - Further design continuation adds docs/architecture/embodiment-3-ecosystem.md. User explicitly requires a redesigned memory module, research-grounded mechanisms, speed/quality tradeoffs and when recall should occur: see embodiment-3-memory.md and embodiment-3-memory-theory.md in the same directory. These are design proposals; theory transfer and performance require implementation and controlled evaluation.
 

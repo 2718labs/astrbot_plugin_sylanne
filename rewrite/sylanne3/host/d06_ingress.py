@@ -24,7 +24,7 @@ def ingress_content_fingerprint(envelope: HostIngressEnvelope) -> str:
 
     if not isinstance(envelope, HostIngressEnvelope):
         raise TypeError("envelope must be HostIngressEnvelope")
-    return canonical_digest({
+    payload = {
         "namespace": envelope.namespace,
         "platform_ref": envelope.platform_ref,
         "conversation_ref": envelope.conversation_ref,
@@ -34,17 +34,27 @@ def ingress_content_fingerprint(envelope: HostIngressEnvelope) -> str:
         "occurred_at": envelope.occurred_at,
         "visibility": envelope.visibility,
         "lineage": envelope.lineage,
-    })
+    }
+    if envelope.attachments:
+        payload["attachments_v2"] = tuple(
+            (item.order, item.media_kind, item.mime_type,
+             len(item.content), item.sha256)
+            for item in envelope.attachments
+        )
+    return canonical_digest(payload)
 
 
 def source_admission_from_host(
     envelope: HostIngressEnvelope,
     reply_source_policy: AdminD06PrivateReplySourcePolicy | None = None,
+    *, allow_verified_media_v2: bool = False,
 ) -> SourceAdmission:
     """Preserve host lineage while producing a bounded D06 source candidate."""
 
     if not isinstance(envelope, HostIngressEnvelope):
         raise TypeError("envelope must be HostIngressEnvelope")
+    if envelope.attachments and allow_verified_media_v2 is not True:
+        raise ValueError("media ingress requires the atomic D06 v2 source path")
     reality = {"external_report": "reported"}.get(envelope.lineage.content_reality)
     if reality is None:
         raise ValueError("host lineage cannot be represented by D06")

@@ -12,6 +12,16 @@ FORBIDDEN_SUFFIXES = {".log", ".pyc", ".pem", ".key", ".sqlite", ".sqlite3"}
 EXPECTED_MIGRATION_PREVIEW = {
     "schema_version": "sylanne.migrations.v1",
     "legacy_data_policy": "registered_migrators",
+    "native_data_policy": {
+        "schema": "sylanne.native-data-policy.v1",
+        "startup_gate": "sylanne3.host.legacy_data_preflight:inspect_native_data_dir_v1",
+        "graph_file": "sylanne3.sqlite3",
+        "allowed_graph_sidecars": ["sylanne3.sqlite3-wal", "sylanne3.sqlite3-shm"],
+        "fresh_install": "absent_or_empty_plugin_data_dir_only",
+        "existing_native": "exact_catalogue_and_authority_recovery_required",
+        "other_data": "migration_required_before_graph_open",
+        "automatic_legacy_migration": False,
+    },
     "migrations": [{
         "id": "sylanne-2.5-person-profile-preview.v1",
         "source_schema": "sylanne-2.5.person-profile.v1",
@@ -37,19 +47,21 @@ def verify_migration_preview(migration: object) -> None:
 
 def verify_workbench(root: Path) -> None:
     workbench = root / "resources" / "workbench"
-    source = root / "webui-src"
+    source = root / "webui-heritage"
+    build_output = source / "dist" / "index.html"
     manifest_path = workbench / "workbench-manifest.json"
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
     if document.get("schema_version") != "sylanne.workbench-assets.v1": raise ValueError("unknown workbench asset schema")
-    if document.get("source") != "webui-src": raise ValueError("workbench manifest source is stale")
+    if document.get("source") != "webui-heritage" or document.get("build_output") != "webui-heritage/dist/index.html":
+        raise ValueError("workbench manifest source or build output is stale")
     listed = {row["path"]: row for row in document.get("files", [])}
     if not listed or "index.html" not in listed: raise ValueError("workbench manifest is incomplete")
-    source_files = {"index.html", *(path.relative_to(source).as_posix() for path in (source / "src").rglob("*") if path.is_file())}
-    if source_files != set(listed): raise ValueError("workbench source and manifest file sets differ")
-    for relative in source_files:
-        path = source / relative
-        if path.is_symlink() or path.read_bytes() != (workbench / relative).read_bytes():
-            raise ValueError(f"workbench resource differs from source: {relative}")
+    if set(listed) != {"index.html"} or not source.is_dir() or source.is_symlink():
+        raise ValueError("workbench manifest file set or declared source is invalid")
+    if (source / "dist").is_symlink() or build_output.is_symlink() or not build_output.is_file():
+        raise FileNotFoundError("webui-heritage build output is missing or unsafe")
+    if build_output.read_bytes() != (workbench / "index.html").read_bytes():
+        raise ValueError("workbench resource differs from webui-heritage build output")
     actual = set()
     for resource_root in (workbench,):
         if not resource_root.is_dir(): raise ValueError(f"missing resource root: {resource_root.name}")
@@ -57,7 +69,10 @@ def verify_workbench(root: Path) -> None:
             if path.is_symlink(): raise ValueError(f"symlink resource: {path}")
             if path.is_file() and (path.name.casefold() in FORBIDDEN_NAMES or path.suffix.casefold() in FORBIDDEN_SUFFIXES): raise ValueError(f"forbidden release resource: {path}")
             if resource_root == workbench and path.is_file() and path.name != "workbench-manifest.json":
-                relative = path.relative_to(workbench).as_posix(); actual.add(relative)
+                relative = path.relative_to(workbench).as_posix()
+                if relative.startswith("src/"):
+                    continue  # Retained legacy source mirror; the package builder excludes it.
+                actual.add(relative)
                 row = listed.get(relative)
                 if not row or row.get("bytes") != path.stat().st_size or row.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest(): raise ValueError(f"workbench asset mismatch: {relative}")
     if actual != set(listed): raise ValueError("workbench manifest file set mismatch")
@@ -74,7 +89,7 @@ def verify(root: Path) -> None:
     if not catalogue.get("types") or catalogue.get("completeness") not in {"candidate-exports-only", "registered-exports"}: raise ValueError("catalogue completeness declaration is missing")
     if catalogue.get("activation_status") != "candidate_only": raise ValueError("catalogue must not claim runtime activation")
     actual_domains = {row.get("writer_domain") for row in catalogue["types"]}
-    expected_domains = {f"d{number:02d}" for number in range(1, 13)}
+    expected_domains = {f"d{number:02d}" for number in range(1, 14)}
     if set(catalogue.get("declared_domains", ())) != actual_domains: raise ValueError("catalogue domain declaration differs from its TypeSpecs")
     if set(catalogue.get("missing_domain_exports", ())) != expected_domains - actual_domains: raise ValueError("catalogue hides a missing domain exporter")
     if catalogue.get("release_eligibility", "").split(":", 1)[0] != "HOLD": raise ValueError("candidate catalogue must not be release eligible")

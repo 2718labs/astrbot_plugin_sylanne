@@ -20,6 +20,7 @@ from ..runtime_contracts import NamespaceId
 
 
 SCHEMA = "sylanne3.authority.owner.v1"
+MIGRATION_HEAD_SCHEMA = "sylanne3.authority.owner_migration_head.v1"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _HEAD = re.compile(r"(?:genesis|sha256:[0-9a-f]{64})\Z")
 _CHALLENGE = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
@@ -282,6 +283,82 @@ class OwnerGraphCommitProofV1:
         _revision(self.graph_epoch, "graph_epoch")
 
 
+@dataclass(frozen=True, slots=True)
+class OwnerMigrationHeadV1:
+    """Authority's immutable Owner control head for one frozen transfer read."""
+
+    authority_namespace: str
+    guard: OwnerAuthorizationGuardV1
+    state: str
+    issue_operation: OwnerAuthorizationOperationV1
+    issue_proof: OwnerGraphCommitProofV1
+    revoke_operation: OwnerAuthorizationOperationV1 | None
+    revoke_proof: OwnerGraphCommitProofV1 | None
+    grant_revision: int
+    grant_digest: str
+    graph_access_epoch: int
+    schema: str = MIGRATION_HEAD_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != MIGRATION_HEAD_SCHEMA or self.state not in {"active", "revoked"}:
+            raise ValueError("unknown Owner migration head")
+        identifier(self.authority_namespace, "authority_namespace")
+        if (type(self.guard) is not OwnerAuthorizationGuardV1
+                or type(self.issue_operation) is not OwnerAuthorizationOperationV1
+                or type(self.issue_proof) is not OwnerGraphCommitProofV1):
+            raise TypeError("Owner migration head needs immutable issue evidence")
+        issue, proof = self.issue_operation, self.issue_proof
+        if (issue.action != "issue" or issue.ticket is None
+                or proof.namespace != issue.namespace
+                or proof.operation_id != issue.operation_id
+                or proof.request_digest != issue.request_digest
+                or proof.grant_id != issue.grant_id
+                or proof.grant_digest != issue.grant_digest
+                or proof.grant_revision != 1
+                or self.guard.authority_id != issue.authority_id
+                or self.guard.installation_id != issue.installation_id
+                or self.guard.namespace != issue.namespace
+                or self.guard.pending_revoke_operation_id is not None):
+            raise ValueError("Owner migration issue identity differs")
+        issue_guard = OwnerAuthorizationGuardV1(
+            issue.authority_id, issue.installation_id, issue.namespace,
+            1, canonical_digest(proof), 0, 0)
+        if self.state == "active":
+            if (self.revoke_operation is not None or self.revoke_proof is not None
+                    or self.guard != issue_guard
+                    or self.grant_revision != 1
+                    or self.grant_digest != proof.grant_digest
+                    or self.graph_access_epoch != proof.graph_access_epoch):
+                raise ValueError("active Owner migration head differs")
+            return
+        revoke, revoked_proof = self.revoke_operation, self.revoke_proof
+        if (type(revoke) is not OwnerAuthorizationOperationV1
+                or type(revoked_proof) is not OwnerGraphCommitProofV1
+                or revoke.action != "revoke" or revoke.ticket is not None
+                or revoke.expected_guard != issue_guard
+                or revoke.expected_grant_revision != 1
+                or (revoke.authority_id, revoke.installation_id,
+                    revoke.namespace, revoke.principal, revoke.grant_id)
+                != (issue.authority_id, issue.installation_id,
+                    issue.namespace, issue.principal, issue.grant_id)
+                or revoked_proof.namespace != revoke.namespace
+                or revoked_proof.operation_id != revoke.operation_id
+                or revoked_proof.request_digest != revoke.request_digest
+                or revoked_proof.grant_id != revoke.grant_id
+                or revoked_proof.grant_digest != revoke.grant_digest
+                or revoked_proof.graph_incarnation != proof.graph_incarnation
+                or revoked_proof.grant_revision != 2
+                or revoked_proof.graph_access_epoch <= proof.graph_access_epoch
+                or self.guard != OwnerAuthorizationGuardV1(
+                    issue.authority_id, issue.installation_id, issue.namespace,
+                    2, canonical_digest(revoked_proof), 2,
+                    revoked_proof.graph_access_epoch)
+                or self.grant_revision != 2
+                or self.grant_digest != revoked_proof.grant_digest
+                or self.graph_access_epoch != revoked_proof.graph_access_epoch):
+            raise ValueError("revoked Owner migration head differs")
+
+
 def _namespace_wire(namespace: NamespaceId) -> dict[str, str]:
     return {"bot_id": namespace.bot_id, "persona_id": namespace.persona_id}
 
@@ -332,7 +409,21 @@ def _operation_wire(value: OwnerAuthorizationOperationV1, *,
 
 def to_wire(value: OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
             OwnerAuthorizationGuardV1 | OwnerAuthorizationOperationV1 |
-            OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1) -> dict[str, Any]:
+            OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1 |
+            OwnerMigrationHeadV1) -> dict[str, Any]:
+    if type(value) is OwnerMigrationHeadV1:
+        return {"schema": value.schema, "kind": "owner_migration_head_v1",
+                "authority_namespace": value.authority_namespace,
+                "guard": to_wire(value.guard), "state": value.state,
+                "issue_operation": to_wire(value.issue_operation),
+                "issue_proof": to_wire(value.issue_proof),
+                "revoke_operation": (to_wire(value.revoke_operation)
+                                     if value.revoke_operation is not None else None),
+                "revoke_proof": (to_wire(value.revoke_proof)
+                                 if value.revoke_proof is not None else None),
+                "grant_revision": value.grant_revision,
+                "grant_digest": value.grant_digest,
+                "graph_access_epoch": value.graph_access_epoch}
     if type(value) is OwnerGraphCommitProofV1:
         return {"schema": value.schema, "kind": "owner_graph_commit_proof_v1",
                 "namespace": _namespace_wire(value.namespace),
@@ -389,10 +480,30 @@ def _decode_principal(value: object) -> OwnerPrincipalV1:
 def from_wire(value: object) -> (OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
                                   OwnerAuthorizationGuardV1 |
                                   OwnerAuthorizationOperationV1 |
-                                  OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1):
-    if type(value) is not dict or value.get("schema") != SCHEMA:
+                                  OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1 |
+                                  OwnerMigrationHeadV1):
+    if type(value) is not dict or value.get("schema") not in {
+            SCHEMA, MIGRATION_HEAD_SCHEMA}:
         raise ValueError("unknown owner contract schema")
     kind = value.get("kind")
+    if kind == "owner_migration_head_v1":
+        _fields(value, {"schema", "kind", "authority_namespace", "guard", "state",
+                        "issue_operation", "issue_proof", "revoke_operation",
+                        "revoke_proof", "grant_revision", "grant_digest",
+                        "graph_access_epoch"}, "Owner migration head")
+        guard = from_wire(value["guard"])
+        issue = from_wire(value["issue_operation"])
+        proof = from_wire(value["issue_proof"])
+        revoke = (from_wire(value["revoke_operation"])
+                  if value["revoke_operation"] is not None else None)
+        revoked_proof = (from_wire(value["revoke_proof"])
+                         if value["revoke_proof"] is not None else None)
+        return OwnerMigrationHeadV1(
+            value["authority_namespace"], guard, value["state"], issue,
+            proof, revoke, revoked_proof, value["grant_revision"],
+            value["grant_digest"], value["graph_access_epoch"], value["schema"])
+    if value["schema"] != SCHEMA:
+        raise ValueError("unknown owner contract schema")
     if kind == "owner_graph_commit_proof_v1":
         _fields(value, {"schema", "kind", "namespace", "operation_id",
                         "request_digest", "grant_id", "grant_digest",
@@ -477,13 +588,15 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
 
 def canonical_bytes(value: OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
                     OwnerAuthorizationGuardV1 | OwnerAuthorizationOperationV1 |
-                    OwnerAuthorizationReceiptV1) -> bytes:
+                    OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1 |
+                    OwnerMigrationHeadV1) -> bytes:
     return _canonical_json(to_wire(value))
 
 
 def canonical_digest(value: OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
                      OwnerAuthorizationGuardV1 | OwnerAuthorizationOperationV1 |
-                     OwnerAuthorizationReceiptV1) -> str:
+                     OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1 |
+                     OwnerMigrationHeadV1) -> str:
     return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
@@ -503,7 +616,8 @@ def _reject_constant(value: str) -> None:
 def decode_bytes(data: bytes) -> (OwnerPrincipalV1 | OwnerActorBindingV1 | OwnerClaimTicketV1 |
                                   OwnerAuthorizationGuardV1 |
                                   OwnerAuthorizationOperationV1 |
-                                  OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1):
+                                  OwnerAuthorizationReceiptV1 | OwnerGraphCommitProofV1 |
+                                  OwnerMigrationHeadV1):
     if type(data) is not bytes:
         raise TypeError("owner wire data must be bytes")
     value = from_wire(json.loads(data.decode("utf-8"),
@@ -514,8 +628,9 @@ def decode_bytes(data: bytes) -> (OwnerPrincipalV1 | OwnerActorBindingV1 | Owner
     return value
 
 
-__all__ = ("SCHEMA", "OwnerPrincipalV1", "OwnerActorBindingV1", "OwnerClaimTicketV1",
+__all__ = ("SCHEMA", "MIGRATION_HEAD_SCHEMA", "OwnerPrincipalV1", "OwnerActorBindingV1", "OwnerClaimTicketV1",
            "OwnerAuthorizationGuardV1", "OwnerAuthorizationOperationV1",
            "OwnerAuthorizationReceiptV1", "OwnerGraphCommitProofV1",
+           "OwnerMigrationHeadV1",
            "to_wire", "from_wire",
            "canonical_bytes", "canonical_digest", "decode_bytes")

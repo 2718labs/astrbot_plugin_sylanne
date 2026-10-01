@@ -173,7 +173,7 @@ class _IngressContext:
 class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_v2_model_port_uses_the_same_admin_bundle_snapshot(self) -> None:
         module = load_plugin_module()
-        package = module.__package__ + ".rewrite.sylanne3"
+        package = "sylanne3"
         profile = importlib.import_module(package + ".host.authority_profile")
         budget = importlib.import_module(package + ".runtime.budget")
         issuers = importlib.import_module(package + ".runtime.issuers")
@@ -787,7 +787,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         event = Event()
         plugin._installed_namespace = (
             await module.build_astrbot_ingress(event, plugin.context)).namespace
-        with patch.object(module, "run_installed_first_ingress_c02_v1",
+        with patch.object(module, "run_installed_first_ingress_c02_v2",
                           new=AsyncMock()) as driver:
             await plugin.ingress(event)
         driver.assert_not_awaited()
@@ -847,7 +847,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         event = Event()
         plugin._installed_namespace = (
             await module.build_astrbot_ingress(event, plugin.context)).namespace
-        with patch.object(module, "run_installed_first_ingress_c02_v1",
+        with patch.object(module, "run_installed_first_ingress_c02_v2",
                           new=pending_driver):
             await plugin.ingress(event)
             await asyncio.wait_for(started.wait(), 1)
@@ -906,7 +906,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         event = Event()
         plugin._installed_namespace = (
             await module.build_astrbot_ingress(event, plugin.context)).namespace
-        with patch.object(module, "run_installed_first_ingress_c02_v1",
+        with patch.object(module, "run_installed_first_ingress_c02_v2",
                           new=held_driver):
             await plugin.ingress(event)
             await asyncio.wait_for(completed.wait(), 1)
@@ -981,7 +981,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         event = Event()
         plugin._installed_namespace = (
             await module.build_astrbot_ingress(event, plugin.context)).namespace
-        with patch.object(module, "run_installed_first_ingress_c02_v1", new=driver):
+        with patch.object(module, "run_installed_first_ingress_c02_v2", new=driver):
             await plugin.ingress(event)
             await asyncio.wait_for(first_started.wait(), 1)
             await plugin.ingress(event)
@@ -1054,7 +1054,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                           new=AsyncMock(return_value=True)), \
                 patch.object(module, "original_unacquired_handoff_v1",
                              side_effect=handoff), \
-                patch.object(module, "run_installed_first_ingress_c02_v1", new=driver):
+                patch.object(module, "run_installed_first_ingress_c02_v2", new=driver):
             await plugin._restore_unacquired_first_ingress_c02_v1()
             await asyncio.wait_for(drained.wait(), 1)
             await asyncio.sleep(0)
@@ -1099,6 +1099,9 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 observed.append(operation_id)
                 return True
 
+            async def commit_post_c02_attention_v1(self, *, c02_operation_id):
+                return None
+
         plugin = module.Sylanne3Plugin(
             Context(asyncio.Queue(), {}, None, None, None, None,
                     None, None, None, None, None),
@@ -1107,7 +1110,10 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
         plugin._runtime = ControlledRuntime()
         plugin._v2_installation = object()
         with patch.object(module, "installed_first_ingress_c02_pairing_ready_v1",
-                          new=AsyncMock(return_value=True)):
+                          new=AsyncMock(return_value=True)), patch.object(
+                              module,
+                              "run_installed_committed_first_ingress_c02_cost_v2",
+                              new=AsyncMock(return_value=False)):
             await plugin._restore_committed_first_ingress_c02_cost_v1()
         self.assertEqual(calls, [(None, 50, 0), ("second-page", 50, 0)])
         self.assertEqual(observed, list(operations))
@@ -1263,7 +1269,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         await plugin.ingress(event)
         scene_ref = importlib.import_module(
-            f"{module.__package__}.rewrite.sylanne3.runtime.first_ingress_v2"
+            "sylanne3.runtime.first_ingress_v2"
         ).scene_ref_for_conversation(
             expected.namespace, expected.platform_ref, expected.conversation_ref)
         exact = dict(namespace=expected.namespace, platform_ref=expected.platform_ref,
@@ -1432,6 +1438,7 @@ class RuntimeBootstrapTests(unittest.IsolatedAsyncioTestCase):
             installation_policy=policy,
             available_cpu_features=frozenset({"avx2"}),
             workbench_origin="https://profile.example",
+            reverse_handoff=None,
         )
 
         async def assemble(profile_id, *, package_root, data_dir):

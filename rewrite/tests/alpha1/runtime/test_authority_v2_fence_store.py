@@ -248,7 +248,9 @@ def test_schema3_requires_explicit_empty_ledger_upgrade(tmp_path):
         AuthorityV2FenceStore(db)
     AuthorityV2FenceStore.upgrade_schema_3_to_4(db)
     AuthorityV2FenceStore(db)
-    assert db.execute("SELECT value FROM authority_v2_meta").fetchone() == ("4",)
+    assert db.execute("SELECT value FROM authority_v2_meta").fetchone() == ("5",)
+    assert db.execute(
+        "SELECT COUNT(*) FROM authority_v2_never_begun").fetchone() == (0,)
     db.close()
 
     path = tmp_path / "old-with-mutation.db"

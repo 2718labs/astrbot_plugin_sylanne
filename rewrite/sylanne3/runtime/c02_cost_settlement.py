@@ -136,12 +136,29 @@ def prepare_c02_unknown_cost_plan(
     if (row is None or row[0] != verified_completion.operation_digest
             or row[1] != quote.activity_id):
         raise C02CostUnavailable("C02 business receipt differs")
+    archived_seal = (
+        db.execute(
+            "SELECT schema,bundle_digest FROM "
+            "graph_first_ingress_c02_committed_seals_v2 WHERE bot=? "
+            "AND persona=? AND operation_id=?",
+            namespace.as_tuple + (operation_id,),
+        ).fetchone()
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='graph_first_ingress_c02_committed_seals_v2'"
+        ).fetchone() else None)
+    seal_schema = (
+        "sylanne.first-ingress-c02-candidate.v2"
+        if archived_seal is not None else None)
     detail = json.loads(row[2]).get("first_ingress_c02")
     if (type(detail) is not dict
+            or (archived_seal is not None and
+                (archived_seal[0] != seal_schema or archived_seal[1] != row[0]))
             or detail != {key: getattr(proof, key) for key in (
                 "read_request_digest", "read_result_digest",
                 "original_intent_digest", "terminal_receipt_digest",
                 "observation_digest", "result_digest")}
+                | ({"seal_schema": seal_schema} if seal_schema is not None else {})
             or proof.original_intent_digest != canonical_digest(asdict(original_intent))
             or (type(read) is WorkerModelResultReadV1 and
                 proof.terminal_receipt_digest != canonical_digest(

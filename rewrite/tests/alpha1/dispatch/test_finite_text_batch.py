@@ -5,11 +5,11 @@ import hashlib
 
 import pytest
 
-from rewrite.sylanne3.dispatch_runtime import DispatchBlocked, DispatchRequest, DispatchResult, DispatchRuntime
-from rewrite.sylanne3.domains.d08.execution import CommunicationIntentGrant, SegmentGrant
-from rewrite.sylanne3.domains.d09 import StagingResult, VerifiedSegment, segment_payload_digest
-from rewrite.sylanne3.host.v2_dispatch_adapter import dispatch_finite_text_batch
-from rewrite.sylanne3.runtime_journal import RecoveryConstraintFootprint
+from sylanne3.dispatch_runtime import DispatchBlocked, DispatchRequest, DispatchResult, DispatchRuntime
+from sylanne3.domains.d08.execution import CommunicationIntentGrant, SegmentGrant
+from sylanne3.domains.d09 import StagingResult, VerifiedSegment, segment_payload_digest
+from sylanne3.host.v2_dispatch_adapter import dispatch_finite_text_batch
+from sylanne3.runtime_journal import RecoveryConstraintFootprint
 
 
 def _fixture():

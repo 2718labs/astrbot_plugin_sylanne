@@ -25,7 +25,7 @@ def _claim(**changes):
         activity_id="activity:one", effect_id="effect:one",
         operation_id="operation:one", handoff_id="handoff:one",
         admission_ref="admission:one", authority_namespace=namespace_ref(namespace),
-        p2_permit_digest=digest, p2_fence_epoch=1, p2_revision=3,
+        p2_permit_digest=digest, p2_fence_epoch=1, p2_revision=2,
         p2_execution_seq=2, p2_execution_digest=digest,
         context_digest=digest, owner_witness_digest=digest,
         binding_digest=digest, claimed_receipt_digest=digest,
@@ -61,7 +61,7 @@ def test_private_claim_type_has_stable_effect_key_and_strict_immutable_spec():
 @pytest.mark.parametrize("change", (
     {"authority_namespace": "bot/persona"},
     {"bot_id": "bad/bot"},
-    {"p2_revision": 2},
+    {"p2_revision": 1},
     {"current_evidence_digest": "unknown"},
 ))
 def test_claim_value_rejects_unbound_namespace_or_unclaimed_p2(change):

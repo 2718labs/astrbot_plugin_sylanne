@@ -5,14 +5,15 @@ import json
 
 import pytest
 
-from rewrite.sylanne3.domains.d06 import (
+from sylanne3.domains.d06 import (
     CandidateItem,
     CandidateSet,
     D06DomainAdapter,
     RecollectionContext,
     SelectionTicket,
+    source_correction_head_key,
 )
-from rewrite.sylanne3.domains.d07 import (
+from sylanne3.domains.d07 import (
     AttentionPolicy,
     AttentionTicket,
     BeliefRevision,
@@ -29,12 +30,12 @@ from rewrite.sylanne3.domains.d07 import (
     WorkingSetItem,
     WorkingSet,
 )
-from rewrite.sylanne3.domains.d04 import AffectAxis, AffectScheme, FeelingState, MoodField
-from rewrite.sylanne3.graph_types import (
+from sylanne3.domains.d04 import AffectAxis, AffectScheme, FeelingState, MoodField
+from sylanne3.graph_types import (
     AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec,
 )
-from rewrite.sylanne3.memory_types import access_key, source_key
-from rewrite.sylanne3.runtime_contracts import (
+from sylanne3.memory_types import access_key, source_key
+from sylanne3.runtime_contracts import (
     AuthorityContext,
     CommandEnvelope,
     DependencySet,
@@ -352,6 +353,8 @@ def test_provider_exposes_frozen_runtime_contract_without_claiming_commit() -> N
     assert provider.descriptor.contract_version == "sylanne.runtime.v1"
     assert provider.register_types() == (
         "d07.concern.v1",
+        "d07.concern_round.v1",
+        "d07.reflection_checkpoint.v1",
         "d07.attention_ticket.v1",
         "d07.focus.v1",
         "d07.working_set.v1",
@@ -404,7 +407,7 @@ def test_provider_builds_a_candidate_domain_proposal_only() -> None:
 
 def test_provider_supplies_d11_catalogue_specs_with_writer_and_schema_validation() -> None:
     specs = D07DomainProvider().type_specs()
-    assert len(specs) == 9
+    assert len(specs) == 11
     assert all(isinstance(spec, TypeSpec) for spec in specs)
     assert all(spec.writer_domain == "d07" for spec in specs)
     assert all(spec.schema_hash is not None and len(spec.schema_hash) == 64 for spec in specs)
@@ -421,6 +424,30 @@ def test_provider_supplies_d11_catalogue_specs_with_writer_and_schema_validation
         concern.validator({**valid, "unowned_claim": True})
     with pytest.raises(ValueError, match="resolution"):
         concern.validator({**valid, "resolution_predicate": None})
+
+
+def test_concern_round_is_discovered_but_plain_graph_write_cannot_forge_service() -> None:
+    from sylanne3.domain_registry import discover_domain_registry
+    from sylanne3.domains.d07.concern_round import (
+        ConcernRoundV1, concern_round_write,
+    )
+
+    registration = discover_domain_registry().registrations["d07"]
+    assert "d07.concern_round.v1" in {
+        spec.name for spec in registration.type_specs
+    }
+    envelope, _ = recollection_envelope()
+    provider = D07DomainProvider()
+    namespace = envelope.authority.namespace
+    for served, effects in (((), ()), ((("concern:a", 1),), ("effect:forged",))):
+        state = ConcernRoundV1(
+            namespace.persona_id, "background", 1, 1,
+            ("concern:a",), served, (), effects,
+        )
+        write = concern_round_write(namespace, state)
+        proposal = replace(provider.proposal_for(envelope), typed_writes=(write,))
+        with pytest.raises(ValueError, match="W01 fenced transition adoption"):
+            provider.validate(proposal)
 
 
 def test_catalogue_checks_complete_cognitive_activity_and_simulation_eligibility() -> None:
@@ -667,7 +694,8 @@ def test_recollection_support_is_consumable_by_d06_c04_without_placeholder_d07_w
             "policy:1", 1,
         ),
         VersionGuard(
-            (GraphVersion(source, 2), GraphVersion(access, 3)), (), 5, 6,
+            (GraphVersion(source, 2), GraphVersion(access, 3),
+             GraphVersion(source_correction_head_key(namespace, "source-1"), 0)), (), 5, 6,
             "catalogue:1", "scheme:1", "operator:1", "policy:1", (),
             (VersionedRef("focus:1", 4),), (),
         ),

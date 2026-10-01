@@ -44,7 +44,8 @@ class SourcedNumericDrive:
         checkpoint = AtomKey.from_token(self.checkpoint_ref)
         source = AtomKey.from_token(self.source_ref)
         access = AtomKey.from_token(self.access_ref)
-        if (checkpoint.type_name != "d04.numeric_checkpoint.v1"
+        if (checkpoint.type_name not in {
+                "d04.numeric_checkpoint.v1", "d04.numeric_checkpoint.v2"}
                 or checkpoint.owner.kind != "persona"
                 or source.type_name != "memory.source" or source.name != "record"
                 or source.owner.kind != "event"
@@ -117,6 +118,8 @@ def sourced_numeric_drive_write(drive: SourcedNumericDrive) -> GraphWrite:
     return GraphWrite(
         AtomKey(Owner("persona", checkpoint.owner.bot, checkpoint.owner.persona),
                 TYPE_NAME, drive.drive_id), value,
-        tuple(AtomKey.from_token(ref) for ref in (
-            drive.checkpoint_ref, drive.source_ref, drive.access_ref)),
+        # An immutable historical candidate cannot have invalidating Graph
+        # dependencies. The installed adopter retains historical_provenance
+        # edges in its commit transaction and requalifies current D06 rights.
+        (),
     )

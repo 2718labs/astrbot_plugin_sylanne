@@ -215,7 +215,11 @@ class InstalledModelCapabilityPort:
                     or type(bundle) is not AdminInstallationBundle
                     or workflows is None
                     or (selection is not workflows.encode
-                        and selection is not workflows.reply)
+                        and selection is not workflows.reply
+                        and selection is not workflows.context_reply
+                        and selection is not workflows.natural_generation
+                        and selection is not workflows.natural_review
+                        and selection is not workflows.appraisal)
                     or type(policy) is not AdminInstallationPolicy
                     or policy.namespace != namespace
                     or selection.work_kind not in policy.root_grant.allowed_work_kinds

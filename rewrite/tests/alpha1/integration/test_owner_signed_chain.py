@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -25,7 +26,7 @@ from sylanne3.authority_service.v2_owner_session import (
 from sylanne3.authority_service.v2_contract import to_wire as fence_to_wire
 from sylanne3.graph_coordinator import GraphCoordinator
 from sylanne3.graph_store import ProductionGraphStore, TypeRegistry
-from sylanne3.graph_types import owner_grant_spec
+from sylanne3.graph_types import owner_grant_policy_digest_v1, owner_grant_spec
 from sylanne3.graph_worker import GraphWorker
 from sylanne3.host.owner_deployment import OwnerDeploymentVerifier
 from sylanne3.host.owner_identity_sqlite import AuthorityOwnerPairingSource
@@ -39,6 +40,7 @@ from sylanne3.workbench_api.installed_owner_ports import InstalledOwnerOnboardin
 from sylanne3.runtime.d11_types import (
     D11_PROPOSAL_SCHEMA, D11_PROPOSAL_SCHEMA_HASH, D11RuntimeProvider,
 )
+from sylanne3.runtime_contracts import canonical_digest
 
 
 ORIGIN = "https://dashboard.local"
@@ -80,13 +82,18 @@ class _HostRequest:
     headers = {"origin": ORIGIN}
 
 
-@pytest.mark.asyncio
-async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_path):
+def _real_owner_chain(tmp_path, *, extra_purpose=None,
+                      extra_capability=None, extra_specs=(), installation_factory=None, issue_runner=None,
+                      extra_purposes=(), extra_capabilities=()):
+    """Install real signed Owner issue/session and guard on one business DB.
+
+    The caller owns ``resources`` and closes them after any additional graph
+    worker/store. No Owner receipt or current guard is fabricated here.
+    """
     (coordinator, bootstrap, service, _compose, expected, principal,
-     authority_id, resources) = _installed(tmp_path)
+     authority_id, resources) = (installation_factory or _installed)(tmp_path, extra_specs=extra_specs)
     graph, core = resources[:2]
     port = coordinator._GraphCoordinator__content_fence_v2
-    worker = None
     try:
         original_authorizer = core._authorize_callback
         core._authorize_callback = lambda credential, action, namespace, holder: (
@@ -100,12 +107,23 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
         )
         now = lambda: datetime.now(timezone.utc).replace(microsecond=0)
         policy = replace(policy_for(graph), expected_authority_id=authority_id,
-                         authority_namespace=AUTH_NS)
+                         authority_namespace=AUTH_NS, manifest_digest=port.installation_grant.manifest_digest)
         creation = coordinator.provision_namespace_v2(
             bootstrap, policy, operation_id="owner-creation")
         expected.update(operation_id=creation.operation_id,
                         digest="sha256:" + creation.input_digest)
         ticket, operation, value = _owner_issue(creation, authority_id, principal)
+        if extra_purpose is not None or extra_capability is not None or extra_purposes or extra_capabilities:
+            value = {**value,
+                     "purposes": sorted(set(value["purposes"]) | (
+                         {extra_purpose} if extra_purpose is not None else set()) | set(extra_purposes)),
+                     "capabilities": sorted(set(value["capabilities"]) | (
+                         {extra_capability} if extra_capability is not None else set()) | set(extra_capabilities))}
+            ticket = replace(ticket, policy_digest=owner_grant_policy_digest_v1(
+                value, bot=ROLE.bot_id, persona=ROLE.persona_id))
+            operation = replace(operation, ticket=ticket,
+                                grant_digest="sha256:" + canonical_digest(value),
+                                request_digest=None)
         source = AuthorityOwnerPairingSource(core, utc_clock=now, create=True)
         verifier = OwnerDeploymentVerifier(source, now)
         key = Ed25519PrivateKey.generate()
@@ -116,20 +134,15 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
         )
         source.pair_credential(
             administrator_credential=ADMIN, registration=registration,
-            client_certificate_sha256="a" * 64,
+            client_certificate_sha256=PEER.certificate_sha256,
             valid_until_utc=now() + timedelta(hours=1))
         actor_binding = OwnerActorBindingV1(
             authority_id, "installation", ROLE, "owner-actor", principal, 1)
-        source.pair_actor(
-            administrator_credential=ADMIN,
-            binding=actor_binding)
+        source.pair_actor(administrator_credential=ADMIN, binding=actor_binding)
         proofs = AuthorityV2OwnerProofStore(
             core, utc_clock=now, pairing_verifier=verifier.pair_credential,
             current_pairing_source=source, create=True)
-        # The test transport is the installed peer; the pairing is held by the
-        # independent Authority DB, not inferred from graph or browser fields.
-        proofs.register_credential(
-            transport_credential=PEER, registration=registration)
+        proofs.register_credential(transport_credential=PEER, registration=registration)
         sessions = AuthorityV2OwnerSessionStore(
             core, utc_clock=now, current_pairing_source=source, create=True)
         issue_request = OwnerSessionLoginRequestV1(
@@ -140,10 +153,9 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
         issue_token = sessions.accept_login(
             transport_credential=PEER, challenge=challenge,
             signature=key.sign(challenge.signed_bytes()))
-
         source.pair_creation(
             administrator_credential=ADMIN, authority_namespace=AUTH_NS,
-            ticket=ticket, client_certificate_sha256="a" * 64,
+            ticket=ticket, client_certificate_sha256=PEER.certificate_sha256,
             valid_until_utc=now() + timedelta(hours=1))
         server = compose_local_owner_authority(
             core=core, v2_fences={AUTH_NS: service},
@@ -156,25 +168,28 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
             administrator_authorizer=lambda *_: True,
             publisher_manifest_verifier=lambda *_: True,
             installations_v2={
-                ("a" * 64, "installed"): AdministratorInstallationV2(
+                (PEER.certificate_sha256, "installed"): AdministratorInstallationV2(
                     "installation", "administrator", "policy", "capabilities-v2", "c" * 64)},
-            namespace_bindings_v2={("a" * 64, "installed", ROLE): AUTH_NS})
+            namespace_bindings_v2={(PEER.certificate_sha256, "installed", ROLE): AUTH_NS})
         tickets = server._v2_owner_tickets
         port.tickets = tickets
-        tickets.register_ticket(
-            credential=PEER, authority_namespace=AUTH_NS, ticket=ticket)
-        pending = tickets.reserve_issue(
-            credential=PEER, authority_namespace=AUTH_NS,
-            operation=operation, session_token=issue_token,
-            session_request=issue_request)
-        assert pending.phase == "pending"
-        proof = coordinator.commit_first_owner_grant_v2(
-            bootstrap, namespace=ROLE, operation_id=operation.operation_id,
-            grant_value=value)
-        committed = tickets.finalize_issue(
-            credential=PEER, authority_namespace=AUTH_NS,
-            operation=operation, proof=proof, session_token=issue_token,
-            session_request=issue_request)
+        if issue_runner is None:
+            tickets.register_ticket(
+                credential=PEER, authority_namespace=AUTH_NS, ticket=ticket)
+            pending = tickets.reserve_issue(
+                credential=PEER, authority_namespace=AUTH_NS,
+                operation=operation, session_token=issue_token,
+                session_request=issue_request)
+            assert pending.phase == "pending"
+            proof = coordinator.commit_first_owner_grant_v2(
+                bootstrap, namespace=ROLE, operation_id=operation.operation_id,
+                grant_value=value)
+            committed = tickets.finalize_issue(
+                credential=PEER, authority_namespace=AUTH_NS,
+                operation=operation, proof=proof, session_token=issue_token,
+                session_request=issue_request)
+        else:
+            committed = issue_runner(dict(locals()))
         assert committed.phase == "committed"
 
         def current_principal(actor, namespace):
@@ -194,8 +209,7 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
                           owner_actor_id=None, owner_session_token=None,
                           owner_session_request=None):
             assert namespace == ROLE and authority_namespace == AUTH_NS
-            service.validate_fence(
-                credential=WORKER, subject=SUBJECT, permit=permit)
+            service.validate_fence(credential=WORKER, subject=SUBJECT, permit=permit)
             return (tickets.get_current_guard(
                 credential=WORKER, authority_namespace=AUTH_NS,
                 installation_id="installation", subject=SUBJECT,
@@ -210,6 +224,34 @@ async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_pat
                 authority_namespace=authority_namespace,
                 installation_id="installation", actor_id=actor_id)
             if namespace == ROLE else None)
+        return SimpleNamespace(
+            coordinator=coordinator, bootstrap=bootstrap, service=service,
+            policy=policy, principal=principal, authority_id=authority_id,
+            resources=resources,
+            port=port, source=source, actor_binding=actor_binding,
+            sessions=sessions, server=server, key=key,
+            issue_request=issue_request, issue_token=issue_token,
+            current_principal=current_principal, current_actor=current_actor,
+        )
+    except BaseException:
+        for resource in resources:
+            resource.close()
+        raise
+
+
+@pytest.mark.asyncio
+async def test_paired_first_owner_issue_then_signed_w11_reads_real_graph(tmp_path):
+    chain = _real_owner_chain(tmp_path)
+    bootstrap, service, policy, principal = (chain.bootstrap, chain.service,
+                                             chain.policy, chain.principal)
+    resources, port, source, actor_binding = (chain.resources, chain.port,
+                                              chain.source, chain.actor_binding)
+    sessions, server, key, issue_request = (chain.sessions, chain.server,
+                                            chain.key, chain.issue_request)
+    authority_id = chain.authority_id
+    current_principal, current_actor = chain.current_principal, chain.current_actor
+    worker = None
+    try:
         registry = TypeRegistry()
         registry.register(owner_grant_spec())
         live = {}

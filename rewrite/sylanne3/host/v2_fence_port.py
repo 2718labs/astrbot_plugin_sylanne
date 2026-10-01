@@ -15,9 +15,12 @@ from ..authority_service.contract import CONTENT_OPERATIONS, identifier
 from ..authority_service.final_handoff_pairing import FinalHandoffPairingV1
 from ..authority_service.v2_clock import IngressClockSampleV2
 from ..authority_service.v2_contract import (
-    ExecutionBindingV1, ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
+    AuthorityCurrentEffectSnapshotV2, ExecutionBindingV1, ExecutionBindingV2,
+    FencePermitV2, FenceNeverBegunReceiptV2, MutationReceiptV2,
+    DeletionMutationReceiptV1,
     PlatformObservationV2,
     SCHEMA as AUTHORITY_V2_PROTOCOL,
+    canonical_digest as authority_canonical_digest,
 )
 from ..authority_service.v2_owner_contract import (
     OwnerAuthorizationGuardV1, OwnerAuthorizationOperationV1,
@@ -40,6 +43,7 @@ from ..runtime_contracts import (
 )
 from .authority_client import AuthorityHandshake, AuthorityProvisioningRequest
 from .authority_profile import AdminIngressClockPolicy
+from .installation_grant_identity import same_installed_grant_identity_v2
 from .mtls_transport import AuthorityTlsProfile, MtlsAuthorityTransport
 
 
@@ -92,6 +96,18 @@ class _PendingFinish:
     request_digest: str
 
 
+@dataclass(frozen=True)
+class _NaturalPaidConsumerBinding:
+    graph: object
+    bundle: object
+    grant: InstallationGrantV2
+    adapters: tuple[object, object, object, object]
+    generation: object
+    review: object
+    executor_method: object
+    provider_check_method: object
+
+
 class V2FencePort:
     """Use only on a dedicated graph worker, never on an asyncio loop thread.
 
@@ -131,6 +147,7 @@ class V2FencePort:
         self._mapped_namespaces: dict[NamespaceId, str] = {}
         self._pending_begin: _PendingBegin | None = None
         self._pending_finish: _PendingFinish | None = None
+        self._natural_paid_consumer_binding: _NaturalPaidConsumerBinding | None = None
         # Process-local lower UTC bound at the last accepted source monotonic sample.
         # Keep it across session repair; a new port process has no durable watermark.
         self._clock_watermark: tuple[str, str, float, float, float] | None = None
@@ -221,6 +238,202 @@ class V2FencePort:
         with self._lock:
             _, grant = self._identity()
             return grant
+
+    @staticmethod
+    def _natural_adapter_specs() -> tuple[tuple[str, type, str], ...]:
+        from .natural_generation_content_port import (
+            InstalledNaturalGenerationContentPortV2,
+        )
+        from .natural_generation_output_port import (
+            InstalledNaturalGenerationOutputPortV2,
+        )
+        from .natural_paid_review_port import InstalledNaturalPaidReviewPortV2
+        from .natural_review_output_port import InstalledNaturalReviewOutputPortV2
+
+        return (
+            ("_GraphCoordinator__natural_generation_output_port",
+             InstalledNaturalGenerationOutputPortV2,
+             "read_original_natural_generation_output_v2"),
+            ("_GraphCoordinator__natural_generation_content_port",
+             InstalledNaturalGenerationContentPortV2,
+             "read_current_natural_generation_content_v2"),
+            ("_GraphCoordinator__natural_review_output_port",
+             InstalledNaturalReviewOutputPortV2,
+             "read_original_natural_review_output_v2"),
+            ("_GraphCoordinator__natural_paid_review_current_port",
+             InstalledNaturalPaidReviewPortV2,
+             "read_current_natural_paid_review_v2"),
+        )
+
+    def _natural_paid_consumer_facts_current(
+        self, binding: _NaturalPaidConsumerBinding, *, mapped: bool,
+    ) -> bool:
+        from ..graph_coordinator import GraphCoordinator
+        from .astrbot_model_call import AstrBotModelProvider
+        from .authority_client import AuthorityClient
+        from .authority_profile import (
+            AdminInstallationBundle, AdminModelWorkflowV2,
+            AdminModelWorkflowsV2, NATURAL_GENERATION_TEMPLATE_VERSION,
+            NATURAL_GENERATION_TEMPLATE_VERSION_V3,
+            NATURAL_GENERATION_TEMPLATE_VERSION_V4,
+            REVIEW_TEMPLATE_VERSION,
+        )
+        from .model_egress_executor import HostModelEgressExecutor
+
+        graph, bundle, grant = binding.graph, binding.bundle, binding.grant
+        if (self._closed or type(graph) is not GraphCoordinator
+                or type(bundle) is not AdminInstallationBundle
+                or type(grant) is not InstallationGrantV2
+                or getattr(graph, "_GraphCoordinator__content_fence_v2", None)
+                   is not self
+                or type(self._grant) is not InstallationGrantV2
+                or not same_installed_grant_identity_v2(
+                    grant, self._grant)
+                or self._installation_grant != grant
+                or self._handshake is None
+                or not self._handshake.valid_pairing()
+                or self._handshake.channel_binding_sha256
+                   != self._grant.channel_binding_sha256
+                or bundle.tls_profile.profile_id != self._request.profile_id
+                or bundle.tls_profile.expected_authority_id != grant.authority_id
+                or bundle.installation_policy.installation_id
+                   != grant.installation_id
+                or bundle.installation_policy.manifest_digest
+                   != grant.manifest_digest
+                or type(bundle.model_workflows) is not AdminModelWorkflowsV2
+                or type(bundle.model_workflows.natural_generation)
+                   is not AdminModelWorkflowV2
+                or type(bundle.model_workflows.natural_review)
+                   is not AdminModelWorkflowV2
+                or bundle.model_workflows.natural_generation
+                   is not binding.generation
+                or bundle.model_workflows.natural_review is not binding.review
+                or (binding.generation.work_kind,
+                    binding.generation.purpose,
+                    binding.generation.template_version) not in (
+                    ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION),
+                    ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V3),
+                    ("natural_generation", "proposal", NATURAL_GENERATION_TEMPLATE_VERSION_V4))
+                or (binding.review.work_kind, binding.review.purpose,
+                    binding.review.template_version) != (
+                    "natural_review", "proposal", REVIEW_TEMPLATE_VERSION)
+                or HostModelEgressExecutor.execute_frozen_natural_once
+                   is not binding.executor_method
+                or AstrBotModelProvider._request_allowed
+                   is not binding.provider_check_method):
+            return False
+        policy = bundle.installation_policy
+        if mapped and self._mapped_namespaces.get(policy.namespace) != (
+                policy.authority_namespace):
+            return False
+        client = None
+        client_grant = None
+        loop = None
+        for adapter, (name, kind, method_name) in zip(
+                binding.adapters, self._natural_adapter_specs(), strict=True):
+            owner = getattr(adapter, "__self__", None)
+            if (type(owner) is not kind
+                    or getattr(adapter, "__func__", None)
+                       is not getattr(kind, method_name)
+                    or getattr(graph, name, None) != adapter
+                    or owner._bundle is not bundle
+                    or type(owner._grant) is not InstallationGrantV2
+                    or not same_installed_grant_identity_v2(
+                        grant, owner._grant)
+                    or type(owner._client) is not AuthorityClient
+                    or not owner._loop.is_running()):
+                return False
+            if client is None:
+                client, client_grant, loop = (
+                    owner._client, owner._grant, owner._loop)
+            elif (owner._client is not client or owner._loop is not loop
+                  or owner._grant != client_grant):
+                return False
+        return (client is not None
+                and client._selection.profile_id == self._request.profile_id
+                and client._v2_request == self._request
+                and client._v2_handshake is not None
+                and client._v2_handshake.valid_pairing()
+                and client._v2_handshake.channel_binding_sha256
+                    == client_grant.channel_binding_sha256)
+
+    def bind_natural_paid_consumers_v2(
+        self, graph: object, bundle: object, grant: InstallationGrantV2,
+    ) -> bool:
+        """Bind actual graph readers to the paired installed paid workflow."""
+        from .astrbot_model_call import AstrBotModelProvider
+        from .model_egress_executor import HostModelEgressExecutor
+
+        adapters = tuple(getattr(graph, name, None) for name, _, _ in
+                         self._natural_adapter_specs())
+        workflows = getattr(bundle, "model_workflows", None)
+        binding = _NaturalPaidConsumerBinding(
+            graph, bundle, grant, adapters,
+            getattr(workflows, "natural_generation", None),
+            getattr(workflows, "natural_review", None),
+            HostModelEgressExecutor.execute_frozen_natural_once,
+            AstrBotModelProvider._request_allowed)
+        with self._lock:
+            if not self._natural_paid_consumer_facts_current(
+                    binding, mapped=False):
+                raise RuntimeError("natural paid consumer installation differs")
+            if (self._natural_paid_consumer_binding is not None
+                    and self._natural_paid_consumer_binding != binding):
+                raise RuntimeError("natural paid consumer already bound")
+            self._natural_paid_consumer_binding = binding
+            return True
+
+    def _natural_consumer_ready_v2(
+        self, *, namespace: NamespaceId, template_version: str,
+        stage: str, installation_id: str | None,
+        provider_id: str | None, model_id: str | None,
+        provider_config_digest: str | None,
+    ) -> bool:
+        with self._lock:
+            binding = self._natural_paid_consumer_binding
+            if (binding is None or type(namespace) is not NamespaceId
+                    or type(template_version) is not str
+                    or not self._natural_paid_consumer_facts_current(
+                        binding, mapped=True)):
+                return False
+            workflow = (binding.generation if stage == "generation"
+                        else binding.review)
+            if (binding.bundle.installation_policy.namespace != namespace
+                    or workflow.template_version != template_version):
+                return False
+            optional = (installation_id, provider_id, model_id,
+                        provider_config_digest)
+            if all(value is None for value in optional):
+                return True
+            return (all(type(value) is str and value for value in optional)
+                    and optional == (
+                        binding.bundle.installation_policy.installation_id,
+                        workflow.provider_id, workflow.model_id,
+                        workflow.provider_config_digest))
+
+    def natural_paid_consumer_ready_v2(
+        self, *, namespace: NamespaceId, template_version: str,
+        installation_id: str | None = None, provider_id: str | None = None,
+        model_id: str | None = None,
+        provider_config_digest: str | None = None,
+    ) -> bool:
+        return self._natural_consumer_ready_v2(
+            namespace=namespace, template_version=template_version,
+            stage="generation", installation_id=installation_id,
+            provider_id=provider_id, model_id=model_id,
+            provider_config_digest=provider_config_digest)
+
+    def natural_review_paid_consumer_ready_v2(
+        self, *, namespace: NamespaceId, template_version: str,
+        installation_id: str | None = None, provider_id: str | None = None,
+        model_id: str | None = None,
+        provider_config_digest: str | None = None,
+    ) -> bool:
+        return self._natural_consumer_ready_v2(
+            namespace=namespace, template_version=template_version,
+            stage="review", installation_id=installation_id,
+            provider_id=provider_id, model_id=model_id,
+            provider_config_digest=provider_config_digest)
 
     def read_final_handoff_pairing_v1(
         self, *, namespace: str, installation_id: str,
@@ -381,6 +594,47 @@ class V2FencePort:
                 or state not in ("active", "finished")):
             raise RuntimeError("v2 fence status identity mismatch")
         return permit, state
+
+    def reject_unbegun_content_fence_v2(
+        self, namespace: NamespaceId, authority_namespace: str, *,
+        holder: str, generation: int, operation_id: str,
+        expected_anchor: RestoreAnchor, request_id: str, request_digest: str,
+    ) -> FenceNeverBegunReceiptV2:
+        """Request an Authority-atomic tombstone for the original write operation."""
+        with self._lock:
+            return self._submit(self._with_session_repair(lambda:
+                self._reject_unbegun_content_fence_v2(
+                    namespace, authority_namespace, holder, generation,
+                    operation_id, expected_anchor, request_id, request_digest)))
+
+    async def _reject_unbegun_content_fence_v2(
+        self, namespace: NamespaceId, authority_namespace: str,
+        holder: str, generation: int, operation_id: str,
+        expected_anchor: RestoreAnchor, request_id: str, request_digest: str,
+    ) -> FenceNeverBegunReceiptV2:
+        identifier(holder, "holder")
+        identifier(operation_id, "operation_id")
+        identifier(request_id, "request_id")
+        if (type(generation) is not int or generation < 0
+                or type(expected_anchor) is not RestoreAnchor
+                or expected_anchor.namespace != authority_namespace
+                or expected_anchor.activation_generation != generation):
+            raise ValueError("never-begun fence activation or anchor is invalid")
+        observed = await self._mapped(namespace, authority_namespace)
+        if (observed.holder != holder or observed.generation != generation
+                or observed.anchor != expected_anchor):
+            raise RuntimeError("never-begun fence activation or anchor changed")
+        handshake, grant = self._identity()
+        receipt = await self._transport.v2_reject_unbegun_content_fence_v2(
+            self._request, handshake, namespace=authority_namespace,
+            holder=holder, generation=generation, operation_id=operation_id,
+            expected_anchor=expected_anchor, request_id=request_id,
+            request_digest=request_digest)
+        if (receipt.installation_id != grant.installation_id
+                or receipt.subject != grant.subject
+                or receipt.authority_id != grant.authority_id):
+            raise RuntimeError("never-begun fence installation mismatch")
+        return receipt
 
     def _owner_identity(self, namespace: NamespaceId, authority_namespace: str,
                         value: OwnerClaimTicketV1 | OwnerAuthorizationOperationV1,
@@ -718,6 +972,176 @@ class V2FencePort:
             raise RuntimeError("v2 owner commit response differs")
         return result
 
+    def reserve_owner_revoke(self, *, namespace: NamespaceId,
+                             authority_namespace: str,
+                             operation: OwnerAuthorizationOperationV1,
+                             owner_session_token: str | None = None,
+                             owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+    ) -> OwnerAuthorizationReceiptV1:
+        return self._submit(self._with_session_repair(lambda: self._owner_revoke_write(
+            namespace, authority_namespace, operation, None,
+            owner_session_token, owner_session_request)))
+
+    def finalize_owner_revoke(self, *, namespace: NamespaceId,
+                              authority_namespace: str,
+                              operation: OwnerAuthorizationOperationV1,
+                              proof: OwnerGraphCommitProofV1,
+                              owner_session_token: str | None = None,
+                              owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+    ) -> OwnerAuthorizationReceiptV1:
+        return self._submit(self._with_session_repair(lambda: self._owner_revoke_write(
+            namespace, authority_namespace, operation, proof,
+            owner_session_token, owner_session_request)))
+
+    async def _owner_revoke_write(
+        self, namespace: NamespaceId, authority_namespace: str,
+        operation: OwnerAuthorizationOperationV1,
+        proof: OwnerGraphCommitProofV1 | None,
+        owner_session_token: str | None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None,
+    ) -> OwnerAuthorizationReceiptV1:
+        if (type(operation) is not OwnerAuthorizationOperationV1
+                or operation.action != "revoke"
+                or proof is not None and type(proof) is not OwnerGraphCommitProofV1):
+            raise TypeError("typed owner revoke operation and proof required")
+        await self._mapped(namespace, authority_namespace)
+        self._owner_identity(namespace, authority_namespace, operation)
+        if owner_session_request is not None:
+            self._owner_session_identity(
+                namespace, authority_namespace, owner_session_request)
+        handshake, _ = self._identity()
+        if proof is None:
+            result = await self._transport.v2_reserve_owner_revoke(
+                self._request, handshake, namespace=authority_namespace,
+                operation=operation, owner_session_token=owner_session_token,
+                owner_session_request=owner_session_request)
+        else:
+            if (proof.namespace != namespace
+                    or proof.operation_id != operation.operation_id
+                    or proof.request_digest != operation.request_digest
+                    or proof.grant_digest != operation.grant_digest):
+                raise RuntimeError("v2 owner revoke graph proof differs")
+            result = await self._transport.v2_finalize_owner_revoke(
+                self._request, handshake, namespace=authority_namespace,
+                operation=operation, proof=proof,
+                owner_session_token=owner_session_token,
+                owner_session_request=owner_session_request)
+        if (result.operation != operation or result.phase != (
+                "pending" if proof is None else "committed")):
+            raise RuntimeError("v2 owner revoke response differs")
+        return result
+
+    def get_pending_owner_revoke(self, *, namespace: NamespaceId,
+                                 authority_namespace: str, operation_id: str,
+                                 owner_session_token: str | None = None,
+                                 owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        return self._submit(self._with_session_repair(lambda: self._owner_revoke_read(
+            namespace, authority_namespace, operation_id, "pending", None,
+            owner_session_token, owner_session_request)))
+
+    def get_committed_owner_revoke(self, *, namespace: NamespaceId,
+                                   authority_namespace: str, operation_id: str,
+                                   owner_session_token: str | None = None,
+                                   owner_session_request: OwnerSessionLoginRequestV1 | None = None,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        return self._submit(self._with_session_repair(lambda: self._owner_revoke_read(
+            namespace, authority_namespace, operation_id, "committed", None,
+            owner_session_token, owner_session_request)))
+
+    def get_pending_owner_revoke_for_graph_write(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        operation_id: str, permit: FencePermitV2,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        return self._submit(self._with_session_repair(lambda: self._owner_revoke_read(
+            namespace, authority_namespace, operation_id, "pending", permit,
+            None, None)))
+
+    def get_pending_deletion_for_graph_write(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        deletion_operation_id: str, permit: FencePermitV2,
+    ) -> DeletionMutationReceiptV1:
+        return self._submit(self._with_session_repair(lambda:
+            self._pending_deletion_for_graph_write(
+                namespace, authority_namespace, deletion_operation_id, permit)))
+
+    async def _pending_deletion_for_graph_write(
+        self, namespace: NamespaceId, authority_namespace: str,
+        deletion_operation_id: str, permit: FencePermitV2,
+    ) -> DeletionMutationReceiptV1:
+        # The ordinary namespace bootstrap requires a clear deletion phase.
+        # The server checks this installation's exact namespace mapping.
+        if (type(namespace) is not NamespaceId
+                or namespace_ref(namespace) != authority_namespace):
+            raise RuntimeError("deletion graph namespace differs")
+        identifier(deletion_operation_id, "deletion_operation_id")
+        handshake, grant = self._identity()
+        if (type(permit) is not FencePermitV2 or permit.operation != "delete"
+                or permit.namespace != authority_namespace
+                or permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject):
+            raise RuntimeError("deletion graph read permit differs")
+        receipt = await self._transport.v2_get_pending_deletion_for_graph_write(
+            self._request, handshake, namespace=authority_namespace,
+            deletion_operation_id=deletion_operation_id, permit=permit)
+        if (type(receipt) is not DeletionMutationReceiptV1
+                or receipt.pending.deletion_operation_id != deletion_operation_id
+                or receipt.pending.source_phase != "absent"
+                or receipt.pending.target_phase != "pending"
+                or receipt.pending.permit.operation_id != permit.operation_id
+                or receipt.pending.permit.token != permit.token
+                or receipt.after_anchor != permit.pinned_anchor
+                or receipt.updated_revision != permit.revision):
+            raise RuntimeError("deletion graph read receipt differs")
+        return receipt
+
+    async def _owner_revoke_read(
+        self, namespace: NamespaceId, authority_namespace: str,
+        operation_id: str, phase: str, permit: FencePermitV2 | None,
+        owner_session_token: str | None,
+        owner_session_request: OwnerSessionLoginRequestV1 | None,
+    ) -> OwnerAuthorizationReceiptV1 | None:
+        identifier(operation_id, "operation_id")
+        await self._mapped(namespace, authority_namespace)
+        if owner_session_request is not None:
+            self._owner_session_identity(
+                namespace, authority_namespace, owner_session_request)
+        handshake, grant = self._identity()
+        if permit is not None:
+            if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                    or permit.namespace != authority_namespace
+                    or permit.authority_id != grant.authority_id
+                    or permit.subject != grant.subject):
+                raise RuntimeError("v2 owner revoke graph read permit differs")
+            result = await self._transport.v2_get_pending_owner_revoke_for_graph_write(
+                self._request, handshake, namespace=authority_namespace,
+                operation_id=operation_id, permit=permit)
+        else:
+            read = (self._transport.v2_get_pending_owner_revoke if phase == "pending"
+                    else self._transport.v2_get_committed_owner_revoke)
+            result = await read(
+                self._request, handshake, namespace=authority_namespace,
+                operation_id=operation_id,
+                owner_session_token=owner_session_token,
+                owner_session_request=owner_session_request)
+        if result is not None and (
+                type(result) is not OwnerAuthorizationReceiptV1
+                or result.phase != phase or result.operation.action != "revoke"
+                or result.operation.operation_id != operation_id
+                or result.operation.namespace != namespace
+                or result.operation.authority_id != grant.authority_id
+                or result.operation.installation_id != grant.installation_id):
+            raise RuntimeError("v2 owner revoke read identity differs")
+        return result
+
+    def get_current_background_owner_authority_for_fence_v1(self, **request):
+        from .d12_target_owner_port_v1 import get_current_background_owner_authority_for_fence_v1
+        return get_current_background_owner_authority_for_fence_v1(self, **request)
+
+    def get_current_owner_authority_for_fence_v1(self, **request):
+        from .d12_target_owner_port_v1 import get_current_owner_authority_for_fence_v1
+        return get_current_owner_authority_for_fence_v1(self, **request)
+
     def get_current_owner_guard_for_fence(
         self, *, namespace: NamespaceId, authority_namespace: str,
         permit: FencePermitV2,
@@ -981,6 +1405,132 @@ class V2FencePort:
         if permit.subject != grant.subject or permit.generation != generation:
             raise RuntimeError("v2 dispatch permit installation or generation mismatch")
         return permit
+
+    def read_current_effect_snapshot_for_write_fence(
+        self, *, namespace: NamespaceId, authority_namespace: str,
+        permit: FencePermitV2,
+    ) -> AuthorityCurrentEffectSnapshotV2:
+        """Read a complete, pinned Authority effect index without admitting dispatch."""
+        return self._submit(self._with_session_repair(
+            lambda: self._read_current_effect_snapshot_for_write_fence(
+                namespace, authority_namespace, permit)))
+
+    async def _read_current_effect_snapshot_for_write_fence(
+        self, namespace: NamespaceId, authority_namespace: str,
+        permit: FencePermitV2,
+    ) -> AuthorityCurrentEffectSnapshotV2:
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.namespace != authority_namespace):
+            raise ValueError("current effect snapshot requires an ordinary write fence")
+        observed = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        if (permit.authority_id != grant.authority_id
+                or permit.subject != grant.subject
+                or permit.holder != observed.holder
+                or permit.generation != observed.generation
+                or permit.pinned_anchor != observed.anchor):
+            raise RuntimeError("current effect snapshot permit is stale or unpaired")
+        read = getattr(
+            self._transport,
+            "v2_execution_read_current_effect_snapshot_for_write_fence", None)
+        if not callable(read):
+            raise RuntimeError("current effect snapshot transport is unavailable")
+        snapshot = await read(self._request, handshake, permit=permit)
+        if (type(snapshot) is not AuthorityCurrentEffectSnapshotV2
+                or snapshot.authority_id != grant.authority_id
+                or snapshot.namespace != authority_namespace
+                or snapshot.anchor != permit.pinned_anchor
+                or snapshot.permit_digest != authority_canonical_digest(permit)
+                or snapshot.execution_head_seq != permit.pinned_anchor.execution_seq
+                or snapshot.execution_head_digest != permit.pinned_anchor.execution_digest
+                or snapshot.coverage != "complete"):
+            raise RuntimeError("current effect snapshot is stale or incomplete")
+        return snapshot
+
+    def read_current_observation_receipt_v1(self, *, namespace, authority_namespace, effect_id):
+        return self._submit(self._with_session_repair(lambda:
+            self._read_current_observation_receipt_v1(namespace, authority_namespace, effect_id)))
+
+    def read_d11_offline_tick_original_v1(self, *, binding):
+        return self._submit(self._with_session_repair(lambda: self._offline_tick_v1(
+            binding, "d11_offline_tick_original_v1")))
+
+    def execute_d11_offline_tick_v1(self, *, binding):
+        # Refresh through a harmless mapped read first. The actual once-call
+        # is issued once; transport uncertainty is resolved by original reads.
+        self._submit(self._with_session_repair(lambda: self._mapped(
+            binding.namespace, binding.authority_namespace)))
+        try:
+            return self._submit(self._offline_tick_v1(binding, "d11_offline_tick_execute_v1"))
+        except (RuntimeError, FutureTimeout) as exc:
+            raise V2FenceOutcomeUnknown("offline tick execute outcome requires original inspection") from exc
+
+    async def _offline_tick_v1(self, binding, method):
+        from ..authority_service.d11_offline_tick_contract_v1 import D11OfflineTickBindingV1
+        if type(binding) is not D11OfflineTickBindingV1:
+            raise TypeError("actual fixed offline tick binding required")
+        await self._mapped(binding.namespace, binding.authority_namespace)
+        handshake, grant = self._identity()
+        return await self._transport.d11_offline_tick_v1(self._request, handshake, grant,
+            binding=binding, method=method)
+
+    def read_historical_d11_offline_tick_original_v1(self, *, binding):
+        return self._submit(self._with_session_repair(lambda: self._historical_offline_tick_original_v1(
+            binding, "d11_offline_tick_historical_original_v1")))
+
+    def recover_claimed_d11_offline_tick_v1(self, *, binding):
+        # Session repair repeats the same consumed identity; this RPC has no
+        # first-claim branch and cannot start a computation.
+        return self._submit(self._with_session_repair(lambda: self._historical_offline_tick_original_v1(
+            binding, "d11_offline_tick_recover_claimed_v1")))
+
+    async def _historical_offline_tick_original_v1(self, binding, method):
+        handshake, grant = self._identity()
+        return await self._transport.d11_offline_tick_v1(self._request, handshake, grant, binding=binding, method=method)
+
+    def offline_tick_unstarted_cancellation_v1(self, *, binding, action, gate=None):
+        return self._submit(self._with_session_repair(lambda: self._offline_tick_unstarted_cancellation_v1(binding, action, gate)))
+
+    async def _offline_tick_unstarted_cancellation_v1(self, binding, action, gate):
+        handshake, grant = self._identity()
+        return await self._transport.d11_offline_tick_unstarted_cancellation_v1(self._request, handshake, grant,
+            binding=binding, action=action, gate=gate)
+
+    def offline_tick_historical_accounting_v1(self, *, binding, action, gate=None):
+        return self._submit(self._with_session_repair(lambda: self._offline_tick_historical_accounting_v1(
+            binding, action, gate)))
+
+    async def _offline_tick_historical_accounting_v1(self, binding, action, gate):
+        # The dedicated Authority service authenticates the retained binding.
+        # A current content bootstrap would incorrectly gate historical cost
+        # and even an exact finished ACK on today's source readiness.
+        handshake, grant = self._identity()
+        return await self._transport.d11_offline_tick_historical_accounting_v1(self._request, handshake, grant,
+            binding=binding, action=action, gate=gate)
+
+    def offline_tick_adoption_bridge_v1(self, *, binding, action, gate=None, outcome=None):
+        # Each operation is exact-original idempotent. Repair only the paired
+        # session; no bridge operation can issue a computation claim.
+        return self._submit(self._with_session_repair(lambda: self._offline_tick_bridge_v1(
+            binding, action, gate, outcome)))
+
+    async def _offline_tick_bridge_v1(self, binding, action, gate, outcome):
+        if action in {"begin", "validate"}:
+            await self._mapped(binding.namespace, binding.authority_namespace)
+        handshake, grant = self._identity()
+        return await self._transport.d11_offline_tick_bridge_v1(self._request, handshake, grant,
+            binding=binding, action=action, gate=gate, outcome=outcome)
+
+    async def _read_current_observation_receipt_v1(self, namespace, authority_namespace, effect_id):
+        observed = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        receipt = await self._transport.v2_execution_read_current_observation_receipt_v1(
+            self._request, handshake, namespace=authority_namespace, effect_id=effect_id)
+        permit = receipt.pending.permit
+        if (permit.authority_id != grant.authority_id or permit.subject != grant.subject
+                or permit.generation != observed.generation):
+            raise RuntimeError("platform observation receipt installation differs")
+        return receipt
 
     def read_current_effect(
         self, *, namespace: NamespaceId, authority_namespace: str,

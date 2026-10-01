@@ -14,6 +14,9 @@ from ..model_broker.first_ingress_encoding import (
     FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST,
     FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
 )
+from ..model_broker.reply_language import (
+    REPLY_TEMPLATE_DIGEST, REPLY_TEMPLATE_VERSION,
+)
 from .contract import AuthorityUnavailable, identifier
 from .current_model_egress_graph_verifier import PinnedCurrentModelEgressGraphVerifier
 from .v2_model_egress_contract import (
@@ -30,7 +33,8 @@ class AuthorityV2ModelEgressService:
                  fences: AuthorityV2FenceService | None = None, *,
                  graph_verifier: PinnedCurrentModelEgressGraphVerifier | None = None,
                  admin_model_policy: (AdminIngressModelPolicy |
-                                      AdminModelWorkflowsV2 | None) = None):
+                                      AdminModelWorkflowsV2 | None) = None,
+                 source_location=None):
         if type(store) is not AuthorityV2ModelEgressStore:
             raise TypeError("Authority-owned model egress store required")
         if fences is not None and (type(fences) is not AuthorityV2FenceService
@@ -48,6 +52,29 @@ class AuthorityV2ModelEgressService:
         self._fences = fences
         self._graph_verifier = graph_verifier
         self._admin_model_policy = admin_model_policy
+        # Installed composition, never a caller-supplied location proof. The
+        # concrete qualifier is checked when configured; old initial-generation
+        # callers remain compatible, but cannot dispatch after a storage rebase
+        # without the installed current-location qualification below.
+        self._source_location = None
+        if source_location is not None:
+            self.install_current_source_location_v1(source_location)
+        from .d07_model_timing_v1 import install_d07_model_timing_schema_v1
+        with self._store._tx() as db:
+            install_d07_model_timing_schema_v1(db)
+
+    def install_current_source_location_v1(self, qualifier):
+        """Bind once during installed assembly, never through a wire request."""
+        from .current_source_location_v1 import InstalledCurrentSourceLocationQualifierV1
+        if (type(qualifier) is not InstalledCurrentSourceLocationQualifierV1
+                or self._fences is None or qualifier._fences is not self._fences
+                or qualifier.core is not self._fences.core
+                or self._graph_verifier is None
+                or qualifier._graph_db_path != self._graph_verifier._path
+                or self._source_location is not None
+                   and self._source_location is not qualifier):
+            raise AuthorityUnavailable("same installed model fence and Graph location qualifier required")
+        self._source_location = qualifier
 
     def _admin_model_matches(self, intent: ModelEgressIntentV1,
                              request: ModelCallRequest | None) -> bool:
@@ -57,11 +84,106 @@ class AuthorityV2ModelEgressService:
             return False
         authority = request.envelope.authority
         if type(policy) is AdminModelWorkflowsV2:
-            encode = policy.encode
-            if (encode.work_kind != "d06.encode_source"
-                    or encode.purpose != "consolidation"
-                    or encode.template_version
-                       != FIRST_INGRESS_ENCODING_TEMPLATE_VERSION):
+            if request.identity.phase == "d13.precompress":
+                from ..model_broker.d13_precompression import (
+                    TEMPLATE_DIGEST as D13_TEMPLATE_DIGEST,
+                )
+                workflow = policy.reply
+                ceiling = dict(intent.budget_ceiling)
+                return (
+                    request.digest == intent.request_digest
+                    and request.call_id == intent.call_id
+                    and request.identity.operation_id == intent.operation_id
+                    and authority.actor == intent.subject
+                    and authority.issuer_domain == "d13"
+                    and authority.activation_generation
+                        == intent.authority_activation_generation
+                    and authority.worker_fence == intent.worker_fence
+                    and authority.purpose == workflow.purpose
+                    and bool(authority.audience)
+                    and set(authority.audience) <= set(workflow.audiences)
+                    and request.privacy_tier == workflow.privacy_tier
+                    and request.required_capabilities
+                        == frozenset(workflow.required_capabilities)
+                    and request.prompt_template_digest == D13_TEMPLATE_DIGEST
+                    and (request.provider_id, request.model_id,
+                         intent.provider_id, intent.model_id) == (
+                            workflow.provider_id, workflow.model_id,
+                            workflow.provider_id, workflow.model_id)
+                    and intent.provider_config_digest
+                        == workflow.provider_config_digest
+                    and request.max_output_tokens == intent.max_output_tokens
+                    and request.max_output_tokens <= workflow.max_output_tokens
+                    and request.max_output_tokens <= ceiling.get("output_tokens", 0)
+                    and request.timeout_seconds == workflow.timeout_seconds
+                )
+            if authority.purpose == "proposal":
+                if request.identity.phase == "context_reply":
+                    from ..model_broker.context_reply import (
+                        CONTEXT_REPLY_TEMPLATE_DIGEST,
+                        CONTEXT_REPLY_TEMPLATE_VERSION,
+                    )
+                    workflow = policy.context_reply
+                    expected = ("context_reply", "proposal",
+                                CONTEXT_REPLY_TEMPLATE_VERSION,
+                                CONTEXT_REPLY_TEMPLATE_DIGEST)
+                elif request.identity.phase == "natural_generation":
+                    from ..model_broker.natural_reply import (
+                        TEMPLATE_DIGEST, TEMPLATE_VERSION,
+                    )
+                    workflow = policy.natural_generation
+                    from ..model_broker.natural_reply_history_v3 import (
+                        TEMPLATE_DIGEST as V3_TEMPLATE_DIGEST,
+                        TEMPLATE_VERSION as V3_TEMPLATE_VERSION,
+                    )
+                    if request.prompt_template_digest == V3_TEMPLATE_DIGEST:
+                        TEMPLATE_VERSION, TEMPLATE_DIGEST = V3_TEMPLATE_VERSION, V3_TEMPLATE_DIGEST
+                    from ..model_broker.natural_reply_history_v4 import TEMPLATE_DIGEST as V4_TEMPLATE_DIGEST, TEMPLATE_VERSION as V4_TEMPLATE_VERSION
+                    if request.prompt_template_digest == V4_TEMPLATE_DIGEST:
+                        TEMPLATE_VERSION, TEMPLATE_DIGEST = V4_TEMPLATE_VERSION, V4_TEMPLATE_DIGEST
+                    expected = ("natural_generation", "proposal",
+                                TEMPLATE_VERSION, TEMPLATE_DIGEST)
+                elif request.identity.phase == "natural_review":
+                    from ..model_broker.natural_review import (
+                        REVIEW_TEMPLATE_DIGEST, REVIEW_TEMPLATE_VERSION,
+                    )
+                    workflow = policy.natural_review
+                    expected = ("natural_review", "proposal",
+                                REVIEW_TEMPLATE_VERSION, REVIEW_TEMPLATE_DIGEST)
+                elif request.identity.phase in {"contact_generation", "contact_review"}:
+                    from ..model_broker.contact_expression_v1 import (GENERATION_TEMPLATE_VERSION,
+                        GENERATION_TEMPLATE_DIGEST, REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
+                        REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
+                    if request.identity.phase == "contact_generation":
+                        workflow = policy.contact_generation
+                        expected = ("contact_generation", "proposal", GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST)
+                    else:
+                        workflow = policy.contact_review
+                        expected = ("contact_review", "proposal", CONTACT_REVIEW_VERSION, CONTACT_REVIEW_DIGEST)
+                elif request.identity.phase == "d04.appraisal":
+                    from ..model_broker.d04_appraisal import TEMPLATE_VERSION as APPRAISAL_TEMPLATE, TEMPLATE_DIGEST as APPRAISAL_DIGEST
+                    workflow = policy.appraisal
+                    expected = ("d04.appraisal", "proposal", APPRAISAL_TEMPLATE, APPRAISAL_DIGEST)
+                elif request.identity.phase == "d07.cognition":
+                    from ..model_broker.d07_cognition_v1 import TEMPLATE_VERSION as D07_TEMPLATE, TEMPLATE_DIGEST as D07_DIGEST
+                    workflow = policy.d07_cognition
+                    expected = ("d07.cognition", "proposal", D07_TEMPLATE, D07_DIGEST)
+                elif request.identity.phase == "post_c02_reply_model":
+                    workflow = policy.reply
+                    expected = ("reply", "proposal", REPLY_TEMPLATE_VERSION,
+                                REPLY_TEMPLATE_DIGEST)
+                else:
+                    return False
+            else:
+                # Keep the existing encoding scope and checks unchanged.
+                workflow = policy.encode
+                expected = ("d06.encode_source", "consolidation",
+                            FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+                            FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST)
+            if (workflow is None
+                    or (workflow.work_kind, workflow.purpose,
+                    workflow.template_version,
+                    request.prompt_template_digest) != expected):
                 return False
             ceiling = dict(intent.budget_ceiling)
             return (
@@ -73,26 +195,26 @@ class AuthorityV2ModelEgressService:
                 and authority.activation_generation
                     == intent.authority_activation_generation
                 and authority.worker_fence == intent.worker_fence
-                and authority.purpose == encode.purpose
+                and authority.purpose == workflow.purpose
                 and bool(authority.audience)
-                and set(authority.audience) <= set(encode.audiences)
-                and request.privacy_tier == encode.privacy_tier
+                and set(authority.audience) <= set(workflow.audiences)
+                and request.privacy_tier == workflow.privacy_tier
                 and request.required_capabilities
-                    == frozenset(encode.required_capabilities)
+                    == frozenset(workflow.required_capabilities)
                 and (request.provider_id, request.model_id,
                      intent.provider_id, intent.model_id) == (
-                        encode.provider_id, encode.model_id,
-                        encode.provider_id, encode.model_id)
+                        workflow.provider_id, workflow.model_id,
+                        workflow.provider_id, workflow.model_id)
                 and intent.provider_config_digest
-                    == encode.provider_config_digest
+                    == workflow.provider_config_digest
                 and request.prompt_template_digest
-                    == FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST
+                    == expected[3]
                 and request.max_output_tokens == intent.max_output_tokens
-                and request.max_output_tokens <= encode.max_output_tokens
+                and request.max_output_tokens <= workflow.max_output_tokens
                 and request.max_output_tokens
                     <= ceiling.get("output_tokens", 0)
-                and request.timeout_seconds == encode.timeout_seconds
-                and all(amount <= encode.quote_ceiling.get(dimension, 0)
+                and request.timeout_seconds == workflow.timeout_seconds
+                and all(amount <= workflow.quote_ceiling.get(dimension, 0)
                         for dimension, amount in intent.budget_ceiling)
             )
         if type(policy) is not AdminIngressModelPolicy:
@@ -155,8 +277,8 @@ class AuthorityV2ModelEgressService:
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=holder,
                 generation=expected_anchor.activation_generation)
-            if anchor != expected_anchor or deletion_history:
-                raise AuthorityUnavailable("model egress anchor changed or deletion history exists")
+            if anchor != expected_anchor:
+                raise AuthorityUnavailable("model egress anchor changed")
             old = self._store._read(db, draft.call_id)
             job_row = db.execute(
                 "SELECT call_id FROM authority_model_egress_v1 WHERE namespace=? "
@@ -199,6 +321,7 @@ class AuthorityV2ModelEgressService:
         namespace: str, job_id: str, acquire_operation_id: str,
         original_model_operation_id: str, call_id: str,
         request_digest: str, binding_digest: str,
+        historical_accounting: bool = False,
     ):
         """Read the Authority's V2 original key; never issue a send or content."""
         if self._fences is None or namespace != self._fences.namespace:
@@ -223,8 +346,12 @@ class AuthorityV2ModelEgressService:
                                        deletion_history):
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=holder)
-            if (deletion_history or anchor.authority_id != authority_id):
+            if anchor.authority_id != authority_id:
                 raise AuthorityUnavailable("original model Authority changed")
+            # _current_locked(require_clear=True) already qualifies RELEASED
+            # current storage when deletion history exists. Historical lookup
+            # remains an explicit separate mode below; normal lookup keeps
+            # activation/revocation and consumed-identity exclusions intact.
             record = self._store.lookup_original_locked(
                 db, authority_id=authority_id, namespace=namespace,
                 installation_id=installation_id,
@@ -234,10 +361,9 @@ class AuthorityV2ModelEgressService:
             if record is None:
                 return None
             intent = record.intent
-            if (intent.subject != subject or
-                    intent.authority_activation_generation !=
-                    anchor.activation_generation or
-                    intent.authority_revocation_epoch != anchor.revocation_epoch):
+            if (intent.subject != subject or (not historical_accounting and (
+                    intent.authority_activation_generation != anchor.activation_generation
+                    or intent.authority_revocation_epoch != anchor.revocation_epoch))):
                 raise AuthorityUnavailable("original model activation or subject changed")
             if not self._store.is_fence_bound_locked(db, intent):
                 raise AuthorityUnavailable("original model fence binding absent")
@@ -398,8 +524,8 @@ class AuthorityV2ModelEgressService:
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=holder,
                 generation=expected_anchor.activation_generation)
-            if anchor != expected_anchor or deletion_history:
-                raise AuthorityUnavailable("model finish anchor changed or deletion history exists")
+            if anchor != expected_anchor:
+                raise AuthorityUnavailable("model finish anchor changed")
             row = self._fences.fences._row(db, intent.operation_id)
             if row is None:
                 raise AuthorityUnavailable("typed model fence absent")
@@ -423,8 +549,8 @@ class AuthorityV2ModelEgressService:
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=holder,
                 generation=expected_anchor.activation_generation)
-            if anchor != expected_anchor or deletion_history:
-                raise AuthorityUnavailable("model finish anchor changed or deletion history exists")
+            if anchor != expected_anchor:
+                raise AuthorityUnavailable("model finish anchor changed")
             row = self._fences.fences._row(db, intent.operation_id)
             if row is None:
                 raise AuthorityUnavailable("typed model fence absent")
@@ -456,8 +582,8 @@ class AuthorityV2ModelEgressService:
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=holder,
                 generation=expected_anchor.activation_generation)
-            if anchor != expected_anchor or deletion_history:
-                raise AuthorityUnavailable("model dispatch anchor changed or deletion history exists")
+            if anchor != expected_anchor:
+                raise AuthorityUnavailable("model dispatch anchor changed")
             record = self._store.read_locked(db, intent)
             row = self._fences.fences._row(db, intent.operation_id)
             if row is None or row[6] != "active":
@@ -470,9 +596,21 @@ class AuthorityV2ModelEgressService:
             if record.state != "prepared":
                 raise AuthorityUnavailable("model dispatch admission cannot repeat")
         # No journal or Authority lock is held during this independent read.
+        location_observation = None
         try:
-            graph_current = (self._graph_verifier is not None
-                             and self._graph_verifier.complete_graph_current(intent) is True)
+            if self._source_location is not None:
+                location_observation = self._source_location.observe_business_for_fence_v1(
+                    credential=credential, subject=subject, permit=permit)
+            elif deletion_history:
+                raise AuthorityUnavailable("installed post-erasure model location unavailable")
+            graph_current = self._graph_verifier is not None
+            if graph_current:
+                if location_observation is None:
+                    graph_current = self._graph_verifier.complete_graph_current(intent) is True
+                else:
+                    graph_current = self._graph_verifier.complete_graph_current(
+                        intent, source_location=self._source_location,
+                        location_observation=location_observation) is True
         except Exception:
             graph_current = False
         try:
@@ -492,15 +630,22 @@ class AuthorityV2ModelEgressService:
                 anchor = self._fences._current_locked(
                     db, deletion_head, execution_head, holder=holder,
                     generation=expected_anchor.activation_generation)
-                if anchor != expected_anchor or deletion_history:
-                    raise AuthorityUnavailable("model dispatch anchor changed or deletion history exists")
+                if anchor != expected_anchor:
+                    raise AuthorityUnavailable("model dispatch anchor changed")
                 row = self._fences.fences._row(db, intent.operation_id)
                 if row is None or self._fences.fences._permit(row) != permit:
                     raise AuthorityUnavailable("original model dispatch permit changed")
+                if location_observation is not None:
+                    self._source_location.require_current_in_tx_v1(db, location_observation)
+                from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+                require_lifecycle_admission_in_tx_v1(db, intent.namespace, action="first_model_dispatch")
                 record = self._store._record_dispatch_started_fenced_locked(
                     db, intent, permit, self._fences.fences, anchor)
                 if admission is not None:
                     self._store.record_admission_locked(db, intent, admission)
+                if request is not None and request.identity.phase == "d07.cognition":
+                    from .d07_model_timing_v1 import record_d07_model_start_locked_v1
+                    record_d07_model_start_locked_v1(db, intent, admission)
                 return record, permit
         except AuthorityUnavailable:
             # A competing successful CAS must never be reclassified as unsent.
@@ -607,8 +752,8 @@ class AuthorityV2ModelEgressService:
             anchor = self._fences._current_locked(
                 db, deletion_head, execution_head, holder=holder,
                 generation=expected_anchor.activation_generation)
-            if anchor != expected_anchor or deletion_history:
-                raise AuthorityUnavailable("model completion anchor changed or deletion history exists")
+            if anchor != expected_anchor:
+                raise AuthorityUnavailable("model completion anchor changed")
             row = self._fences.fences._row(db, intent.operation_id)
             if row is None or row[6] != "active":
                 raise AuthorityUnavailable("original model fence is not active")
@@ -624,6 +769,8 @@ class AuthorityV2ModelEgressService:
                     intent, permit, "completed", observation.digest),
                 admission.installation_id, admission.host_incarnation)
             self._store.record_terminal_receipt_locked(db, admission, receipt)
+            from .d07_model_timing_v1 import record_d07_model_end_locked_v1
+            record_d07_model_end_locked_v1(db, intent, receipt)
             return record, permit, receipt
 
     async def begin_handoff(self, request, request_digest):

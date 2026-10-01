@@ -116,7 +116,8 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         ticket, operation, value = owner_case._owner_issue(
             creation, authority_id, principal)
         value["capabilities"] = [
-            "workbench.bind_scene", "workbench.create", "workbench.read",
+            "workbench.bind_scene", "workbench.create", "workbench.diagnose",
+            "workbench.read",
         ]
         value["purposes"] = ["workbench_user_action", "workbench_view"]
         ticket = replace(ticket, policy_digest=owner_grant_policy_digest_v1(
@@ -238,6 +239,7 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             "owner:paired-account", "paired-session",
             {"bot/persona": frozenset({
                 "workbench.read", "workbench.create", "workbench.bind_scene",
+                "workbench.diagnose",
             })},
             {"bot/persona": frozenset({"owner"})},
             {"bot/persona": frozenset({"workbench_user_action", "workbench_view"})},
@@ -350,6 +352,11 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
 
         worker = await GraphWorker.start(_Store, lambda _: coordinator)
         runtime = RuntimeContext(tmp_path, dependencies=None)
+        runtime._domains = replace(
+            runtime._domains,
+            registrations={name: runtime._domains.registrations[name]
+                           for name in ("d01", "d03")},
+            unavailable={}, required_domains=("d01", "d03"))
         runtime._worker = worker
         runtime._v2_namespace_provisioned = True
         mount, context = WorkbenchHostMount(), _Context()
@@ -396,6 +403,28 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
         assert viewed.status_code == 200, viewed.body
         candidates = json.loads(viewed.body)["projection"]["data"]["candidates"]
         assert candidates[0]["plan_id"] == receipt["plan_id"]
+        support_operation_id = str(uuid4())
+        support_body = json.dumps({
+            "schema_version": "d12.contract.v1",
+            "action": "diagnose_and_export_support",
+            "scope": "bot/persona", "purpose": "workbench_view",
+            "audience": "owner", "operation_id": support_operation_id,
+            "input": {"question": "view_health", "allowed_data": ["view_status"],
+                      "retention_policy_ref": "d12.local_manual_retention.v1",
+                      "local_destination": "managed"},
+        }).encode()
+        with bind_request_context(_Request(
+                support_body, token=token, owner_token=login_token)):
+            exported = await command()
+        assert exported.status_code == 200, exported.body
+        support_receipt = json.loads(exported.body)["receipt"]
+        assert support_receipt["phase"] == "local_support_export_recorded"
+        support_path = tmp_path / "support_exports" / f"{support_operation_id}.json"
+        assert support_receipt["local_path"] == str(support_path)
+        manifest = json.loads(support_path.read_text(encoding="utf-8"))
+        assert manifest["allowed_data"] == ["view_status"]
+        assert manifest["operation_id"] == support_operation_id
+        assert "data" not in manifest
         assert resources[0]._db.execute(
             "SELECT COUNT(*) FROM graph_role_init_receipts_v1").fetchone() == (1,)
         resources[0]._db.execute(
@@ -457,6 +486,11 @@ async def test_paired_owner_dashboard_create_character_reaches_dual_db_receipt(
             revoked_view = await command()
         assert revoked_view.status_code == 401
         assert "projection" not in json.loads(revoked_view.body)
+        with bind_request_context(_Request(
+                support_body, token=token, owner_token=login_token)):
+            revoked_export = await command()
+        assert revoked_export.status_code == 401
+        assert tuple((tmp_path / "support_exports").glob("*.json")) == (support_path,)
         with pytest.raises(AuthorityUnavailable, match="Owner session is not current"):
             coordinator.replay_committed_scene_binding_v2(
                 namespace=owner_case.ROLE, operation_id=scene_operation_id,

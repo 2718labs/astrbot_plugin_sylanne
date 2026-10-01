@@ -32,12 +32,12 @@ from .contract import AuthorityUnavailable, identifier
 from .local_bridge import constraint_keys_from_footprint
 from .v2_contract import (
     DeletionEvidenceV1, DeletionMutationReceiptV1, DeletionPendingV1,
-    FencePermitV2, MutationReceiptV2,
+    FencePermitV2, FenceNeverBegunReceiptV2, MutationReceiptV2,
     PendingMutationV2, SCHEMA, canonical_bytes, decode_bytes, to_wire,
 )
 
 
-_VERSION = "4"
+_VERSION = "5"
 _META_DDL = "CREATE TABLE authority_v2_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 _EPOCH_DDL = "CREATE TABLE authority_v2_epochs(namespace TEXT PRIMARY KEY, last_epoch INTEGER NOT NULL CHECK(last_epoch >= 0))"
 _FENCE_DDL = """CREATE TABLE authority_v2_fences(
@@ -92,6 +92,10 @@ _MUTATION_DDL = """CREATE TABLE authority_v2_mutations(
     CHECK((state='pending' AND receipt IS NULL AND updated_permit IS NULL)
        OR (state!='pending' AND receipt IS NOT NULL AND updated_permit IS NOT NULL))
 )"""
+_NEVER_BEGUN_DDL = """CREATE TABLE authority_v2_never_begun(
+    operation_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+    request_digest TEXT NOT NULL, receipt BLOB NOT NULL
+)"""
 _TABLES = {
     "authority_v2_meta": ("key", "value"),
     "authority_v2_epochs": ("namespace", "last_epoch"),
@@ -106,10 +110,15 @@ _TABLES = {
         "receipt", "updated_permit", "mutation_kind", "deletion_evidence",
         "footprint",
     ),
+    "authority_v2_never_begun": (
+        "operation_id", "request_id", "request_digest", "receipt",
+    ),
 }
-_TABLES_V2 = {**_TABLES, "authority_v2_mutations":
+_TABLES_V4 = {key: value for key, value in _TABLES.items()
+              if key != "authority_v2_never_begun"}
+_TABLES_V2 = {**_TABLES_V4, "authority_v2_mutations":
               _TABLES["authority_v2_mutations"][:10]}
-_TABLES_V3 = {**_TABLES, "authority_v2_mutations":
+_TABLES_V3 = {**_TABLES_V4, "authority_v2_mutations":
               _TABLES["authority_v2_mutations"][:12]}
 
 
@@ -138,7 +147,15 @@ class AuthorityV2FenceStore:
                 db.execute(_FENCE_DDL)
                 db.execute(_INDEX_DDL)
                 db.execute(_MUTATION_DDL)
+                db.execute(_NEVER_BEGUN_DDL)
                 db.execute("INSERT INTO authority_v2_meta(key,value) VALUES('schema_version',?)", (_VERSION,))
+            elif present == set(_TABLES_V4):
+                # V4->V5 only adds an empty tombstone table; perform it under
+                # the same immediate transaction after validating the old DDL.
+                self._check_schema_version(db, "4")
+                db.execute(_NEVER_BEGUN_DDL)
+                db.execute("UPDATE authority_v2_meta SET value='5' "
+                           "WHERE key='schema_version'")
             elif present != set(_TABLES):
                 raise AuthorityUnavailable("partial or unknown v2 fence schema")
             self._check_schema(db)
@@ -167,12 +184,26 @@ class AuthorityV2FenceStore:
             raise AuthorityUnavailable("Owner session/key change waits for v2 namespace work")
 
     @staticmethod
+    def require_idle_migration_in_tx(db: sqlite3.Connection,
+                                     namespace: str) -> None:
+        """No ordinary or pending work may cross the source freeze boundary."""
+        AuthorityV2FenceStore._check_schema(db)
+        AuthorityV2FenceStore._require_no_migration(db)
+        if db.execute(
+                "SELECT 1 FROM authority_v2_fences WHERE namespace=? "
+                "AND (state='active' OR pending IS NOT NULL) LIMIT 1",
+                (namespace,)).fetchone() or db.execute(
+                "SELECT 1 FROM authority_v2_mutations WHERE namespace=? "
+                "AND state='pending' LIMIT 1", (namespace,)).fetchone():
+            raise AuthorityUnavailable("v2 namespace has active or pending work")
+
+    @staticmethod
     def _check_schema(db: sqlite3.Connection) -> None:
         AuthorityV2FenceStore._check_schema_version(db, _VERSION)
 
     @staticmethod
     def _check_schema_version(db: sqlite3.Connection, version: str) -> None:
-        if version not in ("2", "3", "4"):
+        if version not in ("2", "3", "4", "5"):
             raise AuthorityUnavailable("unknown v2 fence schema version")
         try:
             row = db.execute(
@@ -182,7 +213,8 @@ class AuthorityV2FenceStore:
             raise AuthorityUnavailable("malformed v2 fence schema") from exc
         if row != (version,) or count != 1:
             raise AuthorityUnavailable("v2 fence schema version requires explicit migration")
-        tables = {"2": _TABLES_V2, "3": _TABLES_V3, "4": _TABLES}[version]
+        tables = {"2": _TABLES_V2, "3": _TABLES_V3,
+                  "4": _TABLES_V4, "5": _TABLES}[version]
         objects = {(kind, name) for kind, name in db.execute(
             "SELECT type,name FROM sqlite_master WHERE name LIKE 'authority_v2_%'")}
         expected_objects = {("table", table) for table in tables} | {
@@ -195,8 +227,9 @@ class AuthorityV2FenceStore:
             "authority_v2_fences": _FENCE_DDL,
             "authority_v2_mutations": {
                 "2": _MUTATION_DDL_V2, "3": _MUTATION_DDL_V3,
-                "4": _MUTATION_DDL,
+                "4": _MUTATION_DDL, "5": _MUTATION_DDL,
             }[version],
+            "authority_v2_never_begun": _NEVER_BEGUN_DDL,
         }
         for table, expected in tables.items():
             columns = tuple(row[1] for row in db.execute(f"PRAGMA table_info({table})"))
@@ -311,6 +344,30 @@ class AuthorityV2FenceStore:
                 raise
 
     @staticmethod
+    def upgrade_schema_4_to_5(connection: sqlite3.Connection, *,
+                              lock: threading.RLock | None = None) -> None:
+        """Add a durable operation-ID tombstone in an explicit schema upgrade."""
+        if type(connection) is not sqlite3.Connection or connection.isolation_level is not None:
+            raise AuthorityUnavailable("schema upgrade requires service autocommit connection")
+        if (not connection.execute("PRAGMA database_list").fetchone()[2]
+                or connection.execute("PRAGMA synchronous").fetchone()[0] < 2):
+            raise AuthorityUnavailable("schema upgrade requires durable service SQLite")
+        with (lock if lock is not None else threading.RLock()):
+            if connection.in_transaction:
+                raise AuthorityUnavailable("schema upgrade requires no open transaction")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                AuthorityV2FenceStore._check_schema_version(connection, "4")
+                connection.execute(_NEVER_BEGUN_DDL)
+                connection.execute(
+                    "UPDATE authority_v2_meta SET value='5' WHERE key='schema_version'")
+                AuthorityV2FenceStore._check_schema_version(connection, "5")
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+
+    @staticmethod
     def _canonical_footprint(pending: PendingMutationV2,
                              footprint: RecoveryConstraintFootprint) -> bytes:
         if type(footprint) is not RecoveryConstraintFootprint:
@@ -393,6 +450,54 @@ class AuthorityV2FenceStore:
     def _row(db, operation_id: str):
         return db.execute("SELECT operation_id,namespace,subject,token,fence_epoch,revision,state,permit,finish_request_id,finish_request_digest,pending FROM authority_v2_fences WHERE operation_id=?", (operation_id,)).fetchone()
 
+    def reject_unbegun_content_fence_locked(
+        self, db: sqlite3.Connection, *, subject: str, installation_id: str,
+        holder: str, generation: int, operation_id: str,
+        current_anchor: RestoreAnchor, request_id: str, request_digest: str,
+    ) -> FenceNeverBegunReceiptV2:
+        """Atomically reserve a never-issued operation ID, or replay its exact proof."""
+        self._check_schema(db)
+        self._require_no_migration(db)
+        receipt = FenceNeverBegunReceiptV2(
+            authority_id=current_anchor.authority_id,
+            namespace=current_anchor.namespace, subject=subject,
+            installation_id=installation_id, holder=holder,
+            generation=generation, operation_id=operation_id,
+            pinned_anchor=current_anchor, request_id=request_id,
+            request_digest=request_digest,
+        )
+        # Operation IDs are global in this store. A foreign namespace or subject
+        # must never be reported as absent to this caller.
+        if self._row(db, operation_id) is not None:
+            raise AuthorityUnavailable("operation ID already has a fence")
+        if db.execute(
+                "SELECT 1 FROM authority_v2_mutations WHERE operation_id=? LIMIT 1",
+                (operation_id,)).fetchone():
+            raise AuthorityUnavailable("operation has mutation history")
+        old = db.execute(
+            "SELECT request_id,request_digest,receipt FROM authority_v2_never_begun "
+            "WHERE operation_id=?", (operation_id,)).fetchone()
+        if old is not None:
+            try:
+                saved = decode_bytes(old[2])
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise AuthorityUnavailable("malformed never-begun receipt") from exc
+            if (type(saved) is not FenceNeverBegunReceiptV2
+                    or old != (saved.request_id, saved.request_digest,
+                               canonical_bytes(saved))
+                    or saved != receipt):
+                raise AuthorityUnavailable("never-begun operation identity differs")
+            return saved
+        if db.execute(
+                "SELECT 1 FROM authority_v2_never_begun WHERE request_id=?",
+                (request_id,)).fetchone():
+            raise AuthorityUnavailable("never-begun request ID was reused")
+        db.execute(
+            "INSERT INTO authority_v2_never_begun"
+            "(operation_id,request_id,request_digest,receipt) VALUES(?,?,?,?)",
+            (operation_id, request_id, request_digest, canonical_bytes(receipt)))
+        return receipt
+
     def begin_fence(self, *, subject: str, holder: str, operation: str,
                     current_anchor: RestoreAnchor, operation_id: str | None = None,
                     effect_id: str | None = None, command_digest: str | None = None,
@@ -427,6 +532,8 @@ class AuthorityV2FenceStore:
         identifier(subject, "subject")
         identifier(holder, "holder")
         identifier(operation_id, "operation_id")
+        if operation in {"migrate", "recovery"}:
+            raise AuthorityUnavailable("migration permits require the dedicated management service")
         if operation == "accounting" and (effect_id is not None or footprint_digest is not None
                                           or type(command_digest) is not str):
             raise AuthorityUnavailable("typed accounting binding digest required")
@@ -434,6 +541,10 @@ class AuthorityV2FenceStore:
         namespace = current_anchor.namespace
         self._check_schema(db)
         self._require_no_migration(db)
+        if db.execute(
+                "SELECT 1 FROM authority_v2_never_begun WHERE operation_id=?",
+                (operation_id,)).fetchone():
+            raise AuthorityUnavailable("operation ID was durably rejected before begin")
         old = self._row(db, operation_id)
         if old is not None:
             saved = self._permit(old)
@@ -443,6 +554,10 @@ class AuthorityV2FenceStore:
                     or saved.footprint_digest != footprint_digest):
                 raise AuthorityUnavailable("operation ID reused with different identity or completed fence")
             return saved
+        from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+        require_lifecycle_admission_in_tx_v1(db, namespace,
+            action="accounting" if operation == "accounting" else "new_" + operation,
+            original_claimed=operation == "accounting")
         if db.execute("SELECT 1 FROM authority_v2_fences WHERE namespace=? AND state='active'", (namespace,)).fetchone():
             raise AuthorityUnavailable("namespace already has an active v2 fence")
         last = db.execute("SELECT last_epoch FROM authority_v2_epochs WHERE namespace=?", (namespace,)).fetchone()
@@ -592,6 +707,194 @@ class AuthorityV2FenceStore:
     def mutation_locked(db: sqlite3.Connection, mutation_id: str):
         identifier(mutation_id, "mutation_id")
         return db.execute("SELECT operation_id,namespace,subject,request_digest,state,conflict_keys_json,pending,receipt,updated_permit,mutation_kind,deletion_evidence,footprint FROM authority_v2_mutations WHERE mutation_id=?", (mutation_id,)).fetchone()
+
+    @classmethod
+    def verify_current_deletion_bridge_locked(
+            cls, db: sqlite3.Connection, *, core, receipt,
+            original_permit: FencePermitV2, current_anchor: RestoreAnchor,
+            current_permit: FencePermitV2) -> None:
+        """Authenticate the installed storage transition for one accepted deletion."""
+        from .c09_originals_archive_v1 import read_current_deletion_continuation_v1_locked
+
+        if (core is None or getattr(core, "_db", None) is not db
+                or not db.in_transaction
+                or type(receipt) is not DeletionMutationReceiptV1
+                or receipt.pending.target_phase != "accepted"):
+            raise AuthorityUnavailable("installed accepted deletion bridge required")
+        namespace = receipt.pending.permit.namespace
+        operation_id = receipt.pending.deletion_operation_id
+        transition = read_current_deletion_continuation_v1_locked(
+            db, namespace=namespace, operation_id=operation_id)
+        if transition is None:
+            raise AuthorityUnavailable("accepted deletion storage transition is absent")
+        authenticated = core.verify_c09_deletion_transition_v1(
+            namespace=namespace, operation_id=operation_id,
+            transition=transition, db=db)
+        if (authenticated != transition
+                or transition["accepted_receipt_digest"] != canonical_digest(receipt)
+                or transition["original_fence_permit_digest"] != canonical_digest(original_permit)
+                or transition["before_anchor"] != asdict(receipt.after_anchor)
+                or transition["after_anchor"] != asdict(current_anchor)
+                or transition["continuation_permit"] != asdict(current_permit)):
+            raise AuthorityUnavailable("accepted deletion bridge differs from originals")
+
+    @classmethod
+    def require_prior_deletion_transition_locked(cls, db: sqlite3.Connection,
+                                                 pending: DeletionPendingV1, *, core=None) -> None:
+        """Bind a later phase to the one committed original, without a side table."""
+        if type(pending) is not DeletionPendingV1:
+            raise AuthorityUnavailable("typed deletion transition required")
+        if pending.source_phase == "absent":
+            return
+        if pending.evidence.deletion_epoch != pending.deletion_epoch:
+            raise AuthorityUnavailable("graph barrier deletion epoch differs from request")
+        matches = []
+        for row in db.execute(
+                "SELECT operation_id,namespace,subject,request_digest,state,"
+                "conflict_keys_json,pending,receipt,updated_permit,mutation_kind,"
+                "deletion_evidence,footprint FROM authority_v2_mutations "
+                "WHERE namespace=? AND mutation_kind='deletion' AND state='committed'",
+                (pending.permit.namespace,)):
+            kind, prior, receipt, updated = cls._decode_mutation_row(row)
+            if (kind == "deletion"
+                    and prior.deletion_operation_id == pending.deletion_operation_id
+                    and prior.target_phase == pending.source_phase):
+                matches.append((prior, receipt, updated))
+        if len(matches) != 1:
+            raise AuthorityUnavailable("unique prior deletion phase receipt required")
+        prior, receipt, updated = matches[0]
+        bridged_storage = False
+        if receipt.after_anchor != pending.before_anchor or updated != pending.permit:
+            if pending.source_phase != "accepted":
+                raise AuthorityUnavailable("deletion phase anchor differs from prior original")
+            cls.verify_current_deletion_bridge_locked(
+                db, core=core, receipt=receipt, original_permit=updated,
+                current_anchor=pending.before_anchor, current_permit=pending.permit)
+            bridged_storage = True
+        if (prior.permit.operation_id != pending.permit.operation_id
+                or prior.permit.subject != pending.permit.subject
+                or prior.permit.holder != pending.permit.holder
+                or prior.permit.generation != pending.permit.generation
+                or prior.request_digest != pending.request_digest
+                or prior.closure_roots != pending.closure_roots
+                or prior.deletion_epoch != pending.deletion_epoch
+                or prior.policy_ref != pending.policy_ref):
+            raise AuthorityUnavailable("deletion phase differs from prior original")
+        if pending.source_phase == "accepted" and (
+                prior.evidence.graph_version != pending.evidence.graph_version
+                or prior.evidence.incarnation != pending.evidence.incarnation
+                or prior.evidence.access_epoch != pending.evidence.access_epoch
+                or prior.evidence.barrier_scope_digest
+                   != pending.evidence.barrier_scope_digest):
+            # A real selected C09 transition may change only the physical
+            # Graph incarnation. All original barrier scope/version/epochs
+            # remain exact, and the signed old→new certificate qualifies it.
+            if not bridged_storage:
+                raise AuthorityUnavailable("cleanup differs from accepted graph barrier")
+            context = core.require_current_storage_generation_locked(db,
+                namespace=pending.permit.namespace, action="maintenance")
+            prepared = context.prepared_original
+            certificate = None if prepared is None else prepared["graph_certificate_original"]
+            if (certificate is None or prepared["operation_id"] != pending.deletion_operation_id
+                    or prepared["accepted_receipt_digest"] != canonical_digest(receipt)
+                    or certificate["accepted_receipt_digest"] != canonical_digest(receipt)
+                    or (certificate["authority_id"], certificate["namespace"], certificate["operation_id"]) !=
+                       (pending.permit.authority_id, pending.permit.namespace, pending.deletion_operation_id)
+                    or certificate["old_incarnation"] != prior.evidence.incarnation
+                    or certificate["new_incarnation"] != pending.evidence.incarnation
+                    or prior.evidence.graph_version != "graph-epoch-" + str(certificate["old_graph_epoch"])
+                    or certificate["old_access_epoch"] != prior.evidence.access_epoch
+                    or prior.evidence.graph_version != pending.evidence.graph_version
+                    or prior.evidence.access_epoch != pending.evidence.access_epoch
+                    or prior.evidence.barrier_scope_digest != pending.evidence.barrier_scope_digest
+                    or pending.evidence.barrier_scope_digest != "sha256:" + certificate["source_closure_digest"]
+                    or pending.evidence.deletion_epoch != prior.evidence.deletion_epoch):
+                raise AuthorityUnavailable("C09 cleanup does not follow the exact authenticated old Graph barrier")
+
+    def record_deletion_pending_locked(self, db: sqlite3.Connection,
+                                       pending: DeletionPendingV1, *, subject: str,
+                                       current_anchor: RestoreAnchor, core=None) -> DeletionPendingV1:
+        """Durably prepare one typed phase under the caller's Authority lock.
+
+        The caller must first verify the phase-specific Owner/graph/cleanup
+        original. This storage primitive does not make that trust decision.
+        """
+        if type(pending) is not DeletionPendingV1:
+            raise AuthorityUnavailable("typed deletion pending required")
+        identifier(subject, "subject")
+        self._check_schema(db)
+        self._require_no_migration(db)
+        permit = pending.permit
+        self._require_anchor(current_anchor, permit.namespace)
+        if (permit.subject != subject or permit.pinned_anchor != current_anchor
+                or pending.before_anchor != current_anchor):
+            raise AuthorityUnavailable("deletion preparation anchor or subject differs")
+        live = db.execute(
+            "SELECT holder,generation,phase,transfer_id,target,revocation_epoch,"
+            "deletion_journal_id,deletion_seq,deletion_digest,deletion_phase,"
+            "execution_journal_id,execution_seq,execution_digest,anchor_nonce "
+            "FROM authority_namespaces WHERE namespace=?",
+            (permit.namespace,)).fetchone()
+        expected_phase = {"absent": "clear", "pending": "pending",
+                          "accepted": "accepted"}.get(pending.source_phase)
+        if (live is None or expected_phase is None
+                or live[0:5] != (permit.holder, permit.generation, "active", None, None)
+                or live[5:9] != (current_anchor.revocation_epoch,
+                                  current_anchor.deletion_journal_id,
+                                  current_anchor.deletion_seq,
+                                  current_anchor.deletion_digest)
+                or live[9] != expected_phase
+                or live[10:14] != (current_anchor.execution_journal_id,
+                                    current_anchor.execution_seq,
+                                    current_anchor.execution_digest,
+                                    current_anchor.proof)):
+            raise AuthorityUnavailable("live deletion phase or anchor differs")
+        if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='authority_scoped_erasure_v2'").fetchone():
+            from .v2_scoped_erasure_store import AuthorityV2ScopedErasureStore
+
+            marker = AuthorityV2ScopedErasureStore._marker(db)
+            if (marker is None or marker["stage"] != "complete"
+                    or marker["namespace"] != permit.namespace
+                    or not AuthorityV2ScopedErasureStore._table(db)):
+                raise AuthorityUnavailable("scoped deletion migration is incomplete")
+            scoped = db.execute(
+                "SELECT active_operation_id,aggregate_phase,active_epoch "
+                "FROM authority_scoped_erasure_v2 WHERE namespace=?",
+                (permit.namespace,)).fetchone()
+            if (scoped is None
+                    or scoped != (
+                        pending.deletion_operation_id,
+                        "accepted" if pending.source_phase == "accepted"
+                        else "pending", pending.deletion_epoch)):
+                raise AuthorityUnavailable("scoped deletion reservation differs")
+        row = self._row(db, permit.operation_id)
+        if (row is None or row[6] != "active" or self._permit(row) != permit):
+            raise AuthorityUnavailable("deletion preparation has no active fence")
+        self.require_prior_deletion_transition_locked(db, pending, core=core)
+        prior = self.mutation_locked(db, pending.mutation_id)
+        if prior is not None:
+            kind, saved, receipt, updated = self._decode_mutation_row(prior)
+            if (kind != "deletion" or saved != pending or receipt is not None
+                    or updated is not None or row[10] != canonical_bytes(pending)):
+                raise AuthorityUnavailable("deletion mutation ID reused")
+            return pending
+        if row[10] is not None:
+            raise AuthorityUnavailable("fence already has a pending mutation")
+        db.execute(
+            "INSERT INTO authority_v2_mutations(mutation_id,operation_id,namespace,"
+            "subject,request_digest,state,conflict_keys_json,pending,mutation_kind,"
+            "deletion_evidence,footprint) VALUES(?,?,?,?,?,'pending','null',?,'deletion',?,NULL)",
+            (pending.mutation_id, permit.operation_id, permit.namespace, subject,
+             pending.request_digest, canonical_bytes(pending),
+             canonical_bytes(pending.evidence)))
+        if db.execute(
+                "UPDATE authority_v2_fences SET pending=? WHERE operation_id=? "
+                "AND state='active' AND pending IS NULL",
+                (canonical_bytes(pending), permit.operation_id)).rowcount != 1:
+            raise AuthorityUnavailable("deletion preparation fence CAS failed")
+        return pending
 
     @staticmethod
     def _decode_mutation_row(row):

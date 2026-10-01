@@ -19,7 +19,10 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from rewrite.sylanne3.native_runtime.loader import CANONICAL_LIBRARIES, _runtime_target  # noqa: E402
+from _runtime_bootstrap import load_canonical_runtime_v1
+load_canonical_runtime_v1(ROOT)
+
+from sylanne3.native_runtime.loader import CANONICAL_LIBRARIES, _runtime_target  # noqa: E402
 
 
 def select_rust_target(host: str, target_os: str, target_arch: str, libc: str | None) -> str:
@@ -44,7 +47,8 @@ def select_rust_target(host: str, target_os: str, target_arch: str, libc: str | 
     return host
 
 
-def build_and_probe(output_dir: Path, target_dir: Path | None = None) -> dict:
+def build_and_probe(output_dir: Path, target_dir: Path | None = None,
+                    *, backend_only_dev_probe: bool = False) -> dict:
     target_os, target_arch, libc = _runtime_target()
     rustc = shutil.which("rustc")
     cargo = shutil.which("cargo")
@@ -87,13 +91,16 @@ def build_and_probe(output_dir: Path, target_dir: Path | None = None) -> dict:
     # The existing probe expects CARGO_TARGET_DIR/release. Point it at the
     # selected target subdirectory so its package and isolated load use this build.
     environment["CARGO_TARGET_DIR"] = str(build_dir / rust_target)
-    result = subprocess.run(
-        [
+    probe_command = [
             sys.executable,
             str(ROOT / "scripts" / "alpha1" / "probe_current_platform_package.py"),
             "--output-dir",
             str(output_dir.resolve()),
-        ],
+    ]
+    if backend_only_dev_probe:
+        probe_command.append("--backend-only-dev-probe")
+    result = subprocess.run(
+        probe_command,
         cwd=ROOT,
         env=environment,
         check=True,
@@ -119,8 +126,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True, help="directory for the local dev-probe ZIP")
     parser.add_argument("--target-dir", type=Path, help="Cargo build directory (default: rewrite/native/target)")
+    parser.add_argument("--backend-only-dev-probe", action="store_true",
+                        help="build a non-release candidate without unfinished workbench assets")
     args = parser.parse_args()
-    print(json.dumps(build_and_probe(args.output_dir, args.target_dir), sort_keys=True))
+    print(json.dumps(build_and_probe(args.output_dir, args.target_dir,
+                                     backend_only_dev_probe=args.backend_only_dev_probe), sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -35,6 +35,31 @@ from sylanne3.model_broker.reply_language import (
     REPLY_TEMPLATE_VERSION, ReplySourceSnapshot, freeze_installed_reply_request_v1,
     parse_reply_result_v1,
 )
+from sylanne3.model_broker.context_reply import (
+    CONTEXT_REPLY_TEMPLATE_DIGEST, CONTEXT_REPLY_TEMPLATE_VERSION,
+    ContextReplyInstallationV1, freeze_context_reply_request_v1,
+)
+from sylanne3.model_broker.d13_precompression import (
+    freeze_d13_precompression_request_v1,
+)
+from sylanne3.model_broker.natural_reply import (
+    NaturalReplyInstallationV2, TEMPLATE_DIGEST as NATURAL_TEMPLATE_DIGEST,
+    TEMPLATE_VERSION as NATURAL_TEMPLATE_VERSION,
+    freeze_natural_reply_request_v2,
+)
+from sylanne3.model_broker.natural_review import (
+    NaturalReviewInstallationV1, REVIEW_TEMPLATE_DIGEST,
+    REVIEW_TEMPLATE_VERSION, freeze_natural_reply_review_v1,
+)
+from sylanne3.model_broker.d04_appraisal import (
+    AppraisalInstallationV1, TEMPLATE_DIGEST as APPRAISAL_TEMPLATE_DIGEST,
+    TEMPLATE_VERSION as APPRAISAL_TEMPLATE_VERSION,
+    WORK_KIND as APPRAISAL_WORK_KIND, freeze_appraisal_request_v1,
+)
+from rewrite.tests.alpha1.model_broker.test_d04_appraisal import _frozen as appraisal_case
+from rewrite.tests.alpha1.model_broker.test_d13_precompression import _planned as d13_plan_case
+from rewrite.tests.alpha1.contracts.test_context_reply_contract import example_input
+from rewrite.tests.alpha1.runtime.test_natural_reply_job_v2 import _case as natural_case
 from sylanne3.memory_types import SourceRecord, source_key, access_key
 from sylanne3.runtime.budget import BudgetLease
 from sylanne3.runtime.issuers import BudgetLeaseGrant
@@ -212,6 +237,190 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
                 admin_model=workflow, installation_bundle=bundle)
         return bundle, adapter(encode), adapter(reply)
 
+    async def test_d13_main_model_requires_live_umo_selection(self):
+        _, encoder, replier = self.v2_adapters()
+        assert await encoder.selected_d13_main_installation_v1() is None
+        selected = await replier.selected_d13_main_installation_v1()
+        assert selected is not None
+        assert (selected.provider_id, selected.model_id,
+                selected.provider_config_digest) == (
+                    replier._admin_model.provider_id,
+                    replier._admin_model.model_id,
+                    replier._admin_model.provider_config_digest)
+        assert self.manager.seen_umo == [UMO]
+        self.manager.selected = object()
+        assert await replier.selected_d13_main_installation_v1() is None
+        self.manager.selected = self.provider
+        self.provider.provider_config["model"] = "changed"
+        assert await replier.selected_d13_main_installation_v1() is None
+
+    async def test_d13_preflight_matches_main_wire_but_holds_without_exact_counter(self):
+        _, encoder, replier = self.v2_adapters()
+        window, plan, _ = d13_plan_case()
+        main = await replier.selected_d13_main_installation_v1()
+        assert main is not None
+        frozen = freeze_d13_precompression_request_v1(window, plan, main)
+
+        selected = await replier.preflight_d13_precompression_v1(frozen)
+        assert selected.status == "hold"
+        assert selected.wire_digest == frozen.wire_digest
+        assert selected.exact_input_tokens is None
+        assert "exact installed-provider tokenizer unavailable" in selected.reason
+        assert (await encoder.preflight_d13_precompression_v1(frozen)).status == "hold"
+
+        changed = replace(frozen, wire_digest="0" * 64)
+        assert "frozen D13 wire differs" in (
+            await replier.preflight_d13_precompression_v1(changed)).reason
+        self.manager.selected = object()
+        assert "selected conversation model" in (
+            await replier.preflight_d13_precompression_v1(frozen)).reason
+
+    async def test_natural_stage_wire_strips_internal_provider_selector(self):
+        bundle, encoder, replier = self.v2_adapters()
+        config = replier._admin_model
+        _, _, generation_seal, sample, _, _, _ = natural_case()
+        audience = sample.input.plan.audience_ref.ref
+        generation = replace(
+            config, work_kind="natural_generation",
+            template_version=NATURAL_TEMPLATE_VERSION,
+            audiences=(audience,),
+        )
+        review = replace(
+            config, work_kind="natural_review",
+            template_version=REVIEW_TEMPLATE_VERSION,
+            audiences=(audience,),
+        )
+        grant = replace(
+            bundle.installation_policy.root_grant,
+            allowed_work_kinds=("d06.encode_source", "reply",
+                                "natural_generation", "natural_review"),
+        )
+        policy = replace(bundle.installation_policy, root_grant=grant)
+        bundle = replace(bundle, installation_policy=policy,
+                         model_workflows=AdminModelWorkflowsV2(
+                             2, encoder._admin_model, config,
+                             natural_generation=generation,
+                             natural_review=review))
+        generated = freeze_natural_reply_request_v2(
+            sample.input, NaturalReplyInstallationV2(
+                "install", config.provider_config_digest,
+                config.provider_id, config.model_id,
+                generation.max_output_tokens))
+        review_frozen = freeze_natural_reply_review_v1(
+            generation_seal,
+            {"schema": "sylanne.d09.context_reply_output.v2",
+             "body": "Hello.",
+             "units": [{"start": 0, "end": 6, "kind": "rhetoric",
+                        "basis_ids": ["basis:greeting"],
+                        "speech_act": "rhetoric", "promise_grant_id": None,
+                        "slot_ids": []}]},
+            sample.input.plan.units, (), "policy:review",
+            NaturalReviewInstallationV1(
+                "install", config.provider_id, config.provider_config_digest,
+                config.model_id, review.max_output_tokens))
+        for stage, workflow, frozen, template in (
+            ("natural_generation", generation, generated, NATURAL_TEMPLATE_DIGEST),
+            ("natural_review", review, review_frozen, REVIEW_TEMPLATE_DIGEST),
+        ):
+            adapter = AstrBotModelProvider(
+                context=self.context, host_loop=asyncio.get_running_loop(),
+                trusted_umo=UMO, descriptor=self.descriptor,
+                admin_model=workflow, installation_bundle=bundle)
+            base = call_request()
+            authority = replace(
+                base.envelope.authority, audience=(audience,), worker_fence=1,
+                provider_policy_ref=workflow.provider_config_ref)
+            envelope = replace(
+                base.envelope,
+                identity=replace(base.envelope.identity, phase=stage),
+                authority=authority)
+            request = replace(
+                base, envelope=envelope,
+                prompt_template_digest=template,
+                payload=json.loads(frozen.canonical_wire),
+                timeout_seconds=workflow.timeout_seconds,
+                max_output_tokens=workflow.max_output_tokens)
+            admission = LocalModelAdmission(
+                hashlib.sha256(stage.encode()).hexdigest(),
+                adapter.host_incarnation, request.call_id, request.digest,
+                workflow.provider_config_digest)
+            response = await adapter.invoke_admitted(
+                request, admission, asyncio.Event())
+            assert response.status == "completed"
+            sent = json.loads(self.requests[-1][1].content)
+            assert "provider_id" not in sent
+            assert sent["model"] == workflow.model_id
+            assert sent["messages"] == request.payload["messages"]
+            bad = replace(request, payload={**request.payload,
+                                            "provider_id": "spoofed"})
+            assert adapter._request_allowed(bad) is False
+
+    async def test_d04_installed_appraisal_wire_uses_selected_provider_once(self):
+        bundle, encoder, replier = self.v2_adapters()
+        config = replier._admin_model
+        workflow = replace(
+            config, work_kind=APPRAISAL_WORK_KIND,
+            template_version=APPRAISAL_TEMPLATE_VERSION)
+        grant = replace(
+            bundle.installation_policy.root_grant,
+            allowed_work_kinds=("d06.encode_source", "reply", APPRAISAL_WORK_KIND))
+        bundle = replace(
+            bundle,
+            installation_policy=replace(bundle.installation_policy,
+                                        root_grant=grant),
+            model_workflows=replace(bundle.model_workflows, appraisal=workflow))
+        capability = InstalledModelCapabilityPort(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            installed_namespace=bundle.installation_policy.namespace,
+            installation_bundle=bundle)
+        assert await asyncio.to_thread(
+            capability.verify_admin_selection,
+            bundle.installation_policy.namespace, workflow)
+        assert not await asyncio.to_thread(
+            capability.verify_admin_selection,
+            bundle.installation_policy.namespace,
+            replace(workflow, timeout_seconds=0.1))
+        frozen = freeze_appraisal_request_v1(
+            appraisal_case().input,
+            AppraisalInstallationV1(
+                "install", workflow.provider_id, workflow.model_id,
+                workflow.provider_config_ref, workflow.provider_config_digest,
+                workflow.max_output_tokens))
+        adapter = AstrBotModelProvider(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            trusted_umo=UMO, descriptor=self.descriptor,
+            admin_model=workflow, installation_bundle=bundle)
+        base = call_request()
+        authority = replace(
+            base.envelope.authority, worker_fence=1,
+            provider_policy_ref=workflow.provider_config_ref)
+        request = replace(
+            base,
+            envelope=replace(
+                base.envelope,
+                identity=replace(base.envelope.identity, phase=APPRAISAL_WORK_KIND),
+                authority=authority),
+            prompt_template_digest=APPRAISAL_TEMPLATE_DIGEST,
+            payload=json.loads(frozen.canonical_wire),
+            timeout_seconds=workflow.timeout_seconds,
+            max_output_tokens=workflow.max_output_tokens)
+        admission = LocalModelAdmission(
+            hashlib.sha256(b"d04-appraisal").hexdigest(),
+            adapter.host_incarnation, request.call_id, request.digest,
+            workflow.provider_config_digest)
+        assert adapter._request_allowed(request)
+        response = await adapter.invoke_admitted(request, admission, asyncio.Event())
+        assert response.status == "completed"
+        assert (await adapter.invoke_admitted(
+            request, admission, asyncio.Event())).status == "completed"
+        assert len(self.requests) == 1
+        sent = json.loads(self.requests[0][1].content)
+        assert "provider_id" not in sent
+        assert sent["messages"] == request.payload["messages"]
+        assert not adapter._request_allowed(replace(
+            request, payload={**request.payload, "provider_id": "another"}))
+        assert not replier._request_allowed(request)
+
     async def test_v2_same_model_has_distinct_encoding_and_reply_scope(self):
         bundle, encoder, replier = self.v2_adapters()
         port = InstalledModelCapabilityPort(
@@ -253,6 +462,64 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
             trusted_umo=UMO, descriptor=encoder.descriptor,
             admin_model=reduced, installation_bundle=reduced_bundle)
         assert not reduced_encoder._request_allowed(encode_request)
+
+    async def test_context_reply_uses_exact_frozen_three_message_order(self):
+        bundle, _, _ = self.v2_adapters()
+        config = self.admin_model
+        workflow = AdminModelWorkflowV2(
+            work_kind="context_reply", purpose="proposal", audiences=("owner",),
+            template_version=CONTEXT_REPLY_TEMPLATE_VERSION,
+            quote_ceiling={"output_tokens": 32},
+            provider_id=config.provider_id, model_id=config.model_id,
+            provider_config_ref=config.provider_config_ref,
+            provider_config_digest=config.provider_config_digest,
+            privacy_tier="private", required_capabilities=("text",),
+            timeout_seconds=0.2, max_output_tokens=32)
+        grant = replace(bundle.installation_policy.root_grant,
+                        allowed_work_kinds=(
+                            "d06.encode_source", "reply", "context_reply"))
+        bundle = replace(
+            bundle,
+            installation_policy=replace(bundle.installation_policy, root_grant=grant),
+            model_workflows=replace(bundle.model_workflows, context_reply=workflow))
+        adapter = AstrBotModelProvider(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            trusted_umo=UMO, descriptor=self.descriptor,
+            admin_model=workflow, installation_bundle=bundle)
+        capability = InstalledModelCapabilityPort(
+            context=self.context, host_loop=asyncio.get_running_loop(),
+            installed_namespace=bundle.installation_policy.namespace,
+            installation_bundle=bundle)
+        assert await asyncio.to_thread(
+            capability.verify_admin_selection,
+            bundle.installation_policy.namespace, workflow)
+        frozen = freeze_context_reply_request_v1(
+            example_input(), ContextReplyInstallationV1(
+                "install", config.provider_config_digest,
+                "provider-1", "model-1", 32))
+        base = call_request()
+        envelope = replace(
+            base.envelope,
+            identity=replace(base.identity, phase="context_reply"),
+            authority=replace(base.envelope.authority, worker_fence=1))
+        request = replace(
+            base, envelope=envelope,
+            prompt_template_digest=CONTEXT_REPLY_TEMPLATE_DIGEST,
+            payload=json.loads(frozen.canonical_wire), max_output_tokens=32)
+        assert adapter._request_allowed(request)
+        result = await adapter._invoke_on_host(request)
+        assert result.status == "completed"
+        assert result.result == {"text": "hello"}
+        assert len(self.requests) == 1
+        sent = json.loads(self.requests[0][1].content)
+        assert sent["messages"] == [
+            {"role": item.role, "content": item.content}
+            for item in frozen.messages]
+        assert sent["max_completion_tokens"] == 32
+        changed = replace(request, payload={
+            **request.payload,
+            "messages": list(reversed(request.payload["messages"]))})
+        assert not adapter._request_allowed(changed)
 
     async def test_v2_reply_template_reaches_selected_sdk_and_parses_candidate(self):
         bundle, _, replier = self.v2_adapters()
@@ -389,6 +656,14 @@ class AstrBotModelCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests[0][0], self.host_thread)
         self.assertIn(b'"max_completion_tokens":64', self.requests[0][1].content)
         self.assertEqual(self.shared_client.max_retries, 2)
+
+    async def test_cached_usage_cannot_exceed_prompt_tokens(self):
+        self.completion["usage"]["prompt_tokens_details"]["cached_tokens"] = 4
+        response = await self.invoke_on_worker()
+        self.assertEqual(response.status, "unknown")
+        self.assertIsNone(response.result)
+        self.assertEqual(response.usage, {})
+        self.assertEqual(len(self.requests), 1)
 
     async def test_500_429_and_timeout_each_make_one_request(self):
         for status in (500, 429):

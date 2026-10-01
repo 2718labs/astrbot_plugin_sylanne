@@ -1,8 +1,8 @@
 name: astrbot_plugin_sylanne
-display_name: Sylanne 3 Development Candidate
-desc: "Sylanne 3 开发候选。启用前需管理员安装 Authority 配置档；未完成完整运行时装配时保持阻塞，不处理消息。"
+display_name: Sylanne Embodiment 3.0.0-alpha1
+desc: "Sylanne Embodiment 3.0.0-alpha1 测试快照。启用前需完成管理员 Authority、Owner 和模型预算配置；每项执行仍需当前权限。"
 short_desc: "需管理员 Authority 入驻；完整运行时就绪前保持阻塞。"
-version: "3.0.0-dev.1"
+version: "3.0.0-alpha1"
 author: 2718-labs
 license: AGPL-3.0-or-later
 repo: "https://github.com/2718labs/astrbot_plugin_sylanne"

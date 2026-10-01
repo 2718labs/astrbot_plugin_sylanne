@@ -21,7 +21,10 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from rewrite.sylanne3.native_runtime.loader import CANONICAL_LIBRARIES, _runtime_target  # noqa: E402
+from _runtime_bootstrap import load_canonical_runtime_v1
+load_canonical_runtime_v1(ROOT)
+
+from sylanne3.native_runtime.loader import CANONICAL_LIBRARIES, _runtime_target  # noqa: E402
 from rewrite.tools.build_plugin_package import build_package, verify_package  # noqa: E402
 
 
@@ -29,7 +32,7 @@ _COLD_NONLINEAR_PROBE = '''\
 def probe_nonlinear(library, binding):
     from dataclasses import fields, replace
     from decimal import Decimal, localcontext
-    from rewrite.sylanne3.native_runtime import FixedBlockCSR, FixedBlockStep, run_fixed_block_math
+    from sylanne3.native_runtime import FixedBlockCSR, FixedBlockStep, run_fixed_block_math
 
     k = FixedBlockCSR(2, 2, (0, 2, 4), (0, 1, 0, 1), (2.0, 1.0, 1.0, 2.0))
     r = FixedBlockCSR(2, 2, (0, 2, 4), (0, 1, 0, 1), (1.5, 0.25, 0.25, 1.25))
@@ -177,6 +180,8 @@ def main() -> None:
         "--output-dir", type=Path,
         help="retain the dev-probe ZIP here; extraction remains temporary",
     )
+    parser.add_argument("--backend-only-dev-probe", action="store_true",
+                        help="omit unfinished workbench assets from this non-release probe")
     args = parser.parse_args()
     target_os, target_arch, libc = _runtime_target()
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "rewrite" / "native" / "target"))
@@ -193,6 +198,7 @@ def main() -> None:
             native_library=native,
             output_dir=args.output_dir if args.output_dir is not None else temporary / "package",
             allow_dirty_dev_probe=True,
+            backend_only_dev_probe=args.backend_only_dev_probe,
         )
         verify_package(package)
         extracted = temporary / "extracted"
@@ -227,13 +233,13 @@ def main() -> None:
                 "assert all(not Path(value).resolve().is_relative_to(source_root) for value in sys.path if value)",
                 "sys.path.insert(0, str(package_root))",
                 "import rewrite",
-                "import rewrite.sylanne3.native_runtime.loader as loader",
+                "import sylanne3.native_runtime.loader as loader",
                 "assert Path(rewrite.__file__).resolve().is_relative_to(package_root)",
                 "assert Path(loader.__file__).resolve().is_relative_to(package_root)",
-                "from rewrite.sylanne3.host.installed_package import verify_installed_package",
+                "from sylanne3.host.installed_package import verify_installed_package",
                 "installed = verify_installed_package(package_root, sys.argv[3])",
                 "assert installed.verified and installed.build_mode == 'dev-probe', installed",
-                "from rewrite.sylanne3.native_runtime import load_production_native",
+                "from sylanne3.native_runtime import load_production_native",
                 "library = load_production_native(package_root, trusted_manifest_sha256=sys.argv[3])",
                 "assert Path(library.path).resolve() == (package_root / sys.argv[8]).resolve()",
                 "assert all(Path(module.__file__).resolve().is_relative_to(package_root) for name, module in sys.modules.items() if (name == 'rewrite' or name.startswith('rewrite.')) and getattr(module, '__file__', None))",
@@ -241,7 +247,7 @@ def main() -> None:
                 "assert capabilities.abi_version == 2 and capabilities.diagnostic_only",
                 "assert not capabilities.numerically_certified",
                 "assert capabilities.supports_fixed_block_interval_math_v1",
-                "from rewrite.sylanne3.native_runtime import FixedBlockCSR, FixedBlockStep, run_fixed_block_math",
+                "from sylanne3.native_runtime import FixedBlockCSR, FixedBlockStep, run_fixed_block_math",
                 "diagonal = FixedBlockCSR(1, 1, (0, 1), (0,), (2.0,))",
                 "recovery = FixedBlockCSR(1, 1, (0, 1), (0,), (1.0,))",
                 "zero = FixedBlockCSR(1, 1, (0, 0), (), ())",
@@ -313,6 +319,7 @@ def main() -> None:
         )
         result = {
             "status": "dev_probe_only",
+            "candidate_scope": "backend-only" if args.backend_only_dev_probe else "full-assets",
             "package": str(package) if args.output_dir is not None else None,
             "package_bytes": package.stat().st_size,
             "platform": f"{target_os}-{target_arch}",

@@ -7,7 +7,7 @@ import json
 
 from ..domains.d08.execution import ActionIntent
 from ..domains.d10 import (
-    ContactClaim, ContactPolicyCheck, LifeDomain, contact_policy_key,
+    ContactClaim, ContactContinuation, ContactPolicyCheck, LifeDomain, contact_policy_key,
     decode_contact_policy, decode_proactive_opportunity, opportunity_key,
 )
 from ..graph_types import AtomKey, GraphSnapshot, owner_grant_key, validate_owner_grant_v1
@@ -16,7 +16,7 @@ from ..runtime_contracts import CheckReceipt, NamespaceId, QueryEpoch
 
 
 _CONTACT_TYPES = (
-    "d10.contact_policy.v1", "d10.proactive_opportunity.v1", "d10.contact_claim.v1",
+    "d10.contact_policy.v1", "d10.proactive_opportunity.v1", "d10.contact_claim.v1", "d10.contact_claim.v2",
 )
 
 
@@ -40,12 +40,14 @@ class CurrentContactReadV1:
 def read_current_contact(
     db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
     intent: ActionIntent, policy_id: str, opportunity_id: str, *, now: float,
+    current_policy=None, scope=None, continuation: ContactContinuation | None = None,
 ) -> CurrentContactReadV1:
     """Verify the full contact namespace inventory under caller-held BEGIN IMMEDIATE.
 
     This checks durable graph rows, source/access and Owner-grant version pins.
-    Authority issuer and D06 correction heads are outside this graph inventory,
-    so a local rule pass remains an unknown provider receipt and HOLD.
+    A passing provider receipt additionally requires the actual Authority policy
+    read under this same live fence and a complete D06 correction query. It is
+    an input to W01 admission; it never grants a contact claim or platform send.
     """
     if not db.in_transaction:
         raise ValueError("contact read requires the graph write transaction")
@@ -87,7 +89,7 @@ def read_current_contact(
             raise ValueError("contact graph row changed")
         if type_name == "d10.contact_policy.v1":
             decoded = decode_contact_policy(atom.value, namespace)
-            if atom.key != contact_policy_key(namespace, decoded.policy_id) or revision != decoded.version:
+            if atom.key != contact_policy_key(namespace, decoded.policy_id):
                 raise ValueError("contact policy key or version changed")
             policy_rows.append((atom, decoded))
         elif type_name == "d10.proactive_opportunity.v1":
@@ -95,6 +97,13 @@ def read_current_contact(
             if atom.key != opportunity_key(namespace, decoded.opportunity_id):
                 raise ValueError("opportunity key changed")
             opportunity_rows.append((atom, decoded))
+        elif type_name == "d10.contact_claim.v2":
+            from ..domains.d10.contact_claim_v2 import decode_contact_claim_v2, contact_claim_key_v2
+            decoded = decode_contact_claim_v2(atom.value)
+            if atom.key != contact_claim_key_v2(namespace, decoded.contact_id):
+                raise ValueError("contact claim key changed")
+            claims.append(decoded)
+            claim_keys.append(atom.key)
         else:
             claim_spec.validator(atom.value)
             data = atom.value
@@ -150,7 +159,8 @@ def read_current_contact(
     scoped = tuple(claim for claim in claims if (
         claim.subject_ref, claim.channel, claim.category) == (
             opportunity.subject_ref, opportunity.channel, opportunity.category))
-    check = LifeDomain.contact_policy_check(policy, opportunity, scoped, now=now)
+    check = LifeDomain.contact_policy_check(policy, opportunity, scoped, now=now,
+                                          continuation=continuation)
     spec = tuple(item for item in intent.required_checks
                  if item.check_kind == "contact_policy" and item.provider_id == "d10.contact_policy")
     if len(spec) != 1 or spec[0].action_ref != intent.action_id:
@@ -170,10 +180,24 @@ def read_current_contact(
             or spec[0].subject_ref != f"persona:{namespace.persona_id}"
             or spec[0].purpose != intent.purpose):
         raise ValueError("contact action scope changed")
+    missing = []
+    if current_policy is None:
+        missing.append("owner_installation_approval_issuer_verification")
+    else:
+        from .d10_contact_policy_authority_v1 import require_current_contact_policy_v1
+        require_current_contact_policy_v1(current_policy, scope, policy_atom.value, now=now)
+    from .dispatch_source_correction_barrier import read_source_correction_barrier
+    correction = read_source_correction_barrier(db, namespace, query,
+        tuple(dict.fromkeys((opportunity.source_ref, *intent.source_refs))),
+        dependent_ref=intent.action_id)
+    missing.extend(correction.missing_sources)
     receipt = CheckReceipt(spec[0].check_kind, spec[0].subject_ref, spec[0].action_ref,
                            spec[0].purpose, spec[0].required_input_versions, "full",
-                           "unknown", check.valid_until, spec[0].provider_id)
+                           "unknown" if missing else check.result,
+                           check.valid_until, spec[0].provider_id)
     scoped_keys = tuple(key for key, claim in zip(claim_keys, claims) if claim in scoped)
     return CurrentContactReadV1(namespace, QueryEpoch(namespace, scope_ref, query.revision),
                                 check, receipt, policy_atom.key, opportunity_atom.key,
-                                scoped_keys)
+                                scoped_keys,
+                                "check_pass" if not missing and check.result == "pass" else "hold",
+                                tuple(dict.fromkeys(missing)))

@@ -110,6 +110,7 @@ def _proposal_inputs(*, sender_revision=0, event_revision=0):
     reads = (
         source_version, access_version,
         GraphVersion(candidate.sender_key, sender_revision),
+        GraphVersion(candidate.account_binding_key, 0),
         GraphVersion(candidate.event_key, event_revision),
     )
     envelope = CommandEnvelope(
@@ -137,17 +138,21 @@ def test_compiled_arrival_guards_source_access_and_both_target_keys():
     assert hasattr(message_arrival, "build_message_arrival_proposal")
     envelope, candidate, _ = _proposal_inputs()
     proposal = message_arrival.build_message_arrival_proposal(
-        envelope, candidate, sender_atom=None,
+        envelope, candidate, sender_atom=None, binding_atom=None,
     )
     assert proposal.domain == "d03"
     assert proposal.proposal_schema == "d03.proposal.v1"
     assert {write.key for write in proposal.typed_writes} == {
-        candidate.sender_key, candidate.event_key,
+        candidate.sender_key, candidate.event_key, candidate.account_binding_key,
     }
     source_and_access = {candidate.source_version.key, candidate.access_version.key}
-    sender_write, event_write = proposal.typed_writes
+    sender_write, event_write, binding_write = proposal.typed_writes
     assert set(sender_write.dependencies) == source_and_access
     assert set(event_write.dependencies) == source_and_access | {candidate.sender_key}
+    assert set(binding_write.dependencies) == source_and_access | {
+        candidate.sender_key, candidate.event_key,
+    }
+    assert binding_write.value["verification_ref"] == candidate.event_key.token
     assert "hello" not in str(tuple(write.value for write in proposal.typed_writes))
     assert event_write.value["reality"] == "host_observed"
     assert event_write.value["kind"] == "message_received"
@@ -157,21 +162,22 @@ def test_compiled_arrival_guards_source_access_and_both_target_keys():
         GraphAtom(candidate.access_version.key, 1, access),
         GraphAtom(candidate.sender_key, 0, {}, False),
         GraphAtom(candidate.event_key, 0, {}, False),
+        GraphAtom(candidate.account_binding_key, 0, {}, False),
     ), (NamespaceEpoch("bot", "persona", 1),))
     with pytest.raises(ValueError, match="trusted host scene evidence"):
         ContextProvider().validate(proposal, snapshot)
     altered_scene = replace(
-        proposal.typed_writes[-1],
-        value={**proposal.typed_writes[-1].value, "scene_ref": "scene:other"},
+        event_write,
+        value={**event_write.value, "scene_ref": "scene:other"},
     )
-    altered = replace(proposal, typed_writes=proposal.typed_writes[:-1] + (altered_scene,))
+    altered = replace(proposal, typed_writes=(sender_write, altered_scene, binding_write))
     with pytest.raises(ValueError, match="trusted host scene evidence"):
         ContextProvider().validate(altered, snapshot)
     disguised_event = replace(
-        proposal.typed_writes[-1],
-        value={**proposal.typed_writes[-1].value, "kind": "message_arrival"},
+        event_write,
+        value={**event_write.value, "kind": "message_arrival"},
     )
-    disguised = replace(proposal, typed_writes=proposal.typed_writes[:-1] + (disguised_event,))
+    disguised = replace(proposal, typed_writes=(sender_write, disguised_event, binding_write))
     with pytest.raises(ValueError, match="trusted host scene evidence"):
         ContextProvider().validate(disguised, snapshot)
 
@@ -179,17 +185,60 @@ def test_compiled_arrival_guards_source_access_and_both_target_keys():
 def test_compiled_arrival_reuses_existing_compatible_account_anchor():
     envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
     proposal = message_arrival.build_message_arrival_proposal(
-        envelope, candidate, sender_atom=sender_atom,
+        envelope, candidate, sender_atom=sender_atom, binding_atom=None,
+    )
+    assert tuple(write.key for write in proposal.typed_writes) == (
+        candidate.event_key, candidate.account_binding_key,
+    )
+    assert candidate.sender_key in proposal.typed_writes[0].dependencies
+
+
+def test_existing_account_binding_requires_a_guarded_prior_arrival_event():
+    envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
+    prior_key = AtomKey(
+        Owner("event", "bot", "persona", "world:prior-arrival"),
+        "d03.world_event", "current",
+    )
+    prior_value = {
+        **asdict(candidate.account_binding),
+        "verification_ref": prior_key.token,
+    }
+    binding_atom = GraphAtom(candidate.account_binding_key, 2, prior_value)
+    reads = tuple(
+        GraphVersion(item.key, 2) if item.key == candidate.account_binding_key else item
+        for item in envelope.version_guard.read_versions
+    )
+    unguarded = replace(envelope, version_guard=replace(
+        envelope.version_guard, read_versions=reads,
+    ))
+    with pytest.raises(ValueError, match="compatible account"):
+        message_arrival.build_message_arrival_proposal(
+            unguarded, candidate, sender_atom=sender_atom, binding_atom=binding_atom,
+        )
+    guarded = replace(unguarded, version_guard=replace(
+        unguarded.version_guard,
+        read_versions=reads + (GraphVersion(prior_key, 1),),
+    ))
+    proposal = message_arrival.build_message_arrival_proposal(
+        guarded, candidate, sender_atom=sender_atom, binding_atom=binding_atom,
     )
     assert tuple(write.key for write in proposal.typed_writes) == (candidate.event_key,)
-    assert candidate.sender_key in proposal.typed_writes[0].dependencies
+    assert {item.key for item in proposal.dependencies.current_invalidation} == {
+        candidate.source_version.key, candidate.access_version.key,
+        candidate.sender_key, candidate.account_binding_key, prior_key,
+    }
+    with pytest.raises(ValueError, match="compatible account"):
+        message_arrival.build_message_arrival_proposal(
+            guarded, candidate, sender_atom=sender_atom,
+            binding_atom=replace(binding_atom, value={**prior_value, "entity_id": "entity:person"}),
+        )
 
 
 def test_compiled_arrival_rejects_existing_event_and_conflicting_anchor():
     envelope, candidate, _ = _proposal_inputs(event_revision=1)
     with pytest.raises(ValueError, match="event.*revision-0"):
         message_arrival.build_message_arrival_proposal(
-            envelope, candidate, sender_atom=None,
+            envelope, candidate, sender_atom=None, binding_atom=None,
         )
     envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
     bad_anchor = GraphAtom(
@@ -198,7 +247,7 @@ def test_compiled_arrival_rejects_existing_event_and_conflicting_anchor():
     )
     with pytest.raises(ValueError, match="sender anchor"):
         message_arrival.build_message_arrival_proposal(
-            envelope, candidate, sender_atom=bad_anchor,
+            envelope, candidate, sender_atom=bad_anchor, binding_atom=None,
         )
 
 
@@ -211,21 +260,23 @@ def test_compiled_arrival_rejects_missing_current_source_guard():
     )
     with pytest.raises(ValueError, match="source.*access"):
         message_arrival.build_message_arrival_proposal(
-            replace(envelope, version_guard=guard), candidate, sender_atom=None,
+            replace(envelope, version_guard=guard), candidate,
+            sender_atom=None, binding_atom=None,
         )
 
 
 def test_provider_rechecks_reused_anchor_against_transaction_snapshot():
     envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
     proposal = message_arrival.build_message_arrival_proposal(
-        envelope, candidate, sender_atom=sender_atom,
+        envelope, candidate, sender_atom=sender_atom, binding_atom=None,
     )
     _, _, admitted, access, _, _ = _inputs()
     source_atom = GraphAtom(candidate.source_version.key, 1, admitted.source.to_dict())
     access_atom = GraphAtom(candidate.access_version.key, 1, access)
     event_absent = GraphAtom(candidate.event_key, 0, {}, False)
     good = GraphSnapshot(
-        (source_atom, access_atom, sender_atom, event_absent),
+        (source_atom, access_atom, sender_atom, event_absent,
+         GraphAtom(candidate.account_binding_key, 0, {}, False)),
         (NamespaceEpoch("bot", "persona", 1),),
     )
     provider = ContextProvider()
@@ -234,7 +285,8 @@ def test_provider_rechecks_reused_anchor_against_transaction_snapshot():
     conflicting = GraphAtom(
         candidate.sender_key, 3, {**sender_atom.value, "kind": "person"},
     )
-    bad = replace(good, atoms=(source_atom, access_atom, conflicting, event_absent))
+    bad = replace(good, atoms=(source_atom, access_atom, conflicting, event_absent,
+                               GraphAtom(candidate.account_binding_key, 0, {}, False)))
     with pytest.raises(ValueError, match="sender anchor"):
         provider.validate(proposal, bad)
 
@@ -242,7 +294,7 @@ def test_provider_rechecks_reused_anchor_against_transaction_snapshot():
 def test_self_consistent_event_and_sender_rewrites_still_need_d11_ingress_proof():
     envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
     proposal = message_arrival.build_message_arrival_proposal(
-        envelope, candidate, sender_atom=sender_atom,
+        envelope, candidate, sender_atom=sender_atom, binding_atom=None,
     )
     _, _, admitted, access, _, _ = _inputs()
     source_atom = GraphAtom(candidate.source_version.key, 1, admitted.source.to_dict())
@@ -259,10 +311,12 @@ def test_self_consistent_event_and_sender_rewrites_still_need_d11_ingress_proof(
     )
     event_proposal = replace(proposal, typed_writes=(event_write,))
     event_snapshot = GraphSnapshot(
-        (source_atom, access_atom, sender_atom, GraphAtom(other_event_key, 0, {}, False)),
+        (source_atom, access_atom, sender_atom,
+         GraphAtom(other_event_key, 0, {}, False),
+         GraphAtom(candidate.account_binding_key, 0, {}, False)),
         (NamespaceEpoch("bot", "persona", 1),),
     )
-    with pytest.raises(ValueError, match="trusted host scene evidence"):
+    with pytest.raises(ValueError, match="message arrival write shape"):
         provider.validate(event_proposal, event_snapshot)
 
     other_sender_id = "entity:account-v1:other"
@@ -289,17 +343,18 @@ def test_self_consistent_event_and_sender_rewrites_still_need_d11_ingress_proof(
     )
     sender_snapshot = GraphSnapshot(
         (source_atom, access_atom, other_sender,
-         GraphAtom(candidate.event_key, 0, {}, False)),
+         GraphAtom(candidate.event_key, 0, {}, False),
+         GraphAtom(candidate.account_binding_key, 0, {}, False)),
         (NamespaceEpoch("bot", "persona", 1),),
     )
-    with pytest.raises(ValueError, match="trusted host scene evidence"):
+    with pytest.raises(ValueError, match="message arrival snapshot is incomplete"):
         provider.validate(sender_proposal, sender_snapshot)
 
 
 def test_trusted_receipt_rebuilds_exact_arrival_but_scene_still_holds():
     envelope, candidate, sender_atom = _proposal_inputs(sender_revision=3)
     proposal = message_arrival.build_message_arrival_proposal(
-        envelope, candidate, sender_atom=sender_atom)
+        envelope, candidate, sender_atom=sender_atom, binding_atom=None)
     ingress, scene, admitted, access, _, _ = _inputs()
     host = IngressHostFacts(
         ingress.namespace, ingress.platform_ref, ingress.conversation_ref,
@@ -315,6 +370,7 @@ def test_trusted_receipt_rebuilds_exact_arrival_but_scene_still_holds():
         GraphAtom(candidate.source_version.key, 1, admitted.source.to_dict()),
         GraphAtom(candidate.access_version.key, 1, access),
         sender_atom, GraphAtom(candidate.event_key, 0, {}, False),
+        GraphAtom(candidate.account_binding_key, 0, {}, False),
     ), (NamespaceEpoch("bot", "persona", 1),), (receipt,))
     assert message_arrival.derive_trusted_message_arrival_identity(
         proposal, snapshot) == (scene.scene_ref, scene.visibility)

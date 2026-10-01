@@ -29,6 +29,26 @@ from .execution import (
     SegmentGrant,
 )
 from .expression import CommunicationPlanResult, prepare_expression_plan
+from .commitment_acknowledgement import (
+    BilateralAcknowledgementReadV1, BilateralAcknowledgementCandidateV1,
+    propose_bilateral_acknowledgement_v1,
+    prepare_coordinator_bilateral_acknowledgement_write_v1,
+)
+from .dispatch_check import (
+    D08_CRITERIA_REF_V1, D08_CRITERIA_VERSION_V1, D08NegativeQueryV2,
+    DispatchCheckScopeV2, read_dispatch_check_scope_v2,
+)
+from .communication_route_binding import (
+    validate_communication_route_binding_v2, verify_route_bound_grant_v2,
+)
+from .natural_plan import (
+    NATURAL_PLAN_TYPE_V2, AdoptedNaturalPlanV2,
+    NaturalPlanPreparationEvidenceV2, natural_plan_key_v2,
+    natural_plan_id_v2, natural_final_effect_id_v2,
+    natural_route_semantic_digest_v2,
+    decode_natural_plan_v2, prepare_coordinator_natural_plan_write_v2,
+    verify_current_natural_plan_v2,
+)
 
 __all__ = (
     "BASE_REQUIRED_PROVIDERS",
@@ -59,4 +79,21 @@ __all__ = (
     "SegmentGrant",
     "CommunicationPlanResult",
     "prepare_expression_plan",
+    "BilateralAcknowledgementReadV1",
+    "BilateralAcknowledgementCandidateV1",
+    "propose_bilateral_acknowledgement_v1",
+    "prepare_coordinator_bilateral_acknowledgement_write_v1",
+    "D08_CRITERIA_REF_V1",
+    "D08_CRITERIA_VERSION_V1",
+    "D08NegativeQueryV2",
+    "DispatchCheckScopeV2",
+    "read_dispatch_check_scope_v2",
+    "validate_communication_route_binding_v2",
+    "verify_route_bound_grant_v2",
+    "NATURAL_PLAN_TYPE_V2", "AdoptedNaturalPlanV2",
+    "NaturalPlanPreparationEvidenceV2", "natural_plan_key_v2",
+    "natural_plan_id_v2", "natural_final_effect_id_v2",
+    "natural_route_semantic_digest_v2",
+    "decode_natural_plan_v2", "prepare_coordinator_natural_plan_write_v2",
+    "verify_current_natural_plan_v2",
 )

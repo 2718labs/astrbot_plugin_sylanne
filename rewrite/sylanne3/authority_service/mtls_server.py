@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -35,6 +36,15 @@ from .v2_contract import (
     SCHEMA as AUTHORITY_V2_PROTOCOL, from_wire, to_wire,
 )
 from .v2_fence_service import AuthorityV2FenceService
+from .v2_deletion_graph_read import AuthorityV2DeletionGraphReadService
+from .current_erasure_service import CurrentErasureAuthority
+from .current_accepted_erasure_read import CurrentAcceptedErasureReadService
+from .current_accepted_erasure_wire import accepted_to_wire
+from .internal_work_contract import InternalWorkTerminalProofV1, InternalWorkTerminalV2
+from .internal_work_service import AuthorityInternalWorkService
+from .internal_work_contract import InternalWorkBindingV1
+from .internal_work_rpc_wire import from_wire as c04_from_wire, to_wire as c04_to_wire
+from .v2_migration_rpc import MigrationRpcHandlerV2
 from .v2_accounting_contract import (
     AccountingMaintenanceGrantV1, AccountingMaintenanceRequestV1,
 )
@@ -74,6 +84,43 @@ from .v2_reply_worker_model_result_contract import (
 from .v2_worker_model_result_read_service import (
     AuthorityV2WorkerModelResultReadService, WorkerResultDeliveryV1,
 )
+from .v2_context_reply_result_contract import (
+    ContextReplyResultReadRequestV1, to_wire as context_reply_result_to_wire,
+    from_wire as context_reply_result_from_wire,
+)
+from .v2_context_reply_result_service import (
+    AuthorityV2ContextReplyResultReadService, ContextReplyResultDeliveryV2,
+)
+from .v2_natural_generation_output_contract import (
+    NaturalGenerationOutputReadRequestV2,
+    from_wire as natural_output_from_wire,
+    to_wire as natural_output_to_wire,
+)
+from .v2_natural_generation_output_service import (
+    AuthorityV2NaturalGenerationOutputService,
+)
+from .v2_natural_generation_content_contract import (
+    NaturalGenerationContentReadRequestV2,
+    from_wire as natural_content_from_wire,
+    to_wire as natural_content_to_wire,
+)
+from .v2_natural_generation_content_service import (
+    AuthorityV2NaturalGenerationContentService,
+)
+from .v2_natural_review_output_contract import (
+    NaturalReviewOutputReadRequestV2,
+    from_wire as natural_review_output_from_wire,
+    to_wire as natural_review_output_to_wire,
+)
+from .v2_natural_review_output_service import (
+    AuthorityV2NaturalReviewOutputService,
+)
+from .v2_natural_paid_review_contract import (
+    NaturalPaidReviewCurrentReadRequestV2,
+    from_wire as natural_paid_review_from_wire,
+    to_wire as natural_paid_review_to_wire,
+)
+from .v2_natural_paid_review_service import AuthorityV2NaturalPaidReviewService
 from .v2_worker_result_read_fact_contract import (
     WorkerResultReadFactRequestV1, WorkerResultReadFactRequestV2,
     from_wire as worker_fact_from_wire,
@@ -87,7 +134,10 @@ from .current_worker_model_result_graph_verifier import (
 from .current_reply_worker_model_result_graph_verifier import (
     PinnedCurrentReplyWorkerModelResultGraphVerifier,
 )
-from .v2_execution_bridge import AuthorityV2ExecutionBridge, HandoffStartV2
+from .v2_execution_bridge import (
+    AuthorityV2ExecutionBridge, HandoffStartV2,
+    PlatformObservationVerifierUnavailable,
+)
 from .reverse_handoff import ReverseGraphClaimClient
 from .final_handoff_pairing import FinalHandoffPairingV1
 from .v2_owner_contract import (
@@ -96,7 +146,7 @@ from .v2_owner_contract import (
     OwnerPrincipalV1,
     from_wire as owner_from_wire, to_wire as owner_to_wire,
 )
-from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore
+from .v2_owner_ticket_store import AuthorityV2OwnerTicketStore, OwnerAuthorizationBarrier
 from .v2_self_identity_contract import (
     SelfIdentityCurrentRequestV1, SelfIdentityMutationV1,
     from_wire as self_identity_from_wire, to_wire as self_identity_to_wire,
@@ -149,9 +199,9 @@ class MtlsPeerCredential:
 @dataclass(slots=True)
 class _DeferredWorkerDelivery:
     payload: dict[str, object]
-    service: AuthorityV2WorkerModelResultReadService | AuthorityV2TerminalC02RecoveryReadService
+    service: AuthorityV2WorkerModelResultReadService | AuthorityV2TerminalC02RecoveryReadService | AuthorityV2ContextReplyResultReadService
     credential: MtlsPeerCredential
-    delivery: WorkerResultDeliveryV1 | TerminalC02RecoveryDeliveryV1
+    delivery: WorkerResultDeliveryV1 | TerminalC02RecoveryDeliveryV1 | ContextReplyResultDeliveryV2
 
     def finish(self):
         return self.service.finish_delivery(
@@ -247,9 +297,16 @@ class AuthorityRpcServer:
         administrator_authorizer: Callable[[object, str, str, str | None], bool],
         publisher_manifest_verifier: Callable[[str, str, str, str], bool],
         v2_fences: AuthorityV2FenceService | Mapping[str, AuthorityV2FenceService] | None = None,
+        v2_migration_rpc: MigrationRpcHandlerV2 | None = None,
         v2_model_egress: Mapping[str, AuthorityV2ModelEgressService] | None = None,
+        v2_internal_work_services: Mapping[str, AuthorityInternalWorkService] | None = None,
         v2_model_result_reads: Mapping[str, AuthorityV2ModelResultReadService] | None = None,
         v2_worker_model_result_reads: Mapping[str, AuthorityV2WorkerModelResultReadService] | None = None,
+        v2_context_reply_result_reads: Mapping[str, AuthorityV2ContextReplyResultReadService] | None = None,
+        v2_natural_generation_output_reads: Mapping[str, AuthorityV2NaturalGenerationOutputService] | None = None,
+        v2_natural_generation_content_reads: Mapping[str, AuthorityV2NaturalGenerationContentService] | None = None,
+        v2_natural_review_output_reads: Mapping[str, AuthorityV2NaturalReviewOutputService] | None = None,
+        v2_natural_paid_review_reads: Mapping[str, AuthorityV2NaturalPaidReviewService] | None = None,
         worker_result_readers_v2: Mapping[str, tuple[str, str]] | None = None,
         v2_terminal_c02_recovery_reads: Mapping[str, AuthorityV2TerminalC02RecoveryReadService] | None = None,
         terminal_c02_recovery_readers_v2: Mapping[str, tuple[str, str]] | None = None,
@@ -268,6 +325,7 @@ class AuthorityRpcServer:
         v2_final_handoff_issuers: Mapping[str, str] | None = None,
         v2_final_handoff_reverse: Mapping[str, ReverseGraphClaimClient] | None = None,
         v2_platform_observation_verifiers: Mapping[str, Callable] | None = None,
+        v2_dispatch_verifiers: Mapping[str, Callable] | None = None,
         installations_v2: Mapping[tuple[str, str], AdministratorInstallationV2] | None = None,
         namespace_bindings_v2: Mapping[tuple[str, str, NamespaceId], str] | None = None,
         clock_provider: Callable[[], AuthorityClockReadingV2] | None = None,
@@ -296,6 +354,14 @@ class AuthorityRpcServer:
         self._administrator_authorizer = administrator_authorizer
         self._publisher_manifest_verifier = publisher_manifest_verifier
         self._v2_fences = services
+        if v2_migration_rpc is not None:
+            if (type(v2_migration_rpc) is not MigrationRpcHandlerV2
+                    or any(namespace not in services
+                           or migration.core is not core
+                           or migration.fences is not services[namespace]
+                           for namespace, migration in v2_migration_rpc._services.items())):
+                raise TypeError("migration RPC must use installed Authority services")
+        self._v2_migration_rpc = v2_migration_rpc
         if v2_model_egress is not None and not isinstance(v2_model_egress, Mapping):
             raise TypeError("Authority model egress service mapping required")
         model_services = dict(v2_model_egress or {})
@@ -307,11 +373,35 @@ class AuthorityRpcServer:
                for namespace, service in model_services.items()):
             raise TypeError("model egress services require installed Authority dependencies")
         self._v2_model_egress = model_services
+        internal_work = dict(v2_internal_work_services or {})
+        if any(type(namespace) is not str or namespace not in services
+               or type(service) is not AuthorityInternalWorkService
+               or service.journal is not services[namespace].execution
+               or service.installed_algorithm_id !=
+                  "d06.association_activation.v2"
+               or not service.installed_runtime_verified
+               or not callable(service._core_head_verifier)
+               for namespace, service in internal_work.items()):
+            raise TypeError("C04 service needs the installed journal and formal build")
+        self._v2_internal_work_services = internal_work
+        self._v2_internal_work_executors = {}
+        self._v3_internal_work_services = {}
+        self._d04_numeric_services_v3 = {}
+        self._d04_series_services_v1 = {}
+        self._d11_life_services_v1 = {}
+        self._v3_internal_work_executors = {}
         if (v2_owner_tickets is not None
                 and (type(v2_owner_tickets) is not AuthorityV2OwnerTicketStore
                      or v2_owner_tickets._core is not core)):
             raise TypeError("v2 owner tickets must use the same Authority core")
         self._v2_owner_tickets = v2_owner_tickets
+        self._v2_deletion_graph_reads = (
+            {namespace: AuthorityV2DeletionGraphReadService(
+                fence_service=service, owner_tickets=v2_owner_tickets)
+             for namespace, service in services.items()}
+            if v2_owner_tickets is not None else {})
+        self._current_erasure_prepares = {}
+        self._current_accepted_erasure_reads = {}
         if (v2_owner_proofs is not None
                 and (type(v2_owner_proofs) is not AuthorityV2OwnerProofStore
                      or v2_owner_proofs._core is not core)):
@@ -350,6 +440,11 @@ class AuthorityRpcServer:
         if any(namespace not in services or not callable(verifier)
                for namespace, verifier in observation_verifiers.items()):
             raise TypeError("V2 platform observation verifiers must be installed per namespace")
+        dispatch_verifiers = dict(v2_dispatch_verifiers or {})
+        if any(namespace not in services or not callable(verifier)
+               or services[namespace]._v2_dispatch_verifier is not verifier
+               for namespace, verifier in dispatch_verifiers.items()):
+            raise TypeError("V2 dispatch verifiers must match installed fence services")
         self._v2_execution = {
             namespace: AuthorityV2ExecutionBridge(
                 core=core, fences=service.fences, journal=service.execution,
@@ -357,6 +452,7 @@ class AuthorityRpcServer:
                 final_handoff_authorizer=handoff_authorizers.get(namespace),
                 final_handoff_issuer_id=handoff_issuers.get(namespace),
                 observation_verifier=observation_verifiers.get(namespace),
+                v2_dispatch_verifier=dispatch_verifiers.get(namespace),
                 owner_tickets=v2_owner_tickets,
                 owner_installation_id=(reverse_handoffs[namespace].profile.installation_id
                                        if namespace in reverse_handoffs else None),
@@ -493,6 +589,70 @@ class AuthorityRpcServer:
             raise TypeError("worker results require installed original model and reader")
         self._v2_worker_model_result_reads = worker_reads
         self._worker_result_readers_v2 = worker_readers
+        context_reply_reads = dict(v2_context_reply_result_reads or {})
+        if (not set(context_reply_reads) <= set(worker_readers)
+                or any(type(service) is not AuthorityV2ContextReplyResultReadService
+                       or namespace not in model_services
+                       or service._store is not model_services[namespace]._store
+                       or service._fences is not services[namespace]
+                       or service._graph._path != model_services[namespace]._graph_verifier._path
+                       or (service._read_subject, service._installation_id,
+                           service._holder) != (
+                               "mtls:sha256:" + worker_readers[namespace][0],
+                               installed[worker_readers[namespace]].installation_id,
+                               installed[worker_readers[namespace]].administrator_holder)
+                       for namespace, service in context_reply_reads.items())):
+            raise TypeError("context reply result needs installed original model reader")
+        self._v2_context_reply_result_reads = context_reply_reads
+        natural_output_reads = dict(v2_natural_generation_output_reads or {})
+        if (not set(natural_output_reads) <= set(worker_readers)
+                or any(type(service) is not AuthorityV2NaturalGenerationOutputService
+                       or namespace not in model_services
+                       or service._store is not model_services[namespace]._store
+                       or service._fences is not services[namespace]
+                       or service._graph._path != model_services[namespace]._graph_verifier._path
+                       or (service._read_subject, service._installation_id,
+                           service._holder) != (
+                               "mtls:sha256:" + worker_readers[namespace][0],
+                               installed[worker_readers[namespace]].installation_id,
+                               installed[worker_readers[namespace]].administrator_holder)
+                       for namespace, service in natural_output_reads.items())):
+            raise TypeError("natural output needs installed original model reader")
+        self._v2_natural_generation_output_reads = natural_output_reads
+        self._d04_appraisal_reads_v3 = {}
+        self._d07_cognition_reads_v1 = {}
+        self._contact_model_reads_v1 = {}
+        natural_content_reads = dict(v2_natural_generation_content_reads or {})
+        if (not set(natural_content_reads) <= set(natural_output_reads)
+                or any(type(service) is not AuthorityV2NaturalGenerationContentService
+                       or service._original is not natural_output_reads[namespace]
+                       for namespace, service in natural_content_reads.items())):
+            raise TypeError("natural content needs paired original output reader")
+        self._v2_natural_generation_content_reads = natural_content_reads
+        review_output_reads = dict(v2_natural_review_output_reads or {})
+        if (not set(review_output_reads) <= set(worker_readers)
+                or any(type(service) is not AuthorityV2NaturalReviewOutputService
+                       or namespace not in model_services
+                       or service._store is not model_services[namespace]._store
+                       or service._fences is not services[namespace]
+                       or service._graph._path != model_services[namespace]._graph_verifier._path
+                       or (service._read_subject, service._installation_id,
+                           service._holder) != (
+                               "mtls:sha256:" + worker_readers[namespace][0],
+                               installed[worker_readers[namespace]].installation_id,
+                               installed[worker_readers[namespace]].administrator_holder)
+                       for namespace, service in review_output_reads.items())):
+            raise TypeError("natural review output needs installed original reader")
+        self._v2_natural_review_output_reads = review_output_reads
+        paid_review_reads = dict(v2_natural_paid_review_reads or {})
+        if (not set(paid_review_reads) <=
+                (set(review_output_reads) & set(natural_output_reads))
+                or any(type(service) is not AuthorityV2NaturalPaidReviewService
+                       or service._generation is not natural_output_reads[namespace]
+                       or service._review is not review_output_reads[namespace]
+                       for namespace, service in paid_review_reads.items())):
+            raise TypeError("natural paid review needs paired original readers")
+        self._v2_natural_paid_review_reads = paid_review_reads
         recovery_reads = dict(v2_terminal_c02_recovery_reads or {})
         recovery_readers = dict(terminal_c02_recovery_readers_v2 or {})
         if (set(recovery_reads) != set(recovery_readers)
@@ -572,6 +732,11 @@ class AuthorityRpcServer:
         self._worker_close_lock = asyncio.Lock()
         self._worker_closed = False
         self._worker_shutdown_task: asyncio.Task[None] | None = None
+        self.c09_restart_requested_v1 = asyncio.Event()
+        self._first_owner_slot_v1 = threading.BoundedSemaphore(1)
+        self._first_owner_tasks_v1 = set()
+        self._first_owner_closing_v1 = False
+
 
     @staticmethod
     def error_payload(exc: BaseException) -> dict[str, object]:
@@ -759,6 +924,118 @@ class AuthorityRpcServer:
             raise AuthorityUnavailable("namespace unavailable")
         return service
 
+    def install_d04_appraisal_result_reader_v3(self, namespace, service):
+        from .d04_appraisal_result_service_v3 import AuthorityD04AppraisalResultServiceV3
+        if (type(service) is not AuthorityD04AppraisalResultServiceV3
+                or namespace in self._d04_appraisal_reads_v3
+                or service._fences is not self._v2_fences.get(namespace)):
+            raise AuthorityUnavailable("D04 installed result service differs")
+        self._d04_appraisal_reads_v3[namespace] = service
+
+    def install_d07_cognition_result_reader_v1(self, namespace, service):
+        from .d07_cognition_result_service_v1 import AuthorityD07CognitionResultServiceV1
+        if (type(service) is not AuthorityD07CognitionResultServiceV1
+                or namespace in self._d07_cognition_reads_v1
+                or service._fences is not self._v2_fences.get(namespace)):
+            raise AuthorityUnavailable("D07 installed result service differs")
+        self._d07_cognition_reads_v1[namespace] = service
+
+    def install_contact_model_result_reader_v1(self, namespace, service):
+        from .contact_model_result_service_v1 import InstalledContactModelResultServiceV1
+        model = self._v2_model_egress.get(namespace)
+        if (type(service) is not InstalledContactModelResultServiceV1
+                or namespace in self._contact_model_reads_v1
+                or service._fences is not self._v2_fences.get(namespace)
+                or model is None or service._store is not model._store
+                or service._path != model._graph_verifier._path):
+            raise AuthorityUnavailable("contact actual model/result services differ")
+        self._contact_model_reads_v1[namespace] = service
+
+    def install_c04_executor_v2(self, namespace: str,
+                                service: AuthorityInternalWorkService,
+                                executor: object) -> None:
+        """Attach a formal executor while the independent daemon is offline."""
+        from .installed_c04_executor_v2 import InstalledC04ExecutorV2
+        bridge = self._v2_execution.get(namespace)
+        if (bridge is None or namespace in self._v2_internal_work_executors
+                or type(service) is not AuthorityInternalWorkService
+                or type(executor) is not InstalledC04ExecutorV2
+                or executor._service is not service
+                or service.journal is not bridge.journal
+                or service.installed_algorithm_id !=
+                   "d06.association_activation.v2"
+                or not service.installed_runtime_verified
+                or bridge._internal_work_terminal_verifier is None):
+            raise AuthorityUnavailable("installed C04 executor identity differs")
+        self._v2_internal_work_services[namespace] = service
+        self._v2_internal_work_executors[namespace] = executor
+
+    def install_c04_executor_v3(self, namespace: str,
+                                service: AuthorityInternalWorkService,
+                                executor: object) -> None:
+        """Attach the separately pinned V3 executor before serving requests."""
+        from .installed_c04_executor_v3 import InstalledC04ExecutorV3
+
+        bridge = self._v2_execution.get(namespace)
+        if (bridge is None or namespace in self._v3_internal_work_executors
+                or type(service) is not AuthorityInternalWorkService
+                or type(executor) is not InstalledC04ExecutorV3
+                or executor._service is not service
+                or service.journal is not bridge.journal
+                or service.installed_algorithm_id !=
+                   "d06.association_activation.v3"
+                or not service.installed_runtime_verified
+                or bridge._internal_work_terminal_verifier is None):
+            raise AuthorityUnavailable("installed C04 V3 executor identity differs")
+        self._v3_internal_work_services[namespace] = service
+        self._v3_internal_work_executors[namespace] = executor
+
+    def install_d04_numeric_service_v3(self, namespace, service):
+        from .d04_numeric_service_v3 import AuthorityD04NumericServiceV3
+        if (type(service) is not AuthorityD04NumericServiceV3
+                or namespace in self._d04_numeric_services_v3
+                or service.bridge is not self._v2_execution.get(namespace)
+                or service.owner_tickets is not self._v2_owner_tickets):
+            raise AuthorityUnavailable("D04 numeric service installation differs")
+        self._d04_numeric_services_v3[namespace] = service
+        self._core.install_execution_redaction_d04_numeric_service_v3(namespace, service)
+
+    def install_current_erasure_prepare(self, namespace: str,
+                                        installation_id: str,
+                                        service: CurrentErasureAuthority) -> None:
+        """Attach one paired, pinned prepare service before serving requests."""
+        key = (namespace, installation_id)
+        if (key in self._current_erasure_prepares
+                or namespace not in self._v2_fences
+                or type(service) is not CurrentErasureAuthority
+                or service._prepare is None
+                or service._plan_graph_verifier is None
+                or service._prepare[0] is not self._v2_fences[namespace]
+                or service._prepare[4] != installation_id
+                or service._prepare[1] is not self._v2_owner_sessions
+                or service._prepare[2] is not self._v2_owner_tickets):
+            raise AuthorityUnavailable("installed C09 prepare identity differs")
+        self._current_erasure_prepares[key] = service
+        storage_reader = getattr(self, "_d12_owner_storage_services_v1", {}).get(key)
+        if storage_reader is not None:
+            service.install_current_owner_storage_reader_v1(storage_reader)
+
+    def install_current_accepted_erasure_read(
+            self, namespace: str, installation_id: str,
+            reader: CurrentAcceptedErasureReadService) -> None:
+        """Install only the reader paired to this namespace's original ledgers."""
+        key = (namespace, installation_id)
+        erasure = self._current_erasure_prepares.get(key)
+        if (key in self._current_accepted_erasure_reads
+                or type(reader) is not CurrentAcceptedErasureReadService
+                or erasure is None or erasure._prepare is None
+                or reader._service is not self._v2_fences.get(namespace)
+                or reader._service is not erasure._prepare[0]
+                or reader._owner_tickets is not self._v2_owner_tickets
+                or reader._scoped is not erasure._prepare[5]):
+            raise AuthorityUnavailable("installed accepted erasure reader differs")
+        self._current_accepted_erasure_reads[key] = reader
+
     def _bound_v2_service(self, credential: MtlsPeerCredential, profile_id: str,
                           manifest_digest: str, namespace: object) -> AuthorityV2FenceService:
         installed = self._installations_v2.get((credential.certificate_sha256, profile_id))
@@ -822,6 +1099,172 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            from .d12_operation_status_rpc_v1 import dispatch_d12_operation_status_v1
+            from .d12_target_owner_rpc_v1 import dispatch_d12_target_owner_v1
+            from .d12_installation_lifecycle_rpc_v1 import dispatch_d12_installation_lifecycle_v1
+            from .d04_numeric_bridge_rpc_v3 import dispatch_d04_numeric_bridge_v3
+            from .d04_series_rpc_v1 import dispatch_d04_series_rpc_v1
+            from .d04_root_execution_rpc_v3 import dispatch_d04_root_execution_v3
+            from .d11_offline_tick_rpc_v1 import dispatch_d11_offline_tick_v1
+            from .d11_life_rpc_v1 import dispatch_d11_life_v1
+            from .d10_contact_policy_rpc_v1 import dispatch_d10_contact_policy_v1
+            from .d12_package_maintenance_rpc_v2 import dispatch_d12_package_maintenance_v2
+            from .first_owner_reverse_v1 import dispatch_first_owner_issue_v1
+            for dispatch in (dispatch_d12_operation_status_v1, dispatch_d12_target_owner_v1,
+                             dispatch_d12_installation_lifecycle_v1, dispatch_d04_numeric_bridge_v3, dispatch_d04_series_rpc_v1,
+                             dispatch_d04_root_execution_v3, dispatch_d11_offline_tick_v1, dispatch_d11_life_v1, dispatch_d10_contact_policy_v1,
+                             dispatch_d12_package_maintenance_v2, dispatch_first_owner_issue_v1):
+                handled = dispatch(self, method, credential, profile_id, manifest_digest, command)
+                if handled is not None:
+                    return handled
+            if method in {"d04_numeric_claim_v3", "d04_numeric_inspect_v3",
+                          "d04_numeric_terminal_v3"}:
+                from .d04_numeric_contract_v3 import (
+                    D04NumericBindingV3, D04NumericClaimV3, D04NumericMeasurementV3,
+                    from_wire as numeric_from_wire, to_wire as numeric_to_wire,
+                )
+                expected = {"namespace", "binding"}
+                if method == "d04_numeric_claim_v3":
+                    expected.add("executor_incarnation")
+                elif method == "d04_numeric_terminal_v3":
+                    expected.update({"claim", "measurement"})
+                if set(command) != expected:
+                    raise AuthorityUnavailable("D04 numeric command shape differs")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[(credential.certificate_sha256, profile_id)]
+                service = self._d04_numeric_services_v3.get(namespace)
+                binding = numeric_from_wire(command["binding"], D04NumericBindingV3)
+                if (service is None or service.installation_id != installed.installation_id
+                        or binding.authority_namespace != namespace
+                        or binding.installation_id != installed.installation_id):
+                    raise AuthorityUnavailable("paired D04 executor installation differs")
+                if method == "d04_numeric_claim_v3":
+                    claim = service.claim_d04_numeric_v3(binding, command["executor_incarnation"])
+                    return {"claim": numeric_to_wire(claim)}
+                if method == "d04_numeric_terminal_v3":
+                    terminal = service.record_d04_numeric_terminal_v3(binding,
+                        numeric_from_wire(command["claim"], D04NumericClaimV3),
+                        numeric_from_wire(command["measurement"], D04NumericMeasurementV3))
+                    return {"terminal": numeric_to_wire(terminal)}
+                claim, terminal = service.read_d04_numeric_originals_v3(binding)
+                return {"claim": None if claim is None else numeric_to_wire(claim),
+                        "terminal": None if terminal is None else numeric_to_wire(terminal)}
+            if method == "prepare_current_erasure_v1" and set(command) == {
+                    "namespace", "operation_id", "source_id", "owner_actor_id",
+                    "owner_session_token"}:
+                namespace = identifier(command["namespace"], "namespace")
+                fence = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                erasure = self._current_erasure_prepares.get(
+                    (namespace, installed.installation_id)) if installed else None
+                if erasure is None or erasure._prepare[0] is not fence:
+                    raise AuthorityUnavailable("installed C09 prepare unavailable")
+                token = identifier(command["owner_session_token"],
+                                   "owner_session_token")
+                receipt, permit = erasure.prepare_request(
+                    credential=credential, subject=subject,
+                    holder=installed.administrator_holder,
+                    installation_id=installed.installation_id,
+                    owner_actor_id=identifier(command["owner_actor_id"],
+                                              "owner_actor_id"),
+                    owner_session_token=token,
+                    deletion_operation_id=identifier(command["operation_id"],
+                                                     "operation_id"),
+                    source_id=identifier(command["source_id"], "source_id"))
+                return {"receipt": to_wire(receipt), "permit": to_wire(permit)}
+            if method in {"c04_execute_v2", "c04_inspect_v2",
+                          "c04_execute_v3", "c04_inspect_v3"} and set(command) == {
+                    "namespace", "binding"}:
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                v3 = method.endswith("_v3")
+                executor = (self._v3_internal_work_executors if v3 else
+                            self._v2_internal_work_executors).get(namespace)
+                if executor is None:
+                    raise AuthorityUnavailable("installed C04 executor unavailable")
+                binding = c04_from_wire(command["binding"], InternalWorkBindingV1)
+                if (binding.namespace != namespace or
+                        binding.algorithm_ref !=
+                        ("d06.association_activation.v3" if v3 else
+                         "d06.association_activation.v2")):
+                    raise AuthorityUnavailable("installed C04 binding scope differs")
+                inspection = (executor.execute(binding)
+                              if method.startswith("c04_execute_")
+                              else executor.inspect(binding))
+                return {"inspection": c04_to_wire(inspection)}
+            if method == "c04_terminal_verify_v1" and set(command) == {
+                    "namespace", "proof"}:
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                proof = c04_from_wire(command["proof"], InternalWorkTerminalProofV1)
+                services = {
+                    "d06.association_activation.v2":
+                    self._v2_internal_work_services.get(namespace),
+                    "d06.association_activation.v3":
+                    self._v3_internal_work_services.get(namespace),
+                }
+                service = services.get(proof.binding.algorithm_ref)
+                if service is None:
+                    raise AuthorityUnavailable("installed C04 terminal service unavailable")
+                if (proof.binding.namespace != namespace
+                        or type(proof.terminal) is not InternalWorkTerminalV2
+                        or proof.terminal.status not in {"completed", "failed"}):
+                    raise AuthorityUnavailable("installed C04 terminal scope differs")
+                verified = service.verify_original_internal_work_terminal(proof)
+                if (verified.status != proof.terminal.status
+                        or verified.actual_cpu_ms != proof.terminal.actual_cpu_ms
+                        or not service.verify_installed_terminal(
+                            proof.binding, proof.claim, proof.terminal)):
+                    raise AuthorityUnavailable("installed C04 terminal is unverified")
+                return {"verified": c04_to_wire(verified)}
+            if method == "get_pending_deletion_for_graph_write" and set(command) == {
+                    "namespace", "deletion_operation_id", "permit"}:
+                namespace = identifier(command["namespace"], "namespace")
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                reader = self._v2_deletion_graph_reads.get(namespace)
+                permit = from_wire(command["permit"])
+                if (installed is None or reader is None
+                        or type(permit) is not FencePermitV2
+                        or permit.operation != "delete"
+                        or permit.namespace != namespace
+                        or permit.subject != subject
+                        or service is not reader._service):
+                    raise AuthorityUnavailable("installed deletion graph read unavailable")
+                receipt = reader.get_pending_deletion_for_graph_write(
+                    credential=credential, subject=subject,
+                    installation_id=installed.installation_id,
+                    deletion_operation_id=identifier(
+                        command["deletion_operation_id"], "deletion_operation_id"),
+                    permit=permit)
+                return {"receipt": to_wire(receipt)}
+            if method == "read_current_accepted_erasure_v1" and set(command) == {
+                    "namespace", "deletion_operation_id", "scope_digest", "permit"}:
+                namespace = identifier(command["namespace"], "namespace")
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                reader = (self._current_accepted_erasure_reads.get(
+                    (namespace, installed.installation_id)) if installed else None)
+                permit = from_wire(command["permit"])
+                if (reader is None or type(permit) is not FencePermitV2
+                        or reader._service is not service):
+                    raise AuthorityUnavailable("installed accepted erasure read unavailable")
+                original = reader.read_current_accepted_erasure_v1(
+                    credential=credential, subject=subject,
+                    installation_id=installed.installation_id,
+                    deletion_operation_id=identifier(
+                        command["deletion_operation_id"], "deletion_operation_id"),
+                    scope_digest=command["scope_digest"], permit=permit)
+                return {"original": accepted_to_wire(original)}
             if method == "read_final_handoff_pairing_v1":
                 if set(command) != {"namespace", "installation_id"}:
                     raise AuthorityUnavailable("final handoff pairing fields differ")
@@ -939,6 +1382,229 @@ class AuthorityRpcServer:
                     raise
                 return _DeferredWorkerDelivery(
                     {"result": result_wire}, service, credential, delivery)
+            if method == "natural_generation_content_read_v2":
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("natural content command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                service = self._v2_natural_generation_content_reads.get(namespace)
+                if (service is None
+                        or service._original._read_subject != subject
+                        or self._worker_result_readers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("installed natural content reader unavailable")
+                read_request = natural_content_from_wire(
+                    command["read_request"], NaturalGenerationContentReadRequestV2)
+                if (read_request.authority_id != self._authority_id()
+                        or read_request.authority_namespace != namespace
+                        or read_request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            read_request.namespace)) != namespace):
+                    raise AuthorityUnavailable("natural content installation differs")
+                result = service.read_current_natural_generation_content_v2(
+                    credential=credential, request=read_request,
+                    now_utc=time.time())
+                return {"result": natural_content_to_wire(result)}
+            if method in {"d04_appraisal_result_read_v3", "d04_appraisal_result_recover_finish_v3"}:
+                from .current_d04_appraisal_v3 import D04AppraisalResultReadRequestV3, from_wire as d04_from_wire, to_wire as d04_to_wire
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("D04 result command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                service = self._d04_appraisal_reads_v3.get(namespace)
+                request = d04_from_wire(command["read_request"], D04AppraisalResultReadRequestV3)
+                installed = self._installations_v2.get((credential.certificate_sha256, profile_id))
+                if (service is None or installed is None or service._read_subject != "mtls:sha256:" + credential.certificate_sha256
+                        or request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((credential.certificate_sha256, profile_id, request.namespace)) != namespace):
+                    raise AuthorityUnavailable("D04 result installed reader differs")
+                if method == "d04_appraisal_result_recover_finish_v3":
+                    service.recover_finish(credential=credential, request=request)
+                    return {"finished": True}
+                delivery = service.prepare(credential=credential, request=request)
+                return _DeferredWorkerDelivery({"result": d04_to_wire(delivery.result)}, service, credential, delivery)
+            if method in {"d07_cognition_result_read_v1", "d07_cognition_result_recover_finish_v1"}:
+                from .d07_current_execution_v1 import D07CognitionResultReadRequestV1, from_wire as d07_from_wire, to_wire as d07_to_wire
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("D07 result command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                service = self._d07_cognition_reads_v1.get(namespace)
+                request = d07_from_wire(command["read_request"], D07CognitionResultReadRequestV1)
+                installed = self._installations_v2.get((credential.certificate_sha256, profile_id))
+                if (service is None or installed is None or service._read_subject != "mtls:sha256:" + credential.certificate_sha256
+                        or request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((credential.certificate_sha256, profile_id, request.namespace)) != namespace):
+                    raise AuthorityUnavailable("D07 result installed reader differs")
+                if method == "d07_cognition_result_recover_finish_v1":
+                    service.recover_finish(credential=credential, request=request)
+                    return {"finished": True}
+                delivery = service.prepare(credential=credential, request=request)
+                return _DeferredWorkerDelivery({"result": d07_to_wire(delivery.result)}, service, credential, delivery)
+            if method in {"contact_model_result_read_v1", "contact_model_result_recover_finish_v1"}:
+                from .contact_model_result_contract_v1 import ContactModelResultReadRequestV1, contact_result_from_wire_v1, contact_result_to_wire_v1
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("contact result command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                service = self._contact_model_reads_v1.get(namespace)
+                request = contact_result_from_wire_v1(command["read_request"], ContactModelResultReadRequestV1)
+                installed = self._installations_v2.get((credential.certificate_sha256, profile_id))
+                if (service is None or installed is None or service._read_subject != "mtls:sha256:" + credential.certificate_sha256
+                        or request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((credential.certificate_sha256, profile_id, request.namespace)) != namespace):
+                    raise AuthorityUnavailable("contact result installed reader differs")
+                if method == "contact_model_result_recover_finish_v1":
+                    service.recover_finish(credential=credential, request=request)
+                    return {"finished": True}
+                delivery = service.prepare(credential=credential, request=request)
+                return _DeferredWorkerDelivery({"result": contact_result_to_wire_v1(delivery.result)}, service, credential, delivery)
+            if method in {"natural_generation_output_select_v2",
+                          "natural_generation_output_recover_finish_v2"}:
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("natural output command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                service = self._v2_natural_generation_output_reads.get(namespace)
+                if (service is None or service._read_subject != subject
+                        or self._worker_result_readers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("installed natural output reader unavailable")
+                read_request = natural_output_from_wire(
+                    command["read_request"], NaturalGenerationOutputReadRequestV2)
+                if (read_request.authority_id != self._authority_id()
+                        or read_request.authority_namespace != namespace
+                        or read_request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            read_request.namespace)) != namespace):
+                    raise AuthorityUnavailable("natural output read installation differs")
+                if method == "natural_generation_output_recover_finish_v2":
+                    service.recover_finish(
+                        credential=credential, request=read_request)
+                    return {"finished": True}
+                delivery = service.prepare(
+                    credential=credential, request=read_request,
+                    now_utc=time.time())
+                try:
+                    result_wire = natural_output_to_wire(delivery.result)
+                except BaseException:
+                    service.abandon_delivery(delivery=delivery)
+                    raise
+                return _DeferredWorkerDelivery(
+                    {"result": result_wire}, service, credential, delivery)
+            if method in {"natural_review_output_select_v2",
+                          "natural_review_output_recover_finish_v2"}:
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("natural review output command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                service = self._v2_natural_review_output_reads.get(namespace)
+                if (service is None or service._read_subject != subject
+                        or self._worker_result_readers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("installed natural review reader unavailable")
+                read_request = natural_review_output_from_wire(
+                    command["read_request"], NaturalReviewOutputReadRequestV2)
+                if (read_request.authority_id != self._authority_id()
+                        or read_request.authority_namespace != namespace
+                        or read_request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            read_request.namespace)) != namespace):
+                    raise AuthorityUnavailable("natural review output installation differs")
+                if method == "natural_review_output_recover_finish_v2":
+                    service.recover_finish(
+                        credential=credential, request=read_request)
+                    return {"finished": True}
+                delivery = service.prepare(
+                    credential=credential, request=read_request,
+                    now_utc=time.time())
+                try:
+                    result_wire = natural_review_output_to_wire(delivery.result)
+                except BaseException:
+                    service.abandon_delivery(delivery=delivery)
+                    raise
+                return _DeferredWorkerDelivery(
+                    {"result": result_wire}, service, credential, delivery)
+            if method == "natural_paid_review_current_read_v2":
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("natural paid review command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                service = self._v2_natural_paid_review_reads.get(namespace)
+                if (service is None
+                        or service._generation._read_subject != subject
+                        or self._worker_result_readers_v2.get(namespace) !=
+                           (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("installed natural paid review unavailable")
+                read_request = natural_paid_review_from_wire(
+                    command["read_request"],
+                    NaturalPaidReviewCurrentReadRequestV2)
+                generation = read_request.generation_content_request
+                review = read_request.review_output_request
+                if (generation.authority_id != self._authority_id()
+                        or generation.authority_namespace != namespace
+                        or generation.installation_id != installed.installation_id
+                        or review.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            read_request.namespace)) != namespace):
+                    raise AuthorityUnavailable("natural paid review installation differs")
+                result = service.read_current_natural_paid_review_v2(
+                    credential=credential, request=read_request,
+                    now_utc=time.time())
+                return {"result": natural_paid_review_to_wire(result)}
+            if method in {"context_reply_result_read_v2",
+                          "context_reply_result_recover_finish_v2"}:
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("context reply result command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                service = self._v2_context_reply_result_reads.get(namespace)
+                if (service is None or service._read_subject != subject
+                        or self._worker_result_readers_v2.get(namespace) !=
+                        (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("installed context reply reader unavailable")
+                read_request = context_reply_result_from_wire(
+                    command["read_request"], ContextReplyResultReadRequestV1)
+                if (read_request.authority_id != self._authority_id()
+                        or read_request.authority_namespace != namespace
+                        or read_request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((
+                            credential.certificate_sha256, profile_id,
+                            read_request.namespace)) != namespace):
+                    raise AuthorityUnavailable("context reply read installation differs")
+                if method == "context_reply_result_recover_finish_v2":
+                    service.recover_finish(
+                        credential=credential, request=read_request)
+                    return {"finished": True}
+                delivery = service.prepare(
+                    credential=credential, request=read_request,
+                    now_utc=time.time())
+                try:
+                    result_wire = context_reply_result_to_wire(delivery.result)
+                except BaseException:
+                    service.abandon_delivery(delivery=delivery)
+                    raise
+                return _DeferredWorkerDelivery(
+                    {"result": result_wire}, service, credential, delivery)
             if method in {"worker_model_result_select_attempt_v1",
                           "worker_model_result_read_v1",
                           "worker_model_result_recover_finish_v1",
@@ -1024,6 +1690,37 @@ class AuthorityRpcServer:
                 else:
                     fact = service.current(credential=credential, request=request)
                 return {"fact": worker_fact_to_wire(fact)}
+            if method in {"internal_accounting_begin_v1", "internal_accounting_validate_v1",
+                          "internal_accounting_finish_v1", "internal_accounting_recover_finish_v1"}:
+                from .internal_accounting_v1 import (
+                    HistoricalInternalCostRequestV1, HistoricalInternalCostGrantV1,
+                    InstalledHistoricalInternalAccountingServiceV1,
+                    from_wire as internal_from_wire, to_wire as internal_to_wire,
+                )
+                action = method.removeprefix("internal_accounting_").removesuffix("_v1")
+                expected = {"namespace", "request"}
+                if action in {"validate", "finish"}:
+                    expected.add("grant")
+                if set(command) != expected:
+                    raise AuthorityUnavailable("internal accounting command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                installed = self._installations_v2[(credential.certificate_sha256, profile_id)]
+                accounting = self._v2_accounting.get(namespace)
+                internal_work = self._v3_internal_work_services.get(namespace)
+                if (accounting is None or internal_work is None
+                        or self._accounting_observers_v2.get(namespace) != (credential.certificate_sha256, profile_id)
+                        or accounting._subject != subject
+                        or accounting._holder != installed.administrator_holder):
+                    raise AuthorityUnavailable("designated historical internal observer unavailable")
+                request = internal_from_wire(command["request"], HistoricalInternalCostRequestV1)
+                service = InstalledHistoricalInternalAccountingServiceV1(
+                    accounting=accounting, internal_work=internal_work, installation_id=installed.installation_id)
+                result = service.operate(credential=credential, request=request, action=action,
+                    grant=internal_from_wire(command["grant"], HistoricalInternalCostGrantV1)
+                          if "grant" in command else None)
+                return ({"grant": internal_to_wire(result)} if action == "begin"
+                        else {"valid" if action == "validate" else "finished": result})
             if method in {"accounting_begin_v1", "accounting_validate_v1",
                           "accounting_finish_v1", "accounting_recover_finish_v1"}:
                 expected = ({"namespace", "request"} if method in {
@@ -1230,7 +1927,7 @@ class AuthorityRpcServer:
                     binding_digest=command["binding_digest"])
                 return {"original_key": terminal_c02_to_wire(key),
                         "stable_result_digest": key.stable_result_digest}
-            if method == "model_original_intent_lookup_v1":
+            if method in {"model_original_intent_lookup_v1", "model_accounting_intent_lookup_v1"}:
                 expected = {"namespace", "installation_id", "job_id",
                             "acquire_operation_id", "call_id",
                             "original_model_operation_id", "request_digest",
@@ -1258,7 +1955,8 @@ class AuthorityRpcServer:
                         command["original_model_operation_id"],
                     call_id=command["call_id"],
                     request_digest=command["request_digest"],
-                    binding_digest=command["binding_digest"])
+                    binding_digest=command["binding_digest"],
+                    historical_accounting=method == "model_accounting_intent_lookup_v1")
                 if found is None:
                     return {"status": "absent"}
                 record, permit, admission, terminal = found
@@ -1650,6 +2348,93 @@ class AuthorityRpcServer:
                 ):
                     raise AuthorityUnavailable("owner receipt identity mismatch")
                 return {"receipt": None if receipt is None else owner_to_wire(receipt)}
+            if method in {"reserve_owner_revoke", "finalize_owner_revoke",
+                          "get_pending_owner_revoke", "get_committed_owner_revoke",
+                          "get_pending_owner_revoke_for_graph_write"}:
+                namespace = identifier(command.get("namespace"), "namespace")
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, namespace)
+                tickets = self._v2_owner_tickets
+                installed = self._installations_v2.get(
+                    (credential.certificate_sha256, profile_id))
+                if tickets is None or installed is None:
+                    raise AuthorityUnavailable("owner revoke service is unavailable")
+                session_fields = {"owner_session_token", "owner_session_request"}
+                if method in {"reserve_owner_revoke", "finalize_owner_revoke"}:
+                    expected = ({"namespace", "operation", "proof"}
+                                if method == "finalize_owner_revoke"
+                                else {"namespace", "operation"})
+                    if set(command) not in (expected, expected | session_fields):
+                        raise AuthorityUnavailable("owner revoke command fields differ")
+                    raw = command["operation"]
+                    operation = owner_from_wire(raw)
+                    if (type(operation) is not OwnerAuthorizationOperationV1
+                            or owner_to_wire(operation) != raw
+                            or operation.action != "revoke"
+                            or operation.authority_id != self._authority_id()
+                            or operation.installation_id != installed.installation_id
+                            or namespace_ref(operation.namespace) != namespace
+                            or self._namespace_bindings_v2.get((
+                                credential.certificate_sha256, profile_id,
+                                operation.namespace)) != namespace):
+                        raise AuthorityUnavailable("owner revoke identity differs")
+                    kwargs = self._owner_session_kwargs(
+                        command, namespace, installed.installation_id)
+                    if method == "reserve_owner_revoke":
+                        receipt = tickets.reserve_revoke(
+                            credential=credential, authority_namespace=namespace,
+                            operation=operation, **kwargs)
+                    else:
+                        raw_proof = command["proof"]
+                        proof = owner_from_wire(raw_proof)
+                        if (type(proof) is not OwnerGraphCommitProofV1
+                                or owner_to_wire(proof) != raw_proof):
+                            raise AuthorityUnavailable("owner revoke graph proof differs")
+                        receipt = tickets.finalize_revoke(
+                            credential=credential, authority_namespace=namespace,
+                            operation=operation, proof=proof, **kwargs)
+                    if (type(receipt) is not OwnerAuthorizationReceiptV1
+                            or receipt.operation != operation
+                            or receipt.phase != ("pending" if method ==
+                                "reserve_owner_revoke" else "committed")):
+                        raise AuthorityUnavailable("owner revoke receipt differs")
+                    return {"receipt": owner_to_wire(receipt)}
+                if method == "get_pending_owner_revoke_for_graph_write":
+                    if set(command) != {"namespace", "operation_id", "permit"}:
+                        raise AuthorityUnavailable("owner revoke graph read fields differ")
+                    permit = from_wire(command["permit"])
+                    if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                            or permit.namespace != namespace or permit.subject != subject):
+                        raise AuthorityUnavailable("owner revoke graph read needs write fence")
+                    service.validate_fence(
+                        credential=credential, subject=subject, permit=permit)
+                    receipt = tickets.get_revoke_pending_for_graph_write(
+                        credential=credential, authority_namespace=namespace,
+                        operation_id=identifier(command["operation_id"], "operation_id"),
+                        installation_id=installed.installation_id,
+                        subject=subject, permit=permit)
+                else:
+                    expected = {"namespace", "operation_id"}
+                    if set(command) not in (expected, expected | session_fields):
+                        raise AuthorityUnavailable("owner revoke read fields differ")
+                    read = (tickets.get_revoke_pending if method ==
+                            "get_pending_owner_revoke" else tickets.get_revoke_committed)
+                    receipt = read(
+                        credential=credential, authority_namespace=namespace,
+                        operation_id=identifier(command["operation_id"], "operation_id"),
+                        **self._owner_session_kwargs(
+                            command, namespace, installed.installation_id))
+                if receipt is not None and (
+                        type(receipt) is not OwnerAuthorizationReceiptV1
+                        or receipt.operation.action != "revoke"
+                        or receipt.operation.operation_id != command["operation_id"]
+                        or receipt.operation.authority_id != self._authority_id()
+                        or receipt.operation.installation_id != installed.installation_id
+                        or namespace_ref(receipt.operation.namespace) != namespace
+                        or receipt.phase != ("committed" if method ==
+                            "get_committed_owner_revoke" else "pending")):
+                    raise AuthorityUnavailable("owner revoke read identity differs")
+                return {"receipt": None if receipt is None else owner_to_wire(receipt)}
             if method == "begin_dispatch_fence" and set(command) == {
                     "namespace", "holder", "operation_id", "expected_anchor",
                     "effect_id", "command_digest", "footprint"}:
@@ -1671,6 +2456,26 @@ class AuthorityRpcServer:
                     credential, profile_id, manifest_digest, namespace)
                 return asdict(self._v2_execution[namespace].read_current_effect(
                     credential=credential, subject=subject, effect_id=effect_id))
+            if method == "execution_read_current_observation_receipt_v1" and set(command) == {
+                    "namespace", "effect_id"}:
+                namespace = identifier(command["namespace"], "namespace")
+                effect_id = identifier(command["effect_id"], "effect_id")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                receipt = self._v2_execution[namespace].read_current_observation_receipt_v1(
+                    credential=credential, subject=subject, effect_id=effect_id)
+                return {"receipt": to_wire(receipt)}
+            if method == "execution_read_current_effect_snapshot_for_write_fence" and set(command) == {
+                    "permit"}:
+                permit = from_wire(command["permit"])
+                if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                        or to_wire(permit) != command["permit"]):
+                    raise AuthorityUnavailable("canonical ordinary write permit required")
+                self._bound_v2_service(
+                    credential, profile_id, manifest_digest, permit.namespace)
+                snapshot = self._v2_execution[
+                    permit.namespace].read_current_effect_snapshot_for_write_fence(
+                        credential=credential, subject=subject, permit=permit)
+                return {"snapshot": to_wire(snapshot)}
             if method == "execution_prepare" and set(command) == {
                     "permit", "mutation_id", "footprint"}:
                 permit = from_wire(command["permit"])
@@ -1797,6 +2602,24 @@ class AuthorityRpcServer:
                     operation=operation, operation_id=command["operation_id"],
                     expected_anchor=anchor)
                 return {"permit": to_wire(permit)}
+            if method == "reject_unbegun_content_fence_v2" and set(command) == {
+                    "namespace", "holder", "generation", "operation_id",
+                    "expected_anchor", "request_id", "request_digest"}:
+                service = self._bound_v2_service(
+                    credential, profile_id, manifest_digest, command["namespace"])
+                installed = self._installations_v2[
+                    (credential.certificate_sha256, profile_id)]
+                if command["holder"] != installed.administrator_holder:
+                    raise AuthorityUnavailable("installed write holder differs")
+                anchor = self._anchor_from_command({"anchor": command["expected_anchor"]})
+                receipt = service.reject_unbegun_content_fence_v2(
+                    credential=credential, subject=subject,
+                    installation_id=installed.installation_id,
+                    holder=command["holder"], generation=command["generation"],
+                    operation_id=command["operation_id"],
+                    expected_anchor=anchor, request_id=command["request_id"],
+                    request_digest=command["request_digest"])
+                return {"receipt": to_wire(receipt)}
             if method == "get_fence_operation" and set(command) == {
                     "namespace", "operation_id"}:
                 service = self._bound_v2_service(
@@ -1827,6 +2650,14 @@ class AuthorityRpcServer:
                     request_id=command["request_id"],
                     request_digest=command["request_digest"])
                 return {"finished": True}
+        except OwnerAuthorizationBarrier as exc:
+            if method == "execution_begin_handoff_v2":
+                raise
+            raise RuntimeError("authority unavailable") from exc
+        except PlatformObservationVerifierUnavailable as exc:
+            if method == "execution_begin_handoff_v2":
+                raise
+            raise RuntimeError("authority unavailable") from exc
         except (AuthorityUnavailable, TypeError, ValueError) as exc:
             raise RuntimeError("authority unavailable") from exc
         raise RuntimeError("authority unavailable")
@@ -1838,7 +2669,54 @@ class AuthorityRpcServer:
             raise AuthorityUnavailable("Owner signature encoding differs")
         return bytes.fromhex(value)
 
+    def install_current_c09_maintenance_v1(self, maintenance):
+        from .c09_storage_maintenance_v1 import InstalledC09MaintenanceV1
+        if (type(maintenance) is not InstalledC09MaintenanceV1
+                or maintenance.core is not self._core
+                or getattr(self, "_c09_maintenance_v1", None) is not None):
+            raise AuthorityUnavailable("installed C09 RPC maintenance binding differs")
+        self._c09_maintenance_v1 = maintenance
+        self._c09_process_incarnation_v1 = "authority-process-" + secrets.token_hex(24)
+
     def _dispatch(self, method, request, credential, channel_binding: bytes, *,
+                  handshake_binding: str | None = None, command: object = None):
+        maintenance = getattr(self, "_c09_maintenance_v1", None)
+        wire = (_WireRequest(request.profile_id, request.plugin_name,
+                request.host_api_version, request.publisher_package.manifest_sha256)
+                if hasattr(request, "publisher_package") else _WireRequest.from_value(request))
+        peer = (credential.certificate_sha256, wire.profile_id)
+        installation = self._installations_v2.get(peer)
+        lifecycle = tuple(service for service in getattr(
+            self, "_d12_installation_lifecycle_services_v1", {}).values()
+            if installation is not None and service.peer == peer
+            and service.installation_id == installation.installation_id
+            and installation.manifest_digest == wire.manifest_sha256)
+        # These paired routes carry no general content authority. Their own
+        # dispatchers still verify exact current signed Owner/session or actual
+        # supervised process birth, package, storage and resume original.
+        management_methods = {
+            "d12_installation_control_v1", "d12_lifecycle_host_bootstrap_v1",
+            "d12_package_maintenance_v2",
+            "d12_read_operation_v1", "d12_resolve_operation_v1",
+            "begin_owner_session_v1", "accept_owner_session_v1",
+            "describe_owner_session_v1", "current_owner_session_v1",
+            "logout_owner_session_v1",
+        }
+        management = bool(lifecycle) and method in management_methods
+        if management and (type(command) is not dict or command.get("namespace") not in
+                           {service.namespace for service in lifecycle}):
+            raise AuthorityUnavailable("independent lifecycle management scope differs")
+        enrollment = method in {"handshake", "installation_grant_v2", "c09_storage_maintenance_v1"}
+        with ExitStack() as stack:
+            if not management and not enrollment:
+                for service in lifecycle:
+                    stack.enter_context(service.rpc_activity_v1())
+            if maintenance is not None and not management and not enrollment:
+                stack.enter_context(maintenance.gate.admit_peer_v1(peer=peer))
+            return self._dispatch_admitted(method, request, credential, channel_binding,
+                handshake_binding=handshake_binding, command=command)
+
+    def _dispatch_admitted(self, method, request, credential, channel_binding: bytes, *,
                   handshake_binding: str | None = None,
                   command: object = None) -> dict[str, object]:
         """Internal RPC core; public dispatch supplies only verified mTLS peers."""
@@ -1867,6 +2745,40 @@ class AuthorityRpcServer:
         if handshake_binding != binding:
             raise RuntimeError("authority unavailable")
         self._paired_session(binding, peer, wire)
+        if method == "c09_storage_maintenance_v1":
+            maintenance = getattr(self, "_c09_maintenance_v1", None)
+            if (maintenance is None or wire.protocol != AUTHORITY_V2_PROTOCOL
+                    or type(command) is not dict or set(command) != {"action", "operation_id"}
+                    or command["action"] not in {"status", "resume"}
+                    or self._namespace_bindings_v2.get((peer, wire.profile_id, maintenance.namespace_id)) != maintenance.closure.namespace):
+                raise AuthorityUnavailable("installed C09 maintenance request differs")
+            operation_id = command["operation_id"]
+            identifier(operation_id, "operation_id")
+            installed = self._installations_v2[(peer, wire.profile_id)]
+            if installed.installation_id != maintenance.control.installation_id:
+                raise AuthorityUnavailable("C09 maintenance installation differs")
+            maintenance.core._require(credential, "execution_redaction_install", maintenance.closure.namespace)
+            context = maintenance.control.read_verified_current_storage_v1()
+            with maintenance.control._db() as db:
+                current = maintenance.control._current(db)
+                if (current["stage"] not in {"READY", "RELEASED"}
+                        and current["active_operation_id"] not in {None, operation_id}):
+                    raise AuthorityUnavailable("C09 other operation currently active")
+            if command["action"] == "resume":
+                context = maintenance.resume_storage_maintenance_v1(operation_id=operation_id)
+            return {"schema": "sylanne3.c09.maintenance-status.v1", "operation_id": operation_id,
+                "stage": context.stage, "manifest_digest": context.manifest_digest,
+                "pointer_version": context.pointer_version, "storage_generation": context.storage_generation,
+                "restart_required": maintenance.restart_required,
+                "channel_binding_sha256": binding}
+        if method == "migration_v2":
+            if wire.protocol != AUTHORITY_V2_PROTOCOL or self._v2_migration_rpc is None:
+                raise RuntimeError("authority migration route unavailable")
+            result = self._v2_migration_rpc.handle(
+                credential=credential, profile_id=wire.profile_id,
+                channel_binding_sha256=binding, command=command,
+            )
+            return {**result, "channel_binding_sha256": binding}
         if method == "installation_grant_v2":
             if wire.protocol != AUTHORITY_V2_PROTOCOL or command != {}:
                 raise RuntimeError("authority unavailable")
@@ -1958,6 +2870,10 @@ class AuthorityRpcServer:
             method, credential, wire.profile_id, wire.manifest_sha256, command)
                   if wire.protocol == AUTHORITY_V2_PROTOCOL else
                   self._content_command(method, credential, command))
+        from .first_owner_reverse_v1 import _PreparedFirstOwnerIssueV1
+        if type(result) is _PreparedFirstOwnerIssueV1:
+            result.channel_binding = binding
+            return result
         if type(result) is _DeferredWorkerDelivery:
             result.payload["channel_binding_sha256"] = binding
             return result
@@ -1990,7 +2906,19 @@ class AuthorityRpcServer:
         )
 
     async def _dispatch_on_worker(self, method, request, credential, binding,
-                                  handshake_binding, command) -> dict[str, object]:
+                                  handshake_binding, command, *, _first_owner_phase=False) -> dict[str, object]:
+        if method == 'first_owner_issue_v1' and not _first_owner_phase:
+            if self._worker_closed or self._first_owner_closing_v1 or not self._first_owner_slot_v1.acquire(blocking=False):
+                raise RuntimeError('first Owner orchestration unavailable')
+            task = asyncio.create_task(self._run_first_owner_pipeline_v1(
+                method,request,credential,binding,handshake_binding,command))
+            self._first_owner_tasks_v1.add(task)
+            def completed(done):
+                self._first_owner_tasks_v1.discard(done)
+                self._first_owner_slot_v1.release()
+                if not done.cancelled():done.exception()
+            task.add_done_callback(completed)
+            return await asyncio.shield(task)
         # Release only when the concurrent future actually completes. Cancelling
         # the awaiting connection does not release a still-running service call.
         with self._worker_lock:
@@ -2021,12 +2949,55 @@ class AuthorityRpcServer:
             future.add_done_callback(abandoned)
             raise
 
+    async def _run_first_owner_pipeline_v1(self,method,request,credential,binding,handshake_binding,command):
+        from .first_owner_reverse_v1 import _PreparedFirstOwnerIssueV1,_await_actual_completion_v1
+        preparing=asyncio.create_task(self._dispatch_on_worker(method,request,credential,binding,
+            handshake_binding,command,_first_owner_phase=True))
+        try:
+            prepared=await _await_actual_completion_v1(preparing)
+        except asyncio.CancelledError:
+            if not preparing.cancelled() and preparing.exception() is None:
+                abandoned=preparing.result()
+                if type(abandoned) is _PreparedFirstOwnerIssueV1:abandoned.close()
+            raise
+        if type(prepared) is dict:
+            return prepared  # Exact already-finalized original, no new Graph call.
+        if type(prepared) is not _PreparedFirstOwnerIssueV1:
+            raise RuntimeError('actual first Owner prepared continuation unavailable')
+        try:
+            return await self._finish_first_owner_pipeline_v1(prepared)
+        finally:
+            prepared.close()
+
+    async def _finish_first_owner_pipeline_v1(self,prepared):
+        from .first_owner_reverse_v1 import _await_actual_completion_v1
+        reverse=asyncio.create_task(asyncio.to_thread(prepared.reverse_call))
+        proof=await _await_actual_completion_v1(reverse)
+        # Return finalization to the original serialized worker; no general
+        # parallel Authority writer pool and no externally callable finalize.
+        with self._worker_lock:
+            if self._worker_closed or not self._worker_slots.acquire(blocking=False):
+                raise RuntimeError('first Owner finalization unavailable; replay same operation')
+            try:
+                future = self._worker.submit(prepared.finalize,proof)
+            except BaseException:
+                self._worker_slots.release()
+                raise
+            future.add_done_callback(lambda _:self._worker_slots.release())
+        return await _await_actual_completion_v1(asyncio.wrap_future(future))
+
     async def aclose(self) -> None:
         """Stop accepting dispatches and wait for submitted service work to finish.
 
         Deployment closes its asyncio listener first, then awaits this method.
         Closing the listener alone does not own the RPC worker's lifecycle.
         """
+        # First-Owner reverse waits need the ordinary worker for Host callbacks.
+        # Drain their bounded tasks before retiring that worker or its stores.
+        self._first_owner_closing_v1 = True
+        pending = tuple(self._first_owner_tasks_v1)
+        if pending:
+            await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         async with self._worker_close_lock:
             if self._worker_shutdown_task is None:
                 with self._worker_lock:
@@ -2077,7 +3048,18 @@ class AuthorityRpcServer:
                                 "result": (result.payload if type(result) is _DeferredWorkerDelivery
                                            else result)}
                 except Exception as exc:
-                    response = {"request_id": payload["request_id"], **self.error_payload(exc)}
+                    if (payload["method"] == "execution_begin_handoff_v2"
+                            and type(exc) is OwnerAuthorizationBarrier):
+                        response = {"request_id": payload["request_id"],
+                                    "ok": False, "error": "owner_authorization_barrier"}
+                    elif (payload["method"] == "execution_begin_handoff_v2"
+                          and type(exc) is PlatformObservationVerifierUnavailable):
+                        response = {"request_id": payload["request_id"],
+                                    "ok": False,
+                                    "error": "platform_observation_verifier_unavailable"}
+                    else:
+                        response = {"request_id": payload["request_id"],
+                                    **self.error_payload(exc)}
                 try:
                     encoded = _canonical(response)
                     if len(encoded) + 1 > max_message_bytes:
@@ -2088,6 +3070,10 @@ class AuthorityRpcServer:
                     if response["ok"] is True and type(result) is _DeferredWorkerDelivery:
                         result.abandon()
                     raise
+                maintenance = getattr(self, "_c09_maintenance_v1", None)
+                if maintenance is not None and maintenance.restart_required:
+                    self.c09_restart_requested_v1.set()
+                    break
                 if response["ok"] is True and type(result) is _DeferredWorkerDelivery:
                     if type(result.delivery) is TerminalC02RecoveryDeliveryV1:
                         # Local writer.drain() does not prove that the pinned host
@@ -2134,6 +3120,11 @@ class AuthorityRpcServer:
                 TimeoutError, TypeError, ValueError, ConnectionError):
             pass
         finally:
+            maintenance = getattr(self, "_c09_maintenance_v1", None)
+            if maintenance is not None and maintenance.restart_required:
+                # SWITCHED is durable even when the acknowledgement was lost.
+                # Do not leave the old process alive holding retired caches.
+                self.c09_restart_requested_v1.set()
             writer.close()
             try:
                 await writer.wait_closed()

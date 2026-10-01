@@ -25,7 +25,7 @@ from ..graph_coordinator import (
 )
 from ..graph_types import AtomKey
 from ..runtime_contracts import (
-    CommandEnvelope, DomainBundle, FenceScope, NamespaceId,
+    CommandEnvelope, DomainBundle, FenceScope, NamespaceId, OperationIdentity,
     canonical_digest, canonical_serialize,
 )
 from .budget import BudgetLease, get_budget_lease
@@ -37,6 +37,7 @@ MAX_DIMENSIONS = 32
 MAX_QUANTITY = 9_000_000_000_000_000
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
+D13_PAID_PRECOMPRESSION_WORK_KIND = "d13.precompress.paid.v1"
 
 
 class IssuerAuthorityDenied(PermissionError):
@@ -115,6 +116,7 @@ class ResourceQuote:
     ceiling: Mapping[str, int]
     required_worker_fence: int | None
     valid_until_utc: float
+    job_continuation: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         for name in ("quote_id", "bot_id", "persona_id", "activity_id",
@@ -149,6 +151,11 @@ class ResourceQuote:
         object.__setattr__(self, "outbox_refs", outbox)
         object.__setattr__(self, "d02_settlement_refs", settlements)
         object.__setattr__(self, "ceiling", _amounts(self.ceiling))
+        if self.work_kind in {"d13.precompress", D13_PAID_PRECOMPRESSION_WORK_KIND}:
+            if type(self.job_continuation) is not dict:
+                raise ValueError("D13 quote requires its original job continuation")
+        elif self.job_continuation is not None:
+            raise ValueError("only D13 precompression quotes may carry a job continuation")
         object.__setattr__(self, "deadline_utc", deadline)
         object.__setattr__(self, "valid_until_utc", valid_until)
 
@@ -425,6 +432,13 @@ def _d03_policy_id(installation_id: str, grant: BudgetLeaseGrant) -> str:
 def d03_arrival_quote_id(namespace, operation_id: str) -> str:
     """The graph can predeclare the exact D02 guard before its transaction."""
     return "d03-arrival-q-" + canonical_digest({
+        "namespace": list(namespace.as_tuple), "operation_id": operation_id,
+    })[:40]
+
+
+def private_reply_dispatch_quote_id(namespace: NamespaceId, operation_id: str) -> str:
+    """Stable K03 quote identity; a changed policy cannot price the same operation."""
+    return "private-reply-dispatch-q-" + canonical_digest({
         "namespace": list(namespace.as_tuple), "operation_id": operation_id,
     })[:40]
 
@@ -1182,6 +1196,14 @@ def install_schema(db) -> None:
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS runtime_d03_arrival_quote_policies(
+            policy_id TEXT PRIMARY KEY,
+            policy_json TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            status TEXT NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_private_reply_dispatch_policies_v1(
             policy_id TEXT PRIMARY KEY,
             policy_json TEXT NOT NULL,
             signature TEXT NOT NULL,
@@ -2015,6 +2037,158 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
         )
         return evidence["candidate_digest"], signature
 
+    def _qualified_private_reply_dispatch_policy(
+            self, db, envelope: CommandEnvelope, quote: ResourceQuote,
+            grant: BudgetLeaseGrant) -> None:
+        parts = quote.snapshot_ref.split(":")
+        if len(parts) != 3 or parts[0] != "k03snap":
+            raise IssuerAuthorityDenied("K03 quote lacks installed policy binding")
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM "
+            "runtime_private_reply_dispatch_policies_v1 WHERE policy_id=?",
+            (parts[1],),
+        ).fetchone()
+        if row is None or row[2] != "active":
+            raise IssuerAuthorityDenied("K03 signed installed policy is absent")
+        self._d02._signer.verify("private-reply-dispatch-policy.v1", row[0], row[1])
+        try:
+            data = json.loads(row[0])
+            installed = data["installed"]
+            policy_id = "private-reply-dispatch-policy-" + canonical_digest(row[0])[:40]
+            binding = canonical_digest({
+                "policy_id": policy_id, "identity": envelope.identity,
+                "graph_job_ref": quote.graph_job_ref,
+                "outbox_refs": list(quote.outbox_refs),
+            })
+            resource_ref = "private-reply-dispatch-src:" + canonical_digest({
+                "installed_resource_ref": installed["resource_ref"],
+                "installed_snapshot_ref": installed["snapshot_ref"],
+                "policy_id": policy_id, "binding": binding,
+            })[:56]
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise IssuerAuthorityDenied("K03 signed policy payload is invalid") from exc
+        if (canonical_serialize(data) != row[0]
+                or parts != ["k03snap", policy_id, binding[:24]]
+                or data.get("schema") != "sylanne.private-reply-dispatch-policy.v1"
+                or data.get("grant_id") != grant.grant_id
+                or data.get("grant_version") != grant.version
+                or data.get("lease_id") != grant.lease_id
+                or data.get("namespace") != list(envelope.authority.namespace.as_tuple)
+                or data.get("policy_ref") != grant.policy_ref
+                or quote.resource_ref != resource_ref
+                or dict(quote.ceiling) != installed.get("quote_ceiling")
+                or quote.quote_id != private_reply_dispatch_quote_id(
+                    envelope.authority.namespace, envelope.identity.operation_id)):
+            raise IssuerAuthorityDenied("K03 quote differs from signed installed policy")
+
+    def issue_private_reply_dispatch_quote_v2(
+            self, db, *, policy, namespace: NamespaceId,
+            identity: OperationIdentity, parent_grant: BudgetLeaseGrant,
+            deadline_utc: float, graph_job_ref: str,
+            outbox_refs: tuple[str, ...],
+            now_utc: float | None = None) -> ResourceQuote:
+        """Sign the installed K03 price and exact quote in the caller's transaction.
+
+        This does not reserve budget or commit. The caller supplies an OS-verified
+        installed policy and performs the graph and Authority checks separately.
+        """
+        from ..host.authority_profile import AdminPrivateReplyDispatchPolicy
+
+        if type(policy) is not AdminPrivateReplyDispatchPolicy:
+            raise IssuerAuthorityDenied("installed private reply dispatch policy is required")
+        if type(namespace) is not NamespaceId or type(identity) is not OperationIdentity:
+            raise TypeError("K03 namespace and identity must be typed")
+        if type(parent_grant) is not BudgetLeaseGrant:
+            raise TypeError("parent_grant must be BudgetLeaseGrant")
+        if identity.effect_id is None:
+            raise IssuerAuthorityDenied("K03 dispatch requires an effect identity")
+        if type(outbox_refs) is not tuple or not outbox_refs:
+            raise IssuerAuthorityDenied("K03 dispatch requires exact outbox refs")
+        _tuple_refs(outbox_refs, "outbox_refs")
+        try:
+            outbox_keys = tuple(AtomKey.from_token(ref) for ref in outbox_refs)
+        except (TypeError, ValueError) as exc:
+            raise IssuerAuthorityDenied("K03 dispatch outbox refs are invalid") from exc
+        if any(key.type_name != "runtime.outbox" or key.owner.kind != "activity"
+               or (key.owner.bot, key.owner.persona) != namespace.as_tuple
+               or key.owner.subject != identity.activity_id for key in outbox_keys):
+            raise IssuerAuthorityDenied("K03 dispatch outbox crosses activity or namespace")
+        try:
+            job_key = AtomKey.from_token(graph_job_ref)
+        except (TypeError, ValueError) as exc:
+            raise IssuerAuthorityDenied("K03 dispatch job ref is invalid") from exc
+        if (job_key.type_name != "runtime.job" or job_key.owner.kind != "activity"
+                or (job_key.owner.bot, job_key.owner.persona) != namespace.as_tuple
+                or job_key.owner.subject != identity.activity_id):
+            raise IssuerAuthorityDenied("K03 dispatch job crosses activity or namespace")
+        install_schema(db)
+        grant = self._load_grant(db, parent_grant.lease_id)
+        lease = get_budget_lease(db, grant.lease_id)
+        now = _now_utc(now_utc)
+        deadline = _finite(deadline_utc, "deadline_utc")
+        if (grant != parent_grant or "message" not in grant.allowed_work_kinds
+                or (grant.bot_id, grant.persona_id) != namespace.as_tuple
+                or (lease.bot_id, lease.persona_id, lease.currency)
+                != (grant.bot_id, grant.persona_id, grant.currency)
+                or lease.state != "active" or grant.valid_until_utc <= now
+                or not now < deadline <= min(
+                    now + policy.deadline_after_seconds, grant.valid_until_utc)):
+            raise IssuerAuthorityDenied("K03 dispatch lacks current signed grant or deadline")
+        if any(amount > grant.max_ceiling.get(name, 0)
+               or amount > lease.limits.get(name, 0)
+               for name, amount in policy.quote_ceiling.items()):
+            raise IssuerAuthorityDenied("K03 dispatch price exceeds signed root budget")
+        policy_json = canonical_serialize({
+            "schema": "sylanne.private-reply-dispatch-policy.v1",
+            "grant_id": grant.grant_id, "grant_version": grant.version,
+            "lease_id": grant.lease_id, "namespace": list(namespace.as_tuple),
+            "policy_ref": grant.policy_ref, "installed": policy.digest_payload(),
+        })
+        policy_id = "private-reply-dispatch-policy-" + canonical_digest(policy_json)[:40]
+        signature = self._d02._signer.sign("private-reply-dispatch-policy.v1", policy_json)
+        row = db.execute(
+            "SELECT policy_json,signature,status FROM "
+            "runtime_private_reply_dispatch_policies_v1 WHERE policy_id=?",
+            (policy_id,),
+        ).fetchone()
+        if row is not None:
+            self._d02._signer.verify("private-reply-dispatch-policy.v1", row[0], row[1])
+            if row != (policy_json, signature, "active"):
+                raise IssuerAuthorityDenied("K03 installed policy replay differs")
+        else:
+            db.execute(
+                "INSERT INTO runtime_private_reply_dispatch_policies_v1"
+                "(policy_id,policy_json,signature,status) VALUES(?,?,?,'active')",
+                (policy_id, policy_json, signature),
+            )
+        binding = canonical_digest({
+            "policy_id": policy_id, "identity": identity,
+            "graph_job_ref": graph_job_ref, "outbox_refs": list(outbox_refs),
+        })
+        quote = ResourceQuote(
+            private_reply_dispatch_quote_id(namespace, identity.operation_id), 1,
+            *namespace.as_tuple, identity.activity_id, identity.operation_id,
+            identity.effect_id, grant.lease_id, "message",
+            "k03snap:" + policy_id + ":" + binding[:24], deadline,
+            "private-reply-dispatch-src:" + canonical_digest({
+                "installed_resource_ref": policy.resource_ref,
+                "installed_snapshot_ref": policy.snapshot_ref,
+                "policy_id": policy_id, "binding": binding,
+            })[:56], graph_job_ref, outbox_refs, (), dict(policy.quote_ceiling),
+            None, deadline,
+        )
+        existing = db.execute(
+            "SELECT 1 FROM runtime_resource_quotes WHERE quote_id=? AND version=1",
+            (quote.quote_id,),
+        ).fetchone()
+        if existing is None and any(
+                amount > lease.limits.get(name, 0) - lease.used.get(name, 0)
+                - lease.reserved.get(name, 0) - lease.unconfirmed.get(name, 0)
+                for name, amount in quote.ceiling.items()):
+            raise IssuerAuthorityDenied("K03 dispatch budget has insufficient capacity")
+        self._d02._issue_bound_stage_quote(db, quote)
+        return quote
+
     def issue_d03_arrival_quote(self, db, envelope: CommandEnvelope,
                                 admin_policy, *, installation_id: str,
                                 now_utc: float | None = None) -> ResourceQuote:
@@ -2751,6 +2925,9 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
             raise IssuerAuthorityDenied("quote ceiling exceeds the signed budget grant")
         if quote.work_kind == D03_ARRIVAL_WORK_KIND:
             self._d02._qualified_d03_arrival_policy(db, envelope, quote, grant)
+        if quote.work_kind == "message" and quote.quote_id.startswith(
+                "private-reply-dispatch-q-"):
+            self._qualified_private_reply_dispatch_policy(db, envelope, quote, grant)
         if quote.work_kind == D03_SELF_IDENTITY_PROJECTION_WORK_KIND:
             source, mapping, arrival, guarded = _d03_projection_inputs(envelope)
             policy = self._d02._qualified_d03_projection_policy(
@@ -2845,14 +3022,52 @@ class D11BudgetJobIssuer(D11BudgetGrantIssuer):
                 or (key.owner.bot, key.owner.persona) != namespace.as_tuple
                 or key.owner.subject != envelope.identity.activity_id):
             raise IssuerAuthorityDenied("resource quote graph job crosses command authority")
-        return PersistentJob(
+        continuation = {}
+        operator_versions = {"resource_quote": f"{quote.quote_id}:{quote.version}"}
+        if quote.work_kind in {"d13.precompress", D13_PAID_PRECOMPRESSION_WORK_KIND}:
+            if (envelope.authority.issuer_domain != "d13" or
+                    envelope.identity.phase != quote.work_kind or
+                    envelope.identity.effect_id is not None or
+                    type(quote.job_continuation) is not dict or
+                    quote.outbox_refs or quote.d02_settlement_refs):
+                raise IssuerAuthorityDenied("D13 quote is not an original precompression job")
+            continuation = dict(quote.job_continuation)
+            if quote.work_kind == "d13.precompress":
+                operator_versions["d13_compiler"] = "d13.deterministic.v1"
+            else:
+                from .d13_precompression_job import validate_paid_job_continuation_v1
+                validate_paid_job_continuation_v1(
+                    continuation, quote.operation_id, key.name)
+                operator_versions["d13_template"] = "d13.precompression_model_workflow.v1"
+        job = PersistentJob(
             key.name, envelope.identity.operation_id, envelope.identity.activity_id,
             envelope.identity.effect_id, namespace.bot_id, namespace.persona_id,
-            quote.snapshot_ref, "queued", quote.work_kind, {}, None,
+            quote.snapshot_ref, "queued", quote.work_kind, continuation, None,
             self._deadline_text(envelope.deadline_utc), lease.lease_id,
-            quote.resource_ref, {"resource_quote": f"{quote.quote_id}:{quote.version}"},
+            quote.resource_ref, operator_versions,
             None, None, 0, 0, {}, None,
         )
+        if quote.work_kind in {"d13.precompress", D13_PAID_PRECOMPRESSION_WORK_KIND}:
+            from .d13_precompression_job import plan_from_precompression_job_v1
+            try:
+                plan = plan_from_precompression_job_v1(job)
+            except ValueError as exc:
+                raise IssuerAuthorityDenied("signed D13 quote has an invalid original plan") from exc
+            reads = frozenset((item.key.token, item.revision)
+                              for item in envelope.version_guard.read_versions)
+            if (plan.expires_at_utc < envelope.deadline_utc or
+                    not {(item.ref, item.version) for item in (
+                        plan.scene_ref, plan.audience_ref,
+                        *plan.source_dependencies)}.issubset(reads)):
+                raise IssuerAuthorityDenied("signed D13 plan differs from current source guard")
+            if quote.work_kind == D13_PAID_PRECOMPRESSION_WORK_KIND:
+                if (quote.ceiling.get("input_tokens", 0) <= 0 and
+                        quote.ceiling.get("model_tokens", 0) <=
+                        quote.job_continuation["max_output_tokens"] or
+                        quote.ceiling.get("output_tokens", 0) <
+                        quote.job_continuation["max_output_tokens"]):
+                    raise IssuerAuthorityDenied("paid D13 model ceiling is insufficient")
+        return job
 
     def admit_schedule(self, envelope: CommandEnvelope, db, *,
                        now_utc: float | None = None) -> ScheduleAdmission:
@@ -2934,5 +3149,6 @@ def build_runtime_issuers(signing_key: bytes, *,
 __all__ = [
     "BudgetLeaseGrant", "D02ResourceIssuer", "D03ArrivalQuotePolicy", "D03_ARRIVAL_WORK_KIND", "D03SelfIdentityProjectionQuotePolicy", "D03_SELF_IDENTITY_PROJECTION_WORK_KIND", "D04BaselineQuotePolicy", "D04_BASELINE_WORK_KIND", "D06FirstIngressC02QuotePolicy", "D06_FIRST_INGRESS_C02_WORK_KIND", "D06SourceCorrectionQuotePolicy", "D06_SOURCE_CORRECTION_WORK_KIND", "D11BudgetGrantIssuer", "D11BudgetJobIssuer", "d03_arrival_quote_id", "d03_self_identity_projection_quote_id", "d04_baseline_quote_id", "d06_first_ingress_c02_quote_id", "d06_source_correction_quote_id", "d06_source_correction_job_ref", "d06_source_correction_outbox_ref",
     "IssuerAuthorityDenied", "ResourceOutcome", "ResourceQuote",
+    "private_reply_dispatch_quote_id",
     "build_runtime_issuers", "install_schema",
 ]

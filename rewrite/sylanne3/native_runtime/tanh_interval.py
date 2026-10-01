@@ -66,6 +66,13 @@ def conditional_tanh_interval_math(y: float, e: float) -> tuple[float, float]:
     Taylor bound at y+e. Only the final rational bounds round to binary64.
     """
     low, high = _exact_state_interval(y, e)
+    return conditional_tanh_interval_endpoints_math(low, high)
+
+
+def conditional_tanh_interval_endpoints_math(low: Fraction, high: Fraction) -> tuple[float, float]:
+    """Conditional readout on independently proved exact rational endpoints."""
+    if type(low) is not Fraction or type(high) is not Fraction or not 0 <= low <= high <= _DOMAIN_UPPER:
+        raise ValueError("tanh interval endpoints must be exact and inside [0, 4]")
     lower_exp, _ = _exp_positive_bounds(2 * low)
     _, upper_exp = _exp_positive_bounds(2 * high)
     return (

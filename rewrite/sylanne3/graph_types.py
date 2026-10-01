@@ -46,11 +46,12 @@ def validate_owner_grant_v1(value: dict) -> None:
                 or any(type(item) is not str or not item for item in items)
                 or items != sorted(set(items))):
             raise ValueError(f"owner grant {name} must be a sorted nonempty set")
-    if (value["grant_revision"] != 1 or type(value["grant_revision"]) is not int
-            or value["state"] != "pending_authority"
+    if (type(value["grant_revision"]) is not int
+            or (value["grant_revision"], value["state"])
+            not in {(1, "pending_authority"), (2, "revoked")}
             or type(value["activation_generation"]) is not int
             or value["activation_generation"] < 1):
-        raise ValueError("first owner grant must remain pending at revision one")
+        raise ValueError("owner grant revision and state differ")
 
 
 def owner_grant_key(bot: str, persona: str) -> "AtomKey":
@@ -63,7 +64,7 @@ def owner_grant_spec() -> "TypeSpec":
         OWNER_GRANT_TYPE, ("persona",), "state",
         validate_owner_grant_v1, schema_version=1, writer_domain="d11",
         schema_hash=hashlib.sha256(
-            b"sylanne3.graph.owner_grant.v1:strict:pending"
+            b"sylanne3.graph.owner_grant.v1:strict:pending-or-revoked-v2"
         ).hexdigest(),
     )
 

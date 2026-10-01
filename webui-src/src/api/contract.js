@@ -1,6 +1,12 @@
 export const D12_SCHEMA_VERSION = "d12.contract.v1";
 
 export const ACTIONS = Object.freeze({
+  readD04InitializationProfile: "read_d04_initialization_profile",
+  d04RootDraft: "d04_root_draft",
+  d04RootBudget: "d04_root_budget",
+  d04RootCoupling: "d04_root_coupling",
+  d04SemanticMapping: "d04_semantic_mapping",
+  d11RoleClock: "d11_role_clock",
   openWorkspace: "open_workspace",
   createCharacter: "create_character",
   bindScene: "bind_scene",

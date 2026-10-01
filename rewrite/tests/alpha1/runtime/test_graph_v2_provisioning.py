@@ -20,7 +20,7 @@ from sylanne3.authority_service.v2_owner_contract import (
 from sylanne3.graph_coordinator import (
     AuthorityDenied, BudgetAdmission, GraphCoordinator, RuntimeAdmission,
     FirstIngressOutcomeUnknown, IngressHostFacts, IngressLineage,
-    UnavailableGuard,
+    UnavailableGuard, namespace_ref,
 )
 from sylanne3.graph_store import ProductionGraphStore
 from sylanne3.graph_types import (
@@ -71,8 +71,11 @@ class AuthorityPort:
     def provision_namespace(self, *, namespace, request_id):
         self.outside_graph_lock()
         self.genesis_requests.append((namespace, request_id))
+        authority_namespace = (namespace_ref(namespace)
+                               if namespace.bot_id.startswith("astrbot-bot:")
+                               else "opaque:" + namespace.persona_id)
         anchor = self.anchors.setdefault(namespace, RestoreAnchor(
-            "authority", "opaque:" + namespace.persona_id, 1,
+            "authority", authority_namespace, 1,
             "deletion:" + namespace.persona_id, 0, "genesis",
             "execution:" + namespace.persona_id, 0, "genesis", 0,
             "authority-proof"))
@@ -195,6 +198,9 @@ def bundle_system(tmp_path):
     registry.register(TypeSpec(
         "state", ("persona",), "state", lambda value: None,
         writer_domain="d06", schema_hash="a" * 64))
+    from sylanne3.domains.d13.provider import D13ShortContextProvider
+    for spec in D13ShortContextProvider.register_types():
+        registry.register(spec)
     store = ProductionGraphStore(tmp_path / "business.db", registry)
     authority_db = sqlite3.connect(tmp_path / "authority.db", isolation_level=None)
     port = AuthorityPort(store, authority_db)
@@ -339,7 +345,7 @@ def test_v2_bundle_cold_restart_finishes_only_after_durable_business_receipt(
 
 def _owner_issue_case(tmp_path, *, first_ingress=False, return_bootstrap=False,
                       role_types=False, scene_types=False,
-                      owner_capabilities=None, extra_specs=(),
+                      owner_capabilities=None, owner_purposes=None, extra_specs=(),
                       arrival_allowed=False, extra_work_kinds=()):
     """Exercise the private graph transaction; this is not Authority admission."""
     registry = TypeRegistry()
@@ -405,12 +411,13 @@ def _owner_issue_case(tmp_path, *, first_ingress=False, return_bootstrap=False,
         "creation_digest": ticket.creation_digest,
         "issue_operation_id": "owner-issue-1",
         "grant_revision": 1, "state": "pending_authority",
-        "scope": "bot/persona", "issuer_ref": "authority:paired-installation",
+        "scope": "/".join(policy.namespace.as_tuple), "issuer_ref": "authority:paired-installation",
         "capabilities": sorted(owner_capabilities or (
             ("workbench.create", "workbench.read", "workbench.bind_scene")
             if role_types else ("workbench.read",))),
-        "purposes": (["workbench_user_action", "workbench_view"]
-                     if role_types else ["workbench_view"]),
+        "purposes": sorted(set(owner_purposes or (
+            ("workbench_user_action", "workbench_view")
+            if role_types else ("workbench_view",)))),
         "audiences": ["owner"],
         "activation_generation": 1,
         "graph_incarnation": creation.graph_incarnation,

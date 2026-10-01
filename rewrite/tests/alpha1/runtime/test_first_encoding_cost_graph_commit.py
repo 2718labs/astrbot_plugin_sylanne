@@ -81,7 +81,8 @@ class AnchorPort:
         raise AssertionError("ordinary content fence cannot settle cost")
 
 
-def _case(tmp_path, *, unknown=False, deleted=False):
+def _case(tmp_path, *, unknown=False, deleted=False,
+          work_kind="d06.encode_source"):
     registry = TypeRegistry()
     for spec in D11RuntimeProvider().type_specs():
         registry.register(spec)
@@ -116,7 +117,7 @@ def _case(tmp_path, *, unknown=False, deleted=False):
     reserve_budget(db, "lease", "original", "b" * 64, ceiling)
     quote = ResourceQuote(
         "quote", 1, "bot", "persona", "activity", "original", None,
-        "lease", "d06.encode_source", "snapshot", 100.0, "resource",
+        "lease", work_kind, "snapshot", 100.0, "resource",
         runtime_job_key("bot", "persona", "activity", "job").token,
         (), (), ceiling, None, 100.0)
     d02.issue_quote(db, quote)
@@ -153,6 +154,28 @@ def _case(tmp_path, *, unknown=False, deleted=False):
     db.execute("INSERT INTO graph_bundle_sequence VALUES('bot','persona',1)")
     db.commit()
     return store, coordinator, bootstrap, namespace, intent, accounting
+
+
+def test_reply_terminal_cost_uses_original_signed_reply_quote(tmp_path):
+    store, coordinator, bootstrap, namespace, intent, accounting = _case(
+        tmp_path, work_kind="reply")
+    try:
+        with pytest.raises(ModelCostUnavailable):
+            coordinator.commit_first_ingress_model_cost_v1(
+                bootstrap, namespace, intent, quote_id="quote", quote_version=1)
+        assert store._db.execute(
+            "SELECT COUNT(*) FROM graph_atoms WHERE type_name='runtime.cost_settlement'"
+        ).fetchone()[0] == 0
+        result = coordinator.commit_post_c02_reply_model_cost_v1(
+            bootstrap, namespace, intent, quote_id="quote", quote_version=1)
+        assert result.status == "committed"
+        assert get_budget_lease(store._db, "lease").used["output_tokens"] == 90
+        assert coordinator.commit_post_c02_reply_model_cost_v1(
+            bootstrap, namespace, intent, quote_id="quote",
+            quote_version=1).status == "duplicate"
+        assert len(accounting.started) == 2
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("unknown", [False, True])

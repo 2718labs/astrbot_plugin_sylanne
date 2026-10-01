@@ -106,6 +106,8 @@ class AuthorityV2SelfIdentityService:
         self._installation_id, self._manifest_digest = installation_id, manifest_digest
         self._read_subject, self._holder = read_subject, holder
         self._admin_authorizer = administrator_authorizer
+        self._source_location = None
+        self._owner_storage = None
         with core._tx() as db:
             fences._require_mode(db)
             present = {row[0] for row in db.execute(
@@ -119,6 +121,22 @@ class AuthorityV2SelfIdentityService:
                              "authority_self_identity_operations_v1"}:
                 raise AuthorityUnavailable("self identity schema is absent or partial")
             self._check_schema(db)
+
+    def install_current_source_location_v1(self, qualifier, owner_storage):
+        from .current_source_location_v1 import InstalledCurrentSourceLocationQualifierV1
+        from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
+        if (type(qualifier) is not InstalledCurrentSourceLocationQualifierV1
+                or type(owner_storage) is not InstalledD12OwnerStorageAdmissionServiceV1
+                or qualifier._fences is not self._fences or qualifier.core is not self._core
+                or qualifier._graph_db_path != self._graph._path
+                or qualifier.namespace_id != self._namespace_id or qualifier.installation_id != self._installation_id
+                or owner_storage.fences is not self._fences or owner_storage.tickets is not self._tickets
+                or owner_storage.graph_path != self._graph._path
+                or owner_storage.control is not qualifier._control
+                or self._source_location not in (None, qualifier)
+                or self._owner_storage not in (None, owner_storage)):
+            raise AuthorityUnavailable("self identity needs the actual shared source-location composition")
+        self._source_location, self._owner_storage = qualifier, owner_storage
 
     @staticmethod
     def _check_schema(db) -> None:
@@ -238,11 +256,15 @@ class AuthorityV2SelfIdentityService:
             return receipt
 
     def _read_locked(self, db, deletion_head, execution_head, history,
-                     credential, subject, request):
+                     credential, subject, request, location=None):
         self._check_schema(db)
         anchor = self._current_namespace(db, deletion_head, execution_head)
         permit = request.permit
-        if (history or request.authority_id != anchor.authority_id
+        if history and (location is None or self._source_location is None):
+            raise AuthorityUnavailable("self identity needs actual current storage continuation")
+        if location is not None:
+            self._source_location.require_current_in_tx_v1(db, location)
+        if (request.authority_id != anchor.authority_id
                 or permit.pinned_anchor != anchor or permit.subject != subject
                 or permit.holder != self._holder
                 or permit.generation != anchor.activation_generation):
@@ -292,22 +314,38 @@ class AuthorityV2SelfIdentityService:
             raise AuthorityUnavailable("self identity reader installation differs")
         self._core._require(credential, "self_identity_read",
                             request.authority_namespace, self._holder)
+        location = current_owner = None
+        if self._source_location is not None:
+            location = self._source_location.observe_business_for_fence_v1(
+                credential=credential, subject=subject, permit=request.permit)
+            current_owner, observed = self._owner_storage.get_current_background_owner_authority_for_fence_v1(
+                credential=credential, subject=subject, permit=request.permit)
+            if observed != request.permit or current_owner.target_admission is not None:
+                raise AuthorityUnavailable("self identity source Owner observation differs")
         with self._fences._frozen() as (db, deletion_head, execution_head, history):
             before = self._read_locked(db, deletion_head, execution_head,
-                                       history, credential, subject, request)
+                                       history, credential, subject, request, location)
         if before is None:
             return None
         head, guard, anchor, epoch = before
-        current_graph = self._graph.current(
-            request.namespace, anchor, request.installation_id, guard)
+        if current_owner is not None and current_owner.guard != guard:
+            raise AuthorityUnavailable("self identity Owner changed after storage observation")
+        if location is None:
+            current_graph = self._graph.current(request.namespace, anchor, request.installation_id, guard)
+        else:
+            current_graph = self._graph.current(
+                request.namespace, anchor, request.installation_id, guard,
+                source_location=self._source_location, location_observation=location,
+                storage_admission=current_owner.storage_admission, holder=self._holder)
         if current_graph is None:
             raise AuthorityUnavailable("current D01 self identity role is unavailable")
         with self._fences._frozen() as (db, deletion_head, execution_head, history):
             after = self._read_locked(db, deletion_head, execution_head,
-                                      history, credential, subject, request)
+                                      history, credential, subject, request, location)
             if after != before:
                 raise AuthorityUnavailable("self identity changed during graph read")
         graph_incarnation, role_head_id, graph_revision, graph_epoch = current_graph
+        admission = None if current_owner is None else current_owner.storage_admission
         return AuthorityCurrentSelfIdentityV1(
             namespace=request.namespace,
             authority_namespace=request.authority_namespace,
@@ -327,7 +365,9 @@ class AuthorityV2SelfIdentityService:
             owner_minimum_revocation_revision=guard.minimum_revocation_revision,
             owner_revocation_epoch=guard.minimum_revocation_epoch,
             request_operation_id=request.request_operation_id,
-            permit=request.permit)
+            permit=request.permit,
+            origin_graph_incarnation=None if admission is None else admission.source_graph_incarnation,
+            storage_admission_digest=None if admission is None else admission.original_digest)
 
 
 __all__ = ("AuthorityV2SelfIdentityService", "SelfIdentityMutationReceiptV1")

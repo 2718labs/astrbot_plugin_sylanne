@@ -49,7 +49,7 @@ _REASON_CODES = {
     "installation_verification", "affect_scheme_verification", "runtime_bootstrap",
     "namespace_activation", "installed_package", "graph_worker", "domain_registry",
     "v2_fence_recovery", "product_ingress", "owner_guard", "active_role",
-    "scene_binding", "dispatch", "runtime_unavailable",
+    "scene_binding", "dispatch", "migration_required", "runtime_unavailable",
 }
 
 

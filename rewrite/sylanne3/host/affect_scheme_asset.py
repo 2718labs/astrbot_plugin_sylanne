@@ -10,7 +10,7 @@ from pathlib import Path
 
 from ..domain_registry import DomainRegistry, discover_domain_registry
 from ..domains.d04 import AffectAxis, AffectScheme
-from .installed_package import _safe_file, verify_installed_package
+from .installed_package import _safe_file, verify_installed_backend_runtime_v1
 
 
 _ASSET_PATH = "resources/catalogue/d04-affect-scheme.json"
@@ -84,10 +84,10 @@ def load_verified_affect_scheme(
     matching asset does not certify operators, parameter values, or numerics.
     """
     root = Path(package_root).absolute()
-    verification = verify_installed_package(
+    verification = verify_installed_backend_runtime_v1(
         root, expected_manifest_digest, available_cpu_features=available_cpu_features,
     )
-    if not verification.verified or verification.build_mode != "formal-alpha1":
+    if not verification.verified:
         raise ValueError("verified formal-alpha1 package is required for D04 scheme loading")
     manifest_path = _safe_file(root, "release-manifest.json")
     if manifest_path is None:
@@ -107,8 +107,15 @@ def load_verified_affect_scheme(
     catalogue_bytes, _ = _listed_bytes(root, manifest, _CATALOGUE_PATH)
     catalogue = _json_object(catalogue_bytes, "type catalogue")
     capabilities = catalogue.get("domain_capabilities")
-    if (catalogue.get("activation_status") != "runtime_verified"
-            or catalogue.get("release_eligibility") != "READY"
+    active_catalogue = (
+        catalogue.get("activation_status") == "runtime_verified"
+        and catalogue.get("release_eligibility") == "READY"
+    ) if verification.build_mode == "formal-alpha1" else (
+        verification.runtime_scope == "backend-production-acceptance"
+        and catalogue.get("activation_status") == "candidate_only"
+        and str(catalogue.get("release_eligibility", "")).startswith("HOLD:")
+    )
+    if (not active_catalogue
             or not isinstance(capabilities, dict)
             or not isinstance(capabilities.get("d04"), list)
             or _CAPABILITY not in capabilities["d04"]):

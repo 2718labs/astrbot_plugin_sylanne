@@ -18,7 +18,7 @@ import hashlib
 import json
 
 from ..runtime_journal import RecoveryConstraintFootprint
-from .contract import AuthorityUnavailable, identifier
+from .contract import AuthorityUnavailable, JournalHead, identifier
 from .core import AuthorityServiceCore
 from .local_bridge import constraint_keys_from_footprint
 from .v2_contract import (
@@ -27,6 +27,7 @@ from .v2_contract import (
     canonical_digest,
     DispatchHandoffContextV1, DispatchGraphClaimReceiptV1, OwnerDispatchWitnessV1,
     AuthorityDispatchSnapshotV1, AuthorityUnresolvedEffectV1,
+    AuthorityCurrentEffectSnapshotV2,
     PlatformObservationV1, PlatformObservationV2, decode_bytes, from_wire, to_wire,
 )
 from .v2_dispatch_admission_epoch import current_admission_stamp_in_tx
@@ -53,6 +54,10 @@ _HANDOFF_RECEIPT_DDL = """CREATE TABLE authority_execution_handoff_graph_receipt
             ) STRICT"""
 
 
+class PlatformObservationVerifierUnavailable(AuthorityUnavailable):
+    """A V2 handoff cannot begin without its installed observation verifier."""
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedExecutionObservationV2:
     """Verified local prepare state; no platform outcome is represented."""
@@ -63,7 +68,7 @@ class PreparedExecutionObservationV2:
 
 @dataclass(frozen=True, slots=True)
 class CurrentEffectReadV2:
-    """Content-free Authority evidence, never a platform delivery assertion."""
+    """Content-free Authority evidence including the original observed outcome."""
 
     authority_id: str
     namespace: str
@@ -77,6 +82,7 @@ class CurrentEffectReadV2:
     append_digest: str | None = None
     mutation_id: str | None = None
     observation_id: str | None = None
+    observation_outcome: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,7 +181,9 @@ class AuthorityV2ExecutionBridge:
                  observation_verifier=None, final_handoff_authorizer=None,
                  final_handoff_issuer_id: str | None = None,
                  owner_tickets: AuthorityV2OwnerTicketStore | None = None,
-                 owner_installation_id: str | None = None):
+                 owner_installation_id: str | None = None,
+                 v2_dispatch_verifier=None,
+                 internal_work_terminal_verifier=None):
         identifier(namespace, "namespace")
         if (type(core) is not AuthorityServiceCore
                 or type(fences) is not AuthorityV2FenceStore
@@ -187,6 +195,10 @@ class AuthorityV2ExecutionBridge:
         self.fences = fences
         self.journal = journal
         self.namespace = namespace
+        if v2_dispatch_verifier is not None and not callable(v2_dispatch_verifier):
+            raise AuthorityUnavailable("installed V2 dispatch verifier is invalid")
+        self._v2_dispatch_verifier = (
+            v2_dispatch_verifier or core._dispatch_verifier)
         with core._tx() as db:
             self._require_v2_mode_locked(db)
         if type(deletion) is not AuthorityV2DeletionGuard:
@@ -214,6 +226,10 @@ class AuthorityV2ExecutionBridge:
             identifier(owner_installation_id, "owner_installation_id")
         self._owner_tickets = owner_tickets
         self._owner_installation_id = owner_installation_id
+        if (internal_work_terminal_verifier is not None and
+                not callable(internal_work_terminal_verifier)):
+            raise AuthorityUnavailable("installed internal work terminal verifier is invalid")
+        self._internal_work_terminal_verifier = internal_work_terminal_verifier
         with core._tx() as db:
             stored = db.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' "
@@ -230,6 +246,13 @@ class AuthorityV2ExecutionBridge:
             elif stored != (_HANDOFF_RECEIPT_DDL,):
                 raise AuthorityUnavailable("handoff graph receipt schema differs")
 
+    def install_internal_work_terminal_verifier(self, verifier) -> None:
+        """Bind the installed C04 signer exactly once before serving work."""
+        if (self._internal_work_terminal_verifier is not None or
+                not callable(verifier)):
+            raise AuthorityUnavailable("C04 terminal verifier installation differs")
+        self._internal_work_terminal_verifier = verifier
+
     def _check_deletion_locked(self, db, head):
         self.deletion.require_target_schema_locked(
             db, authority_id=self.core._id(db), namespace=self.namespace,
@@ -242,6 +265,228 @@ class AuthorityV2ExecutionBridge:
         row = self.core._row(db, self.namespace)
         if row[10:13] != (head.journal_id, head.seq, head.digest):
             raise AuthorityUnavailable("execution journal differs from Authority head")
+
+    def _check_internal_work_before_locked(self, db, binding, before_head):
+        self._require_v2_mode_locked(db)
+        self.fences._check_schema(db)
+        row = self.core._row(db, self.namespace)
+        if (row[2] != "active" or row[0] is None or
+                row[1] != binding.activation_generation or
+                self.core._head(row, "execution") != before_head or
+                db.execute(
+                    "SELECT 1 FROM authority_v2_fences "
+                    "WHERE namespace=? AND (pending IS NOT NULL OR state='active') LIMIT 1",
+                    (self.namespace,)).fetchone()):
+            raise AuthorityUnavailable("internal work Core owner/head/fence differs")
+
+    def append_internal_work_claim_v1(
+        self, *, credential, binding, claim, before_head,
+        prepared,
+    ):
+        """Service-owned append after W01's current prepared-original read."""
+        from .internal_work_contract import InternalWorkBindingV1, claim_internal_work_v1
+        from ..runtime.c04_internal_work_original_v1 import C04InternalWorkPreparedV1
+
+        if (type(binding) is not InternalWorkBindingV1 or
+                binding.namespace != self.namespace or
+                claim != claim_internal_work_v1(binding) or
+                type(before_head) is not JournalHead or
+                type(prepared) is not C04InternalWorkPreparedV1 or
+                prepared.binding != binding):
+            raise AuthorityUnavailable("current C04 prepared original differs")
+        self.core._require(credential, "execution", self.namespace)
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
+                if self.journal.read_internal_work_v1(binding).claim is not None:
+                    raise AuthorityUnavailable("internal work claim already consumed execution right")
+                journal_head = self.journal.verified_head()
+                with self.core._tx() as db:
+                    from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+                    require_lifecycle_admission_in_tx_v1(db, self.namespace, action="first_internal_work_claim")
+                    self._check_deletion_locked(db, deletion_head)
+                    self._check_internal_work_before_locked(db, binding, before_head)
+                    if journal_head != before_head:
+                        raise AuthorityUnavailable("unreconciled execution append blocks new work")
+                append = self.journal.append_internal_work_claim_v1(
+                    binding, claim, before_head)
+        self.reconcile_internal_work_head(
+            credential=credential, binding=binding, phase="claim")
+        return append
+
+    def append_internal_work_terminal_v1(
+        self, *, credential, binding, claim, terminal, before_head,
+    ):
+        """Accept measured terminal only through the installed verifier."""
+        from .internal_work_contract import (
+            InternalWorkBindingV1, InternalWorkTerminalV1, InternalWorkTerminalV2,
+            claim_internal_work_v1,
+        )
+
+        if (type(binding) is not InternalWorkBindingV1 or
+                binding.namespace != self.namespace or
+                claim != claim_internal_work_v1(binding) or
+                type(terminal) not in (InternalWorkTerminalV1, InternalWorkTerminalV2) or
+                terminal.binding_digest != binding.binding_digest or
+                terminal.claim_mutation_id != claim.mutation_id or
+                type(before_head) is not JournalHead or
+                self._internal_work_terminal_verifier is None or
+                self._internal_work_terminal_verifier(
+                    binding, claim, terminal) is not True):
+            raise AuthorityUnavailable("installed measured internal work terminal unavailable")
+        self.core._require(credential, "execution", self.namespace)
+        # Historical cost must be recordable after revocation or deletion.
+        # The original committed claim, not current Owner authority, permits
+        # exactly one terminal; no graph content is read on this path.
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                inspection = self.journal.read_internal_work_v1(binding)
+                if inspection.claim != claim or inspection.claim_append is None:
+                    raise AuthorityUnavailable("internal work terminal lacks original claim")
+                with self.core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    self._check_execution_head_locked(db, before_head)
+                    if db.execute("SELECT 1 FROM authority_v2_fences WHERE namespace=? "
+                                  "AND (state='active' OR pending IS NOT NULL) LIMIT 1",
+                                  (self.namespace,)).fetchone():
+                        raise AuthorityUnavailable("historical C04 terminal waits for the current exclusive fence")
+                    if before_head.seq < inspection.claim_append.sequence:
+                        raise AuthorityUnavailable("claim is not committed in Core")
+                    if inspection.verified_head != before_head:
+                        raise AuthorityUnavailable("unreconciled execution append blocks terminal")
+                append = self.journal.append_internal_work_terminal_v1(
+                    binding, claim, terminal, before_head)
+        self.reconcile_internal_work_head(
+            credential=credential, binding=binding, phase="terminal")
+        return append
+
+    def is_current_internal_work_head_v1(self, *, credential,
+                                         head: JournalHead) -> bool:
+        """Exact Authority/independent-head check for D02's terminal reread."""
+        self.core._require(credential, "current", self.namespace)
+        if type(head) is not JournalHead:
+            return False
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                actual = self.journal.verified_head()
+                with self.core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    row = self.core._row(db, self.namespace)
+                    deletion_head = self.deletion.verified_head()
+                    # Historical terminal/cost reread remains possible after
+                    # deletion. It never authorizes new work or content reads.
+                    return (row[6:9] == (deletion_head.journal_id,
+                                         deletion_head.seq, deletion_head.digest)
+                            and actual == head and
+                            self.core._head(row, "execution") == head)
+
+    def reconcile_internal_work_head(self, *, credential,
+                                     binding, phase: str):
+        """Import exactly one verified C04 append into the existing Core anchor.
+
+        This is an installer-side recovery/CAS seam, not permission to start
+        work. The caller must first prove W01's immutable prepared original and
+        independently authorize a journal append. A missing or extra append
+        leaves Core behind and all protected reads closed.
+        """
+        from .internal_work_contract import InternalWorkBindingV1
+
+        if (type(binding) is not InternalWorkBindingV1 or
+                binding.namespace != self.namespace or
+                phase not in ("claim", "terminal")):
+            raise AuthorityUnavailable("internal work recovery identity differs")
+        self.core._require(credential, "execution", self.namespace)
+        if binding.algorithm_ref == "d06.association_activation.v3":
+            from .c04_exclusive_execution_v3 import reconcile_exclusive_c04_v3
+            return reconcile_exclusive_c04_v3(self, credential=credential, binding=binding, phase=phase)
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if phase == "claim" and self.deletion.has_deletion_history(self.namespace):
+                    raise AuthorityUnavailable("deletion closure blocks internal work recovery")
+                inspection = self.journal.read_internal_work_v1(binding)
+                append = (inspection.claim_append if phase == "claim"
+                          else inspection.terminal_append)
+                if append is None:
+                    raise AuthorityUnavailable("internal work phase has no durable append")
+                target = JournalHead(
+                    append.journal_id, append.sequence, append.chain_digest)
+                before = self.journal.verified_predecessor_head(append.sequence)
+                if inspection.verified_head != target:
+                    raise AuthorityUnavailable("later execution append requires ordered recovery")
+                with self.core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    self.fences._check_schema(db)
+                    if phase == "claim":
+                        self._check_deletion_locked(db, deletion_head)
+                    row = self.core._row(db, self.namespace)
+                    if (phase == "claim" and
+                            (row[2] != "active" or row[0] is None or
+                             row[1] != binding.activation_generation or
+                             db.execute(
+                                "SELECT 1 FROM authority_v2_fences "
+                                "WHERE namespace=? AND pending IS NOT NULL LIMIT 1",
+                                (self.namespace,)).fetchone())):
+                        raise AuthorityUnavailable("internal work Owner or fence is not settled")
+                    core_head = self.core._head(row, "execution")
+                    if core_head == target:
+                        return self.core._anchor(db, self.namespace, row)
+                    if core_head != before:
+                        raise AuthorityUnavailable("internal work Core head CAS differs")
+                    if phase == "terminal" and (
+                            inspection.claim_append is None or
+                            inspection.claim_append.sequence >= append.sequence):
+                        raise AuthorityUnavailable("internal work terminal lacks claim")
+                    db.execute(
+                        "UPDATE authority_namespaces SET execution_seq=?,"
+                        "execution_digest=?,anchor_nonce=? WHERE namespace=?",
+                        (target.seq, target.digest, self.core._new_nonce(),
+                         self.namespace))
+                    self.core._event(
+                        db, self.namespace, "internal_work_" + phase,
+                        row[1], (binding.binding_digest, append.mutation_id,
+                                 append.content_digest, target.digest))
+                    return self.core._anchor(
+                        db, self.namespace, self.core._row(db, self.namespace))
+
+    def _verified_dispatch_rows(self, rows, journal_id):
+        """Keep typed CPU/numeric entries in the verified chain, out of effect decoding."""
+        from .d04_numeric_journal_v3 import ENTRY_PREFIX
+        from .d04_root_execution_journal_v3 import ROOT_ENTRY_PREFIX_V3
+        from .d11_offline_tick_journal_v1 import ENTRY_PREFIX as OFFLINE_PREFIX
+        from .d04_series_journal_v1 import ENTRY_PREFIX as SERIES_PREFIX
+        from .d11_life_journal_v1 import ENTRY_PREFIX as LIFE_PREFIX
+        self.core._verify_execution_redaction_c04_rows(self.journal, rows, journal_id=journal_id)
+        return tuple(row for row in rows
+            if not row[4].startswith((ENTRY_PREFIX, ROOT_ENTRY_PREFIX_V3, OFFLINE_PREFIX, SERIES_PREFIX, LIFE_PREFIX, b'{"binding":')))
+
+    def read_current_observation_receipt_v1(self, *, credential, subject, effect_id):
+        """Independently reread the observed mutation named by the current effect."""
+        observed = self.read_current_effect(credential=credential, subject=subject, effect_id=effect_id)
+        if observed.state != "observed" or observed.mutation_id is None:
+            raise AuthorityUnavailable("actual platform observation is unavailable")
+        with self.deletion.freeze_writes(), self.journal.freeze_writes():
+            head = self.journal.verified_head()
+            if (head.seq, head.digest) != (observed.execution_head_seq, observed.execution_head_digest):
+                raise AuthorityUnavailable("platform observation head changed")
+            with self.core._tx() as db:
+                row = self.fences.mutation_locked(db, observed.mutation_id)
+                if row is None:
+                    raise AuthorityUnavailable("platform observation mutation disappeared")
+                completed = self._completed_result(row)
+                if completed is None:
+                    raise AuthorityUnavailable("platform observation is not committed")
+                receipt, _permit = completed
+                pending = receipt.pending
+                if (pending.phase != "observed" or pending.permit.subject != subject
+                        or pending.permit.effect_id != effect_id
+                        or pending.platform_observation.observation_id != observed.observation_id
+                        or pending.platform_observation.outcome != observed.observation_outcome):
+                    raise AuthorityUnavailable("platform observation original identity differs")
+                return receipt
 
     def read_current_effect(self, *, credential, subject: str,
                             effect_id: str) -> CurrentEffectReadV2:
@@ -258,7 +503,8 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
-                    raise AuthorityUnavailable("deletion history blocks current effect read")
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 execution_head, rows = self.journal._scan_locked()
                 with self.core._tx() as db:
                     self._require_v2_mode_locked(db)
@@ -275,7 +521,7 @@ class AuthorityV2ExecutionBridge:
                             (self.namespace,)).fetchone():
                         raise AuthorityUnavailable("pending execution mutation blocks effect read")
                     matching = []
-                    for row in rows:
+                    for row in self._verified_dispatch_rows(rows, execution_head.journal_id):
                         pending = decode_bytes(row[4])
                         if pending.permit.effect_id == effect_id:
                             matching.append((row, pending))
@@ -329,6 +575,8 @@ class AuthorityV2ExecutionBridge:
                         append_digest=entry[6], mutation_id=entry[1],
                         observation_id=(pending.platform_observation.observation_id
                                         if pending.phase == "observed" else None),
+                        observation_outcome=(pending.platform_observation.outcome
+                                             if pending.phase == "observed" else None),
                         **common)
 
     @staticmethod
@@ -605,7 +853,8 @@ class AuthorityV2ExecutionBridge:
         core = self.core
         core._require(credential, "dispatch", self.namespace, permit.holder)
         try:
-            verified = core._dispatch_verifier(self.namespace, permit.effect_id, keys)
+            verified = self._v2_dispatch_verifier(
+                self.namespace, permit.effect_id, keys)
         except Exception as exc:
             raise AuthorityUnavailable("D08 dispatch verification failed") from exc
         if verified is not True:
@@ -654,7 +903,8 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
-                    raise AuthorityUnavailable("historical deletion closure blocks claim")
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 inspection = self.journal.inspect_expected(prepared_receipt.pending)
                 if inspection.first_append is None:
                     raise AuthorityUnavailable("original prepared append is absent")
@@ -747,7 +997,8 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
-                    raise AuthorityUnavailable("historical deletion closure blocks observation")
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 inspection = self.journal.inspect_expected(claimed_receipt.pending)
                 if inspection.first_append is None:
                     raise AuthorityUnavailable("original claimed append is absent")
@@ -778,7 +1029,8 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
-                    raise AuthorityUnavailable("historical deletion closure blocks observation")
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 inspection = self.journal.inspect_expected(claimed_receipt.pending)
                 if inspection.first_append is None:
                     raise AuthorityUnavailable("original claimed append is absent")
@@ -855,7 +1107,8 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
-                    raise AuthorityUnavailable("historical deletion closure blocks dispatch append")
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 with self.core._tx() as db:
                     self._require_v2_mode_locked(db)
                     self.fences._check_schema(db)
@@ -882,7 +1135,8 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
               deletion_head = self.deletion.verified_head()
               if self.deletion.has_deletion_history(self.namespace):
-                  raise AuthorityUnavailable("historical deletion closure blocks dispatch recovery")
+                  with self.core._tx() as current_db:
+                      self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
               inspection = None
               inspection_error = None
               verified_head = None
@@ -995,6 +1249,17 @@ class AuthorityV2ExecutionBridge:
                     durable_state=state)
                 updated = self.fences.finish_mutation_locked(
                     db, receipt, subject=subject)
+                if pending.phase == "observed" and state == "committed":
+                    # The journal-qualified terminal observation advances the
+                    # pinned anchor. Close its dispatch fence in this same Core
+                    # commit; an old-host finish request cannot use that anchor.
+                    finish_id = "observed-" + hashlib.sha256(
+                        pending.mutation_id.encode("utf-8")).hexdigest()
+                    self.fences.finish_fence_locked(
+                        db, updated, subject=subject,
+                        current_anchor=receipt.after_anchor,
+                        request_id=finish_id,
+                        request_digest=canonical_digest(receipt))
                 return receipt, updated
 
     def observe_prepared(self, *, credential, subject: str,
@@ -1013,7 +1278,8 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
-                    raise AuthorityUnavailable("historical deletion closure blocks dispatch observation")
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 inspection = self.journal.inspect_expected(pending)
                 if inspection.following_count > 1:
                     raise AuthorityUnavailable("extra execution append quarantines prepared observation")
@@ -1146,9 +1412,8 @@ class AuthorityV2ExecutionBridge:
         if effect != ("unresolved", claimed_receipt.after_anchor.execution_seq):
             raise AuthorityUnavailable("current effect claim differs")
 
-    def _dispatch_snapshot_locked(self, db, *, context: DispatchHandoffContextV1,
-                                  owner_witness: OwnerDispatchWitnessV1,
-                                  execution_rows) -> AuthorityDispatchSnapshotV1:
+    def _unresolved_effects_locked(self, db, *, permit: FencePermitV2,
+                                   execution_rows) -> tuple[AuthorityUnresolvedEffectV1, ...]:
         """Read every unresolved namespace effect from the verified journal.
 
         Any missing footprint, extra committed mutation, or pending mutation
@@ -1164,8 +1429,8 @@ class AuthorityV2ExecutionBridge:
             "SELECT operation_id FROM authority_v2_fences "
             "WHERE namespace=? AND state='active' ORDER BY operation_id",
             (self.namespace,)))
-        if active != (context.permit.operation_id,):
-            raise AuthorityUnavailable("P2 is not the only active namespace fence")
+        if active != (permit.operation_id,):
+            raise AuthorityUnavailable("read permit is not the only active namespace fence")
         indexed = {}
         for effect_id, state, keys_json, execution_seq in db.execute(
                 "SELECT effect_id,state,conflict_keys_json,execution_seq "
@@ -1176,13 +1441,19 @@ class AuthorityV2ExecutionBridge:
             indexed[effect_id] = (state, keys_json, execution_seq)
         by_effect = {}
         journal_mutation_ids = set()
-        for entry in execution_rows:
+        for entry in self._verified_dispatch_rows(execution_rows, self.journal.journal_id):
             try:
                 pending = decode_bytes(entry[4])
             except (TypeError, ValueError, UnicodeError) as exc:
                 raise AuthorityUnavailable("execution journal append is malformed") from exc
             if type(pending) is not PendingMutationV2 or pending.permit.effect_id is None:
                 raise AuthorityUnavailable("execution append lacks effect identity")
+            if (pending.permit.authority_id != permit.authority_id
+                    or pending.permit.namespace != self.namespace
+                    or pending.permit.operation != "dispatch"
+                    or pending.permit.holder != permit.holder
+                    or pending.permit.generation != permit.generation):
+                raise AuthorityUnavailable("execution append Authority identity differs")
             mutation_id = pending.mutation_id
             if mutation_id in journal_mutation_ids:
                 raise AuthorityUnavailable("duplicate execution mutation append")
@@ -1212,7 +1483,7 @@ class AuthorityV2ExecutionBridge:
             previous_phase = None
             for _, pending, _, saved_footprint in entries:
                 if (pending.permit.operation_id != operation_id
-                        or pending.permit.generation != context.permit.generation
+                        or pending.permit.generation != permit.generation
                         or saved_footprint != footprint
                         or (previous_phase is None and pending.phase != "prepared")
                         or (previous_phase == "prepared" and pending.phase != "claimed")
@@ -1233,6 +1504,13 @@ class AuthorityV2ExecutionBridge:
         if {effect_id for effect_id, row in indexed.items()
                 if row[0] == "unresolved"} != set(by_effect):
             raise AuthorityUnavailable("unresolved effect index is incomplete")
+        return tuple(sorted(effects, key=lambda item: item.effect_id))
+
+    def _dispatch_snapshot_locked(self, db, *, context: DispatchHandoffContextV1,
+                                  owner_witness: OwnerDispatchWitnessV1,
+                                  execution_rows) -> AuthorityDispatchSnapshotV1:
+        effects = self._unresolved_effects_locked(
+            db, permit=context.permit, execution_rows=execution_rows)
         stamp = current_admission_stamp_in_tx(db)
         return AuthorityDispatchSnapshotV1(
             context_digest=canonical_digest(context),
@@ -1243,7 +1521,49 @@ class AuthorityV2ExecutionBridge:
             authority_schema_version=stamp.schema_version,
             active_dispatch_operation_id=context.permit.operation_id,
             pending_mutation_ids=(),
-            unresolved_effects=tuple(sorted(effects, key=lambda item: item.effect_id)))
+            unresolved_effects=effects)
+
+    def read_current_effect_snapshot_for_write_fence(
+            self, *, credential, subject: str,
+            permit: FencePermitV2) -> AuthorityCurrentEffectSnapshotV2:
+        """Read the complete pre-P2 effect set at a live ordinary write fence."""
+        identifier(subject, "subject")
+        if (type(permit) is not FencePermitV2 or permit.operation != "write"
+                or permit.namespace != self.namespace or permit.subject != subject):
+            raise AuthorityUnavailable("ordinary write permit identity required")
+        self.core._require(credential, "write", self.namespace, permit.holder)
+        with self.deletion.freeze_writes():
+            with self.journal.freeze_writes():
+                deletion_head = self.deletion.verified_head()
+                if self.deletion.has_deletion_history(self.namespace):
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
+                execution_head, execution_rows = self.journal._scan_locked()
+                with self.core._tx() as db:
+                    self._require_v2_mode_locked(db)
+                    self.fences._check_schema(db)
+                    self._check_deletion_locked(db, deletion_head)
+                    self._check_execution_head_locked(db, execution_head)
+                    owner = self.core._row(db, self.namespace)
+                    if (owner[2] != "active" or owner[0] != permit.holder
+                            or owner[1] != permit.generation
+                            or owner[3] is not None or owner[4] is not None):
+                        raise AuthorityUnavailable("write fence owner is not current")
+                    anchor = self.core._anchor(db, self.namespace, owner)
+                    if (anchor != permit.pinned_anchor
+                            or anchor.authority_id != permit.authority_id):
+                        raise AuthorityUnavailable("write fence pinned anchor is stale")
+                    self._check_fence_locked(db, permit, subject)
+                    effects = self._unresolved_effects_locked(
+                        db, permit=permit, execution_rows=execution_rows)
+                    return AuthorityCurrentEffectSnapshotV2(
+                        authority_id=permit.authority_id,
+                        namespace=self.namespace,
+                        anchor=anchor,
+                        permit_digest=canonical_digest(permit),
+                        execution_head_seq=execution_head.seq,
+                        execution_head_digest=execution_head.digest,
+                        coverage="complete", unresolved_effects=effects)
 
     def begin_handoff(self, *, credential, subject: str,
                       claimed_receipt: MutationReceiptV2,
@@ -1260,6 +1580,9 @@ class AuthorityV2ExecutionBridge:
         if (type(claimed_receipt) is not MutationReceiptV2
                 or type(claimed_receipt.pending.binding) is not ExecutionBindingV2):
             raise AuthorityUnavailable("V2 handoff requires a complete V2 claim")
+        if self._observation_verifier is None:
+            raise PlatformObservationVerifierUnavailable(
+                "V2 handoff requires an installed platform observation verifier")
         return self._begin_handoff(credential=credential, subject=subject,
                                    claimed_receipt=claimed_receipt, handoff_id=handoff_id)
 
@@ -1287,7 +1610,8 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
-                    raise AuthorityUnavailable("historical deletion closure blocks dispatch")
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 execution_head, execution_rows = self.journal._scan_locked()
                 with self.core._tx() as db:
                     self._check_handoff_current_locked(
@@ -1400,9 +1724,12 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
-                    raise AuthorityUnavailable("historical deletion closure blocks handoff")
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 execution_head, execution_rows = self.journal._scan_locked()
                 with self.core._tx() as db:
+                    from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+                    require_lifecycle_admission_in_tx_v1(db, self.namespace, action="first_platform_handoff")
                     self._check_handoff_current_locked(
                         db, permit=permit, subject=subject,
                         claimed_receipt=claimed_receipt,
@@ -1437,9 +1764,12 @@ class AuthorityV2ExecutionBridge:
             with self.journal.freeze_writes():
                 deletion_head = self.deletion.verified_head()
                 if self.deletion.has_deletion_history(self.namespace):
-                    raise AuthorityUnavailable("historical deletion closure blocks handoff")
+                    with self.core._tx() as current_db:
+                        self.core.require_current_content_ready_locked(current_db, namespace=self.namespace)
                 execution_head, execution_rows = self.journal._scan_locked()
                 with self.core._tx() as db:
+                    from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
+                    require_lifecycle_admission_in_tx_v1(db, self.namespace, action="first_platform_handoff")
                     self._check_handoff_current_locked(
                         db, permit=permit, subject=subject,
                         claimed_receipt=claimed_receipt,
@@ -1517,4 +1847,4 @@ class AuthorityV2ExecutionBridge:
 
 __all__ = ["AuthorityV2ExecutionBridge", "CurrentEffectReadV2",
            "PreparedExecutionObservationV2", "HandoffStartV2",
-           "handoff_start_digest_v2"]
+           "PlatformObservationVerifierUnavailable", "handoff_start_digest_v2"]

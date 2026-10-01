@@ -234,6 +234,10 @@ class AuthorityV2ModelEgressStore:
             return None
         try:
             intent = _decoded(row[4])
+            from .c09_model_budget_original_v1 import require_model_identities_unconsumed_in_tx_v1
+            require_model_identities_unconsumed_in_tx_v1(db, namespace=intent.namespace,
+                call_id=intent.call_id, operation_id=intent.operation_id, job_id=intent.job_id,
+                acquire_operation_id=intent.acquire_operation_id)
             if row[:4] != (intent.call_id, intent.operation_id, intent.namespace, intent.subject):
                 raise ValueError("persisted egress identity mismatch")
             status_row = db.execute(
@@ -312,6 +316,10 @@ class AuthorityV2ModelEgressStore:
         """Persist one call per job inside an Authority-owned immediate transaction."""
         if type(intent) is not ModelEgressIntentV1 or db is not self._db or not db.in_transaction:
             raise AuthorityUnavailable("typed model egress intent and Authority transaction required")
+        from .c09_model_budget_original_v1 import require_model_identities_unconsumed_in_tx_v1
+        require_model_identities_unconsumed_in_tx_v1(db, namespace=intent.namespace,
+            call_id=intent.call_id, operation_id=intent.operation_id, job_id=intent.job_id,
+            acquire_operation_id=intent.acquire_operation_id)
         old = self._read(db, intent.call_id)
         if old is not None:
             if old.intent != intent:
@@ -372,6 +380,9 @@ class AuthorityV2ModelEgressStore:
                                binding_digest: str) -> ModelEgressRecoveryV1 | None:
         if db is not self._db or not db.in_transaction:
             raise AuthorityUnavailable("Authority original lookup transaction required")
+        from .c09_model_budget_original_v1 import require_model_identities_unconsumed_in_tx_v1
+        require_model_identities_unconsumed_in_tx_v1(db, namespace=namespace, call_id=call_id,
+            operation_id=operation_id, job_id=job_id, acquire_operation_id=acquire_operation_id)
         row = db.execute(
             "SELECT call_id,authority_id,installation_id,namespace,job_id,acquire_operation_id,"
             "operation_id,request_digest,binding_digest "
@@ -476,6 +487,10 @@ class AuthorityV2ModelEgressStore:
                                 intent: ModelEgressIntentV1,
                                 admission: ModelAdmissionV2) -> None:
         """Bind the v2 observer in the same transaction as the one-way CAS."""
+        from .c09_model_budget_original_v1 import require_model_identities_unconsumed_in_tx_v1
+        require_model_identities_unconsumed_in_tx_v1(db, namespace=intent.namespace,
+            call_id=intent.call_id, operation_id=intent.operation_id, job_id=intent.job_id,
+            acquire_operation_id=intent.acquire_operation_id, admission_id=admission.admission_id)
         if (db is not self._db or not db.in_transaction
                 or type(intent) is not ModelEgressIntentV1
                 or type(admission) is not ModelAdmissionV2

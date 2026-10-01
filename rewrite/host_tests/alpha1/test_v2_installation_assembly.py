@@ -50,7 +50,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
         client.installation_grant_v2 = AsyncMock(return_value=grant)
         package = InstalledPackageVerification(True, "verified", digest, "3.0.0-alpha1", "formal-alpha1")
         with (patch("sylanne3.host.v2_installation.load_admin_installation_bundle", return_value=bundle) as load_bundle,
-              patch("sylanne3.host.v2_installation.verify_installed_package", return_value=package),
+              patch("sylanne3.host.v2_installation.verify_installed_backend_runtime_v1", return_value=package),
               patch("sylanne3.host.v2_installation.MtlsAuthorityTransport", return_value=transport),
               patch("sylanne3.host.v2_installation.AuthorityClient", return_value=client),
               patch("sylanne3.host.v2_installation.V2FencePort") as port_type):
@@ -119,7 +119,7 @@ class V2InstallationAssemblyTests(unittest.IsolatedAsyncioTestCase):
         client.installation_grant_v2 = AsyncMock(return_value=grant)
         package = InstalledPackageVerification(True, "verified", digest, "3.0.0-alpha1", "formal-alpha1")
         with (patch("sylanne3.host.v2_installation.load_admin_installation_bundle", return_value=bundle),
-              patch("sylanne3.host.v2_installation.verify_installed_package", return_value=package),
+              patch("sylanne3.host.v2_installation.verify_installed_backend_runtime_v1", return_value=package),
               patch("sylanne3.host.v2_installation.MtlsAuthorityTransport", return_value=transport),
               patch("sylanne3.host.v2_installation.AuthorityClient", return_value=client)):
             with self.assertRaisesRegex(RuntimeError, "differs from administrator"):

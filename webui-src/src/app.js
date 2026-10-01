@@ -3,18 +3,26 @@ import { DEFAULT_WORKBENCH_API_BASE, WorkbenchApi, WorkbenchApiError } from "./a
 import { applyProblem, applyResponse, initialState, switchRole } from "./state.js";
 import { needsFreshProjection, workflowForPage } from "./workflows.js";
 
+import { initializationInput, initializationForm, initializationProjection, validInitializationProfile } from "./d04_initialization.js";
+
 const pages = [
   ["setup", "开始与连接", "核对工作台接通、角色初始化和场景绑定", "read"],
+  ["initialization", "感受核心初始化", "逐步明确选择创作根、预算、映射与角色时钟", "initialize"],
   ["overview", "总览", "当前角色的权限过滤投影与能力状态", "read"],
-  ["creation", "创作", "创建草稿、编译与采用方案", "compile"],
+  ["creation", "创作", "查看已保存方案；编译与采用等待领域命令接入", "read"],
   ["relations", "关系与经历", "关系、情境与纠错投影", "correct"],
   ["memory", "记忆", "已授权记忆来源的元数据摘要", "read"],
-  ["cognition", "感受与认知", "连续感受、关切和解释视图", "read"],
-  ["action", "计划与行动", "目标、承诺、活动与控制", "control"],
-  ["expression", "表达与投递", "表达合同与投递状态，不直接发送", "control"],
-  ["diagnostics", "实验与诊断", "隔离实验、真实费用与结构化诊断", "experiment"],
-  ["lifecycle", "数据与生命周期", "导入、迁移、升级、停用与删除", "transfer"]
+  ["cognition", "感受与认知", "读取服务实际提供的感受、关切和解释视图", "read"],
+  ["action", "计划与行动", "读取服务实际提供的目标、承诺与活动视图", "read"],
+  ["expression", "表达与投递", "读取服务实际提供的表达与投递状态", "read"],
+  ["diagnostics", "实验与诊断", "实验与支持诊断命令尚未接入工作台 API", "unavailable"],
+  ["lifecycle", "数据与生命周期", "备份、迁移、升级、删除与卸载命令尚未接入工作台 API", "unavailable"]
 ];
+const unavailableOperations = Object.freeze({
+  creation: "方案编译与采用尚未接入 W10 命令执行器；此处只显示服务返回的已保存方案。",
+  diagnostics: "W10 当前没有隔离实验或支持诊断的可执行提供方。此页不会创建实验、计费或导出。",
+  lifecycle: "W10 当前没有备份、迁移、升级、删除、停用或卸载的可执行提供方。此页不会更改角色或文件。"
+});
 const relationStatuses = new Set(["unknown", "available", "unavailable", "stale", "blocked_rebuild", "rebuilt", "sanitized", "reset"]);
 
 const state = initialState();
@@ -37,6 +45,14 @@ const ownerDraft = {};
 const setupReceipts = { roleInitialized: null, sceneBound: null };
 const correctionDraft = {};
 let correctionAttempt = null;
+const initializationDraft = {};
+const initializationAttempts = new Map();
+let initializationProfile = null;
+let initializationScope = null;
+function clearInitialization() {
+  for (const key of Object.keys(initializationDraft)) delete initializationDraft[key];
+  initializationAttempts.clear(); initializationProfile = null; initializationScope = null;
+}
 
 function clearCorrectionDraft() {
   for (const key of Object.keys(correctionDraft)) delete correctionDraft[key];
@@ -81,13 +97,14 @@ function statusCopy(status, problem) {
 }
 
 function formMarkup(page) {
+  if (page[0] === "initialization") return initializationForm(initializationDraft, initializationProfile);
+  if (["diagnostics", "lifecycle"].includes(page[0])) return "";
+  if (page[0] === "creation") return `<section class="unavailable-operation" role="status"><h2>编译与采用暂不可用</h2><p>${escapeHtml(unavailableOperations.creation)}</p></section>`;
+  if (["cognition", "action", "expression"].includes(page[0])) return `<p class="read-only-hint">此页只请求服务当前授权的投影。工作台不会用通用字段表单代替领域控制命令。</p>`;
   if (page[0] === "setup") return `<p class="setup-hint">近期场景候选仅来自宿主已观察到的会话，供 Owner 点选。点选不会绑定场景；服务端仍会核验场景和权限，可能暂缓绑定。</p><button type="button" class="quiet" data-command="refresh-scene-candidates" ${state.sessionReady ? "" : "disabled"}>刷新场景候选</button><div class="scene-candidates" aria-label="近期场景候选">${sceneCandidatesProblem ? `<p>${escapeHtml(sceneCandidatesProblem)}</p>` : sceneCandidates.length ? sceneCandidates.map((item, index) => `<button type="button" class="quiet" data-scene-candidate="${index}">${escapeHtml(item.platform_ref)} · ${escapeHtml(item.conversation_ref)} · ${item.visibility === "group" ? "群聊" : "私聊"}</button>`).join("") : "<p>暂无近期场景候选；需在目标会话中产生真实消息后刷新。</p>"}</div><label>场景引用<input name="scene_ref" required autocomplete="off" placeholder="scene:conversation-v1:（64 位小写十六进制值）" /></label><label>可见范围<select name="visibility" required><option value="">请选择</option><option value="private">私聊</option><option value="group">群聊</option></select></label><label class="acknowledgement"><input type="checkbox" name="acknowledgement" required /><span>我确认所选场景和可见范围适用于当前角色，并明确申请绑定。</span></label>`;
-  if (page[0] === "creation") return `<label>方案草稿（JSON 对象，可编辑）<textarea name="draft_json" placeholder='{"fields":{},"field_sources":{}}'></textarea></label><label>已有方案草稿引用（与 JSON 二选一）<input name="draft_ref" placeholder="由已授权草稿提供" /></label><label>已编译候选引用<input name="compiled_scheme_ref" placeholder="采用前由服务签发" /></label><label>操作<select name="mode"><option value="compile">编译候选</option><option value="activate">采用方案</option></select></label>`;
   if (page[0] === "memory") return `<p>可从左侧已授权来源摘要选择来源。目标引用和当前访问、删除纪元须从可信记录核对后填写；服务端仍会重新核验。HOLD 或超时不代表更正已提交。</p><label>更正说明<textarea name="statement" required maxlength="4096">${correctionField("statement")}</textarea></label><label>来源引用（逗号分隔）<input name="source_refs" value="${correctionField("source_refs")}" required /></label><label>目标引用（逗号分隔）<input name="target_refs" value="${correctionField("target_refs")}" required /></label><label>访问纪元<input name="access_epoch" type="number" min="0" step="1" value="${correctionField("access_epoch")}" required /></label><label>删除纪元<input name="deletion_epoch" type="number" min="0" step="1" value="${correctionField("deletion_epoch")}" required /></label><label>影响预览引用（可选）<input name="impact_preview_ref" value="${correctionField("impact_preview_ref")}" /></label><button type="button" class="quiet" data-command="memory-correction" ${state.role && state.sessionReady && state.status !== "loading" ? "" : "disabled"}>提交来源更正申请</button>`;
   if (page[0] === "relations") return `<p>当前仅支持按 D12 source_claim 合同提交来源更正申请；申请可能保持 HOLD，不代表关系或记忆已修改。解释质疑和创作调整暂不可提交。</p><label>更正说明<textarea name="statement" required maxlength="4096"></textarea></label><label>来源引用（逗号分隔）<input name="source_refs" required /></label><label>目标引用（逗号分隔）<input name="target_refs" required /></label><label>访问纪元<input name="access_epoch" type="number" min="0" step="1" required /></label><label>删除纪元<input name="deletion_epoch" type="number" min="0" step="1" required /></label><label>影响预览引用（可选）<input name="impact_preview_ref" /></label>`;
   if (["cognition", "action", "expression"].includes(page[0])) return `<label>对象引用<input name="object_ref" required /></label><label>控制请求<input name="control" placeholder="只提交领域可解释的控制请求" /></label>`;
-  if (page[0] === "diagnostics") return `<label>操作<select name="mode"><option value="experiment">隔离实验</option><option value="support">生成脱敏支持诊断</option></select></label><label>假设或问题<textarea name="hypothesis"></textarea><input name="question" placeholder="支持问题" /></label>`;
-  if (page[0] === "lifecycle") return `<label>操作<select name="mode"><option value="prepare">准备备份或迁移</option><option value="execute">执行已采用计划</option><option value="erase">删除或停用</option><option value="upgrade">校验升级</option></select></label><label>计划/范围引用<input name="plan_ref" /><input name="scope_selection" /><input name="data_choice" placeholder="保留或删除的明确选择" /><input name="release_manifest_ref" placeholder="受信发布清单引用" /></label>`;
   return "";
 }
 
@@ -263,13 +280,17 @@ function setupMarkup() {
 }
 
 function render() {
-  if (!state.sessionReady) { sceneCandidates = []; clearCorrectionDraft(); }
+  if (!state.sessionReady) { sceneCandidates = []; clearCorrectionDraft(); clearInitialization(); }
+  if (initializationScope && initializationScope !== state.role) clearInitialization();
   const page = pages.find(([id]) => id === state.view) ?? pages[0];
   const [statusTitle, statusDetail] = state.view === "setup" && hasVerifiedCatalogue()
     ? ["工作台会话已核验", "角色初始化、场景绑定与验证对话仍需各自的真实回执。"]
     : statusCopy(state.status, state.problem);
   const sessionVerified = state.sessionReady;
-  const body = state.view === "setup" ? setupMarkup() : sessionVerified && state.projection
+  const body = state.view === "setup" ? setupMarkup()
+    : page[3] === "unavailable" ? `<section class="empty-state" role="status"><div class="empty-mark" aria-hidden="true">◇</div><h2>此操作暂不可用</h2><p>${escapeHtml(unavailableOperations[state.view])}</p><p>工作台不会创建本地替身状态，也不会显示为已完成。</p></section>`
+    : state.view === "initialization" && sessionVerified ? initializationProjection(initializationProfile, state.receipt)
+    : sessionVerified && state.projection
     ? state.view === "overview" ? overviewCatalogueMarkup(state.projection)
       : state.view === "creation" ? creationProjectionMarkup(state.projection)
       : state.view === "memory" ? memoryProjectionMarkup(state.projection)
@@ -297,7 +318,7 @@ function render() {
         <div class="state-banner state-${state.status}" role="status"><strong>${statusTitle}</strong><span>${statusDetail}</span></div>
         <div class="workspace-grid"><section class="projection-panel">${body}</section>
           <aside class="inspector" aria-label="操作面板"><h2>操作</h2><p>操作由服务端能力、当前作用域和版本核验。页面不会直接改图或调用平台发送。</p>
-          <form id="page-form">${formMarkup(page)}<button type="button" class="primary" data-command="page-action" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>${page[0] === "setup" ? "提交场景绑定" : page[0] === "relations" ? "提交来源更正申请" : page[3] === "read" ? "读取当前视图" : "提交给服务端"}</button></form>
+          <form id="page-form">${formMarkup(page)}${page[3] === "unavailable" || page[0] === "memory" ? "" : `<button type="button" class="primary" data-command="page-action" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>${page[0] === "initialization" ? "明确提交所选步骤" : page[0] === "setup" ? "提交场景绑定" : page[0] === "relations" ? "提交来源更正申请" : "读取当前视图"}</button>`}</form>
           ${page[0] === "setup" ? `<section class="owner-operation"><h3>角色初始化</h3><p>模型能力和预算目录不会由工作台推测。请从可信安装资料填写引用；服务端未配置或无法核验时会保持 HOLD。</p><form id="create-character-form"><label>角色名称<input name="display_name" required maxlength="80" /></label><label>角色预设<select name="blueprint" required><option value="">请选择</option><option value="d01.persona.warm-listener.v1">温和倾听者</option><option value="d01.persona.curious-maker.v1">好奇探索者</option></select></label><label>模型能力引用<input name="model_capability_ref" required autocomplete="off" placeholder="来自可信安装资料" /></label><label>预算引用<input name="budget_ref" required autocomplete="off" placeholder="来自可信安装资料" /></label><button type="button" class="primary" data-command="create-character" ${state.role && sessionVerified && state.status !== "loading" ? "" : "disabled"}>提交角色初始化</button></form></section>` : ""}
           ${correctionReceipt}<dl><dt>操作收据</dt><dd>${escapeHtml(state.receipt?.operation_id ?? "尚无")}</dd><dt>状态</dt><dd>${escapeHtml(state.receipt?.phase ?? statusTitle)}</dd></dl></aside>
         </div>
@@ -306,16 +327,35 @@ function render() {
 }
 
 async function loadView() {
+  if (state.view === "initialization") initializationProfile = null;
   const epoch = ++requestEpoch;
+  const selectedPage = pages.find(([id]) => id === state.view);
+  if (selectedPage?.[3] === "unavailable") {
+    state.status = "unavailable";
+    state.problem = { code: "workbench_action_unavailable", message: unavailableOperations[state.view] };
+    state.projection = null;
+    state.receipt = null;
+    render();
+    return;
+  }
   if (!state.role) { Object.assign(state, applyProblem(state, { code: "role_required", message: "请填写已由服务端授权的角色范围；浏览器输入不会创建角色。" })); render(); return; }
   state.status = "loading"; state.problem = null; render();
   try {
-    const result = ["setup", "overview"].includes(state.view)
+    const result = state.view === "initialization"
+      ? await api.command(ACTIONS.readD04InitializationProfile, { scope: state.role, purpose: "workbench_view", input: {} })
+      : ["setup", "overview"].includes(state.view)
       ? await api.command(ACTIONS.openWorkspace, { scope: state.role, purpose: "workbench_view", input: { client_protocol: "d12.contract.v1" } })
       : await api.readView({ scope: state.role, viewType: VIEW_TYPES[state.view] });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
-    if (result.status === "unauthorized") { clearSetupReceipts(); clearCorrectionDraft(); }
+    if (result.status === "unauthorized") { clearSetupReceipts(); clearCorrectionDraft(); clearInitialization(); }
+    if (state.view === "initialization") {
+      initializationProfile = result.status === "ready" && validInitializationProfile(result.projection) ? result.projection : null;
+      initializationScope = state.role;
+      const current = initializationProfile?.current;
+      initializationDraft.expected_revision = Number.isSafeInteger(current?.mapping_revision) ? String(current.mapping_revision) : "";
+      initializationDraft.expected_version = Number.isSafeInteger(current?.clock_version) ? String(current.clock_version) : "";
+    }
     Object.assign(state, state.view === "memory" && result.status === "ready" && !validMemoryProjection(result.projection)
       ? applyProblem(state, { code: "invalid_memory_projection", message: "D06 未返回完整且可确认的来源摘要；请重新请求记忆视图。" })
       : applyResponse(state, result));
@@ -494,6 +534,7 @@ async function command(action) {
     sceneCandidatesProblem = null;
     clearSetupReceipts();
     clearCorrectionDraft();
+    clearInitialization();
     Object.assign(state, switchRole(state, value)); render(); await loadView(); return;
   }
   if (action === "retry-session") return verifySession(true);
@@ -518,6 +559,20 @@ async function command(action) {
   if (action === "open-workspace") return commandAction(ACTIONS.openWorkspace, { client_protocol: "d12.contract.v1" }, "workbench_view");
   if (action === "page-action") {
     const page = pages.find(([id]) => id === state.view) ?? pages[0];
+    if (page[3] === "unavailable" || !state.sessionReady || state.status === "loading") return;
+    if (page[0] === "initialization") {
+      try {
+        const values = Object.fromEntries(new FormData(document.querySelector("#page-form")).entries());
+        Object.assign(initializationDraft, values);
+        const mode = values.mode;
+        const input = initializationInput(mode, values, initializationScope === state.role ? initializationProfile : null);
+        const fingerprint = JSON.stringify([state.role, mode, input]);
+        if (!initializationAttempts.has(fingerprint)) initializationAttempts.set(fingerprint, crypto.randomUUID());
+        return commandAction(mode, input, "workbench_user_action", initializationAttempts.get(fingerprint));
+      } catch (error) {
+        Object.assign(state, applyProblem(state, {code: "invalid_input", message: error.message, retryable: false})); render(); return;
+      }
+    }
     if (page[0] === "setup") {
       try {
         const [nextAction, input] = workflowForPage("setup", Object.fromEntries(new FormData(document.querySelector("#page-form")).entries()));
@@ -570,7 +625,7 @@ async function commandAction(action, input, purpose = "workbench_user_action", o
     const result = await api.command(action, { scope: state.role, purpose, input, operationId });
     if (epoch !== requestEpoch) return;
     state.sessionReady = api.hasSession;
-    if (result.status === "unauthorized") { clearSetupReceipts(); clearCorrectionDraft(); }
+    if (result.status === "unauthorized") { clearSetupReceipts(); clearCorrectionDraft(); clearInitialization(); }
     Object.assign(state, applyResponse(state, result));
     rememberSetupReceipt(action, result);
     if (result.status === "ready" && needsFreshProjection(action)) return loadView();
@@ -675,8 +730,17 @@ app.addEventListener("input", (event) => {
     ownerDraft[event.target.name] = event.target.value;
   }
   if (event.target?.id === "owner-signature") ownerSignature = event.target.value;
+  if (state.view === "initialization" && event.target?.form?.id === "page-form" && event.target.name && !["confirm", "profile_reviewed"].includes(event.target.name)) initializationDraft[event.target.name] = event.target.value;
   if (state.view === "memory" && event.target?.form?.id === "page-form" && event.target.name) {
     correctionDraft[event.target.name] = event.target.value;
+  }
+});
+
+app.addEventListener("change", event => {
+  if (state.view === "initialization" && event.target?.id === "initialization-mode") {
+    initializationDraft.mode = event.target.value;
+    delete initializationDraft.confirm; delete initializationDraft.profile_reviewed;
+    render();
   }
 });
 

@@ -40,23 +40,24 @@ class WorkbenchAssetTests(unittest.TestCase):
     def test_verifier_rejects_source_drift_after_manifest_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "webui-src"
+            source = root / "webui-heritage"
             destination = root / "resources" / "workbench"
-            source.mkdir()
+            (source / "dist").mkdir(parents=True)
             destination.mkdir(parents=True)
             content = b"<main>current</main>\n"
-            for directory in (source, destination):
-                (directory / "index.html").write_bytes(content)
+            (source / "dist" / "index.html").write_bytes(content)
+            (destination / "index.html").write_bytes(content)
             manifest = {
                 "schema_version": "sylanne.workbench-assets.v1",
-                "source": "webui-src",
+                "source": "webui-heritage",
+                "build_output": "webui-heritage/dist/index.html",
                 "files": [{"path": "index.html", "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)}],
             }
             (destination / "workbench-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             verifier = _load_workbench_verifier()
             verifier.verify_workbench(root)
-            (source / "index.html").write_bytes(b"<main>new</main>\n")
-            with self.assertRaisesRegex(ValueError, "differs from source"):
+            (source / "dist" / "index.html").write_bytes(b"<main>new</main>\n")
+            with self.assertRaisesRegex(ValueError, "differs from webui-heritage build output"):
                 verifier.verify_workbench(root)
 
 
@@ -102,6 +103,35 @@ class PluginPackageTests(unittest.TestCase):
         _run_git(self.project, "commit", "--quiet", "-m", "fixture")
         self.builder = _load_builder()
 
+    def test_archive_allowlist_excludes_legacy_workbench_source_mirror(self) -> None:
+        native_path = "rewrite/sylanne3/_native/windows-x86_64/sylanne3_kernel.dll"
+        self.assertTrue(self.builder._allowed_package_member("resources/workbench/index.html", native_path))
+        self.assertTrue(self.builder._allowed_package_member("resources/workbench/workbench-manifest.json", native_path))
+        self.assertFalse(self.builder._allowed_package_member("resources/workbench/src/app.js", native_path))
+
+    def test_backend_only_candidate_excludes_unfinished_workbench_and_cannot_be_formal(self) -> None:
+        workbench = self.project / "resources" / "workbench"
+        workbench.mkdir(parents=True)
+        (workbench / "index.html").write_text("stale frontend", encoding="utf-8")
+        (workbench / "workbench-manifest.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "non-release dev-probe"):
+            self.builder.build_package(
+                project_root=self.project, target_os="windows", target_arch="x86_64",
+                native_library=self._native(), output_dir=self.base / "formal-backend",
+                backend_only_dev_probe=True,
+            )
+        package = self.builder.build_package(
+            project_root=self.project, target_os="windows", target_arch="x86_64",
+            native_library=self._native(), output_dir=self.base / "backend",
+            allow_dirty_dev_probe=True, backend_only_dev_probe=True,
+        )
+        with zipfile.ZipFile(package) as archive:
+            manifest = json.loads(archive.read("release-manifest.json"))
+            self.assertEqual(manifest["build_mode"], "dev-probe")
+            self.assertEqual(manifest["candidate_scope"], "backend-only")
+            self.assertFalse(any(name.startswith("resources/workbench/") for name in archive.namelist()))
+        self.builder.verify_package(package)
+
     def _native(self, name: str = "sylanne3_kernel.dll", *, arch: str = "aarch64") -> Path:
         path = self.base / name
         # Header-only fixtures exercise target binding; they are not loadable libraries.
@@ -123,12 +153,28 @@ class PluginPackageTests(unittest.TestCase):
         path.write_bytes(content)
         return path
 
-    def _add_formal_assets(self) -> None:
+    def _add_formal_assets(self, *, backend_only: bool = False) -> None:
         # Synthetic package-builder fixture only; this is not runtime admission.
+        rows = [{
+            "name": f"{domain}.fixture.v1", "owner_kinds": ["persona"],
+            "storage_role": "state", "immutable": False, "schema_version": 1,
+            "writer_domain": domain,
+            "schema_hash": hashlib.sha256(domain.encode()).hexdigest(),
+        } for domain in (f"d{number:02d}" for number in range(1, 14))]
+        canonical_rows = [[row[name] for name in (
+            "name", "owner_kinds", "storage_role", "immutable", "schema_version",
+            "writer_domain", "schema_hash",
+        )] for row in rows]
         catalogue = {
+            "schema_version": "sylanne.catalogue.v1",
+            "runtime_registry": "sylanne3.domain_registry:discover_domain_registry",
+            "registrars": [], "types": rows,
+            "catalogue_hash": hashlib.sha256(json.dumps(
+                canonical_rows, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            ).encode()).hexdigest(),
             "activation_status": "runtime_verified",
             "release_eligibility": "READY",
-            "declared_domains": [f"d{number:02d}" for number in range(1, 13)],
+            "declared_domains": [f"d{number:02d}" for number in range(1, 14)],
             "missing_domain_exports": [],
             "domain_capabilities": {"d04": ["d04.affect.scheme.v1"]},
         }
@@ -174,19 +220,24 @@ class PluginPackageTests(unittest.TestCase):
             } for i, axis in enumerate(affect_scheme["axes"])],
         }
         migrations = {
+            "schema_version": "sylanne.migrations.v1",
             "legacy_data_policy": "registered_migrators",
-            "release_eligibility": "READY",
-            "migrations": [{"id": "fixture-only", "activation": "validated"}],
+            "native_data_policy": self.builder.NATIVE_DATA_POLICY_V1,
+            "release_eligibility": "HOLD: fixture legacy upgrade is prohibited" if backend_only else "READY",
+            "migrations": [{"id": "fixture-only", "activation": (
+                "prohibited_preview_only" if backend_only else "validated"
+            )}],
         }
         workbench_index = b"<main>Sylanne</main>\n"
         workbench_manifest = {
             "schema_version": "sylanne.workbench-assets.v1",
-            "source": "webui-src",
+            "source": "webui-heritage",
+            "build_output": "webui-heritage/dist/index.html",
             "files": [{"path": "index.html", "sha256": hashlib.sha256(workbench_index).hexdigest(),
                        "bytes": len(workbench_index)}],
         }
         files = {
-            "webui-src/index.html": workbench_index,
+            "webui-heritage/dist/index.html": workbench_index,
             "resources/workbench/index.html": workbench_index,
             "resources/workbench/workbench-manifest.json": json.dumps(workbench_manifest).encode(),
             "resources/catalogue/current.json": json.dumps(catalogue).encode() + b"\n",
@@ -202,6 +253,10 @@ class PluginPackageTests(unittest.TestCase):
             path = self.project / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
+        for relative in self.builder.FORMAL_BACKEND_SOURCE:
+            path = self.project / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"# synthetic formal package fixture\n")
         _run_git(self.project, "add", ".")
         _run_git(self.project, "commit", "--quiet", "-m", "formal assets")
 
@@ -220,6 +275,7 @@ class PluginPackageTests(unittest.TestCase):
             "rewrite/native/target/release/sylanne3_kernel.dll": b"stale native",
             "rewrite/sylanne3/__pycache__/runtime.pyc": b"cache",
             "rewrite/sylanne3/debug.log": b"log",
+            "resources/workbench/src/app.js": b"retained old source mirror",
         }
         for relative, content in excluded.items():
             path = self.project / relative
@@ -260,6 +316,7 @@ class PluginPackageTests(unittest.TestCase):
             )
             self.assertNotIn("rewrite/sylanne3/__pycache__/runtime.pyc", names)
             self.assertNotIn("rewrite/sylanne3/debug.log", names)
+            self.assertNotIn("resources/workbench/src/app.js", names)
             manifest = json.loads(archive.read("release-manifest.json"))
             self.assertEqual(manifest["package_version"], "3.0.0-dev.1")
             self.assertEqual(manifest["source"]["dirty"], True)
@@ -394,6 +451,7 @@ class PluginPackageTests(unittest.TestCase):
         self.assertEqual(manifest["platform"]["libc"], "glibc")
         self.assertEqual(manifest["platform"]["cpu_features"], ["neon"])
         self.assertEqual(manifest["platform"]["abi_version"], 2)
+
         binding = manifest["affect_scheme"]
         context_binding = manifest["context_scheme"]
         self.assertEqual(context_binding["path"], "resources/catalogue/d03-neutral-context-scheme.json")
@@ -426,6 +484,116 @@ class PluginPackageTests(unittest.TestCase):
             "rewrite/sylanne3/_native/linux-aarch64/libsylanne3_kernel.so",
             paths,
         )
+
+    def test_formal_backend_only_scope_keeps_backend_and_rejects_missing_assets_or_abi(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets(backend_only=True)
+        # A stale W11 build must not enter this explicitly backend-only package.
+        (self.project / "webui-heritage" / "dist" / "index.html").write_bytes(b"stale")
+        _run_git(self.project, "add", ".")
+        _run_git(self.project, "commit", "--quiet", "-m", "stale UI fixture")
+        with patch.object(self.builder, "_verify_live_backend_catalogue"):
+            package = self.builder.build_package(
+                project_root=self.project, target_os="windows", target_arch="x86_64",
+                native_library=self._native(), output_dir=self.base / "formal-backend",
+                backend_only_alpha1=True,
+            )
+        with zipfile.ZipFile(package) as source:
+            members = {name: source.read(name) for name in source.namelist()}
+        manifest = json.loads(members["release-manifest.json"])
+        self.assertEqual(manifest["build_mode"], "formal-alpha1")
+        self.assertEqual(manifest["candidate_scope"], "backend-only")
+        self.assertEqual(manifest["package_version"], "3.0.0-alpha1")
+        self.assertTrue(self.builder.FORMAL_BACKEND_SOURCE.issubset(members))
+        self.assertFalse(any(name.startswith("resources/workbench/") for name in members))
+        self.assertIn("resources/catalogue/current.json", members)
+        self.assertIn("resources/migrations/v1.json", members)
+        self.assertIn("THIRD_PARTY_NOTICES", members)
+        self.assertIn("SBOM.spdx.json", members)
+        self.builder.verify_package(package)
+
+        # A fully declared member still cannot enlarge the reviewed backend
+        # resource set after the package has been built.
+        extra = "resources/catalogue/session.sqlite3"
+        members[extra] = b"runtime-state"
+        manifest["files"].append({
+            "path": extra, "bytes": len(members[extra]),
+            "sha256": hashlib.sha256(members[extra]).hexdigest(),
+        })
+        members["release-manifest.json"] = json.dumps(manifest).encode()
+        forged = self.base / "formal-backend-unreviewed-resource.zip"
+        with zipfile.ZipFile(forged, "w") as archive:
+            for name, content in members.items():
+                archive.writestr(name, content)
+        with self.assertRaisesRegex(ValueError, "unreviewed backend release resource"):
+            self.builder.verify_package(forged)
+        del members[extra]
+        manifest["files"] = [row for row in manifest["files"] if row["path"] != extra]
+        members["release-manifest.json"] = json.dumps(manifest).encode()
+
+        for mutation, message in (("missing_migration", "release resources"),
+                                  ("missing_w10", "backend runtime source"),
+                                  ("wrong_abi", "platform or ABI"),
+                                  ("wrong_platform", "platform or ABI"),
+                                  ("scope_removed", "release resources"),
+                                  ("forged_catalogue_hash", "catalogue hash"),
+                                  ("forged_migration_gate", "migration placeholders")):
+            with self.subTest(mutation=mutation):
+                altered = dict(members)
+                record = json.loads(altered["release-manifest.json"])
+                if mutation == "missing_migration":
+                    del altered["resources/migrations/v1.json"]
+                    record["files"] = [row for row in record["files"]
+                                       if row["path"] != "resources/migrations/v1.json"]
+                elif mutation == "missing_w10":
+                    del altered["rewrite/sylanne3/workbench_api/__init__.py"]
+                    record["files"] = [row for row in record["files"]
+                                       if row["path"] != "rewrite/sylanne3/workbench_api/__init__.py"]
+                elif mutation == "wrong_abi":
+                    record["platform"]["abi_version"] = 1
+                elif mutation == "wrong_platform":
+                    record["platform"]["arch"] = "aarch64"
+                elif mutation == "forged_catalogue_hash":
+                    path = "resources/catalogue/current.json"
+                    catalogue = json.loads(altered[path])
+                    catalogue["catalogue_hash"] = "0" * 64
+                    altered[path] = json.dumps(catalogue).encode()
+                    entry = next(row for row in record["files"] if row["path"] == path)
+                    entry["bytes"] = len(altered[path])
+                    entry["sha256"] = hashlib.sha256(altered[path]).hexdigest()
+                elif mutation == "forged_migration_gate":
+                    path = "resources/migrations/v1.json"
+                    migration = json.loads(altered[path])
+                    migration["native_data_policy"]["automatic_legacy_migration"] = True
+                    altered[path] = json.dumps(migration).encode()
+                    entry = next(row for row in record["files"] if row["path"] == path)
+                    entry["bytes"] = len(altered[path])
+                    entry["sha256"] = hashlib.sha256(altered[path]).hexdigest()
+                else:
+                    del record["candidate_scope"]
+                altered["release-manifest.json"] = json.dumps(record).encode()
+                forged = self.base / f"formal-backend-{mutation}.zip"
+                with zipfile.ZipFile(forged, "w") as archive:
+                    for name, content in altered.items():
+                        archive.writestr(name, content)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.builder.verify_package(forged)
+
+    def test_formal_backend_build_rejects_unreviewed_resource_before_zip(self) -> None:
+        self._set_formal_version()
+        self._add_formal_assets(backend_only=True)
+        extra = self.project / "resources/catalogue/session.sqlite3"
+        extra.write_bytes(b"runtime-state")
+        _run_git(self.project, "add", ".")
+        _run_git(self.project, "commit", "--quiet", "-m", "unreviewed runtime data")
+        destination = self.base / "formal-backend-unreviewed"
+        with self.assertRaisesRegex(ValueError, "unreviewed backend release resource"):
+            self.builder.build_package(
+                project_root=self.project, target_os="windows", target_arch="x86_64",
+                native_library=self._native(), output_dir=destination,
+                backend_only_alpha1=True,
+            )
+        self.assertFalse(destination.exists())
 
     def test_formal_build_requires_tanh_readout_and_matching_axes(self) -> None:
         self._set_formal_version()
@@ -845,10 +1013,10 @@ class PluginPackageTests(unittest.TestCase):
     def test_package_rejects_stale_workbench_resource(self) -> None:
         self._set_formal_version()
         self._add_formal_assets()
-        (self.project / "webui-src/index.html").write_bytes(b"<main>new source</main>\n")
+        (self.project / "webui-heritage/dist/index.html").write_bytes(b"<main>new source</main>\n")
         _run_git(self.project, "add", ".")
         _run_git(self.project, "commit", "--quiet", "-m", "new workbench source")
-        with self.assertRaisesRegex(ValueError, "packaged workbench differs from source"):
+        with self.assertRaisesRegex(ValueError, "packaged workbench differs from webui-heritage build output"):
             self.builder.build_package(
                 project_root=self.project, target_os="windows", target_arch="x86_64",
                 native_library=self._native(), output_dir=self.base / "stale-workbench",
