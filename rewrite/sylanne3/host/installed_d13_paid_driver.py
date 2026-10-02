@@ -69,9 +69,13 @@ async def run_installed_d13_paid_precompression_v1(
         logger.warning("Sylanne 3 D13 paid lifecycle unavailable; not dispatched; HOLD")
         return None
     workflow = bundle.model_workflows.reply
+    from ..runtime.d13_installed_paid_purpose_v1 import installed_d13_paid_context_model_v1
+    if not installed_d13_paid_context_model_v1(bundle, workflow):
+        logger.warning("Sylanne 3 D13 installed context binding unavailable; HOLD")
+        return None
     descriptor = ModelProviderDescriptor(
         workflow.provider_id, "astrbot-openai-official-v1", workflow.model_id,
-        frozenset({"text"}), frozenset({workflow.purpose}),
+        frozenset({"text"}), frozenset({"context"}),
         frozenset({workflow.privacy_tier}), workflow.provider_config_ref,
         "unknown", False, False,
     )

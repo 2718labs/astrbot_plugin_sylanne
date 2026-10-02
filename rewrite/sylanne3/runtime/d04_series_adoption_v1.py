@@ -16,6 +16,7 @@ from .d04_series_store_v1 import read_d04_series_chunk_prepared_v1, require_d04_
 from .d04_series_output_v1 import derive_d04_series_final_v1, derive_d04_series_numeric_verification_v1
 from .d04_appraisal_driver_v3 import read_d04_original_v3, record_d04_original_in_transaction_v3
 from .d04_contribution_consumption_v3 import current_contribution_writes_v3
+from .d04_installed_stage_fence_v3 import _D04PhaseTimingsV1
 from .d04_semantic_mapping_v3 import require_current_d04_role_clock_v3, joint_evidence_field_v3
 from .d04_joint_advance_v2 import (ProductAdvanceEvidenceV2, ProductAdvanceMemberV2, JointNumericOriginalVerificationV1,
     preflight_joint_advance_v2, preflight_joint_numeric_original_v1, record_joint_advance_v2, record_joint_numeric_original_v1)
@@ -25,7 +26,8 @@ _LOG = logging.getLogger(__name__)
 
 
 class _AdoptionTimings:
-    def __init__(self):
+    def __init__(self, root):
+        self.diagnostics = _D04PhaseTimingsV1(root.root_ref, deadline_utc=root.prepared.binding.deadline_utc)
         self.seconds = dict.fromkeys(("prefix_restore", "final_derive_numeric_verify",
             "authority_gate_validate", "business_transaction"))
         self.phase = "preflight"
@@ -35,10 +37,11 @@ class _AdoptionTimings:
         self.phase = phase
         started = time.perf_counter()
         try:
-            yield
+            with self.diagnostics.measure(phase):
+                yield
         finally:
             elapsed = time.perf_counter() - started
-            previous = self.seconds[phase]
+            previous = self.seconds.get(phase)
             self.seconds[phase] = elapsed if previous is None else previous + elapsed
 
 
@@ -109,7 +112,7 @@ def _evidence(root, decoded, numeric, output, summary, chunks, contributions):
 
 
 def adopt_d04_series_v1(graph, bootstrap, bundle, root):
-    timings = _AdoptionTimings()
+    timings = _AdoptionTimings(root)
     try:
         result = _adopt_d04_series_v1(graph, bootstrap, bundle, root, timings)
     except BaseException as failure:
@@ -165,8 +168,9 @@ def _adopt_d04_series_v1(graph, bootstrap, bundle, root, timings):
             graph._GraphCoordinator__d04_installed_joint_output_policy,
             adoption_stamp=(metadata.graph_revision, epoch.revision))
         installation = graph._GraphCoordinator__d04_installed_joint_assembly
-        verification = derive_d04_series_numeric_verification_v1(numeric, summary,
-            package_root=installation.package_root, available_cpu_features=installation.available_cpu_features)
+        with timings.measure("installed_asset_verify"):
+            verification = derive_d04_series_numeric_verification_v1(numeric, summary,
+                package_root=installation.package_root, available_cpu_features=installation.available_cpu_features)
     with timings.measure("authority_gate_validate"):
         gate = port.series(binding, "gate", phase="restore")
         port.series(binding, "validate", gate=gate)

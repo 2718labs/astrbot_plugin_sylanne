@@ -87,7 +87,7 @@ def life_plan_read_inputs_v1(db, *, namespace, plan, originals=(), now_utc=None)
     return production_read_plan_v1(LIFE_CURRENT_TYPES, keys, roots, originals)
 
 
-def read_plan_current_life_preparation_v1(db, *, namespace, activity_id, operation_kind, request, now_utc):
+def read_plan_current_life_preparation_v1(db, *, namespace, activity_id, operation_kind, request, now_utc, before_capture_policy=None):
     if operation_kind != "prepare_life" or type(request) is not PrepareCurrentLifeRequestV1:
         raise TypeError("exact installed Life preparation read request required")
     raw = raw_life_original_v1(db, namespace, "plan", request.plan_original_ref)
@@ -96,7 +96,15 @@ def read_plan_current_life_preparation_v1(db, *, namespace, activity_id, operati
     plan = life_from_wire_v1(raw, RegisteredLifePlanV2)
     if plan.activity_id != activity_id:
         raise ValueError("Life preparation belongs to another actual adopted activity")
-    return life_plan_read_inputs_v1(db, namespace=namespace, plan=plan, originals=(request.plan_original_ref,), now_utc=now_utc)
+    reads = life_plan_read_inputs_v1(db, namespace=namespace, plan=plan, originals=(request.plan_original_ref,), now_utc=now_utc)
+    if before_capture_policy is not None:
+        from .d04_life_before_original_v1 import life_d04_before_read_inputs_v1
+        keys, roots, originals = life_d04_before_read_inputs_v1(
+            db, namespace=namespace, policy=before_capture_policy)
+        reads = production_read_plan_v1(reads.fixed_type_ids,
+            (*reads.exact_keys, *keys), (*reads.source_roots, *roots),
+            (*reads.required_original_refs, *originals))
+    return reads
 
 
 def stage_prepare_current_life_in_transaction_v1(db, *, frame, request, installed_readers):
@@ -122,7 +130,8 @@ def stage_prepare_current_life_in_transaction_v1(db, *, frame, request, installe
             installation_id=policy.installation_id, authority_id=policy.expected_authority_id,
             authority_namespace=policy.authority_namespace, manifest_digest=policy.manifest_digest,
             job_holder=graph._GraphCoordinator__holder, installed_build=build,
-            body_quote_authority=graph._GraphCoordinator__body_quote_authority, admission_reader=reader)
+            body_quote_authority=graph._GraphCoordinator__body_quote_authority, admission_reader=reader,
+            before_capture_policy=graph._GraphCoordinator__life_d04_before_capture_policy)
     except MissingProductionOriginalV1 as missing:
         return waiting_stage_v1(frame, "d10", "prepare_life", request, missing)
 
@@ -155,6 +164,13 @@ def life_outcome_read_plan_v2(db, *, namespace, activity_id, outcome, original_r
         AtomKey(owner, "d10.life_progress.v1", plan.effect_id)]
     if adopted:
         terminal = life_from_wire_v1(adopted["terminal"], D11LifeTerminalV1)
+        from .d10_life_progress_provenance_v1 import life_progress_read_keys_v1
+        extra.extend(life_progress_read_keys_v1(terminal.binding))
+        from .d11_life_fact_provenance_v1 import life_fact_auxiliary_key_v1, PROVENANCE_TYPE, ELIGIBILITY_TYPE
+        facts=(AtomKey.from_token(terminal.binding.artifact_ref),life_role_segment_key_v1(terminal.binding,'start'),life_role_segment_key_v1(terminal.binding,'end'))
+        extra.extend(life_fact_auxiliary_key_v1(fact,kind) for fact in facts for kind in (PROVENANCE_TYPE,ELIGIBILITY_TYPE))
+        from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
+        extra.extend(life_outcome_read_keys_v1(terminal.binding,plan.action_intent.ref))
         source_id = life_experience_source_id_v1(terminal.binding)
         extra.extend((life_role_segment_key_v1(terminal.binding, "start"), life_role_segment_key_v1(terminal.binding, "end"),
             source_key(*namespace.as_tuple, source_id), access_key(*namespace.as_tuple, source_id)))

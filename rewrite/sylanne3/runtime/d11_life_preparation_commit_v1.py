@@ -29,7 +29,7 @@ def commit_life_preparation_v1(runtime, db, *, operation, request, preparation, 
     from .d11_life_preparation_v1 import (
         record_life_preparation_after_cas_v1, verify_life_preparation_in_transaction_v1)
     from .domain_production_commit_v1 import _ProductionCommitWitnessV1, _ACTIVE
-    from .domain_production_originals_v1 import _receipt_wire
+    from .domain_production_originals_v1 import record_adopted_domain_operation_v1, _receipt_wire
     from ..authority_service.v2_contract import to_wire
     graph = runtime.graph
     verify_life_preparation_in_transaction_v1(db, preparation,
@@ -56,8 +56,9 @@ def commit_life_preparation_v1(runtime, db, *, operation, request, preparation, 
             now_utc=preparation.frame.now_utc, domain_production_issuance_v1=witness)
     finally:
         _ACTIVE.pop(id(witness), None)
-    original = record_life_preparation_after_cas_v1(db, issuer=readers.issuer,
+    prepared_original = record_life_preparation_after_cas_v1(db, issuer=readers.issuer,
         preparation=preparation, graph_receipt=receipt)
+    original = record_adopted_domain_operation_v1(db, preparation.stage, receipt)
     return {"schema": "sylanne.domain-production-receipt.v1", "domain": "d10",
         "operation_kind": operation.operation_kind, "operation_id": binding.prepare_operation_id,
         "action_operation_id": binding.operation_id,
@@ -66,4 +67,6 @@ def commit_life_preparation_v1(runtime, db, *, operation, request, preparation, 
         "receipt": _receipt_wire(receipt), "receipt_digest": canonical_digest(receipt),
         "job_states": [[preparation.job.job_id, preparation.job.phase]], "coverage": "deferred",
         "missing_inputs": ["actual_life_once_claim_and_durable_artifact_terminal"], "continuation_ref": preparation.job.job_id,
-        "outbox": []}
+        "outbox": [], "produced_originals": [{"kind": prepared_original.kind,
+            "original_ref": prepared_original.original_ref,
+            "original_digest": prepared_original.original_digest}]}

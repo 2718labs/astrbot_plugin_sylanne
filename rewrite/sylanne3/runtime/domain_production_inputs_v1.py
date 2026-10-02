@@ -257,6 +257,11 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
         actual = raw_head_value_v1(db, namespace, key)
         if actual:
             if key.type_name == "d10.life_progress.v1":
+                from .d10_life_progress_provenance_v1 import life_progress_auxiliary_key_v1,PROVENANCE_TYPE,ELIGIBILITY_TYPE
+                keys.extend(life_progress_auxiliary_key_v1(key,kind) for kind in (PROVENANCE_TYPE,ELIGIBILITY_TYPE))
+                from .d10_life_progress_provenance_v1 import life_progress_current_read_inputs_v1
+                current_keys,current_roots,current_originals=life_progress_current_read_inputs_v1(db,namespace,key.token)
+                keys.extend(current_keys);roots.extend(current_roots);originals.extend(current_originals)
                 roots += list(actual["source_refs"])
                 originals += list(actual["receipt_refs"])
                 types.append("d02.settlement.v1")

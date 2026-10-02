@@ -8,6 +8,7 @@ import secrets
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest
 from ..runtime_contracts import NamespaceId
+from ..host.model_workflows_v3 import AdminModelWorkflowsV3
 from ..host.authority_profile import AdminIngressModelPolicy, AdminModelWorkflowsV2
 from ..model_broker.broker import ModelCallRequest
 from ..model_broker.first_ingress_encoding import (
@@ -46,7 +47,7 @@ class AuthorityV2ModelEgressService:
             raise TypeError("administrator-pinned model egress graph verifier required")
         if (admin_model_policy is not None
                 and type(admin_model_policy) not in (
-                    AdminIngressModelPolicy, AdminModelWorkflowsV2)):
+                    AdminIngressModelPolicy, AdminModelWorkflowsV2, AdminModelWorkflowsV3)):
             raise TypeError("administrator-installed model policy required")
         self._store = store
         self._fences = fences
@@ -83,7 +84,7 @@ class AuthorityV2ModelEgressService:
         if type(request) is not ModelCallRequest:
             return False
         authority = request.envelope.authority
-        if type(policy) is AdminModelWorkflowsV2:
+        if type(policy) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3):
             if request.identity.phase == "d13.precompress":
                 from ..model_broker.d13_precompression import (
                     TEMPLATE_DIGEST as D13_TEMPLATE_DIGEST,
@@ -99,7 +100,7 @@ class AuthorityV2ModelEgressService:
                     and authority.activation_generation
                         == intent.authority_activation_generation
                     and authority.worker_fence == intent.worker_fence
-                    and authority.purpose == workflow.purpose
+                    and authority.purpose == "context"
                     and bool(authority.audience)
                     and set(authority.audience) <= set(workflow.audiences)
                     and request.privacy_tier == workflow.privacy_tier
@@ -154,6 +155,12 @@ class AuthorityV2ModelEgressService:
                     from ..model_broker.contact_expression_v1 import (GENERATION_TEMPLATE_VERSION,
                         GENERATION_TEMPLATE_DIGEST, REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
                         REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
+                    if type(policy) is AdminModelWorkflowsV3:
+                        from ..model_broker.contact_expression_v2 import (
+                            GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
+                            REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
+                            REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST,
+                        )
                     if request.identity.phase == "contact_generation":
                         workflow = policy.contact_generation
                         expected = ("contact_generation", "proposal", GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST)
@@ -175,11 +182,26 @@ class AuthorityV2ModelEgressService:
                 else:
                     return False
             else:
-                # Keep the existing encoding scope and checks unchanged.
-                workflow = policy.encode
-                expected = ("d06.encode_source", "consolidation",
-                            FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
-                            FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST)
+                if request.identity.phase == "internal_life_content_v2":
+                    from ..model_broker.internal_life_content_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
+                    if type(policy) is not AdminModelWorkflowsV3:
+                        return False
+                    workflow = policy.life_content
+                    expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
+                elif request.identity.phase == "internal_life_numeric_v1":
+                    from ..model_broker.internal_life_numeric_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
+                    if type(policy) is not AdminModelWorkflowsV3:
+                        return False
+                    workflow = policy.life_numeric
+                    expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
+                elif request.identity.phase == "internal_life_content":
+                    return False  # No Life command/result verifier is installed yet.
+                else:
+                    # Keep the existing encoding scope and checks unchanged.
+                    workflow = policy.encode
+                    expected = ("d06.encode_source", "consolidation",
+                                FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+                                FIRST_INGRESS_ENCODING_TEMPLATE_DIGEST)
             if (workflow is None
                     or (workflow.work_kind, workflow.purpose,
                     workflow.template_version,

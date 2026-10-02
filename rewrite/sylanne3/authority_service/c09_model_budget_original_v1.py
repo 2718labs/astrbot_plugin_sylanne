@@ -350,7 +350,7 @@ def require_model_identities_unconsumed_in_tx_v1(db, *, namespace, call_id, oper
 
 
 def capture_frozen_model_budget_originals_v1(*, core_db, business, namespace_id, seal, resource_issuer,
-        require_existing=False):
+        require_existing=False, budget_job_issuer=None):
     """Read real Core/Graph joins in the installed frozen transaction.
 
     No dedicated model execution append is invented. Its original fence pins
@@ -513,6 +513,58 @@ def capture_frozen_model_budget_originals_v1(*, core_db, business, namespace_id,
                     call, quote.quote_id, quote.version, intent.budget_reservation_digest):
                 raise AuthorityUnavailable("C09 D04 appraisal accounting acquire differs")
             source_commitments.extend((prepared[1], original_call[1]))
+        elif job.work_kind == "d06.encode_internal_life_content":
+            # This authenticates one completed acquire against real Core
+            # originals. It does not close the three-table disposal inventory.
+            from ..runtime.issuers import D11BudgetJobIssuer
+            from ..runtime.internal_life_completed_original_v1 import read_completed_internal_life_original_v1
+            if (type(budget_job_issuer) is not D11BudgetJobIssuer
+                    or budget_job_issuer.resource_issuer is not resource_issuer):
+                raise AuthorityUnavailable("C09 completed Life acquire needs the installed same D11 issuer; HOLD")
+            try:
+                life = read_completed_internal_life_original_v1(business,
+                    namespace=namespace_id, issuer=budget_job_issuer, job_id=job.job_id)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise AuthorityUnavailable("C09 completed Life signed acquire/history is unavailable; HOLD") from exc
+            if (record.state != "observed" or terminal is None
+                    or life.intent != intent or life.job != job
+                    or life.delivered.terminal_receipt != terminal
+                    or life.delivered.observation.digest != record.observation_digest
+                    or (life.prepared.call_id, life.prepared.acquire_operation_id,
+                        life.prepared.quote_id, life.prepared.quote_version,
+                        life.prepared.reservation_digest) !=
+                       (call, intent.acquire_operation_id, quote.quote_id,
+                        quote.version, intent.budget_reservation_digest)
+                    or reservation[4] != "settled"):
+                raise AuthorityUnavailable("C09 completed Life differs from actual Core terminal/accounting; HOLD")
+            from ..runtime.internal_life_paid_result_v2 import read_life_paid_original_v2
+            from .internal_life_model_result_contract_v2 import (
+                InternalLifeModelResultReadRequestV2, internal_life_result_from_wire_v2)
+            try:
+                request_original = read_life_paid_original_v2(business, namespace_id,
+                    budget_job_issuer, "read_attempt", life.delivered.request.read_attempt_id)
+                if (request_original is None or internal_life_result_from_wire_v2(
+                        request_original, InternalLifeModelResultReadRequestV2) != life.delivered.request):
+                    raise ValueError("Life paid request differs")
+            except (ValueError, TypeError, KeyError) as exc:
+                raise AuthorityUnavailable("C09 completed Life paid request original differs; HOLD") from exc
+            # Commit exactly the authenticated carrier rows. These opaque
+            # hashes are evidence inputs, never a replacement for full inventory.
+            life_rows = (
+                ("graph_internal_life_content_originals_v1", "original_ref", "prepared", job.job_id),
+                ("graph_internal_life_content_originals_v1", "original_ref", "prepare_commit", job.job_id),
+                *(("graph_internal_life_worker_originals_v2", "job_id", kind, job.job_id)
+                  for kind in ("binding", "request", "acquire_commit", "call")),
+                ("graph_internal_life_paid_originals_v2", "original_ref", "read_attempt", life.delivered.request.read_attempt_id),
+                ("graph_internal_life_paid_originals_v2", "original_ref", "result", job.job_id),
+                ("graph_internal_life_paid_originals_v2", "original_ref", "adoption_commit", job.job_id),
+            )
+            for table, ref_column, kind, ref in life_rows:
+                row = business.execute(f"SELECT * FROM {table} WHERE bot=? AND persona=? AND kind=? AND {ref_column}=?",
+                    (*namespace_id.as_tuple, kind, ref)).fetchone()
+                if row is None:
+                    raise AuthorityUnavailable("C09 completed Life authenticated carrier is missing; HOLD")
+                source_commitments.append(commitment(business, table, row))
         else:
             raise AuthorityUnavailable("C09 model Graph acquire codec is unavailable")
         known = {}

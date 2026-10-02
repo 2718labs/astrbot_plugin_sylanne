@@ -71,8 +71,8 @@ def prepare_installed_execution_source_v4(*,core,closure,credential,subject,oper
                     namespace=closure.namespace,operation_id=operation_id)
                     for name,method in (("executions","execution"),("d02_facts","d02"),
                         ("d11_facts","d11"),("unknown_facts","unknown"),("graph_facts","graph"))}
-            facts, pin = derive_execution_source_fact_frame_v4(context=context, seal=seal,
-                verifier=verifier, reads=reads)
+                facts, pin = _derive_actual_contact_complete_frame_v5(port, context=context, seal=seal,
+                    verifier=verifier, reads=reads)
         with core._tx() as db:
             persist_execution_source_bundle_in_tx_v4(db, seal=seal, pin=pin, facts=facts)
         return dict(seal=seal,pin=pin,facts=facts,rows=rows,accepted_receipt=accepted,run=run)
@@ -151,6 +151,21 @@ def derive_execution_source_fact_frame_v4(*, context, seal, verifier, reads):
     return facts, make_source_pin_v4(seal=seal, facts=facts)
 
 
+def _derive_actual_contact_complete_frame_v5(port, *, context, seal, verifier, reads):
+    from .c09_recovery_frame_v5 import _issue_contact_finish_inventory_v5, _make_issued_frame_v5
+    from .c09_contact_finish_original_v1 import INVENTORY_PREFIX
+    reads = dict(reads)
+    reads['graph_facts'] = tuple(fact for fact in reads['graph_facts'] if not fact.operation_id.startswith(INVENTORY_PREFIX))
+    ordinary, _old_pin = derive_execution_source_fact_frame_v4(context=context, seal=seal, verifier=verifier, reads=reads)
+    inventory = _issue_contact_finish_inventory_v5(port, namespace=seal.namespace, operation_id=seal.operation_id)
+    facts, pin = _make_issued_frame_v5(port, ordinary_facts=ordinary, inventory=inventory, seal=seal)
+    from .c09_contact_frame_authentication_v1 import _issue_authenticated_contact_frames_v1
+    _issue_authenticated_contact_frames_v1(port, facts=facts, pin=pin)
+    from .c09_contact_carrier_inventory_v2 import _capture_issued_contact_carriers_v2
+    _capture_issued_contact_carriers_v2(port, inventory=inventory)
+    return facts, pin
+
+
 def prepare_execution_source_connections_v4(*, core_db, business_db, execution_reader,
         config, control, operation_id, run, accepted):
     """Recompute all installed source originals before exact insertion or replay."""
@@ -167,26 +182,35 @@ def prepare_execution_source_connections_v4(*, core_db, business_db, execution_r
     rows = tuple(raw)
     port = ConnectionC09RecoveryOriginalsV4(config=config, control=control, core_db=core_db,
         business_db=business_db, execution_reader=execution_reader, rows=rows)
-    port._completed_core = control.read_build_original_v1(operation_id=operation_id, kind="file_core") is not None
-    signed = port.verify_execution_rows_v1()
-    prefix = None if execution_reader._schema_version != "4" else canonical_digest(tuple(
-        execution_reader._db.execute("SELECT * FROM authority_v2_execution_redacted_prefix_v4").fetchone()))
-    seal, verifier = derive_execution_source_seal_v4(context=context, installation_id=control.installation_id,
-        namespace=execution_reader.namespace, operation_id=operation_id, head=head, rows=rows,
-        prefix=prefix, run=run, signed=signed)
-    with port.freeze_verified_connection_originals_v4(seal=seal, verifier_commitment=verifier):
-        reads = {name: getattr(port, "read_current_" + method + "_originals_v4")(
-            namespace=execution_reader.namespace, operation_id=operation_id)
-            for name, method in (("executions", "execution"), ("d02_facts", "d02"),
-                ("d11_facts", "d11"), ("unknown_facts", "unknown"), ("graph_facts", "graph"))}
-    facts, pin = derive_execution_source_fact_frame_v4(context=context, seal=seal, verifier=verifier, reads=reads)
-    completed_core = control.read_build_original_v1(operation_id=operation_id, kind="file_core")
-    if completed_core is not None:
-        for table, column, value in (("authority_c09_execution_source_seals_v4", "seal_json", seal),
-                ("authority_c09_execution_source_pins_v4", "pin_json", pin),
-                ("authority_c09_recovery_fact_frames_v4", "facts_json", facts)):
-            if core_db.execute(f"SELECT {column} FROM {table} WHERE namespace=? AND operation_id=?",
-                    (seal.namespace, operation_id)).fetchone() != (canonical_serialize(asdict(value)),):
-                raise AuthorityUnavailable("C09 completed Core candidate forbids new source originals")
-    persist_execution_source_bundle_in_tx_v4(core_db, seal=seal, pin=pin, facts=facts)
-    return dict(seal=seal, pin=pin, facts=facts, rows=rows, accepted_receipt=accepted, run=run)
+    try:
+        port._completed_core = control.read_build_original_v1(operation_id=operation_id, kind="file_core") is not None
+        signed = port.verify_execution_rows_v1()
+        prefix = None if execution_reader._schema_version != "4" else canonical_digest(tuple(
+            execution_reader._db.execute("SELECT * FROM authority_v2_execution_redacted_prefix_v4").fetchone()))
+        seal, verifier = derive_execution_source_seal_v4(context=context, installation_id=control.installation_id,
+            namespace=execution_reader.namespace, operation_id=operation_id, head=head, rows=rows,
+            prefix=prefix, run=run, signed=signed)
+        with port.freeze_verified_connection_originals_v4(seal=seal, verifier_commitment=verifier):
+            reads = {name: getattr(port, "read_current_" + method + "_originals_v4")(
+                namespace=execution_reader.namespace, operation_id=operation_id)
+                for name, method in (("executions", "execution"), ("d02_facts", "d02"),
+                    ("d11_facts", "d11"), ("unknown_facts", "unknown"), ("graph_facts", "graph"))}
+            facts, pin = _derive_actual_contact_complete_frame_v5(port, context=context, seal=seal, verifier=verifier, reads=reads)
+        completed_core = control.read_build_original_v1(operation_id=operation_id, kind="file_core")
+        if completed_core is not None:
+            for table, column, value in (("authority_c09_execution_source_seals_v4", "seal_json", seal),
+                    ("authority_c09_execution_source_pins_v4", "pin_json", pin),
+                    ("authority_c09_recovery_fact_frames_v4", "facts_json", facts)):
+                if core_db.execute(f"SELECT {column} FROM {table} WHERE namespace=? AND operation_id=?",
+                        (seal.namespace, operation_id)).fetchone() != (canonical_serialize(asdict(value)),):
+                    raise AuthorityUnavailable("C09 completed Core candidate forbids new source originals")
+        persist_execution_source_bundle_in_tx_v4(core_db, seal=seal, pin=pin, facts=facts)
+        return dict(seal=seal, pin=pin, facts=facts, rows=rows, accepted_receipt=accepted, run=run,
+            _contact_finish_scope=port._contact_finish_scope,
+            _life_completed_scope=port._life_completed_scope)
+    except BaseException:
+        from .c09_contact_finish_original_v1 import _revoke_contact_finish_scope_v1
+        _revoke_contact_finish_scope_v1(port)
+        from .c09_life_completed_archive_v1 import revoke_completed_life_scope_v1
+        revoke_completed_life_scope_v1(port)
+        raise

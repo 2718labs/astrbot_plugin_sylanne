@@ -37,8 +37,18 @@ class FreshOfflineStorageCaseV1:
         self.protected_directory.cleanup()
 
 
+@dataclass
+class OuterOwnedProtectedRootV1:
+    """Test supervisor owns this new directory beyond the Authority process."""
+    name: str
+
+    def cleanup(self):
+        # The outer permanent acceptance owns deletion after all cold phases.
+        pass
+
+
 def install_fresh_offline_storage_case_v1(*, core, protected, execution, graph_store,
-        root, server_kwargs, peer, namespace, authority_namespace, registry):
+        root, server_kwargs, peer, namespace, authority_namespace, registry, protected_root=None):
     """Use the installer genesis and actual initial four-file selection.
 
     All migrations have run before Owner login or business writes. The later
@@ -49,7 +59,14 @@ def install_fresh_offline_storage_case_v1(*, core, protected, execution, graph_s
         record_installer_genesis_original_v1, install_first_graph_provision_composition_v1,
     )
     from sylanne3.authority_service.linux_bootstrap_v1 import build_initial_inventory_v1, bootstrap_current_storage_v1
-    protected_directory = tempfile.TemporaryDirectory(prefix="sylanne-offline-current-control-")
+    if protected_root is None:
+        protected_directory = tempfile.TemporaryDirectory(prefix="sylanne-offline-current-control-")
+    else:
+        path = Path(protected_root)
+        if not path.is_absolute() or path.is_symlink() or (path.exists() and any(path.iterdir())):
+            raise ValueError("outer C09 protected fixture root must be new and empty")
+        path.mkdir(parents=True, exist_ok=True)
+        protected_directory = OuterOwnedProtectedRootV1(str(path))
     protected_root = Path(protected_directory.name)
     lease = InstalledC09InstanceLeaseV1(protected_root / "instance.lock")
     try:
@@ -95,7 +112,7 @@ def install_fresh_offline_storage_case_v1(*, core, protected, execution, graph_s
         raise
 
 
-def install_actual_offline_authority_case_v1(case):
+def install_actual_offline_authority_case_v1(case, *, register_host_process=True):
     graph, store, core, server = case["graph"], case["store"], case["core"], case["server"]
     authority_namespace = case["authority_namespace"]
     selected = graph._actual_d04_authority_acceptance_v3
@@ -113,8 +130,22 @@ def install_actual_offline_authority_case_v1(case):
     recovery = AuthorityV2DeletionPendingRecovery(core=core, fences=fence_service.fences,
         deletion=bridge.deletion, execution=bridge.journal, namespace=authority_namespace, scoped_store=scoped)
     subject = "mtls:sha256:" + case["peer"].certificate_sha256
+    application_graph, application_bootstrap = graph, case["bootstrap"]
+    if not register_host_process:
+        from sylanne3.graph_store import ProductionGraphStore
+        from sylanne3.graph_coordinator import GraphCoordinator
+        from sylanne3.authority_service.c09_installed_factory_v1 import _LocalInstalledFencePortV1
+        authority_store = ProductionGraphStore(graph_path, case["domain_registry"].type_registry)
+        application_bootstrap = object()
+        application_graph = GraphCoordinator(authority_store, application_bootstrap,
+            holder=case["policy"].administrator_holder,
+            content_fence_v2=_LocalInstalledFencePortV1(fence_service, case["peer"], subject, case["namespace"]),
+            d02_issuer=case["d02_issuer"], d11_issuer=case["d11_issuer"])
+        case["c09_authority_graph"] = application_graph
+        case["c09_authority_store"] = authority_store
+        case["c09_authority_graph_store"] = authority_store
     application = InstalledC09GraphApplicationV1(control=control, core=core, scoped=scoped,
-        coordinator=graph, bootstrap=case["bootstrap"], namespace=case["namespace"], subject=subject, credential=case["peer"])
+        coordinator=application_graph, bootstrap=application_bootstrap, namespace=case["namespace"], subject=subject, credential=case["peer"])
     close_apply = InstalledC09CloseApplyV1(control=control, service=fence_service, recovery=recovery,
         graph_application=application, subject=subject, credential=case["peer"])
     control.install_applied_reader_v1(close_apply)
@@ -153,13 +184,16 @@ def install_actual_offline_authority_case_v1(case):
     # The supervisor boundary registers this actual live PID/birth against the
     # independently observed selected pointer and files, then gives the Host
     # those exact admitted values. It does not assert lifecycle state.
-    process = read_process_identity_v1(os.getpid())
-    assert process is not None
     gate = InstalledC09WriterGateV1(control=control)
-    gate.register_peer_process_v1(peer=(case["peer"].certificate_sha256, bundle.tls_profile.profile_id), process_id=os.getpid(),
-        process_incarnation="offline-acceptance-host:" + process["birth"], pointer_version=context.pointer_version,
-        storage_generation=context.storage_generation)
-    admission = InstalledHostStorageAdmissionV1(case["policy"].installation_id, case["grant"].authority_id,
-        context.pointer_version, context.storage_generation, context.manifest_digest, graph_path, process)
-    admission.require_current_process_v1()
+    admission = None
+    if register_host_process:
+        process = read_process_identity_v1(os.getpid())
+        assert process is not None
+        gate.register_peer_process_v1(peer=(case["peer"].certificate_sha256, bundle.tls_profile.profile_id), process_id=os.getpid(),
+            process_incarnation="offline-acceptance-host:" + process["birth"], pointer_version=context.pointer_version,
+            storage_generation=context.storage_generation)
+        admission = InstalledHostStorageAdmissionV1(case["policy"].installation_id, case["grant"].authority_id,
+            context.pointer_version, context.storage_generation, context.manifest_digest, graph_path, process)
+        admission.require_current_process_v1()
+    case["c09_writer_gate"] = gate
     return service, owner_service, admission

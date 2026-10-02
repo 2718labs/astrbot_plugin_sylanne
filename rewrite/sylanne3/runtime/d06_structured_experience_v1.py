@@ -80,7 +80,10 @@ class InstalledD06StructuredExperienceReadersV1:
                 from .d06_life_activity_lineage_v1 import qualify_current_life_activity_v1
                 activity = qualify_current_life_activity_v1(db, frame=frame, source_atom=source_atom,
                     adopted=adopted, progress=progress, installed_readers=self)
-                start, end, reality = activity.started_at, activity.completed_at, "host_observed"
+                from .d06_internal_life_episode_v2 import compile_internal_life_episode_v2
+                return compile_internal_life_episode_v2(db, frame=frame, request=request,
+                    activity=activity, mapping=mapping, perspective=perspective,
+                    mapping_ref=mapping_atom.key.token, perspective_ref=perspectives[0].key.token)
             else:
                 expected = "d10-life-experience:" + canonical_digest((progress.activity_id, progress.effect_id))[:48]
                 if source.source_id != expected or source.source_kind != ("simulated" if progress.reality == "role_simulation" else "internal"):
@@ -136,6 +139,9 @@ def read_plan_current_d06_structured_experience_v1(db, *, namespace, activity_id
     life_keys, life_originals = life_activity_read_inputs_v1(db, namespace, request.source_ref)
     keys.extend(life_keys)
     originals.extend(life_originals)
+    if life_keys:
+        from .d06_internal_life_episode_v2 import internal_life_episode_keys_v2
+        keys.extend(internal_life_episode_keys_v2(namespace, request.source_ref))
     return production_read_plan_v1(("d01.persona_activation.v1", "d03.self_perspective.v1"), keys,
         (request.source_ref,), originals)
 
@@ -144,7 +150,11 @@ def stage_encode_current_structured_experience_in_transaction_v1(db, *, frame, r
     if type(installed_readers) is not InstalledD06StructuredExperienceReadersV1:
         raise TypeError("exact installed structured memory readers required")
     try:
-        stage = compile_current_structured_experience_v1(frame, request, installed_readers.read_current(db, frame, request))
+        inputs = installed_readers.read_current(db, frame, request)
+        from .d06_internal_life_episode_v2 import InternalLifeEpisodeStageV2
+        if type(inputs) is InternalLifeEpisodeStageV2:
+            return inputs
+        stage = compile_current_structured_experience_v1(frame, request, inputs)
     except MissingProductionOriginalV1 as missing:
         stage = waiting_stage_v1(frame, "d06", "encode_structured_experience", request, missing)
     return verify_d06_structured_experience_stage_v1(stage)

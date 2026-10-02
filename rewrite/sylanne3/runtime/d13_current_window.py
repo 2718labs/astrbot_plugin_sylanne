@@ -377,8 +377,14 @@ def read_current_d13_window_for_authority_v1(
                 or binding.conversation_ref != conversation
                 or arrival.key.token != slot.value["origin_ref"]):
             raise UnavailableGuard("D13 original inbound route differs; HOLD")
+        evidence_version = binding.binding_evidence_event_version
+        binding_evidence = current_atom(evidence_version.key)
+        if (type(binding_evidence.revision) is not int or binding_evidence.revision < 1
+                or binding_evidence.revision != evidence_version.revision):
+            raise UnavailableGuard("D13 original binding evidence changed; HOLD")
         expected = complete_inbound_turn_v1(
-            namespace, slot, arrival, account, source, access)
+            namespace, slot, arrival, account, source, access,
+            binding_evidence=binding_evidence)
         if (expected.write.key != completion.key
                 or expected.write.value != completion.value):
             raise UnavailableGuard("D13 current inbound completion differs; HOLD")

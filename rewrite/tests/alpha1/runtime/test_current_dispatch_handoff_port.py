@@ -8,7 +8,9 @@ import time
 import pytest
 
 from sylanne3.authority_service.v2_clock import IngressClockSampleV2
-from sylanne3.authority_service.v2_contract import PlatformObservationV2
+from sylanne3.authority_service.v2_contract import (
+    MutationReceiptV2, PendingMutationV2, PlatformObservationV2, canonical_digest,
+)
 from sylanne3.authority_service.v2_execution_bridge import (
     CurrentEffectReadV2, handoff_start_digest_v2,
 )
@@ -94,6 +96,37 @@ def test_port_requires_installed_exact_rpc_and_paired_identity(tmp_path, monkeyp
                 fence_port=fence, policy=policy,
                 grant=replace(grant, installation_id="wrong"),
                 claimed_receipt=claimed)
+
+        pending = PendingMutationV2(
+            start.permit, "mutation:observation", "sha256:" + "b" * 64,
+            "observed", start.permit.pinned_anchor, "append:observation",
+            "sha256:" + "c" * 64, claimed_receipt=claimed,
+            platform_observation=observation,
+            predecessor_mutation_id=claimed.pending.mutation_id,
+            predecessor_receipt_digest=canonical_digest(claimed))
+        observed = MutationReceiptV2(
+            pending, replace(pending.before_anchor,
+                             execution_seq=pending.expected_execution_seq,
+                             execution_digest=pending.expected_append_digest),
+            pending.permit.revision + 1, "committed")
+        updated = replace(pending.permit, revision=observed.updated_revision,
+                          pinned_anchor=observed.after_anchor)
+        response = (observed, updated)
+        fence.execution_observe_v2 = lambda **kwargs: response
+        assert asyncio.run(port.record_observation(start, observation)) == response
+
+        # An authenticated reply must still acknowledge this exact observation
+        # and its durable append, rather than another result for the operation.
+        wrong_observation = replace(observation, observation_id="observation:other")
+        cancelled = replace(observed, durable_state="cancelled_unappended",
+                            after_anchor=pending.before_anchor)
+        for response in (
+            (replace(observed, pending=replace(pending, platform_observation=wrong_observation)), updated),
+            (cancelled, replace(updated, pinned_anchor=cancelled.after_anchor)),
+            (observed, start.permit),
+        ):
+            with pytest.raises(RuntimeError, match="receipt differs"):
+                asyncio.run(port.record_observation(start, observation))
 
         class MissingRead(PairedFence):
             execution_read_current_dispatch_handoff = None

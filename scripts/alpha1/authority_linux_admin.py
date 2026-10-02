@@ -20,6 +20,10 @@ def main():
     from sylanne3.authority_service.admin_cli import main as admin
     daemon, _ = open_linux_authority_v1(args.config)
     try:
+        from sylanne3.authority_service.daemon import AuthorityFactualDaemonV2
+        from sylanne3.authority_service.contract import AuthorityUnavailable
+        if type(daemon) is AuthorityFactualDaemonV2:
+            raise AuthorityUnavailable('C09 V2 factual-only installation: Owner mutation administration HOLD')
         return admin(rest, daemon=daemon)
     finally:
         asyncio.run(daemon.aclose())

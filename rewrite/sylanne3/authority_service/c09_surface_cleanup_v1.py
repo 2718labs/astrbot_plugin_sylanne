@@ -206,11 +206,9 @@ class InstalledC09SurfaceCleanupV1:
                 or plan["details"]["inventory_manifest_digest"] != self.inventory.manifest_digest):
             raise AuthorityUnavailable("C09 managed purge plan scope differs")
         for before in plan["details"]["files"]:
-            path = Path(before["resolved_path"])
-            if path.exists():
-                if file_observation_v1(path, exclusive=True) != before:
-                    raise AuthorityUnavailable("C09 managed file changed before unlink")
-                path.unlink()
+            from .c09_durable_unlink_v2 import unlink_inventory_member_durably_v2
+            self.control.lease.require_held()
+            unlink_inventory_member_durably_v2(before)
         after = self._after(context, operation_id, plan)
         return self.control.sign_original_v1("sylanne3.c09.surface-evidence.v1", {
             "schema": "sylanne3.c09.surface-evidence.v1", "installation_id": self.control.installation_id,

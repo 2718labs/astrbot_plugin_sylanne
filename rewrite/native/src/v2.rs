@@ -617,8 +617,19 @@ unsafe fn step_impl(
             out.status = -2;
             return -2;
         }
+        // Only an exact all-coordinate numerical fixed point skips ordinary updates.
+        // Cancelable calls retain every original cancellation observation.
+        let stationary = cancellation.is_none()
+            && next.len() == y.len()
+            && next
+                .iter()
+                .zip(&y)
+                .all(|(after, before)| after.to_bits() == before.to_bits());
         y = next;
         used += 1;
+        if stationary {
+            break;
+        }
     }
     let g = discrete_gradient(&k, &a, alpha, x, &y);
     let jg = j.mul(&g);

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from .model_workflows_v3 import AdminModelWorkflowsV3
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 import hashlib
@@ -300,7 +301,7 @@ class V2FencePort:
                    != grant.installation_id
                 or bundle.installation_policy.manifest_digest
                    != grant.manifest_digest
-                or type(bundle.model_workflows) is not AdminModelWorkflowsV2
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -594,6 +595,37 @@ class V2FencePort:
                 or state not in ("active", "finished")):
             raise RuntimeError("v2 fence status identity mismatch")
         return permit, state
+
+    def read_contact_finished_original_v3(self,scope,*,request_id,request_digest):
+        """Authenticate exact finished identity and converge only its local ACK."""
+        from ..authority_service.contact_fence_finished_v3 import ContactFenceFinishedOriginalV3
+        from ..runtime_contracts import canonical_serialize
+        with self._lock:
+            original=self._submit(self._with_session_repair(lambda:self._read_contact_finished_original_v3(scope)))
+            if (type(original) is not ContactFenceFinishedOriginalV3 or original.permit!=scope.permit
+                    or (original.finish_request_id,original.finish_request_digest)!=(request_id,request_digest)):
+                raise RuntimeError('Contact finished identity differs from its original request; HOLD')
+            pending=self._pending_finish
+            if pending is not None:
+                if canonical_serialize(pending.scope)==canonical_serialize(scope):
+                    if (pending.request_id,pending.request_digest)!=(request_id,request_digest):
+                        raise RuntimeError('Contact pending ACK has another original finish identity; HOLD')
+                    # The protected RPC confirmed this exact original. No
+                    # finish RPC or deletion of a durable receipt occurs.
+                    self._pending_finish=None
+                else:
+                    raise RuntimeError('another pending finish blocks Contact finished recovery; HOLD')
+            return original
+
+    async def _read_contact_finished_original_v3(self,scope):
+        handshake,grant=await self._check_scope(scope)
+        original=await self._transport.read_contact_finished_original_v3(self._request,handshake,scope.permit)
+        if (original.permit!=scope.permit or original.permit.holder!=scope.permit.holder
+                or original.permit.generation!=scope.generation
+                or original.permit.pinned_anchor!=scope.pinned_anchor
+                or original.permit.authority_id!=grant.authority_id or original.permit.subject!=grant.subject):
+            raise RuntimeError('Contact finished original current installation/scope differs')
+        return original
 
     def reject_unbegun_content_fence_v2(
         self, namespace: NamespaceId, authority_namespace: str, *,
@@ -1141,6 +1173,81 @@ class V2FencePort:
     def get_current_owner_authority_for_fence_v1(self, **request):
         from .d12_target_owner_port_v1 import get_current_owner_authority_for_fence_v1
         return get_current_owner_authority_for_fence_v1(self, **request)
+
+    def capture_current_contact_owner_session_v3(self, **request):
+        from ..authority_service.contact_owner_session_rpc_v3 import CAPTURE
+        return self._contact_owner_session_v3(CAPTURE, **request)
+
+    def associate_contact_finished_owner_read_v1(self, **request):
+        from .contact_finished_owner_read_port_v1 import associate_contact_finished_owner_read_v1
+        return associate_contact_finished_owner_read_v1(self, **request)
+
+    def associate_contact_owner_recovery_v3(self, **request):
+        from ..authority_service.contact_owner_session_rpc_v3 import ASSOCIATE
+        return self._contact_owner_session_v3(ASSOCIATE, **request)
+
+    def _contact_owner_session_v3(self, method, *, namespace, authority_namespace,
+            permit, owner_actor_id, owner_session_token, owner_session_request,
+            original=None, use=None, signature=None):
+        from ..authority_service.contact_owner_session_rpc_v3 import CAPTURE, ASSOCIATE
+        from ..authority_service.contact_owner_session_v3 import (
+            ContactOwnerSessionObservationV3, OwnerContactRecoveryUseV3,
+            to_wire as contact_to_wire, from_wire as contact_from_wire, digest,
+            validate_association_v3)
+        from ..authority_service.d12_target_owner_admission_v1 import current_owner_authority_from_wire_v1
+        from ..authority_service.v2_owner_session import to_wire as session_to_wire
+        from ..authority_service.v2_contract import SCHEMA, to_wire, from_wire
+        if method not in {CAPTURE, ASSOCIATE}:
+            raise ValueError('unknown Contact Owner session operation')
+        if method == CAPTURE and any(v is not None for v in (original, use, signature)):
+            raise ValueError('Contact capture cannot carry recovery authority')
+        if method == ASSOCIATE and (type(original) is not ContactOwnerSessionObservationV3
+                or type(use) is not OwnerContactRecoveryUseV3 or type(signature) is not bytes):
+            raise ValueError('Contact recovery requires exact original and signed use')
+        async def read():
+            await self._mapped(namespace, authority_namespace)
+            self._owner_session_identity(namespace, authority_namespace, owner_session_request)
+            handshake, grant = self._identity()
+            if permit.authority_id != grant.authority_id or permit.subject != grant.subject:
+                raise PermissionError('Contact Owner permit belongs to another installation')
+            command = {'namespace': authority_namespace, 'permit': to_wire(permit),
+                'owner_actor_id': owner_actor_id, 'owner_session_token': owner_session_token,
+                'owner_session_request': session_to_wire(owner_session_request)}
+            if method == ASSOCIATE:
+                command.update(original=contact_to_wire(original),use=contact_to_wire(use),signature=signature.hex())
+            response = await self._transport._content_rpc(self._request, handshake, method,
+                command, protocol=SCHEMA)
+            if set(response) != {'observation', 'authority', 'channel_binding_sha256'}:
+                raise RuntimeError('Contact Owner session response fields differ')
+            authority = response['authority']
+            if type(authority) is not dict or set(authority) not in (
+                    {'guard', 'target_admission', 'permit'},
+                    {'guard', 'target_admission', 'storage_admission', 'permit'}):
+                raise RuntimeError('Contact current Owner authority response differs')
+            current = current_owner_authority_from_wire_v1({k:v for k,v in authority.items() if k != 'permit'})
+            if (from_wire(authority['permit']) != permit or current.guard.namespace != namespace
+                    or current.guard.authority_id != grant.authority_id):
+                raise PermissionError('Contact Owner authority fence differs')
+            observed = response['observation']
+            if method == CAPTURE:
+                value = contact_from_wire(observed)
+                if (type(value) is not ContactOwnerSessionObservationV3
+                        or value.principal != owner_session_request.principal
+                        or value.actor != owner_actor_id or value.installation_id != grant.installation_id
+                        or value.authority_id != grant.authority_id or value.authority_namespace != authority_namespace
+                        or value.permit_digest != digest(to_wire(permit))
+                        or value.authority_observation_digest != digest(authority)):
+                    raise PermissionError('Contact captured session identity differs')
+            else:
+                value = validate_association_v3(observed, original=original, use=use,
+                    authority_observation_digest=digest(authority))
+                if (value.principal != owner_session_request.principal
+                        or value.actor != owner_actor_id or value.installation_id != grant.installation_id
+                        or value.authority_id != grant.authority_id or value.authority_namespace != authority_namespace
+                        or value.permit_digest != digest(to_wire(permit))):
+                    raise PermissionError('Contact associated session identity differs')
+            return {'observation': observed, 'authority': authority}
+        return self._submit(self._with_session_repair(read))
 
     def get_current_owner_guard_for_fence(
         self, *, namespace: NamespaceId, authority_namespace: str,

@@ -43,16 +43,32 @@ _POLICY_TABLES = (
 )
 
 
-def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain, operation_kind, request, operation_id=None, now_utc=None, audiences=None):
+def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain, operation_kind, request, operation_id=None, now_utc=None, audiences=None, life_d04_before_capture_policy=None):
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("domain read plan needs the actual W01 current transaction")
     if operation_kind.startswith("input:"):
         from .domain_production_inputs_v1 import read_plan_current_domain_input_v1
         return read_plan_current_domain_input_v1(db, namespace=namespace, activity_id=activity_id,
             producer_kind=operation_kind[len("input:"):], request=request)
+    if operation_kind == "prepare_contact_dispatch_v3":
+        from .contact_final_stage_v3 import read_plan_contact_final_v3
+        return read_plan_contact_final_v3(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request)
+    if operation_kind == "prepare_contact_dispatch":
+        from .contact_final_stage_v2 import read_plan_contact_final_v2
+        return read_plan_contact_final_v2(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request)
+    if operation_kind == "adopt_contact_expression_plan_v2":
+        from .contact_plan_adoption_v2 import read_plan_contact_expression_v2
+        return read_plan_contact_expression_v2(db,namespace=namespace,activity_id=activity_id,
+            operation_kind=operation_kind,request=request)
     if operation_kind == "adopt_contact_expression_plan":
         from .contact_product_adapter_v1 import read_plan_contact_expression_v1
         return read_plan_contact_expression_v1(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request)
+    if operation_kind == "prepare_contact_model_v2":
+        from .contact_product_adapter_v2 import read_plan_contact_model_v2
+        return read_plan_contact_model_v2(db, namespace=namespace, activity_id=activity_id,
             operation_kind=operation_kind, request=request)
     if operation_kind == "prepare_contact_model":
         from .contact_product_adapter_v1 import read_plan_contact_model_v1
@@ -79,7 +95,63 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
     if domain == "d10" and operation_kind == "prepare_life":
         from .d11_life_product_adapter_v1 import read_plan_current_life_preparation_v1
         return read_plan_current_life_preparation_v1(db, namespace=namespace, activity_id=activity_id,
-            operation_kind=operation_kind, request=request, now_utc=now_utc)
+            operation_kind=operation_kind, request=request, now_utc=now_utc,
+            before_capture_policy=life_d04_before_capture_policy)
+    if domain == "d10" and operation_kind == "advance_life":
+        from .d10_production_operations_v1 import AdvanceCurrentLifeRequestV1
+        from .d11_life_product_adapter_v1 import read_plan_current_life_progress_v2
+        if type(request) is AdvanceCurrentLifeRequestV1:
+            # The installed V2 planner already retains complete current query
+            # inventories and separates Source roots from project/Owner
+            # creation originals. Do not reinterpret these typed originals as
+            # expression/source authority through the generic inventory path.
+            actual = read_plan_current_life_progress_v2(
+                db, namespace=namespace, activity_id=activity_id, request=request,
+            )
+            if actual is not None:
+                return actual
+    if operation_kind == "adopt_internal_life_content_v1":
+        from .internal_life_content_adoption_v1 import read_plan_content_adoption_v1
+        return read_plan_content_adoption_v1(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
+    if operation_kind == "acquire_internal_life_content_v2":
+        from .internal_life_content_worker_v2 import read_plan_internal_life_acquire_v2
+        return read_plan_internal_life_acquire_v2(db,namespace=namespace,activity_id=activity_id,
+            operation_kind=operation_kind,request=request)
+    if operation_kind == "acquire_internal_life_content":
+        from .internal_life_content_worker_v1 import read_plan_internal_life_acquire_v1
+        return read_plan_internal_life_acquire_v1(db,namespace=namespace,activity_id=activity_id,
+            operation_kind=operation_kind,request=request)
+    if operation_kind == "prepare_internal_life_content":
+        from .internal_life_content_preparation_v1 import read_plan_internal_life_content_v1
+        return read_plan_internal_life_content_v1(db,namespace=namespace,activity_id=activity_id,
+            operation_kind=operation_kind,request=request)
+    if operation_kind == "prepare_internal_life_numeric_drive":
+        from .d06_life_numeric_drive_v1 import read_plan_life_numeric_drive_v1
+        return read_plan_life_numeric_drive_v1(db, namespace=namespace, activity_id=activity_id, operation_kind=operation_kind, request=request)
+    if operation_kind == "prepare_internal_life_numeric_joint":
+        from .d06_life_numeric_joint_v1 import read_plan_life_numeric_joint_v1
+        return read_plan_life_numeric_joint_v1(db, namespace=namespace, activity_id=activity_id, operation_kind=operation_kind, request=request)
+    if operation_kind == "prepare_internal_life_interval_baseline":
+        from .d04_life_encoding_baseline_v1 import read_plan_life_encoding_baseline_v1
+        return read_plan_life_encoding_baseline_v1(db, namespace=namespace, activity_id=activity_id, operation_kind=operation_kind, request=request)
+    if operation_kind == "adopt_internal_life_numeric_trace":
+        from .d06_life_numeric_trace_v1 import read_plan_life_numeric_trace_v1
+        return read_plan_life_numeric_trace_v1(db, namespace=namespace, activity_id=activity_id, operation_kind=operation_kind, request=request)
+    if operation_kind in {'prepare_internal_life_numeric', 'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
+        from .d06_life_numeric_task_v1 import read_plan_life_numeric_prepare_v1, read_plan_life_numeric_adopt_v1
+        from .d06_life_numeric_worker_v1 import read_plan_life_numeric_acquire_v1
+        planner = {'prepare_internal_life_numeric':read_plan_life_numeric_prepare_v1,
+            'acquire_internal_life_numeric':read_plan_life_numeric_acquire_v1,
+            'adopt_internal_life_numeric':read_plan_life_numeric_adopt_v1}[operation_kind]
+        return planner(db, namespace=namespace, activity_id=activity_id, operation_kind=operation_kind, request=request)
+    if domain == "d06" and operation_kind == "prepare_internal_life_numeric_context":
+        from .d06_life_numeric_context_v1 import read_plan_life_numeric_context_v1
+        return read_plan_life_numeric_context_v1(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request)
+    if domain == "d06" and operation_kind == "encode_internal_life":
+        from .d06_internal_life_encoding_v1 import read_plan_internal_life_encoding_v1
+        return read_plan_internal_life_encoding_v1(db, namespace=namespace, activity_id=activity_id,
+            operation_kind=operation_kind, request=request)
     if domain == "d06" and operation_kind == "encode_structured_experience":
         from .d06_structured_experience_v1 import read_plan_current_d06_structured_experience_v1
         return read_plan_current_d06_structured_experience_v1(db, namespace=namespace, activity_id=activity_id,
@@ -382,16 +454,137 @@ def read_current_domain_command_identity_v1(db, *, namespace, operation_kind, re
         if operation_id != "d02-life-body:" + root.action_operation_id:
             raise ValueError("Body B must be the actual distinct command of root A")
         activity, effect, purpose = root.activity_id, root.effect_id, "consolidation"
+    elif operation_kind in {'prepare_internal_life_content', 'acquire_internal_life_content', 'acquire_internal_life_content_v2','adopt_internal_life_content_v1'}:
+        from .internal_life_content_preparation_v1 import PrepareInternalLifeContentRequestV1
+        from .internal_life_content_worker_v1 import AcquireInternalLifeContentRequestV1
+        from .d06_internal_life_episode_v2 import PROVENANCE,decode_internal_life_value_v2
+        from ..model_broker.internal_life_content_v1 import internal_life_content_ids_for_occurrence_v1
+        from .internal_life_content_worker_v2 import AcquireInternalLifeContentRequestV2
+        from .internal_life_content_adoption_v1 import AdoptInternalLifeContentRequestV1
+        expected = (AdoptInternalLifeContentRequestV1 if operation_kind=="adopt_internal_life_content_v1" else PrepareInternalLifeContentRequestV1 if operation_kind == 'prepare_internal_life_content' else
+            AcquireInternalLifeContentRequestV2 if operation_kind == 'acquire_internal_life_content_v2' else AcquireInternalLifeContentRequestV1)
+        if type(request) is not expected:
+            raise TypeError('exact Life content preparation request required')
+        episode=AtomKey.from_token(request.episode_ref)
+        proof=decode_internal_life_value_v2(PROVENANCE,
+            raw_head_value_v1(db,namespace,AtomKey(episode.owner,PROVENANCE,'record')))
+        ids=internal_life_content_ids_for_occurrence_v1(proof)
+        if (proof.event.namespace!=namespace or proof.episode.episode_ref!=request.episode_ref
+                or proof.event.causal_operation_id!=request.causal_operation_id
+                or proof.event.activity.activity_id!=requested_activity_id
+                or operation_id!=('life-content-adopt:'+ids['job'].removeprefix('life-content-job:') if operation_kind=='adopt_internal_life_content_v1' else ids['prepare' if operation_kind == 'prepare_internal_life_content' else 'acquire'])):
+            raise ValueError('Life content command must use its immutable occurrence once identity')
+        activity,effect,purpose=proof.event.activity.activity_id,None,'consolidation'
+    elif operation_kind in {'prepare_internal_life_numeric', 'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
+        from .d06_life_numeric_context_v1 import life_numeric_context_ids_v1, decode_life_numeric_context_original_v1, KIND
+        from .d06_life_numeric_task_v1 import _identity
+        from .d11_life_product_adapter_v1 import raw_life_original_v1
+        from ..model_broker.internal_life_numeric_v1 import internal_life_numeric_ids_v1
+        raw = raw_life_original_v1(db, namespace, KIND, life_numeric_context_ids_v1(namespace, request.episode_ref)['original'])
+        if raw is None:
+            raise MissingProductionOriginalV1('actual_life_numeric_context')
+        original = decode_life_numeric_context_original_v1(raw)
+        ids = internal_life_numeric_ids_v1(_identity(original))
+        suffix = {'prepare_internal_life_numeric':'prepare', 'acquire_internal_life_numeric':'acquire', 'adopt_internal_life_numeric':'adopt'}[operation_kind]
+        from .d06_internal_life_episode_v2 import PROVENANCE, decode_internal_life_value_v2
+        episode = AtomKey.from_token(request.episode_ref)
+        proof_raw = raw_head_value_v1(db, namespace, AtomKey(episode.owner, PROVENANCE, 'record'))
+        if proof_raw is None:
+            raise MissingProductionOriginalV1('actual_internal_life_episode_provenance')
+        proof = decode_internal_life_value_v2(PROVENANCE, proof_raw)
+        if (original.namespace != namespace or original.episode_ref != request.episode_ref
+                or proof.event.namespace != namespace or proof.episode.episode_ref != request.episode_ref
+                or proof.event.causal_operation_id != request.causal_operation_id
+                or proof.event.activity.activity_id != requested_activity_id or operation_id != ids[suffix]):
+            raise ValueError('numeric Life task identity differs from its actual occurrence')
+        activity, effect, purpose = proof.event.activity.activity_id, None, 'consolidation'
+    elif operation_kind in {'prepare_internal_life_interval_baseline', 'adopt_internal_life_numeric_trace', 'prepare_internal_life_numeric_joint', 'prepare_internal_life_numeric_drive'}:
+        from .d06_internal_life_episode_v2 import PROVENANCE, decode_internal_life_value_v2
+        from .d06_life_numeric_drive_v1 import life_numeric_drive_ids_v1
+        from .d06_life_numeric_joint_v1 import life_numeric_joint_ids_v1
+        from .d04_life_encoding_baseline_v1 import life_encoding_baseline_ids_v1
+        from .d06_life_numeric_trace_v1 import life_numeric_trace_operation_v1
+        if operation_kind == 'prepare_internal_life_numeric_drive':
+            expected = life_numeric_drive_ids_v1(namespace, request.episode_ref, request.appraisal_ref)['operation']
+        elif operation_kind == 'prepare_internal_life_numeric_joint':
+            expected = life_numeric_joint_ids_v1(namespace, request.episode_ref, request.appraisal_ref)['prepare']
+        elif operation_kind == 'prepare_internal_life_interval_baseline':
+            expected = life_encoding_baseline_ids_v1(namespace, request.episode_ref, request.joint_operation_id)['operation']
+        else:
+            expected = life_numeric_trace_operation_v1(namespace, request.episode_ref, request.joint_operation_id)
+        episode = AtomKey.from_token(request.episode_ref)
+        raw = raw_head_value_v1(db, namespace, AtomKey(episode.owner, PROVENANCE, 'record'))
+        if raw is None:
+            raise MissingProductionOriginalV1('actual_internal_life_episode_provenance')
+        proof = decode_internal_life_value_v2(PROVENANCE, raw)
+        if (proof.event.namespace != namespace or proof.episode.episode_ref != request.episode_ref
+                or proof.event.causal_operation_id != request.causal_operation_id
+                or proof.event.activity.activity_id != requested_activity_id or operation_id != expected):
+            raise ValueError('numeric Life mathematical command differs from actual occurrence and adopted input')
+        activity, effect, purpose = proof.event.activity.activity_id, None, 'consolidation'
+    elif operation_kind == "prepare_internal_life_numeric_context":
+        from .d06_life_numeric_context_v1 import PrepareLifeNumericContextRequestV1, life_numeric_context_ids_v1
+        from .d06_internal_life_episode_v2 import PROVENANCE, decode_internal_life_value_v2
+        if type(request) is not PrepareLifeNumericContextRequestV1:
+            raise TypeError('exact numeric Life context request required')
+        episode = AtomKey.from_token(request.episode_ref)
+        raw = raw_head_value_v1(db, namespace, AtomKey(episode.owner, PROVENANCE, 'record'))
+        if raw is None:
+            raise MissingProductionOriginalV1('actual_internal_life_episode_provenance')
+        proof = decode_internal_life_value_v2(PROVENANCE, raw)
+        if (proof.event.namespace != namespace or proof.episode.episode_ref != request.episode_ref
+                or proof.event.causal_operation_id != request.causal_operation_id
+                or proof.event.activity.activity_id != requested_activity_id
+                or operation_id != life_numeric_context_ids_v1(namespace, request.episode_ref)['operation']):
+            raise ValueError('numeric Life context exact occurrence once identity differs')
+        activity, effect, purpose = proof.event.activity.activity_id, None, 'consolidation'
+    elif operation_kind == "encode_internal_life":
+        from .d06_internal_life_encoding_v1 import EncodeInternalLifeRequestV1
+        from .d06_internal_life_episode_v2 import PROVENANCE, decode_internal_life_value_v2
+        if type(request) is not EncodeInternalLifeRequestV1:
+            raise TypeError('exact Life encoding locator required')
+        episode = AtomKey.from_token(request.episode_ref)
+        proof_value = raw_head_value_v1(db, namespace, AtomKey(episode.owner, PROVENANCE, 'record'))
+        if proof_value is None:
+            raise MissingProductionOriginalV1('actual_internal_life_episode_provenance')
+        proof = decode_internal_life_value_v2(PROVENANCE, proof_value)
+        if (proof.event.namespace != namespace or proof.episode.episode_ref != request.episode_ref
+                or proof.event.causal_operation_id != request.causal_operation_id
+                or proof.event.activity.activity_id != requested_activity_id):
+            raise ValueError('Life encoding identity is not its actual occurrence')
+        activity = proof.event.activity.activity_id
+        effect = 'effect:life-encoding:' + canonical_digest((namespace, request.episode_ref, operation_id))[:48]
+        purpose = 'consolidation'
     elif operation_kind in {"encode_structured_experience", "form_association", "adopt_growth", "adopt_relationship_contribution", "reevaluate_relationship",
             "input:prepare_growth_input", "input:derive_growth_trial"}:
         purpose = "consolidation"
+    elif operation_kind == "prepare_contact_dispatch_v3":
+        from .contact_final_stage_v3 import command_identity_contact_final_v3
+        activity, effect, audience = command_identity_contact_final_v3(db, namespace=namespace,
+            request=request, operation_id=operation_id, issuer=_issuer(installed_readers))
+        if (requested_activity_id, requested_audience_ref) != (activity, audience):
+            raise ValueError("Contact3 final command differs from its actual paid activity/audience")
+        purpose = "expression"
+    elif operation_kind == "prepare_contact_dispatch":
+        from .contact_final_stage_v2 import command_identity_contact_final_v2
+        activity, effect, audience = command_identity_contact_final_v2(db, namespace=namespace,
+            request=request, operation_id=operation_id, issuer=_issuer(installed_readers))
+        if (requested_activity_id, requested_audience_ref) != (activity, audience):
+            raise ValueError('Contact final command differs from its original activity/private audience')
+        purpose = 'expression'
+    elif operation_kind == "prepare_contact_model_v2":
+        from .contact_product_adapter_v2 import command_identity_contact_model_v2
+        activity, effect, purpose = command_identity_contact_model_v2(db, namespace=namespace,
+            request=request, operation_id=operation_id, issuer=_issuer(installed_readers))
+        if requested_activity_id != activity:
+            raise ValueError("Contact V2 preparation must use its actual adopted activity")
     elif operation_kind == "prepare_contact_model":
         from .contact_product_adapter_v1 import command_identity_contact_model_v1
         activity, effect, purpose = command_identity_contact_model_v1(db, namespace=namespace,
             request=request, operation_id=operation_id, issuer=_issuer(installed_readers))
         if requested_activity_id != activity:
             raise ValueError("contact model preparation must use its adopted stable activity")
-    elif operation_kind == "adopt_contact_expression_plan":
+    elif operation_kind in {"adopt_contact_expression_plan", "adopt_contact_expression_plan_v2"}:
         from ..domains.d08.contact_plan_v1 import contact_ids_v1
         opportunity = raw_head_value_v1(db, namespace, AtomKey.from_token(request.opportunity_ref))
         if opportunity is None:

@@ -272,10 +272,14 @@ def _completion(namespace: NamespaceId, slot: GraphAtom, source: GraphAtom,
 def complete_inbound_turn_v1(namespace: NamespaceId, slot: GraphAtom,
                              arrival: GraphAtom, account_binding: GraphAtom,
                              source: GraphAtom, access: GraphAtom,
-                             *, tool_state: str = "not_applicable") -> TurnCompletionCandidateV1:
+                             *, binding_evidence: GraphAtom,
+                             tool_state: str = "not_applicable") -> TurnCompletionCandidateV1:
     """Complete only a committed D03 host-observed arrival and matching D06 text."""
-    if (type(arrival) is not GraphAtom or not arrival.valid
+    if (type(arrival) is not GraphAtom or arrival.valid is not True
+            or type(arrival.revision) is not int or arrival.revision < 1
             or arrival.key.type_name != "d03.world_event"
+            or arrival.key.owner.kind != "event"
+            or (arrival.key.owner.bot, arrival.key.owner.persona) != namespace.as_tuple
             or arrival.key.token != slot.value.get("origin_ref")
             or arrival.value.get("kind") != "message_received"
             or arrival.value.get("reality") != "host_observed"
@@ -288,23 +292,41 @@ def complete_inbound_turn_v1(namespace: NamespaceId, slot: GraphAtom,
         raise ValueError("inbound text must remain a reported source")
     participants = arrival.value.get("participant_roles", [])
     if (len(participants) != 1 or participants[0][1] != "sender_account"
-            or type(account_binding) is not GraphAtom or not account_binding.valid
+            or type(account_binding) is not GraphAtom or account_binding.valid is not True
+            or type(account_binding.revision) is not int or account_binding.revision < 1
             or account_binding.key.type_name != "d03.account_binding"
             or account_binding.value.get("entity_id") != participants[0][0]
             or account_binding.value.get("platform_identifier") != record.speaker_id
-            or account_binding.value.get("verification_ref") != arrival.key.token
             or account_binding.value.get("valid_until") is not None
             or (account_binding.key.owner.bot, account_binding.key.owner.persona)
                != namespace.as_tuple
             or record.recorded_at != arrival.value.get("learned_at")):
         raise ValueError("arrival sender role is not unique")
+    if (type(binding_evidence) is not GraphAtom or binding_evidence.valid is not True
+            or type(binding_evidence.revision) is not int or binding_evidence.revision < 1
+            or binding_evidence.key.type_name != "d03.world_event"
+            or binding_evidence.key.owner.kind != "event"
+            or (binding_evidence.key.owner.bot, binding_evidence.key.owner.persona)
+               != namespace.as_tuple
+            or account_binding.value.get("verification_ref") != binding_evidence.key.token
+            or binding_evidence.value.get("kind") != "message_received"
+            or binding_evidence.value.get("reality") != "host_observed"):
+        raise ValueError("original D03 binding evidence differs")
+    evidence_roles = binding_evidence.value.get("participant_roles")
+    if (type(evidence_roles) not in (list, tuple) or len(evidence_roles) != 1
+            or type(evidence_roles[0]) not in (list, tuple)
+            or tuple(evidence_roles[0]) != (account_binding.value["entity_id"], "sender_account")
+            or _time(binding_evidence.value.get("learned_at"))
+               != _time(account_binding.value.get("valid_from"))):
+        raise ValueError("original D03 binding evidence sender or time differs")
     result = _completion(namespace, slot, source, access,
                          evidence_ref=arrival.key.token, speaker_ref=record.speaker_id,
                          trusted_utc=arrival.value["learned_at"], tool_state=tool_state,
                          observation_state="host_observed")
-    return TurnCompletionCandidateV1(result.write, result.read_versions +
-                                     (GraphVersion(arrival.key, arrival.revision),
-                                      GraphVersion(account_binding.key, account_binding.revision)),
+    return TurnCompletionCandidateV1(result.write, tuple(dict.fromkeys(
+                                     result.read_versions +
+                                     tuple(GraphVersion(atom.key, atom.revision) for atom in
+                                           (arrival, account_binding, binding_evidence)))),
                                      result.absent_completion)
 
 

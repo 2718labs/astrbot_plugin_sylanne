@@ -47,8 +47,11 @@ def validate_life_graph_value_v1(type_name, value):
 
 
 def life_graph_type_specs_v1():
-    return tuple(TypeSpec(name, ("activity",), "state", lambda value, name=name: validate_life_graph_value_v1(name, value),
+    from .d11_life_fact_provenance_v1 import life_fact_auxiliary_type_specs_v1
+    from .d11_life_outcome_provenance_v1 import life_outcome_type_specs_v1
+    return (tuple(TypeSpec(name, ("activity",), "state", lambda value, name=name: validate_life_graph_value_v1(name, value),
         immutable=True, schema_version=1, writer_domain="d11", schema_hash=schema_hash({"type": name, "version": 1})) for name in TYPES)
+        + life_fact_auxiliary_type_specs_v1() + life_outcome_type_specs_v1())
 
 
 def life_role_segment_key_v1(binding, phase):
@@ -58,19 +61,20 @@ def life_role_segment_key_v1(binding, phase):
 
 def life_fact_writes_v1(prepared, claim, terminal, artifact):
     b = prepared.binding
-    sources = tuple(AtomKey.from_token(row.ref) for row in prepared.read_rows if AtomKey.from_token(row.ref).type_name in {
-        "memory.source", "memory.access", "d06.source_correction_head.v1"})
     result = []
     for phase, original in (("start", claim), ("end", terminal)):
         key = life_role_segment_key_v1(b, phase)
         result.append(GraphWrite(key, {"schema": key.type_name, "binding": life_to_wire_v1(b),
             "payload": life_to_wire_v1(original.payload), "journal_ref": original.original_ref,
-            "journal_digest": original.claim_digest if phase == "start" else original.terminal_digest}, sources))
+            "journal_digest": original.claim_digest if phase == "start" else original.terminal_digest}))
     if terminal.status == "completed":
         data, digest, length = artifact
         import json
         source_refs = tuple(row.ref for row in prepared.read_rows if AtomKey.from_token(row.ref).type_name == "memory.source")
         result.append(GraphWrite(AtomKey.from_token(b.artifact_ref), {"schema": "d11.adopted-life-artifact.v1",
             "binding": life_to_wire_v1(b), "artifact": json.loads(data), "artifact_digest": digest, "artifact_length": length,
-            "source_refs": list(source_refs), "audiences": list(prepared.plan.audiences), "purposes": ["context", "consolidation"]}, sources))
-    return tuple(result)
+            "source_refs": list(source_refs), "audiences": list(prepared.plan.audiences), "purposes": ["context", "consolidation"]}))
+    from .d11_life_fact_provenance_v1 import life_fact_qualified_writes_v1
+    qualified=life_fact_qualified_writes_v1(prepared,claim,terminal,tuple(result))
+    from .d11_life_outcome_provenance_v1 import life_outcome_qualified_writes_v1
+    return (*qualified,*life_outcome_qualified_writes_v1(prepared,terminal,qualified))

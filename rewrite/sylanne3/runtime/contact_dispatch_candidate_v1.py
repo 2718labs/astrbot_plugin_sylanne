@@ -75,7 +75,7 @@ def validate_contact_dispatch_candidate_writes_v1(
     action, schema, grant = (specs[write.key.type_name].validator(write.value) for write in (aw, sw, gw))
     batch = validate_contact_verified_batch_v1(bw.value)
     content, first = batch.content, batch.content.segments[0]
-    from .contact_final_action_v1 import contact_action_parameters_digest_v1, contact_final_action_ids_v1
+    from .contact_final_action_v1 import contact_action_parameters_digest_v1, contact_final_action_ids_v1, contact_whole_grant_request_v1
     ids = contact_final_action_ids_v1(content.contact_id, 0)
     required = set(BASE_REQUIRED_PROVIDERS) | {PROACTIVE_REQUIRED_PROVIDER}
     if (type(schema) is not ActionSchemaRecord or not schema.proactive
@@ -98,6 +98,7 @@ def validate_contact_dispatch_candidate_writes_v1(
             or (batch.parent_grant_ref, batch.parent_grant_digest) != (gw.key.token, canonical_digest(grant))
             or batch.segment_manifest_digest != grant.segment_manifest_digest
             or grant.contact_id != content.contact_id or grant.audiences != (content.audience_id,)
+            or grant.communication_action_id != contact_whole_grant_request_v1(content).communication_action_id
             or grant.required_slots != content.required_slots or grant.promise_grants
             or grant.route_binding_digest != content.route_semantic_digest
             or grant.cancellation_epoch != content.cancellation_epoch

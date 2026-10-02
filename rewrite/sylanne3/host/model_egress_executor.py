@@ -5,6 +5,7 @@ response may supply the local start identity; recovery reads the original fact.
 """
 
 from __future__ import annotations
+from .model_workflows_v3 import AdminModelWorkflowsV3
 
 import asyncio
 import hashlib
@@ -170,8 +171,12 @@ class HostModelEgressExecutor:
                               or model is workflows.context_reply
                               or model is workflows.natural_generation
                               or model is workflows.natural_review
+                              or model is workflows.contact_generation
+                              or model is workflows.contact_review
                               or model is workflows.appraisal
-                              or model is workflows.d07_cognition))
+                              or model is workflows.d07_cognition
+                              or (type(workflows) is AdminModelWorkflowsV3
+                                  and model is workflows.life_content)))
         if not installed:
             raise ValueError("executor model workflow is not installed")
         self._authority = authority

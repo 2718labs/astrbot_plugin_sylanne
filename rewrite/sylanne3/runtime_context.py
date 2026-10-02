@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from .host.model_workflows_v3 import AdminModelWorkflowsV3
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 import hashlib
@@ -616,7 +617,7 @@ class RuntimeContext:
                         grant=client_grant, owner_loop=loop)
                     workflows = bundle.model_workflows
                     if (bundle.installation_policy == policy
-                            and type(workflows) is AdminModelWorkflowsV2
+                            and type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
                             and type(workflows.natural_generation)
                             is AdminModelWorkflowV2
                             and type(workflows.natural_review)
@@ -798,7 +799,7 @@ class RuntimeContext:
                 workflows = (bundle.model_workflows
                              if type(bundle) is AdminInstallationBundle else None)
                 workflow = (workflows.encode
-                            if type(workflows) is AdminModelWorkflowsV2 else None)
+                            if type(workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3) else None)
                 if (type(workflow) is AdminModelWorkflowV2
                         and bundle.installation_policy == policy
                         and bundle.ingress_encoding == installation.ingress_encoding
@@ -886,6 +887,11 @@ class RuntimeContext:
                         if type(bundle) is AdminInstallationBundle
                         and bundle.installation_policy == policy
                         else None),
+                    life_d04_before_capture_policy=(
+                        bundle.life_d04_before_capture_policy
+                        if type(bundle) is AdminInstallationBundle
+                        and bundle.installation_policy == policy
+                        else None),
                 )
                 for registration in self._domains.registrations.values():
                     coordinator.register_provider(
@@ -901,7 +907,10 @@ class RuntimeContext:
                 from .runtime.d12_installed_services_v1 import install_d12_services_v1
                 d12_backend_port = install_d12_services_v1(coordinator, bootstrap=bootstrap)
                 if bundle.model_workflows.contact_generation is not None:
-                    coordinator.install_contact_model_runtime_v1(bootstrap, bundle)
+                    if type(bundle.model_workflows) is AdminModelWorkflowsV3:
+                        coordinator.install_contact_model_runtime_v2(bootstrap, bundle)
+                    else:
+                        coordinator.install_contact_model_runtime_v1(bootstrap, bundle)
                 if bundle.package_selection is not None:
                     from .host.d12_package_workbench_port_v2 import InstalledD12PackageWorkbenchPortV2
                     package_maintenance_port = InstalledD12PackageWorkbenchPortV2(
@@ -909,7 +918,7 @@ class RuntimeContext:
                 selection = self._model_selection_port
                 if (type(selection) is InstalledModelCapabilityPort
                         and type(bundle) is AdminInstallationBundle
-                        and type(bundle.model_workflows) is AdminModelWorkflowsV2
+                        and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
                         and selection._installation_bundle is bundle
                         and selection._installed_namespace == policy.namespace
                         and selection._host_loop is natural_owner_loop
@@ -1005,7 +1014,7 @@ class RuntimeContext:
             self._v2_authority_client = natural_authority_client
             self._v2_authority_client_grant = natural_client_grant
             self._v2_authority_loop = natural_owner_loop
-            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) is AdminModelWorkflowsV2
+            if (type(bundle) is AdminInstallationBundle and type(bundle.model_workflows) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
                     and bundle.model_workflows.d07_cognition is not None
                     and type(natural_authority_client) is AuthorityClient
                     and natural_owner_loop is asyncio.get_running_loop()):
@@ -1341,6 +1350,84 @@ class RuntimeContext:
         from .host.installed_contact_model_driver_v1 import run_installed_contact_model_v1
         return await run_installed_contact_model_v1(self, installation, context=context,
             trusted_umo=trusted_umo, contact_id=contact_id, phase=phase)
+
+    async def run_installed_contact_model_v2(self, installation, *, context, trusted_umo, contact_id, phase):
+        from .host.installed_contact_model_driver_v2 import run_installed_contact_model_v2
+        return await run_installed_contact_model_v2(self, installation, context=context,
+            trusted_umo=trusted_umo, contact_id=contact_id, phase=phase)
+
+    async def dispatch_committed_contact_v3(self, installation, *, operation_id,
+            context, server, listener, candidates):
+        """Read the actual single Contact original through installed gates.
+
+        The registered Contact writer currently refuses before P0. The final
+        write's six checks cannot substitute for a current P2 qualification.
+        """
+        from .host.contact_dispatch_driver_v3 import (
+            ContactDispatchDriverV3, ContactDispatchResultV3,
+            InstalledContactContinuationV3,
+        )
+        from .host.installed_dispatch_route import InstalledDispatchRoutePort
+        from .host.reverse_handoff import HostReverseGraphClaimServer
+        from .host.scene_candidates import SceneCandidateCatalog
+        from .host.v2_fence_port import V2FencePort
+        if (type(installation) is not V2InstallationAssembly
+                or installation.admin_bundle is not self._v2_model_bundle
+                or installation.installation_policy is not self._v2_policy
+                or installation.installation_grant != self._v2_installation_grant
+                or installation.data_dir != self._data_dir
+                or type(self._worker) is not GraphWorker
+                or type(self._v2_port) is not V2FencePort
+                or self._v2_bootstrap is None or not self._v2_namespace_provisioned
+                or self._final_claim_writer is None
+                or type(server) is not HostReverseGraphClaimServer
+                or type(candidates) is not SceneCandidateCatalog
+                or not isinstance(listener, asyncio.AbstractServer) or not listener.is_serving()
+                or installation.reverse_handoff is None
+                or server.profile is not installation.reverse_handoff.profile
+                or self.health.status not in {'limited', 'ready'}
+                or type(operation_id) is not str or not operation_id):
+            return ContactDispatchResultV3('hold', 'qualified installed Contact handoff unavailable')
+        worker, port, bootstrap = self._worker, self._v2_port, self._v2_bootstrap
+        policy, grant, bundle = (installation.installation_policy,
+            installation.installation_grant, installation.admin_bundle)
+        host_loop = asyncio.get_running_loop()
+        def install(graph):
+            pairing = port.read_final_handoff_pairing_v1(
+                namespace=policy.authority_namespace, installation_id=grant.installation_id)
+            verified = verify_final_handoff_pairing_v1(pairing, installation, installation.reverse_handoff)
+            anchor = port.current_anchor(namespace=policy.namespace,
+                authority_namespace=policy.authority_namespace)
+            lease, capability = graph.grant(bootstrap, actor=grant.administrator_holder,
+                issuer_domain='d11', namespace=policy.namespace,
+                domains=('d03', 'd05', 'd06', 'd08', 'd09', 'd10', 'd11'),
+                activation_generation=anchor.activation_generation, operation_id=operation_id)
+            try:
+                authority = AuthorityContext(grant.administrator_holder, 'd11', capability,
+                    policy.namespace, ('activity',), 'expression', ('internal',),
+                    policy.root_grant.policy_ref, anchor.activation_generation)
+                route = InstalledDispatchRoutePort(context=context, host_loop=host_loop,
+                    candidates=candidates, coordinator=graph, authority=authority, lease=lease,
+                    policy=policy, grant=grant)
+                writer = graph.register_contact_dispatch_final_claim_writer_v3(bootstrap,
+                    route_port=route, issuer_id=verified.issuer_id)
+                return authority, lease, writer
+            except BaseException:
+                graph.release_authority_lease(bootstrap, lease)
+                raise
+        try:
+            authority, lease, writer = await worker.call(install)
+        except Exception as exc:
+            return ContactDispatchResultV3('hold', str(exc))
+        try:
+            continuation = InstalledContactContinuationV3(worker=worker, authority=authority,
+                lease=lease, fence_port=port, policy=policy, grant=grant, server=server,
+                claim_writer=writer, context=context, candidates=candidates,
+                clock_policy=bundle.ingress_clock)
+            return await ContactDispatchDriverV3(worker, authority, lease, continuation).run_once(
+                operation_id=operation_id)
+        finally:
+            await worker.call(lambda graph: graph.release_authority_lease(bootstrap, lease))
 
     def queue_post_c02_numeric_v3(self, installation, *, c02_operation_id, source_ref):
         """Wake one bounded stage from its already adopted appraisal original."""
@@ -2353,7 +2440,7 @@ class RuntimeContext:
         if (type(bundle) is not AdminInstallationBundle
                 or type(policy) is not AdminInstallationPolicy
                 or bundle.installation_policy != policy
-                or type(bundle.model_workflows) is not AdminModelWorkflowsV2
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
                 or type(bundle.model_workflows.reply) is not AdminModelWorkflowV2):
             return None
         main = bundle.model_workflows.reply
@@ -2943,7 +3030,7 @@ class RuntimeContext:
                 or server.profile.namespace != policy.authority_namespace
                 or server.profile.installation_id != grant.installation_id
                 or bundle.installation_policy is not policy
-                or type(bundle.model_workflows) is not AdminModelWorkflowsV2
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -3043,7 +3130,7 @@ class RuntimeContext:
                 or type(bundle) is not AdminInstallationBundle
                 or type(policy) is not AdminInstallationPolicy
                 or bundle.installation_policy is not policy
-                or type(bundle.model_workflows) is not AdminModelWorkflowsV2
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -3273,7 +3360,7 @@ class RuntimeContext:
         if (type(policy) is not AdminInstallationPolicy
                 or type(grant) is not InstallationGrantV2
                 or type(bundle) is not AdminInstallationBundle
-                or type(bundle.model_workflows) is not AdminModelWorkflowsV2
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
                 or type(bundle.model_workflows.natural_review)
                    is not AdminModelWorkflowV2
                 or generation_saved.seal.namespace != policy.namespace

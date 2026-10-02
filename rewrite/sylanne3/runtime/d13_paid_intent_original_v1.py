@@ -8,6 +8,7 @@ the original D02/D11 signatures and reserved budget are re-read here.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 import json
 import sqlite3
 
@@ -400,6 +401,14 @@ def record_d13_paid_call_original_v1(
         (item.ref, item.version) for item in (
             frozen.plan.scene_ref, frozen.plan.audience_ref,
             *frozen.plan.source_dependencies))
+    if job.lease_expires_utc is None:
+        raise ValueError("paid request worker lease is absent")
+    deadline = min(
+        datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp(),
+        datetime.fromisoformat(job.lease_expires_utc.replace("Z", "+00:00")).timestamp(),
+        current.binding.expires_at_utc)
+    if deadline <= current_window.trusted_utc or envelope.deadline_utc != deadline:
+        raise ValueError("paid request deadline differs from current job, worker or binding")
     if (request != expected
             or request.digest != expected.digest
             or envelope.identity.operation_id != binding.original_operation_id

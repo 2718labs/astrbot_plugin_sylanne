@@ -150,7 +150,7 @@ def load_action_job_binding(
 
 
 def bind_action_job(
-    db, action: ActionIntent, receipt: DispatchAdmissionReceiptV1,
+    db, action: ActionIntent, receipt: DispatchAdmissionReceiptV1, *, contact_issuance=None,
 ) -> DispatchActionJobBindingV1:
     """Bind the unique live job to an inserted admission in its graph transaction."""
     if not db.in_transaction:
@@ -170,6 +170,13 @@ def bind_action_job(
                     action.identity.activity_id, action.identity.effect_id,
                     action.identity.attempt_id, action.identity.operation_id)):
         raise ValueError("action or admission identity differs")
+    contact_job = None
+    if contact_issuance is not None:
+        from .contact_final_stage_v1 import require_contact_action_job_v1
+        from .contact_final_stage_v2 import _ContactFinalCommitWitnessV2, require_contact_action_job_v2
+        from .contact_final_stage_v3 import _ContactFinalCommitWitnessV3, require_contact_action_job_v3
+        require_contact = require_contact_action_job_v3 if type(contact_issuance) is _ContactFinalCommitWitnessV3 else require_contact_action_job_v2 if type(contact_issuance) is _ContactFinalCommitWitnessV2 else require_contact_action_job_v1
+        contact_job = require_contact(contact_issuance, db, action, admission)
     # An exact replay reports only its original historical identity.  Job
     # progress after admission belongs to the final current-state check.
     prior = load_action_job_binding(db, namespace, admission.admission_ref)
@@ -201,7 +208,7 @@ def bind_action_job(
          job.operation_id) != (
              *namespace.as_tuple, admission.activity_id, admission.effect_id,
              admission.operation_id)
-            or not (job.work_kind == "dispatch" or post_c02_reply_job)
+            or not (job.work_kind == "dispatch" or post_c02_reply_job or (contact_job is not None and job == contact_job))
             or job.budget_ref != admission.budget_lease_ref
             or job.phase not in {"queued", "running", "waiting", "deferred"}
             or job.cancel_epoch != 0):

@@ -118,8 +118,25 @@ class InstalledD10ContactPolicyServiceV1:
         return hmac.new(self._key, canonical_serialize(material).encode("utf-8"), hashlib.sha256).hexdigest()
 
     def _decode(self, row):
-        original = contact_policy_original_from_wire_v1(json.loads(row[6]))
-        material = asdict(original); material.pop("signature")
+        # Storage uses canonical typed serialization, while the RPC wire is
+        # the separate asdict projection. Authenticate every type marker;
+        # never strip arbitrary caller markers and accept them as the wire.
+        raw = json.loads(row[6])
+        def typed_fields(value, kind):
+            if (type(value) is not dict
+                    or set(value) != {"$type", *kind.__dataclass_fields__}
+                    or value["$type"] != kind.__module__ + "." + kind.__qualname__):
+                raise AuthorityUnavailable("contact-policy stored canonical type differs")
+            return {name: item for name, item in value.items() if name != "$type"}
+        data = typed_fields(raw, D10ContactPolicyOriginalV1)
+        data["namespace"] = typed_fields(data["namespace"], NamespaceId)
+        data["policy"] = typed_fields(data["policy"], ContactPolicy)
+        data["policy"]["namespace"] = typed_fields(data["policy"]["namespace"], NamespaceId)
+        original = contact_policy_original_from_wire_v1(data)
+        # change() signed typed NamespaceId/ContactPolicy values, not their
+        # asdict wire projection. Recreate that exact original material.
+        material = {name: getattr(original, name)
+            for name in original.__dataclass_fields__ if name != "signature"}
         if (row != (original.authority_namespace, original.installation_id, original.policy.policy_id,
                 original.policy.version, original.operation_id, original.action,
                 canonical_serialize(original), original.digest, original.signature)

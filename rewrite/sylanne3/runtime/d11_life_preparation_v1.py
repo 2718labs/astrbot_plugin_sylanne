@@ -106,6 +106,7 @@ class LifePreparationStageV1:
     writes: tuple[GraphWrite, ...]
     read_versions: tuple[GraphVersion, ...]
     admission_reader: object
+    before_capture_stage: object | None = None
 
 
 def life_ids_v1(plan):
@@ -114,6 +115,7 @@ def life_ids_v1(plan):
 
 
 def life_ids_from_binding_v1(binding):
+    # "result" is the signed adopted-original locator, not the bounded Jobs ID.
     return {"job": binding.job_id, "execution": binding.execution_id, "quote": binding.quote_id,
         "reservation": binding.reservation_operation_id, "prepared": binding.prepared_original_ref, "result": binding.artifact_ref}
 
@@ -161,6 +163,10 @@ def _read(db, *, issuer, namespace, kind, ref):
 
 
 def _plan_current(db, read, plan):
+    from .d08_source_note_action_v1 import source_note_attempt_id_v1
+    if plan.attempt_id != source_note_attempt_id_v1(read.frame.envelope.authority.namespace,
+            plan.project.ref, plan.operation_id):
+        raise ValueError('Life current plan lacks its exact installed typed source-note attempt')
     for frozen in (plan.project, plan.recipe, plan.action_intent, plan.input_source, plan.input_access):
         atom = read.head(db, frozen.ref, required=True)
         if atom.revision != frozen.revision or canonical_digest(atom.value) != frozen.digest:
@@ -253,7 +259,8 @@ def read_prepared_life_by_ref_v1(db, *, namespace, prepared_original_ref, issuer
 
 
 def prepare_current_life_in_transaction_v1(db, *, frame, request, issuer, resource_issuer, installation_id,
-        authority_id, authority_namespace, manifest_digest, job_holder, installed_build, body_quote_authority, admission_reader):
+        authority_id, authority_namespace, manifest_digest, job_holder, installed_build, body_quote_authority, admission_reader,
+        before_capture_policy=None):
     from .domain_production_contracts_v1 import CurrentOperationFrameV1
     if (type(frame) is not CurrentOperationFrameV1 or type(request) is not PrepareCurrentLifeRequestV1
             or type(issuer) is not D11BudgetJobIssuer or type(resource_issuer) is not D02ResourceIssuer):
@@ -277,6 +284,11 @@ def prepare_current_life_in_transaction_v1(db, *, frame, request, issuer, resour
     job_key = AtomKey(Owner("activity", *ns.as_tuple, plan.activity_id), "runtime.job", ids["job"])
     if read.head(db, job_key).revision != 0:
         raise MissingProductionOriginalV1("resume_actual_original_life_preparation")
+    before_stage = None
+    if before_capture_policy is not None:
+        from .d04_life_before_original_v1 import capture_life_d04_before_in_tx_v1
+        before_stage = capture_life_d04_before_in_tx_v1(
+            db, frame=frame, request=request, issuer=issuer, policy=before_capture_policy)
     mapping, clock_json = read_current_offline_clock_reference_v1(db, namespace=ns, issuer=issuer)
     clock = json.loads(clock_json)
     read.original(mapping.mapping_id, kind="d11.role_clock", digest=clock["original_digest"])
@@ -340,7 +352,7 @@ def prepare_current_life_in_transaction_v1(db, *, frame, request, issuer, resour
     evaluate_life_admission_v1(db, frame=frame, prepared=prepared, reader=admission_reader)
     stage = stage_result_v1(frame, "d10", "prepare_life", request, provenance={"prepared_binding": binding,
         "execution": "requires_actual_d11_once_claim_and_durable_artifact_postcondition"})
-    return LifePreparationStageV1(frame, stage, prepared, job, (job_graph_write(job),), frame.snapshot.versions, admission_reader)
+    return LifePreparationStageV1(frame, stage, prepared, job, (job_graph_write(job),), frame.snapshot.versions, admission_reader, before_stage)
 
 
 def record_life_preparation_after_cas_v1(db, *, issuer, preparation, graph_receipt):
@@ -367,6 +379,10 @@ def record_life_preparation_after_cas_v1(db, *, issuer, preparation, graph_recei
         operation_id=p.prepare_operation_id, value=p)
     from .d11_life_accounting_v1 import record_life_accounting_prepared_after_cas_v1
     record_life_accounting_prepared_after_cas_v1(db, issuer=issuer, prepared=p)
+    if preparation.before_capture_stage is not None:
+        from .d04_life_before_original_v1 import record_life_d04_before_after_cas_v1
+        record_life_d04_before_after_cas_v1(db, stage=preparation.before_capture_stage,
+            prepared=p, graph_receipt=graph_receipt, issuer=issuer)
     return original
 
 

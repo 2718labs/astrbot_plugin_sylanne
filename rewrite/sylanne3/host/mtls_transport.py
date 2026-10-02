@@ -1212,6 +1212,87 @@ class MtlsAuthorityTransport:
             raise RuntimeError("contact result recovery is unresolved")
         return True
 
+    async def internal_life_model_result_read_v2(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.internal_life_model_result_contract_v2 import InternalLifeModelResultReadRequestV2, InternalLifeModelResultReadV2, internal_life_result_to_wire_v2, internal_life_result_from_wire_v2
+        if (type(read_request) is not InternalLifeModelResultReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("Life content result installation differs")
+        response = await self._content_rpc(request, handshake, "internal_life_model_result_read_v2",
+            {"namespace": namespace, "read_request": internal_life_result_to_wire_v2(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("Life content result response fields differ")
+        result = internal_life_result_from_wire_v2(response["result"], InternalLifeModelResultReadV2)
+        if result.request != read_request:
+            raise RuntimeError("Life content result original differs")
+        return result
+
+    async def internal_life_model_result_recover_finish_v2(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.internal_life_model_result_contract_v2 import InternalLifeModelResultReadRequestV2, internal_life_result_to_wire_v2
+        if (type(read_request) is not InternalLifeModelResultReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("Life content result recovery installation differs")
+        response = await self._content_rpc(request, handshake, "internal_life_model_result_recover_finish_v2",
+            {"namespace": namespace, "read_request": internal_life_result_to_wire_v2(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if response != {"finished": True, "channel_binding_sha256": response.get("channel_binding_sha256")}:
+            raise RuntimeError("Life content result recovery is unresolved")
+        return True
+
+    async def life_numeric_model_result_read_v1(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.current_life_numeric_v1 import LifeNumericModelResultReadRequestV1, LifeNumericModelResultReadV1, life_numeric_result_to_wire_v1, life_numeric_result_from_wire_v1
+        if (type(read_request) is not LifeNumericModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("Life numeric result installation differs")
+        response = await self._content_rpc(request, handshake, "life_numeric_model_result_read_v1",
+            {"namespace": namespace, "read_request": life_numeric_result_to_wire_v1(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("Life numeric result response fields differ")
+        result = life_numeric_result_from_wire_v1(response["result"], LifeNumericModelResultReadV1)
+        if result.request != read_request:
+            raise RuntimeError("Life numeric result original differs")
+        return result
+
+    async def life_numeric_model_result_recover_finish_v1(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.current_life_numeric_v1 import LifeNumericModelResultReadRequestV1, life_numeric_result_to_wire_v1
+        if (type(read_request) is not LifeNumericModelResultReadRequestV1
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("Life numeric result recovery installation differs")
+        response = await self._content_rpc(request, handshake, "life_numeric_model_result_recover_finish_v1",
+            {"namespace": namespace, "read_request": life_numeric_result_to_wire_v1(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if response != {"finished": True, "channel_binding_sha256": response.get("channel_binding_sha256")}:
+            raise RuntimeError("Life numeric result recovery is unresolved")
+        return True
+
+    async def contact_model_result_read_v2(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.contact_model_result_contract_v2 import ContactModelResultReadRequestV2, ContactModelResultReadV2, contact_result_to_wire_v2, contact_result_from_wire_v2
+        if (type(read_request) is not ContactModelResultReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("contact result installation differs")
+        response = await self._content_rpc(request, handshake, "contact_model_result_read_v2",
+            {"namespace": namespace, "read_request": contact_result_to_wire_v2(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if set(response) != {"result", "channel_binding_sha256"}:
+            raise RuntimeError("contact result response fields differ")
+        result = contact_result_from_wire_v2(response["result"], ContactModelResultReadV2)
+        if result.request != read_request:
+            raise RuntimeError("contact result original differs")
+        return result
+
+    async def contact_model_result_recover_finish_v2(self, request, handshake, grant, *, namespace, read_request):
+        from ..authority_service.contact_model_result_contract_v2 import ContactModelResultReadRequestV2, contact_result_to_wire_v2
+        if (type(read_request) is not ContactModelResultReadRequestV2
+                or (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) !=
+                   (grant.authority_id, namespace, grant.installation_id)):
+            raise RuntimeError("contact result recovery installation differs")
+        response = await self._content_rpc(request, handshake, "contact_model_result_recover_finish_v2",
+            {"namespace": namespace, "read_request": contact_result_to_wire_v2(read_request)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if response != {"finished": True, "channel_binding_sha256": response.get("channel_binding_sha256")}:
+            raise RuntimeError("contact result recovery is unresolved")
+        return True
+
     async def d07_cognition_result_recover_finish_v1(self, request, handshake, grant, *, namespace, read_request):
         from ..authority_service.d07_current_execution_v1 import to_wire
         if (read_request.authority_id, read_request.authority_namespace, read_request.installation_id) != (grant.authority_id, namespace, grant.installation_id):
@@ -3591,6 +3672,21 @@ class MtlsAuthorityTransport:
                 or permit.namespace != namespace or permit.operation_id != operation_id):
             raise RuntimeError("authority v2 status response is invalid")
         return permit, response["state"]
+
+    async def read_contact_finished_original_v3(self,request,handshake,permit):
+        from ..authority_service.contact_fence_finished_v3 import contact_finished_from_wire_v3
+        response=await self._content_rpc(request,handshake,'read_contact_finished_original_v3',
+            {'permit':to_wire(permit)},protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response)!={'original','channel_binding_sha256'}
+                or response['channel_binding_sha256']!=handshake.channel_binding_sha256):
+            raise RuntimeError('Contact finished original channel/fields differ')
+        try:original=contact_finished_from_wire_v3(response['original'])
+        except (TypeError,ValueError,KeyError) as exc:
+            raise RuntimeError('Contact finished original response invalid') from exc
+        if (original.permit!=permit or permit.authority_id!=handshake.installation_authority_id
+                or permit.subject!=handshake.installation_identity_ref):
+            raise RuntimeError('Contact finished original subject/permit differs')
+        return original
 
     async def v2_validate_fence(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

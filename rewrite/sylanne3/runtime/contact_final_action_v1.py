@@ -56,7 +56,13 @@ def contact_final_action_ids_v1(contact_id, index):
         "schema": "d08.contact-message.v1"}
 
 
+def require_contact_segment_index_v1(content, index):
+    if type(index) is not int or not 0 <= index < len(content.segments):
+        raise ValueError("contact segment index must name its actual finite content")
+
+
 def contact_action_parameters_digest_v1(content, index, *, parent_grant_ref=None, parent_grant_digest=None):
+    require_contact_segment_index_v1(content, index)
     item = content.segments[index]
     if ((index == 0 and (parent_grant_ref is not None or parent_grant_digest is not None))
             or (index > 0 and (not parent_grant_ref or not parent_grant_digest))):

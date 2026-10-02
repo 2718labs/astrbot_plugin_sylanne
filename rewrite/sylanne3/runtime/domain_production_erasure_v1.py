@@ -514,14 +514,96 @@ def domain_production_original_dispositions_v1(table, columns, rows, *, affected
 
 
 def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
+    if (domain, operation_kind) == ('d06', 'encode_internal_life'):
+        _exact(provenance, ('schema', 'cause'))
+        from .d06_internal_life_encoding_v1 import CAUSE_SCHEMA, decode_internal_life_encoding_cause_v1
+        if provenance['schema'] != CAUSE_SCHEMA:
+            raise DomainProductionErasureHold('Life encoding causal original schema differs')
+        cause = decode_internal_life_encoding_cause_v1(provenance['cause'])
+        return tuple(sorted(row.ref for row in cause.occurrence.historical_reads
+            if AtomKey.from_token(row.ref).type_name == 'memory.source'))
+    if ((domain, operation_kind) == ('d06', 'encode_structured_experience')
+            and type(provenance) is dict and provenance.get('schema') == 'd06.internal-life-episode-original.v2'):
+        _exact(provenance, ('schema', 'proof', 'encoding_status'))
+        from .d06_internal_life_episode_v2 import PROVENANCE, decode_internal_life_value_v2
+        proof = decode_internal_life_value_v2(PROVENANCE, provenance['proof'])
+        if provenance['encoding_status'] != 'encoding_pending':
+            raise DomainProductionErasureHold('Life episode does not certify a subjective trace')
+        return tuple(sorted(row.ref for row in proof.historical_reads if AtomKey.from_token(row.ref).type_name == 'memory.source'))
     """Closed top-level variants; nested content is checked by typed codecs."""
     if type(provenance) is not dict:
         raise DomainProductionErasureHold("stage provenance must be an exact registered object")
+    if (domain, operation_kind) == ('d08', 'prepare_contact_dispatch_v3'):
+        from .contact_final_stage_v3 import validate_contact_final_provenance_v3
+        try:
+            return validate_contact_final_provenance_v3(provenance)
+        except (ValueError, TypeError, KeyError) as error:
+            raise DomainProductionErasureHold('Contact3 closed final provenance differs') from error
+    if (domain, operation_kind) == ('d08', 'prepare_contact_dispatch'):
+        from .contact_final_stage_v1 import validate_contact_final_provenance_v1
+        from .contact_final_stage_v2 import validate_contact_final_provenance_v2
+        try:
+            validate = validate_contact_final_provenance_v2 if provenance.get("schema") == "d08.contact-final-original.v2" else validate_contact_final_provenance_v1
+            return validate(provenance)
+        except (ValueError, TypeError, KeyError) as error:
+            raise DomainProductionErasureHold('Contact final provenance differs from its closed actual join') from error
     if not provenance:
         return ()
+    if (domain, operation_kind) == ('d11','acquire_internal_life_content_v2'):
+        _exact(provenance,('schema','binding','binding_digest','request_digest','job_ref'))
+        from .internal_life_worker_binding_v2 import decode_internal_life_worker_binding_v2
+        binding=decode_internal_life_worker_binding_v2(provenance['binding'])
+        job=AtomKey.from_token(provenance['job_ref'])
+        if (provenance['schema']!='d06.internal-life-worker-acquisition.v2'
+                or provenance['binding_digest']!=binding.digest or job.type_name!='runtime.job'
+                or job.name!=binding.job_id or NamespaceId.from_key(job)!=binding.namespace
+                or type(provenance['request_digest']) is not str
+                or not re.fullmatch(r'[0-9a-f]{64}',provenance['request_digest'])):
+            raise DomainProductionErasureHold('Life worker dual-role original scope differs')
+        return (binding.episode_ref,job.token,binding.owner_guard.grant_ref)
+    if (domain, operation_kind) == ('d11', 'acquire_internal_life_content'):
+        _exact(provenance, ('schema','prepared_digest','episode_ref','request_digest','job_ref'))
+        from .d06_internal_life_episode_v2 import EPISODE
+        episode = AtomKey.from_token(provenance['episode_ref'])
+        job = AtomKey.from_token(provenance['job_ref'])
+        if (provenance['schema'] != 'd06.internal-life-content-acquisition.v1'
+                or episode.type_name != EPISODE or job.type_name != 'runtime.job'
+                or NamespaceId.from_key(episode) != NamespaceId.from_key(job)
+                or not job.name.startswith('life-content-job:')
+                or any(type(provenance[name]) is not str or not re.fullmatch(r'[0-9a-f]{64}', provenance[name])
+                    for name in ('prepared_digest','request_digest'))):
+            raise DomainProductionErasureHold('Life acquired input provenance closed scope differs')
+        return (episode.token, job.token)
+    if (domain, operation_kind) == ('d11', 'prepare_internal_life_content'):
+        _exact(provenance, ('prepared_digest', 'episode_ref', 'occurrence_digest', 'job_ref'))
+        from .d06_internal_life_episode_v2 import EPISODE
+        episode = AtomKey.from_token(provenance['episode_ref'])
+        job = AtomKey.from_token(provenance['job_ref'])
+        if (episode.type_name != EPISODE or job.type_name != 'runtime.job'
+                or NamespaceId.from_key(episode) != NamespaceId.from_key(job)
+                or not job.name.startswith('life-content-job:')
+                or any(type(provenance[name]) is not str or not re.fullmatch(r'[0-9a-f]{64}', provenance[name])
+                    for name in ('prepared_digest', 'occurrence_digest'))):
+            raise DomainProductionErasureHold('Life content preparation provenance scope/closed type differs')
+        return (episode.token, job.token)
+    if (domain, operation_kind) == ("d11", "prepare_contact_model_v2"):
+        from .c09_contact_originals_v2 import decode_contact_preparation_provenance_v2
+        return decode_contact_preparation_provenance_v2(provenance)
     if (domain, operation_kind) == ("d11", "prepare_contact_model"):
         from .c09_contact_originals_v1 import decode_contact_preparation_provenance_v1
         return decode_contact_preparation_provenance_v1(provenance)
+    if (domain,operation_kind)==('d08','adopt_contact_expression_plan_v2'):
+        _exact(provenance,('schema','contact_plan','expression','proof'))
+        from ..domains.d08.contact_plan_v2 import PROVENANCE,PLAN,decode_contact_plan_member_v2
+        from .contact_plan_adoption_v2 import SIGN_KIND
+        from ..domains.d09.natural_reply import NaturalExpressionPlanV2
+        proof=decode_contact_plan_member_v2(PROVENANCE,provenance['proof'])
+        plan=decode_contact_plan_member_v2(PLAN,provenance['contact_plan'])
+        expression=decode_typed_production_value_v1(provenance['expression'],NaturalExpressionPlanV2)
+        if (provenance['schema']!=SIGN_KIND or canonical_serialize(proof.plan)!=canonical_serialize(plan)
+                or canonical_digest(expression.units)!=plan.qualified_units_digest):
+            raise DomainProductionErasureHold('Contact Plan v2 actual expression/proof differs')
+        return tuple(sorted(set(_references(provenance))))
     if (domain, operation_kind) == ("d08", "adopt_contact_expression_plan"):
         _exact(provenance, ("contact_plan", "expression", "owner_policy_original", "owner_policy_digest"))
         from ..domains.d08.contact_plan_v1 import decode_contact_plan_v1

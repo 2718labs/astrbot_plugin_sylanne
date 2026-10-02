@@ -211,7 +211,7 @@ def stage_current_d04_drive_in_transaction_v3(
         else asdict(dose_policy.namespace) if name == "namespace" else getattr(dose_policy, name)
         for name in dose_policy.__dataclass_fields__}
     signed_budget_grant = {"kind": "budget-grant.v1", "payload_json": grant_json, "signature": grant_signature}
-    acceptance = read_d04_appraisal_acceptance_v3(db, namespace, appraisal_ref)
+    acceptance = _read_mapping_appraisal_acceptance_v1(db, namespace, appraisal_ref, issuer)
     if acceptance is None:
         raise ValueError("D04 appraisal is not adopted")
     appraisal_atom = snapshot.get(AtomKey.from_token(appraisal_ref))
@@ -219,7 +219,11 @@ def stage_current_d04_drive_in_transaction_v3(
             or appraisal_atom.revision != acceptance.appraisal_revision
             or canonical_serialize(appraisal_atom.value) != acceptance.appraisal_value_json):
         raise ValueError("D04 adopted appraisal graph original changed")
-    original_cost = read_d04_original_v3(db, namespace, "appraisal_cost", acceptance.cost_original_ref)
+    from .d06_life_numeric_task_v1 import LifeNumericAppraisalAcceptanceV1, read_life_numeric_paid_cost_for_acceptance_v1
+    if type(acceptance) is LifeNumericAppraisalAcceptanceV1:
+        original_cost = read_life_numeric_paid_cost_for_acceptance_v1(db, acceptance, issuer)
+    else:
+        original_cost = read_d04_original_v3(db, namespace, "appraisal_cost", acceptance.cost_original_ref)
     if original_cost is None or original_cost[1] != acceptance.cost_original_digest or original_cost[0]["paid"] is not True:
         raise ValueError("D04 adopted appraisal lacks fully paid original")
     source_versions, family_by_ref = qualify_appraisal_sources_v3(snapshot, frozen, audience=audience, purpose=purpose)
@@ -418,7 +422,9 @@ def freeze_current_d04_joint_evidence_inputs_v3(
             if len(matching) != 1 or canonical_serialize(matching[0]["value"]) != canonical_serialize(asdict(drive)):
                 raise ValueError("D04 actual numeric drive differs from mapping-issued write")
         appraisal_ref = raw["appraisal_acceptance_ref"]
-        appraisal = read_d04_appraisal_acceptance_v3(db, namespace, appraisal_ref)
+        graph = getattr(installed_mapping_reader, 'graph', None)
+        issuer = getattr(graph, '_GraphCoordinator__d11_issuer', None)
+        appraisal = _read_mapping_appraisal_acceptance_v1(db, namespace, appraisal_ref, issuer)
         if appraisal is None or appraisal.digest != raw["appraisal_acceptance_digest"]:
             raise ValueError("D04 mapped appraisal acceptance original changed")
         mappings[drive.mapping_compiler_ref] = {"ref": drive.mapping_compiler_ref, "digest": digest, "payload": raw}
@@ -564,3 +570,20 @@ def record_d04_joint_evidence_payloads_in_transaction_v3(db, operation_id, paylo
         raise ValueError("D04 evidence payloads require fenced adoption transaction")
     return record_d04_original_in_transaction_v3(db, payloads.inputs.namespace,
         "joint_evidence_payloads", operation_id, asdict(payloads))
+
+
+def _read_mapping_appraisal_acceptance_v1(db, namespace, appraisal_ref, issuer):
+    """Two closed adopted-original families; neither reader issues authority."""
+    from .d06_life_numeric_task_v1 import read_life_numeric_appraisal_acceptance_v1
+    from .issuers import D11BudgetJobIssuer
+    old = read_d04_appraisal_acceptance_v3(db, namespace, appraisal_ref)
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='graph_d11_life_originals_v1'").fetchone() is None:
+        return old
+    if db.execute("SELECT 1 FROM graph_d11_life_originals_v1 WHERE bot=? AND persona=? AND kind='numeric_appraisal_acceptance_v1' AND original_ref=?", (*namespace.as_tuple, appraisal_ref)).fetchone() is None:
+        return old
+    if type(issuer) is not D11BudgetJobIssuer:
+        raise ValueError('numeric mapping appraisal requires the actual installed D11 issuer')
+    numeric = read_life_numeric_appraisal_acceptance_v1(db, namespace, appraisal_ref, issuer)
+    if old is not None and numeric is not None:
+        raise ValueError('mapping appraisal has ambiguous original families')
+    return numeric if numeric is not None else old

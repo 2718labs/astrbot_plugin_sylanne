@@ -404,5 +404,24 @@ class AuthorityV2FenceService:
         self.core._require(credential, permit.operation, self.namespace, permit.holder)
         return permit, state
 
+    def read_contact_finished_original_v3(self, *, credential, subject: str, permit: FencePermitV2):
+        """Observe one actual finished Owner write with protected current guards."""
+        from .contact_fence_finished_v3 import ContactFenceFinishedOriginalV3
+        from .v2_contract import canonical_digest
+        if type(permit) is not FencePermitV2 or permit.operation != 'write':
+            raise AuthorityUnavailable('Contact finished observation needs its original write permit')
+        self.core._require(credential, 'current', self.namespace)
+        self._require_permit(credential=credential,subject=subject,permit=permit)
+        with self._frozen() as (db,deletion_head,execution_head,deletion_history):
+            anchor=self._current_locked(db,deletion_head,execution_head,
+                holder=permit.holder,generation=permit.generation)
+            if deletion_history:self.core.require_current_content_ready_locked(db,namespace=self.namespace)
+            row=self.fences._row(db,permit.operation_id)
+            if (row is None or row[1]!=self.namespace or row[2]!=subject
+                    or self.fences._permit(row)!=permit or row[6]!='finished' or row[10] is not None
+                    or anchor!=permit.pinned_anchor):
+                raise AuthorityUnavailable('Contact actual finished original unavailable; HOLD')
+            return ContactFenceFinishedOriginalV3(permit,canonical_digest(permit),row[8],row[9],anchor)
+
 
 __all__ = ["AuthorityV2FenceService"]

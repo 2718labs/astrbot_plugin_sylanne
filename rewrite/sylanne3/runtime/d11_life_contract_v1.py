@@ -323,6 +323,47 @@ class D11LifeTerminalV1:
         return self.payload.actual_cpu_ms
 
 
+def life_adoption_operation_id_v1(binding):
+    return "d11-life-adopt:" + canonical_digest((binding.namespace, binding.execution_id, binding.digest))[:48]
+
+
+def life_job_result_binding_v1(terminal, *, artifact_graph_digest, artifact_revision=1):
+    """Address a completed job result; only the authenticated original grants authority.
+
+    The existing artifact name binds namespace/effect, but omits job/generation.
+    This domain-separated ID commits the entire original version and execution
+    scope. Its immutable Graph member must be revision one in the actual CAS.
+    """
+    if type(terminal) is not D11LifeTerminalV1 or terminal.status != "completed":
+        raise ValueError("Life job result requires its actual completed terminal")
+    if type(artifact_revision) is not int or artifact_revision != 1:
+        raise ValueError("Life job result requires the first immutable artifact version")
+    _digest(artifact_graph_digest)
+    b = terminal.binding
+    key = AtomKey.from_token(b.artifact_ref)
+    value = {"schema": "d11.life-job-result-binding.v1", "namespace": plain_v1(b.namespace),
+        "activation_generation": b.activation_generation, "binding_digest": b.digest,
+        "job_id": b.job_id, "operation_id": b.operation_id,
+        "producing_operation_id": life_adoption_operation_id_v1(b), "execution_id": b.execution_id,
+        "artifact_ref": key.token, "artifact_name": key.name, "artifact_revision": artifact_revision,
+        "artifact_graph_digest": artifact_graph_digest, "artifact_digest": terminal.payload.artifact_digest,
+        "artifact_length": terminal.payload.artifact_length, "prepared_digest": terminal.payload.prepared_digest,
+        "terminal_ref": terminal.original_ref, "terminal_digest": canonical_digest(plain_v1(terminal))}
+    value["result_ref"] = "d11-life-result:" + canonical_digest(("d11.life-job-result.v1", value))
+    return value
+
+
+def validate_life_job_result_binding_v1(value, *, terminal):
+    """Check the closed mapping; SQL/signature/member authentication is separate."""
+    if type(value) is not dict:
+        raise ValueError("Life job result binding requires a closed object")
+    expected = life_job_result_binding_v1(terminal, artifact_graph_digest=value.get("artifact_graph_digest"),
+        artifact_revision=value.get("artifact_revision"))
+    if canonical_serialize(value) != canonical_serialize(expected):
+        raise ValueError("Life job result original scope/version/identity differs")
+    return expected["result_ref"]
+
+
 @dataclass(frozen=True, slots=True)
 class RegisteredLifeOutcomeV2:
     plan_original_ref: str

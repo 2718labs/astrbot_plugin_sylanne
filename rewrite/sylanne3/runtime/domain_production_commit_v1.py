@@ -45,12 +45,39 @@ _ACTIVE = {}
 
 
 def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
+    from .internal_life_content_worker_v2 import InternalLifeContentAcquisitionStageV2
+    if type(getattr(witness,'stage',None)) is InternalLifeContentAcquisitionStageV2:
+        from .internal_life_content_worker_v2 import (
+            require_exact_internal_life_acquisition_issuance_v2,
+            verify_internal_life_acquisition_in_transaction_v2, internal_life_acquisition_bundle_v2)
+        require_exact_internal_life_acquisition_issuance_v2(witness,graph,bundle)
+        if (db is not graph._GraphCoordinator__store._db or not db.in_transaction
+                or not graph._GraphCoordinator__store._lock._is_owned()
+                or v2_write is None or witness.scope.graph_revision!=v2_write[0].graph_revision
+                or witness.scope.graph_epoch!=v2_write[1]
+                or not graph._anchor_matches(v2_write[0].requirements,witness.scope.pinned_anchor)):
+            raise ValueError('Life worker dual-role witness lost its actual original write fence')
+        from .domain_production_registry_v1 import installed_readers_for_operation_v1
+        readers=installed_readers_for_operation_v1(graph,witness.operation,scope=witness.scope,owner_guard=witness.guard)
+        verify_internal_life_acquisition_in_transaction_v2(db,witness.stage,readers)
+        if internal_life_acquisition_bundle_v2(witness.stage)!=bundle:
+            raise ValueError('Life worker exact dual-role bundle changed')
+        return witness
     from .d11_offline_adoption_v1 import _OfflineCommitWitnessV1, require_offline_commit_v1
     if type(witness) is _OfflineCommitWitnessV1:
         return require_offline_commit_v1(witness, graph, db, bundle, v2_write)
     from .d11_life_adoption_v1 import _LifeCommitWitnessV1, require_life_commit_v1
     if type(witness) is _LifeCommitWitnessV1:
         return require_life_commit_v1(witness, graph, db, bundle, v2_write)
+    from .contact_final_stage_v1 import _ContactFinalCommitWitnessV1, require_contact_final_commit_v1
+    if type(witness) is _ContactFinalCommitWitnessV1:
+        return require_contact_final_commit_v1(witness, graph, db, bundle, v2_write)
+    from .contact_final_stage_v2 import _ContactFinalCommitWitnessV2, require_contact_final_commit_v2
+    if type(witness) is _ContactFinalCommitWitnessV2:
+        return require_contact_final_commit_v2(witness, graph, db, bundle, v2_write)
+    from .contact_final_stage_v3 import _ContactFinalCommitWitnessV3, require_contact_final_commit_v3
+    if type(witness) is _ContactFinalCommitWitnessV3:
+        return require_contact_final_commit_v3(witness, graph, db, bundle, v2_write)
     if (type(witness) is not _ProductionCommitWitnessV1 or _ACTIVE.get(id(witness)) is not witness
             or witness.graph is not graph or witness.runtime.graph is not graph
             or db is not graph._GraphCoordinator__store._db or not db.in_transaction
@@ -70,7 +97,54 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
     from .d10_offline_tick_execution_v1 import D10OfflineTickPreparationStageV1
     from .d11_life_preparation_v1 import LifePreparationStageV1
     from .contact_product_adapter_v1 import ContactModelStageV1
-    if type(witness.stage) is D07PreparationStageV1:
+    from .contact_product_adapter_v2 import ContactModelStageV2
+    from .internal_life_content_preparation_v1 import InternalLifeContentPreparationStageV1,verify_internal_life_content_preparation_in_transaction_v1
+    from .internal_life_content_worker_v1 import InternalLifeContentAcquisitionStageV1
+    from .internal_life_content_adoption_v1 import InternalLifeContentAdoptionStageV1,verify_content_stage_v1,content_bundle_v1
+    from .d06_life_numeric_commit_v1 import _numeric_stage_types, require_exact_life_numeric_task_issuance_v1, verify_life_numeric_task_commit_v1
+    if type(witness.stage) in _numeric_stage_types():
+        from .domain_production_registry_v1 import installed_readers_for_operation_v1
+        require_exact_life_numeric_task_issuance_v1(witness, graph, bundle)
+        readers = installed_readers_for_operation_v1(graph, witness.operation,
+            scope=witness.scope, owner_guard=witness.guard)
+        verify_life_numeric_task_commit_v1(db, witness, readers)
+        return witness
+    from .d06_life_numeric_commit_v1 import life_numeric_math_stages_v1, require_exact_life_numeric_math_issuance_v1, verify_life_numeric_math_stage_v1
+    if type(witness.stage) in life_numeric_math_stages_v1():
+        from .domain_production_registry_v1 import installed_readers_for_operation_v1
+        require_exact_life_numeric_math_issuance_v1(witness, graph, bundle)
+        readers = installed_readers_for_operation_v1(graph, witness.operation,
+            scope=witness.scope, owner_guard=witness.guard)
+        verify_life_numeric_math_stage_v1(db, witness.stage, readers)
+        return witness
+    from .d06_life_numeric_context_v1 import LifeNumericContextStageV1, verify_life_numeric_context_stage_v1
+    if type(witness.stage) is LifeNumericContextStageV1:
+        from .d06_life_numeric_commit_v1 import require_exact_life_numeric_context_issuance_v1
+        from .domain_production_registry_v1 import installed_readers_for_operation_v1
+        require_exact_life_numeric_context_issuance_v1(witness, graph, bundle)
+        readers = installed_readers_for_operation_v1(graph, witness.operation,
+            scope=witness.scope, owner_guard=witness.guard)
+        verify_life_numeric_context_stage_v1(db, witness.stage, installed_readers=readers)
+    elif type(witness.stage) is InternalLifeContentAdoptionStageV1:
+        from .domain_production_registry_v1 import installed_readers_for_operation_v1
+        readers=installed_readers_for_operation_v1(graph,witness.operation,scope=witness.scope,owner_guard=witness.guard)
+        verify_content_stage_v1(db,witness.stage,readers,witness.request)
+        if content_bundle_v1(witness.stage)!=bundle:raise ValueError('Life content actual four-member bundle changed')
+    elif type(witness.stage) is InternalLifeContentAcquisitionStageV1:
+        from .internal_life_content_worker_v1 import verify_internal_life_acquisition_in_transaction_v1, internal_life_acquisition_bundle_v1
+        from .domain_production_registry_v1 import installed_readers_for_operation_v1
+        readers = installed_readers_for_operation_v1(graph,witness.operation,scope=witness.scope,owner_guard=witness.guard)
+        verify_internal_life_acquisition_in_transaction_v1(db,witness.stage,readers)
+        if internal_life_acquisition_bundle_v1(witness.stage) != bundle:
+            raise ValueError('Life exact current acquired bundle differs')
+    elif type(witness.stage) is InternalLifeContentPreparationStageV1:
+        from .internal_life_content_commit_v1 import internal_life_content_preparation_bundle_v1
+        from .domain_production_registry_v1 import installed_readers_for_operation_v1
+        readers=installed_readers_for_operation_v1(graph,witness.operation,scope=witness.scope,owner_guard=witness.guard)
+        verify_internal_life_content_preparation_in_transaction_v1(db,witness.stage,readers,readers.life_content_bundle)
+        if internal_life_content_preparation_bundle_v1(witness.stage)!=bundle:
+            raise ValueError('Life exact independently checked preparation bundle differs')
+    elif type(witness.stage) is D07PreparationStageV1:
         service = getattr(graph, '_GraphCoordinator__d07_execution_service_v1', None)
         if service is None:
             raise ValueError('actual D07 installed service disappeared')
@@ -93,6 +167,17 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
             issuer=graph._GraphCoordinator__d11_issuer, resource_issuer=graph._GraphCoordinator__d02_issuer)
         if life_preparation_bundle_v1(graph, witness.stage) != bundle:
             raise ValueError('Life current prepared bundle differs')
+    elif type(witness.stage) is ContactModelStageV2:
+        from .contact_product_adapter_v2 import verify_contact_model_preparation_in_transaction_v2
+        from .contact_model_preparation_commit_v2 import contact_model_preparation_bundle_v2
+        assembly = graph._GraphCoordinator__d04_installed_joint_assembly
+        if assembly is None:
+            raise ValueError('actual installed Contact V2 model assembly disappeared')
+        verify_contact_model_preparation_in_transaction_v2(db, witness.stage,
+            issuer=graph._GraphCoordinator__d11_issuer, resource_issuer=graph._GraphCoordinator__d02_issuer,
+            installed_bundle=assembly.admin_bundle)
+        if contact_model_preparation_bundle_v2(graph, witness.stage) != bundle:
+            raise ValueError('Contact V2 current prepared bundle differs')
     elif type(witness.stage) is ContactModelStageV1:
         from .contact_product_adapter_v1 import verify_contact_model_preparation_in_transaction_v1
         from .contact_model_preparation_commit_v1 import contact_model_preparation_bundle_v1
@@ -104,12 +189,46 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
             installed_bundle=assembly.admin_bundle)
         if contact_model_preparation_bundle_v1(graph, witness.stage) != bundle:
             raise ValueError('contact current prepared bundle differs')
-    elif witness.frame.envelope != bundle.envelope:
-        raise ValueError('installed domain witness envelope differs')
+    else:
+        from .contact_plan_adoption_v2 import ContactPlanStageV2,stage_adopt_current_contact_expression_plan_in_transaction_v2
+        from .d06_internal_life_episode_v2 import InternalLifeEpisodeStageV2
+        if type(witness.stage) is ContactPlanStageV2:
+            from .domain_production_registry_v1 import installed_readers_for_operation_v1
+            readers=installed_readers_for_operation_v1(graph,witness.operation,scope=witness.scope,owner_guard=witness.guard)
+            readers.contact_policy_scope=witness.scope
+            readers.current_contact_policy=getattr(witness.runtime,'_active_current_contact_policy_v1',None)
+            rebuilt=stage_adopt_current_contact_expression_plan_in_transaction_v2(db,frame=witness.frame,
+                request=witness.request,installed_readers=readers)
+            if rebuilt!=witness.stage:
+                raise ValueError('Contact Plan v2 actual SQL qualification changed before CAS')
+        elif type(witness.stage) is InternalLifeEpisodeStageV2:
+            from .d06_structured_experience_v1 import stage_encode_current_structured_experience_in_transaction_v1
+            from .domain_production_registry_v1 import installed_readers_for_operation_v1
+            readers = installed_readers_for_operation_v1(graph, witness.operation,
+                scope=witness.scope, owner_guard=witness.guard)
+            rebuilt = stage_encode_current_structured_experience_in_transaction_v1(db, frame=witness.frame,
+                request=witness.request, installed_readers=readers)
+            if rebuilt != witness.stage:
+                raise ValueError('internal Life episode actual SQL qualification changed before CAS')
+        elif witness.frame.envelope != bundle.envelope:
+            raise ValueError('installed domain witness envelope differs')
     return witness
 
 
 def _members(stage):
+    from .d06_life_numeric_commit_v1 import life_numeric_math_stages_v1
+    if type(stage) in life_numeric_math_stages_v1():
+        return stage.primary_stage, stage.primary_stage.proposals, (), (), ()
+    from .d06_life_numeric_context_v1 import LifeNumericContextStageV1
+    if type(stage) is LifeNumericContextStageV1:
+        return stage.primary_stage, stage.proposals, (), (), ()
+    from .contact_plan_adoption_v2 import ContactPlanStageV2,verify_contact_plan_stage_v2
+    if type(stage) is ContactPlanStageV2:
+        verify_contact_plan_stage_v2(stage)
+        return stage.stage,stage.stage.proposals,(),(),()
+    from .d06_internal_life_episode_v2 import InternalLifeEpisodeStageV2
+    if type(stage) is InternalLifeEpisodeStageV2:
+        return stage.stage, stage.stage.proposals, stage.episode_refs, (), ()
     from .contact_plan_adoption_v1 import ContactPlanStageV1
     if type(stage) is ContactPlanStageV1:
         from .contact_product_adapter_v1 import verify_contact_plan_stage_v1
@@ -142,6 +261,58 @@ def _members(stage):
 def commit_installed_domain_operation_v1(runtime, db, *, operation, request, frame, stage,
         readers, scope, owner, guard, metadata, epoch, process_lease, external_originals=()):
     graph = runtime.graph
+    from .d06_life_numeric_joint_v1 import LifeNumericJointStageV1
+    if type(stage) is LifeNumericJointStageV1:
+        from .d06_life_numeric_commit_v1 import commit_life_numeric_joint_stage_v1
+        return commit_life_numeric_joint_stage_v1(runtime, db, stage=stage, operation=operation,
+            frame=frame, scope=scope, metadata=metadata, epoch=epoch)
+    from .d06_life_numeric_commit_v1 import _numeric_stage_types, commit_life_numeric_task_v1
+    if type(stage) in _numeric_stage_types():
+        return commit_life_numeric_task_v1(runtime, db, operation=operation, request=request,
+            preparation=stage, readers=readers, scope=scope, owner=owner, guard=guard,
+            metadata=metadata, epoch=epoch, process_lease=process_lease, external_originals=external_originals)
+    from .internal_life_content_adoption_v1 import InternalLifeContentAdoptionStageV1,commit_content_adoption_v1
+    if type(stage) is InternalLifeContentAdoptionStageV1:
+        return commit_content_adoption_v1(runtime,db,operation=operation,request=request,preparation=stage,
+            readers=readers,scope=scope,owner=owner,guard=guard,metadata=metadata,epoch=epoch,
+            process_lease=process_lease,external_originals=external_originals)
+    from .internal_life_content_worker_v2 import InternalLifeContentAcquisitionStageV2, commit_internal_life_acquisition_v2
+    if type(stage) is InternalLifeContentAcquisitionStageV2:
+        return commit_internal_life_acquisition_v2(runtime,db,operation=operation,request=request,
+            preparation=stage,readers=readers,scope=scope,owner=owner,guard=guard,
+            metadata=metadata,epoch=epoch,process_lease=process_lease,external_originals=external_originals)
+    from .internal_life_content_worker_v1 import InternalLifeContentAcquisitionStageV1, commit_internal_life_acquisition_v1
+    if type(stage) is InternalLifeContentAcquisitionStageV1:
+        return commit_internal_life_acquisition_v1(runtime,db,operation=operation,request=request,
+            preparation=stage,readers=readers,scope=scope,owner=owner,guard=guard,
+            metadata=metadata,epoch=epoch,process_lease=process_lease,external_originals=external_originals)
+    from .internal_life_content_preparation_v1 import InternalLifeContentPreparationStageV1
+    if type(stage) is InternalLifeContentPreparationStageV1:
+        from .internal_life_content_commit_v1 import commit_internal_life_content_preparation_v1
+        return commit_internal_life_content_preparation_v1(runtime,db,operation=operation,request=request,
+            preparation=stage,readers=readers,scope=scope,owner=owner,guard=guard,
+            metadata=metadata,epoch=epoch,process_lease=process_lease,external_originals=external_originals)
+    from .contact_final_stage_v1 import ContactFinalStageV1, commit_contact_final_stage_v1
+    if type(stage) is ContactFinalStageV1:
+        return commit_contact_final_stage_v1(runtime, db, operation=operation, request=request,
+            preparation=stage, readers=readers, scope=scope, owner=owner, guard=guard,
+            metadata=metadata, epoch=epoch, process_lease=process_lease, external_originals=external_originals)
+    from .contact_final_stage_v2 import ContactFinalStageV2, commit_contact_final_stage_v2
+    if type(stage) is ContactFinalStageV2:
+        return commit_contact_final_stage_v2(runtime, db, operation=operation, request=request,
+            preparation=stage, readers=readers, scope=scope, owner=owner, guard=guard,
+            metadata=metadata, epoch=epoch, process_lease=process_lease, external_originals=external_originals)
+    from .contact_final_stage_v3 import ContactFinalStageV3, commit_contact_final_stage_v3
+    if type(stage) is ContactFinalStageV3:
+        return commit_contact_final_stage_v3(runtime, db, operation=operation, request=request,
+            preparation=stage, readers=readers, scope=scope, owner=owner, guard=guard,
+            metadata=metadata, epoch=epoch, process_lease=process_lease, external_originals=external_originals)
+    from .contact_product_adapter_v2 import ContactModelStageV2
+    if type(stage) is ContactModelStageV2:
+        from .contact_model_preparation_commit_v2 import commit_contact_model_preparation_v2
+        return commit_contact_model_preparation_v2(runtime, db, operation=operation, request=request,
+            preparation=stage, readers=readers, scope=scope, owner=owner, guard=guard,
+            metadata=metadata, epoch=epoch, process_lease=process_lease, external_originals=external_originals)
     from .contact_product_adapter_v1 import ContactModelStageV1
     if type(stage) is ContactModelStageV1:
         from .contact_model_preparation_commit_v1 import commit_contact_model_preparation_v1
@@ -220,6 +391,11 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         _ACTIVE.pop(id(witness), None)
     from .domain_production_inputs_v1 import StagedDomainInputV1, record_current_domain_input_after_commit_v1
     produced = ()
+    from .contact_plan_adoption_v2 import ContactPlanStageV2,record_contact_plan_after_cas_v2
+    if type(stage) is ContactPlanStageV2:
+        from .domain_production_contracts_v1 import ProductionOriginalRefV1
+        digest=record_contact_plan_after_cas_v2(db,stage=stage,issuer=readers.issuer,receipt=receipt)
+        produced=(ProductionOriginalRefV1('d10.contact_plan.v2',stage.plan.contact_id,digest),)
     from .contact_plan_adoption_v1 import ContactPlanStageV1, record_contact_plan_after_cas_v1
     if type(stage) is ContactPlanStageV1:
         from .domain_production_contracts_v1 import ProductionOriginalRefV1
@@ -238,7 +414,24 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
     if type(stage) is StagedDomainInputV1:
         produced = record_current_domain_input_after_commit_v1(db, frame=frame, staged_input=stage,
             actual_receipt=receipt, installed_readers=readers)
+    from .d06_life_numeric_context_v1 import LifeNumericContextStageV1, record_life_numeric_context_after_cas_v1
+    if type(stage) is LifeNumericContextStageV1:
+        payload = json.loads(primary.original_payload_json)
+        payload['writes'] = [{'key': write.key.token, 'value': write.value,
+            'dependencies': [key.token for key in write.dependencies]}
+            for proposal in stage.proposals for write in proposal.typed_writes]
+        primary = replace(primary, original_payload_json=canonical_serialize(payload),
+            original_digest=canonical_digest(payload))
+        produced = (record_life_numeric_context_after_cas_v1(db, stage=stage,
+            issuer=readers.issuer, receipt=receipt),)
+    from .d06_life_numeric_commit_v1 import life_numeric_math_stages_v1, record_life_numeric_math_stage_v1
+    if type(stage) in life_numeric_math_stages_v1():
+        produced = (record_life_numeric_math_stage_v1(db, stage, readers.issuer, receipt),)
     original = record_adopted_domain_operation_v1(db, primary, receipt)
+    from .d06_internal_life_episode_v2 import InternalLifeEpisodeStageV2, PROVENANCE, decode_internal_life_value_v2, validate_internal_life_episode_history_v2
+    if type(stage) is InternalLifeEpisodeStageV2:
+        proof_write = next(write for proposal in primary.proposals for write in proposal.typed_writes if write.key.type_name == PROVENANCE)
+        validate_internal_life_episode_history_v2(db, decode_internal_life_value_v2(PROVENANCE, proof_write.value))
     for event in primary.outbox:
         row = (*primary.namespace.as_tuple, event.dedupe_key, event.causal_operation_id,
             event.receiver_domain, event.event_kind, event.trigger_original.original_ref,

@@ -24,6 +24,10 @@ async def run(config, *, selection_revision=None, cohort_digest=None):
         daemon, launch = open_linux_authority_v1(config)
     except AuthorityColdRestartRequired:
         return 75
+    from sylanne3.authority_service.daemon import AuthorityFactualDaemonV2
+    if type(daemon) is AuthorityFactualDaemonV2:
+        await daemon.aclose()
+        raise RuntimeError('C09 V2 factual-only installation: Host/business service startup HOLD')
     bundles = tuple(item.installation_bundle for item in daemon.config.natural_model_authorities_v2.values())
     if len(bundles) != 1:
         await daemon.aclose()

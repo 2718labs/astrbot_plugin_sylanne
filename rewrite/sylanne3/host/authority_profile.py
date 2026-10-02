@@ -722,6 +722,9 @@ class AdminInstallationBundle:
     d13_wire_counter: object | None = None
     d04_joint_numeric: object | None = None
     package_selection: PackageSelectionV2 | None = None
+    # Prospective capture is currently installed only by the explicit alpha1
+    # test composition. Ordinary profile JSON does not enable this capability.
+    life_d04_before_capture_policy: object | None = None
 
 
 def _check_profile_id(profile_id: str) -> None:
@@ -1360,6 +1363,9 @@ def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkf
     raw_value = payload["model_workflows"]
     if type(raw_value) is not dict:
         raise ValueError("model workflows must be an object")
+    if raw_value.get("version") == 3:
+        from .model_workflows_v3 import model_workflows_v3_from_payload
+        return model_workflows_v3_from_payload(raw_value)
     raw = _exact_object(raw_value,
                         frozenset({"version", "encode", "reply"}) |
                         {name for name in ("context_reply", "natural_generation",
@@ -1431,7 +1437,8 @@ def _d13_paid_precompression_from_payload(
                         _D13_PAID_PRECOMPRESSION_FIELDS,
                         "D13 paid precompression")
     workflows = _model_workflows_from_payload(payload)
-    if (type(workflows) is not AdminModelWorkflowsV2
+    from .model_workflows_v3 import AdminModelWorkflowsV3
+    if (type(workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
             or type(workflows.reply) is not AdminModelWorkflowV2
             or "d13.precompress.paid.v1"
                not in policy.root_grant.allowed_work_kinds):
@@ -1570,7 +1577,8 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
                                   workflows.natural_generation,
                                   workflows.natural_review,
                                   workflows.appraisal, workflows.d07_cognition,
-                                  workflows.contact_generation, workflows.contact_review) if item is not None):
+                                  workflows.contact_generation, workflows.contact_review,
+                                  getattr(workflows, "life_content", None)) if item is not None):
             if workflow.work_kind not in policy.root_grant.allowed_work_kinds:
                 raise ValueError("model workflow lacks its own root grant work kind")
             if any(amount > policy.root_grant.max_ceiling.get(name, 0)

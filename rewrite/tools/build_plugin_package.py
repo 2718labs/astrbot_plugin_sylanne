@@ -626,7 +626,7 @@ def _handoff_source(project_root: Path, manifest_path: Path) -> tuple[str, dict]
 def _snapshot_workspace_inventory(root: Path, baseline: dict) -> tuple[dict, dict]:
     """Hash the actual engineering snapshot as well as separately pinned payload."""
     old = {row["path"]: row for row in baseline["files"]}
-    paths = set(old)
+    paths = set(old) | set(ROOT_FILE_ALLOWLIST)
     roots = ("rewrite/sylanne3", "rewrite/tests", "rewrite/host_tests", "rewrite/tools", "rewrite/native/src",
              "scripts", "docs", "resources", "webui-src", "webui-heritage/src")
     excluded = {"node_modules", "__pycache__", ".git", ".venv", "target", "build"}
@@ -1020,7 +1020,8 @@ def _verify_live_backend_catalogue(project_root: Path, payload: dict[str, bytes]
         raise RuntimeError("formal backend catalogue differs from current domain registry")
 
 
-def _verify_workbench_source(project_root: Path, payload: dict[str, bytes], *, formal: bool) -> None:
+def _verify_workbench_source(project_root: Path, payload: dict[str, bytes], *, formal: bool,
+                             frozen_test_snapshot: bool = False) -> None:
     """Bind the packaged workbench to W11's self-contained Vue build output."""
     source = project_root / "webui-heritage"
     build_output = project_root / "webui-heritage" / "dist" / "index.html"
@@ -1045,16 +1046,31 @@ def _verify_workbench_source(project_root: Path, payload: dict[str, bytes], *, f
         raise ValueError("packaged workbench manifest has duplicate or invalid entries")
     if set(packaged) - {"workbench-manifest.json"} != {"index.html"}:
         raise ValueError("packaged workbench file set differs from the built output")
-    if ((source / "dist").is_symlink() or build_output.is_symlink()
-            or not build_output.is_file()):
+    if (source / "dist").is_symlink() or build_output.is_symlink():
         raise ValueError("webui-heritage build output is missing or unsafe")
     relative = "index.html"
     _validate_member_path(relative)
-    if build_output.read_bytes() != packaged[relative]:
-        raise ValueError("packaged workbench differs from webui-heritage build output")
     if (listed[relative].get("bytes") != len(packaged[relative])
             or listed[relative].get("sha256") != _sha256(packaged[relative])):
         raise ValueError(f"packaged workbench manifest is stale: {relative}")
+    if build_output.is_file():
+        if build_output.read_bytes() != packaged[relative]:
+            raise ValueError("packaged workbench differs from webui-heritage build output")
+    elif frozen_test_snapshot and not formal:
+        # A development snapshot can retain the actual committed assets. This
+        # is a baseline-byte check, not an assertion that Vue was rebuilt here.
+        for member, content in packaged.items():
+            try:
+                baseline = subprocess.run(
+                    ["git", "show", "HEAD:resources/workbench/" + member],
+                    cwd=project_root, check=True, capture_output=True,
+                ).stdout
+            except (OSError, subprocess.CalledProcessError) as exc:
+                raise ValueError("frozen workbench Git baseline is unavailable") from exc
+            if baseline != content:
+                raise ValueError("frozen workbench differs from committed baseline")
+    else:
+        raise ValueError("webui-heritage build output is missing or unsafe")
 
 
 def _zip_info(path: str) -> zipfile.ZipInfo:
@@ -1248,7 +1264,7 @@ def build_package(
         backend_candidate=candidate_build,
     )
     if not (backend_only_dev_probe or backend_only_alpha1 or backend_alpha1_candidate):
-        _verify_workbench_source(root, payload, formal=formal)
+        _verify_workbench_source(root, payload, formal=formal, frozen_test_snapshot=snapshot_alpha1_test)
     if backend_only_alpha1:
         _verify_live_backend_catalogue(root, payload)
     if candidate_build:

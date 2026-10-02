@@ -7,6 +7,7 @@ unknown; this process-local registry is not durable Authority observation.
 """
 
 from __future__ import annotations
+from .model_workflows_v3 import AdminModelWorkflowsV3
 
 import asyncio
 from concurrent.futures import Future
@@ -315,7 +316,10 @@ class AstrBotModelProvider:
                           or admin_model is workflows.contact_generation
                           or admin_model is workflows.contact_review
                           or admin_model is workflows.appraisal
-                          or admin_model is workflows.d07_cognition))
+                          or admin_model is workflows.d07_cognition
+                          or (type(workflows) is AdminModelWorkflowsV3
+                              and (admin_model is workflows.life_content
+                                   or admin_model is workflows.life_numeric))))
         if not installed:
             raise ValueError("model selection is absent from installed administrator snapshot")
         self._context = context
@@ -345,6 +349,26 @@ class AstrBotModelProvider:
     def descriptor(self) -> ModelProviderDescriptor:
         return self._descriptor
 
+    def _life_numeric_messages(self, request: ModelCallRequest):
+        from ..model_broker.internal_life_numeric_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
+        model = self._admin_model
+        if (model.work_kind != WORK_KIND or model.template_version != TEMPLATE_VERSION
+                or request.identity.phase != "internal_life_numeric_v1"
+                or request.envelope.authority.issuer_domain != "d11"
+                or request.envelope.authority.purpose != "consolidation"
+                or request.prompt_template_digest != TEMPLATE_DIGEST):
+            return None
+        # Wire reuse is limited to the candidate appraisal format. Actual
+        # internal Source/before/worker authority is verified by Core admission.
+        return _appraisal_messages(request)
+
+    def _life_messages(self, request: ModelCallRequest):
+        from ..model_broker.internal_life_content_v1 import internal_life_provider_messages_v2
+        try:
+            return internal_life_provider_messages_v2(request, self._admin_model)
+        except (ValueError, TypeError, KeyError):
+            return None
+
     def _contact_messages(self, request: ModelCallRequest):
         from ..model_broker.contact_expression_v1 import contact_provider_messages_v1
         from ..model_broker.natural_reply import NaturalReplyInstallationV2
@@ -352,6 +376,10 @@ class AstrBotModelProvider:
         installation = NaturalReplyInstallationV2(self._installation_bundle.installation_policy.installation_id,
             model.provider_config_digest, model.provider_id, model.model_id, model.max_output_tokens)
         try:
+            from .model_workflows_v3 import AdminModelWorkflowsV3
+            if type(self._installation_bundle.model_workflows) is AdminModelWorkflowsV3:
+                from ..model_broker.contact_expression_v2 import contact_provider_messages_v2
+                return contact_provider_messages_v2(request, installation)
             return contact_provider_messages_v1(request, installation)
         except (ValueError, TypeError, KeyError):
             return None
@@ -365,6 +393,12 @@ class AstrBotModelProvider:
         authority = request.envelope.authority
         descriptor = self._descriptor
         if type(model) is AdminModelWorkflowV2:
+            expected_purpose = model.purpose
+            if request.identity.phase == "d13.precompress":
+                from ..runtime.d13_installed_paid_purpose_v1 import installed_d13_paid_context_request_v1
+                if not installed_d13_paid_context_request_v1(bundle, model, request):
+                    return False
+                expected_purpose = "context"
             workflows = bundle.model_workflows
             if (workflows is None
                     or (model is not workflows.encode
@@ -375,7 +409,10 @@ class AstrBotModelProvider:
                         and model is not workflows.contact_generation
                         and model is not workflows.contact_review
                         and model is not workflows.appraisal
-                        and model is not workflows.d07_cognition)
+                        and model is not workflows.d07_cognition
+                        and not (type(workflows) is AdminModelWorkflowsV3
+                                 and (model is workflows.life_content
+                                      or model is workflows.life_numeric)))
                     or type(policy) is not AdminInstallationPolicy
                     or policy.namespace != authority.namespace
                     or model.work_kind not in policy.root_grant.allowed_work_kinds
@@ -385,8 +422,8 @@ class AstrBotModelProvider:
                     or not request.required_capabilities
                     or not request.required_capabilities <= descriptor.capabilities
                     or not request.required_capabilities <= set(model.required_capabilities)
-                    or descriptor.purposes != frozenset({model.purpose})
-                    or authority.purpose != model.purpose
+                    or descriptor.purposes != frozenset({expected_purpose})
+                    or authority.purpose != expected_purpose
                     or not authority.audience
                     or not set(authority.audience) <= set(model.audiences)
                     or descriptor.privacy_tiers != frozenset({model.privacy_tier})
@@ -398,6 +435,10 @@ class AstrBotModelProvider:
                 if (amount > policy.root_lease.limits.get(dimension, 0)
                         or amount > policy.root_grant.max_ceiling.get(dimension, 0)):
                     return False
+            if type(workflows) is AdminModelWorkflowsV3 and model is workflows.life_numeric:
+                return self._life_numeric_messages(request) is not None
+            if type(workflows) is AdminModelWorkflowsV3 and model is workflows.life_content:
+                return self._life_messages(request) is not None
             if model is workflows.encode:
                 return (type(encoding) is AdminIngressEncodingPolicy
                         and all(amount <= encoding.quote_ceiling.get(dimension, 0)
@@ -453,6 +494,11 @@ class AstrBotModelProvider:
                     GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
                     REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
                     REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
+                if type(workflows) is AdminModelWorkflowsV3:
+                    from ..model_broker.contact_expression_v2 import (
+                        GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
+                        REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
+                        REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
                 generation = model is workflows.contact_generation
                 return (request.identity.phase == ("contact_generation" if generation else "contact_review")
                         and type(authority.worker_fence) is int and authority.worker_fence >= 1
@@ -596,7 +642,13 @@ class AstrBotModelProvider:
         except Exception:
             return ProviderResponse("not_dispatched", None, {}, {}, None)
         payload = request.payload
-        if (type(self._admin_model) is AdminModelWorkflowV2
+        if (type(self._installation_bundle.model_workflows) is AdminModelWorkflowsV3
+                and self._admin_model is self._installation_bundle.model_workflows.life_content):
+            messages = self._life_messages(request)
+        elif (type(self._installation_bundle.model_workflows) is AdminModelWorkflowsV3
+                and self._admin_model is self._installation_bundle.model_workflows.life_numeric):
+            messages = self._life_numeric_messages(request)
+        elif (type(self._admin_model) is AdminModelWorkflowV2
                 and self._admin_model is self._installation_bundle.model_workflows.context_reply):
             messages = _context_reply_messages(request)
         elif (type(self._admin_model) is AdminModelWorkflowV2

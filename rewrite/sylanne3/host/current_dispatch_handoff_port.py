@@ -7,6 +7,7 @@ constructs a permit, a clock reading, or a graph claim from caller facts.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 from ..authority_service.v2_contract import (
     ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
@@ -125,9 +126,15 @@ class InstalledCurrentDispatchHandoffPort:
         if (type(result) is not tuple or len(result) != 2
                 or type(result[0]) is not MutationReceiptV2
                 or type(result[1]) is not FencePermitV2
+                or result[0].durable_state != "committed"
                 or result[0].pending.phase != "observed"
+                or result[0].pending.claimed_receipt != self._claimed
+                or result[0].pending.platform_observation != observation
                 or result[0].pending.permit.operation_id != start.operation_id
-                or result[1].operation_id != start.operation_id):
+                or result[1] != replace(
+                    result[0].pending.permit,
+                    revision=result[0].updated_revision,
+                    pinned_anchor=result[0].after_anchor)):
             raise RuntimeError("V2 observation Authority receipt differs")
         return result
 

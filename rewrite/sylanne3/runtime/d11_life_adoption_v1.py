@@ -67,7 +67,7 @@ def _bundle(staged):
     job = next(write for write in runtime_writes if write.key.type_name == "runtime.job")
     cost = next(write for write in runtime_writes if write.key.type_name == "runtime.cost_settlement")
     return DomainBundle(staged.envelope, (*staged.memory_stage.proposals, *staged.runtime_stage.proposals),
-        staged.source_refs, (), (), (cost.key.token,),
+        (), (), (), (cost.key.token,),
         (life_adoption_operation_id_v1(binding),), (job.key.token,), ())
 
 
@@ -243,6 +243,7 @@ def adopt_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref)
                 raise ValueError("life saved bridge differs from requested installed namespace and preparation")
             saved = verify_life_adoption_commit_v1(store._db, gate=gate, issuer=issuer,
                 resource_issuer=resources, require_current_metadata=False)
+            validate_life_ack_recovery_v1(store._db, gate=gate, issuer=issuer)
         else:
             prepared = read_prepared_life_by_ref_v1(store._db, namespace=namespace, prepared_original_ref=prepared_original_ref, issuer=issuer)
             if prepared is None:
@@ -251,11 +252,31 @@ def adopt_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref)
             if _read_signed(store._db, namespace, "adoption_receipt", binding.execution_id, issuer) is not None:
                 raise ValueError("life committed receipt lacks its original bridge")
     if gate is not None:
-        # Authenticate immutable composite history before recovering its finish
-        # ACK. Neither today's job nor the deleted preparation body is needed.
+        # Only the original durable composite is recovered. Current generation,
+        # frozen ancestors and result heads must still match; no new work is issued.
+        pairing = port.current_owner_actor_binding(namespace=namespace,
+            authority_namespace=binding.authority_namespace, actor_id=gate.owner_actor_id)
+        if pairing is None or pairing.installation_id != binding.installation_id:
+            raise ValueError("life recovery current Owner pairing differs")
         claim, terminal = life_port.read_d11_life_original_v1(binding=binding)
         if terminal != gate.terminal or claim != gate.terminal.claim:
             raise ValueError("life prior composite receipt lost its actual terminal")
+        if port.current_owner_actor_binding(namespace=namespace,
+                authority_namespace=binding.authority_namespace, actor_id=gate.owner_actor_id) != pairing:
+            raise ValueError("life recovery Owner pairing changed before finish")
+        with store._lock:
+            db = store._db
+            if db.in_transaction:
+                raise ValueError("life ACK recovery requires an independent readonly snapshot")
+            db.execute("BEGIN")
+            try:
+                final = verify_life_adoption_commit_v1(db, gate=gate, issuer=issuer,
+                    resource_issuer=resources, require_current_metadata=False)
+                validate_life_ack_recovery_v1(db, gate=gate, issuer=issuer)
+                if canonical_serialize(final) != canonical_serialize(saved):
+                    raise ValueError("life recovered durable receipt changed before finish")
+            finally:
+                db.rollback()
         life_port.life_adoption_bridge_v1(binding=binding, action="finish", gate=gate, outcome="committed")
         return saved
     gate = life_port.life_adoption_bridge_v1(binding=binding, action="begin")
@@ -354,6 +375,86 @@ def adopt_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref)
             graph.release_authority_lease(bootstrap, local_lease)
 
 
+def validate_life_recovery_heads_v1(db, *, binding, prepared_digest, prepared, adopted):
+    """Readonly recovery joins, independent of unrelated same-generation writes.
+
+    Authentication of prepared/adopted originals is performed by the installed
+    reader. This structural seam never authorizes a new adoption or execution.
+    """
+    from ..runtime_contracts import SnapshotRequirementsV2
+    from .d11_life_terminal_v1 import read_current_life_job_result_v1
+    if (prepared is None or prepared.binding != binding or prepared.digest != prepared_digest
+            or adopted is None or adopted["prepared_digest"] != prepared_digest):
+        raise ValueError("life recovery preparation/result identity differs")
+    metadata = db.execute("SELECT requirements_json FROM graph_recovery_metadata_v2 "
+        "WHERE bot=? AND persona=?", binding.namespace.as_tuple).fetchone()
+    current_requirements = None if metadata is None else _decode_json(metadata[0], SnapshotRequirementsV2)
+    if current_requirements is None or (current_requirements.namespace,current_requirements.authority_id,
+            current_requirements.authority_namespace,current_requirements.activation_generation) != (
+                binding.namespace,binding.authority_id,binding.authority_namespace,binding.activation_generation):
+        raise ValueError("life recovery activation generation differs")
+    from .d11_life_fact_provenance_v1 import life_current_fact_reads_v1
+    for frozen in life_current_fact_reads_v1(prepared):
+        key = AtomKey.from_token(frozen.ref)
+        if (key.owner.bot, key.owner.persona) != binding.namespace.as_tuple:
+            raise ValueError("life recovery ancestor namespace differs")
+        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+            (frozen.ref, *binding.namespace.as_tuple)).fetchone()
+        if row != (frozen.revision, frozen.value_json, int(frozen.valid)) and not (frozen.revision == 0 and row is None):
+            raise ValueError("life recovery frozen Source/access/Owner ancestor changed or deleted")
+    for member in adopted["write_commitments"]:
+        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+            (member["ref"], *binding.namespace.as_tuple)).fetchone()
+        if (row is None or row[0] != member["revision"] or row[2] != 1
+                or canonical_digest(json.loads(row[1])) != member["digest"]):
+            raise ValueError("life recovery current artifact/job/terminal member changed or deleted")
+    from .d11_life_contract_v1 import D11LifeTerminalV1, life_from_wire_v1
+    terminal = life_from_wire_v1(adopted["terminal"], D11LifeTerminalV1)
+    if terminal.binding != binding:
+        raise ValueError("life recovery terminal binding differs")
+    if terminal.status == "completed":
+        import hashlib
+        row = db.execute("SELECT binding_digest,artifact_ref,artifact_bytes,artifact_digest,artifact_length,adopted_operation_id "
+            "FROM graph_d11_life_artifact_stage_v1 WHERE bot=? AND persona=? AND execution_id=?",
+            (*binding.namespace.as_tuple,binding.execution_id)).fetchone()
+        payload = terminal.payload
+        if (row is None or row[0] != binding.digest or row[1] != binding.artifact_ref
+                or type(row[2]) is not bytes or hashlib.sha256(row[2]).hexdigest() != payload.artifact_digest
+                or (row[3],row[4],len(row[2]),row[5]) != (payload.artifact_digest,payload.artifact_length,
+                    payload.artifact_length,life_adoption_operation_id_v1(binding))):
+            raise ValueError("life recovery durable artifact bytes/original adoption identity differs")
+        job,_ = read_current_life_job_result_v1(db, job_id=binding.job_id, adopted=adopted)
+    else:
+        from .jobs import get_job, JobConflict
+        try:
+            job = get_job(db, binding.job_id)
+        except JobConflict as exc:
+            raise ValueError("life recovery actual terminal job is absent") from exc
+        expected_phase = {"failed": "failed", "unknown": "pending_confirmation"}[terminal.status]
+        if ((job.bot_id, job.persona_id, job.job_id, job.operation_id, job.activity_id, job.effect_id,
+                job.phase, job.fence, job.cancel_epoch, job.result_ref) !=
+                (*binding.namespace.as_tuple, binding.job_id, binding.operation_id, binding.activity_id,
+                 binding.effect_id, expected_phase, binding.job_fence, binding.job_cancel_epoch, None)):
+            raise ValueError("life recovery actual failed/unknown job identity differs")
+    projection=job_graph_write(job)
+    if db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+            (projection.key.token,*binding.namespace.as_tuple)).fetchone() != (canonical_serialize(projection.value),1):
+        raise ValueError("life recovery actual full SQL job differs from its committed Graph member")
+    from .d11_life_fact_provenance_v1 import require_current_life_fact_eligibility_v1
+    require_current_life_fact_eligibility_v1(db,prepared=prepared,terminal=terminal,adopted=adopted)
+    return adopted
+
+
+def validate_life_ack_recovery_v1(db, *, gate, issuer):
+    """Authenticate existing originals and current heads before old finish ACK."""
+    binding = gate.binding
+    prepared = read_prepared_life_v1(db, binding=binding, issuer=issuer)
+    adopted = read_adopted_life_original_v1(db, namespace=binding.namespace,
+        result_ref=binding.artifact_ref, issuer=issuer)
+    return validate_life_recovery_heads_v1(db, binding=binding, prepared_digest=gate.prepared_digest,
+        prepared=prepared, adopted=adopted)
+
+
 def verify_life_adoption_commit_v1(db, *, gate, issuer, resource_issuer, require_current_metadata=True):
     """Independent read-only verification before the Authority finishes its gate."""
     from .d11_life_accounting_v1 import read_life_accounting_prepared_v1
@@ -388,7 +489,7 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
     from ..runtime_contracts import CommitReceipt, SnapshotRequirementsV2
     from ..graph_store import GraphStore
     from ..graph_types import NamespaceEpoch
-    from .d11_life_terminal_v1 import read_adopted_life_original_v1
+    from .d11_life_terminal_v1 import read_adopted_life_original_v1, validate_adopted_life_member_history_v1
     from .d11_life_contract_v1 import life_from_wire_v1, D11LifeTerminalV1
     binding, terminal = gate.binding, gate.terminal
     namespace = binding.namespace
@@ -396,6 +497,8 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
     ids = life_ids_from_binding_v1(binding)
     if adopted is None or life_from_wire_v1(adopted["terminal"], D11LifeTerminalV1) != terminal or adopted["prepared_digest"] != gate.prepared_digest:
         raise ValueError("life final actual terminal/adopted original differs")
+    validate_adopted_life_member_history_v1(db, value=adopted, namespace=namespace,
+        result_ref=binding.artifact_ref, producing_operation_id=operation_id)
 
     receipt = _decode_json(adopted["graph_receipt_json"], CommitReceipt)
     event = db.execute("SELECT reads,revisions,epoch_revision,invalidated FROM graph_events "
@@ -435,7 +538,7 @@ def validate_life_adoption_composite_v1(db, *, gate, result, adopted, require_cu
         "original_digest": canonical_digest(plain_v1(adopted)), "graph_receipt_digest": canonical_digest(receipt),
         "status": terminal.status, "source_refs": list(tuple(adopted["source_refs"])), "actual_cpu_ms": terminal.actual_cpu_ms}
     _decode_json(canonical_serialize(result), D11LifeAdoptionReceiptV1)
-    if result != expected:
+    if canonical_serialize(result) != canonical_serialize(expected):
         raise ValueError("life actual composite receipt commitments differ")
     metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", namespace.as_tuple).fetchone()
     before = _decode_json(gate.before_requirements_json, SnapshotRequirementsV2)

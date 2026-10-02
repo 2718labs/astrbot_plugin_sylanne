@@ -151,6 +151,17 @@ def read_execution_recovery_facts_v4_locked(db: sqlite3.Connection,
         return None
     try:
         raw = json.loads(row[1])
+        if raw.get('schema') == 'sylanne3.c09.recovery_fact_frame.v5':
+            from .c09_recovery_frame_v5 import decode_c09_frame_v5, C09ExecutionSourcePinV5
+            facts = decode_c09_frame_v5(raw)
+            pin = read_execution_recovery_facts_pin_v4_locked(db, namespace, operation_id=row[0])
+            if (type(pin) is not C09ExecutionSourcePinV5 or facts.namespace != namespace
+                    or facts.operation_id != row[0] or facts.facts_digest != pin.facts_digest
+                    or facts.contact_finish_inventory.inventory_digest != pin.contact_finish_inventory_digest
+                    or facts.contact_finish_inventory.observed_core_anchor != pin.observed_core_anchor
+                    or _canonical_serialize(asdict(facts)) != row[1]):
+                raise AuthorityUnavailable('V5 recovery complete facts/inventory differ from immutable pin')
+            return facts
         raw["executions"] = tuple(SanitizedExecutionFactV4(**item)
                                   for item in raw["executions"])
         raw["d02_facts"] = tuple(SanitizedD02FactV4(**item)
@@ -213,6 +224,9 @@ def read_execution_recovery_facts_pin_v4_locked(
         if raw.get("schema") == "sylanne3.c09.execution_source_pin.v4":
             from .c09_recovery_frame_v4 import C09ExecutionSourcePinV4
             pin = C09ExecutionSourcePinV4(**raw)
+        elif raw.get('schema') == 'sylanne3.c09.execution_source_pin.v5':
+            from .c09_recovery_frame_v5 import decode_c09_pin_v5
+            pin = decode_c09_pin_v5(raw)
         else:
             pin = ExecutionRecoveryFactsPinV4(**raw)
     except (TypeError, ValueError, KeyError) as exc:

@@ -13,6 +13,7 @@ import json
 import re
 
 from ..dispatch_runtime import DispatchRequest, HandoffUncertain
+from ..authority_service.v2_execution_bridge import CurrentEffectReadV2
 from ..contracts import EventConflict, StaleRead
 from ..graph_coordinator import UnavailableGuard
 from ..graph_worker import GraphWorker
@@ -105,6 +106,27 @@ class InstalledPrivateReplyContinuationV1:
         self._candidates = candidates
         self._clock_policy = clock_policy
         self._adapter_ref = adapter_ref
+
+    async def read_recovery_state(
+        self, original: OriginalPrivateReplyDispatchV1,
+    ) -> CurrentEffectReadV2:
+        """Read the original durable effect before attempting a new P2 fence."""
+        if (type(original) is not OriginalPrivateReplyDispatchV1
+                or original.namespace != self._policy.namespace):
+            raise PrivateReplyDispatchHold("private recovery identity differs")
+        reading = await asyncio.to_thread(
+            self._port.read_current_effect,
+            namespace=original.namespace,
+            authority_namespace=self._policy.authority_namespace,
+            effect_id=original.effect_id)
+        if (type(reading) is not CurrentEffectReadV2
+                or reading.authority_id != self._grant.authority_id
+                or reading.namespace != self._policy.authority_namespace
+                or reading.effect_id != original.effect_id
+                or reading.activation_generation != original.request.activation_generation
+                or reading.state not in {"absent", "unresolved", "observed"}):
+            raise PrivateReplyDispatchHold("private current effect read differs")
+        return reading
 
     async def dispatch(self, original: OriginalPrivateReplyDispatchV1) -> str:
         from .astrbot_dispatch import (
@@ -325,6 +347,13 @@ class PrivateReplyDispatchDriver:
                 "hold", "installed W01 final graph claim and paired P2 continuation unavailable",
                 original)
         try:
+            effect = await self._continuation.read_recovery_state(original)
+            if effect.state == "observed":
+                return PrivateReplyDispatchResultV1(
+                    "hold", "original effect already observed; no platform retry", original)
+            if effect.state == "unresolved":
+                return PrivateReplyDispatchResultV1(
+                    "unknown", "original effect unresolved; reconcile before retry", original)
             outcome = await self._continuation.dispatch(original)
         except (HandoffUncertain, V2FenceOutcomeUnknown) as exc:
             return PrivateReplyDispatchResultV1(

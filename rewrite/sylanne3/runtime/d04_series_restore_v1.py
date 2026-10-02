@@ -32,6 +32,13 @@ class _SeriesPrefixStructuresV1:
 
 
 def _collect_installed_d04_series_prefix_for_final_verifier_v1(graph, root):
+    from .d04_installed_stage_fence_v3 import _D04PhaseTimingsV1
+    timings = _D04PhaseTimingsV1(root.root_ref, deadline_utc=root.prepared.binding.deadline_utc)
+    with timings.measure("prefix_collection"):
+        return _collect_d04_series_prefix_structures_v1(graph, root, timings)
+
+
+def _collect_d04_series_prefix_structures_v1(graph, root, timings):
     from .d04_series_execution_v1 import chunk_operation_v1
     from .d04_series_store_v1 import read_d04_series_chunk_prepared_v1
     from .d04_series_codec_v1 import _decode_series_chunk_for_final_verifier_v1
@@ -54,7 +61,8 @@ def _collect_installed_d04_series_prefix_for_final_verifier_v1(graph, root):
                     raise ValueError("series final collector lacks exact complete planned preparation")
                 bindings.append(prepared[0])
                 start = end
-            manifest = port.series(bindings[-1], "prefix_manifest")
+            with timings.measure("prefix_manifest_rpc"):
+                manifest = port.series(bindings[-1], "prefix_manifest")
             if (type(manifest) is not D04SeriesPrefixManifestV1
                     or (manifest.root_ref, manifest.root_digest, manifest.plan_digest,
                         manifest.total_step_count, manifest.chunk_step_limit, manifest.chunk_count) != (root.root_ref, root.digest,
@@ -66,10 +74,12 @@ def _collect_installed_d04_series_prefix_for_final_verifier_v1(graph, root):
                 raw = read_d04_original_v3(db, binding.numeric.namespace, "series_chunk_math", binding.numeric.operation_id)
                 if raw is None or terminal.binding != binding:
                     raise ValueError("series final collector actual terminal/packet absent")
-                packet = canonical_serialize({"terminal": to_wire(terminal), "math": raw[0]}).encode("utf-8")
-                if len(packet) != entry.length or hashlib.sha256(packet).hexdigest() != entry.sha256:
-                    raise ValueError("series local packet differs from this actual Authority prefix manifest")
-                chunk = _decode_series_chunk_for_final_verifier_v1(raw[0])
+                with timings.measure("packet_hash", chunk_start=binding.start_step_index):
+                    packet = canonical_serialize({"terminal": to_wire(terminal), "math": raw[0]}).encode("utf-8")
+                    if len(packet) != entry.length or hashlib.sha256(packet).hexdigest() != entry.sha256:
+                        raise ValueError("series local packet differs from this actual Authority prefix manifest")
+                with timings.measure("packet_decode", chunk_start=binding.start_step_index):
+                    chunk = _decode_series_chunk_for_final_verifier_v1(raw[0])
                 native = chunk.full.production_binding
                 if ((chunk.root_digest, chunk.plan_digest, chunk.start_step_index,
                         chunk.end_step_index, chunk.predecessor_digest) != (binding.root_digest, binding.plan_digest,

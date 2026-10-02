@@ -275,7 +275,14 @@ def prepare_d13_paid_call_graph_v1(graph, authority, lease, *, job_id, timeout_s
                                  "WHERE bot=? AND persona=? AND ref='current'",
                                  authority.namespace.as_tuple).fetchall())
         inputs = tuple(ref.ref for ref in frozen.plan.source_dependencies)
-        deadline = datetime.fromisoformat(running.deadline_utc.replace("Z", "+00:00")).timestamp()
+        if running.lease_expires_utc is None:
+            raise ValueError("D13 paid worker lease is absent")
+        deadline = min(
+            datetime.fromisoformat(running.deadline_utc.replace("Z", "+00:00")).timestamp(),
+            datetime.fromisoformat(running.lease_expires_utc.replace("Z", "+00:00")).timestamp(),
+            saved.original.binding.expires_at_utc)
+        if deadline <= now:
+            raise ValueError("D13 paid call deadline elapsed")
         model_authority = replace(authority, issuer_domain="d13", worker_fence=running.fence)
         envelope = CommandEnvelope(
             RUNTIME_SCHEMA, OperationIdentity(running.activity_id, None, "d13-paid-model",

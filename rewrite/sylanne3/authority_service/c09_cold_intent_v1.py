@@ -197,12 +197,13 @@ def _read_source_gate(sources, *, config, context, operation):
     return reader, run, accepted, location
 
 
-def _graph_candidate(control, *, operation, target, source, request, registry):
+def _graph_candidate(control, *, operation, target, source, request, registry, contact_finish_scope=None, life_completed_scope=None):
     from .c09_build_originals_v1 import decode_installed_build_original_v1
     from ..runtime.c09_graph_rebase_candidate_v1 import GraphRebaseCandidateV1, build_graph_rebase_candidate_v1, _file_identity, _cold_graph_data_root
     saved = control.read_build_original_v1(operation_id=operation, kind="graph_candidate")
     if saved is None:
-        return build_graph_rebase_candidate_v1(source, target, request=request, completion_control=control, registry=registry)
+        return build_graph_rebase_candidate_v1(source, target, request=request, completion_control=control,
+            registry=registry, contact_finish_scope=contact_finish_scope, life_completed_scope=life_completed_scope)
     candidate = decode_installed_build_original_v1(saved["details"]["candidate"], GraphRebaseCandidateV1)
     if ((candidate.operation_id, candidate.namespace, candidate.source_path, candidate.target_path,
             candidate.source_files_fingerprint, candidate.source_closure_digest, candidate.frozen_inventory_digest,
@@ -325,6 +326,7 @@ def resume_early_intent_before_open_v1(*, config, control):
     gate.revoke_and_drain_v1(operation_id=operation)
     with gate.hold_final_continuation_v3(operation_id=operation) as continuation:
         sources = ColdC09SourceConnectionsV1(control=control)
+        bundle = None
         try:
             sources.begin()
             reader, run, accepted, location = _read_source_gate(sources, config=selected, context=current, operation=operation)
@@ -341,7 +343,8 @@ def resume_early_intent_before_open_v1(*, config, control):
                 pinned_manifest_digest=factory.inventory.manifest_digest,
                 writer_freeze_digest=intent["details"]["quiescence_original"]["quiescence_digest"])
             graph = _graph_candidate(control, operation=operation, target=Path(intent["details"]["targets"]["graph"]),
-                source=Path(members["graph"]["resolved_path"]), request=request, registry=factory.registry)
+                source=Path(members["graph"]["resolved_path"]), request=request, registry=factory.registry,
+                contact_finish_scope=bundle['_contact_finish_scope'], life_completed_scope=bundle['_life_completed_scope'])
             core_db = sources.connections["core"]
             prior_issue = read_graph_rebase_issue_original_v1(core_db, namespace, operation_id=operation)
             if prior_issue is None and control.read_build_original_v1(operation_id=operation, kind="file_core") is not None:
@@ -385,6 +388,12 @@ def resume_early_intent_before_open_v1(*, config, control):
             gate.require_final_continuation_v3(continuation, operation_id=operation)
             control.record_prepared_storage_v1(manifest=manifest, prepared_original=prepared, closing_continuation=continuation)
         finally:
+            if bundle is not None and bundle.get('_contact_finish_scope') is not None:
+                from .c09_contact_finish_original_v1 import _revoke_contact_finish_scope_v1
+                _revoke_contact_finish_scope_v1(bundle['_contact_finish_scope'].port)
+            if bundle is not None and bundle.get("_life_completed_scope") is not None:
+                from .c09_life_completed_archive_v1 import revoke_completed_life_scope_v1
+                revoke_completed_life_scope_v1(bundle["_life_completed_scope"].port)
             sources.close()
     return control.read_verified_current_storage_v1()
 

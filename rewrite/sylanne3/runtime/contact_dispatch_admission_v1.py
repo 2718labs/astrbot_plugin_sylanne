@@ -9,7 +9,7 @@ from ..domains.d09.contact_batch_v1 import validate_contact_verified_batch_v1
 from ..domains.d10.contact_claim_v2 import contact_claim_key_v2
 from ..graph_types import AtomKey
 from ..runtime_contracts import canonical_digest
-from ..runtime_journal import BudgetConstraint, RecoveryConstraintFootprint
+from ..runtime_journal import BudgetConstraint, RecoveryConstraintFootprint, QuotaOccupancy
 from .budget import get_budget_lease
 from .contact_final_issuer_v1 import inspect_contact_final_d11_v1, _value
 from .contact_qualification_v1 import issue_contact_checks_locked_v1, _social_reads
@@ -27,6 +27,8 @@ def issue_contact_dispatch_admission_v1(*, db, bundle, evidence, graph_receipt,
         quote, grant, current_policy, current_effect, effect_snapshot, clock_reading,
         clock_policy, owner_guard, provisional_qualification, now_utc):
     """Recompute checks before sealing; supplied provisional evidence cannot pass alone."""
+    from .contact_final_projection_v1 import require_contact_projection_read_v1
+    require_contact_projection_read_v1(current_read, db, phases=('post_cas_e_plus_1',))
     namespace, identity = bundle.envelope.authority.namespace, bundle.envelope.identity
     snapshot = current_read.check(db)
     query = route.query
@@ -85,22 +87,44 @@ def issue_contact_dispatch_admission_v1(*, db, bundle, evidence, graph_receipt,
     decoder = next(s.validator for s in GoalExecutionProvider().register_types()
         if s.name == 'd08.communication_intent_grant.v1')
     parent = decoder(parent_raw)
+    from .contact_claim_adoption_v1 import read_current_own_contact_continuation_v1
+    from .contact_qualification_v1 import _plan_policy
+    from ..domains.d10.contact_claim_v2 import decode_contact_claim_v2, contact_window_id_v2
+    read_current_own_contact_continuation_v1(db, current_read, content=content, segment_index=0,
+        current_policy=current_policy, scope=scope, now_utc=now_utc)
+    claim_atom = current_read.head(db, contact_claim_key_v2(namespace, content.contact_id), required=True)
+    own_claim = decode_contact_claim_v2(claim_atom.value)
+    _, policy_atom, policy, _, _ = _plan_policy(db, current_read, content, current_policy, scope, now_utc)
+    inventories = tuple(current_read.complete_inventory(db, kind) for kind in ('d10.contact_claim.v1', 'd10.contact_claim.v2'))
+    if (claim_atom.revision != 1 or own_claim.communication_action_id != parent.communication_action_id
+            or own_claim.window_id != contact_window_id_v2(policy) or own_claim.policy_version != policy.version
+            or own_claim.approval_ref != current_policy.original.original_ref
+            or own_claim.approval_digest != current_policy.original.digest):
+        raise ValueError('Contact proactive footprint lost its actual approved whole quota claim')
+    quota_scope = canonical_digest({'claim_ref':claim_atom.key.token, 'claim_revision':claim_atom.revision,
+        'claim_value':own_claim, 'policy_ref':policy_atom.key.token, 'policy_revision':policy_atom.revision,
+        'policy_value':policy_atom.value, 'current_policy_original':current_policy.original,
+        'complete_claim_inventories':inventories})
+    bucket = 'contact-quota:' + canonical_digest((namespace, own_claim.subject_ref, own_claim.channel, own_claim.category))
+    gate = 'contact-object:' + canonical_digest((namespace, own_claim.subject_ref, own_claim.channel, own_claim.category))
     footprint = RecoveryConstraintFootprint('/'.join(namespace.as_tuple), identity.activity_id,
         identity.effect_id, external_idempotency_ref=outbox.idempotency_key,
         conflict_keys=('target:' + parent.target_ref,), communication_action=parent.communication_action_id,
         contact_id=content.contact_id, segment_id=evidence.segment_id,
+        object_gate_keys=(gate,), quota_occupancies=(QuotaOccupancy(bucket, own_claim.window_id, 1),),
         budgets=(BudgetConstraint(lease.lease_id, str(lease.used.get(dimension, 0)),
             str(lease.reserved.get(dimension, 0) + lease.unconfirmed.get(dimension, 0)), str(limit)),))
     command_digest = canonical_digest({'operation_id': identity.operation_id,
         'outbox_ref': runtime.outbox_ref, 'idempotency_key': outbox.idempotency_key,
         'batch_ref': evidence.batch_ref, 'segment_index': evidence.segment_index,
-        'payload_digest': evidence.payload_digest, 'fence_token': scope.permit.token})
+        'payload_digest': evidence.payload_digest, 'fence_token': scope.permit.token,
+        'proactive_contact':True, 'actual_quota_scope_digest':quota_scope})
     request = DispatchRequest('/'.join(namespace.as_tuple), identity.operation_id,
         identity.activity_id, identity.effect_id, identity.attempt_id, command_digest,
         outbox.payload_ref, evidence.payload_digest, 'platform:astrbot-private-v1',
         parent.required_check_refs, outbox.dispatch_generation, scope.generation, job.fence,
-        scope.permit.token, content.cancellation_epoch, footprint, False, batch.parent_grant_ref,
-        parent.segment_manifest_digest, evidence.segment_index, len(content.segments))
+        scope.permit.token, content.cancellation_epoch, footprint, True, batch.parent_grant_ref,
+        parent.segment_manifest_digest, evidence.segment_index, len(content.segments), parent.contact_policy_check_ref)
     deadline = int(min(content.valid_until, bundle.envelope.deadline_utc,
         datetime.fromisoformat(job.deadline_utc.replace('Z', '+00:00')).timestamp(),
         *(check.valid_until for check in qualification.checks)))

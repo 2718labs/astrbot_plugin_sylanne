@@ -622,6 +622,9 @@ class AuthorityRpcServer:
         self._d04_appraisal_reads_v3 = {}
         self._d07_cognition_reads_v1 = {}
         self._contact_model_reads_v1 = {}
+        self._contact_model_reads_v2 = {}
+        self._internal_life_model_reads_v2 = {}
+        self._life_numeric_model_reads_v1 = {}
         natural_content_reads = dict(v2_natural_generation_content_reads or {})
         if (not set(natural_content_reads) <= set(natural_output_reads)
                 or any(type(service) is not AuthorityV2NaturalGenerationContentService
@@ -951,6 +954,41 @@ class AuthorityRpcServer:
             raise AuthorityUnavailable("contact actual model/result services differ")
         self._contact_model_reads_v1[namespace] = service
 
+    def install_contact_model_result_reader_v2(self, namespace, service):
+        from .contact_model_result_service_v2 import InstalledContactModelResultServiceV2
+        model = self._v2_model_egress.get(namespace)
+        if (type(service) is not InstalledContactModelResultServiceV2
+                or namespace in self._contact_model_reads_v2
+                or service._fences is not self._v2_fences.get(namespace)
+                or model is None or service._store is not model._store
+                or service._path != model._graph_verifier._path):
+            raise AuthorityUnavailable("contact actual model/result services differ")
+        self._contact_model_reads_v2[namespace] = service
+
+    def install_internal_life_model_result_reader_v2(self, namespace, service):
+        from .internal_life_model_result_service_v2 import InstalledInternalLifeModelResultServiceV2
+        model = self._v2_model_egress.get(namespace)
+        if (type(service) is not InstalledInternalLifeModelResultServiceV2
+                or namespace in self._internal_life_model_reads_v2
+                or service._fences is not self._v2_fences.get(namespace)
+                or model is None or service._store is not model._store
+                or service._path != model._graph_verifier._path
+                or service._graph_reader is not model._graph_verifier._internal_life_reader_v2):
+            raise AuthorityUnavailable("Life actual model/result services differ")
+        self._internal_life_model_reads_v2[namespace] = service
+
+    def install_life_numeric_model_result_reader_v1(self, namespace, service):
+        from .life_numeric_model_result_service_v1 import InstalledLifeNumericModelResultServiceV1
+        model = self._v2_model_egress.get(namespace)
+        if (type(service) is not InstalledLifeNumericModelResultServiceV1
+                or namespace in self._life_numeric_model_reads_v1
+                or service._fences is not self._v2_fences.get(namespace)
+                or model is None or service._store is not model._store
+                or service._path != model._graph_verifier._path
+                or service._graph_reader is not model._graph_verifier._life_numeric_reader_v1):
+            raise AuthorityUnavailable("Life actual model/result services differ")
+        self._life_numeric_model_reads_v1[namespace] = service
+
     def install_c04_executor_v2(self, namespace: str,
                                 service: AuthorityInternalWorkService,
                                 executor: object) -> None:
@@ -1110,10 +1148,13 @@ class AuthorityRpcServer:
             from .d10_contact_policy_rpc_v1 import dispatch_d10_contact_policy_v1
             from .d12_package_maintenance_rpc_v2 import dispatch_d12_package_maintenance_v2
             from .first_owner_reverse_v1 import dispatch_first_owner_issue_v1
+            from .contact_owner_session_rpc_v3 import dispatch_contact_owner_session_v3
+            from .contact_finished_owner_read_rpc_v1 import dispatch_contact_finished_owner_read_v1
             for dispatch in (dispatch_d12_operation_status_v1, dispatch_d12_target_owner_v1,
                              dispatch_d12_installation_lifecycle_v1, dispatch_d04_numeric_bridge_v3, dispatch_d04_series_rpc_v1,
                              dispatch_d04_root_execution_v3, dispatch_d11_offline_tick_v1, dispatch_d11_life_v1, dispatch_d10_contact_policy_v1,
-                             dispatch_d12_package_maintenance_v2, dispatch_first_owner_issue_v1):
+                             dispatch_d12_package_maintenance_v2, dispatch_first_owner_issue_v1,
+                             dispatch_contact_owner_session_v3, dispatch_contact_finished_owner_read_v1):
                 handled = dispatch(self, method, credential, profile_id, manifest_digest, command)
                 if handled is not None:
                     return handled
@@ -1445,6 +1486,84 @@ class AuthorityRpcServer:
                     return {"finished": True}
                 delivery = service.prepare(credential=credential, request=request)
                 return _DeferredWorkerDelivery({"result": d07_to_wire(delivery.result)}, service, credential, delivery)
+            if method in {"internal_life_model_result_read_v2", "internal_life_model_result_recover_finish_v2"}:
+                from .internal_life_model_result_contract_v2 import InternalLifeModelResultReadRequestV2, internal_life_result_from_wire_v2, internal_life_result_to_wire_v2
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("contact result command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                service = self._internal_life_model_reads_v2.get(namespace)
+                request = internal_life_result_from_wire_v2(command["read_request"], InternalLifeModelResultReadRequestV2)
+                installed = self._installations_v2.get((credential.certificate_sha256, profile_id))
+                if (service is None or installed is None or service._read_subject != "mtls:sha256:" + credential.certificate_sha256
+                        or request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((credential.certificate_sha256, profile_id, request.namespace)) != namespace):
+                    raise AuthorityUnavailable("contact result installed reader differs")
+                if method == "internal_life_model_result_recover_finish_v2":
+                    service.recover_finish(credential=credential, request=request)
+                    return {"finished": True}
+                delivery = service.prepare(credential=credential, request=request)
+                try:
+                    payload = {"result": internal_life_result_to_wire_v2(delivery.result)}
+                except BaseException:
+                    # Encoding did not deliver the result. Release only the
+                    # process-local exclusion; the durable read fence remains
+                    # unresolved for the authenticated recover-finish path.
+                    service.abandon_delivery(delivery=delivery)
+                    raise
+                return _DeferredWorkerDelivery(payload, service, credential, delivery)
+            if method in {"life_numeric_model_result_read_v1", "life_numeric_model_result_recover_finish_v1"}:
+                from .current_life_numeric_v1 import LifeNumericModelResultReadRequestV1, life_numeric_result_from_wire_v1, life_numeric_result_to_wire_v1
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("Life numeric result command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                service = self._life_numeric_model_reads_v1.get(namespace)
+                request = life_numeric_result_from_wire_v1(command["read_request"], LifeNumericModelResultReadRequestV1)
+                installed = self._installations_v2.get((credential.certificate_sha256, profile_id))
+                if (service is None or installed is None or service._read_subject != "mtls:sha256:" + credential.certificate_sha256
+                        or request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((credential.certificate_sha256, profile_id, request.namespace)) != namespace):
+                    raise AuthorityUnavailable("Life numeric result installed reader differs")
+                if method == "life_numeric_model_result_recover_finish_v1":
+                    service.recover_finish(credential=credential, request=request)
+                    return {"finished": True}
+                delivery = service.prepare(credential=credential, request=request)
+                try:
+                    payload = {"result": life_numeric_result_to_wire_v1(delivery.result)}
+                except BaseException:
+                    # Encoding did not deliver the result. Release only the
+                    # process-local exclusion; the durable read fence remains
+                    # unresolved for the authenticated recover-finish path.
+                    service.abandon_delivery(delivery=delivery)
+                    raise
+                return _DeferredWorkerDelivery(payload, service, credential, delivery)
+            if method in {"contact_model_result_read_v2", "contact_model_result_recover_finish_v2"}:
+                from .contact_model_result_contract_v2 import ContactModelResultReadRequestV2, contact_result_from_wire_v2, contact_result_to_wire_v2
+                if set(command) != {"namespace", "read_request"}:
+                    raise AuthorityUnavailable("contact result command fields differ")
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                service = self._contact_model_reads_v2.get(namespace)
+                request = contact_result_from_wire_v2(command["read_request"], ContactModelResultReadRequestV2)
+                installed = self._installations_v2.get((credential.certificate_sha256, profile_id))
+                if (service is None or installed is None or service._read_subject != "mtls:sha256:" + credential.certificate_sha256
+                        or request.installation_id != installed.installation_id
+                        or self._namespace_bindings_v2.get((credential.certificate_sha256, profile_id, request.namespace)) != namespace):
+                    raise AuthorityUnavailable("contact result installed reader differs")
+                if method == "contact_model_result_recover_finish_v2":
+                    service.recover_finish(credential=credential, request=request)
+                    return {"finished": True}
+                delivery = service.prepare(credential=credential, request=request)
+                try:
+                    payload = {"result": contact_result_to_wire_v2(delivery.result)}
+                except BaseException:
+                    # Encoding did not deliver the result. Release only the
+                    # process-local exclusion; the durable read fence remains
+                    # unresolved for the authenticated recover-finish path.
+                    service.abandon_delivery(delivery=delivery)
+                    raise
+                return _DeferredWorkerDelivery(payload, service, credential, delivery)
             if method in {"contact_model_result_read_v1", "contact_model_result_recover_finish_v1"}:
                 from .contact_model_result_contract_v1 import ContactModelResultReadRequestV1, contact_result_from_wire_v1, contact_result_to_wire_v1
                 if set(command) != {"namespace", "read_request"}:
@@ -2628,6 +2747,14 @@ class AuthorityRpcServer:
                     credential=credential, subject=subject,
                     operation_id=command["operation_id"])
                 return {"permit": to_wire(permit), "state": state}
+            if method == 'read_contact_finished_original_v3' and set(command)=={'permit'}:
+                from .contact_fence_finished_v3 import contact_finished_to_wire_v3
+                permit=from_wire(command['permit'])
+                if type(permit) is not FencePermitV2 or permit.operation!='write':
+                    raise AuthorityUnavailable('Contact original write permit required')
+                service=self._bound_v2_service(credential,profile_id,manifest_digest,permit.namespace)
+                original=service.read_contact_finished_original_v3(credential=credential,subject=subject,permit=permit)
+                return {'original':contact_finished_to_wire_v3(original)}
             if method == "validate_fence" and set(command) == {"permit"}:
                 permit = from_wire(command["permit"])
                 if (type(permit) is not FencePermitV2

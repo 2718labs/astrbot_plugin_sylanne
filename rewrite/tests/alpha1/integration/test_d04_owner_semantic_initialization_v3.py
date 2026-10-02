@@ -127,7 +127,7 @@ def current_mapping_read(case):
             request_digest="sha256:" + canonical_digest((operation, permit.token)))
 
 
-def initialize_owner_root_v3(case):
+def initialize_owner_root_v3(case, *, root_operation_id=None):
     """Use only real Owner draft, signed D11 budget, compile and root adoption."""
     graph, ns = case["graph"], case["namespace"]
     reader = install_d04_test_composition(case)
@@ -149,7 +149,7 @@ def initialize_owner_root_v3(case):
         compiled = graph.compile_current_scheme_for_operation_v1(authority, lease,
             operation_id=str(uuid4()), draft_ref=character_draft_key(ns).token,
             budget_ref=case["policy"].root_grant.lease_id)
-        root_operation = str(uuid4())
+        root_operation = str(uuid4()) if root_operation_id is None else root_operation_id
         graph.commit_current_d04_authored_root_v3(authority, lease, operation_id=root_operation,
             compiled_digest=compiled.compiled.compiled_digest, parent_budget_lease_ref=budget["lease_id"], preset=preset)
         original = graph.read_current_d04_authored_root_v3(authority, lease, operation_id=root_operation)

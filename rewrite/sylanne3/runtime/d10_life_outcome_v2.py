@@ -32,6 +32,16 @@ def life_experience_provenance_ref_v1(binding):
     return "d11-life-experience-original:" + canonical_digest((binding.namespace, binding.execution_id, binding.digest))[:48]
 
 
+def life_experience_dependencies_v1(snapshot,writes):
+    """Classify the exact materialized invalidation edges, including absence."""
+    keys={key for write in writes for key in write.dependencies}
+    guarded={version.key:version for version in snapshot.versions}
+    if not keys<=guarded.keys():
+        raise ValueError('Life experience dependency lacks its actual current read guard')
+    return DependencySet(current_invalidation=tuple(guarded[key] for key in sorted(keys,key=lambda key:key.token)),
+        historical_provenance=tuple(v for v in snapshot.versions if v.key.type_name=='memory.source' and v.revision>0))
+
+
 def _actual_outcome(db, read, issuer, outcome):
     ns = read.frame.envelope.authority.namespace
     plan = read_registered_life_plan_v2(db, namespace=ns, issuer=issuer, original_ref=outcome.plan_original_ref)
@@ -47,6 +57,8 @@ def _actual_outcome(db, read, issuer, outcome):
     prepared = read_prepared_life_v1(db, binding=b, issuer=issuer)
     if prepared is None:
         raise MissingProductionOriginalV1("actual_life_frozen_source_and_body_preparation")
+    from .d11_life_fact_provenance_v1 import require_current_life_fact_eligibility_v1
+    require_current_life_fact_eligibility_v1(db,prepared=prepared,terminal=terminal,adopted=adopted)
     verify_durable_life_artifact_v1(db, prepared, digest=outcome.artifact_digest, length=terminal.payload.artifact_length)
     action = _decode_intent(read.head(db, plan.action_intent.ref, required=True).value)
     actual = _decode("d08.action_outcome.v1", read.head(db, outcome.action_outcome_ref, required=True).value)
@@ -121,11 +133,25 @@ def stage_current_life_v2_in_transaction_v1(db, *, frame, request, installed_rea
         prior = read.head(db, progress_key)
         if prior.revision and (not prior.valid or prior.value != plain_v1(progress)):
             raise ValueError("Life stable effect already has different adopted progress")
+        from .d10_life_progress_provenance_v1 import (
+            require_current_life_progress_v1,life_progress_qualified_writes_v1,life_experience_access_dependencies_v1,
+        )
+        if prior.revision:
+            require_current_life_progress_v1(db,namespace=b.namespace,progress=progress,issuer=installed_readers.issuer,read=read)
         inputs = CurrentLifeInputsV1(project, recipe, plan.recipe.ref, activity, progress, terminal_original,
             read.original(b.plan_original_ref, kind="d11.life_plan", digest=b.plan_digest), costs, bool(prior.revision))
         life = compile_advance_current_life_v1(frame, request, inputs)
         if prior.revision:
             return life
+        from ..domains.d01.production_operations_v1 import stage_result_v1
+        qualified_progress=life_progress_qualified_writes_v1(prepared,terminal,progress,frame.envelope.identity.operation_id)
+        prior_proposal=life.proposals[0]
+        life=stage_result_v1(frame,'d10','advance_life',request,writes=qualified_progress,
+            provenance=json.loads(life.original_payload_json)['provenance'],
+            contribution_keys=prior_proposal.contribution_keys,
+            receiver_events=tuple((event.receiver_domain,event.event_kind) for event in life.outbox),
+            costs=life.paid_cost_originals,proposal_schema=prior_proposal.proposal_schema,
+            proposal_hash=prior_proposal.proposal_schema_hash)
         source_id = life_experience_source_id_v1(b)
         source, access = source_key(*b.namespace.as_tuple, source_id), access_key(*b.namespace.as_tuple, source_id)
         if read.head(db, source).revision or read.head(db, access).revision:
@@ -142,12 +168,12 @@ def stage_current_life_v2_in_transaction_v1(db, *, frame, request, installed_rea
         record = SourceRecord(source_id, canonical_serialize(payload), "persona:" + b.namespace.persona_id, "internal", "confirmed",
             _utc(terminal.payload.completed_at_utc).timestamp(), frame.now_utc, "life-terminal:" + terminal.terminal_digest,
             plan.audiences, ("context", "consolidation"), (AtomKey.from_token(plan.input_source.ref).owner.subject,), "same_root")
-        writes = (GraphWrite(source, record.to_dict(), (AtomKey.from_token(plan.input_source.ref),)),
+        writes = (GraphWrite(source, record.to_dict()),
             GraphWrite(access, {"source_id": source_id, "audiences": list(plan.audiences), "purposes": ["context", "consolidation"],
-                "status": "active", "recorded_at": frame.now_utc}, (source,)))
+                "status": "active", "recorded_at": frame.now_utc}, life_experience_access_dependencies_v1(prepared,source)))
         provider = D06DomainProvider()
         memory = DomainProposal("d06", "d06.contract.v1", provider.descriptor.request_schema_hash, frame.envelope, writes,
-            DependencySet(historical_provenance=tuple(v for v in frame.snapshot.versions if v.key.type_name == "memory.source" and v.revision > 0)),
+            life_experience_dependencies_v1(frame.snapshot,writes),
             ("d10-life-internal-experience:" + source.token,), ("experience",))
         provider.validate(memory, frame.snapshot)
         _record(db, issuer=installed_readers.issuer, namespace=b.namespace, kind="experience", ref=provenance_ref,

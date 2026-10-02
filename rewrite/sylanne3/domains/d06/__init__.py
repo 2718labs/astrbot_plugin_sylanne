@@ -877,6 +877,14 @@ class D06DomainProvider:
             writer_domain="d06",
             schema_hash=_SOURCE_CORRECTION_HEAD_SCHEMA_HASH,
         ))
+        from ...runtime.d06_internal_life_episode_v2 import internal_life_episode_type_specs_v2
+        specs.extend(internal_life_episode_type_specs_v2())
+        from ...runtime.internal_life_content_adoption_v1 import content_type_specs_v1
+        specs.extend(content_type_specs_v1())
+        from ...runtime.d06_life_numeric_trace_v1 import life_numeric_trace_type_specs_v1
+        specs.extend(life_numeric_trace_type_specs_v1())
+        from ...runtime.d06_internal_life_trace_v3 import internal_life_trace_type_spec_v3
+        specs.append(internal_life_trace_type_spec_v3())
         return tuple(sorted(specs, key=lambda item: item.name))
 
     def register_types(self) -> tuple[str, ...]:

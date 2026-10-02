@@ -91,13 +91,17 @@ def load_linux_deployment_config_v1(path):
     if affect.registry.type_registry.catalogue_hash != policy.catalogue_hash:
         raise AuthorityUnavailable("installed domain catalogue differs from Host policy")
     resource = D02ResourceIssuer(bundle.d02_signing_key)
+    budget_issuer = D11BudgetJobIssuer(resource, bundle.d11_signing_key)
     body = D02BodyQuoteAuthority(hmac.digest(bundle.d02_signing_key,
         b"sylanne3.d02.body_quote_original.v1\0" + policy.installation_id.encode(), "sha256"))
-    require_complete_provider_cache_binding_v1(bundle, launch["provider_cache"].get("provider_id"))
-    cache = InstalledProviderCacheDispositionV1(**launch["provider_cache"])
-    factory = InstalledC09MaintenanceFactoryV1(namespace=policy.namespace, peer=peer,
-        registry=affect.registry.type_registry, resource_issuer=resource, body_authority=body,
-        inventory_manifest=inventory, target_directory=Path(launch["target_directory"]), provider_cache_cleanup=cache)
+    factory = None
+    if "c09_storage_v2" not in assets:
+        require_complete_provider_cache_binding_v1(bundle, launch["provider_cache"].get("provider_id"))
+        cache = InstalledProviderCacheDispositionV1(**launch["provider_cache"])
+        factory = InstalledC09MaintenanceFactoryV1(namespace=policy.namespace, peer=peer,
+            registry=affect.registry.type_registry, resource_issuer=resource, body_authority=body,
+            budget_job_issuer=budget_issuer,
+            inventory_manifest=inventory, target_directory=Path(launch["target_directory"]), provider_cache_cleanup=cache)
     clock = LinuxKernelClockProviderV1(source_id=bundle.ingress_clock.source_id,
         maximum_error_seconds=bundle.ingress_clock.max_utc_error_seconds)
     config = load_installed_asset_config_v1(launch["assets_path"], core_authorizer=authorizer.core_authorizer,
@@ -105,14 +109,15 @@ def load_linux_deployment_config_v1(path):
         publisher_manifest_verifier=authorizer.publisher_manifest_verifier,
         utc_clock=lambda: datetime.now(timezone.utc), local_administrator_credential=authorizer.local_administrator_credential,
         c09_maintenance_factory=factory)
-    if (config.c09_storage_v1 is None or config.c09_storage_v1.authority_id != policy.expected_authority_id
+    c09 = config.c09_storage_v2 or config.c09_storage_v1
+    if (c09 is None or c09.authority_id != policy.expected_authority_id
             or config.namespace_bindings_v2.get((*peer, policy.namespace)) != policy.authority_namespace):
         raise AuthorityUnavailable("installed current C09 cohort differs from Host")
     namespace = policy.authority_namespace
     observer = HostOneBotObservationInstallationV2(peer[0], peer[1], **launch["host_observation"])
     config = replace(config, clock_provider=clock,
         natural_model_authorities_v2={namespace: InstalledNaturalModelAuthorityV2(
-            D11BudgetJobIssuer(resource, bundle.d11_signing_key), bundle.model_workflows, peer, bundle)},
+            budget_issuer, bundle.model_workflows, peer, bundle)},
         self_identity_readers_v2={namespace: peer}, worker_result_fact_committers_v2={namespace: peer},
         host_onebot_observations_v2={namespace: observer})
     # Every service private key and asset is pinned below administrator-owned
@@ -120,6 +125,12 @@ def load_linux_deployment_config_v1(path):
     for item in (config.tls.certificate, config.tls.client_trust_root):
         read_installed_bytes_v1(item)
     read_installed_bytes_v1(config.tls.private_key, private=True, allowed_gid=0)
+    if config.c09_storage_v2 is not None:
+        # The retired Control path must stay absent. Protect only the installed
+        # identity and the independent, fixed-name V2 selector assets here.
+        read_installed_bytes_v1(c09.key_path, private=True, allowed_gid=0)
+        read_installed_bytes_v1(c09.selector_path, private=True, allowed_gid=0)
+        read_installed_bytes_v1(c09.selector_journal_path, private=True, allowed_gid=0)
     from ..host.selected_profile_cohort_v2 import require_current_bundle_selection_v2
     require_current_bundle_selection_v2(bundle, launch['package_root'], require_selected_python=True, authority_private_config=True)
     return config, launch
@@ -132,6 +143,9 @@ def open_linux_authority_v1(path):
 
 def install_linux_lifecycle_v1(daemon, launch):
     """Compose the real independent controller before opening any RPC listener."""
+    from .daemon import AuthorityFactualDaemonV2
+    if type(daemon) is AuthorityFactualDaemonV2:
+        raise AuthorityUnavailable("C09 V2 factual-only installation: lifecycle/business construction HOLD")
     from .d12_installed_supervisor_v1 import D12SystemdSupervisorConfigV1, InstalledD12SystemdSupervisorV1
     from .d12_operation_status_v1 import InstalledD12OperationStatusServiceV1
     from .d12_operation_status_rpc_v1 import install_d12_operation_status_service_v1

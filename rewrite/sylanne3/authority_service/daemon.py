@@ -166,6 +166,40 @@ def _release_instance_lock(handle):
 
 
 def _resolve_current_c09_config(config, lease):
+    if config.c09_storage_v2 is not None:
+        installed = config.c09_storage_v2
+        from .c09_storage_control_v1 import C09StorageControlV1
+        from .c09_control_selector_v2 import InstalledC09ControlSelectorV2
+        from .c09_sanitized_history_v2 import InstalledC09StorageReaderV2
+        # The old Control is retired. Construct only its protected identity;
+        # never call its SQL opener or V1 recovery/bootstrap path.
+        _installed_file(installed.key_path, "C09 V2 identity key")
+        _installed_file(installed.selector_path, "C09 V2 selector")
+        _installed_file(installed.selector_journal_path, "C09 V2 selector journal")
+        control = C09StorageControlV1(control_path=installed.control_path,
+            key_path=installed.key_path, installation_id=installed.installation_id,
+            authority_id=installed.authority_id, control_store_id=installed.control_store_id,
+            key_id=installed.key_id, lease=lease, resource_roots=installed.resource_roots)
+        selector = InstalledC09ControlSelectorV2(control,
+            installed.selector_path, installed.selector_journal_path)
+        reader = InstalledC09StorageReaderV2(control=control, selector=selector)
+        context = reader.read_verified_current_storage_v2()
+        context.require_current("recovery")
+        namespaces = sorted(config.execution_journals)
+        if (context.manifest["cohort_namespaces"] != namespaces
+                or context.manifest["authority_id"] != installed.authority_id
+                or context.manifest["installation_id"] != installed.installation_id
+                or any(item.installation_id != installed.installation_id
+                       for item in config.installations_v2.values())):
+            raise AuthorityUnavailable("C09 V2 installed factual cohort differs")
+        members = {member["role"]: member for member in context.manifest["members"]}
+        namespace = namespaces[0]
+        return replace(config, authority_db=Path(members["core"]["resolved_path"]),
+            deletion_db=Path(members["deletion"]["resolved_path"]),
+            graph_db=Path(members["graph"]["resolved_path"]),
+            execution_journals={namespace: ExecutionJournalInstallation(
+                Path(members["execution"]["resolved_path"]),
+                members["execution"]["incarnation_or_journal_id"])}), reader
     installed = config.c09_storage_v1
     if installed is None:
         return config, None
@@ -207,6 +241,41 @@ def _resolve_current_c09_config(config, lease):
         execution_journals={namespace: ExecutionJournalInstallation(
             Path(members["execution"]["resolved_path"]),
             members["execution"]["incarnation_or_journal_id"])}), control
+
+
+class AuthorityFactualDaemonV2:
+    """Cold selected factual reader with no model, sender or business listener."""
+
+    def __init__(self, config, lock_handle, reader):
+        from .core import AuthorityFactualReadCoreV2
+        self.config = config
+        self._lock_handle = lock_handle
+        self.reader = reader
+        self.core = AuthorityFactualReadCoreV2(reader=reader,
+            authorizer=config.core_authorizer)
+        self._closed = False
+
+    @property
+    def is_listening(self):
+        return False
+
+    def read_current_sanitized_execution_v2(self, *, credential, namespace, execution_id):
+        if self._closed:
+            raise AuthorityUnavailable("C09 V2 factual daemon is closed")
+        return self.core.read_current_sanitized_execution_v2(
+            credential=credential, namespace=namespace, execution_id=execution_id)
+
+    async def start(self):
+        raise AuthorityUnavailable("C09 V2 factual-only daemon: business/accounting listener HOLD")
+
+    async def aclose(self):
+        if not self._closed:
+            self._closed = True
+            try:
+                self.core.close()
+            finally:
+                _release_instance_lock(self._lock_handle)
+                self._lock_handle = None
 
 
 class AuthorityDaemon:
@@ -701,6 +770,8 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
     core = None
     try:
         config, control = _resolve_current_c09_config(config, lock_handle)
+        if config.c09_storage_v2 is not None:
+            return AuthorityFactualDaemonV2(config, lock_handle, control)
         paths = _preflight(config)
         # Fail on unusable TLS material before touching persistent SQLite state.
         config.tls.ssl_context()
@@ -786,7 +857,13 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityDaemon:
                 if offline_bundle.model_workflows.contact_generation is not None:
                     from .contact_model_result_service_v1 import InstalledContactModelResultServiceV1
                     model._graph_verifier.install_contact_policy_service_v1(contact_service)
-                    server.install_contact_model_result_reader_v1(namespace, InstalledContactModelResultServiceV1(
+                    from ..host.model_workflows_v3 import AdminModelWorkflowsV3
+                    if type(offline_bundle.model_workflows) is AdminModelWorkflowsV3:
+                        from .contact_model_result_service_v2 import InstalledContactModelResultServiceV2 as InstalledContactModelResultServiceV1
+                        install_contact_reader = server.install_contact_model_result_reader_v2
+                    else:
+                        install_contact_reader = server.install_contact_model_result_reader_v1
+                    install_contact_reader(namespace, InstalledContactModelResultServiceV1(
                         store=model._store, fences=server._v2_fences[namespace],
                         graph_db_path=location._graph_db_path, d11_issuer=offline_installation.d11_issuer,
                         installation_id=control.installation_id,

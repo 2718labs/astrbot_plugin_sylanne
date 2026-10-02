@@ -4,15 +4,16 @@ from dataclasses import dataclass
 from ..domains.d03.context import RoleBindingRequest
 from ..domains.d05.prebatch_boundary import issue_prebatch_boundary_check_v1
 from ..domains.d06.source_grant import SourceGrantRead, provide_source_grant_check
-from ..domains.d08.contact_dispatch_check_v1 import read_contact_dispatch_check_scope_v1
+from ..domains.d08.contact_dispatch_check_v1 import DispatchCheckScopeV2, read_contact_dispatch_check_scope_v1
 from ..domains.d08.dispatch_check import D08_CRITERIA_REF_V1, D08_CRITERIA_VERSION_V1
 from ..domains.d10 import decode_contact_policy, decode_proactive_opportunity
 from ..graph_types import AtomKey, GraphVersion, Owner
 from ..memory_types import access_key, source_key
-from ..runtime_contracts import QueryEpoch, VersionedRef, canonical_digest
+from ..runtime_contracts import CheckReceipt, QueryEpoch, VersionedRef, canonical_digest
 from .budget import get_budget_lease
 from .contact_final_action_v1 import (
     ContactCheckVersionSetV1, CurrentContactCheckVersionsV1, contact_final_action_ids_v1,
+    require_contact_segment_index_v1,
 )
 from .contact_route_binding_v1 import contact_route_semantic_digest_v1, read_current_contact_route_binding_v1
 from .d10_contact_policy_authority_v1 import require_current_contact_policy_v1
@@ -26,11 +27,11 @@ from .structural_source_closure_v1 import read_current_structural_source_closure
 
 @dataclass(frozen=True, slots=True)
 class CurrentContactQualificationV1:
-    checks: tuple
+    checks: tuple[CheckReceipt, ...]
     check_versions: CurrentContactCheckVersionsV1
     positive_reads: tuple[GraphVersion, ...]
     negative_predicates: tuple[str, ...]
-    d08_scope: object
+    d08_scope: DispatchCheckScopeV2
     route_semantic_digest: str
     owner_policy_digest: str
 
@@ -62,7 +63,7 @@ def _plan_policy(db, read, content, current_policy, scope, now):
     if len(policies) != 1:
         raise ValueError('contact has no unique current adopted Owner policy')
     policy = require_current_contact_policy_v1(current_policy, scope, policies[0].value, now=now)
-    if policy.original_digest != plan.policy_original_digest:
+    if policy.digest != plan.policy_original_digest:
         raise ValueError('contact current Owner approval changed')
     return plan, policies[0], decode_contact_policy(policies[0].value, content.namespace), opportunity, parsed
 
@@ -71,6 +72,12 @@ def read_contact_check_versions_locked_v1(db, snapshot, query, scope, *, current
         content, segment_index, route, context, d02_issuer, d11_issuer, quote, grant,
         current_policy, now_utc, projected=False):
     """Read raw inputs; E+1 predictions never constitute provider approval."""
+    from .contact_final_projection_v1 import require_contact_projection_read_v1
+    require_contact_projection_read_v1(current_read, db,
+        phases=('pre_e',) if projected is True else ('provisional_e_plus_1', 'post_cas_e_plus_1'))
+    if type(projected) is not bool:
+        raise ValueError('Contact projection mode must match its private installed phase')
+    require_contact_segment_index_v1(content, segment_index)
     current_read.check(db)
     ns = content.namespace
     if (not db.in_transaction or query != QueryEpoch(ns, 'all', snapshot.epochs[0].revision)
@@ -96,6 +103,10 @@ def read_contact_check_versions_locked_v1(db, snapshot, query, scope, *, current
             source_versions.append(VersionedRef(item.token, atom.revision))
     criterion = current_read.head(db, AtomKey.from_token(plan.source_ref.ref), required=True)
     criteria = VersionedRef(criterion.key.token, criterion.revision)
+    if criteria not in source_versions:
+        # D06 checks every pinned input, including this actual Graph criterion.
+        # It does not make the criterion another expression root.
+        source_versions.append(criteria)
     epoch = query.revision + int(projected)
     ids = contact_final_action_ids_v1(content.contact_id, segment_index)
     owner = Owner('activity', *ns.as_tuple, content.activity_id)
@@ -124,6 +135,12 @@ def read_contact_check_versions_locked_v1(db, snapshot, query, scope, *, current
         VersionedRef(opportunity.opportunity_id, opportunity_atom.revision),
         VersionedRef(f'd10.contact_policy:{opportunity.subject_ref}:{opportunity.channel}:{opportunity.category}', epoch),
         *sorted(claims, key=lambda item: item.ref))
+    if projected:
+        from ..domains.d10.contact_claim_v2 import contact_claim_key_v2
+        own = current_read.head(db, contact_claim_key_v2(ns, content.contact_id))
+        if own.revision != 0 or own.valid or any(v.ref == content.contact_id for v in claims):
+            raise ValueError('Contact planned whole claim is already occupied')
+        contact_versions = contact_versions[:4] + tuple(sorted((*claims, VersionedRef(content.contact_id, 1)), key=lambda v:v.ref))
     sets = (
         ContactCheckVersionSetV1('role_binding', criteria.ref, (criteria,
             VersionedRef('d03.role_binding', epoch), *sorted((VersionedRef(v.key.name, v.revision)
@@ -144,13 +161,15 @@ def read_contact_check_versions_locked_v1(db, snapshot, query, scope, *, current
         tuple(GraphVersion(a.key, a.revision) for a in snapshot.atoms if a.valid), sets,
         quote.quote_id, quote.version, grant.grant_id, grant.version, reserve[0],
         current_policy.original.original_ref,
-        current_policy.original.original_digest)
+        current_policy.original.digest)
 
 
 def issue_contact_checks_locked_v1(db, snapshot, query, scope, *, current_read,
         stage, route, context, d02_issuer, d11_issuer, quote, grant, current_policy,
         current_effect, effect_snapshot, now_utc, valid_until_utc):
     """Reissue all six checks from actual staged rows under the installed fence."""
+    from .contact_final_projection_v1 import require_contact_projection_read_v1
+    require_contact_projection_read_v1(current_read, db, phases=('provisional_e_plus_1', 'post_cas_e_plus_1'))
     content, intent, schema = stage.content, stage.intent, stage.schema
     versions = read_contact_check_versions_locked_v1(db, snapshot, query, scope,
         current_read=current_read, content=content, segment_index=stage.segment_index,
@@ -205,4 +224,4 @@ def issue_contact_checks_locked_v1(db, snapshot, query, scope, *, current_read,
         'd10.contact_claim.v1:all', 'd10.contact_claim.v2:all')
     return CurrentContactQualificationV1(checks, versions,
         tuple(sorted(positives.values(), key=lambda v: v.key.token)), predicates, d08,
-        contact_route_semantic_digest_v1(route), current_policy.original.original_digest)
+        contact_route_semantic_digest_v1(route), current_policy.original.digest)

@@ -48,9 +48,13 @@ def _receipt(raw):
     return result
 
 
+def _registered_domain_original_v1(domain, operation_kind):
+    return domain in DOMAINS or (domain, operation_kind) in {('d04', 'adopt_internal_life_numeric'), ('d04', 'prepare_internal_life_numeric_drive')}
+
+
 def record_adopted_domain_operation_v1(db, stage, receipt):
     if (not db.in_transaction or type(stage) is not StagedDomainOperationV1
-            or type(receipt) is not CommitReceipt or stage.domain not in DOMAINS
+            or type(receipt) is not CommitReceipt or not _registered_domain_original_v1(stage.domain, stage.operation_kind)
             or receipt.status != "committed" or receipt.operation_id != stage.operation_id
             or receipt.activity_id != stage.activity_id):
         raise ValueError("domain original needs its actual same-transaction W01 receipt")
@@ -86,7 +90,7 @@ def read_adopted_domain_operation_v1(db, namespace, operation_id):
     payload, read_rows, raw_receipt = json.loads(encoded), json.loads(reads_json), json.loads(receipt_json)
     receipt = _receipt(raw_receipt)
     reads = tuple(GraphVersion(AtomKey.from_token(ref), revision) for ref, revision in read_rows)
-    if (domain not in DOMAINS or canonical_serialize(payload) != encoded
+    if (not _registered_domain_original_v1(domain, kind) or canonical_serialize(payload) != encoded
             or canonical_digest(payload) != original_digest or canonical_serialize(read_rows) != reads_json
             or len(reads) > 1024 or any(NamespaceId.from_key(v.key) != namespace for v in reads)
             or canonical_serialize(raw_receipt) != receipt_json or canonical_digest(receipt) != receipt_digest

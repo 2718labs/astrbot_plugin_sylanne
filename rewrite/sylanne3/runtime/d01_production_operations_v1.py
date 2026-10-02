@@ -604,6 +604,8 @@ class InstalledD01ProductionReadersV1:
             from .domain_production_erasure_v1 import decode_typed_production_value_v1
             from .domain_production_originals_v1 import read_adopted_domain_operation_v1
             progress = decode_typed_production_value_v1(atom.value, LifeProgressHeadV1)
+            from .d10_life_progress_provenance_v1 import require_current_life_progress_v1
+            require_current_life_progress_v1(db,namespace=frame.envelope.authority.namespace,progress=progress,issuer=self.issuer,read=read)
             adoption = read_adopted_domain_operation_v1(db, frame.envelope.authority.namespace, history[0])
             if (adoption is None or adoption["domain"] != "d10" or adoption["operation_kind"] != "advance_life"
                     or progress.reality != "real_execution" or progress.actuality != "completed"):

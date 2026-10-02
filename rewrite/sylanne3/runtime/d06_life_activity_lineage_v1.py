@@ -5,6 +5,7 @@ not qualify the processed text as an external fact or authorize expression.
 """
 from dataclasses import dataclass
 import json
+import weakref
 
 from ..graph_types import AtomKey, GraphVersion, Owner
 from ..memory_types import SourceRecord
@@ -20,8 +21,10 @@ from .d10_life_outcome_v2 import life_experience_source_id_v1, life_experience_p
 from .d02_life_effect_v1 import require_life_body_quote_v1
 from .d11_offline_originals_v1 import _utc
 
+_QUALIFIED_INTERNAL_LIFE = {}
 
-@dataclass(frozen=True, slots=True)
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class QualifiedLifeActivityV1:
     source_ref: str
     source_revision: int
@@ -60,6 +63,7 @@ def life_activity_read_inputs_v1(db, namespace, source_ref):
         raise MissingProductionOriginalV1("signed_actual_life_experience")
     terminal = life_from_wire_v1(original["terminal"], D11LifeTerminalV1)
     b = terminal.binding
+    from .d10_life_progress_provenance_v1 import life_progress_read_keys_v1
     from .d11_life_graph_types_v1 import life_role_segment_key_v1
     from .jobs import get_job
     from .d11_types import job_graph_write
@@ -68,10 +72,19 @@ def life_activity_read_inputs_v1(db, namespace, source_ref):
         life_role_segment_key_v1(b, "start"), life_role_segment_key_v1(b, "end"),
         AtomKey(Owner("activity", *namespace.as_tuple, b.activity_id), "d10.life_progress.v1", b.effect_id),
         *(AtomKey.from_token(ref) for ref in payload["cost_refs"])]
+    keys.extend(life_progress_read_keys_v1(b))
     if job is not None:
         keys.append(job_graph_write(job).key)
+    from .d11_life_fact_provenance_v1 import PROVENANCE_TYPE, ELIGIBILITY_TYPE, life_fact_auxiliary_key_v1
+    facts=(AtomKey.from_token(b.artifact_ref),life_role_segment_key_v1(b,'start'),life_role_segment_key_v1(b,'end'))
+    keys.extend(life_fact_auxiliary_key_v1(fact,kind) for fact in facts for kind in (PROVENANCE_TYPE,ELIGIBILITY_TYPE))
     prepared = raw_life_original_v1(db, namespace, "prepared", b.prepared_original_ref)
     if prepared is not None:
+        from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
+        keys.extend(life_outcome_read_keys_v1(b,prepared['plan']['action_intent']['ref']))
+        from .d10_life_progress_provenance_v1 import life_progress_current_read_inputs_v1,life_progress_key_v1
+        current_keys,_,_=life_progress_current_read_inputs_v1(db,namespace,life_progress_key_v1(b).token)
+        keys.extend(current_keys)
         from .d11_life_contract_v1 import LifeBodyComponentContractV1
         contract = LifeBodyComponentContractV1(**json.loads(prepared["plan"]["body_effect_request_json"]))
         keys.extend((AtomKey.from_token(contract.settlement_ref), AtomKey.from_token(contract.reservation_ref)))
@@ -103,6 +116,20 @@ def qualify_current_life_activity_v1(db, *, frame, source_atom, adopted, progres
         raise ValueError("Life experience differs from its signed execution bridge")
     receipt = verify_life_adoption_commit_v1(db, gate=gate, issuer=issuer,
         resource_issuer=installed_readers.resource_issuer, require_current_metadata=False)
+    from .d11_life_terminal_v1 import read_adopted_life_original_v1
+    from .d11_life_fact_provenance_v1 import require_current_life_fact_eligibility_v1
+    fact_original=read_adopted_life_original_v1(db,namespace=ns,result_ref=b.artifact_ref,issuer=issuer)
+    require_current_life_fact_eligibility_v1(db,prepared=prepared,terminal=terminal,adopted=fact_original)
+    from .d10_life_progress_provenance_v1 import require_current_life_progress_v1,require_life_experience_access_edges_v1
+    require_current_life_progress_v1(db,namespace=ns,progress=progress,issuer=issuer,read=read)
+    access_key_actual=require_life_experience_access_edges_v1(db,prepared=prepared,source=source_atom.key)
+    access_history=db.execute('SELECT value,valid,event_id FROM graph_history WHERE token=? AND revision=1',(access_key_actual.token,)).fetchone()
+    expected_access=canonical_serialize({'source_id':source.source_id,'audiences':list(source.audiences),
+        'purposes':list(source.purposes),'status':'active','recorded_at':source.recorded_at})
+    if (not any(v.key==access_key_actual and v.revision==1 for v in adopted['receipt'].write_versions)
+            or access_history!=(expected_access,1,operation_id)
+            or db.execute('SELECT value FROM graph_atoms WHERE token=?',(access_key_actual.token,)).fetchone()!=(expected_access,)):
+        raise ValueError('Life current experience access lacks its exact actual same-composite original')
     verify_durable_life_artifact_v1(db, prepared, digest=terminal.payload.artifact_digest,
         length=terminal.payload.artifact_length)
     contract, _, body_quote = require_life_body_quote_v1(db, prepared=prepared, issuer=issuer,
@@ -143,10 +170,13 @@ def qualify_current_life_activity_v1(db, *, frame, source_atom, adopted, progres
             operation_id=b.reservation_operation_id)
     if len(payload["cost_refs"]) != 1:
         raise ValueError("Life activity requires its one genuine CPU settlement")
-    from .jobs import get_job
     from .d11_types import job_graph_write
-    job = get_job(db, b.job_id)
-    if (job is None or job.phase != "completed" or job.result_ref != b.artifact_ref
+    from .d11_life_terminal_v1 import read_adopted_life_original_v1, read_current_life_job_result_v1
+    completed_original = read_adopted_life_original_v1(db, namespace=ns, result_ref=b.artifact_ref, issuer=issuer)
+    if completed_original is None:
+        raise MissingProductionOriginalV1("signed_actual_life_job_result_mapping")
+    job, expected_result_ref = read_current_life_job_result_v1(db, job_id=b.job_id, adopted=completed_original)
+    if (job.phase != "completed" or job.result_ref != expected_result_ref
             or job.operation_id != b.operation_id or job.usage != {"thread_cpu_ms": terminal.actual_cpu_ms}):
         raise ValueError("Life activity job does not preserve its actual terminal usage")
     job_write = job_graph_write(job)
@@ -172,7 +202,11 @@ def qualify_current_life_activity_v1(db, *, frame, source_atom, adopted, progres
         raise ValueError("Life progress role interval differs from actual start/end originals")
     start, end = _utc(terminal.claim.payload.claimed_at_utc).timestamp(), _utc(terminal.payload.completed_at_utc).timestamp()
     digest = canonical_digest((canonical_digest(original), receipt, canonical_digest(settlement.value), plain_v1(progress)))
-    return QualifiedLifeActivityV1(source_atom.key.token, source_atom.revision, canonical_digest(source_atom.value),
+    activity = QualifiedLifeActivityV1(source_atom.key.token, source_atom.revision, canonical_digest(source_atom.value),
         b.activity_id, b.effect_id, b.execution_id, b.artifact_ref, terminal.payload.artifact_digest,
         terminal.claim.original_ref, terminal.original_ref, terminal.actual_cpu_ms, start, end,
         settlement.key.token, digest, frame.snapshot.versions)
+    identity = id(activity)
+    _QUALIFIED_INTERNAL_LIFE[identity] = (weakref.ref(activity,
+        lambda _: _QUALIFIED_INTERNAL_LIFE.pop(identity, None)), db, frame)
+    return activity

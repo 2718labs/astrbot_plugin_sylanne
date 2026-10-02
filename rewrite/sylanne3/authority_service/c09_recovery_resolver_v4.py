@@ -91,8 +91,44 @@ class InstalledSanitizedRecoveryResolverV4:
                         if item_id is not None and db.execute("SELECT original_commitment FROM authority_c09_consumed_execution_v1 WHERE namespace=? AND kind=? AND item_id=?",
                                 (namespace, kind, item_id)).fetchone() != (model.original_digest,):
                             raise AuthorityUnavailable("C09 actual model once-only consumption differs")
+                from .c09_contact_finish_original_v1 import validate_contact_finish_frame_inventory_v1, verify_contact_finish_recovery_v1, read_contact_finish_originals_v1, INVENTORY_PREFIX
+                from .c09_recovery_frame_v5 import C09RecoveryFactFrameV5, verify_contact_finish_inventory_restore_v5
+                if type(facts) is C09RecoveryFactFrameV5:
+                    verify_contact_finish_inventory_restore_v5(db, facts=facts, pin=pin, prepared=original, verified_prior=tuple(frames))
+                elif (read_contact_finish_originals_v1(db, namespace=namespace, operation_id=operation)
+                        or any(f.operation_id.startswith(INVENTORY_PREFIX) for f in facts.graph_facts)):
+                    raise AuthorityUnavailable('C09 Contact versioned finish inventory compatibility unresolved; restore HOLD')
+                else:
+                    # Opaque V4 graph commitments are not an authenticated
+                    # proof of absent historical Contact. The strict empty
+                    # complete Graph inventory is the only legacy zero proof.
+                    if facts.graph_facts:
+                        raise AuthorityUnavailable('C09 legacy V4 lacks authenticated complete Contact absence proof; HOLD')
                 prior_root = original["prepared_digest"]
                 frames.append((original,facts,bindings))
+            from .c09_contact_finish_original_v1 import TABLE as CONTACTS, contact_graph_fact_v1, read_contact_finish_originals_v1
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (CONTACTS,)).fetchone():
+                expected = {(p['namespace'], p['operation_id']) for p, _f, _b in frames}
+                recorded = set(db.execute(f'SELECT DISTINCT namespace,operation_id FROM {CONTACTS}'))
+                if not recorded <= expected:
+                    raise AuthorityUnavailable('C09 Contact archive outside signed storage lineage')
+                contacts = {}
+                for namespace, operation in recorded:
+                    for contact in read_contact_finish_originals_v1(db, namespace=namespace, operation_id=operation):
+                        key = contact.business_operation_id
+                        if key in contacts and contacts[key] != contact:
+                            raise AuthorityUnavailable('C09 Contact repeated archive differs')
+                        contacts[key] = contact
+                for _p, facts, _b in frames:
+                    for fact in facts.graph_facts:
+                        contact = contacts.get(fact.operation_id)
+                        if contact is not None and fact != contact_graph_fact_v1(contact):
+                            raise AuthorityUnavailable('C09 Contact carried compound fact differs')
+                latest = frames[-1][1] if frames else None
+                if type(latest) is not C09RecoveryFactFrameV5:
+                    if contacts: raise AuthorityUnavailable('C09 legacy opaque finish inventory cannot prove absence; HOLD')
+                elif {m.original for m in latest.contact_finish_inventory.members} != set(contacts.values()):
+                    raise AuthorityUnavailable('C09 V5 complete latest inventory omits or adds archived historical finishes')
         context.require_current("maintenance")
         return context,tuple(frames)
 

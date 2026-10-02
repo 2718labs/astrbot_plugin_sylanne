@@ -41,7 +41,7 @@ class InstalledC09RecoveryOriginalsV4:
     def __init__(self, *, core, closure, graph: GraphStore,
                  namespace_id: NamespaceId, resource_issuer: D02ResourceIssuer,
                  body_authority: D02BodyQuoteAuthority,
-                 internal_services: dict[str, AuthorityInternalWorkService]):
+                 internal_services: dict[str, AuthorityInternalWorkService], budget_job_issuer=None):
         from .core import AuthorityServiceCore
         from .erasure_closure_inventory import AuthorityErasureClosureInventory
         from .internal_work_service import AuthorityInternalWorkService
@@ -67,6 +67,11 @@ class InstalledC09RecoveryOriginalsV4:
         self.core, self.closure, self.graph = core, closure, graph
         self.namespace_id = namespace_id
         self.resource_issuer = resource_issuer
+        from ..runtime.issuers import D11BudgetJobIssuer
+        if budget_job_issuer is not None and (type(budget_job_issuer) is not D11BudgetJobIssuer
+                or budget_job_issuer.resource_issuer is not resource_issuer):
+            raise C09RecoveryFactsHold(("installed_life_budget_job_issuer",))
+        self.budget_job_issuer = budget_job_issuer
         self.body_authority = body_authority
         self.internal_services = dict(internal_services)
         with graph._lock:
@@ -78,6 +83,12 @@ class InstalledC09RecoveryOriginalsV4:
         self._snapshot = None
         self._original_cache = None
         self._model_cache = None
+        self._contact_registry = graph._registry
+        self._contact_control = core._c09_storage_reader_v1
+        self._contact_finish_scope = None
+        self._life_completed_scope = None
+        from .c09_contact_finish_original_v1 import _register_contact_finish_port_v1
+        _register_contact_finish_port_v1(self)
 
     @contextmanager
     def freeze_verified_originals_v4(self, *, seal, old, rows,
@@ -105,6 +116,8 @@ class InstalledC09RecoveryOriginalsV4:
                     try:
                         yield self
                     finally:
+                        from .c09_contact_disposition_v1 import _revoke_contact_carriers_v1
+                        _revoke_contact_carriers_v1(self)
                         self._snapshot = None
                         self._original_cache = None
                         self._model_cache = None
@@ -425,7 +438,8 @@ class InstalledC09RecoveryOriginalsV4:
             from .c09_model_budget_original_v1 import capture_frozen_model_budget_originals_v1
             self._model_cache = capture_frozen_model_budget_originals_v1(core_db=control,
                 business=business, namespace_id=self.namespace_id, seal=seal, resource_issuer=self.resource_issuer,
-                require_existing=getattr(self, "_completed_core", False))
+                require_existing=getattr(self, "_completed_core", False),
+                budget_job_issuer=self.budget_job_issuer)
         return self._model_cache
 
     def read_current_d02_originals_v4(self, *, namespace, operation_id):
@@ -604,12 +618,34 @@ class InstalledC09RecoveryOriginalsV4:
         return tuple(sorted(facts, key=lambda item: item.execution_id))
 
     def read_current_graph_originals_v4(self, *, namespace, operation_id):
-        self._current(namespace, operation_id)
+        seal, _old, _rows, verifier, business, control = self._current(namespace, operation_id)
         from ..runtime.c09_graph_originals_read_v4 import (
             read_current_graph_originals_v4,
         )
-        return read_current_graph_originals_v4(
-            self._snapshot[4], self.namespace_id, operation_id)
+        facts = read_current_graph_originals_v4(business, self.namespace_id, operation_id)
+        from .c09_contact_finish_original_v1 import capture_contact_finish_originals_v1, contact_graph_fact_v1, contact_finish_inventory_fact_v1, _issue_contact_finish_scope_v1, _revoke_contact_finish_scope_v1
+        _revoke_contact_finish_scope_v1(self)
+        originals = capture_contact_finish_originals_v1(core_db=control, business=business,
+            namespace_id=self.namespace_id, seal=seal, verifier_commitment=verifier,
+            registry=self._contact_registry, graph_facts=facts,
+            require_existing=getattr(self, '_completed_core', False), storage_reader=self._contact_control)
+        replacements = {item.business_operation_id: contact_graph_fact_v1(item) for item in originals}
+        self._contact_finish_scope = _issue_contact_finish_scope_v1(self, originals) if originals else None
+        if any(f.operation_id.startswith('c09-contact-finish-inventory:') for f in facts):
+            raise AuthorityUnavailable('C09 Graph business operation uses reserved Contact inventory identity')
+        issued = tuple(o for o in originals if o.operation_id == seal.operation_id)
+        inventory = () if not issued else (contact_finish_inventory_fact_v1(seal.operation_id, issued),)
+        from .c09_life_completed_archive_v1 import (
+            capture_and_store_completed_life_archive_v1, life_inventory_fact_v1,
+            INVENTORY_PREFIX as LIFE_INVENTORY_PREFIX)
+        if any(f.operation_id.startswith(LIFE_INVENTORY_PREFIX) for f in facts):
+            raise AuthorityUnavailable('C09 Graph business operation uses reserved Life inventory identity')
+        life_archive = capture_and_store_completed_life_archive_v1(self,
+            namespace=namespace, operation_id=operation_id,
+            require_existing=getattr(self, '_completed_core', False))
+        life_inventory = (life_inventory_fact_v1(life_archive),)
+        return tuple(sorted((*tuple(replacements.get(fact.operation_id, fact) for fact in facts), *inventory, *life_inventory),
+                            key=lambda f: f.operation_id))
 
 
 __all__ = ["InstalledC09RecoveryOriginalsV4"]
@@ -648,6 +684,11 @@ class ConnectionC09RecoveryOriginalsV4(InstalledC09RecoveryOriginalsV4):
         factory = config.c09_maintenance_factory
         self.namespace_id = factory.namespace
         self.resource_issuer, self.body_authority = factory.resource_issuer, factory.body_authority
+        self.budget_job_issuer = getattr(factory, "budget_job_issuer", None)
+        self._contact_registry = factory.registry
+        self._contact_control = control
+        self._contact_finish_scope = None
+        self._life_completed_scope = None
         self.internal_services, self._verifiers = {}, {}
         self._snapshot = self._original_cache = self._model_cache = None
         self._connection_material = (core_db, business_db, execution_reader, tuple(rows))
@@ -667,6 +708,8 @@ class ConnectionC09RecoveryOriginalsV4(InstalledC09RecoveryOriginalsV4):
             self.internal_services[algorithm] = InstalledC09OriginalVerifierV1(config=config, control=control,
                 core_db=core_db, business_db=business_db, execution_reader=execution_reader,
                 kind="internal", algorithm=algorithm)
+        from .c09_contact_finish_original_v1 import _register_contact_finish_port_v1
+        _register_contact_finish_port_v1(self)
 
     def _installed_verifier(self, kind, namespace):
         if namespace != self._connection_material[2].namespace:
@@ -688,6 +731,8 @@ class ConnectionC09RecoveryOriginalsV4(InstalledC09RecoveryOriginalsV4):
         try:
             yield self
         finally:
+            from .c09_contact_disposition_v1 import _revoke_contact_carriers_v1
+            _revoke_contact_carriers_v1(self)
             self._snapshot = self._original_cache = self._model_cache = None
 
     def verify_execution_rows_v1(self):

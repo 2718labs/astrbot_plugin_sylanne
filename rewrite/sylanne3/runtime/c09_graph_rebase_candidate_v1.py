@@ -51,6 +51,10 @@ from .c09_contact_originals_v1 import (
     TABLE as _CONTACT_TABLE, COLUMNS as _CONTACT_COLUMNS,
     validate_contact_schema_v1, read_contact_inventory_row_v1, contact_original_dispositions_v1,
 )
+from .c09_contact_originals_v2 import (
+    TABLE as _CONTACT_V2_TABLE, COLUMNS as _CONTACT_V2_COLUMNS,
+    validate_contact_schema_v2, read_contact_inventory_row_v2, contact_original_dispositions_v2,
+)
 _C04_BASELINE_TABLE = "graph_c04_encoding_baselines_v3"
 _SHARED_ORIGINAL_TABLE = "graph_domain_production_originals_v1"
 _SHARED_OUTBOX_TABLE = "graph_domain_production_outbox_v1"
@@ -75,7 +79,7 @@ _KNOWN = _INSTALLED_TABLES | _BODY_TABLES | _EDGE_TABLES | _COMMITMENT_TABLES | 
     "runtime_d11_d04_root_freezes_v3",
     "graph_d07_behavior_original_v1",
 }) | frozenset(_DOMAIN_COLUMNS) | {_SHARED_ORIGINAL_TABLE, _SHARED_OUTBOX_TABLE, _D07_TABLE,
-    _D07_STAGE_TABLE, _D07_ACCOUNTING_TABLE, _C04_BASELINE_TABLE, _CONTACT_TABLE}
+    _D07_STAGE_TABLE, _D07_ACCOUNTING_TABLE, _C04_BASELINE_TABLE, _CONTACT_TABLE, _CONTACT_V2_TABLE}
 _ERASED_SCHEMA = "sylanne3.graph.erased_value.v1"
 _REBASE_TABLES = frozenset({"graph_c09_rebase_certificates_v1", "graph_c09_erased_keys_v1"})
 _FACT_COLUMNS = frozenset({"token", "dependent_token", "dependency_token", "root_source_ref",
@@ -304,6 +308,33 @@ def _installed_closure(db: sqlite3.Connection, request: GraphRebaseInputV1) -> s
     return affected
 
 
+def _validate_internal_life_episode_history_inventory_v2(db):
+    """Authenticate new historical proofs from actual production/member SQL.
+
+    Current withdrawal does not invalidate historical occurrence. Missing or
+    changed actual originals do; a typed DTO alone is no erasure proof.
+    """
+    from .d06_internal_life_episode_v2 import PROVENANCE, decode_internal_life_value_v2, validate_internal_life_episode_history_v2
+    if not db.in_transaction:
+        raise GraphRebaseHold('Life episode history inventory requires actual pinned SQL')
+    seen=set()
+    for table in _BODY_TABLES:
+        rows=db.execute(f"SELECT token,value FROM {table} WHERE json_extract(token,'$[4]')=? ORDER BY token LIMIT 1025",
+            (PROVENANCE,)).fetchall()
+        if len(rows)>1024:raise GraphRebaseHold('Life episode historical proof inventory exceeds bound; HOLD')
+        for token,encoded in rows:
+            if (token,encoded) in seen:continue
+            seen.add((token,encoded))
+            try:
+                proof=decode_internal_life_value_v2(PROVENANCE,json.loads(encoded))
+                from .d06_internal_life_episode_v2 import internal_life_episode_keys_v2
+                if token!=internal_life_episode_keys_v2(proof.event.namespace,proof.event.activity.source_ref)[2].token:
+                    raise ValueError('Life historical proof key differs')
+                validate_internal_life_episode_history_v2(db,proof)
+            except (ValueError,TypeError,KeyError) as exc:
+                raise GraphRebaseHold('Life episode historical production original/membership differs; HOLD') from exc
+
+
 def _dependency_closure(db: sqlite3.Connection, affected: set[str]) -> set[str]:
     current = list(db.execute(
         "SELECT dependent_token,dependency_token FROM graph_dependencies"))
@@ -323,7 +354,6 @@ def _dependency_closure(db: sqlite3.Connection, affected: set[str]) -> set[str]:
                 raise ValueError("dependency pair malformed")
         except (TypeError, ValueError) as exc:
             raise GraphRebaseHold(f"historical dependency original unreadable: {token}") from exc
-    edges = current + historical
     values = []
     for table in _BODY_TABLES:
         for token, value in db.execute(f"SELECT token,value FROM {table}"):
@@ -334,6 +364,98 @@ def _dependency_closure(db: sqlite3.Connection, affected: set[str]) -> set[str]:
                 raise GraphRebaseHold(
                     f"unparseable Graph nested original: {table} token {token}") from exc
             values.append((token, key.type_name, decoded))
+            from .internal_life_content_adoption_v1 import (
+                PROVENANCE as LCP, decode_content_v1, content_keys_v1)
+            if key.type_name == LCP:
+                try:
+                    proof = decode_content_v1(LCP, decoded)
+                    keys = content_keys_v1(proof.trace.episode_ref)
+                    if key != keys[1]:
+                        raise ValueError("content provenance locator differs")
+                    from .d04_root_original_store_v1 import _receipt
+                    receipt = _receipt(db, proof.trace.namespace, proof.trace.producing_operation_id)
+                    members = {v.key.token for v in receipt.write_versions}
+                    content = {v.token for v in keys}
+                    jobs = members - content
+                    if (len(members) != 4 or not content <= members or len(jobs) != 1
+                            or AtomKey.from_token(next(iter(jobs))).type_name != "runtime.job"):
+                        raise ValueError("content adoption four-member receipt differs")
+                    references = {proof.trace.episode_ref,
+                        *(r.ref for r in proof.historical_reads), *(r.ref for r in proof.current_reads)}
+                    historical.extend((member, ref) for member in members for ref in references)
+                    historical.extend((member, sibling) for member in members for sibling in members if member != sibling)
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise GraphRebaseHold("Life content historical closure unreadable; HOLD") from exc
+            from .d06_internal_life_episode_v2 import KINDS as IK, PROVENANCE as IP, ELIGIBILITY as IE, decode_internal_life_value_v2
+            from .d06_internal_life_trace_v3 import TRACE as IT, decode_internal_life_trace_v3
+            if key.type_name == IT:
+                trace=decode_internal_life_trace_v3(json.loads(value))
+                historical.append((token,trace.episode_ref))
+                historical.append((token,trace.encoding_baseline_ref))
+                historical.extend((token,ref) for ref in (trace.perspective_ref,*trace.then_feeling_refs,*trace.interpretation_refs))
+            if key.type_name in IK:
+                proof = decode_internal_life_value_v2(key.type_name, decoded)
+                if key.type_name == IP:
+                    historical.extend((token, row.ref) for row in proof.historical_reads)
+                    historical.extend(((proof.event.event_ref, token), (proof.episode.episode_ref, token)))
+                elif key.type_name == IE:
+                    historical.extend(((token, proof.episode_ref), (token, proof.event_ref), (token, proof.provenance_ref)))
+            from ..domains.d09.contact_batch_v2 import PROVENANCE as CP, ELIGIBILITY as CE, decode_contact_batch_companion_v2, contact_batch_keys_v2
+            from ..domains.d08.contact_plan_v2 import PROVENANCE as CPP,ELIGIBILITY as CPE,decode_contact_plan_member_v2,contact_plan_keys_v2
+            if key.type_name in {CPP,CPE}:
+                proof=decode_contact_plan_member_v2(key.type_name,decoded)
+                if key.type_name==CPP:
+                    if key!=contact_plan_keys_v2(proof.plan)[1]:
+                        raise GraphRebaseHold('Contact Plan v2 exact historical provenance key differs; HOLD')
+                    historical.extend((token,row.ref) for row in proof.historical_reads)
+                    historical.append((contact_plan_keys_v2(proof.plan)[0].token,token))
+                else:
+                    historical.extend(((token,proof.plan_ref.ref),(token,proof.provenance_ref.ref)))
+            if key.type_name in {CP,CE}:
+                proof=decode_contact_batch_companion_v2(key.type_name,decoded)
+                if key.type_name==CP:
+                    if key != contact_batch_keys_v2(proof.batch.content.namespace,proof.batch.content.activity_id,proof.batch.content.contact_id)[1]:
+                        raise GraphRebaseHold('Contact v2 historical provenance key differs; HOLD')
+                    historical.extend((token,row.ref) for row in proof.historical_reads)
+                    historical.append((contact_batch_keys_v2(proof.batch.content.namespace,proof.batch.content.activity_id,proof.batch.content.contact_id)[0].token,token))
+                else:
+                    historical.extend(((token,proof.batch_ref),(token,proof.provenance_ref)))
+            from ..domains.d09.contact_batch_v3 import PROVENANCE as CP3, ELIGIBILITY as CE3, decode_contact_batch_companion_v3, contact_batch_keys_v3
+            if key.type_name in {CP3,CE3}:
+                proof3=decode_contact_batch_companion_v3(key.type_name,decoded)
+                if key.type_name==CP3:
+                    batch_keys3=contact_batch_keys_v3(proof3.batch.content.namespace,proof3.batch.content.activity_id,proof3.batch.content.contact_id)
+                    if key != batch_keys3[1]:
+                        raise GraphRebaseHold('Contact3 exact historical provenance key differs; HOLD')
+                    historical.extend((token,row.ref) for row in proof3.historical_reads)
+                    historical.append((batch_keys3[0].token,token))
+                else:
+                    historical.extend(((token,proof3.batch_ref),(token,proof3.provenance_ref)))
+            from .d10_life_progress_provenance_v1 import PROVENANCE_TYPE as PP,ELIGIBILITY_TYPE as PE,decode_life_progress_auxiliary_v1
+            if key.type_name in {PP,PE}:
+                proof=decode_life_progress_auxiliary_v1(key.type_name,decoded)
+                if key.type_name==PP:
+                    historical.extend(((token,proof.terminal_provenance_ref),(proof.fact_ref,token)))
+                else:
+                    historical.extend(((token,proof.fact_ref),(token,proof.provenance_ref),(token,proof.terminal_eligibility_ref)))
+            from .d11_life_fact_provenance_v1 import PROVENANCE_TYPE, ELIGIBILITY_TYPE, decode_life_fact_auxiliary_v1
+            if key.type_name in {PROVENANCE_TYPE,ELIGIBILITY_TYPE}:
+                proof=decode_life_fact_auxiliary_v1(key.type_name,decoded)
+                # Physical closure includes immutable facts and their proofs;
+                # these deletion edges are not Graph invalidation edges.
+                if key.type_name==PROVENANCE_TYPE:
+                    historical.extend((token,row.ref) for row in proof.reads)
+                    historical.append((proof.fact_ref,token))
+                else:
+                    historical.extend(((token,proof.fact_ref),(token,proof.provenance_ref)))
+            from .d11_life_outcome_provenance_v1 import PROVENANCE_TYPE as OP, ELIGIBILITY_TYPE as OE, decode_life_outcome_auxiliary_v1
+            if key.type_name in {OP,OE}:
+                proof=decode_life_outcome_auxiliary_v1(key.type_name,decoded)
+                if key.type_name==OP:
+                    historical.extend(((token,proof.terminal_provenance_ref),(token,proof.action_ref),(proof.fact_ref,token)))
+                else:
+                    historical.extend(((token,proof.fact_ref),(token,proof.provenance_ref),(token,proof.terminal_eligibility_ref)))
+    edges = current + historical
     source_ids = {AtomKey.from_token(token).owner.subject for token in affected
                   if AtomKey.from_token(token).type_name == "memory.source"}
     while True:
@@ -468,8 +590,25 @@ def _shared_domain_dispositions_v1(db, table, columns, rows, *, registry, affect
                 (*namespace.as_tuple, original["operation_id"])).fetchone()
             if bundle != (receipt.operation_digest, receipt.activity_id, receipt.effect_id, receipt.commit_seq):
                 raise GraphRebaseHold("shared original lacks its actual Graph bundle receipt")
+            payload = json.loads(row[7])
+            contact_final = row[3] == 'd08' and row[4] in {'prepare_contact_dispatch','prepare_contact_dispatch_v3'}
+            if contact_final:
+                from .c09_contact_final_v1 import validate_contact_final_original_joins_v1
+                try:
+                    validate_contact_final_original_joins_v1(db,namespace=namespace,
+                        operation_id=original['operation_id'],payload=payload,receipt=receipt,
+                        original_digest=row[6],registry=registry)
+                except (ValueError,TypeError,KeyError) as error:
+                    raise GraphRebaseHold('Contact final historical COMMIT/qualification inventory differs') from error
             removed = (original["operation_id"] in affected_operations or bool(set(original["graph_refs"]) & affected)
                 or _nested_hits(json.loads(row[7]), affected, source_ids))
+            if contact_final and removed:
+                from .c09_contact_final_v1 import require_contact_final_erasure_finish_v1
+                try:
+                    require_contact_final_erasure_finish_v1(payload['provenance'], db=db,
+                        namespace=namespace, operation_id=original['operation_id'])
+                except ValueError as error:
+                    raise GraphRebaseHold(str(error)) from error
             result.append("derived_removed" if removed else "preserved_exact")
         else:
             original = decode_domain_production_outbox_row_v1(row, namespace, db=db)
@@ -627,6 +766,20 @@ def _cold_graph_data_root(path: Path, namespace: NamespaceId,
                 if "derived_removed" in dispositions:
                     raise GraphRebaseHold("cold D07 execution body survives erased closure")
                 continue
+            if table=='graph_contact_expression_plan_originals_v2':
+                from .c09_contact_plan_originals_v2 import validate_contact_plan_original_schema_v2,contact_plan_original_dispositions_v2
+                validate_contact_plan_original_schema_v2(db)
+                dispositions=contact_plan_original_dispositions_v2(db,columns,rows,
+                    affected=affected,affected_operations=operations)
+                if 'derived_removed' in dispositions:
+                    raise GraphRebaseHold('cold Contact Plan v2 body original survives erased closure')
+                continue
+            if table == _CONTACT_V2_TABLE:
+                dispositions = contact_original_dispositions_v2(columns, rows, affected=affected, affected_operations=operations,
+                    nested_hits=_nested_hits, source_ids=source_ids, authority_namespace=json.loads(recovery[0])["authority_namespace"])
+                if "derived_removed" in dispositions:
+                    raise GraphRebaseHold("cold contact original body survives erased closure")
+                continue
             if table == _CONTACT_TABLE:
                 dispositions = contact_original_dispositions_v1(columns, rows, affected=affected, affected_operations=operations,
                     nested_hits=_nested_hits, source_ids=source_ids, authority_namespace=json.loads(recovery[0])["authority_namespace"])
@@ -687,7 +840,23 @@ def _certificate_draft(**values) -> GraphErasureRebaseCertificateV1:
 
 def build_graph_rebase_candidate_v1(
     source_path: Path, target_path: Path, *, request: GraphRebaseInputV1,
-    completion_control=None, registry=None,
+    completion_control=None, registry=None, contact_finish_scope=None, life_completed_scope=None,
+) -> GraphRebaseCandidateV1:
+    from ..authority_service.c09_contact_finish_original_v1 import _contact_finish_graph_scope_v1
+    try:
+        with _contact_finish_graph_scope_v1(contact_finish_scope):
+            return _build_graph_rebase_candidate_v1(source_path, target_path, request=request,
+                completion_control=completion_control, registry=registry,
+                life_completed_scope=life_completed_scope)
+    finally:
+        if life_completed_scope is not None:
+            from ..authority_service.c09_life_completed_archive_v1 import revoke_completed_life_scope_v1
+            revoke_completed_life_scope_v1(life_completed_scope.port)
+
+
+def _build_graph_rebase_candidate_v1(
+    source_path: Path, target_path: Path, *, request: GraphRebaseInputV1,
+    completion_control=None, registry=None, life_completed_scope=None,
 ) -> GraphRebaseCandidateV1:
     """Build a fresh SQLite candidate; never copy old DB pages or modify source."""
     if type(request) is not GraphRebaseInputV1:
@@ -735,6 +904,36 @@ def build_graph_rebase_candidate_v1(
             columns, pk, rows = _table_rows(db, table)
             if table not in _KNOWN:
                 raise GraphRebaseHold(f"unclassified installed Graph table: {table}")
+            if table == 'graph_contact_owner_invocations_v3':
+                from .c09_contact_owner_invocation_v3 import (
+                    require_contact_owner_invocation_schema_v3, validate_contact_owner_inventory_row_v3,
+                )
+                require_contact_owner_invocation_schema_v3(db)
+                for row in rows:
+                    validate_contact_owner_inventory_row_v3(columns, row)
+                if rows:
+                    raise GraphRebaseHold('Contact Owner V3 authenticated carrier/disposal consumer is not yet closed; HOLD')
+            if table=='graph_internal_life_paid_originals_v2':
+                from .internal_life_paid_result_v2 import require_life_paid_schema_v2,validate_life_paid_inventory_v2
+                require_life_paid_schema_v2(db)
+                for row in rows:validate_life_paid_inventory_v2(columns,row)
+                if rows and life_completed_scope is None:raise GraphRebaseHold('Life paid result/content disposal originals are not yet closed')
+            if table == 'graph_internal_life_worker_originals_v2':
+                from .internal_life_content_worker_v2 import require_life_worker_schema_v2,validate_life_worker_inventory_row_v2
+                require_life_worker_schema_v2(db)
+                for row in rows:validate_life_worker_inventory_row_v2(columns,row)
+                if rows and life_completed_scope is None:
+                    raise GraphRebaseHold('Life worker V2 model/accounting/disposal originals are not yet closed')
+            if table == 'graph_internal_life_content_originals_v1':
+                from .c09_internal_life_content_v1 import (
+                    require_internal_life_content_schema_v1,
+                    validate_internal_life_content_inventory_row_v1,
+                )
+                require_internal_life_content_schema_v1(db)
+                for row in rows:
+                    validate_internal_life_content_inventory_row_v1(columns, row)
+                if rows and life_completed_scope is None:
+                    raise GraphRebaseHold('Life content worker/accounting/disposal originals are not yet closed')
             if table == "graph_d07_behavior_original_v1" and columns != (
                     "bot","persona","operation_id","work_kind","request_digest",
                     "stage_digest","input_digest","request_json","stage_json","source_refs_json"):
@@ -766,16 +965,27 @@ def build_graph_rebase_candidate_v1(
                     request.namespace.as_tuple).fetchone()[0])["authority_namespace"]
                 for row in rows:
                     read_d07_inventory_row_v1(columns, row, authority_namespace=authority_scope)
+            if table == _CONTACT_V2_TABLE:
+                validate_contact_schema_v2(db)
+                if columns != _CONTACT_V2_COLUMNS:
+                    raise GraphRebaseHold("contact original installed columns differ")
+                for row in rows:
+                    read_contact_inventory_row_v2(columns, row)
             if table == _CONTACT_TABLE:
                 if columns != _CONTACT_COLUMNS:
                     raise GraphRebaseHold("contact original installed columns differ")
                 for row in rows:
                     read_contact_inventory_row_v1(columns, row)
+            if table=='graph_contact_expression_plan_originals_v2':
+                from .c09_contact_plan_originals_v2 import validate_contact_plan_original_schema_v2,validate_contact_plan_original_history_row_v2
+                validate_contact_plan_original_schema_v2(db)
+                for row in rows:validate_contact_plan_original_history_row_v2(db,columns,row)
             if table in {_D07_STAGE_TABLE, _D07_ACCOUNTING_TABLE}:
                 validator = validate_d07_stage_attempt_row_v1 if table == _D07_STAGE_TABLE else validate_d07_accounting_attempt_row_v1
                 for row in rows:
                     validator(columns, row)
             descriptions[table] = (columns, pk, rows)
+        _validate_internal_life_episode_history_inventory_v2(db)
         affected = _installed_closure(db, request)
         affected_operations = _affected_operations(db, affected)
         barrier = read_c09_erasure_barrier_v1(
@@ -851,6 +1061,25 @@ def build_graph_rebase_candidate_v1(
                 raise GraphRebaseHold("D04 original erasure linkage differs") from exc
         domain_dispositions = {}
         for table, (columns, _pk, rows) in descriptions.items():
+            if table in {'graph_internal_life_paid_originals_v2',
+                    'graph_internal_life_worker_originals_v2', 'graph_internal_life_content_originals_v1'}:
+                if rows or life_completed_scope is not None:
+                    from ..authority_service.c09_life_completed_archive_v1 import completed_life_table_dispositions_v1
+                    domain_dispositions[table] = completed_life_table_dispositions_v1(db,
+                        scope=life_completed_scope, table=table, columns=columns, rows=rows,
+                        affected=affected, affected_operations=affected_operations)
+                else:
+                    domain_dispositions[table] = ()
+                continue
+            if table=='graph_contact_expression_plan_originals_v2':
+                from .c09_contact_plan_originals_v2 import contact_plan_original_dispositions_v2
+                domain_dispositions[table]=contact_plan_original_dispositions_v2(db,columns,rows,
+                    affected=affected,affected_operations=affected_operations)
+                continue
+            if table == _CONTACT_V2_TABLE:
+                domain_dispositions[table] = contact_original_dispositions_v2(columns, rows, affected=affected,
+                    affected_operations=affected_operations, nested_hits=_nested_hits, source_ids=source_ids,
+                    authority_namespace=recovery_requirements["authority_namespace"])
             if table == _CONTACT_TABLE:
                 domain_dispositions[table] = contact_original_dispositions_v1(columns, rows, affected=affected,
                     affected_operations=affected_operations, nested_hits=_nested_hits, source_ids=source_ids,
@@ -1101,7 +1330,7 @@ def build_installed_graph_rebase_candidate_v1(
     installation_id: str, namespace: NamespaceId, operation_id: str,
     permit: object, inventory_manifest: object,
     pinned_manifest_digest: str, writer_freeze_digest: str,
-    completion_control=None, registry=None,
+    completion_control=None, registry=None, contact_finish_scope=None, life_completed_scope=None,
     current_inventory_qualifier=None, current_inventory_view=None,
 ) -> GraphRebaseCandidateV1:
     """Derive the rebase input from installed Authority and Graph originals."""
@@ -1165,7 +1394,9 @@ def build_installed_graph_rebase_candidate_v1(
             namespace=namespace, operation_id=operation_id, installation_id=installation_id,
             accepted=accepted, pinned_manifest_digest=pinned_manifest_digest,
             writer_freeze_digest=writer_freeze_digest)
-    return build_graph_rebase_candidate_v1(source, target, request=request, completion_control=completion_control, registry=registry)
+    return build_graph_rebase_candidate_v1(source, target, request=request, completion_control=completion_control,
+        registry=registry, contact_finish_scope=contact_finish_scope,
+        life_completed_scope=life_completed_scope)
 
 
 def derive_graph_rebase_input_in_tx_v1(db, *, source_path, namespace, operation_id,

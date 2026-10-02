@@ -980,6 +980,66 @@ class AuthorityClient:
         return await self._transport.contact_model_result_recover_finish_v1(request, handshake, grant,
             namespace=policy.authority_namespace, read_request=read_request)
 
+    async def internal_life_model_result_read_v2(self, bundle, grant, *, read_request):
+        from ..authority_service.internal_life_model_result_contract_v2 import InternalLifeModelResultReadRequestV2
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not InternalLifeModelResultReadRequestV2
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("Life content result installed original differs")
+        return await self._transport.internal_life_model_result_read_v2(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def internal_life_model_result_recover_finish_v2(self, bundle, grant, *, read_request):
+        from ..authority_service.internal_life_model_result_contract_v2 import InternalLifeModelResultReadRequestV2
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not InternalLifeModelResultReadRequestV2
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("Life content result recovery installed original differs")
+        return await self._transport.internal_life_model_result_recover_finish_v2(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def life_numeric_model_result_read_v1(self, bundle, grant, *, read_request):
+        from ..authority_service.current_life_numeric_v1 import LifeNumericModelResultReadRequestV1
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not LifeNumericModelResultReadRequestV1
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("Life numeric result installed original differs")
+        return await self._transport.life_numeric_model_result_read_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def life_numeric_model_result_recover_finish_v1(self, bundle, grant, *, read_request):
+        from ..authority_service.current_life_numeric_v1 import LifeNumericModelResultReadRequestV1
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not LifeNumericModelResultReadRequestV1
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("Life numeric result recovery installed original differs")
+        return await self._transport.life_numeric_model_result_recover_finish_v1(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def contact_model_result_read_v2(self, bundle, grant, *, read_request):
+        from ..authority_service.contact_model_result_contract_v2 import ContactModelResultReadRequestV2
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ContactModelResultReadRequestV2
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("contact result installed original differs")
+        return await self._transport.contact_model_result_read_v2(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
+    async def contact_model_result_recover_finish_v2(self, bundle, grant, *, read_request):
+        from ..authority_service.contact_model_result_contract_v2 import ContactModelResultReadRequestV2
+        request, handshake, policy = await self._model_installation_context(bundle, grant)
+        if (type(read_request) is not ContactModelResultReadRequestV2
+                or (read_request.namespace, read_request.authority_namespace, read_request.installation_id, read_request.authority_id) !=
+                   (policy.namespace, policy.authority_namespace, grant.installation_id, grant.authority_id)):
+            raise RuntimeError("contact result recovery installed original differs")
+        return await self._transport.contact_model_result_recover_finish_v2(request, handshake, grant,
+            namespace=policy.authority_namespace, read_request=read_request)
+
     async def d07_cognition_result_recover_finish_v1(self, bundle, grant, *, read_request):
         request, handshake, policy = await self._model_installation_context(bundle, grant)
         if read_request.namespace != policy.namespace or read_request.authority_namespace != policy.authority_namespace:

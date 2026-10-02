@@ -254,14 +254,10 @@ class InstalledD12ManagedBackupCleanupV2(InstalledC09SurfaceCleanupV1):
                 files=files,roots=[str(p) for p in self._roots()],recovery_coverage=coverage)
             plan=self.control.record_cleanup_plan_v1(operation_id=operation_id,surface=self.surface,details=details)
         self._require_plan(context,operation_id,plan,registered)
+        from .c09_durable_unlink_v2 import unlink_inventory_member_durably_v2
         for before in plan['details']['files']:
-            path=Path(before['resolved_path'])
-            if path.exists():
-                if file_observation_v1(path,exclusive=True)!=before:raise AuthorityUnavailable('registered backup changed before exact unlink')
-                path.unlink()
-            fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-            try:os.fsync(fd)
-            finally:os.close(fd)
+            self.control.lease.require_held()
+            unlink_inventory_member_durably_v2(before)
         after=self._after(context,operation_id,plan)
         return self.control.sign_original_v1('sylanne3.c09.surface-evidence.v1',dict(schema='sylanne3.c09.surface-evidence.v1',
             installation_id=self.control.installation_id,issuer_id=self.control.authority_id,operation_id=operation_id,

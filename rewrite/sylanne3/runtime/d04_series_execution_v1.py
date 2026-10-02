@@ -63,6 +63,15 @@ def commit_series_writes_v1(graph, db, metadata, epoch, root, *, event_id, now, 
     return receipt
 
 
+def _require_d04_series_cpu_deadline_v1(*, grant, lease, policy, base, now):
+    """The existing fixed-root/parent guard, separated for permanent boundaries."""
+    if (grant.grant_id != policy.grant_id or grant.version != policy.grant_version
+            or grant.valid_until_utc <= now or lease.state != "active"
+            or base.cpu_ceiling_ms > grant.max_ceiling.get("cpu_ms", 0)
+            or now >= __import__("datetime").datetime.fromisoformat(base.deadline_utc.replace("Z", "+00:00")).timestamp()):
+        raise ValueError("series fixed deadline/current parent CPU authority expired")
+
+
 def prepare_d04_series_chunk_v1(graph, bootstrap, bundle, root, *, predecessor=None):
     graph._admin(bootstrap)
     start = 0 if predecessor is None else predecessor.end_step_index
@@ -79,11 +88,7 @@ def prepare_d04_series_chunk_v1(graph, bootstrap, bundle, root, *, predecessor=N
         policy = bundle.d04_joint_numeric
         grant = graph._GraphCoordinator__d11_issuer.current_budget_grant(db, policy.lease_id)
         lease = get_budget_lease(db, policy.lease_id)
-        if (grant.grant_id != policy.grant_id or grant.version != policy.grant_version
-                or grant.valid_until_utc <= now or lease.state != "active"
-                or base.cpu_ceiling_ms > grant.max_ceiling.get("cpu_ms", 0)
-                or now >= __import__("datetime").datetime.fromisoformat(base.deadline_utc.replace("Z", "+00:00")).timestamp()):
-            raise ValueError("series fixed deadline/current parent CPU authority expired")
+        _require_d04_series_cpu_deadline_v1(grant=grant, lease=lease, policy=policy, base=base, now=now)
         require_budget_family_admissible(db, lease.lease_id)
         job = get_job(db, base.job_id)
         if job.phase != "running" or job.cancel_epoch:

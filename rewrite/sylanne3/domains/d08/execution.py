@@ -1432,7 +1432,8 @@ class GoalExecutionProvider:
                        if type_name == "d08.natural_expression_plan.v2" else {}),
                 }),
             ))
-        return tuple(specs)
+        from .contact_plan_v2 import contact_plan_type_specs_v2
+        return (*specs,*contact_plan_type_specs_v2())
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):

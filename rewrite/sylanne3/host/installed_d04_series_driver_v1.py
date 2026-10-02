@@ -11,6 +11,7 @@ from ..runtime.d04_appraisal_driver_v3 import read_d04_original_v3
 from ..native_runtime.d04_series_math_v1 import D04SeriesChunkMathV1, verify_d04_series_chunk_math_v1
 from ..authority_service.d04_series_contract_v1 import D04SeriesMeasurementV1, from_wire
 from ..authority_service.contract import AuthorityUnavailable
+from ..runtime.d04_installed_stage_fence_v3 import _D04PhaseTimingsV1
 
 
 def _prepare_next(graph, bootstrap, bundle, root, predecessor):
@@ -59,24 +60,34 @@ async def run_installed_d04_series_v1(runtime, installation, *, c02_operation_id
     if bundle.d04_joint_numeric is None or bundle.d04_semantic_drive is None:
         return {"status": "not_configured", "missing_inputs": ["d04_semantic_drive", "d04_joint_numeric"]}
     arguments = {"c02_operation_id": c02_operation_id, "source_ref": source_ref}
-    drive = await worker.call(lambda graph: graph.commit_post_c02_semantic_drive_v3(bootstrap, bundle, **arguments))
+    timings = _D04PhaseTimingsV1(c02_operation_id)
+    with timings.measure("drive"):
+        drive = await worker.call(lambda graph: graph.commit_post_c02_semantic_drive_v3(bootstrap, bundle, **arguments))
     if drive.get("status") != "drive_adopted":
         return drive
-    root = await worker.call(lambda graph: freeze_post_c02_d04_series_v1(graph, bootstrap, bundle, **arguments))
+    with timings.measure("root_freeze"):
+        root = await worker.call(lambda graph: freeze_post_c02_d04_series_v1(graph, bootstrap, bundle, **arguments))
+    timings.operation_id = root.root_ref
+    timings.deadline_utc = root.prepared.binding.deadline_utc
     def prior_adoption(graph):
         saved = read_d04_original_v3(graph._GraphCoordinator__store._db, root.prepared.binding.namespace, "series_adoption", root.root_ref)
         return None if saved is None else adopt_d04_series_v1(graph, bootstrap, bundle, root)
-    adopted = await worker.call(prior_adoption)
+    with timings.measure("prior_adoption"):
+        adopted = await worker.call(prior_adoption)
     predecessor = None
     while adopted is None:
-        issued = await worker.call(lambda graph: _prepare_next(graph, bootstrap, bundle, root, predecessor))
+        start = 0 if predecessor is None else predecessor.end_step_index
+        with timings.measure("prepare_inspect", chunk_start=start):
+            issued = await worker.call(lambda graph: _prepare_next(graph, bootstrap, bundle, root, predecessor))
         if type(issued) is dict:
             return issued
         hot_return = None
         if type(issued[0]) is InstalledD04SeriesQueueV1:
             queue, ticket = issued
-            measured = await asyncio.shield(asyncio.wrap_future(queue.submit(ticket)))
-            terminal = await worker.call(lambda graph: queue.accept(graph, measured))
+            with timings.measure("queue_wait", chunk_start=start):
+                measured = await asyncio.shield(asyncio.wrap_future(queue.submit(ticket)))
+            with timings.measure("terminal_persist", chunk_start=start):
+                terminal = await worker.call(lambda graph: queue.accept(graph, measured))
             hot_return = measured
             binding = ticket.binding
         else:
@@ -85,25 +96,30 @@ async def run_installed_d04_series_v1(runtime, installation, *, c02_operation_id
         final = binding.end_step_index == root.frozen.plan.total_step_count
         if successful and final:
             try:
-                adopted = await worker.call(lambda graph: adopt_d04_series_v1(graph, bootstrap, bundle, root))
+                with timings.measure("final_adoption", chunk_start=start):
+                    adopted = await worker.call(lambda graph: adopt_d04_series_v1(graph, bootstrap, bundle, root))
             except (ValueError, TypeError, AuthorityUnavailable) as failure:
                 failure_time = time.time()
                 logging.getLogger(__name__).exception("D04 final adoption failed; measured cost retained")
                 await worker.call(lambda graph: abandon_d04_series_adoption_v1(graph, root))
-                paid = await worker.call(lambda graph: settle_d04_series_chunk_v1(graph, bootstrap, bundle, root, binding, terminal))
+                with timings.measure("cpu_settle", chunk_start=start):
+                    paid = await worker.call(lambda graph: settle_d04_series_chunk_v1(graph, bootstrap, bundle, root, binding, terminal))
                 return {**paid, "status": "actual_cpu_accounted", "adoption_status": "not_adopted",
                     "failure_stage": "series_final_adoption", "failure_type": type(failure).__name__,
                     "failure_reason": str(failure), "failure_observed_at_utc": failure_time}
         else:
-            paid = await worker.call(lambda graph: settle_d04_series_chunk_v1(graph, bootstrap, bundle, root, binding, terminal))
+            with timings.measure("cpu_settle", chunk_start=start):
+                paid = await worker.call(lambda graph: settle_d04_series_chunk_v1(graph, bootstrap, bundle, root, binding, terminal))
             if not successful or paid["budget_status"] != "settled":
                 return {**paid, "status": "actual_cpu_accounted", "adoption_status": "not_adopted"}
             try:
                 if hot_return is not None:
-                    handoff = await worker.call(lambda graph: queue.handoff(graph, hot_return, terminal, paid))
+                    with timings.measure("hot_handoff", chunk_start=start):
+                        handoff = await worker.call(lambda graph: queue.handoff(graph, hot_return, terminal, paid))
                     predecessor = handoff.math
                 else:
-                    predecessor = await worker.call(lambda graph: _read_completed_chunk(graph, root, binding, predecessor))
+                    with timings.measure("cold_restore_decode_verify", chunk_start=start):
+                        predecessor = await worker.call(lambda graph: _read_completed_chunk(graph, root, binding, predecessor))
             except (ValueError, TypeError, AuthorityUnavailable) as failure:
                 failure_time = time.time()
                 logging.getLogger(__name__).exception("D04 completed chunk original read failed; measured cost retained")
@@ -111,8 +127,9 @@ async def run_installed_d04_series_v1(runtime, installation, *, c02_operation_id
                     "failure_stage": "completed_chunk_original_read", "failure_type": type(failure).__name__,
                     "failure_reason": str(failure), "failure_observed_at_utc": failure_time}
     try:
-        encoding = await worker.call(lambda graph: graph.commit_post_joint_c04_encoding_v3(bootstrap, bundle,
-            **arguments, joint_operation_id=root.prepared.binding.operation_id))
+        with timings.measure("post_encoding"):
+            encoding = await worker.call(lambda graph: graph.commit_post_joint_c04_encoding_v3(bootstrap, bundle,
+                **arguments, joint_operation_id=root.prepared.binding.operation_id))
     except (ValueError, TypeError, RuntimeError):
         return {**adopted, "encoding_baseline_status": "held"}
     return {**adopted, "encoding_baseline": encoding}

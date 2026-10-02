@@ -5,9 +5,11 @@ an executable field in any user or model request. No long work runs in SQL.
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from dataclasses import asdict
 import json
+import logging
+import time
 
 from ..authority_service.v2_contract import from_wire, to_wire
 from ..authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
@@ -19,6 +21,62 @@ from .restore_anchor import RestoreAnchor
 
 TABLE = "graph_d04_installed_stage_attempts_v3"
 STAGES = frozenset({"interpretation", "prepare", "acquire", "seal_call", "settle", "adopt", "drive", "numeric_prepare", "numeric_adopt", "c04_encoding"})
+
+_TIMING_PHASES = frozenset({"installed_stage_total", "authority_owner_clock", "sql_transaction", "stage_callback",
+    "drive", "root_freeze", "prior_adoption", "prepare_inspect", "queue_wait", "terminal_persist", "cpu_settle",
+    "hot_handoff", "cold_restore_decode_verify", "final_adoption", "post_encoding", "progress_scan",
+    "prefix_collection", "prefix_manifest_rpc", "packet_hash", "packet_decode", "prefix_restore",
+    "final_derive_numeric_verify", "installed_asset_verify", "authority_gate_validate", "business_transaction"})
+_TIMING_LOG = logging.getLogger(__name__)
+
+
+class _D04PhaseTimingsV1:
+    """Finite diagnostic counters, never an authorization or CPU measurement.
+
+    UTC is explicitly absent until an existing qualified paired clock is bound.
+    Advancing that same upper bound uses local monotonic time; no extra RPC,
+    body, permit token, unbounded trace list or persistent state is introduced.
+    """
+    def __init__(self, operation_id, *, deadline_utc=None):
+        self.operation_id, self.deadline_utc = operation_id, deadline_utc
+        self.seconds = dict.fromkeys(_TIMING_PHASES, 0.0)
+        self.counts = dict.fromkeys(_TIMING_PHASES, 0)
+        self.clock_reading = None
+
+    def bind_clock(self, reading):
+        self.clock_reading = reading
+
+    def _upper(self):
+        if self.clock_reading is None:
+            return None
+        # Diagnostics cannot replace/mask the actual stage's clock rejection.
+        try:
+            return trusted_upper(self.clock_reading)
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    @contextmanager
+    def measure(self, phase, *, chunk_start=None):
+        if phase not in _TIMING_PHASES:
+            raise ValueError("unknown finite D04 timing phase")
+        started = time.monotonic()
+        upper_start = self._upper()
+        outcome = "completed"
+        try:
+            yield
+        except BaseException as failure:
+            outcome = type(failure).__name__
+            raise
+        finally:
+            finished = time.monotonic()
+            elapsed = finished - started
+            self.seconds[phase] += elapsed
+            self.counts[phase] += 1
+            _TIMING_LOG.info("D04 phase timing schema=d04.phase-timing.v1 operation_id=%s phase=%s chunk_start=%s "
+                "wall_seconds=%.9f monotonic_start=%.9f monotonic_end=%.9f trusted_utc_upper_start=%s "
+                "trusted_utc_upper_end=%s fixed_deadline_utc=%s outcome=%s",
+                self.operation_id, phase, chunk_start, elapsed, started, finished, upper_start,
+                self._upper(), self.deadline_utc, outcome)
 
 
 def install_schema(db):
@@ -32,6 +90,15 @@ def install_schema(db):
 
 def run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
         source_ref, operation_id, stage, request_digest, commit, semantic=False, fence_observer=None):
+    timings = _D04PhaseTimingsV1(operation_id)
+    with timings.measure("installed_stage_total"):
+        return _run_installed_d04_stage_v3(graph, bootstrap, bundle, c02_operation_id=c02_operation_id,
+            source_ref=source_ref, operation_id=operation_id, stage=stage, request_digest=request_digest,
+            commit=commit, semantic=semantic, fence_observer=fence_observer, timings=timings)
+
+
+def _run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
+        source_ref, operation_id, stage, request_digest, commit, semantic, fence_observer, timings):
     from ..host.authority_profile import AdminInstallationBundle
     from ..graph_coordinator import AuthorityDenied
     graph._admin(bootstrap)
@@ -98,15 +165,18 @@ def run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
     if state != "active" or port.validate_fence(scope) != permit:
         raise ValueError("D04 current installed stage write unavailable")
     try:
-        from ..authority_service.d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
-        guarded = port.get_current_background_owner_authority_for_fence_v1(namespace=namespace,
-            authority_namespace=target.authority_namespace, permit=permit)
-        if (type(guarded) is not tuple or len(guarded) != 2
-                or type(guarded[0]) is not D12CurrentOwnerAuthorityV1 or guarded[1] != permit
-                or type(guarded[0].guard) is not OwnerAuthorizationGuardV1):
-            raise ValueError("D04 actual current Owner guard unavailable")
-        current_owner, guard = guarded[0], guarded[0].guard
-        now = trusted_upper(port.read_ingress_clock(bundle.ingress_clock))
+        with timings.measure("authority_owner_clock"):
+            from ..authority_service.d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
+            guarded = port.get_current_background_owner_authority_for_fence_v1(namespace=namespace,
+                authority_namespace=target.authority_namespace, permit=permit)
+            if (type(guarded) is not tuple or len(guarded) != 2
+                    or type(guarded[0]) is not D12CurrentOwnerAuthorityV1 or guarded[1] != permit
+                    or type(guarded[0].guard) is not OwnerAuthorizationGuardV1):
+                raise ValueError("D04 actual current Owner guard unavailable")
+            current_owner, guard = guarded[0], guarded[0].guard
+            clock_reading = port.read_ingress_clock(bundle.ingress_clock)
+            timings.bind_clock(clock_reading)
+            now = trusted_upper(clock_reading)
         semantic_reader = getattr(graph, "_GraphCoordinator__d04_semantic_mapping_reader", None)
         if semantic and semantic_reader is None:
             raise ValueError("current installed D04 semantic reader unavailable")
@@ -115,7 +185,7 @@ def run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
         if (current_owner.target_admission is not None or current_owner.storage_admission is not None) and semantic_reader is None:
             raise ValueError("D04 migrated background work needs its actual installed location verifier")
         semantic_context = semantic_reader.current_fence(scope) if (semantic or current_owner.target_admission is not None or current_owner.storage_admission is not None) else nullcontext()
-        with semantic_context:
+        with semantic_context, timings.measure("sql_transaction"):
             with store._lock:
                 db = store._db
                 db.execute(f"UPDATE {TABLE} SET permit_json=? WHERE bot=? AND persona=? AND operation_id=? AND permit_json IS NULL",
@@ -136,7 +206,8 @@ def run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
                             c02_operation_id, source_ref, now, epoch)
                     else:
                         current = graph._current_natural_generation_inputs_locked(namespace, c02_operation_id, source_ref, now, epoch)
-                    result = commit(db, metadata, epoch, now, guard, role, current)
+                    with timings.measure("stage_callback"):
+                        result = commit(db, metadata, epoch, now, guard, role, current)
                     db.execute(f"UPDATE {TABLE} SET receipt_json=? WHERE bot=? AND persona=? AND operation_id=? AND receipt_json IS NULL",
                         (canonical_serialize(result), *namespace.as_tuple, operation_id))
                     if db.execute("SELECT changes()").fetchone() != (1,):

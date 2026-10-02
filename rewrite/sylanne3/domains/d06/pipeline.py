@@ -306,6 +306,9 @@ class D06MemoryPipeline:
         trace_version: int = 1,
     ) -> CommittedEncodingEvidence:
         """Read one persisted trace tied to a source still accessible now."""
+        if type(trace_version) is int and trace_version == 3:
+            from ...runtime.d06_internal_life_trace_v3 import require_installed_internal_life_encoding_reader_v3
+            require_installed_internal_life_encoding_reader_v3()
         if trace_version not in (1, 2):
             raise ValueError("trace_version must be 1 or 2")
         namespace = self.adapter.namespace.as_tuple
@@ -440,6 +443,9 @@ class D06MemoryPipeline:
                          if item.candidate_id == ticket.selected_candidate_ids[0]), None)
         if selected is None:
             raise ValueError("D07 ticket does not select a D06 candidate")
+        if encoding_trace_id is not None and type(encoding_trace_version) is int and encoding_trace_version == 3:
+            from ...runtime.d06_internal_life_trace_v3 import require_installed_internal_life_encoding_reader_v3
+            require_installed_internal_life_encoding_reader_v3()
         if encoding_trace_id is not None and encoding_trace_version != 2:
             raise ValueError("then-feeling comparison requires a versioned D04 baseline")
         encoding = (self.read_committed_encoding(

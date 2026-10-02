@@ -7,6 +7,7 @@ only low-trust model input material; no cache write, model call or budget use.
 
 from __future__ import annotations
 
+from .model_workflows_v3 import AdminModelWorkflowsV3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -66,7 +67,7 @@ async def read_installed_d13_raw_context_frame_v1(
             or bundle.installation_policy != policy
             or type(bundle.d13_precompression)
                is not AdminD13PrecompressionPolicyV1
-            or type(bundle.model_workflows) is not AdminModelWorkflowsV2
+            or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
             or grant is None or port is None or worker is None
             or bootstrap is None or not runtime._v2_namespace_provisioned
             or policy.namespace != envelope.namespace

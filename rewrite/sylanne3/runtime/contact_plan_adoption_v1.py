@@ -104,7 +104,7 @@ def prepare_contact_plan_in_transaction_v1(db, *, frame, request, installed_read
         cause.original_ref, cause.original_digest, VersionedRef(opportunity.key.token, opportunity.revision),
         VersionedRef(source.key.token, source.revision), route.target_entity_ref,
         VersionedRef(route.account_version.key.token, route.account_version.revision), contact_route_semantic_digest_v1(route), route.scene_ref, audience,
-        policy_original.original_ref, policy_original.original_digest, inputs.candidate.check.policy_version,
+        policy_original.original_ref, policy_original.digest, inputs.candidate.check.policy_version,
         ("contact",), ("paraphrase",), canonical_digest((unit,)), (candidate.qualification_digest,), reads,
         grant.lease_id, grant.version, canonical_digest(grant), "contact-generation-reservation:" + ids["contact"][8:],
         "contact-review-reservation:" + ids["contact"][8:], tuple(sorted(generation.quote_ceiling.items())),

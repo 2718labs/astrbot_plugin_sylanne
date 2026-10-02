@@ -133,6 +133,7 @@ def d10_production_type_specs_v1():
             raise ValueError("offline occurrences cannot claim external or historical execution")
         return result
 
+    from ...runtime.d10_life_progress_provenance_v1 import life_progress_type_specs_v1
     return (
         TypeSpec("d10.life_progress.v1", ("activity",), "state",
             lambda v: strict(v, LifeProgressHeadV1, ("receipt_refs", "source_refs")), immutable=True,
@@ -142,7 +143,7 @@ def d10_production_type_specs_v1():
             schema_hash=schema_hash({"d10.offline_checkpoint.v1": 1})),
         TypeSpec("d10.offline_simulated_occurrence.v1", ("activity",), "state", occurrence,
             immutable=True, writer_domain="d10", schema_hash=schema_hash({"d10.offline_simulated_occurrence.v1": 1})),
-    )
+    ) + life_progress_type_specs_v1()
 
 
 @dataclass(frozen=True, slots=True)

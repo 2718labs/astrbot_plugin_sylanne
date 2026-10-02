@@ -145,6 +145,13 @@ def _read_d04_series_chunk_for_final_verifier_v1(db, namespace, operation_id):
 
 
 def require_d04_series_own_progress_v1(graph, db, root):
+    from .d04_installed_stage_fence_v3 import _D04PhaseTimingsV1
+    timings = _D04PhaseTimingsV1(root.root_ref, deadline_utc=root.prepared.binding.deadline_utc)
+    with timings.measure("progress_scan"):
+        return _require_d04_series_own_progress_v1(graph, db, root)
+
+
+def _require_d04_series_own_progress_v1(graph, db, root):
     """Only this root's recorded exact job/cost events advance its snapshot.
 
     Graph revisions, namespace epochs, history values and recovery heads must

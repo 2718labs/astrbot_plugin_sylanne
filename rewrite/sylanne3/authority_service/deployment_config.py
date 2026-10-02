@@ -8,6 +8,7 @@ policy and verifier implementations when it constructs this object.
 
 from __future__ import annotations
 
+from ..host.model_workflows_v3 import AdminModelWorkflowsV3
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -107,7 +108,7 @@ class InstalledNaturalModelAuthorityV2:
 
     def __post_init__(self) -> None:
         if (type(self.d11_issuer) is not D11BudgetJobIssuer
-                or type(self.workflows) is not AdminModelWorkflowsV2
+                or type(self.workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3)
                 or self.workflows.natural_generation is None
                 or self.workflows.natural_review is None
                 or type(self.observer_peer) is not tuple
@@ -144,6 +145,26 @@ class InstalledC09AuthorityV1:
         if not roots or any(not path.is_absolute() for path in roots):
             raise AuthorityUnavailable("installed C09 resource roots required")
         object.__setattr__(self, "resource_roots", roots)
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledC09AuthorityV2(InstalledC09AuthorityV1):
+    """Protected, separate selector installation; never a caller-selected path."""
+
+    schema: str = "sylanne3.authority.c09-selector-installation.v2"
+
+    def __post_init__(self):
+        InstalledC09AuthorityV1.__post_init__(self)
+        if self.schema != "sylanne3.authority.c09-selector-installation.v2":
+            raise AuthorityUnavailable("installed C09 V2 schema differs")
+
+    @property
+    def selector_path(self):
+        return Path(str(self.control_path) + ".selector-v2")
+
+    @property
+    def selector_journal_path(self):
+        return Path(str(self.control_path) + ".selector-v2.journal")
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +206,7 @@ class AuthorityDeploymentConfig:
     c04_installations_v3: Mapping[str, InstalledC04AuthorityV3] | None = None
     c09_storage_v1: InstalledC09AuthorityV1 | None = None
     c09_maintenance_factory: Callable | None = None
+    c09_storage_v2: InstalledC09AuthorityV2 | None = None
 
     def __post_init__(self) -> None:
         for name in ("authority_db", "deletion_db", "graph_db", "instance_lock"):
@@ -295,7 +317,13 @@ class AuthorityDeploymentConfig:
                 raise AuthorityUnavailable("installed C04 V3 namespace or pin differs")
             object.__setattr__(self, "c04_installations_v3",
                                MappingProxyType(dict(c04_v3)))
-        if self.c09_storage_v1 is not None:
+        if self.c09_storage_v2 is not None:
+            if (type(self.c09_storage_v2) is not InstalledC09AuthorityV2
+                    or self.c09_storage_v1 is not None
+                    or self.c09_maintenance_factory is not None
+                    or len(namespaces) != 1):
+                raise AuthorityUnavailable("C09 V2 factual installation is exclusive of V1 business composition")
+        elif self.c09_storage_v1 is not None:
             if (type(self.c09_storage_v1) is not InstalledC09AuthorityV1
                     or len(namespaces) != 1 or not callable(self.c09_maintenance_factory)):
                 raise AuthorityUnavailable("installed C09 single cohort and trusted maintenance factory required")
@@ -354,7 +382,7 @@ def load_installed_asset_config_v1(
         "bind_host", "bind_port", "tls", "execution_journals",
         "installations_v2", "namespace_bindings_v2", "reverse_handoff",
     }
-    optional_c04_fields = {"c04_installations_v2", "c04_installations_v3", "c09_storage_v1"}
+    optional_c04_fields = {"c04_installations_v2", "c04_installations_v3", "c09_storage_v1", "c09_storage_v2"}
     if (type(value) is not dict or not fields <= set(value) or
             not set(value).issubset(fields | optional_c04_fields)):
         raise AuthorityUnavailable("installed asset manifest fields differ")
@@ -452,6 +480,9 @@ def load_installed_asset_config_v1(
                 row["package_root"], row["formal_manifest_sha256"],
                 row["component_key_path"])
     c09 = None
+    c09_v2 = None
+    if "c09_storage_v1" in manifest and "c09_storage_v2" in manifest:
+        raise AuthorityUnavailable("installed C09 V1/V2 selectors are mutually exclusive")
     if "c09_storage_v1" in manifest:
         row = _record(manifest["c09_storage_v1"], {
             "control_path", "key_path", "installation_id", "authority_id",
@@ -459,6 +490,13 @@ def load_installed_asset_config_v1(
         if type(row["resource_roots"]) is not list:
             raise AuthorityUnavailable("installed C09 roots must be a list")
         c09 = InstalledC09AuthorityV1(**row)
+    if "c09_storage_v2" in manifest:
+        row = _record(manifest["c09_storage_v2"], {
+            "schema", "control_path", "key_path", "installation_id", "authority_id",
+            "control_store_id", "key_id", "resource_roots"}, "C09 V2 storage")
+        if type(row["resource_roots"]) is not list:
+            raise AuthorityUnavailable("installed C09 V2 roots must be a list")
+        c09_v2 = InstalledC09AuthorityV2(**row)
     return AuthorityDeploymentConfig(
         manifest["authority_db"], manifest["deletion_db"],
         manifest["graph_db"], manifest["instance_lock"], journals,
@@ -468,11 +506,11 @@ def load_installed_asset_config_v1(
         publisher_manifest_verifier, utc_clock,
         local_administrator_credential, c04_installations_v2=c04,
         c04_installations_v3=c04_v3, c09_storage_v1=c09,
-        c09_maintenance_factory=c09_maintenance_factory)
+        c09_maintenance_factory=c09_maintenance_factory, c09_storage_v2=c09_v2)
 
 
 __all__ = ("ASSET_MANIFEST_SCHEMA", "AuthorityCoreVerifiers",
            "AuthorityDeploymentConfig", "ExecutionJournalInstallation",
            "InstalledNaturalModelAuthorityV2", "InstalledC04AuthorityV2",
-           "InstalledC04AuthorityV3",
+           "InstalledC04AuthorityV3", "InstalledC09AuthorityV1", "InstalledC09AuthorityV2",
            "load_installed_asset_config_v1")

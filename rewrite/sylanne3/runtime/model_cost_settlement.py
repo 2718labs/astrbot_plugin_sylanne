@@ -35,7 +35,7 @@ class ModelCostUnavailable(RuntimeError):
 
 
 _MODEL_WORK_KINDS = frozenset({
-    "d06.encode_source", "reply", "context_reply",
+    "d06.encode_source", "d06.encode_internal_life_content", "d06.encode_internal_life_numeric", "reply", "context_reply",
     "natural_generation", "natural_review", "contact_generation", "contact_review",
     "d13.precompress.paid.v1", "d04.appraisal", "d07.cognition",
 })

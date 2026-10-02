@@ -97,12 +97,32 @@ class PinnedCurrentModelEgressGraphVerifier:
         self._paired_clock = trusted_paired_clock
         self._natural_history = natural_history_verifier
         self._contact_policy_service = None
+        self._internal_life_reader_v2 = None
+        self._life_numeric_reader_v1 = None
 
     def install_contact_policy_service_v1(self, service):
         from .d10_contact_policy_service_v1 import InstalledD10ContactPolicyServiceV1
         if type(service) is not InstalledD10ContactPolicyServiceV1 or self._contact_policy_service is not None:
             raise ValueError("actual contact policy service must be installed exactly once")
         self._contact_policy_service = service
+
+    def install_internal_life_reader_v2(self, reader):
+        from .internal_life_model_graph_v2 import InstalledInternalLifeModelGraphReaderV2
+        if (type(reader) is not InstalledInternalLifeModelGraphReaderV2
+                or self._internal_life_reader_v2 is not None
+                or reader.readers.issuer is not self._issuer
+                or reader.owner_storage.graph_path != self._path):
+            raise ValueError("actual same-Graph Life V2 reader must be installed exactly once")
+        self._internal_life_reader_v2 = reader
+
+    def install_life_numeric_reader_v1(self, reader):
+        from .current_life_numeric_v1 import InstalledLifeNumericModelGraphReaderV1
+        if (type(reader) is not InstalledLifeNumericModelGraphReaderV1
+                or self._life_numeric_reader_v1 is not None
+                or reader.readers.issuer is not self._issuer
+                or reader.owner_storage.graph_path != self._path):
+            raise ValueError("actual same-Graph numeric Life reader must be installed exactly once")
+        self._life_numeric_reader_v1 = reader
 
     def __call__(self, intent: ModelEgressIntentV1) -> bool:
         # A graph row alone cannot authenticate the live Authority model fence
@@ -157,6 +177,30 @@ class PinnedCurrentModelEgressGraphVerifier:
                             and NamespaceId(job.bot_id, job.persona_id)
                                 != location_observation.namespace_id):
                         return False
+                    if job.work_kind == "d06.encode_internal_life_content":
+                        if self._internal_life_reader_v2 is None:
+                            return False
+                        current = self._internal_life_reader_v2.read(db, intent, float(now))
+                        if include_binding:
+                            from ..runtime.internal_life_content_worker_v2 import read_life_worker_original_v2
+                            from .v2_model_egress_wire import to_wire
+                            call = read_life_worker_original_v2(db, namespace=current.prepared.namespace,
+                                issuer=self._issuer, kind="call", job_id=job.job_id)
+                            if call is None or call["intent"] != to_wire(intent):
+                                return False
+                        return True
+                    if job.work_kind == "d06.encode_internal_life_numeric":
+                        if self._life_numeric_reader_v1 is None:
+                            return False
+                        current = self._life_numeric_reader_v1.read(db, intent, float(now))
+                        if include_binding:
+                            from ..runtime.d11_life_preparation_v1 import _read
+                            from .v2_model_egress_wire import to_wire
+                            call = _read(db, namespace=current.prepared.namespace,
+                                issuer=self._issuer, kind="numeric_call_v1", ref=job.job_id)
+                            if call is None or call[0]["intent"] != to_wire(intent):
+                                return False
+                        return True
                     if job.work_kind == "reply":
                         return self._check_reply(
                             db, intent, float(now), clock_epoch,
@@ -172,6 +216,8 @@ class PinnedCurrentModelEgressGraphVerifier:
                             include_binding=include_binding)
                     if job.work_kind in {"contact_generation", "contact_review"}:
                         from .contact_model_graph_v1 import read_current_contact_model_graph_v1
+                        if job.job_id.startswith("contact-model-job-v2:"):
+                            from .contact_model_graph_v2 import read_current_contact_model_graph_v2 as read_current_contact_model_graph_v1
                         if self._contact_policy_service is None:
                             return False
                         read_current_contact_model_graph_v1(db, intent, self._issuer, float(now),

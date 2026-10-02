@@ -58,6 +58,8 @@ def read_life_body_effect_v1(readers, db, read, request):
     prepared = read_prepared_life_v1(db, binding=terminal.binding, issuer=readers.issuer)
     if prepared is None:
         raise MissingProductionOriginalV1("actual_life_body_preparation")
+    from .d11_life_fact_provenance_v1 import require_current_life_fact_eligibility_v1
+    require_current_life_fact_eligibility_v1(db,prepared=prepared,terminal=terminal,adopted=adopted)
     contract, quote, body = require_life_body_quote_v1(db, prepared=prepared, issuer=readers.issuer,
         resource_issuer=readers.issuer.resource_issuer, body_quote_authority=readers.body_quote_authority)
     if (request.body_quote_ref != contract.body_quote_ref or request.effect_policy_ref != contract.effect_policy_ref

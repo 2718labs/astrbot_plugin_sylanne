@@ -321,6 +321,14 @@ def initialize_and_prepare(root, *, additional_sources=()):
         closure.begin_run(credential=WORKER, subject=SUBJECT, accepted_mutation_id=accepted.pending.mutation_id)
         result = maintenance.prepare_storage_rebase_v1(operation_id=operation)
         assert control.read_verified_current_storage_v1().stage == "PREPARED"
+        # PREPARED still selects the old files. Authenticate the actual
+        # protected signature here; the fresh switch process below authenticates
+        # the new Core frame/pin and its complete inventory independently.
+        with control._db() as protected:
+            encoded,=protected.execute('SELECT prepared_original_json FROM c09_storage_operations_v1 WHERE operation_id=?',
+                (operation,)).fetchone()
+        prepared=json.loads(encoded);control.verify_original_v1(prepared,'prepared_digest')
+        assert prepared['facts_pin_original']['schema']=='sylanne3.c09.execution_source_pin.v5'
         return {"stage": "PREPARED", "generation": result["maintenance_generation"], "process_id": os.getpid()}
     finally:
         lease.close()
@@ -351,6 +359,21 @@ def _reopen(root):
     maintenance, _ = _compose(control, graph, coordinator, bootstrap, service, scoped, recovery, None,
         _inventory(packet["inventory"]), root)
     return packet, control, lease, maintenance, graph, core, deletion, execution
+
+
+def _assert_authenticated_empty_contact_v5(control):
+    """Reauthenticate actual signed PREPARED/Core joins after a fresh process."""
+    from sylanne3.authority_service.c09_recovery_resolver_v4 import InstalledSanitizedRecoveryResolverV4
+    from sylanne3.authority_service.c09_recovery_frame_v5 import C09RecoveryFactFrameV5, PIN_SCHEMA
+    context,frames=InstalledSanitizedRecoveryResolverV4(storage_reader=control).read_verified_frames_v4()
+    assert frames
+    for prepared,facts,_bindings in frames:
+        assert type(facts) is C09RecoveryFactFrameV5
+        assert facts.contact_finish_inventory.members==()
+        assert prepared['facts_digest']==facts.facts_digest
+        assert prepared['facts_pin_original']['schema']==PIN_SCHEMA
+        assert prepared['facts_pin_original']['contact_finish_inventory_digest']==facts.contact_finish_inventory.inventory_digest
+    return context
 
 
 def _fresh_source_owner_after_release(root, packet, control, maintenance, graph, core, deletion, execution):
@@ -463,6 +486,7 @@ def resume(root, phase):
             from sylanne3.authority_service.c09_preopen_switch_v1 import switch_cold_prepared_storage_before_open_v1
             context = switch_cold_prepared_storage_before_open_v1(control=control, registry=_registry())
             assert context.stage == "SWITCHED"
+            _assert_authenticated_empty_contact_v5(control)
             return {"stage": context.stage, "generation": context.storage_generation, "process_id": os.getpid()}
         finally:
             lease.close()
@@ -492,6 +516,7 @@ def resume(root, phase):
                 assert not (root / "state" / name).exists()
             ordinary = _fresh_source_owner_after_release(root, packet, control, maintenance, graph, core, deletion, execution)
         context = control.read_verified_current_storage_v1()
+        _assert_authenticated_empty_contact_v5(control)
         return {"stage": context.stage, "generation": context.storage_generation, "process_id": os.getpid(),
             **(ordinary if phase == "verify" else {})}
     finally:

@@ -1049,6 +1049,7 @@ class GraphCoordinator:
                  reply_suppression_ack_verifier=None,
                  d13_precompression_policy=None,
                  d13_paid_precompression_policy=None,
+                 life_d04_before_capture_policy=None,
                  body_quote_authority=None, c04_cpu_quote_authority=None,
                  c04_algorithm_build_digest=None,
                  d04_installed_joint_assembly=None,
@@ -1146,6 +1147,8 @@ class GraphCoordinator:
                         plan_json TEXT NOT NULL, receipt_json TEXT NOT NULL,
                         PRIMARY KEY(bot,persona,operation_id));
                 """)
+                from .runtime.contact_owner_invocation_v3 import install_contact_owner_invocation_schema_v3
+                install_contact_owner_invocation_schema_v3(store._db)
         from .runtime.d13_technical_policy import AdminD13PrecompressionPolicyV1
         if (d13_precompression_policy is not None and
                 type(d13_precompression_policy) is not AdminD13PrecompressionPolicyV1):
@@ -1156,6 +1159,16 @@ class GraphCoordinator:
                 type(d13_paid_precompression_policy) is not AdminD13PaidPrecompressionPolicyV1):
             raise TypeError("installed D13 paid precompression policy must be typed")
         self.__d13_paid_precompression_policy = d13_paid_precompression_policy
+        if life_d04_before_capture_policy is not None:
+            from .runtime.d04_life_before_original_v1 import D04LifeBeforeCapturePolicyV1
+            before = life_d04_before_capture_policy
+            installed = None if d04_installed_joint_assembly is None else d04_installed_joint_assembly.installation_policy
+            if (type(before) is not D04LifeBeforeCapturePolicyV1 or installed is None
+                    or before is not d04_installed_joint_assembly.admin_bundle.life_d04_before_capture_policy
+                    or (before.namespace, before.installation_id, before.manifest_digest)
+                    != (installed.namespace, installed.installation_id, installed.manifest_digest)):
+                raise TypeError("Life before capture requires the exact installed D04 policy")
+        self.__life_d04_before_capture_policy = life_d04_before_capture_policy
         if encoding_request_issuer is not None and not callable(encoding_request_issuer):
             raise TypeError("encoding_request_issuer must be callable")
         self.__encoding_request_issuer = encoding_request_issuer
@@ -1163,6 +1176,7 @@ class GraphCoordinator:
             raise TypeError("model_terminal_cost_port must be callable")
         self.__model_terminal_cost_port = model_terminal_cost_port
         self.__contact_model_runtime_v1 = None
+        self.__contact_model_runtime_v2 = None
         if (natural_generation_output_port is not None
                 and not callable(natural_generation_output_port)):
             raise TypeError("natural generation output port must be callable")
@@ -1258,6 +1272,7 @@ class GraphCoordinator:
                                                   frozenset[str], int]] = {}
         self.__owner_leases: dict[_AuthorityLease, OwnerLeaseBindingV1] = {}
         self.__owner_session_proofs: dict[_AuthorityLease, tuple[str, object]] = {}
+        self.__contact_recovery_leases_v3: dict[_AuthorityLease, object] = {}
         self.__deletion_read_leases: set[_AuthorityLease] = set()
         self.__providers: dict[str, tuple[object, str, str]] = {}
 
@@ -6220,6 +6235,10 @@ class GraphCoordinator:
         if (not isinstance(store, ProductionGraphStore) or port is None
                 or owner is None or (proof is None and background_original is None) or capability not in owner.capabilities):
             raise UnavailableGuard("current signed Owner domain write unavailable; HOLD")
+        from .runtime.contact_final_ack_v1 import (contact_owner_call_v1,
+            verify_contact_before_finish_v1, require_contact_finish_ack_v1,
+            read_finished_contact_recovery_v1, _issue_saved_contact_recovery_v1)
+        contact_call = contact_owner_call_v1(self, authority, lease, operation_id, request_digest)
         attempt_id = "owner-domain-" + canonical_digest((
             namespace, operation_id, request_digest))[:48]
         with store._lock:
@@ -6289,6 +6308,36 @@ class GraphCoordinator:
             "schema": "w01.owner-domain-write.v3", "operation_id": operation_id,
             "request_digest": request_digest, "permit_token": permit.token})
         if saved is not None and saved[6] is not None:
+            saved_result = json.loads(saved[6])
+            if (saved_result.get('operation_kind') in {'prepare_contact_dispatch','prepare_contact_dispatch_v3'}
+                    and contact_call is None):
+                raise ValueError('Contact saved receipt requires its exact installed recovery invocation')
+            if contact_call is not None:
+                if state == 'finished':
+                    return read_finished_contact_recovery_v1(contact_call,scope,saved_result,
+                        owner=owner,owner_session_proof=proof)
+                if saved_result.get('schema') == 'sylanne.domain-production-receipt.v1':
+                    from .runtime.contact_final_stage_v3 import PrepareCurrentContactDispatchRequestV3
+                    if type(contact_call.request) is PrepareCurrentContactDispatchRequestV3:
+                        from .runtime.contact_saved_owner_projection_v3 import _read_saved_contact_owner_projection_v3, _ContactSavedFinishedV3
+                        try:
+                            _guard,current_owner=_read_saved_contact_owner_projection_v3(
+                                contact_call,scope,saved_result,owner,proof)
+                        except _ContactSavedFinishedV3:
+                            return read_finished_contact_recovery_v1(contact_call,scope,saved_result,
+                                owner=owner,owner_session_proof=proof)
+                    else:
+                        _guard, current_owner = self._owner_binding_in_fence(
+                            authority,scope,owner.principal,owner,proof)
+                    if fence_context is None:
+                        raise ValueError('Contact recovery has no real installed stage context')
+                    _issue_saved_contact_recovery_v1(contact_call,scope,saved_result)
+                    with fence_context(scope,_guard,current_owner):
+                        verify_contact_before_finish_v1(contact_call,scope,saved_result)
+                port.finish_fence(scope,request_id=finish_id,request_digest=finish_digest)
+                require_contact_finish_ack_v1(contact_call,scope)
+                return read_finished_contact_recovery_v1(contact_call,scope,saved_result,
+                    owner=owner,owner_session_proof=proof)
             if state == "active":
                 port.finish_fence(scope, request_id=finish_id, request_digest=finish_digest)
             # The original receipt is reread under a new current Owner fence;
@@ -6320,6 +6369,13 @@ class GraphCoordinator:
             now = trusted_upper(clock)
             context = (fence_context(scope, _guard, current_owner)
                        if fence_context is not None else nullcontext())
+            contact_session_observation = None
+            if contact_call is not None:
+                from .runtime.contact_final_stage_v3 import PrepareCurrentContactDispatchRequestV3
+                if type(contact_call.request) is PrepareCurrentContactDispatchRequestV3:
+                    from .runtime.contact_owner_invocation_v3 import capture_contact_owner_invocation_v3
+                    contact_session_observation = capture_contact_owner_invocation_v3(
+                        contact_call, scope, owner, proof)
             with context:
                 with store._lock:
                     db = store._db
@@ -6340,6 +6396,10 @@ class GraphCoordinator:
                                    (canonical_json(result), *namespace.as_tuple, operation_id))
                         if db.execute("SELECT changes()").fetchone() != (1,):
                             raise EventConflict("Owner domain receipt raced")
+                        if contact_session_observation is not None:
+                            from .runtime.contact_owner_invocation_v3 import record_contact_owner_invocation_v3
+                            record_contact_owner_invocation_v3(db, contact_call, scope,
+                                result, current_owner, contact_session_observation)
                         db.execute("COMMIT")
                     except BaseException:
                         if db.in_transaction:
@@ -6347,6 +6407,11 @@ class GraphCoordinator:
                         # The retained attempt remains queryable after a transaction
                         # failure; no guessed zero cost or second operation is issued.
                         raise
+                if contact_call is not None:
+                    # COMMIT is durable and the exact installed context is still
+                    # active. Failure leaves the saved receipt/permit pending;
+                    # it neither rolls back committed rows nor finishes the fence.
+                    verify_contact_before_finish_v1(contact_call,scope,result)
         except (ValueError, TypeError, StaleRead, AuthorityDenied) as exc:
             # Fixed W01 callbacks contain only transactional staging. As with
             # installed D04 stages, close a known refusal only after proving
@@ -6381,6 +6446,8 @@ class GraphCoordinator:
             port.finish_fence(scope, request_id=finish_id, request_digest=finish_digest)
             raise
         port.finish_fence(scope, request_id=finish_id, request_digest=finish_digest)
+        if contact_call is not None:
+            require_contact_finish_ack_v1(contact_call,scope)
         return result
 
     def acquire_current_d07_execution_v1(self, bootstrap, bundle, *, job_id):
@@ -6452,10 +6519,107 @@ class GraphCoordinator:
                         wake(job_id)
         return result
 
+    def register_contact_dispatch_final_claim_writer_v3(self, bootstrap, *, route_port=None, issuer_id=None):
+        from .runtime.contact_dispatch_host_v3 import register_contact_dispatch_final_claim_writer_v3
+        return register_contact_dispatch_final_claim_writer_v3(self, bootstrap,
+            route_port=route_port, issuer_id=issuer_id)
+
+    def read_committed_contact_dispatch_v3(self, authority, lease, operation_id):
+        from .runtime.contact_dispatch_host_v3 import read_committed_contact_dispatch_v3
+        return read_committed_contact_dispatch_v3(self, authority, lease, operation_id)
+
+    def get_contact_dispatch_text_segment_v3(self, authority, lease, request):
+        from .runtime.contact_dispatch_host_v3 import get_contact_dispatch_text_segment_v3
+        return get_contact_dispatch_text_segment_v3(self, authority, lease, request)
+
+    def _commit_contact_dispatch_final_claim_v3(self, *args, **kwargs):
+        from .runtime.contact_dispatch_host_v3 import commit_contact_dispatch_final_claim_v3
+        return commit_contact_dispatch_final_claim_v3(self, *args, **kwargs)
+
+    def read_finished_contact_for_owner_v1(self, bootstrap, *, namespace, operation_id,
+            request_digest, owner_session_token, owner_session_request, use, signature):
+        """Read one exact finished Contact original with an independent Owner use."""
+        from .runtime.contact_finished_owner_read_v1 import read_finished_contact_for_owner_v1
+        return read_finished_contact_for_owner_v1(self, bootstrap, namespace=namespace,
+            operation_id=operation_id, request_digest=request_digest,
+            owner_session_token=owner_session_token, owner_session_request=owner_session_request,
+            use=use, signature=signature)
+
+    def recover_contact_owner_dispatch_v3(self, bootstrap, *, namespace, operation_id,
+            request_digest, owner_session_token, owner_session_request, use, signature):
+        """Resume one saved Contact COMMIT with an explicit Owner-signed use.
+
+        The independently authenticated marker supplies only this invocation's
+        temporary process lease. It never escapes to ordinary Owner callers.
+        """
+        from .runtime.contact_owner_invocation_v3 import (
+            authenticate_contact_restart_v3, release_authenticated_contact_restart_v3)
+        recovery = authenticate_contact_restart_v3(self, bootstrap, namespace=namespace,
+            operation_id=operation_id, request_digest=request_digest,
+            owner_session_token=owner_session_token, owner_session_request=owner_session_request,
+            use=use, signature=signature)
+        lease = _AuthorityLease(object())
+        try:
+            authority = recovery.authority
+            domains = frozenset(json.loads(recovery.original.payload_json)['lease_domains'])
+            if 'd08' not in domains or any(domain not in self.__providers for domain in domains):
+                raise AuthorityDenied('Contact recovery original providers are unavailable')
+            owners = frozenset(kind for spec in self.__store._registry.specs
+                if spec.writer_domain in domains for kind in spec.owner_kinds)
+            if not set(authority.owner_scope).issubset(owners):
+                raise AuthorityDenied('Contact recovery original Owner scope differs from installed catalogue')
+            self.__leases[lease] = (authority.capability_ref, authority.actor,
+                authority.issuer_domain, namespace, domains, owners, authority.activation_generation)
+            self.__owner_leases[lease] = recovery.owner
+            self.__owner_session_proofs[lease] = recovery.session
+            self.__contact_recovery_leases_v3[lease] = recovery
+            return self.run_current_domain_operation_v1(authority, lease,
+                operation_kind='prepare_contact_dispatch_v3', request=recovery.request,
+                operation_id=recovery.operation_id, activity_id=recovery.activity_id,
+                audience_ref=recovery.audience_ref,
+                parent_budget_lease_ref=recovery.parent_budget_lease_ref)
+        finally:
+            self.__contact_recovery_leases_v3.pop(lease, None)
+            self.__owner_session_proofs.pop(lease, None)
+            self.__owner_leases.pop(lease, None)
+            self.__leases.pop(lease, None)
+            release_authenticated_contact_restart_v3(recovery)
+
     def adopt_current_offline_tick_v1(self, bootstrap, *, namespace, prepared_original_ref):
         from .runtime.d11_offline_adoption_v1 import adopt_current_offline_tick_v1
         return adopt_current_offline_tick_v1(self, bootstrap, namespace=namespace,
             prepared_original_ref=prepared_original_ref)
+
+    def install_life_before_capture_policy_v1(self, bootstrap, bundle):
+        """Install one prospective explicit-root policy from the actual assembly."""
+        self._admin(bootstrap)
+        from .host.authority_profile import AdminInstallationBundle
+        from .host.v2_installation import V2InstallationAssembly
+        from .runtime.d04_life_before_original_v1 import D04LifeBeforeCapturePolicyV1
+        from .runtime.d04_root_original_store_v3 import read_d04_root_original_v3
+        assembly = self.__d04_installed_joint_assembly
+        if (type(bundle) is not AdminInstallationBundle
+                or type(assembly) is not V2InstallationAssembly or bundle is not assembly.admin_bundle):
+            raise AuthorityDenied("Life before capture requires the actual installed assembly bundle")
+        policy = bundle.life_d04_before_capture_policy
+        installed = assembly.installation_policy
+        if (type(policy) is not D04LifeBeforeCapturePolicyV1
+                or (policy.namespace, policy.installation_id, policy.manifest_digest)
+                != (installed.namespace, installed.installation_id, installed.manifest_digest)):
+            raise AuthorityDenied("Life before capture installed policy identity differs")
+        with self.__store._lock:
+            if self.__life_d04_before_capture_policy is not None:
+                raise AuthorityDenied("Life before capture policy is already installed")
+            db = self.__store._db
+            if db.in_transaction:
+                raise UnavailableGuard("Life before policy installation requires its own read transaction")
+            db.execute("BEGIN")
+            try:
+                read_d04_root_original_v3(db, namespace=policy.namespace,
+                    operation_id=policy.root_operation_id)
+            finally:
+                db.execute("ROLLBACK")
+            self.__life_d04_before_capture_policy = policy
 
     def install_contact_model_runtime_v1(self, bootstrap, bundle):
         from .runtime.contact_graph_runtime_v1 import install_contact_model_graph_runtime_v1
@@ -6464,6 +6628,14 @@ class GraphCoordinator:
     def contact_model_runtime_v1(self, bootstrap, bundle):
         from .runtime.contact_graph_runtime_v1 import contact_model_runtime_v1
         return contact_model_runtime_v1(self, bootstrap, bundle)
+
+    def install_contact_model_runtime_v2(self, bootstrap, bundle):
+        from .runtime.contact_graph_runtime_v2 import install_contact_model_graph_runtime_v2
+        return install_contact_model_graph_runtime_v2(self, bootstrap, bundle)
+
+    def contact_model_runtime_v2(self, bootstrap, bundle):
+        from .runtime.contact_graph_runtime_v2 import contact_model_runtime_v2
+        return contact_model_runtime_v2(self, bootstrap, bundle)
 
     def adopt_current_life_v1(self, bootstrap, *, namespace, prepared_original_ref):
         from .runtime.d11_life_adoption_v1 import adopt_current_life_v1
@@ -7455,6 +7627,19 @@ class GraphCoordinator:
 
     def _authorize(self, lease: object, authority: AuthorityContext,
                    domains: frozenset[str], *, owner_read: bool = False) -> None:
+        recovery = (self.__contact_recovery_leases_v3.get(lease)
+                    if isinstance(lease, _AuthorityLease) else None)
+        if recovery is not None:
+            from .runtime.contact_owner_invocation_v3 import require_authenticated_contact_restart_v3
+            from .runtime.contact_final_ack_v1 import contact_owner_call_v1
+            require_authenticated_contact_restart_v3(recovery, self,
+                operation_id=recovery.operation_id, request_digest=recovery.request_digest)
+            call = contact_owner_call_v1(self, authority, lease,
+                recovery.operation_id, recovery.request_digest)
+            if (not owner_read or domains != frozenset({'d08'})
+                    or authority is not recovery.authority or call is None
+                    or call.request != recovery.request):
+                raise AuthorityDenied('Contact restart lease only resumes its authenticated invocation')
         try:
             ref, actor, issuer_domain, namespace, allowed, owner_scope, generation = self.__leases[lease]
         except (KeyError, TypeError):
@@ -31899,8 +32084,18 @@ class GraphCoordinator:
                     current_order=order)
                 order_write, slot_write = reservation.writes
                 slot = GraphAtom(slot_write.key, 1, slot_write.value, True)
+                evidence_version = binding.binding_evidence_event_version
+                evidence_row = db.execute(
+                    "SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                    (evidence_version.key.token,)).fetchone()
+                if (evidence_version.revision < 1 or evidence_row is None
+                        or evidence_row[0] != evidence_version.revision or evidence_row[2] != 1):
+                    raise StaleRead("D09 original account-binding evidence changed")
+                binding_evidence = GraphAtom(evidence_version.key, evidence_row[0],
+                    json.loads(evidence_row[1]), True)
                 completion = complete_inbound_turn_v1(
-                    namespace, slot, arrival, account, source, access)
+                    namespace, slot, arrival, account, source, access,
+                    binding_evidence=binding_evidence)
                 if (reservation.absent_slot != slot_write.key
                         or completion.absent_completion != completion.write.key):
                     raise UnavailableGuard("D13 turn absence candidate differs; HOLD")
@@ -34800,17 +34995,64 @@ class GraphCoordinator:
             for runtime_write in c04_runtime_writes_v3:
                 reconcile_runtime_write(store._db, runtime_write)
             writes += c04_runtime_writes_v3
-        dispatch_candidate = validate_dispatch_candidate_writes(
-            tuple((proposal.domain, write) for proposal in bundle.proposals
-                  for write in proposal.typed_writes),
-            namespace=namespace, identity=envelope.identity,
-            read_versions=envelope.version_guard.read_versions,
-            source_refs=envelope.source_qualification.source_refs,
-            access_epoch=envelope.version_guard.access_epoch,
-            delete_epoch=envelope.version_guard.delete_epoch,
-            query_epoch=envelope.version_guard.query_epochs[0].revision
-            if len(envelope.version_guard.query_epochs) == 1 else -1,
-        )
+        from .domains.d09.contact_batch_v1 import CONTACT_BATCH_SCHEMA_V1
+        from .runtime.contact_dispatch_candidate_v1 import (
+            ContactDispatchCandidateEvidenceV1, validate_contact_dispatch_candidate_writes_v1)
+        from .runtime.contact_final_stage_v1 import _ContactFinalCommitWitnessV1
+        from .domains.d09.contact_batch_v2 import KINDS as contact_v2_kinds
+        from .runtime.contact_dispatch_candidate_v2 import ContactDispatchCandidateEvidenceV2, validate_contact_dispatch_candidate_writes_v2
+        from .runtime.contact_final_stage_v2 import _ContactFinalCommitWitnessV2
+        from .domains.d09.contact_batch_v3 import KINDS as contact_v3_kinds
+        from .runtime.contact_dispatch_candidate_v3 import ContactDispatchCandidateEvidenceV3, validate_contact_dispatch_candidate_writes_v3
+        from .runtime.contact_final_stage_v3 import _ContactFinalCommitWitnessV3
+        has_contact_v3 = any(w.key.type_name in contact_v3_kinds for w in writes)
+        has_contact_v2 = any(w.key.type_name in contact_v2_kinds for w in writes)
+        has_contact_batch = any(w.key.type_name == CONTACT_BATCH_SCHEMA_V1 for w in writes)
+        if has_contact_v3:
+            if (has_contact_v2 or has_contact_batch or type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV3
+                    or natural_final_admission is not None or v2_write is None):
+                raise UnavailableGuard("Contact3 requires its exact installed final GCP witness; HOLD")
+            dispatch_candidate = validate_contact_dispatch_candidate_writes_v3(
+                tuple((p.domain,w) for p in bundle.proposals for w in p.typed_writes),
+                namespace=namespace, identity=envelope.identity, read_versions=envelope.version_guard.read_versions,
+                source_refs=envelope.source_qualification.source_refs, access_epoch=envelope.version_guard.access_epoch,
+                delete_epoch=envelope.version_guard.delete_epoch,
+                query_epoch=envelope.version_guard.query_epochs[0].revision if len(envelope.version_guard.query_epochs)==1 else -1)
+        elif has_contact_v2:
+            if (has_contact_batch or type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV2
+                    or natural_final_admission is not None or v2_write is None):
+                raise UnavailableGuard("Contact v2 requires its exact installed final GCP witness; HOLD")
+            dispatch_candidate = validate_contact_dispatch_candidate_writes_v2(
+                tuple((p.domain,w) for p in bundle.proposals for w in p.typed_writes),
+                namespace=namespace, identity=envelope.identity, read_versions=envelope.version_guard.read_versions,
+                source_refs=envelope.source_qualification.source_refs, access_epoch=envelope.version_guard.access_epoch,
+                delete_epoch=envelope.version_guard.delete_epoch,
+                query_epoch=envelope.version_guard.query_epochs[0].revision if len(envelope.version_guard.query_epochs)==1 else -1)
+        elif has_contact_batch:
+            if (type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV1
+                    or natural_final_admission is not None or v2_write is None):
+                raise UnavailableGuard("Contact batch requires its installed current final GCP witness; HOLD")
+            dispatch_candidate = validate_contact_dispatch_candidate_writes_v1(
+                tuple((p.domain, w) for p in bundle.proposals for w in p.typed_writes),
+                namespace=namespace, identity=envelope.identity,
+                read_versions=envelope.version_guard.read_versions,
+                source_refs=envelope.source_qualification.source_refs,
+                access_epoch=envelope.version_guard.access_epoch,
+                delete_epoch=envelope.version_guard.delete_epoch,
+                query_epoch=envelope.version_guard.query_epochs[0].revision
+                if len(envelope.version_guard.query_epochs) == 1 else -1)
+        else:
+            dispatch_candidate = validate_dispatch_candidate_writes(
+                tuple((proposal.domain, write) for proposal in bundle.proposals
+                      for write in proposal.typed_writes),
+                namespace=namespace, identity=envelope.identity,
+                read_versions=envelope.version_guard.read_versions,
+                source_refs=envelope.source_qualification.source_refs,
+                access_epoch=envelope.version_guard.access_epoch,
+                delete_epoch=envelope.version_guard.delete_epoch,
+                query_epoch=envelope.version_guard.query_epochs[0].revision
+                if len(envelope.version_guard.query_epochs) == 1 else -1,
+            )
         if (type(dispatch_candidate) is NaturalDispatchCandidateEvidenceV2
                 and natural_final_admission is None):
             raise UnavailableGuard(
@@ -34831,7 +35073,84 @@ class GraphCoordinator:
             if registration is None:
                 raise AuthorityDenied("unregistered proposal domain")
             _, schema, schema_hash = registration
-            if (proposal.proposal_schema, proposal.proposal_schema_hash) != (schema, schema_hash):
+            if any(write.key.type_name == 'memory.subjective_trace.v3' for write in proposal.typed_writes):
+                raise UnavailableGuard('installed Life C02 trace-v3 issuer is unavailable; HOLD')
+            from .runtime.d06_internal_life_episode_v2 import KINDS as internal_life_kinds, PROPOSAL_SCHEMA as internal_life_schema, PROPOSAL_HASH as internal_life_hash, require_exact_internal_life_issuance_v2
+            internal_life = any(write.key.type_name in internal_life_kinds for write in proposal.typed_writes)
+            from .domains.d08.contact_plan_v2 import KINDS as contact_plan_v2_kinds,PROPOSAL_SCHEMA as contact_plan_v2_schema,PROPOSAL_HASH as contact_plan_v2_hash
+            is_contact_plan_v2=any(write.key.type_name in contact_plan_v2_kinds for write in proposal.typed_writes)
+            if proposal.envelope.identity.phase in {'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
+                from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_task_issuance_v1
+                actual = require_exact_life_numeric_task_issuance_v1(domain_production_issuance_v1, self, bundle)
+                if proposal not in actual.bundle.proposals:
+                    raise AuthorityDenied('numeric Life proposal differs from the actual private task')
+                if proposal.envelope.identity.phase == 'acquire_internal_life_numeric':
+                    from .runtime.d06_life_numeric_worker_v1 import PROPOSAL_SCHEMA as ns, PROPOSAL_HASH as nh
+                    expected = (ns, nh) if proposal.domain == 'd11' else None
+                else:
+                    from .runtime.d06_life_numeric_task_v1 import APPRAISAL_SCHEMA, APPRAISAL_HASH, JOB_SCHEMA, JOB_HASH
+                    expected = (APPRAISAL_SCHEMA, APPRAISAL_HASH) if proposal.domain == 'd04' else (JOB_SCHEMA, JOB_HASH) if proposal.domain == 'd11' else None
+                if expected is None or (proposal.proposal_schema, proposal.proposal_schema_hash) != expected:
+                    raise AuthorityDenied('numeric Life task independent schema differs')
+            elif proposal.envelope.identity.phase in {'prepare_internal_life_numeric_drive', 'adopt_internal_life_numeric_trace'}:
+                from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_math_issuance_v1
+                require_exact_life_numeric_math_issuance_v1(domain_production_issuance_v1, self, bundle)
+                if proposal.envelope.identity.phase == 'prepare_internal_life_numeric_drive':
+                    from .runtime.d06_life_numeric_drive_v1 import PROPOSAL_SCHEMA as ns, PROPOSAL_HASH as nh
+                else:
+                    from .runtime.d06_life_numeric_trace_v1 import PROPOSAL_SCHEMA as ns, PROPOSAL_HASH as nh
+                if (proposal.proposal_schema, proposal.proposal_schema_hash) != (ns, nh):
+                    raise AuthorityDenied('numeric Life mathematical proposal schema differs')
+            elif proposal.envelope.identity.phase == 'prepare_internal_life_numeric_context':
+                from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_context_issuance_v1
+                from .runtime.d06_life_numeric_context_v1 import D03_SCHEMA, D07_SCHEMA, PROPOSAL_HASHES
+                require_exact_life_numeric_context_issuance_v1(domain_production_issuance_v1, self, bundle)
+                expected = D03_SCHEMA if proposal.domain == 'd03' else D07_SCHEMA if proposal.domain == 'd07' else None
+                if expected is None or (proposal.proposal_schema, proposal.proposal_schema_hash) != (expected, PROPOSAL_HASHES[expected]):
+                    raise AuthorityDenied('numeric Life context requires its independent installed schema')
+            elif proposal.envelope.identity.phase == 'adopt_internal_life_content_v1':
+                from .runtime.internal_life_content_adoption_v1 import (require_exact_content_issuance_v1,
+                    PROPOSAL_SCHEMA as cs,PROPOSAL_HASH as ch,JOB_SCHEMA as js,JOB_HASH as jh)
+                require_exact_content_issuance_v1(domain_production_issuance_v1,self,bundle)
+                expected=(cs,ch) if proposal.domain=='d06' else (js,jh)
+                if (proposal.proposal_schema,proposal.proposal_schema_hash)!=expected:
+                    raise AuthorityDenied('Life content completion requires its independent installed schema')
+            elif proposal.envelope.identity.phase == "acquire_internal_life_content_v2":
+                from .runtime.internal_life_content_worker_v2 import (
+                    PROPOSAL_SCHEMA as worker_schema,PROPOSAL_HASH as worker_hash,
+                    require_exact_internal_life_acquisition_issuance_v2)
+                require_exact_internal_life_acquisition_issuance_v2(domain_production_issuance_v1,self,bundle)
+                if (proposal.proposal_schema,proposal.proposal_schema_hash)!=(worker_schema,worker_hash):
+                    raise AuthorityDenied('Life worker requires its independent dual-role installed schema')
+            elif proposal.envelope.identity.phase == "acquire_internal_life_content":
+                from .runtime.internal_life_content_worker_v1 import (
+                    PROPOSAL_SCHEMA as life_acquire_schema, PROPOSAL_HASH as life_acquire_hash,
+                    require_exact_internal_life_acquisition_issuance_v1)
+                require_exact_internal_life_acquisition_issuance_v1(domain_production_issuance_v1,self,bundle)
+                if (proposal.proposal_schema,proposal.proposal_schema_hash) != (life_acquire_schema,life_acquire_hash):
+                    raise AuthorityDenied('Life acquisition requires its independent exact installed schema')
+            elif internal_life:
+                require_exact_internal_life_issuance_v2(domain_production_issuance_v1, self, bundle)
+                if (proposal.proposal_schema, proposal.proposal_schema_hash) != (internal_life_schema, internal_life_hash):
+                    raise AuthorityDenied('internal Life proposal requires its explicit installed v2 schema')
+            elif is_contact_plan_v2:
+                from .runtime.contact_plan_adoption_v2 import require_exact_contact_plan_issuance_v2
+                require_exact_contact_plan_issuance_v2(domain_production_issuance_v1,self,bundle)
+                if (proposal.proposal_schema,proposal.proposal_schema_hash)!=(contact_plan_v2_schema,contact_plan_v2_hash):
+                    raise AuthorityDenied('Contact Plan v2 requires its independent exact installed schema/witness')
+            elif any(write.key.type_name in contact_v3_kinds for write in proposal.typed_writes):
+                from .domains.d09.contact_batch_v3 import PROPOSAL_SCHEMA as contact_v3_schema, PROPOSAL_HASH as contact_v3_hash
+                if (type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV3
+                        or domain_production_issuance_v1.stage.bundle is not bundle
+                        or (proposal.proposal_schema,proposal.proposal_schema_hash) != (contact_v3_schema,contact_v3_hash)):
+                    raise AuthorityDenied("Contact3 proposal has no exact private installed schema/witness")
+            elif any(write.key.type_name in contact_v2_kinds for write in proposal.typed_writes):
+                from .domains.d09.contact_batch_v2 import PROPOSAL_SCHEMA as contact_v2_schema, PROPOSAL_HASH as contact_v2_hash
+                if (type(domain_production_issuance_v1) is not _ContactFinalCommitWitnessV2
+                        or domain_production_issuance_v1.stage.bundle is not bundle
+                        or (proposal.proposal_schema,proposal.proposal_schema_hash) != (contact_v2_schema,contact_v2_hash)):
+                    raise AuthorityDenied('Contact v2 proposal has no exact private installed schema/witness')
+            elif (proposal.proposal_schema, proposal.proposal_schema_hash) != (schema, schema_hash):
                 raise AuthorityDenied("proposal schema differs from registered provider")
             for write in proposal.typed_writes:
                 spec = store._registry.spec(write.key.type_name)
@@ -35015,7 +35334,7 @@ class GraphCoordinator:
                     raise AuthorityDenied("one bundle cannot carry two journal-advancing issuers")
                 from .runtime.domain_production_commit_v1 import require_current_production_commit_v1
                 require_current_production_commit_v1(domain_production_issuance_v1, self, db, bundle, v2_write)
-            elif identity.phase in {"encode_structured_experience", "form_association", "record_host_lifecycle", "d11.offline_tick.prepare.v1", "adopt_offline_tick", "d11.life.prepare.v1", "prepare_life", "adopt_life", "prepare_source_note_action", "prepare_source_note_body", "prepare_life_project_context", "focus_life_project"}:
+            elif identity.phase in {"prepare_internal_life_numeric_drive", "prepare_internal_life_interval_baseline", "adopt_internal_life_numeric_trace", "prepare_internal_life_numeric", "acquire_internal_life_numeric", "adopt_internal_life_numeric", "prepare_internal_life_numeric_context", "acquire_internal_life_content_v2", "acquire_internal_life_content", "prepare_internal_life_content", "encode_internal_life", "encode_structured_experience", "form_association", "record_host_lifecycle", "d11.offline_tick.prepare.v1", "adopt_offline_tick", "d11.life.prepare.v1", "prepare_life", "adopt_life", "prepare_source_note_action", "prepare_source_note_body", "prepare_life_project_context", "focus_life_project", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
                 raise AuthorityDenied("installed internal experience requires its exact composite issuer")
             if c02_terminal_recovery is not None:
                 row = db.execute(
@@ -35634,7 +35953,48 @@ class GraphCoordinator:
                     provider = self.__providers[proposal.domain][0]
                     # Providers may return approval or the exact unchanged proposal.
                     # A transformed candidate would need its own validation pass.
-                    validated = provider.validate(proposal, snapshot)
+                    from .runtime.d06_internal_life_episode_v2 import KINDS as internal_life_kinds, require_exact_internal_life_issuance_v2, validate_internal_life_proposal_v2
+                    if proposal.envelope.identity.phase in {'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
+                        from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_task_issuance_v1
+                        actual = require_exact_life_numeric_task_issuance_v1(domain_production_issuance_v1, self, bundle)
+                        if proposal.envelope.identity.phase == 'acquire_internal_life_numeric':
+                            from .runtime.d06_life_numeric_worker_v1 import validate_life_numeric_acquisition_proposal_v1
+                            validated = validate_life_numeric_acquisition_proposal_v1(proposal, snapshot, actual.stage.binding)
+                        else:
+                            # Same-transaction issuer rederived the actual paid Appraisal and completed job.
+                            if proposal not in (*actual.stage.stage.proposals, actual.stage.job_proposal):
+                                raise AuthorityDenied('numeric appraisal proposal differs from actual reissued members')
+                            validated = proposal
+                    elif proposal.envelope.identity.phase in {'prepare_internal_life_numeric_drive', 'adopt_internal_life_numeric_trace'}:
+                        from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_math_issuance_v1
+                        require_exact_life_numeric_math_issuance_v1(domain_production_issuance_v1, self, bundle)
+                        if proposal.envelope.identity.phase == 'prepare_internal_life_numeric_drive':
+                            from .runtime.d06_life_numeric_drive_v1 import validate_life_numeric_drive_proposal_v1 as numeric_validate
+                        else:
+                            from .runtime.d06_life_numeric_trace_v1 import validate_life_numeric_trace_proposal_v1 as numeric_validate
+                        validated = numeric_validate(proposal, snapshot)
+                    elif proposal.envelope.identity.phase == 'prepare_internal_life_numeric_context':
+                        from .runtime.d06_life_numeric_commit_v1 import require_exact_life_numeric_context_issuance_v1
+                        from .runtime.d06_life_numeric_context_v1 import validate_life_numeric_context_proposal_v1
+                        require_exact_life_numeric_context_issuance_v1(domain_production_issuance_v1, self, bundle)
+                        validated = validate_life_numeric_context_proposal_v1(proposal, snapshot)
+                    elif proposal.envelope.identity.phase == 'adopt_internal_life_content_v1':
+                        from .runtime.internal_life_content_adoption_v1 import require_exact_content_issuance_v1,validate_content_proposal_v1
+                        require_exact_content_issuance_v1(domain_production_issuance_v1,self,bundle)
+                        validated=validate_content_proposal_v1(proposal,snapshot)
+                    elif proposal.envelope.identity.phase == "acquire_internal_life_content_v2":
+                        from .runtime.internal_life_content_worker_v2 import require_exact_internal_life_acquisition_issuance_v2,validate_internal_life_acquisition_proposal_v2
+                        actual_worker=require_exact_internal_life_acquisition_issuance_v2(domain_production_issuance_v1,self,bundle)
+                        validated=validate_internal_life_acquisition_proposal_v2(proposal,snapshot,actual_worker.stage.frame.binding)
+                    elif proposal.envelope.identity.phase == "acquire_internal_life_content":
+                        from .runtime.internal_life_content_worker_v1 import require_exact_internal_life_acquisition_issuance_v1,validate_internal_life_acquisition_proposal_v1
+                        require_exact_internal_life_acquisition_issuance_v1(domain_production_issuance_v1,self,bundle)
+                        validated = validate_internal_life_acquisition_proposal_v1(proposal,snapshot)
+                    elif any(write.key.type_name in internal_life_kinds for write in proposal.typed_writes):
+                        require_exact_internal_life_issuance_v2(domain_production_issuance_v1, self, bundle)
+                        validated = validate_internal_life_proposal_v2(proposal, snapshot)
+                    else:
+                        validated = provider.validate(proposal, snapshot)
                     if validated is not True and validated != proposal:
                         raise AuthorityDenied("domain validation did not approve proposal")
             if (c04_adoption_issuance_v3 is None and d04_numeric_issuance_v3 is None
@@ -35804,7 +36164,36 @@ class GraphCoordinator:
                         "observation_digest": observation_digest,
                         "result_digest": result_digest,
                     }
-            if type(dispatch_candidate) is NaturalDispatchCandidateEvidenceV2:
+            if type(dispatch_candidate) in (ContactDispatchCandidateEvidenceV1,ContactDispatchCandidateEvidenceV2,ContactDispatchCandidateEvidenceV3):
+                from .runtime.contact_final_stage_v1 import seal_contact_final_admission_v1
+                from .runtime.contact_final_stage_v2 import seal_contact_final_admission_v2
+                from .runtime.contact_final_stage_v3 import seal_contact_final_admission_v3
+                seal_contact = seal_contact_final_admission_v3 if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV3 else seal_contact_final_admission_v2 if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV2 else seal_contact_final_admission_v1
+                admission_receipt, request, runtime_admission, binding = seal_contact(
+                    domain_production_issuance_v1, self, db, graph_receipt, dispatch_candidate)
+                if (load_request(db, namespace, admission_receipt.admission.admission_ref)
+                        != (admission_receipt, request)
+                        or request.proactive_contact is not True or request.segment_index != 0
+                        or (request.operation_id, request.effect_id, request.payload_digest) != (
+                            identity.operation_id, identity.effect_id, dispatch_candidate.payload_digest)):
+                    raise UnavailableGuard("Contact final actual admission/request differs")
+                runtime_admissions.append(runtime_admission)
+                versions = {v.key.token:v.revision for v in graph_receipt.revisions}
+                refs = (dispatch_candidate.action_ref, dispatch_candidate.schema_ref,
+                        dispatch_candidate.grant_ref, dispatch_candidate.batch_ref)
+                if any(versions.get(ref) != 1 for ref in refs):
+                    raise UnavailableGuard("Contact final four-join actual receipt differs")
+                data["contact_dispatch_candidate"] = {
+                    "schema":"sylanne.d11.contact_dispatch_candidate.v3" if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV3 else "sylanne.d11.contact_dispatch_candidate.v2" if type(dispatch_candidate) is ContactDispatchCandidateEvidenceV2 else "sylanne.d11.contact_dispatch_candidate.v1",
+                    "digest":dispatch_candidate.digest, "refs":[[ref,versions[ref]] for ref in refs],
+                    "graph_epoch":graph_receipt.epoch.revision,
+                    "reviewed_content_digest":dispatch_candidate.reviewed_content_digest,
+                    "segment_index":0, "query_epoch":dispatch_candidate.query_epoch}
+                data["dispatch_admission"] = {"schema":admission_receipt.admission.schema,
+                    "ref":admission_receipt.admission.admission_ref, "digest":admission_receipt.receipt_digest}
+                data["dispatch_action_job_binding"] = {"schema":binding.schema, "digest":binding.digest,
+                    "admission_ref":binding.admission_ref, "job_id":binding.job_id}
+            elif type(dispatch_candidate) is NaturalDispatchCandidateEvidenceV2:
                 versions = {item.key.token: item.revision
                             for item in graph_receipt.revisions}
                 refs = (dispatch_candidate.action_ref,
@@ -36138,6 +36527,26 @@ class GraphCoordinator:
             for kind, refs in part_refs:
                 for ref in refs:
                     if kind == "persistent_job" and domain_production_issuance_v1 is not None:
+                        if identity.phase=='adopt_internal_life_content_v1':
+                            from .runtime.internal_life_content_adoption_v1 import require_content_job_registration_v1
+                            if ref not in require_content_job_registration_v1(domain_production_issuance_v1,db):
+                                raise ValueError('Life content completion contains another persistent job')
+                            continue
+                        if identity.phase in {'acquire_internal_life_numeric', 'adopt_internal_life_numeric'}:
+                            from .runtime.d06_life_numeric_commit_v1 import require_life_numeric_job_registration_v1
+                            if ref not in require_life_numeric_job_registration_v1(domain_production_issuance_v1, db):
+                                raise ValueError('numeric Life task contains another persistent job')
+                            continue
+                        if identity.phase == 'acquire_internal_life_content_v2':
+                            from .runtime.internal_life_content_worker_v2 import require_internal_life_acquisition_job_registration_v2
+                            if ref not in require_internal_life_acquisition_job_registration_v2(domain_production_issuance_v1,db):
+                                raise ValueError('Life worker acquisition contains another persistent job')
+                            continue
+                        if identity.phase == 'acquire_internal_life_content':
+                            from .runtime.internal_life_content_worker_v1 import require_internal_life_acquisition_job_registration_v1
+                            if ref not in require_internal_life_acquisition_job_registration_v1(domain_production_issuance_v1,db):
+                                raise ValueError('Life acquisition contains another persistent job')
+                            continue
                         from .runtime.d11_offline_adoption_v1 import (
                             _OfflineCommitWitnessV1, require_offline_job_registration_v1,
                         )

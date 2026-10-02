@@ -1274,6 +1274,9 @@ class D07DomainProvider:
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):
             raise TypeError("proposal must be DomainProposal")
+        if proposal.domain == 'd07' and proposal.proposal_schema == 'd07.internal-life-presence.v1':
+            from ...runtime.d06_life_numeric_context_v1 import validate_life_numeric_context_proposal_v1
+            return validate_life_numeric_context_proposal_v1(proposal, snapshot)
         if proposal.domain != "d07" or proposal.proposal_schema != "d07.proposal.v1":
             raise ValueError("proposal is not a D07 cognition proposal")
         if proposal.proposal_schema_hash != self.descriptor.request_schema_hash:

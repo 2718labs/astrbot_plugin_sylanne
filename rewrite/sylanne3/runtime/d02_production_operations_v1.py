@@ -420,6 +420,26 @@ def read_plan_current_d02_operation_v1(db, *, namespace, activity_id, operation_
         originals.extend((request.clock_mapping_ref, request.trigger_original_ref))
     elif operation_kind == "apply_body_effect" and type(request) is ApplyCurrentBodyEffectRequestV1:
         originals.extend((request.component_terminal_ref, request.body_quote_ref, request.effect_policy_ref, request.settlement_operation_ref))
+        from .d11_life_preparation_v1 import TABLE as LIFE_TABLE
+        if table_exists_v1(db,LIFE_TABLE):
+            rows=db.execute("SELECT payload_json FROM "+LIFE_TABLE+" WHERE bot=? AND persona=? AND kind='adopted_life' AND json_extract(payload_json,'$.terminal.original_ref')=? LIMIT 2",(*namespace.as_tuple,request.component_terminal_ref)).fetchall()
+            if len(rows)>1:raise ValueError('Life Body read plan has conflicting terminal originals')
+            if rows:
+                from .d11_life_contract_v1 import D11LifeTerminalV1, life_from_wire_v1
+                from .d11_life_graph_types_v1 import life_role_segment_key_v1
+                from .d11_life_fact_provenance_v1 import life_fact_auxiliary_key_v1, PROVENANCE_TYPE, ELIGIBILITY_TYPE
+                terminal=life_from_wire_v1(json.loads(rows[0][0])['terminal'],D11LifeTerminalV1)
+                b=terminal.binding
+                facts=(AtomKey.from_token(b.artifact_ref),life_role_segment_key_v1(b,'start'),life_role_segment_key_v1(b,'end'))
+                keys.extend(facts)
+                keys.extend(life_fact_auxiliary_key_v1(fact,kind) for fact in facts for kind in (PROVENANCE_TYPE,ELIGIBILITY_TYPE))
+                originals.extend((b.prepared_original_ref,b.artifact_ref))
+                prepared=raw_registered_input_v1(db,LIFE_TABLE,namespace,b.prepared_original_ref)
+                if prepared:
+                    from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
+                    keys.extend(life_outcome_read_keys_v1(b,prepared['plan']['action_intent']['ref']))
+                    keys.extend(AtomKey.from_token(row['ref']) for row in prepared['read_rows'])
+                    roots.extend(row['ref'] for row in prepared['read_rows'] if AtomKey.from_token(row['ref']).type_name=='memory.source')
         action_component = raw_registered_input_v1(db, "graph_d02_action_components_v1", namespace, request.settlement_operation_ref)
         if action_component:
             keys.extend(AtomKey.from_token(action_component[name]) for name in (

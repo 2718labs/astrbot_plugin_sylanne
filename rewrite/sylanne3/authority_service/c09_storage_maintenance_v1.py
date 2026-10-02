@@ -423,7 +423,15 @@ class InstalledC09MaintenanceV1:
 
     def prepare_storage_rebase_v1(self, *, operation_id):
         with self._maintenance_lock:
-            return self._prepare_storage_rebase_v1(operation_id=operation_id)
+            try:
+                return self._prepare_storage_rebase_v1(operation_id=operation_id)
+            finally:
+                from .c09_contact_finish_original_v1 import _revoke_contact_finish_scope_v1
+                port = self.core._execution_recovery_facts_ports_v4.get(self.closure.namespace)
+                if port is not None:
+                    _revoke_contact_finish_scope_v1(port)
+                    from .c09_life_completed_archive_v1 import revoke_completed_life_scope_v1
+                    revoke_completed_life_scope_v1(port)
 
     def _prepare_storage_rebase_v1(self, *, operation_id):
         from .erasure_closure_inventory import CleanupRunV2,_TABLES
@@ -469,6 +477,8 @@ class InstalledC09MaintenanceV1:
                 permit=permit,inventory_manifest=self.inventory_manifest,pinned_manifest_digest=self.inventory_manifest.manifest_digest,
                 writer_freeze_digest=self.control.read_operation_event_v1(operation_id, "INTENT")["details"]["quiescence_original"]["quiescence_digest"],
                 completion_control=self.control, registry=self.graph._registry,
+                contact_finish_scope=self.core._execution_recovery_facts_ports_v4[self.closure.namespace]._contact_finish_scope,
+                life_completed_scope=self.core._execution_recovery_facts_ports_v4[self.closure.namespace]._life_completed_scope,
                 current_inventory_qualifier=self.current_source_location,current_inventory_view=inventory_view)
         else:
             graph_candidate = decode_installed_build_original_v1(saved["details"]["candidate"], GraphRebaseCandidateV1)

@@ -33,6 +33,14 @@ from .c09_model_budget_original_v1 import (
 )
 from ..runtime.c09_d07_execution_v1 import TIMING_TABLE as _D07_TIMING_TABLE, validate_d07_schema_v1, validate_d07_timing_row_v1
 from .d10_contact_policy_service_v1 import TABLE as _CONTACT_POLICY_TABLE, DDL as _CONTACT_POLICY_DDL
+from .c09_contact_finish_original_v1 import TABLE as _CONTACT_FINISH_TABLE, validate_contact_finish_row_v1
+from .c09_contact_frame_authentication_v1 import (
+    TABLE as _CONTACT_FRAME_AUTH_TABLE, validate_contact_frame_authentication_row_v1,
+)
+from .c09_life_completed_archive_v1 import (
+    TABLE as _LIFE_COMPLETED_ARCHIVE_TABLE, validate_life_archive_row_v1,
+    require_completed_life_archive_schema_v1,
+)
 
 
 _KNOWN_CORE_TABLES = frozenset({
@@ -81,7 +89,7 @@ _KNOWN_CORE_TABLES = frozenset({
     "authority_c09_originals_archive_v1", "authority_c09_deletion_continuations_v1",
     "authority_c09_recovery_bindings_v1", "authority_c09_execution_source_seals_v4",
     "authority_c09_execution_source_pins_v4", "authority_c09_recovery_fact_frames_v4",
-}) | frozenset(_OWNER_PAIRING_SCHEMAS) | frozenset(_INSTALLER_GENESIS_TABLES) | frozenset(_PACKAGE_CORE_SCHEMAS) | {_MODEL_BUDGET_TABLE, _D07_TIMING_TABLE, _CONTACT_POLICY_TABLE}
+}) | frozenset(_OWNER_PAIRING_SCHEMAS) | frozenset(_INSTALLER_GENESIS_TABLES) | frozenset(_PACKAGE_CORE_SCHEMAS) | {_MODEL_BUDGET_TABLE, _D07_TIMING_TABLE, _CONTACT_POLICY_TABLE, _CONTACT_FINISH_TABLE, _CONTACT_FRAME_AUTH_TABLE, _LIFE_COMPLETED_ARCHIVE_TABLE}
 _KNOWN_DELETION_TABLES = frozenset({
     "deletion_meta", "deletion_events", "authority_deletion_v2_meta",
     "authority_deletion_v2_tail",
@@ -287,6 +295,14 @@ def _build_file(source: sqlite3.Connection, target: Path,
     if _CONTACT_POLICY_TABLE in observed:
         from .c09_contact_policy_rows_v1 import require_contact_policy_schema_v1
         require_contact_policy_schema_v1(source)
+    if _CONTACT_FINISH_TABLE in observed:
+        from .c09_contact_finish_original_v1 import require_contact_finish_archive_schema_v1
+        require_contact_finish_archive_schema_v1(source)
+    if _CONTACT_FRAME_AUTH_TABLE in observed:
+        from .c09_contact_frame_authentication_v1 import require_contact_frame_authentication_schema_v1
+        require_contact_frame_authentication_schema_v1(source)
+    if _LIFE_COMPLETED_ARCHIVE_TABLE in observed:
+        require_completed_life_archive_schema_v1(source)
     if any(table not in observed for table in transform.required_tables):
         raise AuthorityUnavailable(
             "required C09 installed table(s) absent: " +
@@ -468,6 +484,22 @@ class _CoreTransform:
         if table == _MODEL_BUDGET_TABLE:
             for row in rows:
                 validate_c09_model_budget_row_v1(columns, row)
+            return rows, ()
+        if table == _CONTACT_FINISH_TABLE:
+            for row in rows:
+                validate_contact_finish_row_v1(columns, row)
+            return rows, ()
+        if table == _CONTACT_FRAME_AUTH_TABLE:
+            for row in rows:
+                validate_contact_frame_authentication_row_v1(columns, row)
+            # Authentication alone does not authorize disposal. Preserve the
+            # original until an exact private disposition verifies the chain.
+            return rows, ()
+        if table == _LIFE_COMPLETED_ARCHIVE_TABLE:
+            for row in rows:
+                validate_life_archive_row_v1(columns, row)
+            # Minimal retained associations are not anonymous data. No later
+            # disposal is implied by recognizing their exact immutable schema.
             return rows, ()
         if table in MODEL_TABLES:
             from .c09_model_budget_original_v1 import validate_model_core_row_v1

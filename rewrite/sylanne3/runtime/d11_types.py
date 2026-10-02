@@ -413,6 +413,10 @@ def validate_d11_writes(writes: tuple[GraphWrite, ...], namespace: NamespaceId,
     _id(activity_id, "activity_id")
     if effect_id is not None:
         _id(effect_id, "effect_id")
+    from .d11_life_companion_writes_v1 import validate_life_companion_writes_v1
+    companion_keys = validate_life_companion_writes_v1(
+        writes, namespace, operation_id=operation_id, activity_id=activity_id, effect_id=effect_id,
+    )
     jobs: dict[str, tuple[AtomKey, RuntimeJobValue]] = {}
     outbox_ids: set[str] = set()
     idempotency_keys: set[str] = set()
@@ -420,6 +424,8 @@ def validate_d11_writes(writes: tuple[GraphWrite, ...], namespace: NamespaceId,
     cost_operations: set[str] = set()
     decoded: list[tuple[GraphWrite, object]] = []
     for write in writes:
+        if write.key in companion_keys:
+            continue
         from .d11_life_graph_types_v1 import TYPES as LIFE_TYPES, validate_life_graph_value_v1
         if write.key.type_name in LIFE_TYPES:
             binding = validate_life_graph_value_v1(write.key.type_name, write.value)

@@ -22,7 +22,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_d04_owner_semantic_initialization_v3 import (
-    installed_d04_root, real_owner_case, initialize_owner_root_v3, adopt_mapping_and_clock,
+    installed_d04_root, real_owner_case, initialize_owner_root_v3, adopt_mapping_and_clock, current_owner,
 )
 from test_current_domain_production_v1 import command, domain_owner
 from d11_offline_authority_acceptance_support_v1 import install_actual_offline_authority_case_v1
@@ -72,8 +72,8 @@ from sylanne3.runtime.jobs import get_job
 from sylanne3.runtime_contracts import canonical_digest, canonical_serialize
 
 
-def _installed_life_service(case):
-    _, owner_service, _ = install_actual_offline_authority_case_v1(case)
+def _installed_life_service(case, *, register_host_process=True):
+    _, owner_service, _ = install_actual_offline_authority_case_v1(case, register_host_process=register_host_process)
     graph, server = case["graph"], case["server"]
     bridge = server._v2_execution[case["authority_namespace"]]
     bundle = graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle
@@ -161,20 +161,35 @@ def _prepare_owner_context_and_focus(case, *, project_ref, source_ref, audience)
     assert focus["coverage"] == "complete" and len(focus["receipt"]["write_versions"]) == 2
 
 
-@pytest.mark.asyncio
-async def test_installed_owner_source_note_once_execution_body_progress_and_final_ack(tmp_path, installed_d04_root):
+async def run_installed_owner_life_case(tmp_path, installed_d04_root, *,
+        natural_workflow_builder=None, after_episode_async=None, enable_c09_maintenance=False, life_before_root_operation_id=None,
+        enable_d04_semantic_drive=False, enable_d04_joint_numeric=False,
+        host_process_runner=None, c09_protected_root=None):
     initialized = {}
 
     async def after_role(case):
         initialized.update(case)
         def install():
-            initialize_owner_root_v3(case)
-            adopt_mapping_and_clock(case)
+            initialize_owner_root_v3(case, root_operation_id=life_before_root_operation_id)
+            if life_before_root_operation_id is not None:
+                graph = case["graph"]
+                graph.install_life_before_capture_policy_v1(case["bootstrap"],
+                    graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle)
+            if enable_d04_joint_numeric:
+                with current_owner(case) as (authority, lease):
+                    topology = case["graph"].adopt_current_d04_root_coupling_v3(
+                        authority, lease, operation_id=str(uuid4()),
+                        root_operation_id=case["root_operation_id"], effective_until=86400.0)
+                assert topology["edge_count"] == 48
+                case["topology"] = topology
+            mapping, clock = adopt_mapping_and_clock(case)
+            case.update(installed_mapping=mapping, installed_clock=clock)
             for domain in ("d10",):
                 registration = case["domain_registry"].registrations[domain]
                 case["graph"].register_provider(case["bootstrap"], domain, registration.provider,
                     registration.proposal_schema, registration.proposal_schema_hash)
             initialized["life_service"] = _installed_life_service(case)
+            initialized.update(case)
         await asyncio.to_thread(install)
 
     async def after_c02(current):
@@ -294,7 +309,13 @@ async def test_installed_owner_source_note_once_execution_body_progress_and_fina
                 assert {db.execute("SELECT event_id FROM graph_history WHERE token=? ORDER BY revision DESC LIMIT 1", (ref,)).fetchone()[0]
                     for ref in members} == {adopted["operation_id"]}
                 job = get_job(db, prepared.binding.job_id)
-                assert job.phase == "completed" and job.result_ref == artifact_ref and job.usage == {"thread_cpu_ms": terminal.actual_cpu_ms}
+                from sylanne3.runtime.d11_life_terminal_v1 import read_adopted_life_original_v1
+                signed_result = read_adopted_life_original_v1(db, namespace=ns, result_ref=artifact_ref,
+                    issuer=graph._GraphCoordinator__d11_issuer)
+                assert signed_result["schema"] == "d11.adopted-life-original.v4"
+                assert signed_result["result_ref"] == artifact_ref
+                assert job.phase == "completed" and job.result_ref == signed_result["job_result_binding"]["result_ref"]
+                assert len(job.result_ref) == 80 and job.usage == {"thread_cpu_ms": terminal.actual_cpu_ms}
                 settlement_state, actual_json = db.execute("SELECT state,actual_json FROM runtime_budget_reservations WHERE lease_id=? AND operation_id=?",
                     (prepared.binding.parent_budget_lease_ref, prepared.binding.reservation_operation_id)).fetchone()
                 assert settlement_state == "settled" and json.loads(actual_json) == {"thread_cpu_ms": terminal.actual_cpu_ms}
@@ -333,17 +354,68 @@ async def test_installed_owner_source_note_once_execution_body_progress_and_fina
                 EncodeCurrentStructuredExperienceRequestV1(progress_receipt["operation_id"], experience_ref),
                 audience=audience, activity_id=activity)
             assert structured["coverage"] == "partial"
-            event_key, episode_key = structured_experience_output_keys_v1(ns, experience_ref)
+            from sylanne3.runtime.d06_internal_life_episode_v2 import (
+                internal_life_episode_keys_v2, decode_internal_life_value_v2,
+                PROVENANCE, validate_internal_life_episode_history_v2,
+            )
+            event_key, episode_key, proof_key, eligibility_key = internal_life_episode_keys_v2(ns, experience_ref)
             event = _head(case, event_key.token)[1]
-            assert event["reality"] == "host_observed" and event["source_refs"] == [experience_ref]
+            assert event['reality'] == 'internal_life' and event['assertion_scope'] == 'activity_occurred_only'
+            assert event['activity']['source_ref'] == experience_ref
+            assert event['activity']['artifact_ref'] == prepared.binding.artifact_ref
+            assert event['activity']['terminal_original_ref'] == terminal.original_ref
+            assert event['activity']['body_settlement_ref'] == body.settlement_ref
+            assert event['activity']['actual_cpu_ms'] == terminal.actual_cpu_ms
+            assert event['causal_operation_id'] == progress_receipt['operation_id']
             assert _head(case, episode_key.token)[1]["source_refs"] == [experience_ref]
-        await asyncio.to_thread(accept)
+            assert _head(case, eligibility_key.token)[1]['episode_ref'] == episode_key.token
+            with store._lock:
+                db = store._db
+                db.execute('BEGIN')
+                try:
+                    proof = decode_internal_life_value_v2(PROVENANCE, _head(case, proof_key.token)[1])
+                    original = validate_internal_life_episode_history_v2(db, proof)
+                    assert original['receipt'].operation_id == structured['operation_id']
+                    assert {v.key for v in original['receipt'].write_versions} == {event_key,episode_key,proof_key,eligibility_key}
+                    assert db.execute('SELECT 1 FROM graph_atoms WHERE token=?',
+                        (structured_experience_output_keys_v1(ns,experience_ref)[0].token,)).fetchone() is None
+                    from sylanne3.runtime.c09_graph_rebase_candidate_v1 import (
+                        _validate_internal_life_episode_history_inventory_v2,GraphRebaseHold,
+                    )
+                    _validate_internal_life_episode_history_inventory_v2(db)
+                    # Actual historical originals must be present and exact;
+                    # a closed DTO with a self-consistent digest is insufficient.
+                    frozen=next(row for row in proof.historical_reads if row.ref==experience_ref)
+                    db.execute('UPDATE graph_history SET value=? WHERE token=? AND revision=?',
+                        ('{}',frozen.ref,frozen.revision))
+                    with pytest.raises(GraphRebaseHold,match='historical production original'):
+                        _validate_internal_life_episode_history_inventory_v2(db)
+                finally:
+                    db.execute('ROLLBACK')
+            return {**case,'episode_ref':episode_key.token,'life_activity_id':activity,
+                'life_causal_operation_id':progress_receipt['operation_id'],'life_audience':audience}
+        completed=await asyncio.to_thread(accept)
+        # No await or second worker entry occurs while the synchronous Life
+        # acceptance holds the actual graph lock/SQL transaction.
+        if after_episode_async is not None:
+            await after_episode_async(completed)
 
     # This service shares the actual scoped C09 installation with the offline
     # service. Run its authorized migrations before the first Owner/business
     # write, so recovery and the selected four stores use the same mode.
     await real_owner_case(tmp_path, "owned", installed_package_root=installed_d04_root,
+        natural_workflow_builder=natural_workflow_builder,
         after_role_initialization=after_role, continue_to_ingress=True, after_c02=after_c02,
         enable_d09_workbench=True, enable_d04_root_cpu=True, enable_c04_body_work=True,
         enable_d10_offline_ticks=True, enable_d11_life_source_note=True,
+        enable_c09_maintenance=enable_c09_maintenance,
+        host_process_runner=host_process_runner, c09_protected_root=c09_protected_root,
+        life_before_root_operation_id=life_before_root_operation_id,
+        enable_d04_semantic_drive=enable_d04_semantic_drive,
+        enable_d04_joint_numeric=enable_d04_joint_numeric,
         extra_owner_purposes=("context", "consolidation"))
+
+
+@pytest.mark.asyncio
+async def test_installed_owner_source_note_once_execution_body_progress_and_final_ack(tmp_path,installed_d04_root):
+    await run_installed_owner_life_case(tmp_path,installed_d04_root)

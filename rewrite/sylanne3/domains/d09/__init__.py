@@ -568,6 +568,8 @@ class D09ExpressionProvider:
                 ("receipt_refs", "str_list"), ("version", "positive_int"),
             )),
         )
+        from .contact_batch_v2 import contact_batch_type_specs_v2
+        from .contact_batch_v3 import contact_batch_type_specs_v3
         return tuple(TypeSpec(
             name=name,
             owner_kinds=owners,
@@ -588,11 +590,21 @@ class D09ExpressionProvider:
                 "immutable": immutable, "fields": fields,
                 "version": 2 if name in {PAID_BATCH_SCHEMA_V2, NATURAL_BATCH_SCHEMA_V2} else 1,
             }),
-        ) for name, owners, role, immutable, fields in definitions) + turn_order_type_specs_v1()
+        ) for name, owners, role, immutable, fields in definitions) + turn_order_type_specs_v1() + contact_batch_type_specs_v2() + contact_batch_type_specs_v3()
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):
             raise TypeError("proposal must be DomainProposal")
+        from .contact_batch_v3 import KINDS as kinds3, PROPOSAL_SCHEMA as schema3, validate_contact_batch_proposal_v3
+        if proposal.proposal_schema == schema3:
+            return validate_contact_batch_proposal_v3(proposal)
+        if any(w.key.type_name in kinds3 for w in proposal.typed_writes):
+            raise ValueError("Contact3 cannot use another proposal schema")
+        from .contact_batch_v2 import KINDS, PROPOSAL_SCHEMA, validate_contact_batch_proposal_v2
+        if proposal.proposal_schema == PROPOSAL_SCHEMA:
+            return validate_contact_batch_proposal_v2(proposal)
+        if any(w.key.type_name in KINDS for w in proposal.typed_writes):
+            raise ValueError("Contact v2 cannot use the legacy D09 proposal schema")
         if proposal.domain != "d09" or proposal.proposal_schema != _D09_PROPOSAL_SCHEMA:
             raise ValueError("proposal is not a D09 expression proposal")
         if proposal.proposal_schema_hash != _D09_PROPOSAL_SCHEMA_HASH:

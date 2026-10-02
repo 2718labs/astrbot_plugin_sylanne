@@ -66,15 +66,33 @@ def decode_life_original_content_v1(kind, encoded):
             raise DomainProductionErasureHold("Life internal experience lacks exact completed activity facts")
         return raw
     if kind == "adopted_life":
-        if set(raw) != {"schema", "namespace", "result_ref", "producing_operation_id", "prepared_digest", "terminal", "source_refs", "graph_receipt_json", "write_commitments"}:
+        current = raw.get("schema") in {"d11.adopted-life-original.v2","d11.adopted-life-original.v3", "d11.adopted-life-original.v4"}
+        expected_fields = {"schema", "namespace", "result_ref", "producing_operation_id", "prepared_digest", "terminal", "source_refs", "graph_receipt_json", "write_commitments"}
+        if set(raw) != expected_fields | ({"job_result_binding"} if current else set()):
             raise DomainProductionErasureHold("Life adopted original fields differ")
         terminal = life_from_wire_v1(raw["terminal"], D11LifeTerminalV1)
-        if (raw["schema"] != "d11.adopted-life-original.v1" or raw["prepared_digest"] != terminal.payload.prepared_digest
+        if (raw["schema"] not in {"d11.adopted-life-original.v1", "d11.adopted-life-original.v2","d11.adopted-life-original.v3", "d11.adopted-life-original.v4"} or raw["prepared_digest"] != terminal.payload.prepared_digest
                 or raw["result_ref"] != terminal.binding.artifact_ref or raw["namespace"] != {
                     "bot_id": terminal.binding.namespace.bot_id, "persona_id": terminal.binding.namespace.persona_id}
                 or type(raw["write_commitments"]) is not list
                 or any(set(r) != {"ref", "revision", "digest"} for r in raw["write_commitments"])):
             raise DomainProductionErasureHold("Life adopted original identity differs")
+        if current:
+            from .d11_life_contract_v1 import life_adoption_operation_id_v1, validate_life_job_result_binding_v1
+            if raw["producing_operation_id"] != life_adoption_operation_id_v1(terminal.binding):
+                raise DomainProductionErasureHold("Life result mapping belongs to another adoption operation")
+            if terminal.status == "completed":
+                try:
+                    validate_life_job_result_binding_v1(raw["job_result_binding"], terminal=terminal)
+                    artifact = [row for row in raw["write_commitments"] if row["ref"] == terminal.binding.artifact_ref]
+                    mapping = raw["job_result_binding"]
+                    if (len(artifact) != 1 or artifact[0]["revision"] != mapping["artifact_revision"]
+                            or artifact[0]["digest"] != mapping["artifact_graph_digest"]):
+                        raise ValueError("Life result mapping differs from its committed artifact version")
+                except (ValueError, TypeError, KeyError) as exc:
+                    raise DomainProductionErasureHold("Life completed result mapping differs") from exc
+            elif raw["job_result_binding"] is not None:
+                raise DomainProductionErasureHold("Life incomplete terminal carries a completed result mapping")
         return raw
     raise DomainProductionErasureHold("unregistered Life original kind")
 
@@ -148,6 +166,36 @@ def validate_life_original_joins_v1(db):
             source=_json(history[0][0])
             if source["source_kind"] != "internal" or source["assertion_status"] != "confirmed" or source["text"] != canonical_serialize(raw["experience"]) or source["purposes"] != ["context","consolidation"]:
                 raise DomainProductionErasureHold("Life activity Source facts or permission differ")
+            if adopted[2]['schema']=='d11.adopted-life-original.v4':
+                from .domain_production_originals_v1 import read_adopted_domain_operation_v1
+                from .d10_life_progress_provenance_v1 import validate_life_progress_provenance_history_v1,life_experience_access_dependencies_v1
+                from ..domains.d10.production_operations_v1 import LifeProgressHeadV1
+                from .domain_production_erasure_v1 import decode_typed_production_value_v1
+                production=read_adopted_domain_operation_v1(db,ns,op)
+                prepared=originals.get((ns,'prepared',terminal.binding.prepared_original_ref))
+                if production is None or prepared is None:
+                    raise DomainProductionErasureHold('Life progress lacks its actual historical production/prepared original')
+                progress=decode_typed_production_value_v1(production['payload']['provenance']['actual_progress'],LifeProgressHeadV1)
+                validate_life_progress_provenance_history_v1(db,prepared=prepared[1],terminal=terminal,progress=progress,production=production)
+                from ..memory_types import SourceRecord,source_key,access_key
+                record=SourceRecord.from_dict(source);parent=AtomKey.from_token(prepared[1].plan.input_source.ref)
+                if record.parent_source_ids!=(parent.owner.subject,) or raw['source_ref']!=source_key(*ns.as_tuple,record.source_id).token:
+                    raise DomainProductionErasureHold('Life historical source lost its exact typed parent')
+                access=access_key(*ns.as_tuple,record.source_id)
+                access_row=db.execute('SELECT value,valid,event_id,dependencies FROM graph_history WHERE token=? AND revision=1',(access.token,)).fetchone()
+                dependencies=life_experience_access_dependencies_v1(prepared[1],AtomKey.from_token(raw['source_ref']))
+                from .d11_life_fact_provenance_v1 import life_current_fact_reads_v1
+                current_reads=life_current_fact_reads_v1(prepared[1])
+                expected_deps=tuple(sorted((key.token,1 if key.type_name in {'memory.source','d11.life_fact_eligibility.v1'} and
+                    key.token not in {row.ref for row in current_reads} else next(row.revision for row in current_reads if row.ref==key.token)) for key in dependencies))
+                expected_access=canonical_serialize({'source_id':record.source_id,'audiences':list(record.audiences),
+                    'purposes':list(record.purposes),'status':'active','recorded_at':record.recorded_at})
+                if (not any(v.key==access and v.revision==1 for v in production['receipt'].write_versions)
+                        or access_row is None or access_row[:3]!=(expected_access,1,op)
+                        or tuple(sorted(tuple(pair) for pair in json.loads(access_row[3])))!=expected_deps
+                        or db.execute('SELECT dependencies FROM graph_history WHERE token=? AND revision=1 AND event_id=?',
+                            (raw['source_ref'],op)).fetchone()!=('[]',)):
+                    raise DomainProductionErasureHold('Life historical experience source/access ownership differs')
             continue
         if kind not in {"adoption_bridge","adoption_receipt","historical_accounting_gate","historical_accounting_receipt"}:
             continue

@@ -15,6 +15,7 @@ from sylanne3.host.private_reply_dispatch_driver import (
     InstalledPrivateReplyContinuationV1, PrivateReplyDispatchDriver,
 )
 from sylanne3.host.v2_fence_port import V2FenceOutcomeUnknown
+from sylanne3.authority_service.v2_execution_bridge import CurrentEffectReadV2
 from sylanne3.runtime.dispatch_admission import DispatchAdmissionReceiptV1
 from sylanne3.runtime.post_c02_reply_ownership_v1 import ReplyOwnershipReceiptV1
 from sylanne3.runtime_contracts import CommitReceipt, NamespaceId, canonical_digest
@@ -175,6 +176,10 @@ def test_uncertain_handoff_is_reported_unknown_without_retry(error) -> None:
                 raise error
 
             continuation.dispatch = dispatch
+            async def absent(original):
+                return CurrentEffectReadV2(
+                    "authority", "ns-a", original.effect_id, 1, "absent", 0, "head")
+            continuation.read_recovery_state = absent
             driver = PrivateReplyDispatchDriver(
                 worker, authority, lease, continuation)
             result = await driver.run_once(
@@ -188,3 +193,43 @@ def test_uncertain_handoff_is_reported_unknown_without_retry(error) -> None:
     assert result.original is not None
     assert calls == ["effect"]
     assert graph.calls == ["read", "require", "dispatch", "operation"]
+
+
+@pytest.mark.parametrize("state,status", [("observed", "hold"), ("unresolved", "unknown")])
+def test_existing_private_effect_is_read_without_new_handoff(state, status):
+    graph = _Graph()
+    calls = []
+
+    async def run():
+        worker = await GraphWorker.start(
+            lambda: SimpleNamespace(close=lambda: None), lambda _store: graph)
+        try:
+            authority, lease = SimpleNamespace(namespace=NAMESPACE), object()
+            continuation = object.__new__(InstalledPrivateReplyContinuationV1)
+            continuation._worker, continuation._authority, continuation._lease = worker, authority, lease
+
+            def current(**kwargs):
+                calls.append("current")
+                assert kwargs == {"namespace": NAMESPACE, "authority_namespace": "ns-a",
+                                  "effect_id": "effect"}
+                return CurrentEffectReadV2(
+                    "authority", "ns-a", "effect", 1, state, 1, "head",
+                    observation_id="observation" if state == "observed" else None)
+
+            async def dispatch(original):
+                calls.append("dispatch")
+                raise AssertionError("existing durable effect must not begin another handoff")
+
+            continuation._policy = SimpleNamespace(namespace=NAMESPACE, authority_namespace="ns-a")
+            continuation._grant = SimpleNamespace(authority_id="authority")
+            continuation._port = SimpleNamespace(read_current_effect=current)
+            continuation.dispatch = dispatch
+            return await PrivateReplyDispatchDriver(worker, authority, lease, continuation).run_once(
+                ingress_operation_id="ingress", handler_invocation_id="handler")
+        finally:
+            await worker.close()
+
+    result = asyncio.run(run())
+    assert calls == ["current"]
+    assert result.status == status
+    assert result.original is not None

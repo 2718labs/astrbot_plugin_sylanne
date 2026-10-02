@@ -297,6 +297,9 @@ class ContextProvider:
             raise TypeError("proposal must be DomainProposal")
         if proposal.domain != "d03":
             raise ValueError("D03 provider cannot validate another domain's candidate")
+        if proposal.domain == 'd03' and proposal.proposal_schema == 'd03.internal-life-context.v1':
+            from ...runtime.d06_life_numeric_context_v1 import validate_life_numeric_context_proposal_v1
+            return validate_life_numeric_context_proposal_v1(proposal, snapshot)
         if proposal.proposal_schema != "d03.proposal.v1":
             raise ValueError("unsupported D03 proposal schema")
         allowed_types = frozenset(self.register_types())

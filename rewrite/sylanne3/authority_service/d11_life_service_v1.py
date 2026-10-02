@@ -89,6 +89,8 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
             db.execute("BEGIN")
             prepared = read_current_prepared_life_v1(db, binding=binding, issuer=self.issuer,
                 resource_issuer=self.resource_issuer, now_utc=self._now(), for_execution=for_execution)
+            from ..runtime.d04_life_before_original_v1 import require_life_d04_before_for_claim_v1
+            require_life_d04_before_for_claim_v1(db, prepared=prepared, issuer=self.issuer)
             from ..runtime.d08_life_admission_v1 import InstalledLifeAdmissionReaderV1, require_current_life_action_admission_v1
             from ..runtime_contracts import FenceScope
             from ..graph_types import NamespaceEpoch

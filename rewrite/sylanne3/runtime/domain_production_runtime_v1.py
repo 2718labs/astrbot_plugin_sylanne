@@ -22,6 +22,7 @@ class InstalledDomainOperationRuntimeV1:
         graph._admin(bootstrap)
         self.graph, self._bootstrap = graph, bootstrap
         self._active_life_execution_inventory_v1 = None
+        self._last_refusal_exception_v1 = None
 
     def _current(self):
         if getattr(self.graph, "_GraphCoordinator__domain_production_runtime_v1", None) is not self:
@@ -59,11 +60,15 @@ class InstalledDomainOperationRuntimeV1:
             read_current_domain_policy_refs_v1, read_current_domain_command_identity_v1)
         readers = installed_readers_for_operation_v1(self.graph, operation, scope=scope, owner_guard=guard,
             execution_reader=getattr(self.graph, "_GraphCoordinator__d07_execution_service_v1", None))
+        if operation.operation_kind == "acquire_internal_life_content_v2":
+            from .internal_life_worker_binding_v2 import require_installed_life_worker_v2
+            readers.life_worker_issuance_v2 = require_installed_life_worker_v2(
+                self._active_internal_life_worker_v2,self)
         contact_policy = getattr(self, "_active_contact_policy_original_v1", None)
         if operation.operation_kind == "input:set_contact_policy":
             readers.contact_policy_original = contact_policy
         current_contact = getattr(self, "_active_current_contact_policy_v1", None)
-        if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "prepare_contact_model"}:
+        if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
             readers.contact_policy_scope = scope
             readers.current_contact_policy = current_contact
         identity = read_current_domain_command_identity_v1(db, namespace=envelope.authority.namespace,
@@ -96,10 +101,18 @@ class InstalledDomainOperationRuntimeV1:
             authority=replace(envelope.authority, purpose=identity.purpose,
                 audience=life_audiences if life_audiences is not None else offline.authority.audience if offline is not None else
                     followup.authority.audience if followup is not None else (identity.audience_ref,)))
+        if operation.operation_kind == 'prepare_source_note_action':
+            from .d08_source_note_action_v1 import PrepareSourceNoteActionRequestV1, source_note_attempt_id_v1
+            if type(request) is not PrepareSourceNoteActionRequestV1:
+                raise TypeError('source-note root requires its exact installed request')
+            envelope = replace(envelope, identity=replace(envelope.identity,
+                attempt_id=source_note_attempt_id_v1(envelope.authority.namespace,
+                    request.project_ref, envelope.identity.operation_id)))
         plan = read_plan_current_domain_operation_v1(db, namespace=envelope.authority.namespace,
             activity_id=envelope.identity.activity_id, domain=operation.domain,
             operation_kind=operation.operation_kind, request=request, operation_id=envelope.identity.operation_id,
-            now_utc=now_utc, audiences=envelope.authority.audience)
+            now_utc=now_utc, audiences=envelope.authority.audience,
+            life_d04_before_capture_policy=self.graph._GraphCoordinator__life_d04_before_capture_policy)
         followup = getattr(self, "_active_background_followup_v1", None)
         if followup is not None:
             from .domain_production_followups_v1 import read_plan_current_domain_followup_v1
@@ -115,7 +128,7 @@ class InstalledDomainOperationRuntimeV1:
         if operation.operation_kind == "input:set_contact_policy" and contact_policy is not None:
             originals += (ProductionOriginalRefV1("d10.owner_contact_policy",
                 contact_policy.original_ref, contact_policy.digest),)
-        if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "prepare_contact_model"} and current_contact is not None:
+        if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"} and current_contact is not None:
             originals += (ProductionOriginalRefV1("d10.owner_contact_policy",
                 current_contact.original.original_ref, current_contact.original.digest),)
         frame = freeze_domain_production_frame_v1(self.graph, db, envelope=envelope,
@@ -135,6 +148,7 @@ class InstalledDomainOperationRuntimeV1:
             activity_id, audience_ref, parent_budget_lease_ref, _background_followup=None,
             _background_host_lifecycle=None, _background_offline=None):
         self._current()
+        self._last_refusal_exception_v1 = None
         graph = self.graph
         operation = installed_operation_v1(operation_kind)
         if type(request) is not operation.request_type:
@@ -168,7 +182,7 @@ class InstalledDomainOperationRuntimeV1:
             context.update(scope=scope, guard=guard, owner=owner)
             reader = getattr(graph, "_GraphCoordinator__d04_semantic_mapping_reader", None)
             if (operation.domain in {"d02", "d07", "d10"} or operation.operation_kind in {
-                    "adopt_contact_expression_plan", "prepare_contact_model"}) and reader is None:
+                    "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}) and reader is None:
                 raise ValueError("actual installed role-clock reader is unavailable")
             from .domain_production_read_plans_v1 import (read_plan_current_domain_operation_v1,
                 read_independent_current_original_requests_v1)
@@ -187,10 +201,13 @@ class InstalledDomainOperationRuntimeV1:
                         plan = read_plan_current_domain_operation_v1(store._db, namespace=namespace,
                             activity_id=activity_id, domain=operation.domain, operation_kind=operation_kind,
                             request=request, operation_id=operation_id, now_utc=read_now_utc,
-                            audiences=(audience_ref,))
+                            audiences=(audience_ref,),
+                            life_d04_before_capture_policy=graph._GraphCoordinator__life_d04_before_capture_policy)
                         requests = read_independent_current_original_requests_v1(store._db, namespace=namespace, plan=plan)
-                        if operation.operation_kind == "prepare_contact_model":
+                        if operation.operation_kind in {"prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
                             from .contact_plan_adoption_v1 import read_adopted_contact_plan_v1
+                            if operation.operation_kind in {"prepare_contact_model_v2", "prepare_contact_dispatch_v3"}:
+                                from .contact_plan_adoption_v2 import read_adopted_contact_plan_v2 as read_adopted_contact_plan_v1
                             contact_plan, _, contact_original, _ = read_adopted_contact_plan_v1(store._db,
                                 namespace=namespace, contact_id=request.contact_id, issuer=graph._GraphCoordinator__d11_issuer)
                             contact_policy_ref = contact_original["policy_ref"]
@@ -242,7 +259,11 @@ class InstalledDomainOperationRuntimeV1:
                 originals.extend((ProductionOriginalRefV1("d11.internal_component", requested.component_ref, verified.proof_digest),
                     ProductionOriginalRefV1("d11.internal_cost", verified.terminal_receipt_ref, verified.terminal_receipt_digest)))
             with ExitStack() as qualifications:
-                if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "prepare_contact_model"}:
+                # These observations belong to this exact independently held
+                # scope, including failures while subsequent observers enter.
+                qualifications.callback(setattr, self, '_active_life_numeric_environment_v1', None)
+                qualifications.callback(setattr, self, '_active_life_numeric_topology_v1', None)
+                if operation.operation_kind in {"prepare_contact", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
                     from ..graph_types import AtomKey
                     from .d10_contact_policy_authority_v1 import read_installed_current_contact_policy_v1
                     policy_key = AtomKey.from_token(contact_policy_ref if contact_policy_ref is not None else request.contact_policy_ref)
@@ -258,16 +279,97 @@ class InstalledDomainOperationRuntimeV1:
                     if current_policy is not None:
                         originals.append(ProductionOriginalRefV1("d10.owner_contact_policy",
                             current_policy.original.original_ref, current_policy.original.digest))
+                if operation.operation_kind in {'prepare_internal_life_interval_baseline', 'adopt_internal_life_numeric_trace'}:
+                    from .installed_c04_encoding_context_v3 import observe_installed_c04_encoding_environment_v3
+                    self._active_life_numeric_environment_v1 = observe_installed_c04_encoding_environment_v3(
+                        graph, self._bootstrap, namespace)
+                if operation.operation_kind == 'prepare_internal_life_numeric_joint':
+                    topology = graph._installed_d04_authored_topology_verifier_v3()
+                    topology.observe_current_location_for_fence_v3(port, scope)
+                    self._active_life_numeric_topology_v1 = topology
                 context["external_originals"] = tuple(originals)
                 qualifications.enter_context(reader.current_fence(scope) if operation.domain in {"d02", "d07", "d10"}
-                                              or operation.operation_kind in {"prepare_source_note_action", "adopt_contact_expression_plan", "prepare_contact_model"}
+                                              or operation.operation_kind in {"prepare_internal_life_numeric_drive", "prepare_internal_life_numeric_joint", "prepare_source_note_action", "adopt_contact_expression_plan", "adopt_contact_expression_plan_v2", "prepare_contact_model", "prepare_contact_model_v2", "prepare_contact_dispatch", "prepare_contact_dispatch_v3"}
                                              else nullcontext())
+                if operation.operation_kind in {"prepare_contact_dispatch", "prepare_contact_dispatch_v3"}:
+                    from .contact_final_stage_v2 import command_identity_contact_final_v2
+                    if operation.operation_kind == "prepare_contact_dispatch_v3":
+                        from .contact_final_stage_v3 import command_identity_contact_final_v3 as command_identity_contact_final_v2
+                    with store._lock:
+                        store._db.execute('BEGIN')
+                        try:
+                            _, effect_id, _ = command_identity_contact_final_v2(store._db, namespace=namespace,
+                                request=request, operation_id=operation_id, issuer=graph._GraphCoordinator__d11_issuer)
+                        finally:
+                            store._db.rollback()
+                    actual_port = graph._GraphCoordinator__content_fence_v2
+                    self._active_contact_final_command_v1 = (request, operation_id)
+                    self._active_contact_final_scope_v1 = scope
+                    self._active_contact_final_owner_v1 = owner
+                    self._active_contact_final_guard_v1 = guard
+                    self._active_contact_final_clock_v1 = clock
+                    self._active_contact_final_effect_v1 = actual_port.read_current_effect(namespace=namespace,
+                        authority_namespace=scope.authority_namespace, effect_id=effect_id)
+                    self._active_contact_final_effect_snapshot_v1 = actual_port.read_current_effect_snapshot_for_write_fence(
+                        namespace=namespace, authority_namespace=scope.authority_namespace, permit=scope.permit)
+                    self._active_contact_final_stage_call_v1 = object()
+                if operation.operation_kind=='adopt_internal_life_content_v1':
+                    from .internal_life_content_adoption_v1 import content_keys_v1
+                    from .internal_life_paid_result_v2 import read_life_paid_original_v2
+                    from .internal_life_content_worker_v2 import read_life_worker_original_v2
+                    from .d06_internal_life_episode_v2 import PROVENANCE,decode_internal_life_value_v2
+                    from ..model_broker.internal_life_content_v1 import internal_life_content_ids_for_occurrence_v1
+                    from ..graph_types import AtomKey
+                    from ..authority_service.v2_model_egress_wire import from_wire
+                    from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1
+                    from .model_cost_settlement import read_original_model_cost
+                    with store._lock:
+                        store._db.execute('BEGIN')
+                        try:
+                            key=AtomKey.from_token(request.episode_ref)
+                            ep=decode_internal_life_value_v2(PROVENANCE,json.loads(store._db.execute('SELECT value FROM graph_atoms WHERE token=?',
+                                (AtomKey(key.owner,PROVENANCE,'record').token,)).fetchone()[0]))
+                            ids=internal_life_content_ids_for_occurrence_v1(ep)
+                            original=read_life_worker_original_v2(store._db,namespace=namespace,issuer=graph._GraphCoordinator__d11_issuer,
+                                kind='call',job_id=ids['job'])
+                            if original is None:raise ValueError('Life content adoption actual sealed call missing')
+                            actual_intent=from_wire(original['intent'],ModelEgressIntentV1)
+                        finally:store._db.rollback()
+                    self._active_life_content_fact_v2=read_original_model_cost(graph._GraphCoordinator__model_terminal_cost_port,actual_intent)
+                numeric_worker = None
+                if operation.operation_kind == 'acquire_internal_life_numeric':
+                    from .d06_life_numeric_worker_v1 import issue_installed_life_numeric_worker_v1
+                    numeric_worker = issue_installed_life_numeric_worker_v1(self, scope, guard, owner)
+                    self._active_life_numeric_issuance_v1 = numeric_worker
+                life_worker = None
+                if operation.operation_kind == 'acquire_internal_life_content_v2':
+                    from .internal_life_worker_binding_v2 import issue_installed_life_worker_v2
+                    life_worker = issue_installed_life_worker_v2(self,scope,guard,owner)
+                    self._active_internal_life_worker_v2 = life_worker
                 try:
                     yield
                 finally:
+                    if numeric_worker is not None:
+                        from .d06_life_numeric_worker_v1 import release_installed_life_numeric_worker_v1
+                        release_installed_life_numeric_worker_v1(numeric_worker)
+                        self._active_life_numeric_issuance_v1 = None
+                    if life_worker is not None:
+                        from .internal_life_worker_binding_v2 import release_installed_life_worker_v2
+                        release_installed_life_worker_v2(life_worker)
+                        self._active_internal_life_worker_v2 = None
                     self._active_contact_policy_original_v1 = None
                     self._active_current_contact_policy_v1 = None
                     self._active_life_execution_inventory_v1 = None
+                    self._active_life_content_fact_v2 = None
+                    if operation.operation_kind in {'prepare_contact_dispatch', 'prepare_contact_dispatch_v3'}:
+                        from .contact_final_stage_v1 import revoke_contact_final_material_v1
+                        if operation.operation_kind == "prepare_contact_dispatch_v3":
+                            from .contact_final_stage_v3 import revoke_contact_final_material_v3 as revoke_contact_final_material_v1
+                        revoke_contact_final_material_v1(self)
+                        self._active_contact_final_command_v1 = None
+                        self._active_contact_final_scope_v1 = None
+                        self._active_contact_final_stage_call_v1 = None
+                        self._active_contact_final_stage_v1 = None
         def staged_commit(db, metadata, epoch, now, owner, scope):
             from .domain_production_commit_v1 import commit_installed_domain_operation_v1
             resolution = None
@@ -282,8 +384,10 @@ class InstalledDomainOperationRuntimeV1:
                     or grant.valid_until_utc <= now):
                 raise ValueError("domain operation parent budget is not currently installed")
             require_budget_family_admissible(db, budget.lease_id)
-            domains = (("d06", "d11") if operation.operation_kind == "record_host_lifecycle" else
+            domains = (("d08", "d09", "d10", "d11") if operation.operation_kind in {"prepare_contact_dispatch", "prepare_contact_dispatch_v3"} else
+                ("d06", "d11") if operation.operation_kind == "record_host_lifecycle" else
                 ("d08", "d11") if operation.operation_kind == "prepare_source_note_action" else
+                ("d03", "d06", "d07", "d11") if operation.operation_kind == "prepare_internal_life_numeric_context" else
                 ("d03", "d06", "d11") if operation.domain == "d06" else
                 ("d02", "d06", "d10", "d11") if operation.domain == "d10" else
                 ("d02", "d07", "d11") if operation.domain == "d07" else (operation.domain, "d11"))
@@ -297,7 +401,7 @@ class InstalledDomainOperationRuntimeV1:
                     else (audience_ref,),
                 grant.policy_ref, authority.activation_generation)
             deadline_seconds = 60.0
-            if operation.operation_kind == "adopt_contact_expression_plan":
+            if operation.operation_kind in {"adopt_contact_expression_plan", "adopt_contact_expression_plan_v2"}:
                 assembly = graph._GraphCoordinator__d04_installed_joint_assembly
                 if assembly is None:
                     raise ValueError("actual installed contact model workflows are unavailable")
@@ -371,11 +475,66 @@ class InstalledDomainOperationRuntimeV1:
         self._active_host_lifecycle_v1 = _background_host_lifecycle
         self._active_background_offline_v1 = _background_offline
         try:
-            return graph._owner_domain_write_v3(authority, lease, operation_id=operation_id,
+            if operation.operation_kind in {'prepare_contact_dispatch', 'prepare_contact_dispatch_v3'}:
+                from .contact_final_ack_v1 import issue_contact_owner_call_v1
+                issue_contact_owner_call_v1(self,authority=authority,lease=lease,request=request,
+                    operation_id=operation_id,request_digest=request_digest)
+            result = graph._owner_domain_write_v3(authority, lease, operation_id=operation_id,
                 request_digest=request_digest, domains=(operation.domain,), capability=operation.capability,
                 commit=commit, fence_context=fence_context,
                 background_original=_background_followup or _background_host_lifecycle or _background_offline)
+            if operation.operation_kind == 'acquire_internal_life_content' and result.get('job_states'):
+                from contextlib import closing
+                from pathlib import Path
+                import sqlite3
+                from .internal_life_content_worker_v1 import read_committed_internal_life_request_v1
+                store = graph._GraphCoordinator__store
+                path = Path(store._db.execute('PRAGMA database_list').fetchone()[2])
+                with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as durable:
+                    durable.execute('PRAGMA query_only=ON'); durable.execute('BEGIN')
+                    read_committed_internal_life_request_v1(durable,namespace=namespace,
+                        issuer=graph._GraphCoordinator__d11_issuer,job_id=result['job_states'][0][0])
+                    durable.rollback()
+            if operation.operation_kind == 'prepare_internal_life_content' and result.get('job_states'):
+                # The Owner helper has performed the actual COMMIT. This
+                # independent read certifies historical durability only;
+                # workers must acquire fresh current Owner/Source permission.
+                from .internal_life_content_preparation_v1 import read_committed_internal_life_prepared_v1
+                store = graph._GraphCoordinator__store
+                with store._lock:
+                    store._db.execute('BEGIN')
+                    try:
+                        prepared = read_committed_internal_life_prepared_v1(store._db,
+                            namespace=namespace, issuer=graph._GraphCoordinator__d11_issuer,
+                            job_id=result['job_states'][0][0])
+                        if prepared.prepare_operation_id != operation_id:
+                            raise ValueError('Life content returned another durable preparation')
+                    finally:
+                        store._db.rollback()
+            if operation.operation_kind=='adopt_contact_expression_plan_v2' and result.get('coverage')=='complete':
+                from .contact_plan_adoption_v2 import read_adopted_contact_plan_v2
+                store = graph._GraphCoordinator__store
+                with store._lock:
+                    store._db.execute('BEGIN')
+                    try:
+                        original=store._db.execute('SELECT original_payload_json FROM graph_domain_production_originals_v1 '
+                            'WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,operation_id)).fetchone()
+                        if original is None:raise ValueError('Contact Plan v2 actual durable production original absent')
+                        contact_id=json.loads(original[0])['provenance']['contact_plan']['contact_id']
+                        read_adopted_contact_plan_v2(store._db,namespace=namespace,contact_id=contact_id,
+                            issuer=graph._GraphCoordinator__d11_issuer)
+                    finally:store._db.rollback()
+            return result
         finally:
+            if operation.operation_kind in {'prepare_contact_dispatch', 'prepare_contact_dispatch_v3'}:
+                from .contact_final_ack_v1 import revoke_contact_owner_call_v1
+                revoke_contact_owner_call_v1(self)
+                from .contact_final_stage_v1 import revoke_contact_final_material_v1
+                if operation.operation_kind == "prepare_contact_dispatch_v3":
+                    from .contact_final_stage_v3 import revoke_contact_final_material_v3 as revoke_contact_final_material_v1
+                revoke_contact_final_material_v1(self)
+                for name in ('command','scope','stage_call','stage','owner','guard','clock','effect','effect_snapshot'):
+                    setattr(self, '_active_contact_final_' + name + '_v1', None)
             self._active_background_followup_v1 = None
             self._active_host_lifecycle_v1 = None
             self._active_background_offline_v1 = None

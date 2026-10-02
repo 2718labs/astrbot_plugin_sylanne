@@ -308,7 +308,8 @@ class AuthorityServiceCore:
 
     def _verify_current_heads(self, namespace: str, row) -> None:
         """A journal append not yet reflected here closes every content path."""
-        if getattr(self, "_c09_storage_reader_v1", None) is not None:
+        if (getattr(self, "_c09_storage_reader_v1", None) is not None
+                or getattr(self, "_c09_storage_reader_v2", None) is not None):
             self.require_current_storage_generation_locked(self._db, namespace=namespace,
                 action="business" if row[9] == "clear" else "maintenance")
         else:
@@ -545,7 +546,7 @@ class AuthorityServiceCore:
 
     def install_current_c09_recovery_readers_v4(
             self, *, closure, graph, namespace_id, resource_issuer,
-            body_authority, internal_services):
+            body_authority, internal_services, budget_job_issuer=None):
         """Bind live installed Authority/Graph/D02 readers to this Core."""
         from .c09_current_recovery_originals_v4 import (
             InstalledC09RecoveryOriginalsV4,
@@ -555,7 +556,8 @@ class AuthorityServiceCore:
             core=self, closure=closure, graph=graph,
             namespace_id=namespace_id, resource_issuer=resource_issuer,
             body_authority=body_authority,
-            internal_services=internal_services)
+            internal_services=internal_services,
+            budget_job_issuer=budget_job_issuer)
         self.install_execution_recovery_facts_port_v4(closure.namespace, port)
         return port
 
@@ -585,8 +587,58 @@ class AuthorityServiceCore:
             raise AuthorityUnavailable("C09 current namespace is not content ready")
         return context
 
+    def install_current_c09_storage_reader_v2(self, *, reader) -> None:
+        """Register a selected sanitized reader for factual recovery only.
+
+        V2 never supplies the V1 PREPARED object or a business grant. Once
+        registered, the V1 current-admission path cannot bypass its selector.
+        """
+        from .c09_sanitized_history_v2 import InstalledC09StorageReaderV2
+        if type(reader) is not InstalledC09StorageReaderV2:
+            raise AuthorityUnavailable("exact installed C09 V2 reader required")
+        context = reader.read_verified_current_storage_v2()
+        context.require_current("recovery")
+        members = [m for m in context.manifest["members"] if m["role"] == "core"]
+        if len(members) != 1 or members[0]["resolved_path"] != str(self.path.resolve()):
+            raise AuthorityUnavailable("Core outside selected C09 V2 manifest")
+        with self._tx() as db:
+            if context.manifest["authority_id"] != self._id(db):
+                raise AuthorityUnavailable("C09 V2 selected Authority differs")
+            prior = getattr(self, "_c09_storage_reader_v2", None)
+            if prior is not None and prior is not reader:
+                raise AuthorityUnavailable("C09 V2 reader already installed")
+            reader.require_context_v2(context, action="recovery")
+            self._c09_storage_reader_v2 = reader
+
+    def read_current_sanitized_execution_v2(
+            self, *, credential, namespace, execution_id):
+        """Read selected factual evidence under the existing maintenance right."""
+        self._require(credential, "execution_redaction_install", namespace)
+        with self._tx() as db:
+            reader = getattr(self, "_c09_storage_reader_v2", None)
+            if reader is None:
+                raise AuthorityUnavailable("installed C09 V2 factual reader unavailable")
+            context = reader.read_verified_current_storage_v2()
+            context.require_current("recovery")
+            members = [m for m in context.manifest["members"] if m["role"] == "core"]
+            if (len(members) != 1
+                    or members[0]["resolved_path"] != str(self.path.resolve())
+                    or members[0]["namespace"] != namespace
+                    or context.manifest["authority_id"] != self._id(db)):
+                raise AuthorityUnavailable("C09 V2 factual Core/namespace binding differs")
+            evidence = reader.read_sanitized_execution_v2(
+                namespace=namespace, execution_id=execution_id)
+            if evidence is not None:
+                reader.require_execution_evidence_v2(evidence)
+                if evidence.history_digest != context.history_digest:
+                    raise AuthorityUnavailable("C09 V2 factual selection changed during read")
+            reader.require_context_v2(context, action="recovery")
+            return evidence
+
     def require_current_storage_generation_locked(self, db, *, namespace, action):
         """Current generation admission; old seal guards remain unchanged."""
+        if getattr(self, "_c09_storage_reader_v2", None) is not None:
+            raise AuthorityUnavailable("C09 V2 requires its dedicated factual consumer; V1 admission HOLD")
         reader = getattr(self, "_c09_storage_reader_v1", None)
         if reader is None:
             raise AuthorityUnavailable("installed current C09 storage verifier unavailable")
@@ -666,8 +718,15 @@ class AuthorityServiceCore:
 
     def prepare_c09_execution_source_v4(self, *, credential, closure, subject, operation_id):
         from .c09_source_prepare_v4 import prepare_installed_execution_source_v4
-        return prepare_installed_execution_source_v4(core=self,credential=credential,
-            closure=closure,subject=subject,operation_id=operation_id)
+        try:
+            return prepare_installed_execution_source_v4(core=self,credential=credential,
+                closure=closure,subject=subject,operation_id=operation_id)
+        except BaseException:
+            from .c09_contact_finish_original_v1 import _revoke_contact_finish_scope_v1
+            port = self._execution_recovery_facts_ports_v4.get(closure.namespace)
+            if port is not None:
+                _revoke_contact_finish_scope_v1(port)
+            raise
 
     def issue_graph_rebase_certificate_v1(
             self, *, credential, closure, subject: str,
@@ -1647,4 +1706,57 @@ class AuthorityServiceCore:
                 self._db = None
 
 
-__all__ = ["AuthorityServiceCore"]
+class AuthorityFactualReadCoreV2(AuthorityServiceCore):
+    """A separately constructed, read-only Core for selected C09 facts.
+
+    The normal initializer is deliberately never called: it enables WAL and
+    installs schema. This instance has no executable journal verifiers and
+    cannot turn a sanitized fact into business/accounting authority.
+    """
+
+    def __init__(self, *, reader, authorizer):
+        from .c09_sanitized_history_v2 import InstalledC09StorageReaderV2
+        if type(reader) is not InstalledC09StorageReaderV2 or not callable(authorizer):
+            raise AuthorityUnavailable("installed C09 V2 reader and authorizer required")
+        context = reader.read_verified_current_storage_v2()
+        context.require_current("recovery")
+        members = [m for m in context.manifest["members"] if m["role"] == "core"]
+        if len(members) != 1:
+            raise AuthorityUnavailable("C09 factual Core member must be unique")
+        self.path = Path(members[0]["resolved_path"])
+        self._lock = threading.RLock()
+        self._authorize_callback = authorizer
+        self._factual_reader_v2 = reader
+        self._c09_storage_reader_v2 = reader
+        from .c09_sanitized_history_v2 import _factual_member_observation_v2
+        before = _factual_member_observation_v2(reader.control, members[0])
+        self._db = sqlite3.connect(self.path.as_uri() + "?mode=ro&immutable=1", uri=True,
+            isolation_level=None, check_same_thread=False)
+        try:
+            self._db.execute("PRAGMA query_only=ON")
+            self.install_current_c09_storage_reader_v2(reader=reader)
+            if _factual_member_observation_v2(reader.control, members[0]) != before:
+                raise AuthorityUnavailable("C09 factual Core changed during immutable open")
+        except BaseException:
+            self.close()
+            raise
+
+    @contextmanager
+    def _tx(self):
+        with self._lock:
+            if self._db is None:
+                raise AuthorityUnavailable("C09 factual Core is closed")
+            context = self._factual_reader_v2.read_verified_current_storage_v2()
+            context.require_current("recovery")
+            self._db.execute("BEGIN")
+            try:
+                yield self._db
+                self._factual_reader_v2.require_context_v2(context, action="recovery")
+            finally:
+                self._db.execute("ROLLBACK")
+
+    def _verify_current_heads(self, namespace, row):
+        raise AuthorityUnavailable("C09 V2 factual-only Core: business/accounting HOLD")
+
+
+__all__ = ["AuthorityServiceCore", "AuthorityFactualReadCoreV2"]

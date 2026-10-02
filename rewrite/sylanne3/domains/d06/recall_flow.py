@@ -157,6 +157,9 @@ def prepare_mandatory_recollection_candidate(
             raise ValueError("C03 proof is not current in the W01 snapshot")
 
     trace_key = AtomKey.from_token(encoding_trace_ref)
+    if trace_key.type_name == 'memory.subjective_trace.v3':
+        from ...runtime.d06_internal_life_trace_v3 import require_installed_internal_life_encoding_reader_v3
+        require_installed_internal_life_encoding_reader_v3()
     if (trace_key.type_name != "memory.subjective_trace.v2"
             or (trace_key.owner.bot, trace_key.owner.persona)
             != adapter.namespace.as_tuple):

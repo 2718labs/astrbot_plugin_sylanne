@@ -77,6 +77,18 @@ def source_note_effect_id_v1(namespace, project_ref, operation_id):
     return "effect:source-note:" + canonical_digest((namespace, project_ref, operation_id))[:48]
 
 
+def source_note_attempt_id_v1(namespace, project_ref, operation_id):
+    """One typed D08 attempt, derived by the installed root before freezing."""
+    from ..runtime_contracts import NamespaceId
+    key = AtomKey.from_token(project_ref)
+    if (type(namespace) is not NamespaceId or NamespaceId.from_key(key) != namespace
+            or key.type_name != 'd10.life_project.v1'
+            or type(operation_id) is not str or not operation_id):
+        raise ValueError('source-note attempt requires its actual namespace/project/operation')
+    return 'attempt:source-note:' + canonical_digest((
+        'd08.source-note-attempt.v1', namespace, project_ref, operation_id))[:48]
+
+
 def _keys(namespace, activity_id, operation_id, request):
     tag = canonical_digest((namespace, request.project_ref, operation_id))[:48]
     entity = AtomKey.from_token(request.target_entity_ref)
@@ -114,6 +126,8 @@ def _intent(db, frame, request, installed_readers):
     from ..host.installed_d11_life_build_v1 import read_installed_d11_life_build_v1
     read = CurrentDomainReadV1(frame)
     ns, identity = frame.envelope.authority.namespace, frame.envelope.identity
+    if identity.attempt_id != source_note_attempt_id_v1(ns, request.project_ref, identity.operation_id):
+        raise ValueError('source-note root lost its exact typed attempt identity')
     project, recipe, source, goal_atom = (read.head(db, ref, required=True) for ref in
         (request.project_ref, request.recipe_ref, request.source_ref, request.goal_ref))
     entity_key, action_key, _ = _keys(ns, identity.activity_id, identity.operation_id, request)

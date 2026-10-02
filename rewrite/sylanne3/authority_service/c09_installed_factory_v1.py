@@ -65,7 +65,8 @@ class InstalledC09MaintenanceFactoryV1:
     """
     def __init__(self, *, namespace, peer, registry, resource_issuer,
             body_authority, inventory_manifest, target_directory,
-            provider_cache_cleanup, controlled_backup_cleanup=None, controlled_backup_registry=None):
+            provider_cache_cleanup, controlled_backup_cleanup=None, controlled_backup_registry=None,
+            budget_job_issuer=None):
         if (type(namespace) is not NamespaceId or type(registry) is not TypeRegistry
                 or type(resource_issuer) is not D02ResourceIssuer
                 or type(body_authority) is not D02BodyQuoteAuthority
@@ -73,6 +74,10 @@ class InstalledC09MaintenanceFactoryV1:
                 or inventory_manifest.namespace != namespace_ref(namespace)
                 or type(peer) is not tuple or len(peer) != 2):
             raise AuthorityUnavailable("typed installed C09 factory assets required")
+        from ..runtime.issuers import D11BudgetJobIssuer
+        if budget_job_issuer is not None and (type(budget_job_issuer) is not D11BudgetJobIssuer
+                or budget_job_issuer.resource_issuer is not resource_issuer):
+            raise AuthorityUnavailable("C09 Life requires the actual same-installation D11/D02 issuers")
         for service in (provider_cache_cleanup, controlled_backup_cleanup):
             if service is not None and any(not callable(getattr(service, name, None))
                     for name in ("clean_installed_surface_v1", "reread_installed_surface_v1")):
@@ -86,6 +91,7 @@ class InstalledC09MaintenanceFactoryV1:
                 raise AuthorityUnavailable("one exact installed managed-backup registry is required")
         self.namespace, self.peer, self.registry = namespace, peer, registry
         self.resource_issuer, self.body_authority = resource_issuer, body_authority
+        self.budget_job_issuer = budget_job_issuer
         self.inventory, self.target_directory = inventory_manifest, Path(target_directory)
         self.provider_cache_cleanup = provider_cache_cleanup
         self.controlled_backup_cleanup = controlled_backup_cleanup
@@ -133,7 +139,8 @@ class InstalledC09MaintenanceFactoryV1:
             internal = dict(daemon.core._execution_redaction_c04_services.get(namespace, {}))
             daemon.core.install_current_c09_recovery_readers_v4(closure=closure, graph=graph,
                 namespace_id=self.namespace, resource_issuer=self.resource_issuer,
-                body_authority=self.body_authority, internal_services=internal)
+                body_authority=self.body_authority, internal_services=internal,
+                budget_job_issuer=self.budget_job_issuer)
             result = InstalledC09MaintenanceV1(control=control, gate=gate, core=daemon.core,
                 closure=closure, graph=graph, namespace_id=self.namespace,
                 accepted_service=accepted, inventory_manifest=self.inventory,
